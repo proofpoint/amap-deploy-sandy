@@ -363,6 +363,7 @@ td.strong{font-family:var(--display);font-weight:700}
             </tbody>
           </table>
         </div>
+        <p class="note">sandy is one choice, not a requirement. You can replace the sandy container with the isolation method of your choice, provided it implements at a minimum <strong>credential, network and file-system isolation</strong>: for example, the gVisor sandbox with an egress allowlist in <a href="https://github.com/anthropics/defending-code-reference-harness">defending-code-reference-harness</a>. The runtime and the connector stay as they are. What you replace is this deployment, with one that supplies each row of the table above in your environment.</p>
       </div>
     </section>
 
