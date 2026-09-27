@@ -1,8 +1,12 @@
 name: tests
 
-# List form deliberately: in YAML 1.1 a bare `on:` key parses as the boolean
-# `true`, which GitHub tolerates but other YAML tools do not.
-on: [push, pull_request]
+# A pull request runs the suite through `pull_request`; `push` covers only
+# main, so a PR's commits are not tested twice. The job names, and so the
+# required checks `suite (3.9)` and `suite (3.13)`, are unchanged.
+on:
+  push:
+    branches: [main]
+  pull_request:
 
 jobs:
   suite:

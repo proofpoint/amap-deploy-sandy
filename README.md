@@ -17,6 +17,11 @@ router's config from the operator's policy. Its parts:
 **New to AMAP?** Start with the explainer (`docs/index.html`, served by GitHub Pages), which walks through the concepts with animated flows. Then follow [the runbook](docs/TUTORIAL.md), which gets two agents talking
 and then breaks each guarantee on purpose so you can see where it is enforced.
 
+sandy is one isolation choice, not a requirement of AMAP. Any isolation method
+that implements at a minimum credential, network and file-system isolation can
+take its place, with a deployment of its own in place of this repo; the
+explainer's "Why sandy" screen lists what that deployment must supply.
+
 Everything here runs **host-side, as the operator**. Nothing in this repo
 runs inside a sandbox, and nothing here can send or receive a message.
 
