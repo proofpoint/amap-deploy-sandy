@@ -2016,12 +2016,27 @@ class RelayStartedAndMountsTest(unittest.TestCase):
         self.assertTrue(any(p.startswith("relay not configured") for p in problems), problems)
         self.assertIn("install --apply", problems[0])
 
-    def test_a_marker_running_an_explicit_override_names_both_paths(self):
+    def test_another_features_entry_pinned_as_the_relay_names_that_feature(self):
+        """sandy 2.2.0+ records only `source` "manifest" or "none", and pins ONE
+        selected feature's entry as the relay: a foreign path under "manifest"
+        is another feature's entry, never an override (sandy refuses one)."""
+        other = f"{prov.CONTAINER_FEATURES_ROOT}/zzz-other/run"
+        problems = self._started({"relay": {"path": other, "source": "manifest",
+                                            "disabled_by": None}})
+        self.assertTrue(any(p.startswith("relay elsewhere") for p in problems), problems)
+        self.assertIn(other, problems[0])
+        self.assertIn("'zzz-other' feature's entry", problems[0])
+        self.assertIn("no relay override to clear", problems[0])
+
+    def test_a_pre_floor_marker_with_a_foreign_path_asks_for_a_relaunch(self):
+        """"explicit" (and "slot") appear only in a marker a sandy older than
+        the floor wrote; a relaunch under the floor rewrites it."""
         other = "/opt/elsewhere/my-relay"
         problems = self._started({"relay": {"path": other, "source": "explicit"}})
         self.assertTrue(any(p.startswith("relay elsewhere") for p in problems), problems)
         self.assertIn(other, problems[0])
-        self.assertIn("explicit", problems[0])
+        self.assertIn("relay.source='explicit'", problems[0])
+        self.assertIn(f"Relaunch it under sandy {prov.SANDY_FLOOR}", problems[0])
 
     def test_a_marker_disabled_by_a_tier_is_reported_off_disabled_by(self):
         """`disabled_by` is the only host-side signal that a cloned repo
