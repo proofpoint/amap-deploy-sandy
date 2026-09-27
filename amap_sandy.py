@@ -2008,6 +2008,33 @@ def verify_relay_disabled_record(slug: str, record: Optional[dict]) -> List[str]
             f"relaunch"]
 
 
+ENTRY_STATE_ABSENT = "absent"                 # `--print-state` entry `state`: no supervisor state written
+
+
+def verify_entry_started_record(slug: str, record: Optional[dict]) -> List[str]:
+    """For a RUNNING sandbox: this feature's entry, declared and not disabled,
+    that sandy's supervisor never started. `--print-state` reports it as
+    `feature_entries.<feature>.state` "absent" (no state file in its
+    `state_dir`) with `disabled_by` null. The known cause is an agent image
+    older than the sandy that launched it, whose container-side supervisor
+    starts only the relay-designated entry. The same reading occurs for the
+    first seconds of a launch, before the supervisor writes its state, so the
+    report says to re-run. Silent where `feature_entries` is not reported,
+    where this feature has no entry, or where it is disabled: other checks
+    own those."""
+    reported, mine = own_feature_entry(record)
+    if not reported or not isinstance(mine, dict) or mine.get("disabled_by"):
+        return []
+    if mine.get("state") != ENTRY_STATE_ABSENT:
+        return []
+    return [f"entry not started: {slug}: sandy declared the {FEATURE_NAME} entry at the "
+            f"last launch but its supervisor never started it (state {ENTRY_STATE_ABSENT!r}). "
+            f"If the container started seconds ago, re-run verify. Otherwise the agent image "
+            f"is likely older than sandy (a deferred rebuild) and starts only the "
+            f"relay-designated entry: relaunch once the build dependencies are reachable, "
+            f"or run `sandy --rebuild`"]
+
+
 def verify_selection(slug: str, box: Optional[dict]) -> List[str]:
     """Sandy's own reading: a member's LAST LAUNCH selected the feature. `box`
     is the record from `discover_sandboxes` (None when sandy reported
@@ -2899,6 +2926,7 @@ def run_verify(args: argparse.Namespace, servers: Dict[str, dict], home: Path,
         if slug in running:
             live.append(slug)
             problems += verify_relay_started(slug, running[slug])
+            problems += verify_entry_started_record(slug, records.get(slug))
             problems += verify_feature_mount(home, slug, running[slug])
             problems += verify_roster_mount(home, slug, running[slug])
             problems += verify_feature_env(slug, running[slug],

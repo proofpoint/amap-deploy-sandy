@@ -1511,6 +1511,35 @@ class VerifyUnitTest(SandboxFixture):
         self.assertIn("the real cause", problems[0])
         self.assertNotIn("lock held", problems[0])
 
+    def test_an_entry_declared_but_never_started_is_reported(self):
+        """sandy's report (rappdw/sandy#381, unmerged): with an agent image
+        older than sandy, the container starts only the designated entry, and
+        `--print-state` shows ours as state "absent", disabled_by null. The
+        daemon heartbeat check fails too; this names the cause."""
+        record = self._entries_record(self.sandbox() / "feature-state" / prov.FEATURE_NAME)
+        record["feature_entries"][prov.FEATURE_NAME]["state"] = "absent"
+        problems = prov.verify_entry_started_record(self.SLUG, record)
+        self.assertTrue(any(p.startswith("entry not started") for p in problems), problems)
+        self.assertIn("sandy --rebuild", problems[0])
+        self.assertIn("re-run verify", problems[0])
+        for state in ("started", "failed", "looping"):
+            with self.subTest(state=state):
+                record["feature_entries"][prov.FEATURE_NAME]["state"] = state
+                self.assertEqual(prov.verify_entry_started_record(self.SLUG, record), [])
+
+    def test_absent_state_is_not_raised_where_other_checks_own_the_answer(self):
+        """Disabled (sandy reports "absent" and a tier), not adopted, and not
+        reported: each has its own check, so this one stays silent."""
+        ours = self.sandbox() / "feature-state" / prov.FEATURE_NAME
+        disabled = self._entries_record(ours, disabled_by="env")
+        disabled["feature_entries"][prov.FEATURE_NAME]["state"] = "absent"
+        not_adopted = {"feature_entries": {"aaa-other": {"state": "absent"}}}
+        unreported = {"feature_entries": None, "relay": {"state": "absent"}}
+        for name, record in (("disabled", disabled), ("not adopted", not_adopted),
+                             ("unreported", unreported), ("no record", None)):
+            with self.subTest(name):
+                self.assertEqual(prov.verify_entry_started_record(self.SLUG, record), [])
+
     def test_own_entry_disabled_at_its_last_launch_is_reported_off_the_record(self):
         """Without `relay{}` at all, the shape once a later sandy major removes
         it (rappdw/sandy#382): the entry's own disabled_by is the only signal."""
