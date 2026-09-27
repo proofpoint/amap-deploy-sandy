@@ -324,6 +324,12 @@ SYSTEM_PROMPT_FILE_FLAG = "--append-system-prompt-file"   # Claude Code: append 
 # mounts at /etc/sandy-session.json): what THAT launch pinned, readable
 # without a container, for a stopped sandbox too. Last launch, not next.
 SANDY_SESSION_MARKER_NAME = "sandy-session.json"
+# Sandy's per-feature entry record, in the session marker (`{path, relay_alias,
+# disabled_by}` per feature) and in `--print-state` (the same, plus `state_dir`,
+# a HOST path, and supervisor counters). Where it is reported, this feature's
+# own entry answers every relay question and `relay{}` is not read: `relay{}`
+# describes whichever ONE entry sandy designated, which need not be ours.
+FEATURE_ENTRIES_KEY = "feature_entries"
 
 # Where that entry RESOLVES inside the container, which is what sandy records
 # as `relay.path` in the session marker. The `payload/` component drops out
@@ -405,6 +411,11 @@ def discover_sandboxes(sandy_bin: str = "sandy") -> List[Dict[str, str]]:
             # TWO FRAMES IN ONE OBJECT: `path` is a CONTAINER path,
             # `state_dir` a HOST path. Carried whole.
             "relay": b.get("relay"),
+            # `{<feature>: {path, state_dir, disabled_by, relay_alias, ...}}`,
+            # one per selected feature's entry at the LAST LAUNCH; sandy runs
+            # each separately. Same two frames as `relay`. Null or absent on a
+            # sandy, or a launch, that predates it. Carried whole.
+            FEATURE_ENTRIES_KEY: b.get(FEATURE_ENTRIES_KEY),
             # The feature names sandy will honour (sorted; `[]`
             # never null, and read at QUERY time — no last-launch caveat) and
             # every entry it will not, with the reason. Carried whole.
@@ -1707,6 +1718,19 @@ SANDY_SESSION_RELAY_KEY = "relay"             # the session marker's relay objec
 RELAY_SOURCE_MANIFEST = "manifest"            # `relay.source` when a feature manifest's `entry` supplied the relay
 
 
+def own_feature_entry(doc: Any) -> Tuple[bool, Any]:
+    """`(reported, entry)` for this feature in a marker or `--print-state`
+    record. `reported` is False when `feature_entries` is absent or null (a
+    sandy, or a last launch, that predates it): the caller falls back to
+    `relay{}`. When it is reported, `entry` is this feature's object, or
+    None when sandy adopted no entry for it at that launch. The gate is the
+    field's PRESENCE, never sandy's version."""
+    entries = doc.get(FEATURE_ENTRIES_KEY) if isinstance(doc, dict) else None
+    if not isinstance(entries, dict):
+        return False, None
+    return True, entries.get(FEATURE_NAME)
+
+
 def verify_relay_started(slug: str, container: str, *, docker_bin: str = "docker") -> List[str]:
     """SANDY'S OWN SIGNAL — the authority on whether a relay was CONFIGURED.
 
@@ -1745,6 +1769,9 @@ def verify_relay_started(slug: str, container: str, *, docker_bin: str = "docker
         return [f"relay not configured: {slug}: {SANDY_SESSION_FILE} is not JSON ({e})"]
     if not isinstance(doc, dict):
         return [f"relay not configured: {slug}: {SANDY_SESSION_FILE} is not an object"]
+    reported, mine = own_feature_entry(doc)
+    if reported:
+        return _verify_own_entry_marker(slug, container, mine)
     relay = doc.get(SANDY_SESSION_RELAY_KEY)
     if not isinstance(relay, dict):
         return [f"relay not configured: {slug}: {SANDY_SESSION_FILE} has no "
@@ -1782,6 +1809,33 @@ def verify_relay_started(slug: str, container: str, *, docker_bin: str = "docker
             f"sandy {SANDY_FLOOR} and later refuse one"]
 
 
+def _verify_own_entry_marker(slug: str, container: str, mine: Any) -> List[str]:
+    """The marker's verdict off this feature's own `feature_entries` object.
+    Sandy runs every selected feature's entry under its own supervisor, so
+    which entry `relay{}` describes is irrelevant here and `relay_alias` is
+    not read."""
+    if mine is None:
+        return [f"relay not configured: {slug}: sandy adopted no {FEATURE_NAME} entry at "
+                f"this launch ({SANDY_SESSION_FILE} `{FEATURE_ENTRIES_KEY}` has no "
+                f"{FEATURE_NAME!r}), so nothing in {container} runs the daemon. Why is "
+                f"sandy's to say: `list` shows its verdict and reason. Run install --apply "
+                f"and relaunch"]
+    if not isinstance(mine, dict):
+        return [f"relay not configured: {slug}: {SANDY_SESSION_FILE} "
+                f"`{FEATURE_ENTRIES_KEY}.{FEATURE_NAME}` is {mine!r}, not an object"]
+    by = mine.get("disabled_by")
+    if by:
+        return [f"relay disabled: {slug}: sandy reports the {FEATURE_NAME} entry off "
+                f"(SANDY_RELAY=0 from the {by} tier). Nothing in {container} is running the "
+                f"daemon. Set SANDY_RELAY=1 (or remove the 0) at that tier and relaunch"]
+    path = mine.get("path")
+    if path == CONTAINER_ENTRY_PATH:
+        return []
+    return [f"relay elsewhere: {slug}: sandy resolved the {FEATURE_NAME} entry to {path!r}, "
+            f"not {CONTAINER_ENTRY_PATH} — the manifest sandy read at this launch names a "
+            f"different `entry` from this deployment's. Run install --apply and relaunch"]
+
+
 def _feature_of_entry_path(path: str) -> Optional[str]:
     """The feature whose payload `path` sits in, when it is under sandy's
     container features root (`/opt/sandy/features/<feature>/...`); None for
@@ -1800,11 +1854,13 @@ SUPERVISOR_LOG_NAME = "supervisor.log"
 
 
 def supervisor_log_path(record: Optional[dict]) -> Optional[Path]:
-    """The supervisor log, where sandy says it is: `relay.state_dir` off
-    `--print-state` (a HOST path — `relay.path` beside it is a CONTAINER
-    path) joined with the file's name. None when the record names no state
-    directory: the sandbox's last launch predates sandy 2.2.0, and there is
-    no other location worth guessing.
+    """The supervisor log, where sandy says it is: this feature's
+    `feature_entries.<feature>.state_dir` off `--print-state` where that is
+    reported, else `relay.state_dir` (a HOST path either way — `path` beside
+    it is a CONTAINER path), joined with the file's name. None when the
+    record names no state directory: sandy adopted no entry for this feature
+    at its last launch, or that launch predates sandy 2.2.0, and there is no
+    other location worth guessing.
 
     ON THE RECORD ONLY, never the session marker, by sandy's design: the
     marker is read
@@ -1813,16 +1869,25 @@ def supervisor_log_path(record: Optional[dict]) -> Optional[Path]:
     document can be mistaken for the other. The absence is permanent — a
     host path in the marker would be a NEW field named for its frame — so
     nothing here looks for `state_dir` in the marker."""
-    relay = (record or {}).get("relay") if isinstance(record, dict) else None
-    state_dir = relay.get("state_dir") if isinstance(relay, dict) else None
+    reported, mine = own_feature_entry(record)
+    if reported:
+        state_dir = mine.get("state_dir") if isinstance(mine, dict) else None
+    else:
+        relay = record.get("relay") if isinstance(record, dict) else None
+        state_dir = relay.get("state_dir") if isinstance(relay, dict) else None
     if state_dir:
         return Path(state_dir) / SUPERVISOR_LOG_NAME
     return None
 SUPERVISOR_TAIL_BYTES = 65536
 # Two non-zero exits inside this window is a loop, not an incident.
 SUPERVISOR_LOOP_WINDOW_SECONDS = 900
+# Any bracketed label: sandy's relay-designated entry logs as `[sandy-relay]`,
+# any other entry as `[sandy-entry <feature>]`, and each log is one entry's.
 _SUPERVISOR_RE = re.compile(
-    r"^\[sandy-relay\]\s+(?P<ts>\S+)\s+(?P<event>supervisor started|start|exit rc=(?P<rc>-?\d+))")
+    r"^\[[^\]]+\]\s+(?P<ts>\S+)\s+(?P<event>supervisor started|start|exit rc=(?P<rc>-?\d+))")
+# The supervisor refusing to start a second copy of itself: its own line, not
+# the relay's stderr, and not an event.
+_SUPERVISOR_LOCK_HELD_RE = re.compile(r"^\[[^\]]+\]\s+\S+\s+supervisor already running")
 
 
 def read_supervisor_log(path: Path) -> Tuple[List[Tuple[str, str, Optional[int]]], List[str]]:
@@ -1852,6 +1917,8 @@ def read_supervisor_log(path: Path) -> Tuple[List[Tuple[str, str, Optional[int]]
             rc = m.group("rc")
             events.append((m.group("ts"), m.group("event").split()[0],
                            int(rc) if rc is not None else None))
+        elif _SUPERVISOR_LOCK_HELD_RE.match(line):
+            continue
         elif line.strip():
             other.append(line.strip())
     return events, other
@@ -1927,8 +1994,12 @@ def verify_relay_disabled_record(slug: str, record: Optional[dict]) -> List[str]
     manifest entry included. LAG semantics: the last
     launch, so a tightening removed since reads as still off until the
     relaunch that clears it."""
-    relay = record.get("relay") if isinstance(record, dict) else None
-    by = relay.get("disabled_by") if isinstance(relay, dict) else None
+    reported, mine = own_feature_entry(record)
+    if reported:
+        by = mine.get("disabled_by") if isinstance(mine, dict) else None
+    else:
+        relay = record.get("relay") if isinstance(record, dict) else None
+        by = relay.get("disabled_by") if isinstance(relay, dict) else None
     if not by:
         return []
     return [f"relay disabled: {slug}: SANDY_RELAY=0 from the {by} tier at its last launch, "
@@ -2794,9 +2865,14 @@ def run_verify(args: argparse.Namespace, servers: Dict[str, dict], home: Path,
         problems += verify_selection(slug, records.get(slug))
         problems += verify_lane_sources(home, slug)
         if supervisor_log_path(records.get(slug)) is None:
-            notes.append(f"{slug}: relay health is not checkable until it is relaunched — its "
-                         f"last launch predates sandy 2.2.0, which names the supervisor's state "
-                         f"directory")
+            if own_feature_entry(records.get(slug))[0]:
+                notes.append(f"{slug}: relay health is not checkable — sandy reports no "
+                             f"{FEATURE_NAME} entry state directory for its last launch "
+                             f"(no entry adopted, or none named)")
+            else:
+                notes.append(f"{slug}: relay health is not checkable until it is relaunched — "
+                             f"its last launch predates sandy 2.2.0, which names the "
+                             f"supervisor's state directory")
         problems += verify_relay_supervisor(sandbox_dir, slug, record=records.get(slug))
         # SANDY_RELAY=0 at the last launch, off sandy's own record — for a
         # STOPPED sandbox too, which the marker read below cannot reach.
