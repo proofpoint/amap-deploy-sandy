@@ -166,7 +166,8 @@ POLICY_SOURCE = "payload/INBOX-POLICY.md"
 # read-only wrapper that execs a writable daemon hands it the same thing one
 # link down, and a read-only daemon that imports a writable `_inboxlib.py`
 # two links down. The chain is only as read-only as its most writable link,
-# so all three sit together on the payload mount. Sandy guarantees only the
+# so all three sit together on the payload mount, with the session lister
+# the daemon execs (`SESSION_SOURCE_NAME`). Sandy guarantees only the
 # FIRST executable; the wrapper finds its neighbours through `$0`, so the
 # WHOLE chain is behind the read-only mount, which is strictly more than sandy
 # promises.
@@ -179,6 +180,11 @@ DELIVERY_SUPPORT_NAME = "_inboxlib.py"
 # The wrapper as SHIPPED in this checkout: `payload/relay`, under the name it
 # is installed as, so the repo file and the installed file have one name.
 RELAY_WRAPPER_NAME = "relay"
+# The session lister the daemon runs as `AMAP_DELIVERY_SESSION_SOURCE`, shipped
+# from this checkout like the wrapper and found by the wrapper beside itself.
+# It encodes sandy's published pane-identity contract. The daemon EXECS it, so
+# it belongs to the relay chain and sits on the read-only payload with the rest.
+SESSION_SOURCE_NAME = "handoff-sessions"
 
 # ------------------------------------------------------------ the feature tree
 #
@@ -917,15 +923,16 @@ def _write_file(path: Path, want: str, *, dry_run: bool, label: str,
 def payload_sources(connector_src: Path,
                     servers_path: Path = DEFAULT_SERVERS) -> Tuple[Tuple[str, Path, bool], ...]:
     """`(relative path in the payload, source file, executable)` — every file
-    the payload holds, in one place. The wrapper, the MCP registration and
-    the policy text come from THIS checkout; the daemon, its module and both
-    MCP binaries from the connector. The registration and the policy text
+    the payload holds, in one place. The wrapper, the session lister, the
+    MCP registration and the policy text come from THIS checkout; the
+    daemon, its module and both MCP binaries from the connector. The registration and the policy text
     are what the manifest's `agent_args` point the agent at, so they live
     once per host on the read-only mount like everything else here. Sibling
     tools import this tuple: it moves by agreement."""
     src = Path(connector_src)
     return (
         (RELAY_WRAPPER_NAME, relay_wrapper_source(), True),
+        (SESSION_SOURCE_NAME, PAYLOAD_DIR / SESSION_SOURCE_NAME, True),
         (DELIVERY_DAEMON_NAME, src / DELIVERY_DAEMON_NAME, True),
         (DELIVERY_SUPPORT_NAME, src / DELIVERY_SUPPORT_NAME, False),
         (MCP_SERVERS_PAYLOAD_NAME, Path(servers_path), False),

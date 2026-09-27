@@ -205,6 +205,14 @@ between two sandboxes or two hosts. Edit it here, then run
 executes the **shipped file** under `/bin/sh`, and there is no Python mirror
 of it.
 
+**`payload/handoff-sessions` is checked in the same way.** It is the session
+lister the daemon runs as `AMAP_DELIVERY_SESSION_SOURCE`, and it reads pane
+identity only through sandy's published pane-identity contract: the tmux
+session `sandy`, the `@sandy_pane_agent` option in multi-agent mode, and
+`$SANDY_AGENT` as spawn order. **Never identify a pane by `pane_index`**; in
+the four-agent grid it is not spawn order. `tests/test_handoff_sessions.py`
+executes the shipped file against a fake `tmux` and a staged `/proc`.
+
 ### Authorisation is the router's
 
 The daemon holds **no allowlist**, and nothing on the agent's side names whom

@@ -53,8 +53,9 @@ AMAP_DELIVERY_STATE_DIR="$AMAP_CONNECTOR/delivery-state"
 # The outcomes directory is the daemon's own: `Outcomes.write` makedirs it
 # per write, so it exists once there has been peer traffic and not before.
 AMAP_DELIVERY_OUTCOME_DIR="$AMAP_OUTBOX_DIR/ext/claude-code/outcomes"
-# Sandy's in-container session lister (its name, not ours).
-AMAP_DELIVERY_SESSION_SOURCE="/usr/local/bin/sandy-handoff-sessions"
+# The session lister shipped beside this wrapper, which reads sandy's
+# published pane-identity contract. Found no other way, like the daemon.
+AMAP_DELIVERY_SESSION_SOURCE="$SELF_DIR/handoff-sessions"
 export AMAP_DELIVERY_MAIL_NOTICE_DIR AMAP_DELIVERY_MAIL_CLAIM AMAP_DELIVERY_PEER_NOTICE_DIR AMAP_DELIVERY_PEER_MESSAGE_DIR AMAP_DELIVERY_PEER_CLAIM AMAP_DELIVERY_STATE_DIR AMAP_DELIVERY_OUTCOME_DIR AMAP_DELIVERY_SESSION_SOURCE
 
 # No AMAP_DELIVERY_PEERS: the daemon reads no policy file, and the router
