@@ -1,0 +1,80 @@
+{
+  "schema": 1,
+  "sandboxes": {
+    "include": [
+      "*"
+    ],
+    "exclude": [
+      "tmp.*"
+    ]
+  },
+  "agents": {
+    "include": [
+      "claude"
+    ],
+    "exclude": []
+  },
+  "create": [
+    "instances/${slug}/inbox/notices",
+    "instances/${slug}/inbox/messages",
+    "instances/${slug}/peer/notices",
+    "instances/${slug}/peer/messages",
+    "instances/${slug}/outbox/results",
+    "instances/${slug}/outbox/processed"
+  ],
+  "mounts": [
+    {
+      "name": "payload",
+      "from": "payload",
+      "mode": "ro",
+      "export": "AMAP_PAYLOAD_DIR"
+    },
+    {
+      "name": "inbox",
+      "from": "instances/${slug}/inbox",
+      "mode": "ro",
+      "export": "AMAP_INBOX_DIR"
+    },
+    {
+      "name": "peer",
+      "from": "instances/${slug}/peer",
+      "mode": "ro",
+      "export": "AMAP_PEER_DIR"
+    },
+    {
+      "name": "outbox",
+      "from": "instances/${slug}/outbox",
+      "mode": "rw",
+      "export": "AMAP_OUTBOX_DIR"
+    },
+    {
+      "name": "roster",
+      "from": "roster",
+      "mode": "ro",
+      "export": "AMAP_ROSTER_DIR"
+    }
+  ],
+  "entry": "payload/relay",
+  "expose": {
+    "AMAP_FLEET_DOMAIN": "agents.example.org"
+  },
+  "agent_args": {
+    "claude": [
+      "--mcp-config",
+      "/opt/sandy/features/amap/mcp-servers.json",
+      "--append-system-prompt-file",
+      "/opt/sandy/features/amap/INBOX-POLICY.md"
+    ]
+  },
+  "feature": {
+    "version": 1,
+    "groups": {},
+    "default_peers": [],
+    "peers": {},
+    "task_graph": "ALL",
+    "task_deny": [],
+    "fleet_domain": "agents.example.org",
+    "container_recreate_interval_hours": 24,
+    "_comment": "An example of $SANDY_HOME/features/amap/feature.json as `install` renders it. The `feature` section IS the fleet policy, and `sandboxes`/`agents` are the selection rule sandy evaluates at every launch: every sandbox launched with claude, less throwaway `tmp.*` ones. `schema`, `create`, `mounts`, `entry`, `expose` and `agent_args` belong to amap-deploy-sandy and `install` rewrites them; edit the rest in place. task_graph ALL: any selected sandbox may task any other, self excluded. peers stays EMPTY: this fleet is for tasking, and the two lanes must not share an ordered pair."
+  }
+}

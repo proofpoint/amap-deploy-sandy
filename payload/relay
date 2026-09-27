@@ -1,0 +1,99 @@
+#!/bin/sh
+# payload/relay — shipped by amap-deploy-sandy and copied VERBATIM onto the
+# feature payload, once per host, by amap-sandy.py. Edit it HERE, in this
+# checkout, then re-run install --apply. An edit to a deployed copy is drift:
+# verify reports it on every run thereafter and never adopts it.
+#
+# It is a constant: every path is derived from sandy's exports, so nothing in
+# it differs between two sandboxes or two hosts. The daemon's contract is the
+# explicit AMAP_DELIVERY_* variables and stays host-agnostic; translating
+# sandy's facts into them is this repo's job, and this file is that
+# translation.
+#
+# sandy launches this as the relay. It exports the AMAP_DELIVERY_*
+# variables the delivery daemon requires (all of them; the daemon has no
+# defaults and refuses to start if one is missing) and execs the daemon.
+# Eight are paths, derived from the manifest's lane exports; the ninth is the daemon's
+# own address, derived from sandy's session file and the fleet's domain,
+# and is optional by the daemon's design (a fleet with no domain has none).
+# The daemon's source (amap-connector-claude, bin/inbox-delivery) is the
+# contract.
+#
+# This file and everything it execs sit behind a read-only mount: the agent
+# may read the relay and may not replace it. Nothing here may reach outside
+# that directory.
+set -e
+
+# The directory this script is in — the :ro mount. The daemon and its
+# module are its neighbours, and are found no other way.
+SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+
+# Where sandy mounted the three lanes, in its own words: the manifest's
+# per-mount `export` (feature.json `mounts[].export`, `AMAP_*_DIR`), which
+# sandy passes into the container environment verbatim. REQUIRED: ${VAR:?}
+# exits non-zero with this message rather than letting the daemon start
+# against a path nobody set. The daemon applies the same rule to its own
+# required variables — a guessed path is a wrong path used silently — and
+# sandy's supervisor records the exit and the reason.
+: "${AMAP_INBOX_DIR:?relay: sandy exported no AMAP_INBOX_DIR; the inbox lane is not mounted, so there is nothing to watch}"
+: "${AMAP_OUTBOX_DIR:?relay: sandy exported no AMAP_OUTBOX_DIR; the outbox lane is not mounted, so there is nowhere to write}"
+: "${AMAP_PEER_DIR:?relay: sandy exported no AMAP_PEER_DIR; the peer lane is not mounted, so there is nothing to watch}"
+
+# The agent's private connector state, from $HOME — which tracks the
+# container user sandy actually created; a baked-in /home/<name> would point
+# at nothing if sandy renamed that user.
+AMAP_CONNECTOR="$HOME/.claude/connector"
+
+AMAP_DELIVERY_MAIL_NOTICE_DIR="$AMAP_INBOX_DIR/notices"
+AMAP_DELIVERY_MAIL_CLAIM="$AMAP_CONNECTOR/claims/mail.amap-consumer.json"
+AMAP_DELIVERY_PEER_NOTICE_DIR="$AMAP_PEER_DIR/notices"
+AMAP_DELIVERY_PEER_MESSAGE_DIR="$AMAP_PEER_DIR/messages"
+AMAP_DELIVERY_PEER_CLAIM="$AMAP_CONNECTOR/claims/peer.amap-consumer.json"
+AMAP_DELIVERY_STATE_DIR="$AMAP_CONNECTOR/delivery-state"
+# The outcomes directory is the daemon's own: `Outcomes.write` makedirs it
+# per write, so it exists once there has been peer traffic and not before.
+AMAP_DELIVERY_OUTCOME_DIR="$AMAP_OUTBOX_DIR/ext/claude-code/outcomes"
+# Sandy's in-container session lister (its name, not ours).
+AMAP_DELIVERY_SESSION_SOURCE="/usr/local/bin/sandy-handoff-sessions"
+export AMAP_DELIVERY_MAIL_NOTICE_DIR AMAP_DELIVERY_MAIL_CLAIM AMAP_DELIVERY_PEER_NOTICE_DIR AMAP_DELIVERY_PEER_MESSAGE_DIR AMAP_DELIVERY_PEER_CLAIM AMAP_DELIVERY_STATE_DIR AMAP_DELIVERY_OUTCOME_DIR AMAP_DELIVERY_SESSION_SOURCE
+
+# No AMAP_DELIVERY_PEERS: the daemon reads no policy file, and the router
+# holds the graph. (A connector old enough to REQUIRE that variable refuses
+# to start under this wrapper; the daemon-required-set test says so.)
+
+# The ninth variable: the daemon's OWN address, <sandbox_name>@<fleet_domain>.
+# `sandbox_name` is sandy's, composed host-side into its session file before
+# the container runs; the slug IS the instance name, so
+# nothing is derived from it here. The domain is the fleet policy's, and it
+# reaches this process as AMAP_FLEET_DOMAIN — an `expose` export of the
+# feature manifest that sandy passes to the container environment verbatim
+# (`-e` on `docker run`; the relay inherits the whole container environment,
+# whichever path started it). Neither value comes from anything the agent
+# can write.
+#
+# No AMAP_FLEET_DOMAIN means the policy declares no fleet_domain, so the
+# ROUTER places no peer notices and there is no address to export; nothing
+# is exported. The daemon's peer lane still RUNS: it keeps the variable
+# OPTIONAL for exactly this fleet, cannot tell a mail-only fleet
+# from a peer fleet that forgot, and does not guess — a peer notice arriving
+# anyway is refused, per notice, with an outcome that names the missing
+# variable, and the router raises a DSN from it. Fails closed and loud,
+# not quiet. Do not make the missing export fatal here. Every OTHER gap is
+# fatal here, never guessed: an exported-but-empty domain is a bad render,
+# and a session file without a name is a sandy too old to have a feature
+# mount to run this from in the first place.
+SANDY_SESSION_FILE=/etc/sandy-session.json
+if [ -n "${AMAP_FLEET_DOMAIN+x}" ]; then
+    fleet_domain="$AMAP_FLEET_DOMAIN"
+    : "${fleet_domain:?relay: AMAP_FLEET_DOMAIN is exported but empty; re-run amap-sandy.py install --apply}"
+    if [ ! -r "$SANDY_SESSION_FILE" ]; then
+        echo "relay: $SANDY_SESSION_FILE is missing or unreadable; sandy composes it before launch" >&2
+        exit 1
+    fi
+    sandbox_name=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("sandbox_name") or "")' "$SANDY_SESSION_FILE")
+    : "${sandbox_name:?relay: $SANDY_SESSION_FILE carries no sandbox_name; sandy composes it before launch}"
+    AMAP_DELIVERY_SELF="$sandbox_name@$fleet_domain"
+    export AMAP_DELIVERY_SELF
+fi
+
+exec "$SELF_DIR/inbox-delivery" "$@"

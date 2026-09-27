@@ -1,0 +1,6 @@
+# GitHub SILENTLY IGNORES an owner it cannot resolve (an unknown handle, or
+# one without access to this repo): a wrong entry reviews nothing and raises
+# no error. Confirm on the repo's Settings -> Code review page that this rule
+# shows as ACTIVE.
+
+* @rappdw

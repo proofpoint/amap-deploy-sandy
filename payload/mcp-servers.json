@@ -1,0 +1,27 @@
+{
+  "mcpServers": {
+    "inbox": {
+      "command": "/opt/sandy/features/amap/bin/inbox-mcp-vol",
+      "env": {
+        "INBOX_MESSAGE_DIR": "${AMAP_INBOX_DIR}/messages",
+        "INBOX_LANE": "mail"
+      }
+    },
+    "delegation": {
+      "command": "/opt/sandy/features/amap/bin/inbox-mcp-vol",
+      "env": {
+        "INBOX_MESSAGE_DIR": "${AMAP_PEER_DIR}/messages",
+        "INBOX_LANE": "peer"
+      }
+    },
+    "inbox-submit": {
+      "command": "/opt/sandy/features/amap/bin/inbox-submit",
+      "args": [
+        "mcp"
+      ],
+      "env": {
+        "OUTBOX_DIR": "${AMAP_OUTBOX_DIR}"
+      }
+    }
+  }
+}

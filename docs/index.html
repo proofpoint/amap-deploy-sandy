@@ -1,0 +1,712 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>AMAP, Explained</title>
+<meta name="description" content="A step-by-step walkthrough of the Agent Mailbox Access Protocol: why agents run isolated, how the router and the connector meet at a directory tree, animated flows through each, and how to run it yourself under sandy.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&display=swap">
+<style>
+:root{
+  color-scheme: light;
+  --paper:#f2f4f2; --panel:#ffffff; --ink:#17201d; --muted:#56635e; --rule:#d5dcd8;
+  --trust:#0f6b5c; --trust-soft:#dcefe9;
+  --agent:#a86a12; --agent-soft:#f7ead3;
+  --refuse:#b83227; --refuse-soft:#f8e0dc;
+  --ro:#2f5f93; --ro-soft:#e1ebf6;
+  --code:#e8ece9; --term:#17201d; --term-ink:#e4ebe7; --term-muted:#8fa19a;
+  --display:"Bricolage Grotesque", "Avenir Next", "Segoe UI", system-ui, sans-serif;
+  --body:"Source Serif 4", Charter, "Iowan Old Style", Georgia, serif;
+  --mono:"JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    color-scheme: dark;
+    --paper:#111715; --panel:#18201d; --ink:#e4ebe7; --muted:#9aa8a2; --rule:#2c3833;
+    --trust:#4cc3a8; --trust-soft:#153a31;
+    --agent:#e2a64a; --agent-soft:#3a2b12;
+    --refuse:#f0776b; --refuse-soft:#3d1b17;
+    --ro:#7fb0e6; --ro-soft:#172a40;
+    --code:#1f2926; --term:#0b100e; --term-ink:#e4ebe7; --term-muted:#7f918a;
+  }
+}
+:root[data-theme="dark"]{
+  color-scheme: dark;
+  --paper:#111715; --panel:#18201d; --ink:#e4ebe7; --muted:#9aa8a2; --rule:#2c3833;
+  --trust:#4cc3a8; --trust-soft:#153a31;
+  --agent:#e2a64a; --agent-soft:#3a2b12;
+  --refuse:#f0776b; --refuse-soft:#3d1b17;
+  --ro:#7fb0e6; --ro-soft:#172a40;
+  --code:#1f2926; --term:#0b100e; --term-ink:#e4ebe7; --term-muted:#7f918a;
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{margin:0;background:var(--paper);color:var(--ink);font:17px/1.55 var(--body);-webkit-font-smoothing:antialiased;overflow:hidden}
+a{color:var(--trust);text-underline-offset:2px}
+a:focus-visible,button:focus-visible,summary:focus-visible{outline:2px solid var(--trust);outline-offset:2px;border-radius:3px}
+code{font-family:var(--mono);font-size:.84em;background:var(--code);padding:.06em .34em;border-radius:3px}
+h1,h2,h3{font-family:var(--display);line-height:1.1;text-wrap:balance;margin:0}
+h2{font-size:clamp(1.5rem,3vw,2.2rem);font-weight:700;letter-spacing:-.01em}
+h3{font-size:1.02rem;font-weight:700}
+p{margin:0}
+.eyebrow{font-family:var(--mono);font-size:.72rem;letter-spacing:.12em;text-transform:uppercase;color:var(--muted)}
+
+/* ---------- app frame: header · stage · controls ---------- */
+.app{height:100%;display:grid;grid-template-rows:auto minmax(0,1fr) auto}
+.top{padding:12px 24px 10px;padding-top:calc(12px + env(safe-area-inset-top,0px));display:grid;gap:8px;border-bottom:1px solid var(--rule);background:var(--paper)}
+.top-row{display:flex;justify-content:space-between;align-items:baseline;gap:16px}
+.brand{font-family:var(--display);font-weight:700;font-size:1rem}
+.where{font-family:var(--mono);font-size:.74rem;color:var(--muted);text-align:right;font-variant-numeric:tabular-nums}
+.chapters{display:grid;grid-auto-flow:column;grid-auto-columns:minmax(0,1fr);gap:4px}
+.chapters button{appearance:none;border:0;background:transparent;padding:6px 0 0;cursor:pointer;text-align:left;display:grid;gap:5px;color:var(--muted);font:500 .74rem/1.2 var(--display);min-width:0}
+.chapters .fill{height:4px;border-radius:2px;background:var(--rule);position:relative;overflow:hidden}
+.chapters .fill i{position:absolute;inset:0;width:0;background:var(--trust);transition:width .3s}
+.chapters .lbl{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.chapters button[aria-current="step"]{color:var(--ink)}
+.stage{min-height:0;overflow:hidden;position:relative}
+.screen{position:absolute;inset:0;overflow:auto;padding:18px 24px;display:flex;align-items:center;justify-content:center}
+.screen[hidden]{display:none}
+.inner{width:100%;max-width:1080px;display:grid;gap:12px;animation:in .35s ease-out;margin:auto 0}
+@keyframes in{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+@media (prefers-reduced-motion: reduce){.inner{animation:none}.chapters .fill i{transition:none}}
+.lede{font-size:1.1rem;max-width:66ch}
+.body{max-width:66ch}
+.controls{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:12px 24px;padding-bottom:calc(12px + env(safe-area-inset-bottom,0px));border-top:1px solid var(--rule);background:var(--paper)}
+.controls button{font:700 .95rem/1 var(--display);height:44px;padding:0 20px;border-radius:8px;border:1px solid var(--rule);background:var(--panel);color:var(--ink);cursor:pointer}
+.controls button.next{background:var(--trust);border-color:var(--trust);color:var(--paper);min-width:140px}
+.controls button:disabled{opacity:.4;cursor:default}
+.hint{font-family:var(--mono);font-size:.72rem;color:var(--muted);text-align:center}
+
+/* ---------- screen furniture ---------- */
+.hero h1{font-size:clamp(2.3rem,6vw,4.4rem);font-weight:700;letter-spacing:-.02em;max-width:14ch}
+.hero .ask{color:var(--agent)} .hero .act{color:var(--trust)}
+.invariant{max-width:66ch;border-left:3px solid var(--trust);padding:4px 0 4px 18px;font-style:italic}
+.invariant b{font-style:normal;font-family:var(--mono);font-size:.7rem;letter-spacing:.1em;text-transform:uppercase;color:var(--trust);display:block;margin-bottom:4px}
+.grid3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}
+.grid2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}
+.card{background:var(--panel);border:1px solid var(--rule);border-radius:9px;padding:13px 16px;display:grid;gap:6px;align-content:start}
+.card p{font-size:.95rem;color:var(--muted)}
+.tag{font-family:var(--mono);font-size:.66rem;letter-spacing:.08em;text-transform:uppercase;padding:2px 7px;border-radius:4px;white-space:nowrap;justify-self:start}
+.tag.t{background:var(--trust-soft);color:var(--trust)} .tag.u{background:var(--agent-soft);color:var(--agent)} .tag.n{background:var(--code);color:var(--muted)}
+.repo{font-family:var(--mono);font-size:.78rem;color:var(--muted)}
+.card header{display:flex;justify-content:space-between;align-items:baseline;gap:8px;flex-wrap:wrap}
+.practices{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+.practice{background:var(--panel);border:1px solid var(--rule);border-radius:9px;padding:14px 16px;display:grid;gap:4px}
+.practice .why{font-family:var(--mono);font-size:.74rem;color:var(--trust)}
+.practice p{font-size:.93rem;color:var(--muted)}
+.note{background:var(--agent-soft);border-radius:8px;padding:12px 16px;font-size:.95rem;max-width:74ch}
+.move{display:grid;grid-template-columns:minmax(0,1fr) auto minmax(0,1fr) auto minmax(0,1fr);gap:10px}
+.move .step{background:var(--panel);border:1px solid var(--rule);border-radius:9px;padding:14px 16px;display:grid;gap:6px;align-content:start}
+.move .arrow{align-self:center;font-family:var(--mono);color:var(--muted)}
+.move .step.a{border-color:var(--agent)} .move .step.r{border-color:var(--trust)}
+.tablewrap{overflow-x:auto}
+table{border-collapse:collapse;width:100%;min-width:560px;font-size:.93rem}
+th{font-family:var(--mono);font-size:.68rem;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);text-align:left;padding:7px 10px;border-bottom:1px solid var(--rule)}
+td{padding:6px 10px;border-bottom:1px solid var(--rule);vertical-align:top}
+td.path{font-family:var(--mono);font-size:.82rem;white-space:nowrap}
+td.d1{padding-left:28px}
+td.strong{font-family:var(--display);font-weight:700}
+.mode{font-family:var(--mono);font-size:.7rem;padding:1px 6px;border-radius:4px;white-space:nowrap}
+.mode.ro{background:var(--ro-soft);color:var(--ro)} .mode.rw{background:var(--agent-soft);color:var(--agent)} .mode.host{background:var(--trust-soft);color:var(--trust)}
+.lane svg{width:100%;max-width:260px;height:auto}
+.lane ul{margin:0;padding-left:1.1em;font-size:.94rem;display:grid;gap:3px}
+.outcome b{font-family:var(--mono);font-size:.82rem;letter-spacing:.06em}
+.outcome.p b{color:var(--trust)} .outcome.f b{color:var(--refuse)} .outcome.u b{color:var(--agent)}
+.links{display:flex;flex-wrap:wrap;gap:10px}
+.links a{font:600 .92rem/1 var(--display);padding:12px 16px;border-radius:7px;text-decoration:none;border:1px solid var(--rule);color:var(--ink);background:var(--panel)}
+.links a.primary{background:var(--trust);border-color:var(--trust);color:var(--paper)}
+
+/* ---------- commands ---------- */
+.cmd{position:relative;background:var(--term);color:var(--term-ink);border-radius:9px;min-width:0}
+.cmd pre{margin:0;padding:14px 16px;overflow-x:auto;font:13px/1.6 var(--mono);white-space:pre}
+.cmd .c{color:var(--term-muted)}
+.cmd .label{display:flex;justify-content:space-between;align-items:center;padding:8px 10px 0 16px;font-family:var(--mono);font-size:.68rem;letter-spacing:.08em;text-transform:uppercase;color:var(--term-muted)}
+.copy{font:600 .7rem/1 var(--mono);letter-spacing:.04em;padding:6px 9px;border-radius:5px;border:1px solid var(--term-muted);background:transparent;color:var(--term-ink);cursor:pointer}
+.steps2{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:14px;align-items:start}
+.small{font-size:.92rem;color:var(--muted)}
+.req{display:flex;flex-wrap:wrap;gap:8px}
+.req span{font-family:var(--mono);font-size:.76rem;background:var(--panel);border:1px solid var(--rule);border-radius:5px;padding:4px 8px}
+.prompt{background:var(--panel);border-left:3px solid var(--agent);border-radius:0 8px 8px 0;padding:12px 16px;font-style:italic;max-width:74ch}
+
+/* ---------- flow screens ---------- */
+.flowhead{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:6px 18px;align-items:end}
+.flowhead .count{font-family:var(--mono);font-size:.78rem;color:var(--muted);font-variant-numeric:tabular-nums}
+.caption{font-size:1.05rem;min-height:2.4em;max-width:84ch}
+.scenebox{background:var(--panel);border:1px solid var(--rule);border-radius:10px;overflow-x:auto}
+.scenebox svg{display:block;width:100%;min-width:620px;height:auto;max-height:calc(100vh - 364px)}
+.fsteps{font-size:.86rem;color:var(--muted)}
+.fsteps summary{cursor:pointer;font-family:var(--mono);font-size:.72rem;letter-spacing:.06em;text-transform:uppercase}
+.fsteps ol{margin:8px 0 0;padding-left:1.3em;display:grid;gap:3px}
+.fsteps li.on{color:var(--ink);font-weight:600}
+.swipe{display:none;font-family:var(--mono);font-size:.72rem;color:var(--muted)}
+.sc-box{fill:var(--panel);stroke:var(--rule)}
+.sc-sand{fill:var(--paper);stroke:var(--agent);stroke-dasharray:6 5;stroke-width:1.4}
+.sc-host{fill:var(--trust-soft);stroke:var(--trust);stroke-width:1.4}
+.sc-lane{stroke:var(--rule)}
+.sc-lane.ro{fill:var(--ro-soft)} .sc-lane.rw{fill:var(--agent-soft)}
+.sc-t{font:600 13px var(--display);fill:var(--ink)}
+.sc-s{font:11.5px var(--mono);fill:var(--muted)}
+.sc-m{font:12px var(--mono);fill:var(--ink)}
+.sc-seam{stroke:var(--muted);stroke-dasharray:2 6;stroke-width:1.5}
+.sc-seamt{font:10.5px var(--mono);fill:var(--muted);letter-spacing:.08em}
+.tok rect{stroke-width:1.8}
+.tok text{font:600 11.5px var(--mono);fill:var(--ink)}
+.tok.req rect{fill:var(--agent-soft);stroke:var(--agent)}
+.tok.ok rect{fill:var(--trust-soft);stroke:var(--trust)}
+.tok.bad rect{fill:var(--refuse-soft);stroke:var(--refuse)}
+.tok{transition:transform .9s cubic-bezier(.45,.05,.3,1)}
+.sc-dec{font:600 13px var(--display)}
+.sc-dec.ok{fill:var(--trust)} .sc-dec.bad{fill:var(--refuse)} .sc-dec.n{fill:var(--muted)}
+.sc-say{font:600 12px var(--mono);fill:var(--agent)}
+.hot{stroke:var(--trust)!important;stroke-width:2.4!important}
+.hotbad{stroke:var(--refuse)!important;stroke-width:2.4!important}
+@media (prefers-reduced-motion: reduce){.tok{transition:none}}
+
+@media (max-height: 760px) and (min-width: 821px){
+  body{font-size:15.5px}
+  h2{font-size:1.6rem} .hero h1{font-size:3rem} .lede{font-size:1rem}
+  .card{padding:11px 14px} .practice{padding:11px 14px} .note{padding:10px 14px}
+  .inner{gap:10px} .screen{padding:12px 24px}
+  .cmd pre{padding:10px 14px;font-size:12.5px}
+  .scenebox svg{max-height:calc(100vh - 336px)}
+}
+@media (max-width: 820px){
+  body{font-size:16px}
+  .top{padding-inline:16px} .screen{padding:18px 16px;align-items:flex-start} .controls{padding-inline:16px}
+  .chapters .lbl{display:none}
+  .grid3,.grid2,.practices,.steps2{grid-template-columns:minmax(0,1fr)}
+  .move{grid-template-columns:minmax(0,1fr)} .move .arrow{justify-self:center;transform:rotate(90deg)}
+  .hint{display:none}
+  .swipe{display:block}
+  .controls button.next{min-width:0}
+}
+</style>
+</head>
+<body>
+<div class="app">
+  <header class="top">
+    <div class="top-row"><span class="brand">AMAP, explained</span><span class="where" id="where" aria-live="polite"></span></div>
+    <nav class="chapters" id="chapters" aria-label="Chapters"></nav>
+  </header>
+
+  <main class="stage" id="stage">
+
+    <section class="screen hero" data-id="start" data-ch="0">
+      <div class="inner">
+        <p class="eyebrow">Agent Mailbox Access Protocol</p>
+        <h1><span class="ask">An agent can ask.</span> <span class="act">Only the runtime can act.</span></h1>
+        <p class="lede">AMAP is a wire contract that lets sandboxed AI agents take part in message-based workflows through a trusted runtime that does not trust them. Press <strong>Next</strong> to walk through the ideas, watch each flow move through the real pieces, and then run it yourself.</p>
+        <p class="invariant"><b>The invariant</b>The runtime's authority does not depend on the agent or its connector behaving correctly. A request file cannot, on its own, grant permission to send, change the sending identity, or bypass policy.</p>
+      </div>
+    </section>
+
+    <section class="screen" data-id="risks" data-ch="1">
+      <div class="inner">
+        <p class="eyebrow">The problem</p>
+        <h2>An agent is an untrusted process</h2>
+        <p class="lede">It can be prompt-injected, buggy or compromised. Connecting it to a workflow does not make its decisions trustworthy, and message access brings three risks.</p>
+        <div class="grid3">
+          <article class="card"><h3>Inbound</h3><p>A message can carry untrusted content and injection attempts straight into the agent's reasoning.</p></article>
+          <article class="card"><h3>Outbound</h3><p>A message can disclose information, or misuse an identity the agent should not control.</p></article>
+          <article class="card"><h3>Credentials</h3><p>Anything the agent can read, it can leak. Credentials in its reach are credentials at risk.</p></article>
+        </div>
+        <p class="body">What matters is not whether the agent can write a message. It is whether it can authorise one, choose the identity it goes out under, or step around policy.</p>
+      </div>
+    </section>
+
+    <section class="screen" data-id="move" data-ch="1">
+      <div class="inner">
+        <p class="eyebrow">The problem</p>
+        <h2>AMAP's one move: a request is never permission</h2>
+        <div class="move">
+          <div class="step a"><span class="tag u">agent</span><h3>Reads</h3><p>what was delivered to it, from a place it cannot write.</p></div>
+          <span class="arrow" aria-hidden="true">→</span>
+          <div class="step a"><span class="tag u">agent</span><h3>Writes an inert request</h3><p>a file saying what it would like to happen. Nothing more.</p></div>
+          <span class="arrow" aria-hidden="true">→</span>
+          <div class="step r"><span class="tag t">runtime</span><h3>Decides</h3><p>whether anything happens, to whom, and under which identity.</p></div>
+        </div>
+        <p class="note">AMAP was designed for email workflows, where the runtime holds the mail credentials. This walkthrough uses <strong>amap-router-local</strong>, a reference runtime that carries no mail at all: no provider, no credentials, no network. It moves the same artifacts between agents on one machine, so what is left is exactly what the protocol asks of a runtime.</p>
+      </div>
+    </section>
+
+    <section class="screen" data-id="isolation" data-ch="2">
+      <div class="inner">
+        <p class="eyebrow">Isolation first</p>
+        <h2>AMAP assumes the agent is already contained</h2>
+        <p class="lede">The protocol defines who may do what across a boundary. It does not create the boundary. Running each agent in isolation is the operational baseline that gives the protocol's guarantees meaning, and it is good practice even when nothing is malicious.</p>
+        <div class="practices">
+          <div class="practice"><h3>One contained space per agent</h3><span class="why">limits the blast radius</span><p>A compromised or confused agent damages its own workspace, not its neighbours' or the host's.</p></div>
+          <div class="practice"><h3>No credentials in the sandbox</h3><span class="why">nothing to leak</span><p>The runtime holds every credential and the sending identity. The connector holds none.</p></div>
+          <div class="practice"><h3>Read-only by mount, not by permission bits</h3><span class="why">the agent owns its files</span><p>It runs as your user, so <code>chmod</code> would succeed. A read-only mount makes the kernel refuse the write: <code>EROFS</code>.</p></div>
+          <div class="practice"><h3>Identity given from outside</h3><span class="why">an agent must not name itself</span><p>The runtime binds each sender to its own outbox, named by the host.</p></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="screen" data-id="isolation-2" data-ch="2">
+      <div class="inner">
+        <p class="eyebrow">Isolation first</p>
+        <h2>…and run it like infrastructure</h2>
+        <div class="practices">
+          <div class="practice"><h3>Supervised, and recreated on a cadence</h3><span class="why">recoverable by design</span><p>The delivery process restarts if it dies, and containers are rebuilt on a schedule, so drift and damage do not accumulate.</p></div>
+          <div class="practice"><h3>Membership is the operator's decision</h3><span class="why">joining is a security act</span><p>Which agents take part is a rule the operator writes and the host evaluates. Nothing inside a workspace can add itself.</p></div>
+          <div class="practice"><h3>Observable, in three outcomes</h3><span class="why">"could not tell" is not "fine"</span><p>Every check ends in pass, fail or unknown, and unknown is reported as a problem.</p></div>
+        </div>
+        <p class="note">If your environment cannot provide one of these, the matching guarantee does not hold. It is not merely weaker. This walkthrough uses <strong>sandy</strong> for isolation because it provides every one of them, and shows each.</p>
+      </div>
+    </section>
+
+    <section class="screen" data-id="pieces" data-ch="3">
+      <div class="inner">
+        <p class="eyebrow">The pieces</p>
+        <h2>Five parts, one boundary: they meet only at the contract, and only one side is trusted</h2>
+        <div class="grid3">
+          <article class="card"><header><h3>The protocol</h3><span class="tag n">contract</span></header><span class="repo">amap-spec</span><p>The directory layout, message and verdict shapes as JSON Schema, and golden fixtures. Each side proves conformance against the fixtures, without the other.</p></article>
+          <article class="card"><header><h3>The runtime</h3><span class="tag t">trusted</span></header><span class="repo">amap-router-local</span><p>Holds the graph of who may reach whom, binds replies, quarantines on first sight, writes the roster. Runs on the host with no network.</p></article>
+          <article class="card"><header><h3>The connector</h3><span class="tag u">untrusted</span></header><span class="repo">amap-connector-claude</span><p>MCP tools to read (<code>inbox</code>, <code>delegation</code>) and to request (<code>inbox-submit</code>), plus <code>inbox-delivery</code>, which injects deliveries into the session. No credentials, no allowlist.</p></article>
+          <article class="card"><header><h3>The isolation environment</h3><span class="tag n">container</span></header><span class="repo">sandy</span><p>The sandbox per agent, the read-only mounts, the agent's name, the supervised process and the membership rule.</p></article>
+          <article class="card"><header><h3>The deployment</h3><span class="tag n">operator's tool</span></header><span class="repo">amap-deploy-sandy</span><p>Turns one policy into sandy's feature manifest and the router's config, then verifies that what runs is what was declared.</p></article>
+        </div>
+      </div>
+    </section>
+
+    <section class="screen" data-id="seam" data-ch="4">
+      <div class="inner">
+        <p class="eyebrow">The seam</p>
+        <h2>The boundary is a directory tree</h2>
+        <p class="lede">Runtime and connector never call each other. They share directories, and the design rests on which side can write which one. Everything the agent reads, it cannot forge; everything it writes is only a request.</p>
+        <div class="tablewrap">
+          <table>
+            <thead><tr><th>Path</th><th>Written by</th><th>In the sandbox</th><th>Holds</th></tr></thead>
+            <tbody>
+              <tr><td class="path">instances/&lt;name&gt;/</td><td>host</td><td></td><td>One agent's lanes. The name is the agent's identity.</td></tr>
+              <tr><td class="path d1">inbox/</td><td>runtime</td><td><span class="mode ro">read-only</span></td><td>Mail delivered to this agent.</td></tr>
+              <tr><td class="path d1">peer/</td><td>runtime</td><td><span class="mode ro">read-only</span></td><td>Tasks from agents allowed to send them.</td></tr>
+              <tr><td class="path d1">outbox/</td><td>agent</td><td><span class="mode rw">writable</span></td><td>Inert requests; the runtime's verdicts come back in <code>results/</code>.</td></tr>
+              <tr><td class="path">payload/</td><td>operator</td><td><span class="mode ro">read-only</span></td><td>The relay, the connector, the MCP config and the agent's policy text.</td></tr>
+              <tr><td class="path">roster/</td><td>runtime</td><td><span class="mode ro">read-only</span></td><td>Who exists in the fleet. Never who may task whom.</td></tr>
+              <tr><td class="path">router state</td><td>runtime</td><td><span class="mode host">host only</span></td><td>Ledgers and first-sight markers. No agent can reach it.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section class="screen" data-id="lanes" data-ch="5">
+      <div class="inner">
+        <p class="eyebrow">Two lanes</p>
+        <h2>Mail and delegation carry different trust</h2>
+        <p class="lede">They are declared separately, and a pair of agents may sit on only one of them, so a sender can never pick which trust it is judged under.</p>
+        <div class="grid2">
+          <article class="card lane">
+            <h3>Mail</h3>
+            <svg viewBox="0 0 280 80" role="img" aria-label="Mail is mutual: a and b each list the other">
+              <defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10z" fill="var(--ink)"/></marker><marker id="ah2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10z" fill="var(--trust)"/></marker></defs>
+              <circle cx="50" cy="40" r="20" fill="var(--agent-soft)" stroke="var(--agent)"/><text x="50" y="45" text-anchor="middle" class="sc-t">a</text>
+              <circle cx="230" cy="40" r="20" fill="var(--agent-soft)" stroke="var(--agent)"/><text x="230" y="45" text-anchor="middle" class="sc-t">b</text>
+              <path d="M76 33 H204" stroke="var(--ink)" stroke-width="1.6" fill="none" marker-end="url(#ah)"/>
+              <path d="M204 47 H76" stroke="var(--ink)" stroke-width="1.6" fill="none" marker-end="url(#ah)"/>
+            </svg>
+            <ul><li><strong>Mutual:</strong> both sides must list each other.</li><li>Delivery is a content-free doorbell; the agent reads with the <code>inbox</code> tool.</li><li>Content is untrusted: reported, not obeyed.</li></ul>
+          </article>
+          <article class="card lane">
+            <h3>Delegation</h3>
+            <svg viewBox="0 0 280 80" role="img" aria-label="Delegation is directed: a may task b, which does not let b task a">
+              <circle cx="50" cy="40" r="20" fill="var(--agent-soft)" stroke="var(--agent)"/><text x="50" y="45" text-anchor="middle" class="sc-t">a</text>
+              <circle cx="230" cy="40" r="20" fill="var(--agent-soft)" stroke="var(--agent)"/><text x="230" y="45" text-anchor="middle" class="sc-t">b</text>
+              <path d="M76 40 H204" stroke="var(--trust)" stroke-width="2" fill="none" marker-end="url(#ah2)"/>
+              <text x="140" y="72" text-anchor="middle" class="sc-s">a may task b</text>
+            </svg>
+            <ul><li><strong>Directed:</strong> a may task b says nothing about b tasking a.</li><li>The request itself is injected into the session.</li><li>The runtime authorised it, so it is meant to be acted on, within what the agent may already do.</li></ul>
+          </article>
+        </div>
+        <p class="body">On both lanes a <strong>reply</strong> goes back to the sender and nowhere else, even against the direction of a delegation edge.</p>
+      </div>
+    </section>
+
+    <section class="screen" data-id="flow-deleg" data-ch="6" data-flow="deleg"><div class="inner flowscreen"></div></section>
+    <section class="screen" data-id="flow-reply" data-ch="6" data-flow="reply"><div class="inner flowscreen"></div></section>
+    <section class="screen" data-id="flow-held" data-ch="6" data-flow="held"><div class="inner flowscreen"></div></section>
+    <section class="screen" data-id="flow-first" data-ch="6" data-flow="first"><div class="inner flowscreen"></div></section>
+    <section class="screen" data-id="flow-mail" data-ch="6" data-flow="mail"><div class="inner flowscreen"></div></section>
+
+    <section class="screen" data-id="verify" data-ch="7">
+      <div class="inner">
+        <p class="eyebrow">Knowing it holds</p>
+        <h2>Three outcomes, never two</h2>
+        <p class="lede">The deployment's <code>verify</code> checks the manifest against the policy, the payload byte for byte, each agent's lanes and mounts, and the router's container and health. Every check ends one of three ways.</p>
+        <div class="grid3">
+          <div class="card outcome p"><b>PASS</b><p>Established from the thing itself: the container's mount table, not the host directory; the router's own status, not a guess.</p></div>
+          <div class="card outcome f"><b>FAIL</b><p>Known to be broken. Every failure names its remedy, and the tempting wrong fix.</p></div>
+          <div class="card outcome u"><b>UNKNOWN</b><p>Could not be answered, as when the router is stopped. Reported as a problem, never rounded to a pass.</p></div>
+        </div>
+        <p class="body">The fleet roster keeps the same honesty. It lists who exists so agents can find addresses, and says it is neither permission nor a prediction. The verdict in <code>outbox/results</code> is the only report of what happened.</p>
+      </div>
+    </section>
+
+    <section class="screen" data-id="env" data-ch="8">
+      <div class="inner">
+        <p class="eyebrow">Run it yourself · with sandy</p>
+        <h2>Why sandy</h2>
+        <p class="lede">The runtime and the connector need no changes between environments; only the deployment knows where agents run. sandy supplies every property AMAP needs, and makes each one visible.</p>
+        <div class="tablewrap">
+          <table>
+            <thead><tr><th>AMAP needs</th><th>Why</th><th>sandy provides it as</th></tr></thead>
+            <tbody>
+              <tr><td class="strong">A space per agent</td><td>Each agent's lanes must be its own.</td><td>One sandbox per workspace.</td></tr>
+              <tr><td class="strong">An identity it cannot forge</td><td>The runtime binds a sender to its outbox.</td><td>The slug, reported by sandy, never derived by the agent.</td></tr>
+              <tr><td class="strong">Read-only mounts</td><td>Inbound lanes, the connector and the agent's instructions must be out of reach.</td><td>Feature mounts: a write fails with <code>EROFS</code>.</td></tr>
+              <tr><td class="strong">A supervised process</td><td>Something must inject deliveries into the session, and restart if it dies.</td><td>The manifest's <code>entry</code>, run by sandy's relay supervisor.</td></tr>
+              <tr><td class="strong">Operator-owned membership</td><td>Joining is a security decision.</td><td>Include and exclude rules, evaluated by sandy at each launch.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section class="screen" data-id="get" data-ch="8">
+      <div class="inner">
+        <p class="eyebrow">Run it yourself · 1 of 4</p>
+        <h2>Install sandy, and clone the three repos side by side</h2>
+        <div class="req"><span>macOS or Linux</span><span>Docker</span><span>Python 3.9+</span><span>jq</span><span>a Claude account sandy can use</span></div>
+        <div class="steps2">
+          <div class="cmd"><div class="label"><span>sandy, 2.2.0 or later</span><button type="button" class="copy">Copy</button></div>
+<pre><span class="c"># install, then check the host is ready</span>
+curl -fsSL https://raw.githubusercontent.com/rappdw/sandy/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/rappdw/sandy/main/doctor.sh | bash
+sandy --print-schema | jq '.schema_version'   <span class="c"># must print 3</span></pre></div>
+          <div class="cmd"><div class="label"><span>the code</span><button type="button" class="copy">Copy</button></div>
+<pre>mkdir -p ~/amap &amp;&amp; cd ~/amap
+git clone https://github.com/proofpoint/amap-deploy-sandy
+git clone https://github.com/proofpoint/amap-router-local
+git clone https://github.com/proofpoint/amap-connector-claude</pre></div>
+        </div>
+        <p class="small">amap-deploy-sandy finds the other two by looking beside itself; <code>$AMAP_ROUTER_REPO</code> and <code>$AMAP_CONNECTOR_REPO</code> override that. You will not need to build the connector: the deployment copies its binaries onto the read-only payload.</p>
+      </div>
+    </section>
+
+    <section class="screen" data-id="policy" data-ch="8">
+      <div class="inner">
+        <p class="eyebrow">Run it yourself · 2 of 4</p>
+        <h2>Create two agents, install, and write the policy</h2>
+        <div class="steps2">
+          <div class="cmd"><div class="label"><span>two workspaces, then install</span><button type="button" class="copy">Copy</button></div>
+<pre><span class="c"># sandy creates each sandbox and names it (its slug)</span>
+mkdir -p ~/amap-demo/alpha ~/amap-demo/beta
+sandy --provision --workspace ~/amap-demo/alpha --yes
+sandy --provision --workspace ~/amap-demo/beta --yes
+
+cd ~/amap/amap-deploy-sandy
+python3 amap-sandy.py install --apply
+<span class="c"># first run writes a template, then stops for the policy</span></pre></div>
+          <div class="cmd"><div class="label"><span>~/.sandy/features/amap/feature.json · replace "feature"</span><button type="button" class="copy">Copy</button></div>
+<pre>"feature": {
+  "version": 1,
+  "groups": {},
+  "default_peers": [],
+  "peers": {},
+  "task_graph": "ALL",
+  "task_deny": [],
+  "fleet_domain": "agents.example.org",
+  "container_recreate_interval_hours": 24
+}</pre></div>
+        </div>
+        <p class="small">Replace the whole <code>feature</code> section; do not merge. The template's default is a full mail mesh, and with <code>task_graph: "ALL"</code> every pair would sit on both lanes, which <code>install</code> refuses. Then run <code>python3 amap-sandy.py install --apply</code> again: it validates the policy and renders the router's config beside it.</p>
+      </div>
+    </section>
+
+    <section class="screen" data-id="start-it" data-ch="8">
+      <div class="inner">
+        <p class="eyebrow">Run it yourself · 3 of 4</p>
+        <h2>Start the agents and the router, then verify</h2>
+        <div class="steps2">
+          <div class="cmd"><div class="label"><span>agents, then the router</span><button type="button" class="copy">Copy</button></div>
+<pre><span class="c"># sandy selects each at launch, mounts the payload ro</span>
+cd ~/amap-demo/alpha &amp;&amp; sandy --start
+cd ~/amap-demo/beta  &amp;&amp; sandy --start
+
+cd ~/amap/amap-router-local
+docker/build.sh
+docker/run.sh --config ~/.sandy/features/amap/router.json \
+  --detach</pre></div>
+          <div class="cmd"><div class="label"><span>check it</span><button type="button" class="copy">Copy</button></div>
+<pre>cd ~/amap/amap-deploy-sandy
+python3 amap-sandy.py list     <span class="c"># both: selected</span>
+python3 amap-sandy.py verify   <span class="c"># exit 0 before going on</span></pre></div>
+        </div>
+        <p class="small">Starting the router is the approval: its first poll of each agent is first sight, and anything staged before it is never delivered. The router runs with no network and re-reads its config every poll, so later policy changes need only <code>install --apply</code>.</p>
+      </div>
+    </section>
+
+    <section class="screen" data-id="try" data-ch="8">
+      <div class="inner">
+        <p class="eyebrow">Run it yourself · 4 of 4</p>
+        <h2>Send your first delegation</h2>
+        <div class="steps2">
+          <div class="cmd"><div class="label"><span>two terminals</span><button type="button" class="copy">Copy</button></div>
+<pre>cd ~/amap-demo/alpha &amp;&amp; sandy --attach   <span class="c"># terminal 1</span>
+cd ~/amap-demo/beta  &amp;&amp; sandy --attach   <span class="c"># terminal 2: watch it arrive</span></pre></div>
+          <div class="grid" style="display:grid;gap:10px">
+            <p class="small">Ask alpha:</p>
+            <p class="prompt">Read $AMAP_ROSTER_DIR/roster.json and find beta's address. Then ask beta, through inbox-submit, to list the files in its workspace and report back.</p>
+          </div>
+        </div>
+        <p class="body">You have just watched the first flow for real. The runbook then breaks each guarantee on purpose: a write to the payload fails with <code>EROFS</code>, a task that was never granted is held, and a stopped router makes <code>verify</code> say UNKNOWN.</p>
+        <div class="links">
+          <a class="primary" href="https://github.com/proofpoint/amap-deploy-sandy/blob/main/docs/TUTORIAL.md">Open the full runbook</a>
+          <a href="https://github.com/proofpoint/amap-spec">amap-spec</a>
+          <a href="https://github.com/proofpoint/amap-router-local">amap-router-local</a>
+          <a href="https://github.com/proofpoint/amap-connector-claude">amap-connector-claude</a>
+          <a href="https://github.com/rappdw/sandy">sandy</a>
+        </div>
+        <p class="repo">amap-deploy-sandy · Apache License 2.0 · AMAP is a draft contract; the spec repository is normative.</p>
+      </div>
+    </section>
+  </main>
+
+  <footer class="controls">
+    <button type="button" id="back">Back</button>
+    <span class="hint">← → or space to move</span>
+    <button type="button" class="next" id="next">Next</button>
+  </footer>
+</div>
+
+<template id="flow-tpl">
+  <div class="flowhead">
+    <div><p class="eyebrow">Watch it work</p><h2 class="ftitle"></h2></div>
+    <span class="count"></span>
+  </div>
+  <p class="caption" aria-live="polite"></p>
+  <p class="swipe">Scroll the diagram sideways to see beta →</p>
+  <div class="scenebox"></div>
+  <details class="fsteps"><summary>All steps as text</summary><ol></ol></details>
+</template>
+
+<div hidden>
+<svg id="scene" viewBox="0 0 960 430" role="img" aria-labelledby="scene-t">
+  <title id="scene-t">Two sandboxes, alpha and beta, with the router on the host between them. Policy: alpha may task beta; beta may not task alpha.</title>
+  <rect x="0" y="0" width="960" height="430" fill="var(--panel)"/>
+  <rect class="sc-sand" x="16" y="18" width="286" height="390" rx="12"/>
+  <text class="sc-t" x="34" y="44">sandbox · alpha</text><text class="sc-s" x="286" y="44" text-anchor="end">untrusted</text>
+  <rect class="sc-box" id="n-a-sess" x="32" y="58" width="254" height="78" rx="8"/>
+  <text class="sc-m" x="46" y="80">Claude Code session</text>
+  <text class="sc-say" id="say-a" x="46" y="112"></text>
+  <rect class="sc-lane rw" id="n-a-out" x="32" y="152" width="254" height="64" rx="8"/>
+  <text class="sc-m" x="46" y="172">outbox/</text><text class="sc-s" x="272" y="172" text-anchor="end">writable</text>
+  <rect class="sc-lane ro" id="n-a-peer" x="32" y="228" width="254" height="64" rx="8"/>
+  <text class="sc-m" x="46" y="248">peer/notices</text><text class="sc-s" x="272" y="248" text-anchor="end">read-only</text>
+  <rect class="sc-lane ro" id="n-a-in" x="32" y="304" width="254" height="64" rx="8"/>
+  <text class="sc-m" x="46" y="324">inbox/notices</text><text class="sc-s" x="272" y="324" text-anchor="end">read-only</text>
+  <text class="sc-s" x="46" y="392">inbox-delivery → session</text>
+  <rect class="sc-sand" x="658" y="18" width="286" height="390" rx="12"/>
+  <text class="sc-t" x="676" y="44">sandbox · beta</text><text class="sc-s" x="928" y="44" text-anchor="end">untrusted</text>
+  <rect class="sc-box" id="n-b-sess" x="674" y="58" width="254" height="78" rx="8"/>
+  <text class="sc-m" x="688" y="80">Claude Code session</text>
+  <text class="sc-say" id="say-b" x="688" y="112"></text>
+  <rect class="sc-lane rw" id="n-b-out" x="674" y="152" width="254" height="64" rx="8"/>
+  <text class="sc-m" x="688" y="172">outbox/</text><text class="sc-s" x="914" y="172" text-anchor="end">writable</text>
+  <rect class="sc-lane ro" id="n-b-peer" x="674" y="228" width="254" height="64" rx="8"/>
+  <text class="sc-m" x="688" y="248">peer/notices</text><text class="sc-s" x="914" y="248" text-anchor="end">read-only</text>
+  <rect class="sc-lane ro" id="n-b-in" x="674" y="304" width="254" height="64" rx="8"/>
+  <text class="sc-m" x="688" y="324">inbox/notices</text><text class="sc-s" x="914" y="324" text-anchor="end">read-only</text>
+  <text class="sc-s" x="688" y="392">inbox-delivery → session</text>
+  <line class="sc-seam" x1="330" y1="14" x2="330" y2="412"/><line class="sc-seam" x1="630" y1="14" x2="630" y2="412"/>
+  <text class="sc-seamt" x="336" y="410">SEAM</text><text class="sc-seamt" x="624" y="410" text-anchor="end">SEAM</text>
+  <rect class="sc-host" id="n-r" x="354" y="110" width="252" height="210" rx="12"/>
+  <text class="sc-t" x="480" y="138" text-anchor="middle">amap-router-local</text>
+  <text class="sc-s" x="480" y="156" text-anchor="middle">host · trusted · no network</text>
+  <text class="sc-s" x="480" y="178" text-anchor="middle">graph · reply binding · first sight</text>
+  <text class="sc-dec" id="dec1" x="480" y="276" text-anchor="middle"></text>
+  <text class="sc-dec" id="dec2" x="480" y="298" text-anchor="middle"></text>
+  <g id="toks"></g>
+</svg>
+</div>
+
+<script>
+(() => {
+  const NS = "http://www.w3.org/2000/svg";
+  const CHAPTERS = ["Start", "The problem", "Isolation first", "The pieces", "The seam", "Two lanes", "Watch it work", "Knowing it holds", "Run it yourself"];
+  const P = {
+    aOut:[160,196], aRes:[236,196], aPeer:[160,272], aIn:[160,348],
+    bOut:[802,196], bPeer:[802,272], bIn:[802,348],
+    r:[480,222], rHold:[480,232], aStaged:[96,196]
+  };
+  // Policy throughout: alpha may task beta; beta may not task alpha.
+  const FLOWS = {
+    deleg: { name:"A delegation", steps:[
+      ["alpha decides to ask beta for work. It calls submit(to: beta).", [["say","a","submit(to: beta)"]]],
+      ["The connector writes an inert request into alpha's outbox. That is all an agent can do.", [["tok","q","request","req","aOut"],["hot","n-a-out","ok"]]],
+      ["The router picks the request up on its next poll.", [["mv","q","r"]]],
+      ["It checks its graph: alpha may task beta. It binds the sender to alpha's outbox, not to anything alpha wrote.", [["dec",1,"alpha → beta: granted ✓","ok"],["kind","q","ok"]]],
+      ["The router places a notice in beta's read-only peer lane, and writes alpha's verdict: accepted.", [["mv","q","bPeer"],["tok","v","accepted","ok","r"],["mv","v","aRes"],["hot","n-b-peer","ok"]]],
+      ["beta's inbox-delivery injects the request into beta's live session. beta acts on it, within what it may already do.", [["say","b","← task from alpha"],["hot","n-b-sess","ok"]]]
+    ]},
+    reply: { name:"Reply binding", steps:[
+      ["beta finished alpha's task and replies with submit, naming the task in in_reply_to.", [["say","b","submit(reply)"]]],
+      ["The reply is a request in beta's outbox, like any other.", [["tok","q","reply","req","bOut"],["hot","n-b-out","ok"]]],
+      ["The router picks it up.", [["mv","q","r"]]],
+      ["A reply is bound to the original sender. Whatever address beta put on it, it can only go to alpha.", [["dec",1,"reply → bound to alpha","ok"],["kind","q","ok"]]],
+      ["It arrives in alpha's peer lane, against the direction of the delegation edge. A reply is not a new task.", [["mv","q","aPeer"],["hot","n-a-peer","ok"]]],
+      ["alpha's inbox-delivery injects it into alpha's session.", [["say","a","← reply from beta"],["hot","n-a-sess","ok"]]]
+    ]},
+    held: { name:"A task that was never granted", steps:[
+      ["Now beta tries to start a new task for alpha. It calls submit(to: alpha).", [["say","b","submit(to: alpha)"]]],
+      ["The connector writes the request anyway. It holds no allowlist, so it cannot refuse.", [["tok","q","request","req","bOut"],["hot","n-b-out","ok"]]],
+      ["The router picks it up exactly as before.", [["mv","q","r"]]],
+      ["The graph has no edge from beta to alpha. The router holds the request for the operator.", [["dec",1,"beta → alpha: not granted ✗","bad"],["dec",2,"held · nothing delivered","bad"],["kind","q","bad"],["mv","q","rHold"],["hot","n-r","bad"]]],
+      ["Nothing reaches alpha. The verdict in beta's results is the only report of what happened.", [["tok","v","not delivered","bad","r"],["mv","v","bOut"]]]
+    ]},
+    first: { name:"First sight", steps:[
+      ["Before the router has ever polled alpha, something already sits in alpha's outbox.", [["tok","s","staged","req","aStaged"],["hot","n-a-out","bad"]]],
+      ["The router's first poll of alpha takes a snapshot of that outbox.", [["dec",1,"first sight of alpha","n"],["hot","n-r","ok"]]],
+      ["Anything staged before that moment is quarantined and never delivered. Nobody can pre-load requests before the router is watching.", [["kind","s","bad"],["dec",2,"staged file quarantined","bad"]]],
+      ["A request written after first sight is handled normally.", [["tok","q","request","req","aOut"],["mv","q","r"],["kind","q","ok"]]],
+      ["This is why there is no approve step: starting the router is the approval, and it covers only what comes after.", []]
+    ]},
+    mail: { name:"The mail doorbell", steps:[
+      ["Mail needs both sides to list each other. Suppose the operator made alpha and beta mutual mail peers.", [["dec",1,"alpha ⇄ beta: mail peers","n"]]],
+      ["alpha submits a message to beta. It is a request, like everything else.", [["say","a","submit(to: beta)"],["tok","q","message","req","aOut"]]],
+      ["The router checks the mutual listing and places the message in beta's read-only inbox.", [["mv","q","bIn"],["kind","q","ok"],["hot","n-b-in","ok"]]],
+      ["beta's inbox-delivery rings a doorbell with no content in it. The message itself stays in the inbox.", [["say","b","(doorbell) new mail"],["hot","n-b-sess","ok"]]],
+      ["beta reads it with the inbox tool. Mail content is untrusted: beta reports what it asks for rather than obeying it.", [["say","b","read_message(…)"]]]
+    ]}
+  };
+
+  const screens = [...document.querySelectorAll(".screen")];
+  const scene = document.getElementById("scene"), toksG = document.getElementById("toks");
+  const whereEl = document.getElementById("where"), nav = document.getElementById("chapters");
+  const bBack = document.getElementById("back"), bNext = document.getElementById("next");
+  const reduce = window.matchMedia("(prefers-reduced-motion: reduce)");
+  let cur = 0, step = 0;
+
+  const tpl = document.getElementById("flow-tpl");
+  screens.filter(s => s.dataset.flow).forEach(s => {
+    const f = FLOWS[s.dataset.flow], box = s.querySelector(".flowscreen");
+    box.append(tpl.content.cloneNode(true));
+    box.querySelector(".ftitle").textContent = f.name;
+    box.querySelector(".fsteps ol").append(...f.steps.map(st => { const li = document.createElement("li"); li.textContent = st[0]; return li; }));
+  });
+
+  const firstOf = CHAPTERS.map((_, c) => screens.findIndex(s => +s.dataset.ch === c));
+  CHAPTERS.forEach((name, c) => {
+    const b = document.createElement("button"); b.type = "button";
+    b.innerHTML = '<span class="fill"><i></i></span><span class="lbl"></span>';
+    b.querySelector(".lbl").textContent = name; b.setAttribute("aria-label", "Go to " + name);
+    b.addEventListener("click", () => go(firstOf[c], 0)); nav.append(b);
+  });
+
+  // Copy buttons: clipboard where allowed, else select the text.
+  document.querySelectorAll(".cmd").forEach(box => {
+    const btn = box.querySelector(".copy"), pre = box.querySelector("pre");
+    btn.addEventListener("click", () => {
+      const text = pre.innerText;
+      const done = () => { btn.textContent = "Copied"; setTimeout(() => btn.textContent = "Copy", 1500); };
+      const select = () => { const r = document.createRange(); r.selectNodeContents(pre); const s = getSelection(); s.removeAllRanges(); s.addRange(r); btn.textContent = "Selected"; setTimeout(() => btn.textContent = "Copy", 1500); };
+      try { navigator.clipboard.writeText(text).then(done, select); } catch (e) { select(); }
+    });
+  });
+
+  function tokEl(id, label, kind, at) {
+    const g = document.createElementNS(NS, "g");
+    g.setAttribute("class", "tok " + kind); g.dataset.id = id;
+    const w = 14 + label.length * 7.4;
+    const r = document.createElementNS(NS, "rect");
+    r.setAttribute("x", -w / 2); r.setAttribute("y", -12); r.setAttribute("width", w); r.setAttribute("height", 24); r.setAttribute("rx", 5);
+    const t = document.createElementNS(NS, "text"); t.setAttribute("text-anchor", "middle"); t.setAttribute("y", 4); t.textContent = label;
+    g.append(r, t); place(g, at, false); toksG.append(g);
+  }
+  function place(g, at, animate) {
+    const [x, y] = P[at];
+    if (!animate) g.style.transition = "none";
+    g.style.transform = "translate(" + x + "px, " + y + "px)";
+    if (!animate) { g.getBoundingClientRect(); g.style.transition = ""; }
+  }
+  function clearScene() {
+    toksG.replaceChildren();
+    ["dec1","dec2","say-a","say-b"].forEach(i => document.getElementById(i).textContent = "");
+    scene.querySelectorAll(".hot,.hotbad").forEach(n => n.classList.remove("hot","hotbad"));
+  }
+  function apply(ops, animate) {
+    scene.querySelectorAll(".hot,.hotbad").forEach(n => n.classList.remove("hot","hotbad"));
+    for (const [k, a, b, c, d] of ops) {
+      const tok = () => toksG.querySelector('[data-id="' + a + '"]');
+      if (k === "tok") tokEl(a, b, c, d);
+      else if (k === "mv") { const e = tok(); if (e) place(e, b, animate); }
+      else if (k === "kind") { const e = tok(); if (e) e.setAttribute("class", "tok " + b); }
+      else if (k === "dec") { const e = document.getElementById("dec" + a); e.textContent = b; e.setAttribute("class", "sc-dec " + c); }
+      else if (k === "say") document.getElementById("say-" + a).textContent = b;
+      else if (k === "hot") document.getElementById(a)?.classList.add(b === "bad" ? "hotbad" : "hot");
+    }
+  }
+  function renderFlow(s, animate) {
+    const f = FLOWS[s.dataset.flow];
+    s.querySelector(".scenebox").append(scene);
+    clearScene();
+    for (let i = 0; i < step; i++) apply(f.steps[i][1], false);
+    const ops = f.steps[step][1];
+    apply(ops.filter(o => o[0] === "tok"), false);
+    const rest = ops.filter(o => o[0] !== "tok");
+    if (animate && !reduce.matches) requestAnimationFrame(() => requestAnimationFrame(() => apply(rest, true)));
+    else apply(rest, false);
+    s.querySelector(".caption").textContent = f.steps[step][0];
+    s.querySelector(".count").textContent = "step " + (step + 1) + " of " + f.steps.length;
+    [...s.querySelectorAll(".fsteps li")].forEach((li, i) => li.classList.toggle("on", i === step));
+  }
+  const flowLen = s => s.dataset.flow ? FLOWS[s.dataset.flow].steps.length : 1;
+
+  function show(animate) {
+    screens.forEach((s, i) => s.hidden = i !== cur);
+    const s = screens[cur], ch = +s.dataset.ch;
+    if (s.dataset.flow) renderFlow(s, animate);
+    const inCh = screens.filter(x => +x.dataset.ch === ch), pos = inCh.indexOf(s);
+    [...nav.children].forEach((b, c) => {
+      const pct = c < ch ? 100 : c > ch ? 0 : Math.round(100 * (pos + (step + 1) / flowLen(s)) / inCh.length);
+      b.querySelector("i").style.width = pct + "%";
+      if (c === ch) b.setAttribute("aria-current", "step"); else b.removeAttribute("aria-current");
+    });
+    whereEl.textContent = CHAPTERS[ch] + " · " + (cur + 1) + " of " + screens.length;
+    bBack.disabled = cur === 0;
+    bNext.disabled = cur === screens.length - 1;
+    bNext.textContent = s.dataset.flow && step < flowLen(s) - 1 ? "Next step" : "Next";
+    if (location.hash.slice(1) !== s.dataset.id) history.replaceState(null, "", "#" + s.dataset.id);
+  }
+  function go(i, st) { cur = Math.max(0, Math.min(screens.length - 1, i)); step = st; show(false); }
+  function next() {
+    const s = screens[cur];
+    if (s.dataset.flow && step < flowLen(s) - 1) { step++; show(true); }
+    else if (cur < screens.length - 1) { cur++; step = 0; show(false); }
+  }
+  function back() {
+    const s = screens[cur];
+    if (s.dataset.flow && step > 0) { step--; show(false); }
+    else if (cur > 0) { cur--; step = flowLen(screens[cur]) - 1; show(false); }
+  }
+  bNext.addEventListener("click", next);
+  bBack.addEventListener("click", back);
+  document.addEventListener("keydown", e => {
+    if (e.target.closest && e.target.closest("summary,a,button.copy,input,textarea,pre")) return;
+    if (["ArrowRight","PageDown"," "].includes(e.key)) { e.preventDefault(); next(); }
+    else if (["ArrowLeft","PageUp"].includes(e.key)) { e.preventDefault(); back(); }
+    else if (e.key === "Home") go(0, 0);
+    else if (e.key === "End") go(screens.length - 1, 0);
+  });
+  let tx = null;
+  const stage = document.getElementById("stage");
+  stage.addEventListener("touchstart", e => { tx = e.touches[0].clientX; }, { passive: true });
+  stage.addEventListener("touchend", e => {
+    if (tx === null || e.target.closest(".scenebox,.tablewrap,.cmd")) { tx = null; return; }
+    const dx = e.changedTouches[0].clientX - tx; tx = null;
+    if (dx < -60) next(); else if (dx > 60) back();
+  });
+  window.addEventListener("hashchange", () => {
+    const i = screens.findIndex(s => s.dataset.id === location.hash.slice(1));
+    if (i >= 0 && i !== cur) go(i, 0);
+  });
+  const start = screens.findIndex(s => s.dataset.id === location.hash.slice(1));
+  go(start >= 0 ? start : 0, 0);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,46 @@
+name: tests
+
+# List form deliberately: in YAML 1.1 a bare `on:` key parses as the boolean
+# `true`, which GitHub tolerates but other YAML tools do not.
+on: [push, pull_request]
+
+jobs:
+  suite:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.9", "3.13"]
+
+    steps:
+      # The suite needs the router and the connector checked out BESIDE this
+      # repo: it imports the router's package to agree with its layout, and
+      # reads the connector's daemon to agree with its variables. Without
+      # them it fails rather than passing as a smaller green, so a sibling
+      # checkout that went missing turns this job red, never quietly green.
+      - uses: actions/checkout@v4
+        with:
+          path: amap-deploy-sandy
+
+      - uses: actions/checkout@v4
+        with:
+          repository: proofpoint/amap-router-local
+          path: amap-router-local
+
+      - uses: actions/checkout@v4
+        with:
+          repository: proofpoint/amap-connector-claude
+          path: amap-connector-claude
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: install pytest
+        run: python -m pip install pytest
+
+      # No sandy, no docker, no network: sandy is stubbed and conftest.py
+      # refuses every docker call for the whole session.
+      - name: suite
+        working-directory: amap-deploy-sandy
+        run: python -m pytest tests -q
