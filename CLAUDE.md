@@ -208,9 +208,10 @@ of it.
 **`payload/handoff-sessions` is checked in the same way.** It is the session
 lister the daemon runs as `AMAP_DELIVERY_SESSION_SOURCE`, and it reads pane
 identity only through sandy's published pane-identity contract: the tmux
-session `sandy`, the `@sandy_pane_agent` option in multi-agent mode, and
-`$SANDY_AGENT` as spawn order. **Never identify a pane by `pane_index`**; in
-the four-agent grid it is not spawn order. `tests/test_handoff_sessions.py`
+session `sandy`, the `@sandy_pane_agent` option, and `$SANDY_AGENT` as spawn
+order. When any pane carries the option, only the options identify; a pane
+without one is a user split or a teammate. **Never identify a pane by
+`pane_index`**; in the four-agent grid it is not spawn order. `tests/test_handoff_sessions.py`
 executes the shipped file against a fake `tmux` and a staged `/proc`.
 
 ### Authorisation is the router's

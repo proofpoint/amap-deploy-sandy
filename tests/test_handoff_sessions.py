@@ -2,8 +2,9 @@
 
 The daemon runs it as `AMAP_DELIVERY_SESSION_SOURCE` and injects into the one
 `claude` row it prints. Identity comes from sandy's published pane-identity
-contract: the tmux session "sandy", the `@sandy_pane_agent` pane option in
-multi-agent mode, `$SANDY_AGENT` for the sole pane in single-agent mode, and
+contract: the tmux session "sandy", the `@sandy_pane_agent` pane option on
+every pane sandy creates (multi-agent mode only before sandy 2.4.0),
+`$SANDY_AGENT` for the sole pane of an untagged single-agent session, and
 `$SANDY_AGENT` as spawn order, never `pane_index`.
 
 Nothing here touches the real tmux or /proc. `tmux` is a fake on PATH that
@@ -165,10 +166,30 @@ class PaneIdentityContractTest(unittest.TestCase):
         self.assertEqual([r["agent"] for r in rows], ["codex"])
 
     def test_single_agent_with_a_second_pane_identifies_neither(self):
-        """Two option-less panes are not "the sole pane": no guess, no row."""
+        """With no option anywhere (sandy before 2.4.0), two panes are not
+        "the sole pane": no guess, no row."""
         rc, err, rows = run_lister([(0, 100, "", "claude"), (1, 200, "", "claude")], "claude")
         self.assertEqual(rc, 0, err)
         self.assertEqual(rows, [])
+
+    def test_a_tagged_single_agent_pane_beside_a_user_split_is_identified(self):
+        """Sandy 2.4.0+ tags its single-agent pane too, so a user's shell
+        split beside it no longer hides the agent. The split is at index 0 to
+        show that position does not decide."""
+        rc, err, rows = run_lister([(0, 100, "", None), (1, 200, "claude", "claude")],
+                                   "claude")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual([(r["agent"], r["pane_index"], r["socket"]) for r in rows],
+                         [("claude", "1", "201.sock")])
+
+    def test_agent_team_teammates_beside_a_tagged_lead_get_no_row(self):
+        """Teammate panes run real claude processes with their own sockets,
+        but sandy did not create them and they carry no option: only the
+        lead is a target, so the daemon sees one claude row, not three."""
+        panes = [(0, 100, "claude", "claude"), (1, 200, "", "claude"), (2, 300, "", "claude")]
+        rc, err, rows = run_lister(panes, "claude")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual([(r["pane_pid"], r["socket"]) for r in rows], [("100", "101.sock")])
 
     def test_no_sandy_session_is_zero_rows_not_a_failure(self):
         """The daemon reads a nonzero exit as "the helper failed" and zero
