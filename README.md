@@ -30,6 +30,10 @@ runs inside a sandbox, and nothing here can send or receive a message.
 - **sandy 2.2.0 or later** (`--print-schema` reports `schema_version` 3).
   `install` refuses an older sandy, because on one every later step would
   report success while sandy read none of it.
+  On sandy 2.4.0 or later, `install` also declares `receives:
+  ["cross_session"]` in the manifest, so sandy accepts cross-session delivery
+  for amap's sandboxes because the feature asks for it. On an older sandy, the
+  key is left out and sandy's legacy rule does the same job.
 - **amap-router-local** and **amap-connector-claude**, each checked out beside
   this repo (a sibling directory of an ancestor), or named by
   `$AMAP_ROUTER_REPO` / `$AMAP_CONNECTOR_REPO`.
@@ -41,7 +45,7 @@ Everything lives once per host, under `$SANDY_HOME/features/amap/`:
 
 | Path | What it is | Whose |
 |---|---|---|
-| `feature.json` | sandy's feature **manifest**. Its `feature` section is the fleet **policy**, and `sandboxes`/`agents` hold the selection rule | yours to edit; `install` owns the `schema`/`create`/`mounts`/`expose` blocks |
+| `feature.json` | sandy's feature **manifest**. Its `feature` section is the fleet **policy**, and `sandboxes`/`agents` hold the selection rule | yours to edit; `install` owns the `schema`/`create`/`mounts`/`entry`/`expose`/`agent_args`/`receives` blocks |
 | `payload/` | the relay wrapper, the session lister, the connector's binaries, `mcp-servers.json` and `INBOX-POLICY.md`. Mounted **read-only** at `/opt/sandy/features/amap` in every selected sandbox | `install` |
 | `router.json` | the router's config, **generated** from the policy | `install`; never hand-edit |
 | `roster/` | the fleet roster the router writes, mounted read-only into every selected sandbox | created empty by `install`, written by the router |

@@ -234,7 +234,7 @@ class ManifestTest(unittest.TestCase):
         self.assertEqual(doc["sandboxes"], authored["sandboxes"])
         rendered = prov.render_manifest(policy)
         for key in prov.ADAPTER_OWNED_KEYS:
-            self.assertEqual(doc[key], rendered[key], key)
+            self.assertEqual(doc.get(key), rendered.get(key), key)
         self.assertEqual(doc["expose"], {"AMAP_FLEET_DOMAIN": "new.example"},
                          "the exposed domain is derived from the declared one")
         self.assertEqual(prov.verify_manifest(self.home, policy), [])
@@ -293,6 +293,58 @@ class ManifestTest(unittest.TestCase):
         bad["create"].append("instances/${slug}/.hidden")
         with self.assertRaises(prov.ProvisionError):
             prov._check_manifest_names(bad)
+
+
+class ReceivesDeclarationTest(unittest.TestCase):
+    """`receives: ["cross_session"]` is rendered only where this host's sandy
+    accepts it, since an unknown key or value refuses the whole manifest.
+    Unknown leaves the operator's file as it is."""
+
+    def setUp(self):
+        self._tmp = TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.home = Path(self._tmp.name)
+        prov.feature_root(self.home).mkdir(parents=True)
+        self.policy = fp.load_policy(self.home / "absent.json")   # the default policy
+
+    def _doc(self):
+        return json.loads(prov.feature_manifest_path(self.home).read_text())
+
+    def test_rendered_only_when_sandy_accepts_it(self):
+        self.assertEqual(prov.render_manifest(self.policy, receives=True)[prov.RECEIVES_KEY],
+                         [prov.RECEIVES_CROSS_SESSION])
+        for receives in (False, None):
+            with self.subTest(receives=receives):
+                self.assertNotIn(prov.RECEIVES_KEY,
+                                 prov.render_manifest(self.policy, receives=receives))
+
+    def test_install_adds_it_and_verify_then_passes(self):
+        prov.install_manifest(self.home, self.policy, dry_run=False, receives=False)
+        self.assertNotIn(prov.RECEIVES_KEY, self._doc())
+        drift = prov.verify_manifest(self.home, self.policy, receives=True)
+        self.assertTrue(any(prov.RECEIVES_KEY in p for p in drift), drift)
+        prov.install_manifest(self.home, self.policy, dry_run=False, receives=True)
+        self.assertEqual(self._doc()[prov.RECEIVES_KEY], [prov.RECEIVES_CROSS_SESSION])
+        self.assertEqual(prov.verify_manifest(self.home, self.policy, receives=True), [])
+
+    def test_a_sandy_that_does_not_accept_it_reports_it_and_install_removes_it(self):
+        """A sandy downgraded below the key would refuse the whole manifest:
+        verify names the key as drift, and install takes it out."""
+        prov.install_manifest(self.home, self.policy, dry_run=False, receives=True)
+        drift = prov.verify_manifest(self.home, self.policy, receives=False)
+        self.assertTrue(any(prov.RECEIVES_KEY in p for p in drift), drift)
+        prov.install_manifest(self.home, self.policy, dry_run=False, receives=False)
+        self.assertNotIn(prov.RECEIVES_KEY, self._doc())
+        self.assertEqual(prov.verify_manifest(self.home, self.policy, receives=False), [])
+
+    def test_unknown_leaves_the_key_as_it_is_either_way(self):
+        for present in (True, False):
+            with self.subTest(present=present):
+                prov.install_manifest(self.home, self.policy, dry_run=False, receives=present)
+                before = self._doc()
+                prov.install_manifest(self.home, self.policy, dry_run=False, receives=None)
+                self.assertEqual(self._doc(), before)
+                self.assertEqual(prov.verify_manifest(self.home, self.policy, receives=None), [])
 
 
 class RosterMountTest(unittest.TestCase):
@@ -1411,6 +1463,35 @@ class SandyManifestGateTest(unittest.TestCase):
         ok, why = prov.sandy_manifest_capable()
         self.assertIs(ok, True, why)
         prov.require_manifest_capable()   # does not raise
+
+    # --- receives, gated on MEMBERSHIP of the key AND the value -------------
+
+    # sandy 2.4.0's `--print-schema` manifest block, as its released source
+    # prints it (`_sandy_fm_known_keys`, `_sandy_fm_receives_known`).
+    MANIFEST_2_4 = {"top_level_keys": ["schema", "sandboxes", "agents", "create", "mounts",
+                                       "entry", "expose", "feature", "agent_args", "receives"],
+                    "mount_keys": ["name", "from", "mode", "export"],
+                    "receives_values": ["cross_session"]}
+
+    def test_receives_is_accepted_only_with_the_key_and_the_value_listed(self):
+        rows = (
+            ("sandy 2.4.0", {**self.SCHEMA_3, "manifest": self.MANIFEST_2_4}, True),
+            ("sandy 2.2/2.3: no key", self.SCHEMA_3, False),
+            ("key without the value", {**self.SCHEMA_3, "manifest": {
+                **self.MANIFEST_2_4, "receives_values": []}}, False),
+            ("value list absent", {**self.SCHEMA_3, "manifest": {
+                k: v for k, v in self.MANIFEST_2_4.items() if k != "receives_values"}}, False),
+            ("no manifest block", {k: v for k, v in self.SCHEMA_3.items() if k != "manifest"},
+             False),
+        )
+        for name, schema, want in rows:
+            with self.subTest(name):
+                self._with(schema)
+                self.assertIs(prov.sandy_accepts_receives(), want)
+
+    def test_an_unreadable_schema_is_unknown_not_false(self):
+        self._with(None)
+        self.assertIsNone(prov.sandy_accepts_receives())
 
     def test_an_older_schema_is_refused_by_token(self):
         for old in (1, 2):

@@ -144,8 +144,13 @@ you prove the contract, capture the degenerate document first.
 **The manifest is the policy.** `$SANDY_HOME/features/amap/feature.json` is
 authored. Its `sandboxes`/`agents` blocks are the selection rule, and its
 `feature` section is the fleet policy, which `fleet_policy.load_policy` reads
-directly. Its `schema`, `create`, `mounts` and `expose` blocks belong to this
-repo: `install` rewrites them and `verify` reports a hand edit as drift.
+directly. Its `schema`, `create`, `mounts`, `entry`, `expose`, `agent_args`
+and `receives` blocks belong to this repo: `install` rewrites them and
+`verify` reports a hand edit as drift. **`receives: ["cross_session"]` is
+rendered only where this host's sandy lists the key in `--print-schema`'s
+`manifest.top_level_keys` and the value in `manifest.receives_values`**
+(`sandy_accepts_receives`), because an unknown key or value refuses the whole
+manifest. Where the schema cannot be read, the key is left as it is.
 `router.json` beside it is **generated** in the router's exact vocabulary
 and nothing else, because the router refuses an unknown key.
 

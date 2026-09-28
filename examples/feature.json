@@ -66,6 +66,9 @@
       "/opt/sandy/features/amap/INBOX-POLICY.md"
     ]
   },
+  "receives": [
+    "cross_session"
+  ],
   "feature": {
     "version": 1,
     "groups": {},
@@ -75,6 +78,6 @@
     "task_deny": [],
     "fleet_domain": "agents.example.org",
     "container_recreate_interval_hours": 24,
-    "_comment": "An example of $SANDY_HOME/features/amap/feature.json as `install` renders it. The `feature` section IS the fleet policy, and `sandboxes`/`agents` are the selection rule sandy evaluates at every launch: every sandbox launched with claude, less throwaway `tmp.*` ones. `schema`, `create`, `mounts`, `entry`, `expose` and `agent_args` belong to amap-deploy-sandy and `install` rewrites them; edit the rest in place. task_graph ALL: any selected sandbox may task any other, self excluded. peers stays EMPTY: this fleet is for tasking, and the two lanes must not share an ordered pair."
+    "_comment": "An example of $SANDY_HOME/features/amap/feature.json as `install` renders it. The `feature` section IS the fleet policy, and `sandboxes`/`agents` are the selection rule sandy evaluates at every launch: every sandbox launched with claude, less throwaway `tmp.*` ones. `schema`, `create`, `mounts`, `entry`, `expose`, `agent_args` and `receives` belong to amap-deploy-sandy and `install` rewrites them (`receives` only on a sandy whose --print-schema lists it, 2.4.0 and later); edit the rest in place. task_graph ALL: any selected sandbox may task any other, self excluded. peers stays EMPTY: this fleet is for tasking, and the two lanes must not share an ordered pair."
   }
 }
