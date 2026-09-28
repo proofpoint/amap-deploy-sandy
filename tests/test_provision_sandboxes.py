@@ -559,6 +559,16 @@ class MembershipTest(unittest.TestCase):
         self.assertEqual(states["e-5"][0], "not selected")
         self.assertIn("redteam", states["e-5"][1])
 
+    def test_another_feature_named_amap_something_is_not_our_verdict(self):
+        """A real sandy 2.4.0 record (the sandy workspace's launch of PR #394,
+        which v2.4.0 matches but for the version string) carried "amap-spec: no sandboxes include matched", a
+        different feature's refusal. The match is "amap:" with the colon, so
+        a sandbox with no verdict for this feature stays unknown."""
+        _select(self.home, "a-1")
+        boxes = [self._box("f-6", ["probea"],
+                           problems=["amap-spec: no sandboxes include matched"])]
+        self.assertEqual(prov.selection_states(self.home, boxes)["f-6"][0], "unknown")
+
     def test_a_verdict_file_with_another_schema_is_refused_by_name(self):
         """The file carries its own `schema` so it can move on its own. Any
         other token is refused with the number in the message — never read

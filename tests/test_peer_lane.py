@@ -1452,6 +1452,152 @@ class VerifyUnitTest(SandboxFixture):
         self.assertTrue(any(p.startswith("relay disabled") for p in problems), problems)
         self.assertIn("workspace tier", problems[0])
 
+
+    # --- `feature_entries` in the `--print-state` record. Shape measured on a
+    # real launch of sandy 2.4.0's tree (PR #394; v2.4.0 adds only the version
+    # string), as the sandy workspace reported it: state_dir is a HOST path,
+    # $SANDBOX_DIR/relay-state for the designated entry and
+    # $SANDBOX_DIR/feature-state/<feature> for any other.
+
+    def _measured_record(self, amap_state="started"):
+        """The `--print-state` element from that launch: amap designated
+        (it sorts first), two other features' entries beside it, and another
+        feature whose name starts with "amap" in feature_problems. Host paths
+        are rebased onto this test's sandbox."""
+        sb = self.sandbox()
+
+        def entry(feature, path, state_dir, alias, state="started"):
+            return {"state": state, "restarts": 0, "last_exit_code": None,
+                    "last_restart_at": None, "executable_present": True, "path": path,
+                    "state_dir": str(state_dir), "relay_alias": alias, "disabled_by": None}
+        return {
+            "name": self.SLUG, "path": str(sb),
+            "relay": {"state": "started", "source": "manifest", "executable_present": True,
+                      "path": "/opt/sandy/features/amap/relay",
+                      "state_dir": str(sb / "relay-state"), "last_exit_code": None,
+                      "restarts": 0, "last_restart_at": None, "disabled_by": None},
+            "features": ["amap", "probea", "probeb"],
+            "feature_problems": ["amap-spec: no sandboxes include matched"],
+            "feature_entries": {
+                "amap": entry("amap", "/opt/sandy/features/amap/relay", sb / "relay-state",
+                              True, amap_state),
+                "probea": entry("probea", "/opt/sandy/features/probea/run",
+                                sb / "feature-state" / "probea", False),
+                "probeb": entry("probeb", "/opt/sandy/features/probeb/run",
+                                sb / "feature-state" / "probeb", False)},
+        }
+
+    def test_the_measured_record_passes_and_names_relay_state_as_our_log(self):
+        record = self._measured_record()
+        self.assertEqual(prov.supervisor_log_path(record),
+                         self.sandbox() / "relay-state" / prov.SUPERVISOR_LOG_NAME)
+        self.assertEqual(prov.verify_entry_started_record(self.SLUG, record), [])
+        self.assertEqual(prov.verify_relay_disabled_record(self.SLUG, record), [])
+
+    def test_another_feature_named_amap_something_is_not_our_selection_problem(self):
+        """The measured record carries "amap-spec: no sandboxes include
+        matched", another feature's refusal. The match is on "amap:" with the
+        colon; a bare "amap" prefix would report this feature unselected."""
+        self.assertEqual(prov.verify_selection(self.SLUG, self._measured_record()), [])
+
+    def test_the_measured_absent_shape_is_entry_not_started(self):
+        """State "absent" as sandy printed it for an entry whose `.state` was
+        never written (probeb, with the file removed after a stop)."""
+        problems = prov.verify_entry_started_record(
+            self.SLUG, self._measured_record(amap_state="absent"))
+        self.assertTrue(any(p.startswith("entry not started") for p in problems), problems)
+
+    def _entries_record(self, state_dir, *, disabled_by=None, relay_state_dir=None):
+        return {"name": self.SLUG,
+                "relay": {"path": f"{prov.CONTAINER_FEATURES_ROOT}/aaa-other/run",
+                          "state_dir": str(relay_state_dir or self._relay_state()),
+                          "disabled_by": disabled_by},
+                "feature_entries": {prov.FEATURE_NAME: {
+                    "path": prov.CONTAINER_ENTRY_PATH, "state_dir": str(state_dir),
+                    "relay_alias": False, "disabled_by": disabled_by}}}
+
+    def test_the_log_is_read_from_our_entrys_state_dir_not_the_relays(self):
+        """relay{} names the designated entry's state; ours is elsewhere. A
+        healthy log under relay.state_dir must not hide ours being down."""
+        self._supervisor(
+            "(header)",
+            f"[sandy-relay] {self._ts(300)} start /opt/sandy/features/aaa-other/run")
+        ours = self.sandbox() / "feature-state" / prov.FEATURE_NAME
+        ours.mkdir(parents=True)
+        (ours / prov.SUPERVISOR_LOG_NAME).write_text(
+            "(header)\n"
+            f"[sandy-entry {prov.FEATURE_NAME}] {self._ts(120)} start {prov.CONTAINER_ENTRY_PATH}\n"
+            "inbox-delivery: fatal: something\n"
+            f"[sandy-entry {prov.FEATURE_NAME}] {self._ts(119)} exit rc=2 uptime=0s; "
+            "restart in 60s\n")
+        problems = prov.verify_relay_supervisor(self.sandbox(), self.SLUG,
+                                                record=self._entries_record(ours))
+        self.assertTrue(any(p.startswith("relay is down") for p in problems), problems)
+        self.assertIn(str(ours / prov.SUPERVISOR_LOG_NAME), problems[0])
+        self.assertIn("fatal: something", problems[0])
+
+    def test_entries_reported_without_ours_names_no_log(self):
+        record = {"name": self.SLUG,
+                  "relay": {"path": "x", "state_dir": str(self._relay_state())},
+                  "feature_entries": {"aaa-other": {"path": "x", "state_dir": "/y"}}}
+        self.assertIsNone(prov.supervisor_log_path(record))
+        self.assertEqual(prov.supervisor_log_path({**record, "feature_entries": None}),
+                         self._relay_state() / prov.SUPERVISOR_LOG_NAME)
+
+    def test_the_lock_held_line_is_not_the_relays_last_words(self):
+        """The supervisor refusing a second copy of itself writes its own
+        line; the diagnosis is still the relay's stderr before it."""
+        self._supervisor(
+            "(header)",
+            f"[sandy-relay] {self._ts(120)} start /opt/sandy/features/amap/relay",
+            "inbox-delivery: fatal: the real cause",
+            f"[sandy-relay] {self._ts(119)} supervisor already running (lock held); "
+            "not starting a second",
+            f"[sandy-relay] {self._ts(118)} exit rc=2 uptime=0s; restart in 60s")
+        problems = prov.verify_relay_supervisor(self.sandbox(), self.SLUG, record=self._record())
+        self.assertTrue(any(p.startswith("relay is down") for p in problems), problems)
+        self.assertIn("the real cause", problems[0])
+        self.assertNotIn("lock held", problems[0])
+
+    def test_an_entry_declared_but_never_started_is_reported(self):
+        """sandy's report (rappdw/sandy#381, unmerged): with an agent image
+        older than sandy, the container starts only the designated entry, and
+        `--print-state` shows ours as state "absent", disabled_by null. The
+        daemon heartbeat check fails too; this names the cause."""
+        record = self._entries_record(self.sandbox() / "feature-state" / prov.FEATURE_NAME)
+        record["feature_entries"][prov.FEATURE_NAME]["state"] = "absent"
+        problems = prov.verify_entry_started_record(self.SLUG, record)
+        self.assertTrue(any(p.startswith("entry not started") for p in problems), problems)
+        self.assertIn("sandy --rebuild", problems[0])
+        self.assertIn("re-run verify", problems[0])
+        for state in ("started", "failed", "looping"):
+            with self.subTest(state=state):
+                record["feature_entries"][prov.FEATURE_NAME]["state"] = state
+                self.assertEqual(prov.verify_entry_started_record(self.SLUG, record), [])
+
+    def test_absent_state_is_not_raised_where_other_checks_own_the_answer(self):
+        """Disabled (sandy reports "absent" and a tier), not adopted, and not
+        reported: each has its own check, so this one stays silent."""
+        ours = self.sandbox() / "feature-state" / prov.FEATURE_NAME
+        disabled = self._entries_record(ours, disabled_by="env")
+        disabled["feature_entries"][prov.FEATURE_NAME]["state"] = "absent"
+        not_adopted = {"feature_entries": {"aaa-other": {"state": "absent"}}}
+        unreported = {"feature_entries": None, "relay": {"state": "absent"}}
+        for name, record in (("disabled", disabled), ("not adopted", not_adopted),
+                             ("unreported", unreported), ("no record", None)):
+            with self.subTest(name):
+                self.assertEqual(prov.verify_entry_started_record(self.SLUG, record), [])
+
+    def test_own_entry_disabled_at_its_last_launch_is_reported_off_the_record(self):
+        """Without `relay{}` at all, the shape once a later sandy major removes
+        it (rappdw/sandy#382): the entry's own disabled_by is the only signal."""
+        record = self._entries_record(self.sandbox() / "feature-state" / prov.FEATURE_NAME,
+                                      disabled_by="host")
+        del record["relay"]
+        problems = prov.verify_relay_disabled_record(self.SLUG, record)
+        self.assertTrue(any(p.startswith("relay disabled") for p in problems), problems)
+        self.assertIn("host tier", problems[0])
+
     def test_a_healthy_relay_passes(self):
         self._supervisor(
             "(header line the tail may have cut)",
@@ -2037,6 +2183,83 @@ class RelayStartedAndMountsTest(unittest.TestCase):
         self.assertIn(other, problems[0])
         self.assertIn("relay.source='explicit'", problems[0])
         self.assertIn(f"Relaunch it under sandy {prov.SANDY_FLOOR}", problems[0])
+
+
+    # --- sandy's per-feature entries (`feature_entries`) in the marker.
+    # Shape measured on a real launch of sandy 2.4.0's tree (PR #394; v2.4.0
+    # adds only the version string), as the sandy workspace reported it: per
+    # feature, exactly {path, relay_alias, disabled_by}.
+
+    def test_the_measured_marker_passes(self):
+        """The marker from that launch: amap designated, two other features'
+        entries beside it."""
+        doc = {"relay": {"source": "manifest", "path": "/opt/sandy/features/amap/relay",
+                         "disabled_by": None},
+               "feature_entries": {
+                   "amap": {"path": "/opt/sandy/features/amap/relay", "relay_alias": True,
+                            "disabled_by": None},
+                   "probea": {"path": "/opt/sandy/features/probea/run",
+                              "relay_alias": False, "disabled_by": None},
+                   "probeb": {"path": "/opt/sandy/features/probeb/run",
+                              "relay_alias": False, "disabled_by": None}},
+               "offline": False}
+        self.assertEqual(self._started(doc), [])
+
+    @staticmethod
+    def _entry(path=None, relay_alias=True, disabled_by=None):
+        return {"path": prov.CONTAINER_ENTRY_PATH if path is None else path,
+                "relay_alias": relay_alias, "disabled_by": disabled_by}
+
+    def test_own_entry_running_passes_while_relay_describes_another_feature(self):
+        """sandy runs every selected feature's entry; `relay{}` describes the
+        one it designated. With `feature_entries` reported, ours is read and
+        `relay{}` is not, so another feature's designation is no fault."""
+        other = f"{prov.CONTAINER_FEATURES_ROOT}/aaa-other/run"
+        doc = {"relay": {"path": other, "source": "manifest", "disabled_by": None},
+               "feature_entries": {"aaa-other": self._entry(other, True),
+                                   prov.FEATURE_NAME: self._entry(relay_alias=False)}}
+        self.assertEqual(self._started(doc), [])
+
+    def test_own_entry_disabled_is_reported_before_anything_else(self):
+        """relay_alias is false on a disabled entry even when it would have
+        been designated, so disabled_by is read first."""
+        doc = {"relay": {"path": None, "source": "none", "disabled_by": "env"},
+               "feature_entries": {prov.FEATURE_NAME: self._entry(relay_alias=False,
+                                                                  disabled_by="env")}}
+        problems = self._started(doc)
+        self.assertTrue(any(p.startswith("relay disabled") for p in problems), problems)
+        self.assertIn("env tier", problems[0])
+
+    def test_entries_reported_without_ours_is_an_entry_not_adopted(self):
+        other = f"{prov.CONTAINER_FEATURES_ROOT}/aaa-other/run"
+        doc = {"relay": {"path": other, "source": "manifest", "disabled_by": None},
+               "feature_entries": {"aaa-other": self._entry(other, True)}}
+        problems = self._started(doc)
+        self.assertTrue(any(p.startswith("relay not configured") for p in problems), problems)
+        self.assertIn(f"adopted no {prov.FEATURE_NAME} entry", problems[0])
+
+    def test_own_entry_at_another_path_is_a_manifest_mismatch(self):
+        doc = {"feature_entries": {prov.FEATURE_NAME: self._entry(
+            path=f"{prov.CONTAINER_FEATURE_DIR}/old-relay")}}
+        problems = self._started(doc)
+        self.assertTrue(any(p.startswith("relay elsewhere") for p in problems), problems)
+        self.assertIn("install --apply", problems[0])
+
+    def test_null_or_absent_entries_fall_back_to_the_relay_record(self):
+        """Null (a launch before the upgrade) and absent (an older sandy) are
+        UNKNOWN for `feature_entries`, never an empty answer: the relay{}
+        reading applies, including its failures."""
+        other = f"{prov.CONTAINER_FEATURES_ROOT}/aaa-other/run"
+        for entries in ({"feature_entries": None}, {}):
+            with self.subTest(entries=entries):
+                ours = {"relay": {"path": prov.CONTAINER_ENTRY_PATH, "source": "manifest",
+                                  "disabled_by": None}, **entries}
+                self.assertEqual(self._started(ours), [])
+                theirs = {"relay": {"path": other, "source": "manifest",
+                                    "disabled_by": None}, **entries}
+                problems = self._started(theirs)
+                self.assertTrue(any(p.startswith("relay elsewhere") for p in problems),
+                                problems)
 
     def test_a_marker_disabled_by_a_tier_is_reported_off_disabled_by(self):
         """`disabled_by` is the only host-side signal that a cloned repo
