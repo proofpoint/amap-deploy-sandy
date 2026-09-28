@@ -389,8 +389,15 @@ class DisjointnessTest(unittest.TestCase):
 # reporting them on a dry run, exit 3 on `--apply`.
 
 
+# sandy 2.4.0's `--print-schema` manifest block, as its released source prints
+# it: the key `receives` and its one value published for membership gates.
+MANIFEST_BLOCK_2_4 = {"top_level_keys": ["schema", "sandboxes", "agents", "create", "mounts",
+                                         "entry", "expose", "feature", "agent_args", "receives"],
+                      "receives_values": ["cross_session"]}
+
+
 class SyncRefusalTest(unittest.TestCase):
-    def _run(self, policy, *, apply=False, fleet=()):
+    def _run(self, policy, *, apply=False, fleet=(), manifest_block=None):
         with TemporaryDirectory() as d:
             root = Path(d)
             home = root / "sandy-home"
@@ -406,9 +413,10 @@ class SyncRefusalTest(unittest.TestCase):
                 _select(home, *fleet)
             fake = root / "sandy"
             schema = json.dumps({"schema_version": 3, "config": {},
-                                 "manifest": {"top_level_keys": ["schema", "sandboxes", "agents",
-                                                                 "create", "mounts", "entry", "expose",
-                                                                 "feature", "agent_args"]},
+                                 "manifest": manifest_block or {
+                                     "top_level_keys": ["schema", "sandboxes", "agents",
+                                                        "create", "mounts", "entry", "expose",
+                                                        "feature", "agent_args"]},
                                  "agents": [{"name": "claude"}]})
             fake.write_text("#!/bin/sh\ncase \"$1\" in --print-schema) cat <<'EOF'\n" + schema
                             + "\nEOF\n;; --print-version) echo '{\"full_version\": \"2.2.0\"}';; "
@@ -431,7 +439,21 @@ class SyncRefusalTest(unittest.TestCase):
             # "Provisioned" is the HOST install: the payload landed. Nothing
             # per sandbox exists to look for.
             provisioned = prov.payload_entry_path(home).is_file()
+            self.last_manifest = json.loads(manifest.read_text())
             return rc, out.getvalue() + err.getvalue(), provisioned
+
+    def test_install_declares_receives_only_where_this_sandy_accepts_it(self):
+        """Through main(): the host's own --print-schema decides, so a
+        sandy 2.2/2.3 manifest never carries a key that would refuse it."""
+        policy = _policy(**{fp.TASK_GRAPH_KEY: {}})
+        rc, out, _ = self._run(policy, apply=True, fleet=("alpha",),
+                               manifest_block=MANIFEST_BLOCK_2_4)
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.last_manifest.get(prov.RECEIVES_KEY),
+                         [prov.RECEIVES_CROSS_SESSION])
+        rc, out, _ = self._run(policy, apply=True, fleet=("alpha",))
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn(prov.RECEIVES_KEY, self.last_manifest)
 
     def test_a_ratifiable_policy_provisions(self):
         rc, out, provisioned = self._run(_policy(**{fp.TASK_GRAPH_KEY: {}}), apply=True,
@@ -1815,7 +1837,7 @@ class VerifyEndToEndTest(SandboxFixture):
     helpers. A first cut of these called the check functions directly, which
     would have stayed green over a `main()` that never called them."""
 
-    def _run(self, selected=(None,)):
+    def _run(self, selected=(None,), manifest_block=None):
         """`selected` is the slugs whose last launch selected the feature —
         both, by default."""
         chosen = list(selected) if selected != (None,) else [self.SLUG, self.OTHER]
@@ -1827,9 +1849,10 @@ class VerifyEndToEndTest(SandboxFixture):
              "feature_problems": [] if s in chosen else [f"{prov.FEATURE_NAME}: excluded"]}
             for s in (self.SLUG, self.OTHER)]})
         schema = json.dumps({"schema_version": 3, "config": {"privileged_keys": []},
-                             "manifest": {"top_level_keys": ["schema", "sandboxes", "agents", "create",
-                                                             "mounts", "entry", "expose", "feature",
-                                                             "agent_args"]},
+                             "manifest": manifest_block or {
+                                 "top_level_keys": ["schema", "sandboxes", "agents", "create",
+                                                    "mounts", "entry", "expose", "feature",
+                                                    "agent_args"]},
                              "agents": [{"name": "claude"}]})
         fake.write_text("#!/bin/sh\ncase \"$1\" in\n  --print-schema) cat <<'EOF'\n"
                         + schema + "\nEOF\n;;\n  *) cat <<'EOF'\n" + state + "\nEOF\n;;\nesac\n")
@@ -1871,6 +1894,17 @@ class VerifyEndToEndTest(SandboxFixture):
         self.assertIn("never runs docker", out)
         self.assertIn("router-container, router-health", out)
 
+
+    def test_a_sandy_that_accepts_receives_reports_its_absence_as_drift(self):
+        """Through main(): on sandy 2.4 a manifest without `receives` is
+        stale, and install --apply is the remedy. On a sandy without the key
+        the same file is current."""
+        rc, out = self._run(manifest_block=MANIFEST_BLOCK_2_4)
+        self.assertEqual(rc, 1)
+        self.assertTrue(any("manifest drift" in l and prov.RECEIVES_KEY in l
+                            for l in out.splitlines()), out)
+        rc, out = self._run()
+        self.assertFalse(any("manifest drift" in l for l in out.splitlines()), out)
 
     def test_payload_drift_exits_1(self):
         """The chain is on the payload; a hand-edited wrapper there is drift,

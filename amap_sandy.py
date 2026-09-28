@@ -846,6 +846,23 @@ def sandy_manifest_capable(sandy_bin: str = "sandy") -> Tuple[Optional[bool], st
                   f"{AGENT_ARGS_KEY} and names {MANIFEST_AGENT!r}")
 
 
+def sandy_accepts_receives(sandy_bin: str = "sandy") -> Optional[bool]:
+    """Does this sandy's manifest parser accept `receives: ["cross_session"]`?
+    MEMBERSHIP of the key in `--print-schema`'s `manifest.top_level_keys` and
+    of the value in `manifest.receives_values`, never a version. None when
+    the schema cannot be read: unknown, and never rounded to either answer."""
+    schema = _sandy_json(sandy_bin, "--print-schema")
+    if not isinstance(schema, dict):
+        return None
+    manifest = schema.get("manifest")
+    if not isinstance(manifest, dict):
+        return False
+    keys = manifest.get("top_level_keys")
+    values = manifest.get("receives_values")
+    return (isinstance(keys, list) and RECEIVES_KEY in keys
+            and isinstance(values, list) and RECEIVES_CROSS_SESSION in values)
+
+
 def require_manifest_capable(sandy_bin: str = "sandy") -> None:
     """Refuse to install against a sandy whose feature manifests this
     deployment cannot use.
@@ -1009,7 +1026,17 @@ def install_roster_dir(home: Path, *, dry_run: bool) -> str:
 # derived. `install --apply` writes the whole file only when it is ABSENT (the
 # template: every sandbox launched with claude, no excludes, no domain), and
 # then refuses to go further until the operator has ratified it.
-ADAPTER_OWNED_KEYS = ("schema", "create", "mounts", "entry", "expose", AGENT_ARGS_KEY)
+#
+# `receives` declares what this feature needs delivered into the session:
+# cross-session messages, which the daemon injects. Sandy resolves the
+# agent's cross-session inbound setting to accept from a selected feature's
+# declaration. It is rendered only where this host's sandy lists the key and
+# the value in `--print-schema` (`sandy_accepts_receives`), because an unknown
+# key or value refuses the whole manifest.
+RECEIVES_KEY = "receives"
+RECEIVES_CROSS_SESSION = "cross_session"
+ADAPTER_OWNED_KEYS = ("schema", "create", "mounts", "entry", "expose", AGENT_ARGS_KEY,
+                      RECEIVES_KEY)
 
 
 def agent_args_for_manifest() -> Dict[str, List[str]]:
@@ -1041,13 +1068,15 @@ def agent_args_for_manifest() -> Dict[str, List[str]]:
 EXIT_POLICY_UNRATIFIED = 3
 
 
-def render_manifest(policy: Dict[str, Any]) -> Dict[str, Any]:
+def render_manifest(policy: Dict[str, Any], *,
+                    receives: Optional[bool] = None) -> Dict[str, Any]:
     """The manifest document for `policy`: selection verbatim; the lane
     tree under `create`; sibling lane mounts with their exports; the domain
-    as an `expose` export; the policy itself (minus the selection blocks the
-    manifest carries at top level, and the loader's own marker) as
-    `feature`. This is the TEMPLATE a first install writes, and the source
-    of the deployment-owned blocks every later install repairs."""
+    as an `expose` export; `receives` when `receives` is True (this host's
+    sandy accepts it: `sandy_accepts_receives`); the policy itself (minus the
+    selection blocks the manifest carries at top level, and the loader's own
+    marker) as `feature`. This is the TEMPLATE a first install writes, and
+    the source of the deployment-owned blocks every later install repairs."""
     selection = fp.selection(policy)
     create = [f"{FEATURE_INSTANCES_SUBDIR}/{MANIFEST_SLUG}/{lane}/{leaf}"
               for lane in FEATURE_LANES for leaf in FEATURE_LANE_LEAVES[lane]]
@@ -1072,6 +1101,8 @@ def render_manifest(policy: Dict[str, Any]) -> Dict[str, Any]:
         AGENT_ARGS_KEY: agent_args_for_manifest(),
         "feature": feature,
     }
+    if receives:
+        doc[RECEIVES_KEY] = [RECEIVES_CROSS_SESSION]
     domain = policy.get(fp.FLEET_DOMAIN_KEY)
     if domain is not None:
         doc["expose"][EXPOSE_FLEET_DOMAIN] = domain
@@ -1132,8 +1163,16 @@ def _check_manifest_names(doc: Dict[str, Any]) -> None:
                                      f"with it; use the -file form of the flag")
 
 
-def manifest_text(policy: Dict[str, Any]) -> str:
-    return json.dumps(render_manifest(policy), indent=2) + "\n"
+def manifest_text(policy: Dict[str, Any], *, receives: Optional[bool] = None) -> str:
+    return json.dumps(render_manifest(policy, receives=receives), indent=2) + "\n"
+
+
+def _owned_keys(receives: Optional[bool]) -> Tuple[str, ...]:
+    """The deployment-owned keys an install repairs and `verify` compares.
+    `receives` is left out when this sandy's answer is unknown: rendering it
+    either way would be a guess, and the capability check reports the
+    unreadable schema."""
+    return tuple(k for k in ADAPTER_OWNED_KEYS if not (k == RECEIVES_KEY and receives is None))
 
 
 def _read_manifest(path: Path) -> Any:
@@ -1143,7 +1182,8 @@ def _read_manifest(path: Path) -> Any:
         return None
 
 
-def install_manifest(home: Path, policy: Dict[str, Any], *, dry_run: bool) -> str:
+def install_manifest(home: Path, policy: Dict[str, Any], *, dry_run: bool,
+                     receives: Optional[bool] = None) -> str:
     """Write the manifest when it is ABSENT (the template rendered from
     `policy` — on a fresh host the default policy), or REPAIR the
     deployment-owned blocks of the one that is there, leaving the operator's keys and
@@ -1156,13 +1196,16 @@ def install_manifest(home: Path, policy: Dict[str, Any], *, dry_run: bool) -> st
         if not isinstance(existing, dict):
             raise ProvisionError(f"{path} exists but is not a JSON object — it is the authored "
                                  f"policy, so it is not overwritten; fix it by hand")
-        rendered = render_manifest(policy)
+        rendered = render_manifest(policy, receives=receives)
         doc = dict(existing)
-        for key in ADAPTER_OWNED_KEYS:
-            doc[key] = rendered[key]
+        for key in _owned_keys(receives):
+            if key in rendered:
+                doc[key] = rendered[key]
+            else:
+                doc.pop(key, None)
         want = json.dumps(doc, indent=2) + "\n"
     else:
-        want = manifest_text(policy)
+        want = manifest_text(policy, receives=receives)
     return _write_file(path, want, dry_run=dry_run, label=FEATURE_MANIFEST_NAME)
 
 
@@ -1184,7 +1227,8 @@ def manifest_changed_at(home: Path) -> Optional[str]:
     return datetime.fromtimestamp(st.st_mtime, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def verify_manifest(home: Path, policy: Dict[str, Any]) -> List[str]:
+def verify_manifest(home: Path, policy: Dict[str, Any], *,
+                    receives: Optional[bool] = None) -> List[str]:
     """The manifest on disk is current: its deployment-owned blocks equal
     what this deployment renders for its own policy, its `feature` section is an
     object (the policy loads — `policy` is that load), and its own `expose`
@@ -1206,8 +1250,8 @@ def verify_manifest(home: Path, policy: Dict[str, Any]) -> List[str]:
     if not isinstance(doc, dict) or not isinstance(doc.get("feature"), dict):
         return [f"manifest drift: {path} carries no `feature` object — the policy lives there"]
     problems = []
-    rendered = render_manifest(policy)
-    stale = [k for k in ADAPTER_OWNED_KEYS if doc.get(k) != rendered[k]]
+    rendered = render_manifest(policy, receives=receives)
+    stale = [k for k in _owned_keys(receives) if doc.get(k) != rendered.get(k)]
     if stale:
         problems.append(f"manifest drift: {path}: {', '.join(stale)} differ from what this "
                         f"adapter renders — those blocks are the adapter's; re-run install "
@@ -1540,7 +1584,8 @@ def run_provision(
     failed = 0
     # THE MANIFEST AND THE PAYLOAD, ONCE, FIRST.
     try:
-        report = install_manifest(home, policy, dry_run=dry)
+        report = install_manifest(home, policy, dry_run=dry,
+                                  receives=sandy_accepts_receives(args.sandy))
     except ProvisionError as e:
         print(f"  FAIL  manifest {feature_manifest_path(home)}: {e}", file=sys.stderr)
         failed += 1
@@ -2878,7 +2923,7 @@ def run_verify(args: argparse.Namespace, servers: Dict[str, dict], home: Path,
     ok, why = sandy_manifest_capable(args.sandy)
     if not ok:
         problems.append(f"sandy without feature manifests: {why}")
-    problems += verify_manifest(home, policy)
+    problems += verify_manifest(home, policy, receives=sandy_accepts_receives(args.sandy))
     problems += verify_feature_payload(home, args.connector_src, servers_path=args.servers)
     problems += verify_roster_source(home)
     problems += verify_roster(home)
