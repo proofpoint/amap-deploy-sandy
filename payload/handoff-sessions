@@ -1,0 +1,103 @@
+#!/bin/bash
+# payload/handoff-sessions — shipped by amap-deploy-sandy and copied VERBATIM
+# onto the feature payload beside the relay, which points the delivery daemon
+# at it as AMAP_DELIVERY_SESSION_SOURCE. Edit it HERE, then re-run
+# install --apply; an edit to a deployed copy is drift.
+#
+# It enumerates the live agent sessions in this container, one row per pane:
+#
+#   agent<TAB>pane_index<TAB>pane_pid<TAB>agent_pid<TAB>socket<TAB>keyfile
+#
+# with "-" for a value that does not apply. The daemon injects only into a
+# `claude` row, through its socket and key file, and refuses when there is
+# more than one (amap-connector-claude, bin/inbox-delivery).
+#
+# PANE IDENTITY is sandy's published pane-identity contract, and nothing else:
+#   1. the tmux session is the literal "sandy", with one window;
+#   2. sandy sets the pane option @sandy_pane_agent, naming its agent, on
+#      every pane it creates, in single- and multi-agent mode (2.4.0+). A pane
+#      without it is not sandy's: a user split, or a pane an agent opened,
+#      such as an agent-teams teammate. Sandy before 2.4.0 set it in
+#      multi-agent mode only, and there a single-agent pane's agent is
+#      $SANDY_AGENT;
+#   3. $SANDY_AGENT (comma-separated) is spawn order;
+#   4. pane_index is NOT spawn order in the four-agent grid.
+# So identity is read from the option, never from pane_index, a scrollback
+# marker or the pane title. A pane without the option gets no row, except
+# the sole pane of a single-agent session, which is $SANDY_AGENT. So when any
+# pane carries the option only the options identify, and no version is read.
+#
+# A process in the session can rewrite or clear the option. That can only
+# stop delivery into this sandbox (two claude rows, or none), never redirect
+# it.
+#
+# The socket and key-file locations are Claude Code's, not sandy's.
+#
+# This file sits behind the read-only payload mount with the rest of the
+# relay chain: the daemon execs it, so it must be no more writable than the
+# daemon itself.
+set -uo pipefail
+
+PROC=/proc
+SOCK_DIR=/tmp/cc-socks
+KEY_DIR="$HOME/.claude/sessions"
+SESSION=sandy
+TAB="$(printf '\t')"
+
+panes() {
+    tmux list-panes -t "$SESSION" -F "#{pane_index}${TAB}#{pane_pid}${TAB}#{@sandy_pane_agent}" 2>/dev/null || true
+}
+
+ppid_of() { local l; l="$(cat "$PROC/$1/stat" 2>/dev/null)" || return 1; l="${l##*) }"; set -- $l; echo "$2"; }
+comm_of() { local l; l="$(cat "$PROC/$1/stat" 2>/dev/null)" || return 1; l="${l#*(}"; echo "${l%%)*}"; }
+
+is_agent() {  # $1 pid, $2 agent name
+    [ "$(comm_of "$1")" = "$2" ] && return 0
+    # Process substitution, not a `tr | grep -q` pipe: under pipefail, grep -q
+    # can match and exit while tr is still writing, and tr's SIGPIPE (141)
+    # would become the pipeline's status and hide a real match on a long
+    # command line.
+    grep -qxE "(.*/)?$2" < <(tr '\0' '\n' < "$PROC/$1/cmdline" 2>/dev/null)
+}
+
+descendants() {  # breadth-first over $PROC; prints pids nearest first
+    local q="$1" cur d
+    while [ -n "$q" ]; do
+        cur="${q%% *}"; q="${q#"$cur"}"; q="${q# }"
+        for d in "$PROC"/[0-9]*; do
+            d="${d##*/}"; [ "$(ppid_of "$d" 2>/dev/null)" = "$cur" ] || continue
+            echo "$d"; q="$q $d"
+        done
+    done
+}
+
+IFS=',' read -ra ORDER <<< "${SANDY_AGENT:-claude}"
+rows="$(panes)"; [ -n "$rows" ] || exit 0
+count="$(printf '%s\n' "$rows" | grep -c .)"
+
+# Rows are emitted in spawn order, matched by the option; pane_index is only
+# reported.
+for a in "${ORDER[@]}"; do
+    while IFS="$TAB" read -r idx ppid tag; do
+        [ -n "${idx:-}" ] || continue
+        if [ -z "$tag" ]; then
+            # Untagged: identified only as the sole pane of a single-agent
+            # session, which is then untagged throughout (sandy before 2.4.0).
+            # Any other untagged pane is a user split or a teammate.
+            [ "${#ORDER[@]}" -eq 1 ] && [ "$count" -eq 1 ] || continue
+            tag="${ORDER[0]}"
+        fi
+        [ "$tag" = "$a" ] || continue
+        apid="-"; sock="-"; key="-"
+        for d in $(descendants "$ppid"); do
+            is_agent "$d" "$a" || continue
+            if [ "$a" = "claude" ] && [ -S "$SOCK_DIR/$d.sock" ]; then apid="$d"; break; fi
+            [ "$apid" = "-" ] && apid="$d"
+        done
+        if [ "$a" = "claude" ] && [ "$apid" != "-" ]; then
+            [ -S "$SOCK_DIR/$apid.sock" ] && sock="$SOCK_DIR/$apid.sock"
+            for k in "$KEY_DIR/$apid".*.key; do [ -f "$k" ] && { key="$k"; break; }; done
+        fi
+        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$a" "$idx" "$ppid" "$apid" "$sock" "$key"
+    done <<< "$rows"
+done

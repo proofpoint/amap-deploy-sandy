@@ -1953,8 +1953,8 @@ class ManualCheckRegistryTest(unittest.TestCase):
         "ambiguous-target": (
             "With two `claude` panes live, a delegation yields an "
             "`ambiguous_target` outcome and remains in the spool; with one, it is "
-            "delivered. Needs a live container with two panes and sandy's real "
-            "`sandy-handoff-sessions`; the daemon's own suite in "
+            "delivered. Needs a live container with two panes and the payload's "
+            "`handoff-sessions`; the daemon's own suite in "
             "amap-connector-claude covers the counting logic."),
         "launchd-live": (
             "The launchd job LOADED, and the relay present after a real "

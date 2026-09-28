@@ -42,7 +42,7 @@ Everything lives once per host, under `$SANDY_HOME/features/amap/`:
 | Path | What it is | Whose |
 |---|---|---|
 | `feature.json` | sandy's feature **manifest**. Its `feature` section is the fleet **policy**, and `sandboxes`/`agents` hold the selection rule | yours to edit; `install` owns the `schema`/`create`/`mounts`/`expose` blocks |
-| `payload/` | the relay wrapper, the connector's binaries, `mcp-servers.json` and `INBOX-POLICY.md`. Mounted **read-only** at `/opt/sandy/features/amap` in every selected sandbox | `install` |
+| `payload/` | the relay wrapper, the session lister, the connector's binaries, `mcp-servers.json` and `INBOX-POLICY.md`. Mounted **read-only** at `/opt/sandy/features/amap` in every selected sandbox | `install` |
 | `router.json` | the router's config, **generated** from the policy | `install`; never hand-edit |
 | `roster/` | the fleet roster the router writes, mounted read-only into every selected sandbox | created empty by `install`, written by the router |
 | `selected.json` | **sandy's** verdict: which sandboxes the rule selected at their last launch | sandy |
