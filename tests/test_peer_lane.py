@@ -1453,11 +1453,59 @@ class VerifyUnitTest(SandboxFixture):
         self.assertIn("workspace tier", problems[0])
 
 
-    # --- `feature_entries` in the `--print-state` record. Shape as the sandy
-    # workspace reported it from sandy's unmerged amap-decouple branch
-    # (rappdw/sandy#381): state_dir is a HOST path, $SANDBOX_DIR/relay-state
+    # --- `feature_entries` in the `--print-state` record. Shape measured on a
+    # real launch of sandy PR #394 (amap-decouple, unreleased), as the sandy
+    # workspace reported it: state_dir is a HOST path, $SANDBOX_DIR/relay-state
     # for the designated entry and $SANDBOX_DIR/feature-state/<feature> for
-    # any other. Re-measure against a released sandy 2.4.0 before relying on it.
+    # any other. Re-check against the released sandy 2.4.0.
+
+    def _measured_record(self, amap_state="started"):
+        """The `--print-state` element from that launch: amap designated
+        (it sorts first), two other features' entries beside it, and another
+        feature whose name starts with "amap" in feature_problems. Host paths
+        are rebased onto this test's sandbox."""
+        sb = self.sandbox()
+
+        def entry(feature, path, state_dir, alias, state="started"):
+            return {"state": state, "restarts": 0, "last_exit_code": None,
+                    "last_restart_at": None, "executable_present": True, "path": path,
+                    "state_dir": str(state_dir), "relay_alias": alias, "disabled_by": None}
+        return {
+            "name": self.SLUG, "path": str(sb),
+            "relay": {"state": "started", "source": "manifest", "executable_present": True,
+                      "path": "/opt/sandy/features/amap/relay",
+                      "state_dir": str(sb / "relay-state"), "last_exit_code": None,
+                      "restarts": 0, "last_restart_at": None, "disabled_by": None},
+            "features": ["amap", "probea", "probeb"],
+            "feature_problems": ["amap-spec: no sandboxes include matched"],
+            "feature_entries": {
+                "amap": entry("amap", "/opt/sandy/features/amap/relay", sb / "relay-state",
+                              True, amap_state),
+                "probea": entry("probea", "/opt/sandy/features/probea/run",
+                                sb / "feature-state" / "probea", False),
+                "probeb": entry("probeb", "/opt/sandy/features/probeb/run",
+                                sb / "feature-state" / "probeb", False)},
+        }
+
+    def test_the_measured_record_passes_and_names_relay_state_as_our_log(self):
+        record = self._measured_record()
+        self.assertEqual(prov.supervisor_log_path(record),
+                         self.sandbox() / "relay-state" / prov.SUPERVISOR_LOG_NAME)
+        self.assertEqual(prov.verify_entry_started_record(self.SLUG, record), [])
+        self.assertEqual(prov.verify_relay_disabled_record(self.SLUG, record), [])
+
+    def test_another_feature_named_amap_something_is_not_our_selection_problem(self):
+        """The measured record carries "amap-spec: no sandboxes include
+        matched", another feature's refusal. The match is on "amap:" with the
+        colon; a bare "amap" prefix would report this feature unselected."""
+        self.assertEqual(prov.verify_selection(self.SLUG, self._measured_record()), [])
+
+    def test_the_measured_absent_shape_is_entry_not_started(self):
+        """State "absent" as sandy printed it for an entry whose `.state` was
+        never written (probeb, with the file removed after a stop)."""
+        problems = prov.verify_entry_started_record(
+            self.SLUG, self._measured_record(amap_state="absent"))
+        self.assertTrue(any(p.startswith("entry not started") for p in problems), problems)
 
     def _entries_record(self, state_dir, *, disabled_by=None, relay_state_dir=None):
         return {"name": self.SLUG,
@@ -2138,10 +2186,25 @@ class RelayStartedAndMountsTest(unittest.TestCase):
 
 
     # --- sandy's per-feature entries (`feature_entries`) in the marker.
-    # Shape as the sandy workspace reported it from sandy's unmerged
-    # amap-decouple branch (rappdw/sandy#381): per feature, exactly
-    # {path, relay_alias, disabled_by}. Re-measure against a released
-    # sandy 2.4.0 marker before relying on it.
+    # Shape measured on a real launch of sandy PR #394 (amap-decouple,
+    # unreleased), as the sandy workspace reported it: per feature, exactly
+    # {path, relay_alias, disabled_by}. Re-check against the released sandy
+    # 2.4.0 marker.
+
+    def test_the_measured_marker_passes(self):
+        """The marker from that launch: amap designated, two other features'
+        entries beside it."""
+        doc = {"relay": {"source": "manifest", "path": "/opt/sandy/features/amap/relay",
+                         "disabled_by": None},
+               "feature_entries": {
+                   "amap": {"path": "/opt/sandy/features/amap/relay", "relay_alias": True,
+                            "disabled_by": None},
+                   "probea": {"path": "/opt/sandy/features/probea/run",
+                              "relay_alias": False, "disabled_by": None},
+                   "probeb": {"path": "/opt/sandy/features/probeb/run",
+                              "relay_alias": False, "disabled_by": None}},
+               "offline": False}
+        self.assertEqual(self._started(doc), [])
 
     @staticmethod
     def _entry(path=None, relay_alias=True, disabled_by=None):
