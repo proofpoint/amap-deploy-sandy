@@ -296,10 +296,11 @@ CONTAINER_FEATURE_DIR = f"{CONTAINER_FEATURES_ROOT}/{FEATURE_NAME}"
 FEATURE_BIN_SUBDIR = "bin"
 CONTAINER_FEATURE_BIN = f"{CONTAINER_FEATURE_DIR}/{FEATURE_BIN_SUBDIR}"
 # What sandy supervises: the wrapper on the read-only feature payload, named
-# by the manifest's `entry`. Sandy's relay precedence is an explicit relay
-# variable, then a per-sandbox relay, then `entry`; this deployment declares
-# only the last. A started relay proves the daemon runs; only a delivered
-# message proves sandy's cross-session gate accepted it.
+# by the manifest's `entry`. From sandy 2.2.0 a feature manifest's `entry` is
+# the only relay producer (an operator-set relay path is refused), and sandy
+# pins ONE selected feature's entry as the relay. A started relay proves the
+# daemon runs; only a delivered message proves sandy's cross-session gate
+# accepted it.
 MANIFEST_ENTRY = f"{FEATURE_PAYLOAD_SUBDIR}/{RELAY_WRAPPER_NAME}"
 # A feature contributes LAUNCH ARGUMENTS to the agent it
 # selects, per agent name, applied at the selecting launch before the agent
@@ -321,9 +322,9 @@ SANDY_SESSION_MARKER_NAME = "sandy-session.json"
 # Where that entry RESOLVES inside the container, which is what sandy records
 # as `relay.path` in the session marker. The `payload/` component drops out
 # because the payload directory is itself what is mounted at the feature dir.
-# This is the surface that distinguishes sandy's three relay producers from
-# one another — an explicit override, a per-sandbox relay, and the manifest's
-# entry all set `path`, and only this value means the last of them.
+# This is the surface that tells this feature's entry from another selected
+# feature's: both set `relay.source` to "manifest", and only this `path` means
+# ours.
 CONTAINER_ENTRY_PATH = f"{CONTAINER_FEATURE_DIR}/{RELAY_WRAPPER_NAME}"
 
 # The two chain files copied from the connector checkout, in install order;
@@ -1696,6 +1697,7 @@ def _read_json(path: Path) -> Any:
 
 SANDY_SESSION_FILE = "/etc/sandy-session.json"
 SANDY_SESSION_RELAY_KEY = "relay"             # the session marker's relay object: {"path", "source", "disabled_by"}
+RELAY_SOURCE_MANIFEST = "manifest"            # `relay.source` when a feature manifest's `entry` supplied the relay
 
 
 def verify_relay_started(slug: str, container: str, *, docker_bin: str = "docker") -> List[str]:
@@ -1710,9 +1712,12 @@ def verify_relay_started(slug: str, container: str, *, docker_bin: str = "docker
     What it proves, and nothing else does, is that sandy accepted a relay for
     this sandbox at all — nothing this tool writes can make it true. The
     marker's `relay` object carries `path`, `source` and `disabled_by`. The
-    verdict is read off `path`: sandy has more than one relay producer (an
-    explicit override and the manifest's `entry`), `path` is the one surface
-    where they differ, and only the entry is the payload this tool verifies.
+    verdict is read off `path`: from sandy 2.2.0 the relay is always some
+    selected feature's `entry` (`source` "manifest", or "none" when no entry
+    was adopted), and `path` is the one surface that says WHICH feature's.
+    Only this feature's entry is the payload this tool verifies. A `source`
+    of "explicit" or "slot" is a marker written by a sandy older than
+    SANDY_FLOOR, which a relaunch rewrites.
 
     `disabled_by` names the tier that turned the capability off (env, host
     or workspace): a cloned repository shipping `SANDY_RELAY=0` would
@@ -1752,11 +1757,33 @@ def verify_relay_started(slug: str, container: str, *, docker_bin: str = "docker
                 f"resolved no `entry` from the manifest. Run `install --apply` (which writes "
                 f"the entry) and RELAUNCH; the marker records launch intent and nothing "
                 f"since, so it cannot have noticed a later fix"]
-    return [f"relay elsewhere: {slug}: sandy is running {path!r}"
-            + (f" (relay.source={source!r})" if source else "") + f", not the manifest's "
-            f"entry at {CONTAINER_ENTRY_PATH} — an explicit relay override was set for this "
-            f"sandbox and it WINS over the entry, so the payload wrapper everything else "
-            f"here verifies is idle. Clear the override and relaunch"]
+    if source != RELAY_SOURCE_MANIFEST:
+        return [f"relay elsewhere: {slug}: sandy is running {path!r}"
+                + (f" (relay.source={source!r})" if source else "") + f", not the "
+                f"manifest's entry at {CONTAINER_ENTRY_PATH}. Only a sandy older than "
+                f"{SANDY_FLOOR} records a relay from anywhere but a feature manifest, so "
+                f"{container} was launched by one. Relaunch it under sandy {SANDY_FLOOR} "
+                f"or later"]
+    other = _feature_of_entry_path(path)
+    who = f"the {other!r} feature's entry" if other else "another feature's entry"
+    return [f"relay elsewhere: {slug}: sandy pinned {who} ({path!r}) as this sandbox's "
+            f"relay, not {FEATURE_NAME}'s at {CONTAINER_ENTRY_PATH}. The relay record, "
+            f"and the supervisor log this tool reads through it, describe that entry, so "
+            f"the payload wrapper everything else here verifies may not be running. "
+            f"Exclude {FEATURE_NAME} or that feature from this sandbox, or remove that "
+            f"feature's `entry`, and relaunch. There is no relay override to clear: "
+            f"sandy {SANDY_FLOOR} and later refuse one"]
+
+
+def _feature_of_entry_path(path: str) -> Optional[str]:
+    """The feature whose payload `path` sits in, when it is under sandy's
+    container features root (`/opt/sandy/features/<feature>/...`); None for
+    any other path."""
+    root = CONTAINER_FEATURES_ROOT + "/"
+    if not path.startswith(root):
+        return None
+    name = path[len(root):].split("/", 1)[0]
+    return name or None
 
 
 # Sandy's relay supervisor writes this file in the relay's state directory,
