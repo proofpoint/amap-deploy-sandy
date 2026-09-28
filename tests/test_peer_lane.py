@@ -1454,10 +1454,10 @@ class VerifyUnitTest(SandboxFixture):
 
 
     # --- `feature_entries` in the `--print-state` record. Shape measured on a
-    # real launch of sandy PR #394 (amap-decouple, unreleased), as the sandy
-    # workspace reported it: state_dir is a HOST path, $SANDBOX_DIR/relay-state
-    # for the designated entry and $SANDBOX_DIR/feature-state/<feature> for
-    # any other. Re-check against the released sandy 2.4.0.
+    # real launch of sandy 2.4.0's tree (PR #394; v2.4.0 adds only the version
+    # string), as the sandy workspace reported it: state_dir is a HOST path,
+    # $SANDBOX_DIR/relay-state for the designated entry and
+    # $SANDBOX_DIR/feature-state/<feature> for any other.
 
     def _measured_record(self, amap_state="started"):
         """The `--print-state` element from that launch: amap designated
@@ -2186,10 +2186,9 @@ class RelayStartedAndMountsTest(unittest.TestCase):
 
 
     # --- sandy's per-feature entries (`feature_entries`) in the marker.
-    # Shape measured on a real launch of sandy PR #394 (amap-decouple,
-    # unreleased), as the sandy workspace reported it: per feature, exactly
-    # {path, relay_alias, disabled_by}. Re-check against the released sandy
-    # 2.4.0 marker.
+    # Shape measured on a real launch of sandy 2.4.0's tree (PR #394; v2.4.0
+    # adds only the version string), as the sandy workspace reported it: per
+    # feature, exactly {path, relay_alias, disabled_by}.
 
     def test_the_measured_marker_passes(self):
         """The marker from that launch: amap designated, two other features'

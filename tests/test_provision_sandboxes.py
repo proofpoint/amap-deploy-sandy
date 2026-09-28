@@ -560,8 +560,8 @@ class MembershipTest(unittest.TestCase):
         self.assertIn("redteam", states["e-5"][1])
 
     def test_another_feature_named_amap_something_is_not_our_verdict(self):
-        """A real sandy 2.4 record (sandy PR #394, as the sandy workspace
-        reported it) carried "amap-spec: no sandboxes include matched", a
+        """A real sandy 2.4.0 record (the sandy workspace's launch of PR #394,
+        which v2.4.0 matches but for the version string) carried "amap-spec: no sandboxes include matched", a
         different feature's refusal. The match is "amap:" with the colon, so
         a sandbox with no verdict for this feature stays unknown."""
         _select(self.home, "a-1")
