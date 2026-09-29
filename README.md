@@ -27,7 +27,7 @@ runs inside a sandbox, and nothing here can send or receive a message.
 
 ## Requirements
 
-- **sandy 2.2.0 or later** (`--print-schema` reports `schema_version` 3).
+- **sandy 2.2.0 or later** (`--print-schema` reports `schema_version` 3 or 4).
   `install` refuses an older sandy, because on one every later step would
   report success while sandy read none of it.
   On sandy 2.4.0 or later, `install` also declares `receives:

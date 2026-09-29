@@ -282,14 +282,20 @@ MANIFEST_SLUG = "${slug}"                            # the only substitution san
 # repo renders so a manifest it writes can never fail sandy's validator for a
 # reason it could have caught first.
 SANDY_SEGMENT_RE = re.compile(r"^[A-Za-z0-9._-]+$")
-# `--print-schema`'s `schema_version` tokens this deployment has REVIEWED: 3
-# (sandy 2.2.0: `relay.state_dir` on --print-state, `SANDY_RELAY=0` stopping a
-# manifest entry too). OPAQUE TOKENS compared by membership — never parsed,
+# `--print-schema`'s `schema_version` tokens this deployment has REVIEWED:
+#   3  sandy 2.2.0 to 2.5.x: `relay.state_dir` on --print-state, `SANDY_RELAY=0`
+#      stopping a manifest entry too; from 2.4.0 also `feature_entries`.
+#   4  sandy with `relay{}` removed from the marker and --print-state. A
+#      marker's `feature_entries.<f>` is `{path}` alone (no `relay_alias`, no
+#      `disabled_by`), every entry's state_dir is `feature-state/<f>`, setting
+#      SANDY_RELAY is a launch error, and there is no relay-legacy inbound
+#      default. Every relay question is answered from `feature_entries`.
+# OPAQUE TOKENS compared by membership — never parsed,
 # ordered or int()ed: `2.0.0-dev` equals `2.0.0` under every version
 # comparison. A bump is sandy's signal that a field changed meaning, and the
 # gate going FALSE on an unreviewed token is the gate working: add the token
 # here only after reading what moved.
-SANDY_SCHEMA_VERSIONS = (3,)
+SANDY_SCHEMA_VERSIONS = (3, 4)
 # The three words `selection_states` answers with, per sandbox. Sandy's
 # verdict is `selected` / `not selected`; `unknown` is this side's word for
 # "not launched since the manifest was written" — neither answer, and never
@@ -325,10 +331,12 @@ SYSTEM_PROMPT_FILE_FLAG = "--append-system-prompt-file"   # Claude Code: append 
 # without a container, for a stopped sandbox too. Last launch, not next.
 SANDY_SESSION_MARKER_NAME = "sandy-session.json"
 # Sandy's per-feature entry record, in the session marker (`{path, relay_alias,
-# disabled_by}` per feature) and in `--print-state` (the same, plus `state_dir`,
-# a HOST path, and supervisor counters). Where it is reported, this feature's
-# own entry answers every relay question and `relay{}` is not read: `relay{}`
-# describes whichever ONE entry sandy designated, which need not be ours.
+# disabled_by}` per feature under schema 3, `{path}` under schema 4) and in
+# `--print-state` (the same, plus `state_dir`, a HOST path, and supervisor
+# counters). Where it is reported, this feature's own entry answers every relay
+# question and `relay{}` is not read: under schema 3 `relay{}` describes
+# whichever ONE entry sandy designated, which need not be ours, and schema 4
+# has no `relay{}`.
 FEATURE_ENTRIES_KEY = "feature_entries"
 
 # Where that entry RESOLVES inside the container, which is what sandy records

@@ -1560,13 +1560,33 @@ class SandyManifestGateTest(unittest.TestCase):
         self.assertIs(prov.sandy_manifest_capable()[0], False)
 
     def test_an_unreviewed_token_is_refused_by_name(self):
-        """4 has not been reviewed, so the gate goes FALSE — naming both the
+        """5 has not been reviewed, so the gate goes FALSE — naming both the
         token and the reason."""
-        self._with({**self.SCHEMA_3, "schema_version": 4})
+        self._with({**self.SCHEMA_3, "schema_version": 5})
         ok, why = prov.sandy_manifest_capable()
         self.assertIs(ok, False)
-        self.assertIn("schema_version=4", why)
+        self.assertIn("schema_version=5", why)
         self.assertIn("reviewed", why)
+
+    # sandy's schema 4 `--print-schema`, from the sandy workspace's real launch
+    # of its relay-removal branch (f10aea6): compatibility {current 4,
+    # supported [4]}, the manifest block unchanged.
+    def _schema_4(self):
+        return {**self.SCHEMA_3, "schema_version": 4,
+                "compatibility": {"current_schema_version": 4,
+                                  "supported_schema_versions": [4]},
+                "manifest": self.MANIFEST_2_4}
+
+    def test_schema_4_is_reviewed_and_capable_and_3_still_is(self):
+        """Both during the rollout: a host still on sandy 2.5 (3) keeps
+        working while another has upgraded (4)."""
+        for schema in (self.SCHEMA_3, self._schema_4()):
+            with self.subTest(schema_version=schema["schema_version"]):
+                self._with(schema)
+                ok, why = prov.sandy_manifest_capable()
+                self.assertIs(ok, True, why)
+        self._with(self._schema_4())
+        self.assertIs(prov.sandy_accepts_receives(), True)
 
     def test_no_schema_version_or_unreadable_is_unknown_and_still_a_refusal(self):
         self._with(self.SCHEMA_NONE)

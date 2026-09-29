@@ -1509,6 +1509,46 @@ class VerifyUnitTest(SandboxFixture):
                                 sb / "feature-state" / "probeb", False)},
         }
 
+    def _schema_4_record(self, amap_state="started"):
+        """The schema 4 `--print-state` element: no `relay` key, every entry's
+        state_dir under feature-state/, no relay_alias or disabled_by. From
+        the sandy workspace's real launch of its relay-removal branch
+        (f10aea6), with amap in place of a probe and host paths rebased."""
+        sb = self.sandbox()
+
+        def entry(feature, state="started"):
+            return {"state": state, "restarts": 0, "last_exit_code": None,
+                    "last_restart_at": None, "executable_present": True,
+                    "path": (prov.CONTAINER_ENTRY_PATH if feature == prov.FEATURE_NAME
+                             else f"/opt/sandy/features/{feature}/run"),
+                    "state_dir": str(sb / "feature-state" / feature)}
+        return {"name": self.SLUG, "path": str(sb),
+                "features": [prov.FEATURE_NAME, "probeb"], "feature_problems": [],
+                "feature_entries": {prov.FEATURE_NAME: entry(prov.FEATURE_NAME, amap_state),
+                                    "probeb": entry("probeb")}}
+
+    def test_schema_4_record_reads_our_log_from_feature_state(self):
+        record = self._schema_4_record()
+        log = self.sandbox() / "feature-state" / prov.FEATURE_NAME / prov.SUPERVISOR_LOG_NAME
+        self.assertEqual(prov.supervisor_log_path(record), log)
+        log.parent.mkdir(parents=True)
+        log.write_text(
+            "(header)\n"
+            f"[sandy-entry {prov.FEATURE_NAME}] {self._ts(120)} start {prov.CONTAINER_ENTRY_PATH}\n"
+            "inbox-delivery: fatal: something\n"
+            f"[sandy-entry {prov.FEATURE_NAME}] {self._ts(119)} exit rc=2 uptime=0s; "
+            "restart in 60s\n")
+        problems = prov.verify_relay_supervisor(self.sandbox(), self.SLUG, record=record)
+        self.assertTrue(any(p.startswith("relay is down") for p in problems), problems)
+        self.assertEqual(prov.verify_relay_disabled_record(self.SLUG, record), [])
+        self.assertEqual(prov.verify_selection(self.SLUG, record), [])
+        self.assertEqual(prov.verify_entry_started_record(self.SLUG, record), [])
+
+    def test_schema_4_record_with_our_entry_absent_is_entry_not_started(self):
+        problems = prov.verify_entry_started_record(
+            self.SLUG, self._schema_4_record(amap_state="absent"))
+        self.assertTrue(any(p.startswith("entry not started") for p in problems), problems)
+
     def test_the_measured_record_passes_and_names_relay_state_as_our_log(self):
         record = self._measured_record()
         self.assertEqual(prov.supervisor_log_path(record),
@@ -2278,6 +2318,27 @@ class RelayStartedAndMountsTest(unittest.TestCase):
         problems = self._started(doc)
         self.assertTrue(any(p.startswith("relay elsewhere") for p in problems), problems)
         self.assertIn("install --apply", problems[0])
+
+    # --- schema 4: `relay{}` removed. Shape from the sandy workspace's real
+    # launch of its relay-removal branch (f10aea6): the marker has no `relay`
+    # key, and each `feature_entries.<f>` is exactly {path}.
+
+    def test_schema_4_marker_with_our_entry_passes(self):
+        doc = {"cross_session_inbound": "accept",
+               "cross_session_inbound_source": f"feature:{prov.FEATURE_NAME}",
+               "feature_entries": {
+                   prov.FEATURE_NAME: {"path": prov.CONTAINER_ENTRY_PATH},
+                   "probeb": {"path": "/opt/sandy/features/probeb/run"}}}
+        self.assertEqual(self._started(doc), [])
+
+    def test_schema_4_marker_failures_are_still_named(self):
+        not_adopted = {"feature_entries": {"probeb": {"path": "/opt/sandy/features/probeb/run"}}}
+        problems = self._started(not_adopted)
+        self.assertTrue(any(p.startswith("relay not configured") for p in problems), problems)
+        moved = {"feature_entries": {prov.FEATURE_NAME: {
+            "path": f"{prov.CONTAINER_FEATURE_DIR}/old-relay"}}}
+        problems = self._started(moved)
+        self.assertTrue(any(p.startswith("relay elsewhere") for p in problems), problems)
 
     def test_null_or_absent_entries_fall_back_to_the_relay_record(self):
         """Null (a launch before the upgrade) and absent (an older sandy) are
