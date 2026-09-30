@@ -429,6 +429,13 @@ def discover_sandboxes(sandy_bin: str = "sandy") -> List[Dict[str, str]]:
             # every entry it will not, with the reason. Carried whole.
             "features": b.get("features"),
             "feature_problems": b.get("feature_problems"),
+            # The last launch's applied launch arguments, the marker they
+            # were read from (`{state, sandy_version, launched_at}`, which says
+            # what a null above means), and the cross-session inputs. Absent
+            # on a sandy that predates them. Carried whole.
+            AGENT_ARGS_KEY: b.get(AGENT_ARGS_KEY),
+            MARKER_KEY: b.get(MARKER_KEY),
+            CROSS_SESSION_INBOUND_KEY: b.get(CROSS_SESSION_INBOUND_KEY),
         }
         for b in boxes
         if b.get("name") and b.get("path")
@@ -1679,7 +1686,11 @@ def read_session_marker(sandbox_dir: Path) -> Optional[Dict[str, Any]]:
     return doc if isinstance(doc, dict) else None
 
 
-def verify_agent_args(sandbox_dir: Path, slug: str) -> Tuple[List[str], List[str]]:
+SETTINGS_FLAG = "--settings"                  # Claude Code: settings from a file, last-wins
+
+
+def verify_agent_args(sandbox_dir: Path, slug: str,
+                      record: Optional[Dict[str, Any]] = None) -> Tuple[List[str], List[str]]:
     """`(problems, notes)`: what sandy APPLIED for this feature at the
     sandbox's last launch, against what the manifest asks for now.
 
@@ -1695,15 +1706,35 @@ def verify_agent_args(sandbox_dir: Path, slug: str) -> Tuple[List[str], List[str
     has the same remedy — relaunch — and none of it is drift (the manifest
     itself is verified against its rendering by `verify_manifest`). A
     verify that went red on a fleet that had merely not relaunched yet
-    would teach an operator to scroll past the line that matters."""
+    would teach an operator to scroll past the line that matters. The one
+    exception is a marker sandy reports it cannot read: that is UNKNOWN.
+
+    WHERE IT COMES FROM. Where sandy's `--print-state` record carries
+    `marker`, `agent_args` is read from the record and a null is read
+    against `marker.state` (sandy writes no deliberate null there).
+    Otherwise the host copy of the marker is read directly."""
     problems: List[str] = []
     notes: List[str] = []
-    doc = read_session_marker(sandbox_dir)
-    if doc is None:
-        notes.append(f"{slug}: no {SANDY_SESSION_MARKER_NAME} on the host — not launched "
-                     f"yet, so what sandy applies for it is not knowable until it is")
-        return problems, notes
-    recorded = doc.get(AGENT_ARGS_KEY)
+    marker = record.get(MARKER_KEY) if isinstance(record, dict) else None
+    if isinstance(marker, dict):
+        state = marker.get("state")
+        if state == MARKER_ABSENT:
+            notes.append(f"{slug}: sandy reports no marker — not launched yet, so what "
+                         f"sandy applies for it is not knowable until it is")
+            return problems, notes
+        if state != MARKER_PRESENT:
+            problems.append(f"agent_args unverifiable: {slug}: sandy reports its marker as "
+                            f"{state!r}, so what its last launch applied cannot be read — "
+                            f"relaunch it")
+            return problems, notes
+        recorded = record.get(AGENT_ARGS_KEY)
+    else:
+        doc = read_session_marker(sandbox_dir)
+        if doc is None:
+            notes.append(f"{slug}: no {SANDY_SESSION_MARKER_NAME} on the host — not launched "
+                         f"yet, so what sandy applies for it is not knowable until it is")
+            return problems, notes
+        recorded = doc.get(AGENT_ARGS_KEY)
     want = agent_args_for_manifest()[MANIFEST_AGENT]
     if recorded is None:
         notes.append(f"{slug}: its last launch was under a sandy that did not record "
@@ -1718,6 +1749,7 @@ def verify_agent_args(sandbox_dir: Path, slug: str) -> Tuple[List[str], List[str
     entries = recorded.get(MANIFEST_AGENT)
     ours = None
     others_with_mcp: List[str] = []
+    with_settings: List[str] = []
     for e in (entries if isinstance(entries, list) else []):
         if not isinstance(e, dict):
             continue
@@ -1725,6 +1757,12 @@ def verify_agent_args(sandbox_dir: Path, slug: str) -> Tuple[List[str], List[str
             ours = e.get("args")
         elif MCP_CONFIG_FLAG in (e.get("args") or []):
             others_with_mcp.append(str(e.get("feature")))
+        if SETTINGS_FLAG in (e.get("args") or []):
+            with_settings.append(str(e.get("feature")))
+    if with_settings:
+        notes.append(f"{slug}: {', '.join(sorted(with_settings))} pass {SETTINGS_FLAG}, which "
+                     f"Claude Code reads last-wins and which can set {CROSS_SESSION_KEY}; the "
+                     f"cross-session check does not read it")
     if ours is None:
         notes.append(f"{slug}: its last launch applied no {AGENT_ARGS_KEY} for {FEATURE_NAME} "
                      f"(the manifest declared none then, or did not select it) — relaunch "
@@ -2458,8 +2496,114 @@ def _cross_session_value(path: Optional[Path]) -> Optional[str]:
     return value if isinstance(value, str) else None
 
 
+#: The workspace's COMMITTED settings file. Claude Code reads `crossSessionInbound`
+#: from it too, and there it can only tighten, like `settings.local.json`. Sandy
+#: neither writes nor reports it, so this reads it, with sandy's own guards:
+#: it is repository content, and a symlink, a FIFO (which would block the
+#: read, and `verify`, forever) or an oversized file is not opened.
+WORKSPACE_COMMITTED_SETTINGS = "settings.json"
+WORKSPACE_SETTINGS_MAX_BYTES = 1048576
+#: `--print-state`'s `cross_session_inbound` statuses this check reads. Any
+#: other status is UNKNOWN: sandy's vocabulary may grow.
+SETTING_OK = "ok"
+SETTING_NONE = ("key_absent", "file_absent")
+SETTING_NOT_OBJECT = "not_object"
+PINNED_NOT_CLAUDE = "not_claude"
+PINNED_NOT_WRITTEN = "not_written"
+MARKER_KEY = "marker"
+MARKER_ABSENT = "absent"
+MARKER_PRESENT = "present"
+CROSS_SESSION_INBOUND_KEY = "cross_session_inbound"
+#: What the cross-session verdict covers, stated once per run: the check reads
+#: these inputs and no others, and Claude Code's precedence among them is the
+#: one sandy documents as measured.
+CROSS_SESSION_COVERAGE = (
+    "cross-session inbound: verify reads the sandbox's claude/settings.json and the "
+    "workspace's .claude/settings.local.json (from sandy's --print-state where it reports "
+    "them) and the workspace's committed .claude/settings.json; a `--settings` flag in "
+    "agent_args is named where one is found and not read")
+
+
+def _workspace_setting(workspace: Optional[Path], name: str) -> Tuple[Optional[str], Optional[str]]:
+    """`(value, trouble)` for `crossSessionInbound` in `<workspace>/.claude/<name>`.
+    `trouble` is None when the answer is known (a value, or none there), and
+    otherwise says why it is not."""
+    if workspace is None:
+        return None, None
+    d = Path(workspace) / ".claude"
+    f = d / name
+    if d.is_symlink() or f.is_symlink():
+        return None, "is a symlink, which is not followed"
+    if not f.exists():
+        return None, None
+    if not f.is_file():
+        return None, "is not a regular file"
+    try:
+        if f.stat().st_size > WORKSPACE_SETTINGS_MAX_BYTES:
+            return None, "is over 1 MiB"
+        doc = json.loads(f.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError) as e:
+        return None, f"cannot be read ({e})"
+    except json.JSONDecodeError:
+        return None, "is not valid JSON"
+    if not isinstance(doc, dict):
+        return None, "is not a JSON object"
+    value = doc.get(CROSS_SESSION_KEY)
+    if value is None:
+        return None, None
+    return (value if isinstance(value, str) else json.dumps(value)), None
+
+
+def _reported_setting(obj: Any) -> Tuple[Optional[str], Optional[str]]:
+    """`(value, trouble)` from one `--print-state` settings-file object."""
+    status = obj.get("status") if isinstance(obj, dict) else None
+    if status == SETTING_OK:
+        value = obj.get("value")
+        return (value if isinstance(value, str) else None), None
+    if status in SETTING_NONE:
+        return None, None
+    if status == SETTING_NOT_OBJECT:
+        return None, ("is torn or not a JSON object (sandy issue #400 tears the user copy "
+                      "under a single-file bind mount)")
+    return None, f"is reported by sandy as {status!r}"
+
+
+def _pinned_verdict(slug: str, record: Dict[str, Any],
+                    pinned: Any) -> Optional[Tuple[List[str], List[str]]]:
+    """The verdict `--print-state`'s `pinned` value settles on its own, or
+    None when it is `ok` and the settings files decide. A null `pinned` is
+    read against `marker.state`: sandy never writes a deliberate null there."""
+    if pinned is None:
+        marker = record.get(MARKER_KEY)
+        state = marker.get("state") if isinstance(marker, dict) else None
+        if state == MARKER_ABSENT:
+            return [], [f"{slug}: not launched (sandy reports no marker), so no "
+                        f"{CROSS_SESSION_KEY} has been resolved; it is resolved at launch"]
+        if state == MARKER_PRESENT:
+            return [], [f"{slug}: its last launch was under a sandy that did not record the "
+                        f"resolved {CROSS_SESSION_KEY} — LAG: relaunch it"]
+        return [f"cross-session inbound unverifiable: {slug}: sandy reports no pinned "
+                f"{CROSS_SESSION_KEY} and its marker as {state!r} — relaunch it, and check "
+                f"`sandy --print-state` if this persists"], []
+    status = pinned.get("status") if isinstance(pinned, dict) else None
+    if status == SETTING_OK:
+        return None
+    if status == PINNED_NOT_CLAUDE:
+        return [], [f"{slug}: its last launch ran no Claude Code agent ({CROSS_SESSION_KEY} "
+                    f"is Claude-only), so the Claude Code connector installed here can never "
+                    f"deliver — exclude this sandbox in the policy"]
+    if status == PINNED_NOT_WRITTEN:
+        return [f"cross-session inbound not set: {slug}: Claude Code runs, but sandy's "
+                f"writes of {CROSS_SESSION_KEY} were refused at its last launch, so nothing "
+                f"resolved it and delegations may be refused. Check that the sandbox's "
+                f"claude/ and the workspace's .claude/ are writable, then relaunch"], []
+    return [f"cross-session inbound unverifiable: {slug}: sandy reports the pinned "
+            f"{CROSS_SESSION_KEY} as {status!r} — relaunch it"], []
+
+
 def verify_cross_session_inbound(
     sandbox_dir: Path, slug: str, workspace: Optional[Path],
+    record: Optional[Dict[str, Any]] = None,
 ) -> Tuple[List[str], List[str]]:
     """`(problems, notes)` for whether this sandbox will ACCEPT an injection.
 
@@ -2468,29 +2612,59 @@ def verify_cross_session_inbound(
     no reason attached because the router forwards none — while mounts,
     trees and peer edges are all green.
 
-    Read from BOTH files, because they are not peers. The container's
-    `claude/settings.json` is the copy that can deliver `accept`; the
-    workspace's `.claude/settings.local.json` is a tighten-only seam, and a
-    `hold`/`refuse` there wins over it. Reading only the first would report a
-    sandbox as reachable while the seam quietly refuses everything.
+    THE INPUTS ARE NOT PEERS. The container's `claude/settings.json` is the
+    copy that can deliver `accept`. The workspace's `.claude/settings.local.json`
+    (which sandy writes) and its committed `.claude/settings.json` (which it
+    does not) are tighten-only: a `hold` or `refuse` in either wins over the
+    first, and the stricter of the two wins. Reading only the container's
+    copy would report a sandbox as reachable while a workspace file quietly
+    refuses everything.
+
+    WHERE THE VALUES COME FROM. Where sandy's `--print-state` record reports
+    `cross_session_inbound`, the pinned launch value and both files it writes
+    are read from there, and its statuses decide what is known. Otherwise
+    the two files are read directly. The committed file is always read here,
+    since sandy does not report it. Anything that cannot be read is UNKNOWN,
+    and a problem.
 
     `hold` is a NOTE, not a problem: it gates delivery behind the recipient
     user's approval rather than breaking it, the router treats the resulting
     `held` outcome as an alert rather than a failure, and an operator who set
-    it meant it. Failing on it would make `verify` red forever over a
-    deliberate choice.
+    it meant it.
 
-    An ABSENT value is also a note. It means sandy has never resolved one here
-    — a sandbox not launched since before the setting existed — and what
-    Claude Code then defaults to is not ours to assert. Saying "this will
-    refuse" would be a guess; saying nothing would hide a sandbox nobody can
-    reach.
+    An ABSENT value is also a note: what Claude Code then defaults to is not
+    ours to assert.
     """
-    user = _cross_session_value(Path(sandbox_dir) / "claude" / "settings.json")
-    seam = _cross_session_value(
-        Path(workspace) / ".claude" / "settings.local.json" if workspace else None)
-    effective = seam if seam in CROSS_SESSION_TIGHTENINGS else user
-    where = "the workspace seam" if seam in CROSS_SESSION_TIGHTENINGS else "its own settings"
+    csi = record.get(CROSS_SESSION_INBOUND_KEY) if isinstance(record, dict) else None
+    if isinstance(csi, dict):
+        settled = _pinned_verdict(slug, record, csi.get("pinned"))
+        if settled is not None:
+            return settled
+        user, user_trouble = _reported_setting(csi.get("user_settings"))
+        local, local_trouble = _reported_setting(csi.get("workspace_settings"))
+    else:
+        user, user_trouble = _cross_session_value(
+            Path(sandbox_dir) / "claude" / "settings.json"), None
+        local, local_trouble = _cross_session_value(
+            Path(workspace) / ".claude" / "settings.local.json" if workspace else None), None
+    committed, committed_trouble = _workspace_setting(workspace, WORKSPACE_COMMITTED_SETTINGS)
+    troubles = [f"{label} {why}" for label, why in (
+        ("the sandbox's claude/settings.json", user_trouble),
+        ("the workspace's .claude/settings.local.json", local_trouble),
+        ("the workspace's committed .claude/settings.json", committed_trouble)) if why]
+    if troubles:
+        return [f"cross-session inbound unverifiable: {slug}: {'; '.join(troubles)} — so "
+                f"whether this instance accepts delegations cannot be told. Fix or remove "
+                f"that file, then relaunch"], []
+
+    seams = ((local, "the workspace seam"),
+             (committed, "the workspace's committed .claude/settings.json"))
+    effective, where = user, "its own settings"
+    for tightening in reversed(CROSS_SESSION_TIGHTENINGS):
+        hit = [w for v, w in seams if v == tightening]
+        if hit:
+            effective, where = tightening, hit[0]
+            break
     if effective == CROSS_SESSION_ACCEPT:
         return [], []
     if effective is None:
@@ -2501,7 +2675,8 @@ def verify_cross_session_inbound(
         # running another agent would get a Claude Code connector and a daemon
         # that injects into a Claude Code session, and its only symptom would
         # be a relay crash-looping on a `~/.claude` tree that never exists —
-        # so the note says what the absence can mean.
+        # so the note says what the absence can mean. Where `--print-state`
+        # reports `pinned`, the second cause arrives as `not_claude` instead.
         return [], [f"{slug}: no {CROSS_SESSION_KEY} resolved. TWO causes, and they need "
                     f"different fixes: this sandbox has not been launched since the "
                     f"setting existed (launch it once), OR it does not run Claude Code at "
@@ -2513,10 +2688,13 @@ def verify_cross_session_inbound(
         return [], [f"{slug}: {CROSS_SESSION_KEY} is 'hold' ({where}) — delegations are "
                     f"held for the recipient user's approval, not delivered. Deliberate if "
                     f"you set it; the router reports these as `held`, an alert, not a fault"]
+    committed_wins = where == seams[1][1]
+    remedy = ("Remove it from that file in the repository: sandy does not write it, so a "
+              "relaunch does not change it" if committed_wins else
+              "Relaunch it so sandy re-resolves; the value is decided at launch")
     return ([f"{slug}: {CROSS_SESSION_KEY} is {effective!r} ({where}) — this instance will "
              f"REFUSE every delegation at the session level, and the sender is told only "
-             f"`refused` with no reason. Relaunch it so sandy re-resolves; the value is "
-             f"decided at launch"], [])
+             f"`refused` with no reason. {remedy}"], [])
 
 
 # ------------------------------------------------ the router's sibling config
@@ -2936,6 +3114,7 @@ def run_verify(args: argparse.Namespace, servers: Dict[str, dict], home: Path,
     problems += verify_roster_source(home)
     problems += verify_roster(home)
     problems += verify_roster_pointer_exposed(home)
+    notes.append(CROSS_SESSION_COVERAGE)
     notes.append(f"feature: {feature_root(home)} (manifest, payload, instances; sandy mounts "
                  f"the payload at {CONTAINER_FEATURE_DIR} — the mount is what is verified "
                  f"below, per running sandbox)")
@@ -2961,14 +3140,15 @@ def run_verify(args: argparse.Namespace, servers: Dict[str, dict], home: Path,
         # manifest declares now. Host-side, from sandy's own record, for a
         # stopped sandbox too — and every disagreement is LAG (relaunch),
         # never drift: the manifest is verified against its rendering above.
-        _args_problems, _args_notes = verify_agent_args(sandbox_dir, slug)
+        _args_problems, _args_notes = verify_agent_args(sandbox_dir, slug,
+                                                        record=records.get(slug))
         problems += _args_problems
         notes += _args_notes
         # Unconditional, and deliberately NOT gated on the sandbox running:
         # the value is resolved at launch and sits on disk afterwards, so a
         # stopped sandbox's answer is both readable and the one it will use.
         _refuse_problems, _refuse_notes = verify_cross_session_inbound(
-            sandbox_dir, slug, workspace)
+            sandbox_dir, slug, workspace, record=records.get(slug))
         problems += _refuse_problems
         notes += _refuse_notes
         # Liveness, the authority, and the invariant — all three only for

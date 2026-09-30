@@ -1877,7 +1877,7 @@ class VerifyEndToEndTest(SandboxFixture):
     helpers. A first cut of these called the check functions directly, which
     would have stayed green over a `main()` that never called them."""
 
-    def _run(self, selected=(None,), manifest_block=None):
+    def _run(self, selected=(None,), manifest_block=None, extra=None):
         """`selected` is the slugs whose last launch selected the feature —
         both, by default."""
         chosen = list(selected) if selected != (None,) else [self.SLUG, self.OTHER]
@@ -1886,7 +1886,8 @@ class VerifyEndToEndTest(SandboxFixture):
             {"name": s, "path": str(self.sandbox(s)), "workspace_path": f"/ws/{s}",
              "agents": ["claude"],
              "features": [prov.FEATURE_NAME] if s in chosen else [],
-             "feature_problems": [] if s in chosen else [f"{prov.FEATURE_NAME}: excluded"]}
+             "feature_problems": [] if s in chosen else [f"{prov.FEATURE_NAME}: excluded"],
+             **(extra or {})}
             for s in (self.SLUG, self.OTHER)]})
         schema = json.dumps({"schema_version": 3, "config": {"privileged_keys": []},
                              "manifest": manifest_block or {
@@ -1945,6 +1946,23 @@ class VerifyEndToEndTest(SandboxFixture):
                             for l in out.splitlines()), out)
         rc, out = self._run()
         self.assertFalse(any("manifest drift" in l for l in out.splitlines()), out)
+
+    def test_sandys_marker_and_cross_session_record_reach_the_checks(self):
+        """Through main(): with sandy 2.7's `marker` and `cross_session_inbound`
+        on each --print-state record (shapes from sandy main f996871), the
+        verdicts come from the record. No host marker or settings file exists
+        here, so these lines have no other producer."""
+        extra = {"marker": {"state": "unreadable", "sandy_version": None, "launched_at": None},
+                 "agent_args": None,
+                 "cross_session_inbound": {
+                     "pinned": {"value": None, "source": None, "status": "not_written"},
+                     "user_settings": {"value": None, "status": "file_absent"},
+                     "workspace_settings": {"value": None, "status": "file_absent"}}}
+        rc, out = self._run(extra=extra)
+        self.assertEqual(rc, 1)
+        self.assertIn(f"agent_args unverifiable: {self.SLUG}", out)
+        self.assertIn(f"cross-session inbound not set: {self.SLUG}", out)
+        self.assertIn(prov.CROSS_SESSION_COVERAGE, out)
 
     def test_payload_drift_exits_1(self):
         """The chain is on the payload; a hand-edited wrapper there is drift,

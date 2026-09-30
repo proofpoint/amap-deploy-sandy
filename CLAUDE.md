@@ -183,7 +183,17 @@ payload, once per host. The manifest's `agent_args` carry `--mcp-config` and
 `--append-system-prompt-file`, both pointing at the read-only payload. What
 sandy applied is recorded in the sandbox's `sandy-session.json` from its
 **last** launch, so a disagreement with the manifest is LAG (relaunch), never
-drift.
+drift. **Read it through `--print-state`** where sandy reports `marker`
+(2.7.0+): `agent_args` and `cross_session_inbound` come from the record, and
+a null there is read against `marker.state`. Sandy's host path contract makes
+the host copy of the marker and the two settings files private, so reading
+them directly is only the fallback for an older sandy.
+
+**The cross-session verdict names what it covers** (`CROSS_SESSION_COVERAGE`).
+Claude Code also reads `crossSessionInbound` from the workspace's committed
+`.claude/settings.json` (tighten-only, which sandy neither writes nor
+reports, so `verify` reads it with sandy's symlink, FIFO and size guards)
+and from a `--settings` flag (last-wins, named where `agent_args` shows one).
 
 **Two frames in one object.** In `--print-state`, `relay.path` is a
 CONTAINER path and `relay.state_dir` is a HOST path.

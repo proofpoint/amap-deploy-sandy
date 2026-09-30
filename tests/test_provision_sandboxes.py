@@ -1054,11 +1054,8 @@ class InboxPolicyNamesTheReplyPathTest(unittest.TestCase):
                       prov.agent_args_for_manifest()[prov.MANIFEST_AGENT][-1])
 
 
-class CrossSessionInboundTest(unittest.TestCase):
-    """A silent-refusal path: the router routes happily, the recipient
-    rejects on arrival, and the sender is told `refused` with no reason
-    because the router forwards none — while mounts, lanes and peer edges
-    are all green. Only this check sees it."""
+class _CrossSessionFixture:
+    """A sandbox and a workspace, and the two files sandy writes."""
 
     def setUp(self):
         self._tmp = TemporaryDirectory()
@@ -1081,6 +1078,13 @@ class CrossSessionInboundTest(unittest.TestCase):
 
     def _run(self):
         return prov.verify_cross_session_inbound(self.sandbox, "alpha-1", self.workspace)
+
+
+class CrossSessionInboundTest(_CrossSessionFixture, unittest.TestCase):
+    """A silent-refusal path: the router routes happily, the recipient
+    rejects on arrival, and the sender is told `refused` with no reason
+    because the router forwards none — while mounts, lanes and peer edges
+    are all green. Only this check sees it."""
 
     def test_accept_is_clean(self):
         self._set(user="accept")
@@ -1146,6 +1150,135 @@ class CrossSessionInboundTest(unittest.TestCase):
         problems, notes = self._run()
         self.assertEqual(problems, [])
         self.assertIn("Claude-only", notes[0])
+
+
+class CrossSessionInboundFromPrintStateTest(_CrossSessionFixture, unittest.TestCase):
+    """The same check where sandy's `--print-state` reports
+    `cross_session_inbound` and `marker` (sandy 2.7.0+). Shapes are from
+    sandy's source on main at f996871 (`_sandy_ps_settings_file` and the
+    per-sandbox `cross_session_inbound` block), not yet measured on a
+    released build. Files on disk contradict the record in each test, so a
+    verdict that follows the record could only have come from it."""
+
+    @staticmethod
+    def _record(pinned=("accept", "feature:amap", "ok"), user=("accept", "ok"),
+                ws=(None, "file_absent"), marker="present"):
+        def file_obj(v):
+            return {"value": v[0], "status": v[1]}
+        return {"name": "alpha-1",
+                "marker": {"state": marker, "sandy_version": "2.7.0",
+                           "launched_at": "2026-09-29T00:00:00Z"},
+                "cross_session_inbound": {
+                    "pinned": (None if pinned is None else
+                               {"value": pinned[0], "source": pinned[1], "status": pinned[2]}),
+                    "user_settings": file_obj(user), "workspace_settings": file_obj(ws)}}
+
+    def _run_record(self, record):
+        return prov.verify_cross_session_inbound(self.sandbox, "alpha-1", self.workspace,
+                                                 record=record)
+
+    def test_the_record_decides_not_the_files_on_disk(self):
+        self._set(user="refuse")
+        self.assertEqual(self._run_record(self._record()), ([], []))
+        self._set(user="accept")
+        problems, _ = self._run_record(self._record(user=("refuse", "ok")))
+        self.assertIn("REFUSE", problems[0])
+
+    def test_a_tightening_workspace_file_from_the_record_wins(self):
+        problems, notes = self._run_record(self._record(ws=("hold", "ok")))
+        self.assertEqual(problems, [])
+        self.assertIn("workspace seam", notes[0])
+
+    def test_not_claude_is_a_note_that_says_exclude(self):
+        problems, notes = self._run_record(self._record(pinned=(None, None, "not_claude")))
+        self.assertEqual(problems, [])
+        self.assertIn("exclude", notes[0])
+
+    def test_not_written_is_a_problem(self):
+        problems, _ = self._run_record(self._record(pinned=(None, None, "not_written")))
+        self.assertTrue(problems[0].startswith("cross-session inbound not set"), problems)
+
+    def test_a_null_pinned_is_read_against_the_marker(self):
+        _, notes = self._run_record(self._record(pinned=None, marker="present"))
+        self.assertIn("LAG", notes[0])
+        _, notes = self._run_record(self._record(pinned=None, marker="absent"))
+        self.assertIn("not launched", notes[0])
+        problems, _ = self._run_record(self._record(pinned=None, marker="unreadable"))
+        self.assertTrue(problems[0].startswith("cross-session inbound unverifiable"), problems)
+
+    def test_unknown_statuses_are_problems_never_a_pass(self):
+        rows = (("pinned unknown", self._record(pinned=(None, None, "unknown"))),
+                ("user unreadable", self._record(user=(None, "unreadable"))),
+                ("workspace not computed", self._record(ws=(None, "not_computed"))),
+                ("a status sandy may add", self._record(user=(None, "something_new"))))
+        for name, record in rows:
+            with self.subTest(name):
+                problems, _ = self._run_record(record)
+                self.assertTrue(problems and "unverifiable" in problems[0], problems)
+
+    def test_a_torn_user_file_names_the_likely_cause(self):
+        problems, _ = self._run_record(self._record(user=(None, "not_object")))
+        self.assertIn("#400", problems[0])
+
+
+class CommittedWorkspaceSettingsTest(_CrossSessionFixture, unittest.TestCase):
+    """Claude Code also reads the workspace's COMMITTED .claude/settings.json,
+    tighten-only, and sandy neither writes nor reports it. A repository that
+    commits a refusal would otherwise pass verify while every delegation is
+    refused."""
+
+    def _commit(self, value=None, text=None):
+        d = self.workspace / ".claude"
+        d.mkdir(exist_ok=True)
+        (d / "settings.json").write_text(
+            text if text is not None else json.dumps({"crossSessionInbound": value}))
+
+    def test_a_committed_refusal_beats_an_accepting_user_file(self):
+        self._set(user="accept")
+        self._commit("refuse")
+        problems, _ = self._run()
+        self.assertEqual(len(problems), 1)
+        self.assertIn("committed .claude/settings.json", problems[0])
+        self.assertIn("Remove it from that file", problems[0])
+        self.assertNotIn("Relaunch it", problems[0])
+
+    def test_the_stricter_of_the_two_workspace_files_wins(self):
+        self._set(user="accept", seam="hold")
+        self._commit("refuse")
+        problems, _ = self._run()
+        self.assertIn("'refuse'", problems[0])
+
+    def test_a_committed_accept_grants_nothing(self):
+        self._set(user="refuse")
+        self._commit("accept")
+        problems, _ = self._run()
+        self.assertIn("its own settings", problems[0])
+
+    def test_a_committed_file_that_cannot_be_read_is_unverifiable(self):
+        self._set(user="accept")
+        rows = (("not JSON", lambda: self._commit(text="{ torn")),
+                ("not an object", lambda: self._commit(text="[]")))
+        for name, make in rows:
+            with self.subTest(name):
+                make()
+                problems, _ = self._run()
+                self.assertTrue(problems and "unverifiable" in problems[0], problems)
+
+    def test_a_symlink_or_fifo_is_not_opened(self):
+        """Repository content: a FIFO would block the read, and verify,
+        forever."""
+        self._set(user="accept")
+        d = self.workspace / ".claude"
+        d.mkdir(exist_ok=True)
+        target = self.tmp / "elsewhere.json"
+        target.write_text(json.dumps({"crossSessionInbound": "accept"}))
+        (d / "settings.json").symlink_to(target)
+        problems, _ = self._run()
+        self.assertIn("symlink", problems[0])
+        (d / "settings.json").unlink()
+        os.mkfifo(d / "settings.json")
+        problems, _ = self._run()
+        self.assertIn("not a regular file", problems[0])
 
 
 class ManifestEntryTest(_ConnectorFixtureMixin, unittest.TestCase):
@@ -2064,6 +2197,43 @@ class AgentArgsTest(unittest.TestCase):
         self.assertEqual(len(notes), 1)
         self.assertIn("other", notes[0])
         self.assertIn("precedence", notes[0])
+
+    # --- from sandy's --print-state record (sandy 2.7.0+): `agent_args` is the
+    # marker's own value, passed through, and `marker.state` says what a null
+    # means. Shape from sandy's source on main at f996871.
+
+    @staticmethod
+    def _record(state="present", agent_args=None):
+        return {"name": "alpha-1", "agent_args": agent_args,
+                "marker": {"state": state, "sandy_version": "2.7.0",
+                           "launched_at": "2026-09-29T00:00:00Z"}}
+
+    def test_the_record_decides_not_the_host_marker(self):
+        d = self._sandbox()
+        self._marker(d, {"schema": 1, "agent_args": {"claude": [
+            {"feature": prov.FEATURE_NAME, "args": ["--mcp-config", "/old/path"]}]}})
+        applied = {"claude": [{"feature": prov.FEATURE_NAME,
+                               "args": prov.agent_args_for_manifest()["claude"]}]}
+        self.assertEqual(prov.verify_agent_args(d, "alpha-1", record=self._record(
+            agent_args=applied)), ([], []))
+
+    def test_a_null_is_read_against_the_marker_state(self):
+        d = self._sandbox()
+        _, notes = prov.verify_agent_args(d, "alpha-1", record=self._record("absent"))
+        self.assertIn("not launched", notes[0])
+        problems, notes = prov.verify_agent_args(d, "alpha-1", record=self._record("present"))
+        self.assertEqual(problems, [])
+        self.assertIn("LAG", notes[0])
+        problems, _ = prov.verify_agent_args(d, "alpha-1", record=self._record("unreadable"))
+        self.assertTrue(problems[0].startswith("agent_args unverifiable"), problems)
+
+    def test_a_settings_flag_is_named_because_it_can_set_cross_session_inbound(self):
+        d = self._sandbox()
+        applied = {"claude": [
+            {"feature": prov.FEATURE_NAME, "args": prov.agent_args_for_manifest()["claude"]},
+            {"feature": "other", "args": ["--settings", "/opt/sandy/features/other/s.json"]}]}
+        _, notes = prov.verify_agent_args(d, "alpha-1", record=self._record(agent_args=applied))
+        self.assertTrue(any("--settings" in n and "other" in n for n in notes), notes)
 
     def test_a_marker_this_adapter_cannot_read_is_a_problem_never_a_pass(self):
         d = self._sandbox()
