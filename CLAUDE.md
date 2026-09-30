@@ -267,7 +267,13 @@ never who may task whom.
 - **The slug is the instance name.** One string names the sandbox, the
   router instance and the local part of the address. Nothing derives a
   second name, and nothing case-folds it.
-- `fleet_policy.py` is a **library, not a CLI**.
+- `fleet_policy.py` is a **library, not a CLI**, and **its pure core is a
+  shared interface.** amap-deploy-openshell imports it from a sibling
+  checkout rather than copying it. The functions, parameter names and key
+  constants it may rely on are pinned in `tests/test_shared_policy_surface.py`,
+  which also requires the module to import with the standard library alone.
+  Changing one of them is a word to that repository first. `policy_checks.py`
+  is not shared.
 - **Scripts are launchers over modules.** `amap-sandy.py` is a ten-line
   launcher and the code is in `amap_sandy.py`: a hyphen means "run me", an
   underscore means "import me".
