@@ -471,6 +471,19 @@ class RosterMountTest(unittest.TestCase):
         self.assertIn('"peers"', source)
         self.assertIn(f'"{prov.EXPORT_ROSTER_DIR}"', source)
 
+    def test_the_reply_id_is_read_from_the_daemons_trailer_or_looked_up(self):
+        """The connector's inbox-delivery appends a labelled trailer to each
+        delivered delegation, carrying its message id. The policy names the
+        label it writes, and keeps the lookup for a connector without it."""
+        text = self._policy_text()
+        source = (Path(prov._default_connector_src()) / prov.DELIVERY_DAEMON_NAME).read_text()
+        for phrase in ("-- added by inbox-delivery --", "message id:"):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, text)
+                self.assertIn(phrase, source)
+        self.assertIn("Without that line", text)
+        self.assertIn("Never guess it", text)
+
     def test_the_bound_agents_are_told_is_the_bound_verify_applies(self):
         """The spec fixes no staleness bound; this deployment's is stated to
         agents in prose and applied by verify in code. One number, pinned."""
