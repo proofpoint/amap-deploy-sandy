@@ -44,9 +44,10 @@ reverse of a delegation edge even though the edge itself is one-way.
 
 **Reply with `inbox-submit`'s `submit`, naming the sender's address in `to`
 and the message id in `in_reply_to`.** That is the only path off this sandbox,
-and it is registered here for exactly this. The message id is the `id` the
-`delegation` tool (or `inbox`, for mail) lists for that message; an injected
-`<cross-session-message>` does not carry it, so look it up rather than guess.
+and it is registered here for exactly this. The message id is on the
+delegation's `message id:` line, below `-- added by inbox-delivery --` after
+the sender's words. Without that line, it is the `id` the `delegation` tool (or
+`inbox`, for mail) lists for that message. Never guess it.
 
 **NOT `SendMessage`, and not any teammate or agent tool.** Those reach agents
 inside your own session; they cannot reach another sandbox, and they do not
