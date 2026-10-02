@@ -4,7 +4,7 @@ This is the hands-on half. It sets up two Claude Code agents, each in its own
 sandy sandbox, sends a real delegation between them through amap-router-local,
 and then breaks each guarantee on purpose so you can see where it is enforced.
 
-**New to AMAP?** Start with the [explainer](index.html), which covers what the
+**New to AMAP?** Start with the [explainer](https://proofpoint.github.io/amap-deploy-sandy/), which covers what the
 protocol guarantees, why agents run isolated, and how the pieces fit, with
 animated flows. This page assumes that background and sticks to commands.
 
