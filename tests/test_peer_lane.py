@@ -897,10 +897,14 @@ class McpRegistrationIsOneConstantFileTest(unittest.TestCase):
         and does not move with it, so `${HOME}` would be the wrong root."""
         for name, spec in self._servers().items():
             with self.subTest(server=name):
-                self.assertTrue(spec["command"].startswith(prov.CONTAINER_FEATURE_BIN + "/"),
+                self.assertTrue(spec["command"].startswith(prov.CONTAINER_FEATURE_DIR + "/"),
                                 spec["command"])
                 self.assertNotIn("~", spec["command"])
                 self.assertNotIn("${", spec["command"], "a fixed mount path expands nothing")
+        # inbox-submit is started through this repo's wrapper, which supplies
+        # AMAP_SELF and execs the connector's server from bin/.
+        self.assertEqual(self._servers()["inbox-submit"]["command"],
+                         f"{prov.CONTAINER_FEATURE_DIR}/{prov.SUBMIT_SERVER_NAME}")
 
     def test_no_container_home_and_no_placeholder_survives_in_the_shipped_block(self):
         """Scoped to the `mcpServers` object, not the raw file, so the guard

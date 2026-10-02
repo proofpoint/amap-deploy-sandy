@@ -1,0 +1,43 @@
+#!/bin/sh
+# payload/submit-server — shipped by amap-deploy-sandy and copied VERBATIM onto
+# the feature payload beside the relay. payload/mcp-servers.json registers it
+# as the `inbox-submit` MCP server's command. Edit it HERE, then re-run
+# install --apply; an edit to a deployed copy is drift.
+#
+# It gives the connector's inbox-submit server its own address, AMAP_SELF, so
+# that `peers` can mark the agent's own roster entry `self`, and then execs
+# the server. The address is derived the way payload/relay derives the
+# daemon's AMAP_DELIVERY_SELF: <sandbox_name>@<fleet_domain>, with
+# `sandbox_name` from sandy's session file and the domain from the manifest's
+# AMAP_FLEET_DOMAIN expose. Neither comes from anything the agent can write.
+#
+# UNLIKE THE RELAY, NOTHING HERE IS FATAL. `submit` is the agent's only way to
+# send, and AMAP_SELF only labels a roster entry. So any gap — no domain (a
+# fleet without one), an empty one, no session file, no name in it — leaves
+# AMAP_SELF unset, says why on stderr, and starts the server anyway: an unset
+# AMAP_SELF marks nothing `self`, which the server documents as normal.
+#
+# This file sits behind the read-only payload mount: the agent may read it and
+# may not replace it.
+
+# The directory this script is in — the :ro mount. The server is found beside
+# it, and no other way.
+SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+
+unset AMAP_SELF
+SANDY_SESSION_FILE=/etc/sandy-session.json
+if [ -z "${AMAP_FLEET_DOMAIN:-}" ]; then
+    echo "submit-server: no AMAP_FLEET_DOMAIN, so no AMAP_SELF; peers marks nothing self" >&2
+elif [ ! -r "$SANDY_SESSION_FILE" ]; then
+    echo "submit-server: $SANDY_SESSION_FILE is unreadable, so no AMAP_SELF" >&2
+else
+    sandbox_name=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("sandbox_name") or "")' "$SANDY_SESSION_FILE" 2>/dev/null)
+    if [ -n "$sandbox_name" ]; then
+        AMAP_SELF="$sandbox_name@$AMAP_FLEET_DOMAIN"
+        export AMAP_SELF
+    else
+        echo "submit-server: $SANDY_SESSION_FILE carries no sandbox_name, so no AMAP_SELF" >&2
+    fi
+fi
+
+exec "$SELF_DIR/bin/inbox-submit" "$@"

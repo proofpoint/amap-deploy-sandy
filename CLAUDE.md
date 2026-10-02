@@ -231,6 +231,14 @@ without one is a user split or a teammate. **Never identify a pane by
 `pane_index`**; in the four-agent grid it is not spawn order. `tests/test_handoff_sessions.py`
 executes the shipped file against a fake `tmux` and a staged `/proc`.
 
+**`payload/submit-server` is checked in the same way.** It is the
+`inbox-submit` MCP server's command: it derives `AMAP_SELF` the way the
+relay derives `AMAP_DELIVERY_SELF`, then execs the connector's server from
+`bin/`. **Unlike the relay, nothing in it is fatal**, because `submit` is
+the agent's only way to send and `AMAP_SELF` only labels a roster entry: a
+gap leaves it unset and starts the server anyway.
+`tests/test_submit_server.py` executes the shipped file.
+
 ### Authorisation is the router's
 
 The daemon holds **no allowlist**, and nothing on the agent's side names whom

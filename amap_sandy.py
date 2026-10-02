@@ -185,6 +185,10 @@ RELAY_WRAPPER_NAME = "relay"
 # It encodes sandy's published pane-identity contract. The daemon EXECS it, so
 # it belongs to the relay chain and sits on the read-only payload with the rest.
 SESSION_SOURCE_NAME = "handoff-sessions"
+# The `inbox-submit` MCP server's command, shipped from this checkout: it
+# derives the server's own address, AMAP_SELF, the way the relay derives the
+# daemon's, and execs the connector's server from `bin/`.
+SUBMIT_SERVER_NAME = "submit-server"
 
 # ------------------------------------------------------------ the feature tree
 #
@@ -967,7 +971,8 @@ def payload_sources(connector_src: Path,
                     servers_path: Path = DEFAULT_SERVERS) -> Tuple[Tuple[str, Path, bool], ...]:
     """`(relative path in the payload, source file, executable)` — every file
     the payload holds, in one place. The wrapper, the session lister, the
-    MCP registration and the policy text come from THIS checkout; the
+    submit server's wrapper, the MCP registration and the policy text come
+    from THIS checkout; the
     daemon, its module and both MCP binaries from the connector. The registration and the policy text
     are what the manifest's `agent_args` point the agent at, so they live
     once per host on the read-only mount like everything else here. Sibling
@@ -976,6 +981,7 @@ def payload_sources(connector_src: Path,
     return (
         (RELAY_WRAPPER_NAME, relay_wrapper_source(), True),
         (SESSION_SOURCE_NAME, PAYLOAD_DIR / SESSION_SOURCE_NAME, True),
+        (SUBMIT_SERVER_NAME, PAYLOAD_DIR / SUBMIT_SERVER_NAME, True),
         (DELIVERY_DAEMON_NAME, src / DELIVERY_DAEMON_NAME, True),
         (DELIVERY_SUPPORT_NAME, src / DELIVERY_SUPPORT_NAME, False),
         (MCP_SERVERS_PAYLOAD_NAME, Path(servers_path), False),
