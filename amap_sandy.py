@@ -1738,6 +1738,21 @@ def read_session_marker(sandbox_dir: Path) -> Optional[Dict[str, Any]]:
 SETTINGS_FLAG = "--settings"                  # Claude Code: settings from a file, last-wins
 
 
+def _has_flag(args: List[str], flag: str) -> bool:
+    """`flag` followed by a value in `args`."""
+    return any(a == flag and i + 1 < len(args) for i, a in enumerate(args))
+
+
+def _policy_text_unapplied(slug: str, why: str) -> str:
+    """The problem line for a selected sandbox whose last launch did not give
+    its agent this feature's MCP config and policy text."""
+    return (f"amap launch arguments not applied: {slug}: {why}. Its agent can still be "
+            f"delivered delegations, but without the policy text and the inbox-submit "
+            f"tool it cannot reply through the router, and tends to try Claude Code's "
+            f"SendMessage, which cannot reach a peer. Relaunch it (sandy --stop, then "
+            f"sandy --start)")
+
+
 def verify_agent_args(sandbox_dir: Path, slug: str,
                       record: Optional[Dict[str, Any]] = None) -> Tuple[List[str], List[str]]:
     """`(problems, notes)`: what sandy APPLIED for this feature at the
@@ -1750,13 +1765,15 @@ def verify_agent_args(sandbox_dir: Path, slug: str,
     is "too old to say" and is LAG, because it clears at the next launch;
     it is never read as "nothing applied".
 
-    Everything here is a NOTE, not a problem, by design: the record is of
-    the LAST launch and the manifest is the NEXT one, so every disagreement
-    has the same remedy — relaunch — and none of it is drift (the manifest
-    itself is verified against its rendering by `verify_manifest`). A
-    verify that went red on a fleet that had merely not relaunched yet
-    would teach an operator to scroll past the line that matters. The one
-    exception is a marker sandy reports it cannot read: that is UNKNOWN.
+    A disagreement is LAG, never drift: the record is of the LAST launch and
+    the manifest is the NEXT one, so the remedy is always a relaunch (the
+    manifest itself is verified against its rendering by `verify_manifest`).
+    A different path for the same two flags is a NOTE. A last launch that
+    did not give the agent BOTH flags, `--mcp-config` and
+    `--append-system-prompt-file`, is a PROBLEM: that agent is delivered
+    delegations it cannot answer through the router. So are a launch too old
+    to record the field and a marker sandy cannot read, which are UNKNOWN.
+    A sandbox not launched yet is a note: it has no agent to be wrong.
 
     WHERE IT COMES FROM. Where sandy's `--print-state` record carries
     `marker`, `agent_args` is read from the record and a null is read
@@ -1786,9 +1803,9 @@ def verify_agent_args(sandbox_dir: Path, slug: str,
         recorded = doc.get(AGENT_ARGS_KEY)
     want = agent_args_for_manifest()[MANIFEST_AGENT]
     if recorded is None:
-        notes.append(f"{slug}: its last launch was under a sandy that did not record "
-                     f"{AGENT_ARGS_KEY} (older than {SANDY_FLOOR}) — LAG, not drift: "
-                     f"relaunch under {SANDY_FLOOR} and this reads the applied set")
+        problems.append(_policy_text_unapplied(
+            slug, f"its last launch was under a sandy that did not record {AGENT_ARGS_KEY} "
+                  f"(older than {SANDY_FLOOR}), so whether it has them cannot be told"))
         return problems, notes
     if not isinstance(recorded, dict):
         problems.append(f"{slug}: {SANDY_SESSION_MARKER_NAME} carries {AGENT_ARGS_KEY}="
@@ -1813,9 +1830,14 @@ def verify_agent_args(sandbox_dir: Path, slug: str,
                      f"Claude Code reads last-wins and which can set {CROSS_SESSION_KEY}; the "
                      f"cross-session check does not read it")
     if ours is None:
-        notes.append(f"{slug}: its last launch applied no {AGENT_ARGS_KEY} for {FEATURE_NAME} "
-                     f"(the manifest declared none then, or did not select it) — relaunch "
-                     f"under the current manifest")
+        problems.append(_policy_text_unapplied(
+            slug, f"its last launch applied no {AGENT_ARGS_KEY} for {FEATURE_NAME} (the "
+                  f"manifest declared none then, or did not select it)"))
+    elif not all(_has_flag(list(ours), flag) for flag in (MCP_CONFIG_FLAG,
+                                                          SYSTEM_PROMPT_FILE_FLAG)):
+        problems.append(_policy_text_unapplied(
+            slug, f"its last launch applied {AGENT_ARGS_KEY} {list(ours)!r}, without "
+                  f"{MCP_CONFIG_FLAG} and {SYSTEM_PROMPT_FILE_FLAG} both"))
     elif list(ours) != list(want):
         notes.append(f"{slug}: its last launch applied {AGENT_ARGS_KEY} {list(ours)!r}, the "
                      f"manifest now declares {want!r} — LAG: relaunch")

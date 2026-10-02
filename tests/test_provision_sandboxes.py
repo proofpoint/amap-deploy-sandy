@@ -2201,27 +2201,31 @@ class AgentArgsTest(unittest.TestCase):
         self.assertEqual(len(notes), 1)
         self.assertIn("not launched", notes[0])
 
-    def test_a_marker_WITHOUT_the_field_is_a_sandy_too_old_to_say_and_reads_as_LAG(self):
-        """The trap: absent is 'too old to say', including
-        every launch before a host was upgraded, and clears on relaunch. It
-        is never read as 'nothing applied', and never as drift."""
+    def test_a_marker_WITHOUT_the_field_is_a_sandy_too_old_to_say_and_a_problem(self):
+        """Absent is 'too old to say', never 'nothing applied'. Whether the
+        agent has the policy text cannot be told, so it is UNKNOWN: a
+        problem, with a relaunch as the remedy."""
         d = self._sandbox()
         self._marker(d, {"schema": 1, "agents": ["claude"]})
         problems, notes = prov.verify_agent_args(d, "alpha-1")
-        self.assertEqual(problems, [])
-        self.assertEqual(len(notes), 1)
-        self.assertIn("LAG", notes[0])
-        self.assertIn(prov.SANDY_FLOOR, notes[0])
-        self.assertIn("relaunch", notes[0])
+        self.assertEqual(notes, [])
+        self.assertEqual(len(problems), 1)
+        self.assertIn("cannot be told", problems[0])
+        self.assertIn(prov.SANDY_FLOOR, problems[0])
+        self.assertIn("Relaunch", problems[0])
 
-    def test_an_empty_object_is_a_sandy_that_applied_none_and_says_relaunch(self):
+    def test_an_empty_object_is_an_agent_without_the_policy_text_and_a_problem(self):
+        """Delegations still reach that agent, which then cannot answer them
+        through the router: the failure an operator saw as an agent replying
+        with SendMessage."""
         d = self._sandbox()
         self._marker(d, {"schema": 1, "agent_args": {}})
         problems, notes = prov.verify_agent_args(d, "alpha-1")
-        self.assertEqual(problems, [])
-        self.assertEqual(len(notes), 1)
-        self.assertIn("applied no", notes[0])
-        self.assertIn("relaunch", notes[0])
+        self.assertEqual(notes, [])
+        self.assertEqual(len(problems), 1)
+        self.assertTrue(problems[0].startswith("amap launch arguments not applied"), problems)
+        self.assertIn("SendMessage", problems[0])
+        self.assertIn("Relaunch", problems[0])
 
     def test_the_applied_set_equal_to_the_manifest_is_silent(self):
         d = self._sandbox()
@@ -2229,15 +2233,27 @@ class AgentArgsTest(unittest.TestCase):
             {"feature": prov.FEATURE_NAME, "args": prov.agent_args_for_manifest()["claude"]}]}})
         self.assertEqual(prov.verify_agent_args(d, "alpha-1"), ([], []))
 
-    def test_a_different_applied_set_is_LAG_with_relaunch_as_the_remedy(self):
+    def test_both_flags_at_other_paths_is_LAG_with_relaunch_as_the_remedy(self):
         d = self._sandbox()
         self._marker(d, {"schema": 1, "agent_args": {"claude": [
-            {"feature": prov.FEATURE_NAME, "args": ["--mcp-config", "/old/path"]}]}})
+            {"feature": prov.FEATURE_NAME, "args": ["--mcp-config", "/old/path",
+                                                    "--append-system-prompt-file", "/old/p"]}]}})
         problems, notes = prov.verify_agent_args(d, "alpha-1")
         self.assertEqual(problems, [])
         self.assertEqual(len(notes), 1)
         self.assertIn("LAG", notes[0])
         self.assertIn("/old/path", notes[0])
+
+    def test_a_launch_missing_either_flag_is_a_problem(self):
+        d = self._sandbox()
+        for args in (["--mcp-config", "/x"], ["--append-system-prompt-file", "/x"],
+                     ["--mcp-config", "/x", "--append-system-prompt-file"]):
+            with self.subTest(args=args):
+                self._marker(d, {"schema": 1, "agent_args": {"claude": [
+                    {"feature": prov.FEATURE_NAME, "args": args}]}})
+                problems, _ = prov.verify_agent_args(d, "alpha-1")
+                self.assertTrue(problems and problems[0].startswith(
+                    "amap launch arguments not applied"), problems)
 
     def test_another_feature_also_passing_mcp_config_is_named_because_precedence_is_the_agents(self):
         d = self._sandbox()
@@ -2274,8 +2290,8 @@ class AgentArgsTest(unittest.TestCase):
         _, notes = prov.verify_agent_args(d, "alpha-1", record=self._record("absent"))
         self.assertIn("not launched", notes[0])
         problems, notes = prov.verify_agent_args(d, "alpha-1", record=self._record("present"))
-        self.assertEqual(problems, [])
-        self.assertIn("LAG", notes[0])
+        self.assertEqual(notes, [])
+        self.assertIn("cannot be told", problems[0])
         problems, _ = prov.verify_agent_args(d, "alpha-1", record=self._record("unreadable"))
         self.assertTrue(problems[0].startswith("agent_args unverifiable"), problems)
 

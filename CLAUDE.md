@@ -183,7 +183,9 @@ payload, once per host. The manifest's `agent_args` carry `--mcp-config` and
 `--append-system-prompt-file`, both pointing at the read-only payload. What
 sandy applied is recorded in the sandbox's `sandy-session.json` from its
 **last** launch, so a disagreement with the manifest is LAG (relaunch), never
-drift. **Read it through `--print-state`** where sandy reports `marker`
+drift. A different path is a note; **a last launch that did not apply both
+flags is a problem**, because that agent is delivered delegations it cannot
+answer through the router. **Read it through `--print-state`** where sandy reports `marker`
 (2.7.0+): `agent_args` and `cross_session_inbound` come from the record, and
 a null there is read against `marker.state`. Sandy's host path contract makes
 the host copy of the marker and the two settings files private, so reading
