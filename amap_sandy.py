@@ -1005,24 +1005,49 @@ def install_feature_payload(home: Path, connector_src: Path, *, dry_run: bool,
     return "; ".join(parts)
 
 
-def install_roster_dir(home: Path, *, dry_run: bool) -> str:
-    """Create the roster mount's SOURCE, empty — and nothing else: the file
-    inside is the router's to write. Settled once the directory exists. A
+def _install_empty_dir(d: Path, what: str, whose: str, *, dry_run: bool) -> str:
+    """Create `d`, empty, and nothing inside it. Settled once it exists. A
     symlink or a non-directory at the path is refused rather than followed or
-    replaced, because a mount source that resolves somewhere else is not the
-    directory the router writes to."""
-    d = feature_roster_dir(home)
+    replaced: a mount source that resolves somewhere else is not the
+    directory its writer uses."""
     if d.is_symlink():
-        raise ProvisionError(f"{d} is a symlink — the roster mount source must be a real "
-                             f"directory; remove it and re-run")
+        raise ProvisionError(f"{d} is a symlink — the {what} must be a real directory; "
+                             f"remove it and re-run")
     if d.is_dir():
-        return "roster directory present"
+        return f"{what} present"
     if d.exists():
         raise ProvisionError(f"{d} exists and is not a directory")
     if dry_run:
-        return "would create roster directory (empty; the router writes into it)"
+        return f"would create {what} (empty; {whose})"
     d.mkdir(parents=True, exist_ok=True)
-    return "created roster directory (empty; the router writes into it)"
+    return f"created {what} (empty; {whose})"
+
+
+def install_roster_dir(home: Path, *, dry_run: bool) -> str:
+    """The roster mount's SOURCE, empty: the file inside is the router's to
+    write."""
+    return _install_empty_dir(feature_roster_dir(home), "roster directory",
+                              "the router writes into it", dry_run=dry_run)
+
+
+def install_instances_dir(home: Path, *, dry_run: bool) -> str:
+    """The ROOT of the instance lanes, empty. The router mounts it whole and
+    finds each sandbox in it at poll time, and `docker/run.sh` refuses to
+    start while it is missing. So it exists from install on, and the router
+    can be started before any sandbox has launched. Every `<slug>/` lane tree
+    inside is sandy's, created at that sandbox's launch."""
+    return _install_empty_dir(feature_instances_dir(home), "instances directory",
+                              "sandy creates each sandbox's lanes in it at launch",
+                              dry_run=dry_run)
+
+
+def install_router_state_dir(state_dir: Path, *, dry_run: bool) -> str:
+    """The router's `state_dir`, empty. `docker/run.sh` refuses a missing
+    bind source rather than let Docker create it as root, so without it the
+    router cannot start. Every file in it is the router's own: its first-sight
+    markers, reply ledger and quarantine."""
+    return _install_empty_dir(state_dir, "router state_dir",
+                              "the router writes into it", dry_run=dry_run)
 
 
 # ------------------------------------------------------------- the manifest
@@ -1365,6 +1390,22 @@ def verify_roster_source(home: Path) -> List[str]:
     return []
 
 
+def verify_router_mount_sources(home: Path, state_dir: Path) -> List[str]:
+    """The two directories `docker/run.sh` needs before the router can start:
+    the instances root and the router's `state_dir`. It refuses a missing
+    bind source, so either one missing means the router cannot (re)start."""
+    problems: List[str] = []
+    for d, what in ((feature_instances_dir(home), "instances directory"),
+                    (Path(state_dir), "router state_dir")):
+        if d.is_symlink():
+            problems.append(f"{what} is a symlink: {d} — it must be a real directory; "
+                            f"remove it and run install --apply")
+        elif not d.is_dir():
+            problems.append(f"{what} absent: {d} does not exist — run install --apply; "
+                            f"docker/run.sh refuses to start the router without it")
+    return problems
+
+
 def verify_roster(home: Path, *, now: Optional[datetime] = None) -> List[str]:
     """The roster the policy text points every agent at: present, readable,
     and FRESH by this deployment's rule — `written_at` within
@@ -1626,6 +1667,15 @@ def run_provision(
         if not _part_is_settled(report):
             stale += 1
         print(f"  roster {feature_roster_dir(home)}: {report}")
+    try:
+        report = install_instances_dir(home, dry_run=dry)
+    except ProvisionError as e:
+        print(f"  FAIL  instances {feature_instances_dir(home)}: {e}", file=sys.stderr)
+        failed += 1
+    else:
+        if not _part_is_settled(report):
+            stale += 1
+        print(f"  instances {feature_instances_dir(home)}: {report}")
 
     boxes = discover_sandboxes(args.sandy)
     by_name = {b["name"]: b for b in boxes}
@@ -2934,6 +2984,15 @@ def run_render_router(args: argparse.Namespace, home: Path, boxes: List[Dict[str
               f"rendering: {refused}", file=sys.stderr)
         return 2
     names = ", ".join(sorted(members))
+    # The router cannot start without its state_dir, so it is created here —
+    # only after the rendering (state_dir included) has passed the router's
+    # own loader, so a placement the router refuses is never created.
+    try:
+        print(f"router state_dir {state_dir}: "
+              f"{install_router_state_dir(state_dir, dry_run=not apply)}")
+    except ProvisionError as e:
+        print(f"router state_dir: {e}", file=sys.stderr)
+        return 2
     want = sibling_text(doc)
     try:
         have = path.read_text(encoding="utf-8")
@@ -3111,6 +3170,7 @@ def run_verify(args: argparse.Namespace, servers: Dict[str, dict], home: Path,
     problems += verify_manifest(home, policy, receives=sandy_accepts_receives(args.sandy))
     problems += verify_feature_payload(home, args.connector_src, servers_path=args.servers)
     problems += verify_roster_source(home)
+    problems += verify_router_mount_sources(home, sibling_state_dir(home, args.state_dir))
     problems += verify_roster(home)
     problems += verify_roster_pointer_exposed(home)
     notes.append(CROSS_SESSION_COVERAGE)

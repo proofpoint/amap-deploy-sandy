@@ -434,23 +434,24 @@ python3 amap-sandy.py install --apply
     <section class="screen" data-id="start-it" data-ch="8">
       <div class="inner">
         <p class="eyebrow">Run it yourself · 3 of 4</p>
-        <h2>Start the agents and the router, then verify</h2>
+        <h2>Start the router, then the agents, then verify</h2>
         <div class="steps2">
-          <div class="cmd"><div class="label"><span>agents, then the router</span><button type="button" class="copy">Copy</button></div>
-<pre><span class="c"># first launch creates the sandbox; sandy selects it, mounts the payload ro</span>
-cd ~/amap-demo/alpha &amp;&amp; sandy --start
-cd ~/amap-demo/beta  &amp;&amp; sandy --start
-
+          <div class="cmd"><div class="label"><span>the router, then agents as needed</span><button type="button" class="copy">Copy</button></div>
+<pre><span class="c"># the router needs no agent running yet</span>
 cd ~/amap/amap-router-local
 docker/build.sh
 docker/run.sh --config ~/.sandy/features/amap/router.json \
-  --detach</pre></div>
+  --detach
+
+<span class="c"># then agents, in any order, whenever you need them</span>
+cd ~/amap-demo/alpha &amp;&amp; sandy --start
+cd ~/amap-demo/beta  &amp;&amp; sandy --start</pre></div>
           <div class="cmd"><div class="label"><span>check it</span><button type="button" class="copy">Copy</button></div>
 <pre>cd ~/amap/amap-deploy-sandy
 python3 amap-sandy.py list     <span class="c"># both: selected</span>
 python3 amap-sandy.py verify   <span class="c"># exit 0 before going on</span></pre></div>
         </div>
-        <p class="small">Starting the router is the approval: its first poll of each agent is first sight, and anything staged before it is never delivered. The router runs with no network and re-reads its config every poll, so later policy changes need only <code>install --apply</code>.</p>
+        <p class="small">Starting the router is the approval: its first poll of each agent is first sight, and anything staged before it is never delivered. The router picks up each agent on its next poll after the agent launches, so agents can delegate to each other as they come online. It runs with no network and re-reads its config every poll, so later policy changes need only <code>install --apply</code>.</p>
       </div>
     </section>
 
