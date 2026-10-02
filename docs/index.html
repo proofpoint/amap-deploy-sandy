@@ -117,6 +117,13 @@ td.strong{font-family:var(--display);font-weight:700}
 .links{display:flex;flex-wrap:wrap;gap:10px}
 .links a{font:600 .92rem/1 var(--display);padding:12px 16px;border-radius:7px;text-decoration:none;border:1px solid var(--rule);color:var(--ink);background:var(--panel)}
 .links a.primary{background:var(--trust);border-color:var(--trust);color:var(--paper)}
+.paths{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:14px;align-items:stretch}
+.path{background:var(--panel);border:1px solid var(--rule);border-radius:9px;padding:14px 16px;display:grid;gap:10px;align-content:start;min-width:0}
+.path h3{margin:0;font:700 1.02rem/1.2 var(--display)}
+.path h3 .n{display:inline-grid;place-items:center;width:1.6em;height:1.6em;margin-right:8px;border-radius:50%;background:var(--trust);color:var(--paper);font-size:.85rem}
+.path p{margin:0}
+.path .links{margin-top:auto}
+@media (max-width:760px){.paths{grid-template-columns:minmax(0,1fr)}}
 
 /* ---------- commands ---------- */
 .cmd{position:relative;background:var(--term);color:var(--term-ink);border-radius:9px;min-width:0}
@@ -378,25 +385,36 @@ td.strong{font-family:var(--display);font-weight:700}
     <section class="screen" data-id="get" data-ch="8">
       <div class="inner">
         <p class="eyebrow">Run it yourself · 1 of 4</p>
-        <h2>Install sandy, and clone the three repos side by side</h2>
+        <h2>Install sandy, then choose a path</h2>
         <div class="req"><span>macOS or Linux</span><span>Docker</span><span>Python 3.9+</span><span>jq</span><span>a Claude account sandy can use</span></div>
-        <div class="steps2">
-          <div class="cmd"><div class="label"><span>sandy, 2.2.0 or later</span><button type="button" class="copy">Copy</button></div>
+        <div class="cmd"><div class="label"><span>first, either way: sandy 2.2.0 or later</span><button type="button" class="copy">Copy</button></div>
 <pre><span class="c"># install, then check the host is ready</span>
 curl -fsSL https://raw.githubusercontent.com/rappdw/sandy/main/install.sh | bash
 curl -fsSL https://raw.githubusercontent.com/rappdw/sandy/main/doctor.sh | bash
 sandy --print-schema | jq '.schema_version'   <span class="c"># must print 3 or 4</span></pre></div>
-          <div class="cmd"><div class="label"><span>the code</span><button type="button" class="copy">Copy</button></div>
+        <div class="paths">
+          <div class="path">
+            <h3><span class="n">1</span>One command</h3>
+            <p class="small">Clones the three repos into <code>~/amap</code>, installs the default policy (every agent may task every other), and builds and starts the router. Then make two workspaces and start an agent in each.</p>
+            <div class="cmd"><div class="label"><span>install, then two agents</span><button type="button" class="copy">Copy</button></div>
+<pre>curl -fsSL https://raw.githubusercontent.com/proofpoint/amap-deploy-sandy/main/install.sh | bash
+
+mkdir -p ~/amap-demo/alpha ~/amap-demo/beta
+cd ~/amap-demo/alpha &amp;&amp; sandy --start
+cd ~/amap-demo/beta  &amp;&amp; sandy --start</pre></div>
+            <div class="links"><a class="primary" href="#try">Agents running: send a delegation →</a></div>
+          </div>
+          <div class="path">
+            <h3><span class="n">2</span>Step by step</h3>
+            <p class="small">Clone the three repos side by side, then install, start the router and start agents yourself, one screen at a time. amap-deploy-sandy finds the other two by looking beside itself; <code>$AMAP_ROUTER_REPO</code> and <code>$AMAP_CONNECTOR_REPO</code> override that.</p>
+            <div class="cmd"><div class="label"><span>the code</span><button type="button" class="copy">Copy</button></div>
 <pre>mkdir -p ~/amap &amp;&amp; cd ~/amap
 git clone https://github.com/proofpoint/amap-deploy-sandy
 git clone https://github.com/proofpoint/amap-router-local
 git clone https://github.com/proofpoint/amap-connector-claude</pre></div>
+            <div class="links"><a href="#policy">Cloned: walk through it →</a></div>
+          </div>
         </div>
-        <p class="small">amap-deploy-sandy finds the other two by looking beside itself; <code>$AMAP_ROUTER_REPO</code> and <code>$AMAP_CONNECTOR_REPO</code> override that. You will not need to build the connector: the deployment copies its binaries onto the read-only payload.</p>
-        <div class="cmd"><div class="label"><span>or, all of it in one command</span><button type="button" class="copy">Copy</button></div>
-<pre><span class="c"># clone or update the three repos, install the default policy, build and start the router</span>
-curl -fsSL https://raw.githubusercontent.com/proofpoint/amap-deploy-sandy/main/install.sh | bash</pre></div>
-        <p class="small">Once sandy is installed, this one line does the rest of the setup: the next screen's install, and the router half of 3 of 4. Then start agents whenever you need them. It is safe to run again, and leaves a router that is already running alone.</p>
       </div>
     </section>
 
