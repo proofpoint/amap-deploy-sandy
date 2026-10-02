@@ -15,7 +15,7 @@
       }
     },
     "inbox-submit": {
-      "command": "/opt/sandy/features/amap/bin/inbox-submit",
+      "command": "/opt/sandy/features/amap/submit-server",
       "args": [
         "mcp"
       ],
