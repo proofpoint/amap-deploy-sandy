@@ -63,6 +63,16 @@ config and the system-prompt policy, both from the read-only payload.
 
 ## Bring-up
 
+With sandy installed and Docker running, one command clones (or updates) the
+three repos into `~/amap`, runs `install --apply` and starts the router:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/proofpoint/amap-deploy-sandy/main/install.sh | bash
+```
+
+Then start agents whenever you need them (`sandy --start` in each workspace)
+and run `verify`. The same steps by hand:
+
 ```sh
 # 1. Install. On a fresh host this writes the manifest from a TEMPLATE that works
 #    as written: every sandbox launched with claude selected, every one may

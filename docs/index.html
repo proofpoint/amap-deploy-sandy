@@ -393,6 +393,10 @@ git clone https://github.com/proofpoint/amap-router-local
 git clone https://github.com/proofpoint/amap-connector-claude</pre></div>
         </div>
         <p class="small">amap-deploy-sandy finds the other two by looking beside itself; <code>$AMAP_ROUTER_REPO</code> and <code>$AMAP_CONNECTOR_REPO</code> override that. You will not need to build the connector: the deployment copies its binaries onto the read-only payload.</p>
+        <div class="cmd"><div class="label"><span>or, all of it in one command</span><button type="button" class="copy">Copy</button></div>
+<pre><span class="c"># clone or update the three repos, install the default policy, build and start the router</span>
+curl -fsSL https://raw.githubusercontent.com/proofpoint/amap-deploy-sandy/main/install.sh | bash</pre></div>
+        <p class="small">Once sandy is installed, this one line does the rest of the setup: the next screen's install, and the router half of 3 of 4. Then start agents whenever you need them. It is safe to run again, and leaves a router that is already running alone.</p>
       </div>
     </section>
 
