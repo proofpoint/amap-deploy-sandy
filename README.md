@@ -59,18 +59,17 @@ config and the system-prompt policy, both from the read-only payload.
 ## Bring-up
 
 ```sh
-# 1. Install. On a fresh host this writes the manifest TEMPLATE and the payload,
-#    then stops until you have edited the policy.
+# 1. Install. On a fresh host this writes the manifest from a TEMPLATE that works
+#    as written: every sandbox launched with claude selected, every one may
+#    task every other (task_graph "ALL", no mail lane), addresses
+#    <slug>@agents.internal, a 24h recreation cadence. Also renders router.json.
 python3 amap-sandy.py install            # preview (every verb is a dry run without --apply)
 python3 amap-sandy.py install --apply
 
-# 2. Author the policy: edit $SANDY_HOME/features/amap/feature.json.
-#    examples/feature.json is a complete one, as install renders it.
-#    Its `feature` section needs at least:
-#      fleet_domain                        e.g. "agents.example.org"; addresses are <slug>@<domain>
-#      container_recreate_interval_hours   the recreation cadence (see `cadence`)
-#      task_graph                          who may task whom: "ALL", or explicit edges
-#    Then install again. This also renders router.json.
+# 2. Optional: narrow the policy in $SANDY_HOME/features/amap/feature.json
+#    (a glob in sandboxes.exclude, explicit task_graph edges, your own
+#    fleet_domain; examples/feature.json is a complete edited one), then
+#    install again.
 python3 amap-sandy.py install --apply
 
 # 3. Launch each agent's workspace. The first launch creates its sandbox, and

@@ -1038,9 +1038,8 @@ def install_roster_dir(home: Path, *, dry_run: bool) -> str:
 # this deployment owns the mechanical blocks below and rewrites them on every
 # install from constants and from the operator's own `feature.fleet_domain`, so
 # the domain is typed once and the exposed copy sandy hands the container is
-# derived. `install --apply` writes the whole file only when it is ABSENT (the
-# template: every sandbox launched with claude, no excludes, no domain), and
-# then refuses to go further until the operator has ratified it.
+# derived. `install --apply` writes the whole file only when it is ABSENT: the
+# template, `fleet_policy.default_policy()`, which works as written.
 #
 # `receives` declares what this feature needs delivered into the session:
 # cross-session messages, which the daemon injects. Sandy resolves the
@@ -3263,9 +3262,13 @@ def run_sync(args: argparse.Namespace, home: Path, boxes_dir: Path) -> int:
     policy_path = feature_manifest_path(home)
     policy = fp.load_policy(policy_path)
     if policy.get(fp.SOURCE_KEY) == fp.SOURCE_DEFAULT:
-        print(f"note: no {policy_path} yet — install --apply writes the TEMPLATE (every sandbox "
-              f"launched with claude, nothing excluded, no fleet domain). Edit it in place: "
-              f"its `feature` section is the policy, `sandboxes`/`agents` the selection rule.")
+        print(f"note: no {policy_path} yet — install --apply writes the TEMPLATE, which works "
+              f"as written: every sandbox launched with claude is selected and nothing is "
+              f"excluded; every selected sandbox may task every other (task_graph \"ALL\", "
+              f"no mail lane); addresses are <slug>@{fp.DEFAULT_FLEET_DOMAIN}; containers are "
+              f"recreated every {fp.DEFAULT_RECREATE_INTERVAL_HOURS}h. To narrow it, edit it in "
+              f"place: `sandboxes.exclude` keeps a sandbox out, and its `feature` section is "
+              f"the policy.")
 
     boxes = discover_sandboxes(args.sandy)
     apply = args.apply
