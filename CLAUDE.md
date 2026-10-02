@@ -288,6 +288,14 @@ never who may task whom.
   which also requires the module to import with the standard library alone.
   Changing one of them is a word to that repository first. `policy_checks.py`
   is not shared.
+- **`router_health.py` shares only its three-outcome discipline** with the
+  same consumer: the verdicts, `Unresolved`, `Fact`, `Check`, `check()`,
+  `unknown()`, `same_set()` and `CannotRun`, and the behaviour that makes
+  them the discipline. `tests/test_shared_router_health_core.py` pins them
+  and that the module imports no router or sandy code. Everything else in
+  it, including `Ctx`, `FACT_SOURCES`, `WIRE_NAMES`, `run_sections` and the
+  two router sections, is internal: their facts reach this repo's sandy
+  layout through `provisioner()`.
 - **Scripts are launchers over modules.** `amap-sandy.py` is a ten-line
   launcher and the code is in `amap_sandy.py`: a hyphen means "run me", an
   underscore means "import me".
