@@ -10,7 +10,7 @@ animated flows. This page assumes that background and sticks to commands.
 
 1. [What you need](#1-what-you-need)
 2. [Get the pieces](#2-get-the-pieces)
-3. [Create two agents](#3-create-two-agents)
+3. [Make two workspaces](#3-make-two-workspaces)
 4. [Install and write the policy](#4-install-and-write-the-policy)
 5. [Start the agents and the router](#5-start-the-agents-and-the-router)
 6. [Verify](#6-verify)
@@ -28,7 +28,7 @@ animated flows. This page assumes that background and sticks to commands.
 ```sh
 curl -fsSL https://raw.githubusercontent.com/rappdw/sandy/main/install.sh | bash
 curl -fsSL https://raw.githubusercontent.com/rappdw/sandy/main/doctor.sh | bash
-sandy --print-schema | jq '.schema_version'   # must print 3
+sandy --print-schema | jq '.schema_version'   # must print 3 or 4
 ```
 
 ## 2. Get the pieces
@@ -46,18 +46,21 @@ git clone https://github.com/proofpoint/amap-connector-claude
 `$AMAP_ROUTER_REPO` and `$AMAP_CONNECTOR_REPO` override that. You do not build
 the connector: `install` copies its binaries onto the read-only payload.
 
-## 3. Create two agents
+## 3. Make two workspaces
 
 ```sh
 mkdir -p ~/amap-demo/alpha ~/amap-demo/beta
-sandy --provision --workspace ~/amap-demo/alpha --yes
-sandy --provision --workspace ~/amap-demo/beta --yes
 ```
 
-Never create a sandbox directory by hand: sandy makes it and names it with
-the **slug**, which looks like `alpha-1a2b3c4d`. The slug is also the agent's
-name to the router and the local part of its address. List them with
-`python3 amap-sandy.py list` from the `amap-deploy-sandy` checkout.
+That is all for now. Sandy creates a workspace's sandbox at its **first
+launch** (step 5) and names it with the **slug**, which looks like
+`alpha-1a2b3c4d`. The slug is also the agent's name to the router and the
+local part of its address. Never create a sandbox directory by hand.
+
+Launch only after the policy is written. Sandy decides at each launch whether
+the feature selects a sandbox, against the manifest on disk, so a sandbox
+launched before step 4 has to be relaunched (`sandy --stop`, then
+`sandy --start`) to join.
 
 ## 4. Install and write the policy
 
@@ -100,6 +103,10 @@ refuses.
 - Leave the top-level **`sandboxes`/`agents`** blocks alone. They are the
   selection rule, and the template selects every sandbox launched with
   claude.
+- This policy names no slugs. One that does (explicit `task_graph` edges,
+  `peers` or `groups`) needs those sandboxes to exist first, because
+  `install` refuses a slug sandy does not report: start them once, write
+  the policy, install, and relaunch them.
 
 `examples/feature.json` is a complete manifest. Then install again, which
 validates the policy and renders the router's config beside it:
@@ -115,7 +122,8 @@ cd ~/amap-demo/alpha && sandy --start
 cd ~/amap-demo/beta  && sandy --start
 ```
 
-At each launch sandy evaluates the selection rule, creates the agent's lanes
+The first `--start` in a workspace creates its sandbox. At each launch sandy
+evaluates the selection rule, creates the agent's lanes
 under `~/.sandy/features/amap/instances/<slug>/`, mounts the payload
 read-only at `/opt/sandy/features/amap`, starts the relay, and passes Claude
 Code its MCP config and its system-prompt policy.

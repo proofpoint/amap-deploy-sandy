@@ -73,9 +73,11 @@ python3 amap-sandy.py install --apply
 #    Then install again. This also renders router.json.
 python3 amap-sandy.py install --apply
 
-# 3. Launch the sandboxes. Sandy selects each one against the rule, creates its
-#    lanes and mounts the payload.
-sandy --provision --all
+# 3. Launch each agent's workspace. The first launch creates its sandbox, and
+#    every launch selects it against the rule, creates its lanes and mounts the
+#    payload. A sandbox already running from before step 2 must be relaunched
+#    (sandy --stop, then sandy --start) to pick up the manifest.
+sandy --start                            # in each workspace
 
 # 4. Start the router from the amap-router-local checkout.
 docker/build.sh && docker/run.sh --config "$SANDY_HOME/features/amap/router.json"
