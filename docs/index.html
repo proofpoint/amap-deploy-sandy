@@ -468,8 +468,9 @@ python3 amap-sandy.py verify   <span class="c"># exit 0 before going on</span></
 <pre>cd ~/amap-demo/alpha &amp;&amp; sandy --attach   <span class="c"># terminal 1</span>
 cd ~/amap-demo/beta  &amp;&amp; sandy --attach   <span class="c"># terminal 2: watch it arrive</span></pre></div>
           <div class="grid" style="display:grid;gap:10px">
-            <p class="small">Ask alpha:</p>
-            <p class="prompt">Read $AMAP_ROSTER_DIR/roster.json and find beta's address. Then ask beta, through inbox-submit, to list the files in its workspace and report back.</p>
+            <p class="small">Ask alpha, in plain words:</p>
+            <p class="prompt">Ask beta to list the files in its workspace and report back.</p>
+            <p class="small">Its system prompt already tells it where the fleet roster is, how an address is formed, and that <code>inbox-submit</code> is how to ask.</p>
           </div>
         </div>
         <p class="body">You have just watched the first flow for real. The runbook then breaks each guarantee on purpose: a write to the payload fails with <code>EROFS</code>, a task that was never granted is held, and a stopped router makes <code>verify</code> say UNKNOWN.</p>

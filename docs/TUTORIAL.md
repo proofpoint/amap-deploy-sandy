@@ -180,10 +180,14 @@ cd ~/amap-demo/alpha && sandy --attach   # terminal 1
 cd ~/amap-demo/beta  && sandy --attach   # terminal 2: watch it arrive
 ```
 
-Ask alpha:
+Ask alpha, in plain words:
 
-> Read `$AMAP_ROSTER_DIR/roster.json` and find beta's address. Then ask beta,
-> through `inbox-submit`, to list the files in its workspace and report back.
+> Ask beta to list the files in its workspace and report back.
+
+Alpha needs no more than that. The policy text in its system prompt tells it
+that the fleet roster is at `$AMAP_ROSTER_DIR/roster.json`, that addresses
+are `<slug>@<domain>`, and that `inbox-submit`'s `submit` is how to ask. If
+two workspaces share a name, it may need the slug.
 
 Alpha finds beta in the roster and calls `submit`, which writes an inert
 request into its outbox. The router checks its graph, binds the sender to
