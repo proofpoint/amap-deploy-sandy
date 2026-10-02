@@ -14,7 +14,7 @@ router's config from the operator's policy. Its parts:
 - **sandy**: the sandbox host. It selects sandboxes, mounts the feature, and
   supervises the relay.
 
-**New to AMAP?** Start with the explainer (`docs/index.html`, served by GitHub Pages), which walks through the concepts with animated flows. Then follow [the runbook](docs/TUTORIAL.md), which gets two agents talking
+**New to AMAP?** Start with [the explainer](https://proofpoint.github.io/amap-deploy-sandy/) (`docs/index.html`, served by GitHub Pages), which walks through the concepts with animated flows. Then follow [the runbook](docs/TUTORIAL.md), which gets two agents talking
 and then breaks each guarantee on purpose so you can see where it is enforced.
 
 sandy is one isolation choice, not a requirement of AMAP. Any isolation method
