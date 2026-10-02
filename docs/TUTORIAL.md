@@ -46,6 +46,19 @@ git clone https://github.com/proofpoint/amap-connector-claude
 `$AMAP_ROUTER_REPO` and `$AMAP_CONNECTOR_REPO` override that. You do not build
 the connector: `install` copies its binaries onto the read-only payload.
 
+**Or, in one command:**
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/proofpoint/amap-deploy-sandy/main/install.sh | bash
+```
+
+This clones (or updates) the three repos side by side in `~/amap`, runs
+step 4's `install --apply`, and builds and starts the router: the first half
+of step 5. Then make your workspaces (step 3), start agents as in the second
+half of step 5, and verify (step 6). It is safe to run again, and leaves a
+router that is already running alone. `AMAP_DIR` and `SANDY_HOME` override
+where it puts things.
+
 ## 3. Make two workspaces
 
 ```sh
