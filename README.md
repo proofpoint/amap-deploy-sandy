@@ -14,6 +14,17 @@ router's config from the operator's policy. Its parts:
 - **sandy**: the sandbox host. It selects sandboxes, mounts the feature, and
   supervises the relay.
 
+**Quick start.** With [sandy](https://github.com/rappdw/sandy) installed and
+Docker running, one command clones the three repos into `~/amap`, installs
+the default policy (every agent may task every other) and starts the router:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/proofpoint/amap-deploy-sandy/main/install.sh | bash
+```
+
+Then start agents whenever you need them, with `sandy --start` in each
+workspace. They can delegate to each other as they come online.
+
 **New to AMAP?** Start with [the explainer](https://proofpoint.github.io/amap-deploy-sandy/) (`docs/index.html`, served by GitHub Pages), which walks through the concepts with animated flows. Then follow [the runbook](docs/TUTORIAL.md), which gets two agents talking
 and then breaks each guarantee on purpose so you can see where it is enforced.
 
