@@ -33,7 +33,8 @@ import amap_sandy as prov  # noqa: E402
 import _wrapper  # noqa: E402
 
 LISTER = HERE / "payload" / prov.SESSION_SOURCE_NAME
-ROOT_LINES = ("PROC=/proc", "SOCK_DIR=/tmp/cc-socks", 'KEY_DIR="$HOME/.claude/sessions"')
+ROOT_LINES = ("PROC=/proc", 'SOCK_DIRS="/tmp/cc-socks /tmp/cc-socks-$(id -u)"',
+              'KEY_DIR="$HOME/.claude/sessions"')
 
 # A pane: (pane_index, pane_pid, @sandy_pane_agent or "" when unset,
 #          agent process name under it, or None for an idle shell).
@@ -44,10 +45,13 @@ class _Staged:
     """A process table, socket directory and key directory for `panes`, and a
     fake `tmux` that prints them only when asked for the session "sandy"."""
 
-    def __init__(self, root: Path, panes: List[Pane], *, session_exists: bool = True):
+    def __init__(self, root: Path, panes: List[Pane], *, session_exists: bool = True,
+                 fallback_socket: bool = False):
         self.root = root
         self.proc = root / "proc"
         self.socks = root / "s"          # short: a unix socket path has a length limit
+        self.socks_uid = root / "u"      # the per-uid fallback directory
+        self.socks_uid.mkdir()
         self.keys = root / "keys"
         for d in (self.proc, self.socks, self.keys):
             d.mkdir()
@@ -60,7 +64,8 @@ class _Staged:
                 self._proc(apid, agent, pane_pid)
                 if agent == "claude":
                     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                    s.bind(str(self.socks / f"{apid}.sock"))
+                    where = self.socks_uid if fallback_socket else self.socks
+                    s.bind(str(where / f"{apid}.sock"))
                     self._servers.append(s)
                     (self.keys / f"{apid}.k1.key").write_text("{}")
             rows.append(f"{idx}\t{pane_pid}\t{tag}")
@@ -87,15 +92,16 @@ class _Staged:
             s.close()
 
 
-def run_lister(panes: List[Pane], sandy_agent: str, *,
-               session_exists: bool = True) -> Tuple[int, str, List[Dict[str, str]]]:
+def run_lister(panes: List[Pane], sandy_agent: str, *, session_exists: bool = True,
+               fallback_socket: bool = False) -> Tuple[int, str, List[Dict[str, str]]]:
     """`(rc, stderr, rows)`, each row keyed by the six column names."""
     text = LISTER.read_text()
     with TemporaryDirectory(dir="/tmp") as d:
-        staged = _Staged(Path(d), panes, session_exists=session_exists)
+        staged = _Staged(Path(d), panes, session_exists=session_exists,
+                         fallback_socket=fallback_socket)
         try:
             for line, repl in zip(ROOT_LINES, (f"PROC={staged.proc}",
-                                               f"SOCK_DIR={staged.socks}",
+                                               f'SOCK_DIRS="{staged.socks} {staged.socks_uid}"',
                                                f"KEY_DIR={staged.keys}")):
                 assert line in text, f"{line!r} is not in payload/{prov.SESSION_SOURCE_NAME}"
                 text = text.replace(line, repl, 1)
@@ -190,6 +196,15 @@ class PaneIdentityContractTest(unittest.TestCase):
         rc, err, rows = run_lister(panes, "claude")
         self.assertEqual(rc, 0, err)
         self.assertEqual([(r["pane_pid"], r["socket"]) for r in rows], [("100", "101.sock")])
+
+    def test_a_socket_in_the_per_uid_fallback_directory_is_found(self):
+        """Claude Code falls back to a private /tmp/cc-socks-<uid> when it
+        cannot use /tmp/cc-socks. A lister that looked only in the default
+        would find no socket, and the daemon would wait silently."""
+        rc, err, rows = run_lister([(0, 100, "claude", "claude")], "claude",
+                                   fallback_socket=True)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual([(r["agent_pid"], r["socket"]) for r in rows], [("101", "101.sock")])
 
     def test_no_sandy_session_is_zero_rows_not_a_failure(self):
         """The daemon reads a nonzero exit as "the helper failed" and zero

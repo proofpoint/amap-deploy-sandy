@@ -31,7 +31,11 @@
 # stop delivery into this sandbox (two claude rows, or none), never redirect
 # it.
 #
-# The socket and key-file locations are Claude Code's, not sandy's.
+# The socket and key-file locations are Claude Code's, not sandy's. Claude Code
+# uses /tmp/cc-socks, and falls back to a private /tmp/cc-socks-<uid> when it
+# cannot use that; both are searched, the default first. The socket's own
+# variable is set only in claude's children, not in its environment, so it
+# cannot be read from the process.
 #
 # This file sits behind the read-only payload mount with the rest of the
 # relay chain: the daemon execs it, so it must be no more writable than the
@@ -39,7 +43,7 @@
 set -uo pipefail
 
 PROC=/proc
-SOCK_DIR=/tmp/cc-socks
+SOCK_DIRS="/tmp/cc-socks /tmp/cc-socks-$(id -u)"
 KEY_DIR="$HOME/.claude/sessions"
 SESSION=sandy
 TAB="$(printf '\t')"
@@ -50,6 +54,14 @@ panes() {
 
 ppid_of() { local l; l="$(cat "$PROC/$1/stat" 2>/dev/null)" || return 1; l="${l##*) }"; set -- $l; echo "$2"; }
 comm_of() { local l; l="$(cat "$PROC/$1/stat" 2>/dev/null)" || return 1; l="${l#*(}"; echo "${l%%)*}"; }
+
+sock_of() {  # $1 pid: its messaging socket, from the first directory holding one
+    local dir
+    for dir in $SOCK_DIRS; do
+        [ -S "$dir/$1.sock" ] && { echo "$dir/$1.sock"; return 0; }
+    done
+    return 1
+}
 
 is_agent() {  # $1 pid, $2 agent name
     [ "$(comm_of "$1")" = "$2" ] && return 0
@@ -91,11 +103,11 @@ for a in "${ORDER[@]}"; do
         apid="-"; sock="-"; key="-"
         for d in $(descendants "$ppid"); do
             is_agent "$d" "$a" || continue
-            if [ "$a" = "claude" ] && [ -S "$SOCK_DIR/$d.sock" ]; then apid="$d"; break; fi
+            if [ "$a" = "claude" ] && sock_of "$d" >/dev/null; then apid="$d"; break; fi
             [ "$apid" = "-" ] && apid="$d"
         done
         if [ "$a" = "claude" ] && [ "$apid" != "-" ]; then
-            [ -S "$SOCK_DIR/$apid.sock" ] && sock="$SOCK_DIR/$apid.sock"
+            sock=$(sock_of "$apid") || sock="-"
             for k in "$KEY_DIR/$apid".*.key; do [ -f "$k" ] && { key="$k"; break; }; done
         fi
         printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$a" "$idx" "$ppid" "$apid" "$sock" "$key"
