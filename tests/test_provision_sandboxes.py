@@ -10,6 +10,7 @@ import json
 import os
 import shutil
 import stat
+import subprocess
 import unittest
 import unittest.mock
 import sys
@@ -1546,6 +1547,67 @@ class SyncTest(_ConnectorFixtureMixin, unittest.TestCase):
         self.assertTrue(prov.router_sibling_path(self.tmp).is_file(),
                         "the router's config is rendered in the same run")
         self.assertFalse((self.boxes / "alpha-1.claude.json").exists(), "nothing per sandbox")
+
+
+class RouterCanStartFirstTest(_ConnectorFixtureMixin, unittest.TestCase):
+    """The router can be started before any sandbox has launched: `install
+    --apply` creates the two directories `docker/run.sh` refuses to start
+    without, the instances root and the router's state_dir, both empty."""
+
+    POLICY = SyncTest.POLICY
+    _policy = SyncTest._policy
+    _sync = SyncTest._sync
+    _fleet = SyncTest._fleet
+
+    def _fresh_install(self, *extra):
+        self._fleet()
+        prov.feature_manifest_path(self.tmp).unlink()
+        return self._sync(None, *extra)
+
+    def test_the_routers_own_mount_derivation_accepts_a_fresh_install(self):
+        """The proof is the router's `docker/derive-mounts.py`, run against
+        the config install rendered, before any sandbox has launched: it
+        refuses any bind source that does not exist."""
+        rc, out = self._fresh_install("--apply")
+        self.assertEqual(rc, 0, out)
+        idir = prov.feature_instances_dir(self.tmp)
+        state = prov.sibling_state_dir(self.tmp, None)
+        self.assertEqual((sorted(idir.iterdir()), sorted(state.iterdir())), ([], []),
+                         "both are created empty")
+        r = subprocess.run([sys.executable, str(_ROUTER_ROOT / "docker" / "derive-mounts.py"),
+                            str(prov.router_sibling_path(self.tmp))],
+                           capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        mounted = {line.split("\t")[0] for line in r.stdout.splitlines()}
+        self.assertIn(str(idir), mounted)
+        self.assertIn(str(state), mounted)
+
+    def test_a_dry_run_creates_neither(self):
+        rc, out = self._fresh_install()
+        self.assertIn("would create instances directory", out)
+        self.assertFalse(prov.feature_instances_dir(self.tmp).exists())
+        self.assertFalse(prov.sibling_state_dir(self.tmp, None).exists())
+
+    def test_verify_names_either_one_missing(self):
+        state = self.tmp / "router-state"
+        self.assertEqual(len(prov.verify_router_mount_sources(self.tmp, state)), 2)
+        prov.feature_instances_dir(self.tmp).mkdir(parents=True)
+        state.mkdir()
+        self.assertEqual(prov.verify_router_mount_sources(self.tmp, state), [])
+        state.rmdir()
+        state.symlink_to(self.tmp)
+        problems = prov.verify_router_mount_sources(self.tmp, state)
+        self.assertTrue(problems and "symlink" in problems[0], problems)
+
+    def test_a_symlink_where_the_instances_root_goes_is_refused(self):
+        self._fleet()
+        idir = prov.feature_instances_dir(self.tmp)
+        if idir.exists():
+            shutil.rmtree(idir)
+        idir.parent.mkdir(parents=True, exist_ok=True)
+        idir.symlink_to(self.tmp)
+        with self.assertRaises(prov.ProvisionError):
+            prov.install_instances_dir(self.tmp, dry_run=False)
 
 
 class SandyManifestGateTest(unittest.TestCase):

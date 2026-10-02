@@ -272,8 +272,12 @@ never who may task whom.
 - **Nothing here writes under the router's `state_dir`.** The router takes
   an instance's first-sight snapshot on its own first poll, and a marker
   written by anything else would be a snapshot taken at the wrong moment.
+  `install` creates the directory itself, empty, because `docker/run.sh`
+  refuses a missing bind source rather than let Docker create it as root.
 - **Never `mkdir` a sandbox directory or a lane tree.** Sandy creates both
-  at launch.
+  at launch. `install` creates only the empty `instances/` root, which the
+  router mounts whole, so the router can start before any sandbox has
+  launched.
 - **The slug is the instance name.** One string names the sandbox, the
   router instance and the local part of the address. Nothing derives a
   second name, and nothing case-folds it.

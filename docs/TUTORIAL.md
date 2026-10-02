@@ -12,7 +12,7 @@ animated flows. This page assumes that background and sticks to commands.
 2. [Get the pieces](#2-get-the-pieces)
 3. [Make two workspaces](#3-make-two-workspaces)
 4. [Install](#4-install)
-5. [Start the agents and the router](#5-start-the-agents-and-the-router)
+5. [Start the router, then the agents](#5-start-the-router-then-the-agents)
 6. [Verify](#6-verify)
 7. [Send your first delegation](#7-send-your-first-delegation)
 8. [Break it on purpose](#8-break-it-on-purpose)
@@ -71,8 +71,9 @@ python3 amap-sandy.py install --apply
 
 Every verb is a dry run without `--apply`, so drop it to preview. On a fresh
 host this writes the manifest at `~/.sandy/features/amap/feature.json` from
-a template that **works as written**, installs the payload beside it, and
-renders the router's config.
+a template that **works as written**, installs the payload beside it,
+renders the router's config, and creates the empty directories the router
+mounts.
 
 The manifest *is* the policy. Its `feature` section, as the template writes
 it:
@@ -110,18 +111,7 @@ explicit edges. A policy that names slugs (explicit `task_graph` edges,
 refuses a slug sandy does not report: start them once, edit, install, and
 relaunch them. `examples/feature.json` is a complete edited manifest.
 
-## 5. Start the agents and the router
-
-```sh
-cd ~/amap-demo/alpha && sandy --start
-cd ~/amap-demo/beta  && sandy --start
-```
-
-The first `--start` in a workspace creates its sandbox. At each launch sandy
-evaluates the selection rule, creates the agent's lanes
-under `~/.sandy/features/amap/instances/<slug>/`, mounts the payload
-read-only at `/opt/sandy/features/amap`, starts the relay, and passes Claude
-Code its MCP config and its system-prompt policy.
+## 5. Start the router, then the agents
 
 ```sh
 cd ~/amap/amap-router-local
@@ -130,14 +120,30 @@ docker/run.sh --config ~/.sandy/features/amap/router.json \
   --detach
 ```
 
-The router's container has no network, and its mounts are computed from its
-config. It re-reads the config on every poll, so later policy changes need
-only `install --apply`, not a restart.
+The router needs no agent to be running. Its container has no network, and
+its mounts are computed from its config. It re-reads the config and looks
+for new agents on every poll, so later policy changes need only
+`install --apply`, and an agent launched later is picked up with no restart.
+
+```sh
+cd ~/amap-demo/alpha && sandy --start
+cd ~/amap-demo/beta  && sandy --start
+```
+
+Start agents whenever you need them, in any order. The first `--start` in a
+workspace creates its sandbox. At each launch sandy evaluates the selection
+rule, creates the agent's lanes under
+`~/.sandy/features/amap/instances/<slug>/`, mounts the payload read-only at
+`/opt/sandy/features/amap`, starts the relay, and passes Claude Code its MCP
+config and its system-prompt policy. Agents can delegate to each other as
+they come online.
 
 **Starting the router is the approval.** Its first poll of each agent is
 *first sight*: it snapshots that agent's outbox, and never delivers anything
-staged before then. Keep its state directory on persistent storage, because
-a fresh one is a fresh first sight.
+staged before then. With the router already running, that is a few seconds
+after the agent's launch, before it has anything to say. Keep the router's
+state directory on persistent storage, because a fresh one is a fresh first
+sight.
 
 ## 6. Verify
 

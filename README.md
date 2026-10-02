@@ -50,7 +50,12 @@ Everything lives once per host, under `$SANDY_HOME/features/amap/`:
 | `router.json` | the router's config, **generated** from the policy | `install`; never hand-edit |
 | `roster/` | the fleet roster the router writes, mounted read-only into every selected sandbox | created empty by `install`, written by the router |
 | `selected.json` | **sandy's** verdict: which sandboxes the rule selected at their last launch | sandy |
+| `instances/` | the root of every instance's lanes, mounted whole by the router | created empty by `install` |
 | `instances/<slug>/` | each instance's lanes (inbox, peer, outbox), created by sandy at launch | sandy |
+
+Beside it, `$SANDY_HOME/router-state/` is the router's `state_dir`: first-sight
+markers, the reply ledger, held requests. `install` creates it empty, and
+everything in it is the router's.
 
 **Nothing is written into a sandbox.** Sandy applies the manifest to each
 sandbox at its launch. The manifest's `agent_args` pass Claude Code the MCP
@@ -72,14 +77,16 @@ python3 amap-sandy.py install --apply
 #    install again.
 python3 amap-sandy.py install --apply
 
-# 3. Launch each agent's workspace. The first launch creates its sandbox, and
-#    every launch selects it against the rule, creates its lanes and mounts the
-#    payload. A sandbox already running from before step 2 must be relaunched
-#    (sandy --stop, then sandy --start) to pick up the manifest.
-sandy --start                            # in each workspace
-
-# 4. Start the router from the amap-router-local checkout.
+# 3. Start the router from the amap-router-local checkout. It needs no sandbox
+#    to have launched yet.
 docker/build.sh && docker/run.sh --config "$SANDY_HOME/features/amap/router.json"
+
+# 4. Launch agents whenever you like, in any order. The first launch creates a
+#    workspace's sandbox, and every launch selects it against the rule,
+#    creates its lanes and mounts the payload; the router admits it on its
+#    next poll. A sandbox already running from before step 1 must be
+#    relaunched (sandy --stop, then sandy --start) to pick up the manifest.
+sandy --start                            # in each workspace
 
 # 5. Check everything, the router process included.
 python3 amap-sandy.py verify
@@ -87,8 +94,9 @@ python3 amap-sandy.py verify
 
 **There is no approve step.** The first time the router polls an instance,
 it takes a snapshot of that instance's outbox. It never delivers anything
-staged before that snapshot. So finish steps 1–3 before the agents have
-anything to say, and keep the router's `state_dir` on persistent storage: a
+staged before that snapshot. With the router already running, that snapshot
+comes at its first poll after an agent's launch, before the agent has
+anything to say. Keep the router's `state_dir` on persistent storage: a
 fresh `state_dir` means a fresh first sight.
 
 ## Verbs
