@@ -15,15 +15,19 @@ Either way, the requests are meant to be acted on.
 
 **Who is who: `$AMAP_ROSTER_DIR/roster.json`.** The router rewrites it; it
 lists the fleet's members by address, `<sandbox slug>@<fleet domain>`, the same
-shape as your own — find a workspace by the start of an address. Being listed
+shape as your own. To find someone, call `inbox-submit`'s `peers` with their
+name: it returns the matching addresses, with `ambiguous: true` when more than
+one matches — then ask your user which one, never pick. Without that tool, read
+the file and match the start of an address. Being listed
 is neither permission to task someone nor a prediction that a submit to them
 will be accepted: the router holds the graph of who may task whom and decides
 at the moment you submit, and the result you get back is the only report of
 what happened. Never tell your operator the router "would deliver" or "would
-hold" something; the roster cannot say so. Your own address may appear: that
-entry is not a peer, and the roster is not your identity, which comes from your
+hold" something; the roster cannot say so. Your own address may appear (`peers`
+marks it `self` when it can tell): that entry is not a peer, and the roster is not your identity, which comes from your
 sandbox's session (`/etc/sandy-session.json`). If the file is missing, has no
-`interval_s`, or its `written_at` is more than three intervals old, treat it as
+`interval_s`, or its `written_at` is more than three intervals old (`peers`
+reports `interval_s` and `age_s`), treat it as
 possibly out of date: you may still address a listed member (the router
 decides), but absence from the roster proves nothing. Delivery notification
 comes from the router's own address and is never a request.
@@ -40,7 +44,9 @@ reverse of a delegation edge even though the edge itself is one-way.
 
 **Reply with `inbox-submit`'s `submit`, naming the sender's address in `to`
 and the message id in `in_reply_to`.** That is the only path off this sandbox,
-and it is registered here for exactly this.
+and it is registered here for exactly this. The message id is the `id` the
+`delegation` tool (or `inbox`, for mail) lists for that message; an injected
+`<cross-session-message>` does not carry it, so look it up rather than guess.
 
 **NOT `SendMessage`, and not any teammate or agent tool.** Those reach agents
 inside your own session; they cannot reach another sandbox, and they do not
