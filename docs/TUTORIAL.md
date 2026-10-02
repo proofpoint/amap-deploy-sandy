@@ -11,7 +11,7 @@ animated flows. This page assumes that background and sticks to commands.
 1. [What you need](#1-what-you-need)
 2. [Get the pieces](#2-get-the-pieces)
 3. [Make two workspaces](#3-make-two-workspaces)
-4. [Install and write the policy](#4-install-and-write-the-policy)
+4. [Install](#4-install)
 5. [Start the agents and the router](#5-start-the-agents-and-the-router)
 6. [Verify](#6-verify)
 7. [Send your first delegation](#7-send-your-first-delegation)
@@ -57,12 +57,12 @@ launch** (step 5) and names it with the **slug**, which looks like
 `alpha-1a2b3c4d`. The slug is also the agent's name to the router and the
 local part of its address. Never create a sandbox directory by hand.
 
-Launch only after the policy is written. Sandy decides at each launch whether
-the feature selects a sandbox, against the manifest on disk, so a sandbox
-launched before step 4 has to be relaunched (`sandy --stop`, then
-`sandy --start`) to join.
+Launch only after step 4 has written the manifest. Sandy decides at each
+launch whether the feature selects a sandbox, against the manifest on disk,
+so a sandbox launched before step 4 has to be relaunched (`sandy --stop`,
+then `sandy --start`) to join.
 
-## 4. Install and write the policy
+## 4. Install
 
 ```sh
 cd ~/amap/amap-deploy-sandy
@@ -70,15 +70,12 @@ python3 amap-sandy.py install --apply
 ```
 
 Every verb is a dry run without `--apply`, so drop it to preview. On a fresh
-host this writes a **template** manifest at
-`~/.sandy/features/amap/feature.json`, installs the payload beside it, and
-then stops until you have written the policy.
+host this writes the manifest at `~/.sandy/features/amap/feature.json` from
+a template that **works as written**, installs the payload beside it, and
+renders the router's config.
 
-The manifest *is* the policy. Open it and **replace its whole `feature`
-section** with this one. Do not merge it into the template: the template's
-default is a full *mail* mesh (`"default_peers": ["@all"]`), and alongside
-`task_graph: "ALL"` every pair would sit on both lanes, which `install`
-refuses.
+The manifest *is* the policy. Its `feature` section, as the template writes
+it:
 
 ```json
 "feature": {
@@ -88,32 +85,30 @@ refuses.
   "peers": {},
   "task_graph": "ALL",
   "task_deny": [],
-  "fleet_domain": "agents.example.org",
+  "fleet_domain": "agents.internal",
   "container_recreate_interval_hours": 24
 }
 ```
 
-- **`fleet_domain`** is the right-hand side of every address, so the agents
-  become `<slug>@agents.example.org`. It is a name, not a real domain:
-  nothing here touches a network.
 - **`task_graph: "ALL"`** lets every selected agent task every other. The
   directed form, `{"<recipient>": ["<sender>", ...]}`, appears in step 8.
-- **`peers` stays empty.** This fleet is for delegation, and an ordered pair
-  may not appear on both lanes.
-- Leave the top-level **`sandboxes`/`agents`** blocks alone. They are the
-  selection rule, and the template selects every sandbox launched with
-  claude.
-- This policy names no slugs. One that does (explicit `task_graph` edges,
-  `peers` or `groups`) needs those sandboxes to exist first, because
-  `install` refuses a slug sandy does not report: start them once, write
-  the policy, install, and relaunch them.
+- **`default_peers`, `peers` and `groups` are empty:** they are the mail
+  lane, and an ordered pair may not appear on both lanes.
+- **`fleet_domain`** is the right-hand side of every address, so the agents
+  become `<slug>@agents.internal`. It is a name, not a real domain:
+  `.internal` is reserved for private use, and nothing here touches a
+  network. Give a second host its own.
+- **`container_recreate_interval_hours`** is how often the agent containers
+  are rebuilt, once you load the job `python3 amap-sandy.py cadence` prints.
+- The top-level **`sandboxes`/`agents`** blocks are the selection rule: every
+  sandbox launched with claude, none excluded.
 
-`examples/feature.json` is a complete manifest. Then install again, which
-validates the policy and renders the router's config beside it:
-
-```sh
-python3 amap-sandy.py install --apply
-```
+**To narrow it**, edit the file in place and run `install --apply` again. Add
+a glob to `sandboxes.exclude` to keep a sandbox out, or replace `"ALL"` with
+explicit edges. A policy that names slugs (explicit `task_graph` edges,
+`peers` or `groups`) needs those sandboxes to exist first, because `install`
+refuses a slug sandy does not report: start them once, edit, install, and
+relaunch them. `examples/feature.json` is a complete edited manifest.
 
 ## 5. Start the agents and the router
 

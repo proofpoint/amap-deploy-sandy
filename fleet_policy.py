@@ -55,8 +55,10 @@ SEMANTICS:
     module never evaluates it (one matcher, sandy's, and `selected.json` is
     its verdict). Selection IS enrolment: there is no enrol list, no marker,
     and no enrol command.
-  - No policy -> `default_policy()` below: `default_peers: ["@all"]`, a full
-    mail mesh over the selected set. `load_policy` marks the returned dict so
+  - No policy -> `default_policy()` below: `task_graph: "ALL"`, a full
+    DELEGATION mesh over the selected set, with no mail lane, the domain
+    `agents.internal` and a daily recreation cadence. It is also the template
+    a fresh host's manifest is written from. `load_policy` marks the returned dict so
     a caller can print a one-line "here is how to create one" notice without
     re-deriving "was this file present" itself.
 
@@ -167,11 +169,12 @@ def default_selection() -> Dict[str, Dict[str, List[str]]]:
 #                                       reference, no mutuality ("ALL" is
 #                                       the one wildcard; see TASK_GRAPH_ALL).
 #   container_recreate_interval_hours   the recreation cadence the launchd job
-#                                       runs at. No default anywhere:
-#                                       `install` refuses to provision under a
-#                                       policy that omits it, which is what
-#                                       makes writing it in the operator's
-#                                       ratification of the number.
+#                                       runs at. The template writes 24, and
+#                                       `install` refuses a policy that omits
+#                                       it, so the job's number is always one
+#                                       in the reviewed file. Loading the job
+#                                       (`cadence` prints the line) is the
+#                                       operator's ratification of it.
 #
 # `peers`/`groups`/`default_peers` are the MAIL matrix.
 
@@ -277,32 +280,35 @@ class PolicyError(Exception):
 
 # ------------------------------------------------------------------ loading
 
+DEFAULT_FLEET_DOMAIN = "agents.internal"    # `.internal` is reserved for private use: never a real domain
+DEFAULT_RECREATE_INTERVAL_HOURS = 24
+
+
 def default_policy() -> Dict[str, Any]:
-    """The policy an absent `feature` section is treated as: full mail mesh,
-    every sandbox launched with claude selected. `default_peers: ["@all"]`
-    with no per-instance `peers` overrides makes `resolve_peers` hand every
-    instance the full set of every OTHER selected instance, so "no policy"
-    and "a policy that spells out the full mesh" are the same code path
-    rather than two. (`install` still refuses to PROVISION under a manifest that
-    omits the ratified fields; a default is what an absent file MEANS, not
-    what an operator is allowed to leave unsaid.)"""
+    """The policy an absent `feature` section is treated as, and the template
+    a fresh host's manifest is written from: every sandbox launched with
+    claude selected, none excluded, and every selected instance may task
+    every other (`task_graph: "ALL"`) with no mail lane. On a single-host
+    local router that is the policy an operator writes anyway, so the
+    template works unedited; narrowing it (an exclude, explicit edges) is the
+    operator's edit.
+
+    It carries a `fleet_domain`, because every delegation edge needs an
+    address, and a recreation cadence, because `install` refuses a policy
+    without one. The human gates are elsewhere: starting the router (its
+    first sight of each outbox) and loading the recreation job."""
     return {
         "version": SCHEMA_VERSION,
         **default_selection(),
         "groups": {},
-        "default_peers": [ALL_GROUP_REF],
+        # Empty: the lanes are disjoint per ordered pair, and "ALL" below puts
+        # every pair on the delegation lane.
+        "default_peers": [],
         "peers": {},
-        # Empty, not absent: "no delegation edges" is a real, renderable
-        # answer, and every consumer may read `policy[TASK_GRAPH_KEY]`
-        # without a `.get`. `fleet_domain` and
-        # `container_recreate_interval_hours` are the opposite case and are
-        # deliberately ABSENT here -- they have no defensible default, they
-        # are operator decisions, and `install` refuses to provision under a
-        # policy that omits the second one. Synthesising either would make
-        # "the operator chose this" and "nobody chose anything"
-        # indistinguishable, which is the exact confusion the
-        # ratification step exists to remove.
-        TASK_GRAPH_KEY: {},
+        TASK_GRAPH_KEY: TASK_GRAPH_ALL,
+        TASK_DENY_KEY: [],
+        FLEET_DOMAIN_KEY: DEFAULT_FLEET_DOMAIN,
+        RECREATE_INTERVAL_KEY: DEFAULT_RECREATE_INTERVAL_HOURS,
     }
 
 
@@ -559,7 +565,7 @@ def load_policy(path: Path) -> Dict[str, Any]:
                 f"{path}: {RECREATE_INTERVAL_KEY!r} is {interval!r} — expected a positive "
                 "whole number of hours. Absent is also an answer here, and a different "
                 "one: `install` refuses to provision under a manifest that omits "
-                "this field, because installing it is what ratifies the cadence.")
+                "this field, because the recreation job runs at it.")
 
     out = {
         "version": version,

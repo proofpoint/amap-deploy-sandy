@@ -32,12 +32,25 @@ class DefaultPolicyTest(unittest.TestCase):
         d[fp.SANDBOXES_KEY]["include"].append("x")
         self.assertEqual(fp.default_policy()[fp.SANDBOXES_KEY]["include"], ["*"])
 
-    def test_default_policy_resolves_to_full_mesh(self):
-        names = {"alice", "bob", "carol"}
-        resolved = fp.resolve_peers(fp.default_policy(), names)
-        self.assertEqual(resolved["alice"], ["bob", "carol"])
-        self.assertEqual(resolved["bob"], ["alice", "carol"])
-        self.assertEqual(resolved["carol"], ["alice", "bob"])
+    def test_default_policy_is_a_full_delegation_mesh_with_no_mail_lane(self):
+        """The template a fresh host gets works unedited on a single-host
+        local router: every selected instance may task every other, the mail
+        lane is empty so the lanes stay disjoint, and it carries the address
+        domain and the cadence the write path requires."""
+        import policy_checks
+        policy = fp.default_policy()
+        names = ["alice", "bob", "carol"]
+        self.assertEqual(fp.resolve_task_graph(policy, names),
+                         {"alice": ["bob", "carol"], "bob": ["alice", "carol"],
+                          "carol": ["alice", "bob"]})
+        self.assertEqual(fp.resolve_peers(policy, names),
+                         {"alice": [], "bob": [], "carol": []})
+        resolved = fp.resolve_peers(policy, names)
+        self.assertEqual(fp.overlapping_pairs(policy, resolved,
+                                              fp.resolve_task_graph(policy, names)), [])
+        self.assertEqual(policy[fp.FLEET_DOMAIN_KEY], fp.DEFAULT_FLEET_DOMAIN)
+        self.assertTrue(fp.FLEET_DOMAIN_RE.match(policy[fp.FLEET_DOMAIN_KEY]))
+        self.assertEqual(policy_checks.check_ratification(policy), [])
 
 class LoadPolicyValidationTest(unittest.TestCase):
     def setUp(self):

@@ -789,14 +789,13 @@ def _stub_sandy(case, features=True):
 
 
 def _ratify(home):
-    """The authored manifest a provisioning test runs under: the default
-    template plus the one value the write-path gate refuses to default —
-    the recreation cadence — so `--apply` reaches the sandboxes. Written
-    only when absent, so a test that authored its own manifest keeps it."""
+    """The manifest a provisioning test runs under: the default template,
+    which the write path accepts as written. Written only when absent, so a
+    test that authored its own manifest keeps it."""
     path = prov.feature_manifest_path(Path(home))
     if not path.exists():
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(prov.manifest_text({**fp.default_policy(), fp.RECREATE_INTERVAL_KEY: 24}))
+        path.write_text(prov.manifest_text(fp.default_policy()))
 
 
 def _select(home, *slugs, rejected=(), at=None):
@@ -1524,38 +1523,29 @@ class SyncTest(_ConnectorFixtureMixin, unittest.TestCase):
         self.assertIn("feature.json present", out)
         self.assertIn("host: 0 part(s) needed changes", out)
 
-    def test_a_fresh_host_gets_the_template_and_is_told_to_ratify_it(self):
+    def test_a_fresh_host_gets_a_template_that_works_unedited(self):
         """No manifest yet: `install --apply` writes the TEMPLATE (every sandbox
-        launched with claude, nothing excluded, no domain) and the payload,
-        then refuses to finish until the operator has ratified the file — the
-        recreation cadence has no default — naming the file and the section
-        to edit. Its own exit code, kept apart from a failure's 1."""
+        launched with claude, nothing excluded, a full delegation mesh with no
+        mail lane, a domain and a cadence), says what it is and how to
+        narrow it, and completes: the router's config is rendered in the same
+        run. Nothing is written per sandbox; the next launch applies it."""
         self._fleet()
-        prov.feature_manifest_path(self.tmp).unlink()     # the fixture's ratified template
+        prov.feature_manifest_path(self.tmp).unlink()     # the fixture's manifest
         rc, out = self._sync(None, "--apply")
-        self.assertEqual(rc, prov.EXIT_POLICY_UNRATIFIED, out)
-        self.assertIn("TEMPLATE", out)
-        self.assertIn("container_recreate_interval_hours", out)
-        self.assertIn("feature.json (its `feature` section is the policy)", out)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("TEMPLATE, which works as written", out)
+        self.assertIn("sandboxes.exclude", out)
         manifest = json.loads(prov.feature_manifest_path(self.tmp).read_text())
         self.assertEqual(manifest["sandboxes"], {"include": ["*"], "exclude": []})
         self.assertEqual(manifest["agents"], {"include": ["claude"], "exclude": []})
-        self.assertEqual(manifest["expose"], {})
-        self.assertNotIn("fleet_domain", manifest["feature"])
+        self.assertEqual(manifest["feature"][fp.TASK_GRAPH_KEY], fp.TASK_GRAPH_ALL)
+        self.assertEqual(manifest["feature"]["default_peers"], [])
+        self.assertEqual(manifest["expose"], {prov.EXPOSE_FLEET_DOMAIN: fp.DEFAULT_FLEET_DOMAIN})
+        self.assertEqual(manifest[prov.AGENT_ARGS_KEY], prov.agent_args_for_manifest())
         self.assertTrue(prov.payload_entry_path(self.tmp).is_file(), "the payload lands too")
-        self.assertFalse((self.boxes / "alpha-1.claude.json").exists(), "no sandbox provisioned")
-        # The operator ratifies it by editing the file; the next install completes.
-        doc = json.loads(prov.feature_manifest_path(self.tmp).read_text())
-        doc["feature"]["container_recreate_interval_hours"] = 24
-        prov.feature_manifest_path(self.tmp).write_text(json.dumps(doc, indent=2) + "\n")
-        rc, out = self._sync(None, "--apply")
-        self.assertEqual(rc, 0, out)
-        # Ratified: the install is complete, and it is still nothing per
-        # sandbox — the manifest's agent_args is what reaches alpha-1, at its
-        # next launch.
-        doc = json.loads(prov.feature_manifest_path(self.tmp).read_text())
-        self.assertEqual(doc[prov.AGENT_ARGS_KEY], prov.agent_args_for_manifest())
-        self.assertFalse((self.boxes / "alpha-1.claude.json").exists())
+        self.assertTrue(prov.router_sibling_path(self.tmp).is_file(),
+                        "the router's config is rendered in the same run")
+        self.assertFalse((self.boxes / "alpha-1.claude.json").exists(), "nothing per sandbox")
 
 
 class SandyManifestGateTest(unittest.TestCase):

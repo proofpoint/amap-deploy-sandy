@@ -14,11 +14,11 @@ container on the box. `install_command()` hands the operator the exact line;
 `amap-sandy.py cadence` reads the record and reports.
 
 THE NUMBER IS THE POLICY'S, NOT THIS FILE'S. `container_recreate_interval_hours`
-lives in the manifest's `feature` section and `install` refuses a policy
-that omits it. That refusal is what makes writing it in the operator's
-ratification of the cadence — so this module takes the
-interval as an argument and has no default. A default here would be a cadence
-the fleet runs on that appears in no reviewed artifact.
+lives in the manifest's `feature` section (the template writes one) and
+`install` refuses a policy that omits it, so the number the job runs at is
+always in the reviewed file. This module takes the interval as an argument
+and has no default of its own; loading the job it renders is the operator's
+ratification of the cadence.
 
 WHY A STAMP FILE. "Is the job loaded" and "did it actually run" are different
 questions, and launchd answers only the first in any form this repo can rely

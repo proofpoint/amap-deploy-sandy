@@ -9,9 +9,9 @@ it on the write path with the checks below, refusing to provision until they
 pass and naming what to edit:
 
   - `check_ratification`: pure functions of the file. The recreation cadence
-    must be present (writing it into the manifest is the operator's
-    ratification of it), and a task graph with edges must have a
-    `fleet_domain` to address them with.
+    must be present (the recreation job runs at it, and reads it only from
+    here), and a task graph with edges must have a `fleet_domain` to address
+    them with. The template carries both.
   - `check_resolve_peers` / `check_disjoint`: against the PROJECTED
     membership (`projected_membership`) — what sandy reports at all plus what
     it has selected — because on a fresh fleet nothing is selected yet and a
@@ -105,13 +105,14 @@ def check_ratification(policy: Dict[str, Any]) -> List[str]:
     every host, forever, and printing it as a warning on a dry run would
     only teach an operator to scroll past it.
 
-    WHY THE CADENCE IS REQUIRED RATHER THAN DEFAULTED. Writing it in IS the
-    operator's ratification of the number. A default would mean this repo
-    carries a recreation cadence nobody typed, and the
-    launchd job would then run on a schedule that appears in no reviewed
-    artifact. `fleet_policy.load_policy` validates the field's SHAPE when it
-    is present and says nothing about its absence, precisely so that this
-    is the one place absence is decided.
+    WHY THE CADENCE IS REQUIRED IN THE FILE. The launchd job runs at it and
+    reads it from nowhere else, so its number always appears in the reviewed
+    manifest. The template writes `fleet_policy.DEFAULT_RECREATE_INTERVAL_HOURS`;
+    a policy that drops it is refused rather than silently defaulted here.
+    Loading the job is the operator's ratification of the number.
+    `fleet_policy.load_policy` validates the field's SHAPE when it is present
+    and says nothing about its absence, precisely so that this is the one
+    place absence is decided.
 
     WHY A DOMAIN IS REQUIRED FOR EDGES. Every peer address is
     `<instance>@<fleet_domain>`; without a domain no edge has an address
@@ -121,10 +122,9 @@ def check_ratification(policy: Dict[str, Any]) -> List[str]:
     problems: List[str] = []
     if fp.RECREATE_INTERVAL_KEY not in policy:
         problems.append(
-            f"{fp.RECREATE_INTERVAL_KEY!r} is missing. It has no default: writing it "
-            "into the policy is what ratifies the container recreation cadence the "
-            "launchd job runs at, and a cadence nobody typed is not a decision. Add "
-            "it, in hours (for example 24).")
+            f"{fp.RECREATE_INTERVAL_KEY!r} is missing. The launchd job that recreates "
+            "the containers runs at it and reads it only from this file. Add it, in "
+            f"hours ({fp.DEFAULT_RECREATE_INTERVAL_HOURS} is the template's).")
     graph = policy.get(fp.TASK_GRAPH_KEY) or {}
     # The wildcard declares an edge for every ordered pair of selected
     # instances, so it needs a domain for exactly the reason an explicit edge
