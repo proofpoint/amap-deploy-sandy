@@ -451,6 +451,26 @@ class RosterMountTest(unittest.TestCase):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, text)
 
+    def test_the_policy_points_at_peers_and_says_to_ask_on_ambiguity(self):
+        """`peers` resolves a name against the roster. The pointer says to ask
+        the user on an ambiguous match, never pick, and keeps the file as the
+        fallback for a connector without the tool."""
+        text = self._policy_text()
+        for phrase in ("`inbox-submit`'s `peers`", "`ambiguous: true`",
+                       "ask your user which one, never pick",
+                       "Without that tool, read the file"):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, text)
+
+    def test_the_tool_the_policy_names_is_the_connectors(self):
+        """Agreement with the connector checkout this payload is built from:
+        its inbox-submit registers a `peers` tool reading the variables the
+        manifest exports. A policy naming a tool the server does not have
+        would send agents after nothing."""
+        source = (Path(prov._default_connector_src()) / "inbox-submit").read_text()
+        self.assertIn('"peers"', source)
+        self.assertIn(f'"{prov.EXPORT_ROSTER_DIR}"', source)
+
     def test_the_bound_agents_are_told_is_the_bound_verify_applies(self):
         """The spec fixes no staleness bound; this deployment's is stated to
         agents in prose and applied by verify in code. One number, pinned."""
