@@ -377,7 +377,7 @@ td.strong{font-family:var(--display);font-weight:700}
 <pre><span class="c"># install, then check the host is ready</span>
 curl -fsSL https://raw.githubusercontent.com/rappdw/sandy/main/install.sh | bash
 curl -fsSL https://raw.githubusercontent.com/rappdw/sandy/main/doctor.sh | bash
-sandy --print-schema | jq '.schema_version'   <span class="c"># must print 3</span></pre></div>
+sandy --print-schema | jq '.schema_version'   <span class="c"># must print 3 or 4</span></pre></div>
           <div class="cmd"><div class="label"><span>the code</span><button type="button" class="copy">Copy</button></div>
 <pre>mkdir -p ~/amap &amp;&amp; cd ~/amap
 git clone https://github.com/proofpoint/amap-deploy-sandy
@@ -391,13 +391,11 @@ git clone https://github.com/proofpoint/amap-connector-claude</pre></div>
     <section class="screen" data-id="policy" data-ch="8">
       <div class="inner">
         <p class="eyebrow">Run it yourself · 2 of 4</p>
-        <h2>Create two agents, install, and write the policy</h2>
+        <h2>Make two workspaces, install, and write the policy</h2>
         <div class="steps2">
           <div class="cmd"><div class="label"><span>two workspaces, then install</span><button type="button" class="copy">Copy</button></div>
-<pre><span class="c"># sandy creates each sandbox and names it (its slug)</span>
+<pre><span class="c"># sandy creates each sandbox at its first launch (3 of 4)</span>
 mkdir -p ~/amap-demo/alpha ~/amap-demo/beta
-sandy --provision --workspace ~/amap-demo/alpha --yes
-sandy --provision --workspace ~/amap-demo/beta --yes
 
 cd ~/amap/amap-deploy-sandy
 python3 amap-sandy.py install --apply
@@ -424,7 +422,7 @@ python3 amap-sandy.py install --apply
         <h2>Start the agents and the router, then verify</h2>
         <div class="steps2">
           <div class="cmd"><div class="label"><span>agents, then the router</span><button type="button" class="copy">Copy</button></div>
-<pre><span class="c"># sandy selects each at launch, mounts the payload ro</span>
+<pre><span class="c"># first launch creates the sandbox; sandy selects it, mounts the payload ro</span>
 cd ~/amap-demo/alpha &amp;&amp; sandy --start
 cd ~/amap-demo/beta  &amp;&amp; sandy --start
 
