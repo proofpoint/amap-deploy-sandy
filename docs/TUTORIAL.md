@@ -74,8 +74,11 @@ host this writes a **template** manifest at
 `~/.sandy/features/amap/feature.json`, installs the payload beside it, and
 then stops until you have written the policy.
 
-The manifest *is* the policy. Open it and **replace its whole `feature`
-section** with this one. Do not merge it into the template: the template's
+The manifest *is* the policy. Open it in an editor and **replace its whole
+`feature` section** with this one: select from `"feature": {` to its
+matching `}` and paste this in its place, leaving every other key as it is.
+The template's `feature` section is a mail mesh between every agent
+(`"default_peers": ["@all"]`), with no delegation and no address domain. Do not merge it into the template: the template's
 default is a full *mail* mesh (`"default_peers": ["@all"]`), and alongside
 `task_graph: "ALL"` every pair would sit on both lanes, which `install`
 refuses.

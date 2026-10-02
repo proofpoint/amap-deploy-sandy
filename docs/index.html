@@ -126,6 +126,16 @@ td.strong{font-family:var(--display);font-weight:700}
 .copy{font:600 .7rem/1 var(--mono);letter-spacing:.04em;padding:6px 9px;border-radius:5px;border:1px solid var(--term-muted);background:transparent;color:var(--term-ink);cursor:pointer}
 .steps2{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:14px;align-items:start}
 .small{font-size:.92rem;color:var(--muted)}
+.fileview{background:var(--code);border:1px solid var(--rule);border-radius:9px;min-width:0}
+.fileview .label{padding:8px 16px 0;font-family:var(--mono);font-size:.68rem;letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
+.fileview pre{margin:0;padding:10px 16px 14px;overflow-x:auto;font:12.5px/1.6 var(--mono);white-space:pre;color:var(--ink)}
+.fileview .c{color:var(--muted)}
+.fileview .hl{background:var(--agent-soft);border-radius:3px}
+.fields{display:grid;gap:7px;margin:0;font-size:.92rem}
+.fields div{display:grid;grid-template-columns:minmax(0,15ch) minmax(0,1fr);gap:10px}
+.fields dt{font-family:var(--mono);font-size:.82rem;color:var(--trust);overflow-wrap:anywhere}
+.fields dd{margin:0;color:var(--muted)}
+@media (max-width:640px){.fields div{grid-template-columns:minmax(0,1fr);gap:2px}}
 .req{display:flex;flex-wrap:wrap;gap:8px}
 .req span{font-family:var(--mono);font-size:.76rem;background:var(--panel);border:1px solid var(--rule);border-radius:5px;padding:4px 8px}
 .prompt{background:var(--panel);border-left:3px solid var(--agent);border-radius:0 8px 8px 0;padding:12px 16px;font-style:italic;max-width:74ch}
@@ -400,6 +410,27 @@ mkdir -p ~/amap-demo/alpha ~/amap-demo/beta
 cd ~/amap/amap-deploy-sandy
 python3 amap-sandy.py install --apply
 <span class="c"># first run writes a template, then stops for the policy</span></pre></div>
+          <div class="fileview"><div class="label">what that writes: ~/.sandy/features/amap/feature.json</div>
+<pre>{
+  "schema": 1,
+  "sandboxes": { … },    <span class="c">the selection rule sandy applies</span>
+  "agents": { … },       <span class="c">at each launch: leave it for now</span>
+  "create": [ … ],       <span class="c">install owns these blocks and</span>
+  "mounts": [ … ],       <span class="c">rewrites them on every run:</span>
+  "entry": "payload/relay",  <span class="c">leave them alone</span>
+  "expose": { … },
+  "agent_args": { … },
+  <span class="hl">"feature": {</span>          <span class="c">THE POLICY. The template's is a</span>
+    <span class="hl">"version": 1,</span>        <span class="c">mail mesh between everyone, with</span>
+    <span class="hl">"groups": {},</span>        <span class="c">no delegation, no address domain</span>
+    <span class="hl">"default_peers": ["@all"],</span>
+    <span class="hl">"peers": {},</span>
+    <span class="hl">"task_graph": {}</span>
+  <span class="hl">},</span>                     <span class="c">← replace this whole object</span>
+  "receives": [ … ]      <span class="c">install's too (sandy 2.4.0+)</span>
+}</pre></div>
+        </div>
+        <div class="steps2">
           <div class="cmd"><div class="label"><span>~/.sandy/features/amap/feature.json · replace "feature"</span><button type="button" class="copy">Copy</button></div>
 <pre>"feature": {
   "version": 1,
@@ -411,8 +442,15 @@ python3 amap-sandy.py install --apply
   "fleet_domain": "agents.example.org",
   "container_recreate_interval_hours": 24
 }</pre></div>
+          <dl class="fields">
+            <div><dt>default_peers, peers, groups</dt><dd>The <strong>mail</strong> lane, which is mutual. Left empty: this fleet uses delegation only.</dd></div>
+            <div><dt>task_graph: "ALL"</dt><dd>The <strong>delegation</strong> lane, which is directed: every agent may task every other. The runbook's step 8 narrows it to explicit edges.</dd></div>
+            <div><dt>task_deny</dt><dd>Ordered pairs <code>[sender, recipient]</code> to block even though <code>task_graph</code> grants them. None here.</dd></div>
+            <div><dt>fleet_domain</dt><dd>The right-hand side of every address: <code>&lt;slug&gt;@agents.example.org</code>. A name only; nothing touches a network.</dd></div>
+            <div><dt>container_recreate_interval_hours</dt><dd>How often the agent containers are rebuilt. It has no default: writing it in is your sign-off on the cadence.</dd></div>
+          </dl>
         </div>
-        <p class="small">Replace the whole <code>feature</code> section; do not merge. The template's default is a full mail mesh, and with <code>task_graph: "ALL"</code> every pair would sit on both lanes, which <code>install</code> refuses. Then run <code>python3 amap-sandy.py install --apply</code> again: it validates the policy and renders the router's config beside it.</p>
+        <p class="note"><strong>How:</strong> open the file in an editor, select from <code>"feature": {</code> to its matching <code>}</code>, and paste the block above in its place. Leave every other key as it is. <strong>Why replace rather than merge:</strong> the template's <code>"default_peers": ["@all"]</code> puts every pair of agents on the mail lane, and <code>task_graph: "ALL"</code> puts every pair on the delegation lane. A pair may not be on both lanes, because they carry different trust, so <code>install</code> would refuse the result. Then run <code>python3 amap-sandy.py install --apply</code> again: it validates the policy and renders the router's config beside the manifest.</p>
       </div>
     </section>
 
