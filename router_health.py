@@ -756,8 +756,12 @@ def verify_container(ctx: Ctx) -> Iterator[Check]:
     yield check(claim=CONTAINER_RUNNING,
                 expected=ctx.fact("true"),
                 actual=running.rc == 0 and running.out.strip().lower() == "true",
-                remedy="docker/run.sh --detach from the router checkout; read "
-                       "`docker logs --tail 200`")
+                remedy=f"the container exists but is stopped, and still holds its name, "
+                       f"so docker/run.sh would fail on the name: docker start {name}. "
+                       f"Read `docker logs --tail 200 {name}` for why it stopped",
+                do_not="do not docker rm it to make room for run.sh: start it; its "
+                       "state is on the host, but removing it discards the container's "
+                       "own log")
     net = _inspect(name, "{{.HostConfig.NetworkMode}} {{.HostConfig.RestartPolicy.Name}}")
     yield check(claim=CONTAINER_POSTURE,
                 expected=Fact("posture", ["none", "unless-stopped"],
@@ -1215,7 +1219,7 @@ def problem_lines(outcomes: Sequence[Outcome]) -> List[str]:
             else:
                 line = f"router: UNKNOWN whether {c.claim}: {c.reason} — {c.remedy}"
             if c.do_not:
-                line += f" (do not: {c.do_not})"
+                line += f" ({c.do_not})"
             out.append(line)
     return out
 

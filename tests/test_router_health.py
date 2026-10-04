@@ -310,7 +310,19 @@ class OneMissingContainerIsOneFailureTest(FleetTestCase):
         with patch.object(rh, "run", return_value=self.listed()), \
                 patch.object(rh, "_inspect", stopped):
             cs = list(rh.verify_container(self.ctx()))
-        self.assertIs(self.one(cs, rh.CONTAINER_RUNNING).result, rh.FAIL)
+        c = self.one(cs, rh.CONTAINER_RUNNING)
+        self.assertIs(c.result, rh.FAIL)
+        # A stopped container still holds its name, so run.sh's `docker run
+        # --name` would fail: the remedy restarts it instead.
+        self.assertIn("docker start", c.remedy)
+        self.assertNotIn("run.sh --detach", c.remedy)
+
+    def test_every_do_not_reads_once_in_a_problem_line(self):
+        """Every `do_not` already says "do not", so the line must not add it."""
+        f = rh.Fact("x", True, "p")
+        c = rh.check(claim="c", expected=f, actual=False, remedy="r", do_not="do not x")
+        [line] = rh.problem_lines([rh.Outcome(rh.SECTIONS[0], [c])])
+        self.assertEqual(line.count("do not"), 1, line)
 
     def test_a_mount_table_that_is_not_a_list_does_not_crash_the_verify(self):
         for bad in ("true", "null", "7", "{}", "not json"):
@@ -849,7 +861,8 @@ class ProblemLinesNeverStateTheOppositeOfTheTruthTest(unittest.TestCase):
         [line] = rh.problem_lines(self._wrap(c))
         self.assertTrue(line.startswith("router: NOT the router is up"), line)
         self.assertIn("start it", line)
-        self.assertIn("do not: do not guess", line)
+        self.assertIn("(do not guess)", line)
+        self.assertNotIn("do not: do not", line)
 
     def test_an_unknown_check_says_so_and_why_rather_than_asserting(self):
         f = rh.Fact("x", True, "p")
