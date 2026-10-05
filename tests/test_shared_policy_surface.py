@@ -36,6 +36,8 @@ SHARED_FUNCTIONS = {
     "overlapping_pairs": ["policy", "resolved_peers", "graph"],
     "address_for": ["name", "fleet_domain"],
     "router_address": ["fleet_domain"],
+    "host_label": ["hostname"],
+    "derived_fleet_domain": ["runtime", "hostname", "base"],
 }
 
 # Policy-document vocabulary: an operator's file spells these, in both repos.
@@ -48,6 +50,8 @@ SHARED_CONSTANTS = {
     "GROUP_SIGIL": "@",
     "ALL_GROUP": "all",
     "SCHEMA_VERSION": 1,
+    "DEFAULT_DOMAIN_BASE": "internal",
+    "DNS_LABEL_MAX": 63,
 }
 
 
@@ -67,6 +71,22 @@ class SharedPolicySurfaceTest(unittest.TestCase):
 
     def test_policy_error_is_an_exception_a_caller_can_catch(self):
         self.assertTrue(issubclass(fp.PolicyError, Exception))
+
+    def test_the_domain_derivation_behaves_as_both_runtimes_rely_on(self):
+        """<runtime>.<host>.<base>, pure (the hostname passed in), always a
+        domain the router accepts, and a refusal rather than an invalid one."""
+        self.assertEqual(fp.derived_fleet_domain("sandy", "Laptop2.local"),
+                         "sandy.laptop2.internal")
+        self.assertEqual(fp.derived_fleet_domain("openshell", "My_Box", "agents.example.org"),
+                         "openshell.my-box.agents.example.org")
+        self.assertEqual(fp.derived_fleet_domain("openshell", "___"), "openshell.internal")
+        self.assertEqual(fp.host_label("Daniels-MacBook-Pro.local"), "daniels-macbook-pro")
+        self.assertIsNone(fp.host_label(""))
+        for runtime, base in (("Sandy", "internal"), ("a.b", "internal"),
+                              ("sandy", "Not_A.Domain"), ("", "internal")):
+            with self.subTest(runtime=runtime, base=base):
+                with self.assertRaises(fp.PolicyError):
+                    fp.derived_fleet_domain(runtime, "laptop2", base)
 
     def test_it_imports_with_the_standard_library_alone(self):
         """No router and no amap_sandy: the importer has neither."""

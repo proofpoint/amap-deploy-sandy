@@ -281,6 +281,42 @@ class PolicyError(Exception):
 # ------------------------------------------------------------------ loading
 
 DEFAULT_FLEET_DOMAIN = "agents.internal"    # `.internal` is reserved for private use: never a real domain
+
+# A per-host fleet domain, `<runtime>.<host>.<base>`. The spec's peer-origin
+# profile makes the domain the runtime's authority, so one router has one
+# domain: a runtime label keeps two runtimes on one host apart, and the host
+# label keeps two hosts apart (two hosts' workspaces at the same path share a
+# slug). `internal` is reserved for private use and never a real domain, which
+# a same-host fleet without mail may use; routing between runtimes is mail and
+# needs a routable base. Pure: the caller passes the hostname in.
+DEFAULT_DOMAIN_BASE = "internal"
+DNS_LABEL_MAX = 63
+
+
+def host_label(hostname: str) -> Optional[str]:
+    """`hostname`'s first dot-separated part as one DNS label: lowercased,
+    every character outside `a-z0-9-` turned into `-`, runs of `-`
+    collapsed, at most 63 characters, edges trimmed. None when nothing
+    usable is left."""
+    label = re.sub(r"[^a-z0-9-]", "-", (hostname or "").split(".")[0].lower())
+    label = re.sub(r"-+", "-", label)[:DNS_LABEL_MAX].strip("-")
+    return label or None
+
+
+def derived_fleet_domain(runtime: str, hostname: str, base: str = DEFAULT_DOMAIN_BASE) -> str:
+    """`<runtime>.<host>.<base>`, or `<runtime>.<base>` when `hostname`
+    yields no label. The result always matches FLEET_DOMAIN_RE: a runtime
+    that is not one lowercase label, or a base that is not a lowercase
+    domain, raises PolicyError rather than produce one that does not."""
+    if not FLEET_DOMAIN_RE.match(runtime or "") or "." in runtime:
+        raise PolicyError(f"fleet domain runtime {runtime!r} is not one lowercase DNS label")
+    if not FLEET_DOMAIN_RE.match(base or ""):
+        raise PolicyError(f"fleet domain base {base!r} is not a lowercase domain "
+                          f"(letters, digits and hyphens in dot-separated labels)")
+    domain = ".".join(p for p in (runtime, host_label(hostname), base) if p)
+    if not FLEET_DOMAIN_RE.match(domain):
+        raise PolicyError(f"derived fleet domain {domain!r} is not a valid domain")
+    return domain
 DEFAULT_RECREATE_INTERVAL_HOURS = 24
 
 

@@ -1658,10 +1658,10 @@ class FleetDomainTest(_ConnectorFixtureMixin, unittest.TestCase):
         rows = (("Daniels-MacBook-Pro.local", "daniels-macbook-pro"),
                 ("My_Laptop", "my-laptop"), ("host--two", "host-two"),
                 ("-edge-", "edge"), ("", None), ("___", None),
-                ("a" * 80, "a" * prov.DNS_LABEL_MAX))
+                ("a" * 80, "a" * fp.DNS_LABEL_MAX))
         for hostname, want in rows:
             with self.subTest(hostname=hostname):
-                self.assertEqual(prov.host_label(hostname), want)
+                self.assertEqual(fp.host_label(hostname), want)
 
     def test_the_derived_domain_names_the_runtime_the_host_and_the_base(self):
         self.assertEqual(prov.derived_fleet_domain(hostname="Laptop2.local"),
