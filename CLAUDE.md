@@ -24,6 +24,14 @@ here can send or receive a message.
 python3 -m pytest tests -q
 ```
 
+**The siblings are pinned.** `siblings.json` names the full commit of
+`amap-router-local` and `amap-connector-claude` that this repo is tested
+against, and `amap-siblings.py --apply` (`siblings.py`, standard library
+only, importing nothing that loads a sibling) puts the checkouts there.
+CI, the installer and the runbook all use it, so a host runs what CI ran.
+To move a pin, edit its commit in `siblings.json`, check out that commit,
+and run the suite; the PR is the operator's decision to adopt it.
+
 `tests/_workspace.py` finds the router by walking up for `amap-router-local`
 (or through `$AMAP_ROUTER_REPO`) and confirms it by the presence of
 `router/reset.py`. The connector is found the same way (`amap-connector-claude`,

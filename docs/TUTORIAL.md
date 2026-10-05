@@ -33,17 +33,21 @@ sandy --print-schema | jq '.schema_version'   # must print 3 or 4
 
 ## 2. Get the pieces
 
-Clone the three repos side by side:
+Clone amap-deploy-sandy, then put the router and the connector beside it, at
+the commits this repo is tested against:
 
 ```sh
 mkdir -p ~/amap && cd ~/amap
 git clone https://github.com/proofpoint/amap-deploy-sandy
-git clone https://github.com/proofpoint/amap-router-local
-git clone https://github.com/proofpoint/amap-connector-claude
+python3 amap-deploy-sandy/amap-siblings.py --apply
 ```
 
-`amap-deploy-sandy` finds the other two by looking beside itself;
-`$AMAP_ROUTER_REPO` and `$AMAP_CONNECTOR_REPO` override that. You do not build
+`amap-siblings.py` clones `amap-router-local` and `amap-connector-claude`
+into `~/amap` and checks out the commits pinned in `siblings.json`. Run it
+without `--apply` to see what it would do. It refuses a checkout with
+uncommitted changes. `amap-deploy-sandy` finds the other two by looking
+beside itself; `$AMAP_ROUTER_REPO` and `$AMAP_CONNECTOR_REPO` override that,
+and `amap-siblings.py` leaves an overridden checkout alone. You do not build
 the connector: `install` copies its binaries onto the read-only payload.
 
 **Or, in one command:**
@@ -52,7 +56,8 @@ the connector: `install` copies its binaries onto the read-only payload.
 curl -fsSL https://raw.githubusercontent.com/proofpoint/amap-deploy-sandy/main/install.sh | bash
 ```
 
-This clones (or updates) the three repos side by side in `~/amap`, runs
+This clones (or updates) the three repos side by side in `~/amap`, with the
+router and the connector at their pinned commits, runs
 step 4's `install --apply`, and builds and starts the router: the first half
 of step 5. Then make your workspaces (step 3), start agents as in the second
 half of step 5, and verify (step 6). It is safe to run again, and leaves a

@@ -1,19 +1,22 @@
 """The SHIPPED one-command installer, `install.sh`, executed under bash.
 
-Only the outside world is faked: `git` (a clone copies the real checkouts
-this suite already runs against), `docker` (it records what it is asked and
-answers like a daemon with no router yet) and `sandy` (its `--print-schema`
-and `--print-state`). Everything else is real: this repo's
-`amap-sandy.py install --apply` writes the manifest, payload, router config
-and directories under a temporary `$SANDY_HOME`, and the router's own
-`docker/build.sh`, `docker/run.sh` and `docker/derive-mounts.py` run against
-them. So a pass means the router's mount derivation accepted a fresh host
-with no sandbox launched.
+Only `docker` (it records what it is asked and answers like a daemon with no
+router yet) and `sandy` (its `--print-schema` and `--print-state`) are faked.
+git is real, against local "remote" repositories under `$AMAP_REPO_BASE`:
+this checkout, with its siblings.json pinned to the commits the router and
+connector checkouts this suite runs against are at, and clones of those two.
+So the installer clones this repo, `amap-siblings.py` puts the siblings at
+their pins, this repo's `install --apply` writes the manifest, payload,
+router config and directories under a temporary `$SANDY_HOME`, and the
+router's own `docker/build.sh`, `docker/run.sh` and `docker/derive-mounts.py`
+run against them. A pass means the router's mount derivation accepted a
+fresh host with no sandbox launched.
 """
 from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import unittest
@@ -42,18 +45,16 @@ SCHEMA = {"schema_version": 4, "config": {"privileged_keys": []},
                        "receives_values": ["cross_session"]},
           "agents": [{"name": "claude"}]}
 
-FAKE_GIT = """#!/bin/sh
-echo "git $*" >> "$FAKE_LOG"
-if [ "$1" = clone ]; then
-  for a; do dest="$a"; done
-  for a; do case "$a" in *.git) url="$a";; esac; done
-  name=$(basename "$url" .git)
-  src=$(eval echo "\\$FAKE_SRC_$(echo "$name" | tr - _)")
-  cp -R "$src" "$dest" && rm -rf "$dest/.git" && mkdir "$dest/.git"
-  exit $?
-fi
-exit 0
-"""
+GIT_ENV = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.org",
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.org"}
+
+
+def _git(*args, cwd=None):
+    r = subprocess.run(["git", *args], cwd=str(cwd) if cwd else None, capture_output=True,
+                       text=True, env={**os.environ, **GIT_ENV}, timeout=300)
+    assert r.returncode == 0, r.stderr
+    return r.stdout.strip()
+
 
 FAKE_DOCKER = """#!/bin/sh
 echo "docker $*" >> "$FAKE_LOG"
@@ -80,8 +81,9 @@ class InstallShTest(unittest.TestCase):
         bindir = self.root / "bin"
         bindir.mkdir(parents=True)
         self.home.mkdir()
-        for name, body in (("git", FAKE_GIT), ("docker", FAKE_DOCKER),
-                           ("sandy", self._fake_sandy())):
+        self.remotes = self.root / "remotes"
+        self.pins = self._remotes()
+        for name, body in (("docker", FAKE_DOCKER), ("sandy", self._fake_sandy())):
             (bindir / name).write_text(body)
             (bindir / name).chmod(0o755)
         self.env = {k: v for k, v in os.environ.items()
@@ -89,9 +91,31 @@ class InstallShTest(unittest.TestCase):
         self.env.update({
             "HOME": str(self.home), "PATH": f"{bindir}:{os.environ['PATH']}",
             "AMAP_DIR": str(self.amap_dir), "SANDY_HOME": str(self.sandy_home),
+            "AMAP_REPO_BASE": str(self.remotes),
             "FAKE_LOG": str(self.log), "FAKE_RUNNING": str(self.root / "running"),
-            "PYTHONDONTWRITEBYTECODE": "1",
-            **{f"FAKE_SRC_{n.replace('-', '_')}": str(p) for n, p in SOURCES.items()}})
+            "PYTHONDONTWRITEBYTECODE": "1", **GIT_ENV})
+
+    def _remotes(self):
+        """The "remote" repositories, and the pins this repo's copy carries:
+        the commits the sibling checkouts this suite runs against are at."""
+        self.remotes.mkdir()
+        pins = {}
+        for name in ("amap-router-local", "amap-connector-claude"):
+            dest = self.remotes / name
+            _git("clone", "--quiet", str(SOURCES[name]), str(dest))
+            pins[name] = _git("rev-parse", "HEAD", cwd=dest)
+        # The installer clones "$AMAP_REPO_BASE/amap-deploy-sandy.git".
+        mine = self.remotes / "amap-deploy-sandy.git"
+        shutil.copytree(HERE, mine, ignore=shutil.ignore_patterns(
+            ".git", "__pycache__", ".pytest_cache", "*.pyc"))
+        doc = json.loads((mine / "siblings.json").read_text())
+        for s in doc["siblings"]:
+            s["commit"] = pins[s["name"]]
+        (mine / "siblings.json").write_text(json.dumps(doc, indent=2) + "\n")
+        _git("init", "--quiet", "-b", "main", cwd=mine)
+        _git("add", "-A", cwd=mine)
+        _git("commit", "--quiet", "-m", "snapshot", cwd=mine)
+        return pins
 
     @staticmethod
     def _fake_sandy():
@@ -123,6 +147,9 @@ class InstallShTest(unittest.TestCase):
         self.assertIn(str(self.sandy_home / "features/amap/instances"), runs[0])
         self.assertIn(str(self.sandy_home / "router-state"), runs[0])
         self.assertIn("sandy --start", out)
+        for name, commit in self.pins.items():
+            with self.subTest(sibling=name):
+                self.assertEqual(_git("rev-parse", "HEAD", cwd=self.amap_dir / name), commit)
 
     def test_the_fleet_domain_is_this_hosts_and_takes_a_base_from_the_environment(self):
         rc, out = self._run()
@@ -143,15 +170,16 @@ class InstallShTest(unittest.TestCase):
         self.assertEqual(rc, 0, out)
         calls = self._calls()
         self.assertEqual(len([c for c in calls if c.startswith("docker run")]), 1, calls)
-        self.assertEqual(len([c for c in calls if "pull --ff-only" in c]), 3, calls)
+        self.assertIn("updating", out)
+        self.assertEqual(out.count(": present "), 2, out)
         self.assertIn("already exists; it was left running", out)
 
     def test_a_missing_prerequisite_stops_before_anything_is_written(self):
         env = dict(self.env)
         bare = self.root / "bare"
         bare.mkdir()
-        for tool in ("git", "sandy"):
-            os.symlink(self.root / "bin" / tool, bare / tool)
+        os.symlink(shutil.which("git"), bare / "git")
+        os.symlink(self.root / "bin" / "sandy", bare / "sandy")
         env["PATH"] = f"{bare}:/usr/bin:/bin"
         if Path("/usr/bin/docker").exists() or Path("/bin/docker").exists():
             self.skipTest("a real docker on /usr/bin or /bin would satisfy the check")
