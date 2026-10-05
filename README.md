@@ -88,7 +88,8 @@ and run `verify`. The same steps by hand:
 # 1. Install. On a fresh host this writes the manifest from a TEMPLATE that works
 #    as written: every sandbox launched with claude selected, every one may
 #    task every other (task_graph "ALL", no mail lane), addresses
-#    <slug>@agents.internal, a 24h recreation cadence. Also renders router.json.
+#    <slug>@sandy.<this host>.internal, a 24h recreation cadence. Also renders
+#    router.json.
 python3 amap-sandy.py install            # preview (every verb is a dry run without --apply)
 python3 amap-sandy.py install --apply
 
@@ -131,6 +132,7 @@ Host-wide options (`--sandy-home`, `--sandy`, `--servers`, `--connector-src`,
 | `verify [--only SLUG] [--match SUBSTR] [--host-facts PATH]` | read-only. It checks the install, every selected sandbox (lanes, relay, the mounts, what sandy applied at its last launch) and, last, the router process: its container, mount set and health. It exits 1 on any problem |
 | `router-config [--apply]` | only the router's config. Without `--apply` it compares the file with the rendering and exits 1 on drift |
 | `list` | every sandbox sandy reports, with sandy's verdict for this feature: `selected`, `not selected` (with the reason) or `unknown` (not launched since the manifest changed) |
+| `fleet-domain [--base BASE] [--apply]` | this host's derived fleet domain, `sandy.<host>.<base>` (base: `internal`), beside the manifest's; `--apply` writes it into `feature.fleet_domain`. Every agent's address changes, so relaunch them after |
 | `cadence [--apply]` | the container-recreation job (macOS launchd), rendered from the policy's cadence. It prints the `launchctl` line and never runs it |
 | `teardown [--apply] [--force]` | takes the host back to before `install`: removes the payload, the router's config and its state. It keeps the manifest and `instances/`. `--force` also empties every lane |
 

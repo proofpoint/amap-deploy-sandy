@@ -124,6 +124,18 @@ class InstallShTest(unittest.TestCase):
         self.assertIn(str(self.sandy_home / "router-state"), runs[0])
         self.assertIn("sandy --start", out)
 
+    def test_the_fleet_domain_is_this_hosts_and_takes_a_base_from_the_environment(self):
+        rc, out = self._run()
+        self.assertEqual(rc, 0, out)
+        manifest = self.sandy_home / "features/amap/feature.json"
+        self.assertEqual(json.loads(manifest.read_text())["feature"]["fleet_domain"],
+                         prov.derived_fleet_domain())
+        manifest.unlink()
+        rc, out = self._run({**self.env, "AMAP_FLEET_DOMAIN_BASE": "agents.example.org"})
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(json.loads(manifest.read_text())["feature"]["fleet_domain"],
+                         prov.derived_fleet_domain("agents.example.org"))
+
     def test_a_second_run_updates_and_leaves_a_running_router_alone(self):
         rc, out = self._run()
         self.assertEqual(rc, 0, out)
