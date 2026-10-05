@@ -3331,46 +3331,26 @@ def policy_problems(policy: Dict[str, Any], boxes: List[Dict[str, Any]],
     return problems
 
 
-# The fleet's domain is the RUNTIME's authority (amap-spec, peer-origin
-# profile): one router, one domain. A fresh host's template gets
-# `sandy.<host>.<base>`, so two hosts, or a sandy and another runtime on one
-# host, never share a namespace, and two hosts' identically named workspaces
-# never share an address. The base defaults to `internal`, which is reserved
-# for private use and never a real domain: allowed for a same-host fleet
-# without mail. Routing between runtimes is mail, which needs a routable base
-# the operator controls. The domain is derived ONCE, when the template is
-# written: every address carries it, so changing it is an explicit operator
-# act (`fleet-domain --apply`), never a side effect of a renamed host.
+# The fleet's domain is this host's sandy router's: `sandy.<host>.<base>`, from
+# `fleet_policy.derived_fleet_domain` (shared with other runtimes' deployments,
+# which pass their own runtime label). It is derived ONCE, when the template
+# is written: every address carries it, so changing it is an explicit
+# operator act (`fleet-domain --apply`), never a side effect of a renamed host.
 FLEET_DOMAIN_RUNTIME_LABEL = "sandy"
-FLEET_DOMAIN_DEFAULT_BASE = "internal"
-DNS_LABEL_MAX = 63
-
-
-def host_label(hostname: Optional[str] = None) -> Optional[str]:
-    """This host's short name as one DNS label: the first dot-separated part
-    of the hostname, lowercased, with every character outside `a-z0-9-`
-    turned into `-`, runs of `-` collapsed and the edges trimmed. None when
-    nothing usable is left."""
-    import socket
-    name = (hostname if hostname is not None else socket.gethostname()) or ""
-    label = re.sub(r"[^a-z0-9-]", "-", name.split(".")[0].lower())
-    label = re.sub(r"-+", "-", label)[:DNS_LABEL_MAX].strip("-")
-    return label or None
 
 
 def derived_fleet_domain(base: Optional[str] = None, hostname: Optional[str] = None) -> str:
-    """`sandy.<host>.<base>`, `base` defaulting to `internal`; `sandy.<base>`
-    when the hostname yields no label. Raises ProvisionError for a base, or a
-    result, the router's domain rule refuses."""
-    base = base or FLEET_DOMAIN_DEFAULT_BASE
-    if not fp.FLEET_DOMAIN_RE.match(base):
-        raise ProvisionError(f"fleet domain base {base!r} is not a lowercase domain "
-                             f"(letters, digits and hyphens in dot-separated labels)")
-    label = host_label(hostname)
-    domain = ".".join(p for p in (FLEET_DOMAIN_RUNTIME_LABEL, label, base) if p)
-    if not fp.FLEET_DOMAIN_RE.match(domain):
-        raise ProvisionError(f"derived fleet domain {domain!r} is not a valid domain")
-    return domain
+    """This host's `sandy.<host>.<base>`, `base` defaulting to `internal` and
+    `hostname` to this host's. Raises ProvisionError for a base the domain
+    rule refuses."""
+    import socket
+    try:
+        return fp.derived_fleet_domain(
+            FLEET_DOMAIN_RUNTIME_LABEL,
+            hostname if hostname is not None else socket.gethostname(),
+            base or fp.DEFAULT_DOMAIN_BASE)
+    except fp.PolicyError as e:
+        raise ProvisionError(str(e))
 
 
 def run_fleet_domain(args: argparse.Namespace, home: Path) -> int:

@@ -164,7 +164,8 @@ and nothing else, because the router refuses an unknown key.
 
 **The fleet domain names the runtime.** The spec's peer-origin profile makes
 the domain "the runtime's authority": one router, one domain. A fresh host's
-template gets `sandy.<host>.<base>` (`derived_fleet_domain`, base `internal`),
+template gets `sandy.<host>.<base>` (`fleet_policy.derived_fleet_domain`, shared
+with other runtimes' deployments, base `internal`),
 derived **once**, because every address carries it. `install` never changes
 an existing host's domain; `fleet-domain --apply` is the one explicit move.
 A non-routable base is allowed for a fleet on one host; routing between
