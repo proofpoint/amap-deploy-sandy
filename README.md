@@ -47,7 +47,11 @@ runs inside a sandbox, and nothing here can send or receive a message.
   key is left out and sandy's legacy rule does the same job.
 - **amap-router-local** and **amap-connector-claude**, each checked out beside
   this repo (a sibling directory of an ancestor), or named by
-  `$AMAP_ROUTER_REPO` / `$AMAP_CONNECTOR_REPO`.
+  `$AMAP_ROUTER_REPO` / `$AMAP_CONNECTOR_REPO`. **They are pinned:**
+  `siblings.json` names the commit of each that this repo is tested against,
+  and `python3 amap-siblings.py --apply` clones or checks out exactly those
+  (a dry run without `--apply`; an overridden checkout is left alone). The
+  one-command installer does this for you.
 - Python 3 (standard library only; the tests use pytest) and Docker for the router.
 
 ## What gets installed
@@ -180,7 +184,8 @@ never `router.json`, then run `install --apply`.
 python3 -m pytest tests -q
 ```
 
-The suite needs the **router and connector checked out as siblings**. It
+The suite needs the **router and connector checked out as siblings**, at
+their pins (`python3 amap-siblings.py --apply`). It
 imports the router's package to agree with its layout, and it reads the
 connector's daemon to agree with its variables. Without them the run fails;
 it does not pass as a smaller green. The suite never runs Docker, the router

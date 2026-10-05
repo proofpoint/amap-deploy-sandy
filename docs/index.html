@@ -395,7 +395,7 @@ sandy --print-schema | jq '.schema_version'   <span class="c"># must print 3 or 
         <div class="paths">
           <div class="path">
             <h3><span class="n">1</span>One command</h3>
-            <p class="small">Clones the three repos into <code>~/amap</code>, installs the default policy (every agent may task every other), and builds and starts the router. Then make two workspaces and start an agent in each.</p>
+            <p class="small">Clones the three repos into <code>~/amap</code>, with the router and the connector at the commits this repo is tested against, installs the default policy (every agent may task every other), and builds and starts the router. Then make two workspaces and start an agent in each.</p>
             <div class="cmd"><div class="label"><span>install, then two agents</span><button type="button" class="copy">Copy</button></div>
 <pre>curl -fsSL https://raw.githubusercontent.com/proofpoint/amap-deploy-sandy/main/install.sh | bash
 
@@ -406,12 +406,11 @@ cd ~/amap-demo/beta  &amp;&amp; sandy --start</pre></div>
           </div>
           <div class="path">
             <h3><span class="n">2</span>Step by step</h3>
-            <p class="small">Clone the three repos side by side, then install, start the router and start agents yourself, one screen at a time. amap-deploy-sandy finds the other two by looking beside itself; <code>$AMAP_ROUTER_REPO</code> and <code>$AMAP_CONNECTOR_REPO</code> override that.</p>
+            <p class="small">Clone amap-deploy-sandy, and put the router and the connector beside it at the commits it is tested against (pinned in <code>siblings.json</code>). Then install, start the router and start agents yourself, one screen at a time.</p>
             <div class="cmd"><div class="label"><span>the code</span><button type="button" class="copy">Copy</button></div>
 <pre>mkdir -p ~/amap &amp;&amp; cd ~/amap
 git clone https://github.com/proofpoint/amap-deploy-sandy
-git clone https://github.com/proofpoint/amap-router-local
-git clone https://github.com/proofpoint/amap-connector-claude</pre></div>
+python3 amap-deploy-sandy/amap-siblings.py --apply</pre></div>
             <div class="links"><a href="#policy">Cloned: walk through it →</a></div>
           </div>
         </div>

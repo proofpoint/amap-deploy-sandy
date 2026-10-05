@@ -3,14 +3,15 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/proofpoint/amap-deploy-sandy/main/install.sh | bash
 #
-# It clones (or fast-forwards) the three repositories side by side, runs
+# It clones (or fast-forwards) amap-deploy-sandy, puts the router and the
+# connector beside it at the commits pinned in its siblings.json, runs
 # `amap-sandy.py install --apply`, which writes the default policy (every
 # sandbox launched with claude may task every other), the payload and the
 # router's config, then builds the router's image and starts it. Agents are
 # started afterwards, whenever and in any order, with `sandy --start`.
 #
-# Safe to run again: checkouts are fast-forwarded, install is idempotent, and
-# a router container that already exists is left running.
+# Safe to run again: the checkouts are brought up to date, install is
+# idempotent, and a router container that already exists is left running.
 #
 # It needs no root and no credentials, and installs nothing outside $AMAP_DIR
 # and $SANDY_HOME/features/amap (plus the router's state directory).
@@ -26,7 +27,9 @@ AMAP_DIR="${AMAP_DIR:-$HOME/amap}"
 SANDY_HOME="${SANDY_HOME:-$HOME/.sandy}"
 AMAP_REPO_BASE="${AMAP_REPO_BASE:-https://github.com/proofpoint}"
 ROUTER_CONTAINER=amap-router-local
-REPOS="amap-deploy-sandy amap-router-local amap-connector-claude"
+# The checkouts are the ones under $AMAP_DIR: an override pointing elsewhere
+# would install and build from a tree this script did not put at its pin.
+unset AMAP_ROUTER_REPO AMAP_CONNECTOR_REPO
 
 say() { printf '[amap] %s\n' "$*"; }
 die() { printf '[amap] error: %s\n' "$*" >&2; exit 1; }
@@ -43,19 +46,20 @@ need sandy "Install sandy first: curl -fsSL https://raw.githubusercontent.com/ra
 
 # --- the three checkouts, side by side ------------------------------------
 mkdir -p "$AMAP_DIR"
-for repo in $REPOS; do
-  dest="$AMAP_DIR/$repo"
-  if [ -d "$dest/.git" ]; then
-    say "updating $dest"
-    git -C "$dest" pull --ff-only --quiet \
-      || die "$dest cannot be fast-forwarded (local changes or a diverged branch). Resolve it, then re-run."
-  elif [ -e "$dest" ]; then
-    die "$dest exists and is not a git checkout. Move it aside, then re-run."
-  else
-    say "cloning $repo into $dest"
-    git clone --quiet "$AMAP_REPO_BASE/$repo.git" "$dest"
-  fi
-done
+dest="$AMAP_DIR/amap-deploy-sandy"
+if [ -d "$dest/.git" ]; then
+  say "updating $dest"
+  git -C "$dest" pull --ff-only --quiet \
+    || die "$dest cannot be fast-forwarded (local changes or a diverged branch). Resolve it, then re-run."
+elif [ -e "$dest" ]; then
+  die "$dest exists and is not a git checkout. Move it aside, then re-run."
+else
+  say "cloning amap-deploy-sandy into $dest"
+  git clone --quiet "$AMAP_REPO_BASE/amap-deploy-sandy.git" "$dest"
+fi
+say "putting the router and the connector at their pinned commits"
+AMAP_REPO_BASE="$AMAP_REPO_BASE" python3 "$dest/amap-siblings.py" --apply --base "$AMAP_DIR" \
+  || die "a sibling checkout could not be put at its pin; see above."
 
 # --- the manifest, the payload, the router's config and its directories ---
 say "installing the AMAP feature into $SANDY_HOME/features/amap"
