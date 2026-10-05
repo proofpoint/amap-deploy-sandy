@@ -1,14 +1,22 @@
 name: tests
 
 # A pull request runs the suite through `pull_request`; `push` covers only
-# main, so a PR's commits are not tested twice. The job names, and so the
-# required checks `suite (3.9)` and `suite (3.13)`, are unchanged.
+# main, so a PR's commits are not tested twice. The daily run is for the
+# canary: it is how a breaking change on a sibling's main shows up before
+# anyone moves a pin.
 on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    - cron: "17 6 * * *"
 
 jobs:
+  # The required checks, `suite (3.9)` and `suite (3.13)`. The router and the
+  # connector are put BESIDE this repo at the commits pinned in siblings.json,
+  # by the same step the installer and the runbook use, so CI tests exactly
+  # what a host runs. Without them the suite fails rather than passing as a
+  # smaller green.
   suite:
     runs-on: ubuntu-latest
     strategy:
@@ -17,11 +25,34 @@ jobs:
         python: ["3.9", "3.13"]
 
     steps:
-      # The suite needs the router and the connector checked out BESIDE this
-      # repo: it imports the router's package to agree with its layout, and
-      # reads the connector's daemon to agree with its variables. Without
-      # them it fails rather than passing as a smaller green, so a sibling
-      # checkout that went missing turns this job red, never quietly green.
+      - uses: actions/checkout@v4
+        with:
+          path: amap-deploy-sandy
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: the siblings, at their pins
+        run: python amap-deploy-sandy/amap-siblings.py --apply
+
+      - name: install pytest
+        run: python -m pip install pytest
+
+      # No sandy, no docker, no network: sandy is stubbed and conftest.py
+      # refuses every docker call for the whole session.
+      - name: suite
+        working-directory: amap-deploy-sandy
+        run: python -m pytest tests -q
+
+  # NOT a required check. The same suite against each sibling's current main:
+  # red here, green above, means a sibling has moved in a way this repo must
+  # adapt to before its pin is moved. It never blocks a merge.
+  canary:
+    name: canary (siblings' main)
+    runs-on: ubuntu-latest
+
+    steps:
       - uses: actions/checkout@v4
         with:
           path: amap-deploy-sandy
@@ -38,13 +69,11 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python }}
+          python-version: "3.13"
 
       - name: install pytest
         run: python -m pip install pytest
 
-      # No sandy, no docker, no network: sandy is stubbed and conftest.py
-      # refuses every docker call for the whole session.
       - name: suite
         working-directory: amap-deploy-sandy
         run: python -m pytest tests -q
