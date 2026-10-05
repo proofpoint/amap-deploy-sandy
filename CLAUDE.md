@@ -154,6 +154,14 @@ manifest. Where the schema cannot be read, the key is left as it is.
 `router.json` beside it is **generated** in the router's exact vocabulary
 and nothing else, because the router refuses an unknown key.
 
+**The fleet domain names the runtime.** The spec's peer-origin profile makes
+the domain "the runtime's authority": one router, one domain. A fresh host's
+template gets `sandy.<host>.<base>` (`derived_fleet_domain`, base `internal`),
+derived **once**, because every address carries it. `install` never changes
+an existing host's domain; `fleet-domain --apply` is the one explicit move.
+A non-routable base is allowed for a fleet on one host; routing between
+runtimes is mail and needs a routable base.
+
 **Selection is sandy's, at launch.** The policy's include and exclude globs
 go into the manifest verbatim. `fleet_policy.selection()` copies the rule and
 never evaluates it. The selected set is what sandy reports, intersected with

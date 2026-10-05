@@ -99,7 +99,7 @@ it:
   "peers": {},
   "task_graph": "ALL",
   "task_deny": [],
-  "fleet_domain": "agents.internal",
+  "fleet_domain": "sandy.<this host>.internal",
   "container_recreate_interval_hours": 24
 }
 ```
@@ -108,10 +108,15 @@ it:
   directed form, `{"<recipient>": ["<sender>", ...]}`, appears in step 8.
 - **`default_peers`, `peers` and `groups` are empty:** they are the mail
   lane, and an ordered pair may not appear on both lanes.
-- **`fleet_domain`** is the right-hand side of every address, so the agents
-  become `<slug>@agents.internal`. It is a name, not a real domain:
-  `.internal` is reserved for private use, and nothing here touches a
-  network. Give a second host its own.
+- **`fleet_domain`** is the right-hand side of every address, and names this
+  host's router: `<slug>@sandy.<this host>.internal`. `install` derives it
+  from the host's short name, once, so two hosts never share one. It is a
+  name, not a real domain: `.internal` is reserved for private use, which is
+  allowed for a fleet on one host. Routing between hosts or runtimes is
+  mail, so for that pass a base you control:
+  `install --apply --fleet-domain-base <your domain>` on a fresh host, or
+  `fleet-domain --base <your domain> --apply` to move an existing one (every
+  address changes, so relaunch the agents after).
 - **`container_recreate_interval_hours`** is how often the agent containers
   are rebuilt, once you load the job `python3 amap-sandy.py cadence` prints.
 - The top-level **`sandboxes`/`agents`** blocks are the selection rule: every

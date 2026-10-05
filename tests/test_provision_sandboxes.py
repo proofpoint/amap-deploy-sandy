@@ -1574,7 +1574,8 @@ class SyncTest(_ConnectorFixtureMixin, unittest.TestCase):
         self.assertEqual(manifest["agents"], {"include": ["claude"], "exclude": []})
         self.assertEqual(manifest["feature"][fp.TASK_GRAPH_KEY], fp.TASK_GRAPH_ALL)
         self.assertEqual(manifest["feature"]["default_peers"], [])
-        self.assertEqual(manifest["expose"], {prov.EXPOSE_FLEET_DOMAIN: fp.DEFAULT_FLEET_DOMAIN})
+        self.assertEqual(manifest["expose"], {prov.EXPOSE_FLEET_DOMAIN: prov.derived_fleet_domain()})
+        self.assertEqual(manifest["feature"][fp.FLEET_DOMAIN_KEY], prov.derived_fleet_domain())
         self.assertEqual(manifest[prov.AGENT_ARGS_KEY], prov.agent_args_for_manifest())
         self.assertTrue(prov.payload_entry_path(self.tmp).is_file(), "the payload lands too")
         self.assertTrue(prov.router_sibling_path(self.tmp).is_file(),
@@ -1641,6 +1642,99 @@ class RouterCanStartFirstTest(_ConnectorFixtureMixin, unittest.TestCase):
         idir.symlink_to(self.tmp)
         with self.assertRaises(prov.ProvisionError):
             prov.install_instances_dir(self.tmp, dry_run=False)
+
+
+class FleetDomainTest(_ConnectorFixtureMixin, unittest.TestCase):
+    """The fleet's domain is the runtime's authority: a fresh host's template
+    gets sandy.<host>.<base>, derived once; moving an existing host is the
+    explicit `fleet-domain --apply`."""
+
+    POLICY = SyncTest.POLICY
+    _policy = SyncTest._policy
+    _sync = SyncTest._sync
+    _fleet = SyncTest._fleet
+
+    def test_the_host_label_is_one_lowercase_dns_label(self):
+        rows = (("Daniels-MacBook-Pro.local", "daniels-macbook-pro"),
+                ("My_Laptop", "my-laptop"), ("host--two", "host-two"),
+                ("-edge-", "edge"), ("", None), ("___", None),
+                ("a" * 80, "a" * prov.DNS_LABEL_MAX))
+        for hostname, want in rows:
+            with self.subTest(hostname=hostname):
+                self.assertEqual(prov.host_label(hostname), want)
+
+    def test_the_derived_domain_names_the_runtime_the_host_and_the_base(self):
+        self.assertEqual(prov.derived_fleet_domain(hostname="Laptop2.local"),
+                         "sandy.laptop2.internal")
+        self.assertEqual(prov.derived_fleet_domain("agents.example.org", hostname="laptop2"),
+                         "sandy.laptop2.agents.example.org")
+        self.assertEqual(prov.derived_fleet_domain(hostname="___"), "sandy.internal")
+        for d in (prov.derived_fleet_domain(hostname="Laptop2.local"),
+                  prov.derived_fleet_domain("agents.example.org", hostname="laptop2")):
+            self.assertTrue(fp.FLEET_DOMAIN_RE.match(d), d)
+        with self.assertRaises(prov.ProvisionError):
+            prov.derived_fleet_domain("Not_A.Domain", hostname="laptop2")
+
+    def _fresh(self, *extra):
+        self._fleet()
+        prov.feature_manifest_path(self.tmp).unlink(missing_ok=True)
+        with unittest.mock.patch("socket.gethostname", return_value="Laptop2.local"):
+            return self._sync(None, *extra)
+
+    def test_a_fresh_host_gets_its_own_domain_and_a_base_when_given(self):
+        rc, out = self._fresh("--apply")
+        self.assertEqual(rc, 0, out)
+        doc = json.loads(prov.feature_manifest_path(self.tmp).read_text())
+        self.assertEqual(doc["feature"][fp.FLEET_DOMAIN_KEY], "sandy.laptop2.internal")
+        self.assertEqual(doc["expose"], {prov.EXPOSE_FLEET_DOMAIN: "sandy.laptop2.internal"})
+        self.assertIn("<slug>@sandy.laptop2.internal", out)
+        rc, out = self._fresh("--apply", "--fleet-domain-base", "agents.example.org")
+        doc = json.loads(prov.feature_manifest_path(self.tmp).read_text())
+        self.assertEqual(doc["feature"][fp.FLEET_DOMAIN_KEY], "sandy.laptop2.agents.example.org")
+
+    def test_an_existing_manifest_keeps_its_domain_through_install(self):
+        self._fleet()
+        self._policy(self.POLICY)
+        rc, out = self._sync(None, "--apply", "--fleet-domain-base", "agents.example.org")
+        self.assertEqual(rc, 0, out)
+        doc = json.loads(prov.feature_manifest_path(self.tmp).read_text())
+        self.assertEqual(doc["feature"][fp.FLEET_DOMAIN_KEY], self.POLICY[fp.FLEET_DOMAIN_KEY])
+        self.assertEqual(doc["expose"], {prov.EXPOSE_FLEET_DOMAIN: self.POLICY[fp.FLEET_DOMAIN_KEY]},
+                         "the exposed domain follows the authored one, never the base")
+        self.assertIn("fleet-domain --base agents.example.org", out)
+
+    def _fdom(self, *extra):
+        out, err = io.StringIO(), io.StringIO()
+        with unittest.mock.patch("socket.gethostname", return_value="Laptop2.local"), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = prov.main(self._base_args() + ["fleet-domain", *extra])
+        return rc, out.getvalue() + err.getvalue()
+
+    def test_fleet_domain_shows_then_moves_an_existing_host_and_nothing_else(self):
+        self._policy(self.POLICY)
+        path = prov.feature_manifest_path(self.tmp)
+        before = json.loads(path.read_text())
+        rc, out = self._fdom()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("dry run", out)
+        self.assertIn("every agent's address changes", out)
+        self.assertEqual(json.loads(path.read_text()), before, "a dry run writes nothing")
+        rc, out = self._fdom("--apply")
+        self.assertEqual(rc, 0, out)
+        after = json.loads(path.read_text())
+        self.assertEqual(after["feature"][fp.FLEET_DOMAIN_KEY], "sandy.laptop2.internal")
+        self.assertEqual(list(after), list(before), "key order is the operator's")
+        del after["feature"][fp.FLEET_DOMAIN_KEY], before["feature"][fp.FLEET_DOMAIN_KEY]
+        self.assertEqual(after, before, "only feature.fleet_domain changed")
+        rc, out = self._fdom("--apply")
+        self.assertIn("already set", out)
+
+    def test_fleet_domain_on_a_fresh_host_only_reports(self):
+        prov.feature_manifest_path(self.tmp).unlink(missing_ok=True)
+        rc, out = self._fdom("--apply")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("install --apply writes the template", out)
+        self.assertFalse(prov.feature_manifest_path(self.tmp).exists())
 
 
 class SandyManifestGateTest(unittest.TestCase):

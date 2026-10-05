@@ -18,6 +18,8 @@
 #   AMAP_DIR        where the checkouts go           (default: ~/amap)
 #   SANDY_HOME      sandy's home                     (default: ~/.sandy)
 #   AMAP_REPO_BASE  where the repositories come from (default: GitHub)
+#   AMAP_FLEET_DOMAIN_BASE  a fresh host's fleet domain is sandy.<host>.<this>
+#                   (default: internal, non-routable)
 set -euo pipefail
 
 AMAP_DIR="${AMAP_DIR:-$HOME/amap}"
@@ -57,7 +59,8 @@ done
 
 # --- the manifest, the payload, the router's config and its directories ---
 say "installing the AMAP feature into $SANDY_HOME/features/amap"
-SANDY_HOME="$SANDY_HOME" python3 "$AMAP_DIR/amap-deploy-sandy/amap-sandy.py" install --apply
+SANDY_HOME="$SANDY_HOME" python3 "$AMAP_DIR/amap-deploy-sandy/amap-sandy.py" install --apply \
+  ${AMAP_FLEET_DOMAIN_BASE:+--fleet-domain-base "$AMAP_FLEET_DOMAIN_BASE"}
 CONFIG="$SANDY_HOME/features/amap/router.json"
 [ -f "$CONFIG" ] || die "install did not write $CONFIG; see its output above."
 

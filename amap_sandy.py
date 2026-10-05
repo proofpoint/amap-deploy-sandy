@@ -3331,6 +3331,83 @@ def policy_problems(policy: Dict[str, Any], boxes: List[Dict[str, Any]],
     return problems
 
 
+# The fleet's domain is the RUNTIME's authority (amap-spec, peer-origin
+# profile): one router, one domain. A fresh host's template gets
+# `sandy.<host>.<base>`, so two hosts, or a sandy and another runtime on one
+# host, never share a namespace, and two hosts' identically named workspaces
+# never share an address. The base defaults to `internal`, which is reserved
+# for private use and never a real domain: allowed for a same-host fleet
+# without mail. Routing between runtimes is mail, which needs a routable base
+# the operator controls. The domain is derived ONCE, when the template is
+# written: every address carries it, so changing it is an explicit operator
+# act (`fleet-domain --apply`), never a side effect of a renamed host.
+FLEET_DOMAIN_RUNTIME_LABEL = "sandy"
+FLEET_DOMAIN_DEFAULT_BASE = "internal"
+DNS_LABEL_MAX = 63
+
+
+def host_label(hostname: Optional[str] = None) -> Optional[str]:
+    """This host's short name as one DNS label: the first dot-separated part
+    of the hostname, lowercased, with every character outside `a-z0-9-`
+    turned into `-`, runs of `-` collapsed and the edges trimmed. None when
+    nothing usable is left."""
+    import socket
+    name = (hostname if hostname is not None else socket.gethostname()) or ""
+    label = re.sub(r"[^a-z0-9-]", "-", name.split(".")[0].lower())
+    label = re.sub(r"-+", "-", label)[:DNS_LABEL_MAX].strip("-")
+    return label or None
+
+
+def derived_fleet_domain(base: Optional[str] = None, hostname: Optional[str] = None) -> str:
+    """`sandy.<host>.<base>`, `base` defaulting to `internal`; `sandy.<base>`
+    when the hostname yields no label. Raises ProvisionError for a base, or a
+    result, the router's domain rule refuses."""
+    base = base or FLEET_DOMAIN_DEFAULT_BASE
+    if not fp.FLEET_DOMAIN_RE.match(base):
+        raise ProvisionError(f"fleet domain base {base!r} is not a lowercase domain "
+                             f"(letters, digits and hyphens in dot-separated labels)")
+    label = host_label(hostname)
+    domain = ".".join(p for p in (FLEET_DOMAIN_RUNTIME_LABEL, label, base) if p)
+    if not fp.FLEET_DOMAIN_RE.match(domain):
+        raise ProvisionError(f"derived fleet domain {domain!r} is not a valid domain")
+    return domain
+
+
+def run_fleet_domain(args: argparse.Namespace, home: Path) -> int:
+    """`fleet-domain`: show this host's derived domain beside the manifest's,
+    and with --apply write it into the manifest's `feature.fleet_domain`, the
+    one policy key this tool ever writes in an existing manifest, and only
+    when asked. Every agent's address changes with it."""
+    path = feature_manifest_path(home)
+    want = derived_fleet_domain(args.base)
+    if not path.is_file():
+        print(f"fleet-domain: no {path} yet; install --apply writes the template with "
+              f"fleet_domain {want!r}")
+        return 0
+    doc = _read_manifest(path)
+    if not isinstance(doc, dict) or not isinstance(doc.get("feature"), dict):
+        raise ProvisionError(f"{path} carries no `feature` object; fix it by hand first")
+    have = doc["feature"].get(fp.FLEET_DOMAIN_KEY)
+    print(f"fleet-domain: the manifest has {have!r}; this host's derived domain is {want!r}")
+    if have == want:
+        print("  already set; nothing to do")
+        return 0
+    consequence = (f"every agent's address changes from <slug>@{have} to <slug>@{want}. "
+                   f"Let delegations in flight finish first: a reply to an old address "
+                   f"is not delivered. After it: install --apply (the router re-reads its "
+                   f"config on its next poll), then relaunch every agent (sandy --stop, then "
+                   f"sandy --start) so its daemon and tools carry the new address")
+    if not args.apply:
+        print(f"  dry run (pass --apply to write it): {consequence}")
+        return 0
+    doc["feature"][fp.FLEET_DOMAIN_KEY] = want
+    _write_file(path, json.dumps(doc, indent=2) + "\n", dry_run=False,
+                label=FEATURE_MANIFEST_NAME)
+    fp.load_policy(path)
+    print(f"  wrote {fp.FLEET_DOMAIN_KEY} = {want!r} into {path}. Now: {consequence}")
+    return 0
+
+
 def run_sync(args: argparse.Namespace, home: Path, boxes_dir: Path) -> int:
     """`install`: reconcile the host against the manifest's policy in one
     idempotent pass. Dry run unless `--apply`.
@@ -3349,14 +3426,20 @@ def run_sync(args: argparse.Namespace, home: Path, boxes_dir: Path) -> int:
     """
     policy_path = feature_manifest_path(home)
     policy = fp.load_policy(policy_path)
+    base = getattr(args, "fleet_domain_base", None)
     if policy.get(fp.SOURCE_KEY) == fp.SOURCE_DEFAULT:
+        policy[fp.FLEET_DOMAIN_KEY] = derived_fleet_domain(base)
         print(f"note: no {policy_path} yet — install --apply writes the TEMPLATE, which works "
               f"as written: every sandbox launched with claude is selected and nothing is "
               f"excluded; every selected sandbox may task every other (task_graph \"ALL\", "
-              f"no mail lane); addresses are <slug>@{fp.DEFAULT_FLEET_DOMAIN}; containers are "
+              f"no mail lane); addresses are <slug>@{policy[fp.FLEET_DOMAIN_KEY]}; containers are "
               f"recreated every {fp.DEFAULT_RECREATE_INTERVAL_HOURS}h. To narrow it, edit it in "
               f"place: `sandboxes.exclude` keeps a sandbox out, and its `feature` section is "
               f"the policy.")
+    elif base:
+        print(f"note: --fleet-domain-base applies only to a fresh host's template; this "
+              f"host's manifest exists, so its fleet_domain stays "
+              f"{policy.get(fp.FLEET_DOMAIN_KEY)!r}. To move it: fleet-domain --base {base}")
 
     boxes = discover_sandboxes(args.sandy)
     apply = args.apply
@@ -3554,6 +3637,17 @@ def build_parser() -> argparse.ArgumentParser:
                         "router's config beside the manifest — the whole install, once per "
                         "host; sandy applies it to each sandbox at its launch")
     install.add_argument("--apply", action="store_true", help="write (default: report only)")
+    install.add_argument("--fleet-domain-base", metavar="BASE",
+                         help="a fresh host's template gets fleet_domain sandy.<host>.BASE "
+                              "(default: internal, non-routable); a domain you control is "
+                              "what routing between runtimes will need")
+
+    fdom = sub.add_parser(
+        "fleet-domain", help="this host's derived fleet domain, sandy.<host>.<base>, beside "
+                             "the manifest's; --apply writes it into the manifest. Every "
+                             "agent's address changes with it")
+    fdom.add_argument("--base", metavar="BASE", help="the domain's base (default: internal)")
+    fdom.add_argument("--apply", action="store_true", help="write (default: show)")
 
     verify = sub.add_parser(
         "verify", help="report only, exit 1 if anything is missing, stale or wrong: the "
@@ -3631,6 +3725,9 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         if args.command == "cadence":
             return run_cadence(args, home)
+
+        if args.command == "fleet-domain":
+            return run_fleet_domain(args, home)
 
         if args.command == "teardown":
             return run_teardown(args, home, boxes_dir)

@@ -438,7 +438,7 @@ python3 amap-sandy.py install --apply
   "peers": {},
   "task_graph": "ALL",
   "task_deny": [],
-  "fleet_domain": "agents.internal",
+  "fleet_domain": "sandy.&lt;this host&gt;.internal",
   "container_recreate_interval_hours": 24
 }</pre></div>
         </div>
@@ -446,7 +446,7 @@ python3 amap-sandy.py install --apply
           <div><dt>task_graph: "ALL"</dt><dd>The <strong>delegation</strong> lane, which is directed: every selected agent may task every other.</dd></div>
           <div><dt>default_peers, peers, groups</dt><dd>The <strong>mail</strong> lane, which is mutual. Empty, because a pair of agents may not sit on both lanes: they carry different trust.</dd></div>
           <div><dt>task_deny</dt><dd>Ordered pairs <code>[sender, recipient]</code> to block even though <code>task_graph</code> grants them. None.</dd></div>
-          <div><dt>fleet_domain</dt><dd>The right-hand side of every address: <code>&lt;slug&gt;@agents.internal</code>. A name only; nothing touches a network.</dd></div>
+          <div><dt>fleet_domain</dt><dd>The right-hand side of every address, naming this host's router: <code>&lt;slug&gt;@sandy.&lt;this host&gt;.internal</code>. A name only; nothing touches a network.</dd></div>
           <div><dt>container_recreate_interval_hours</dt><dd>How often the agent containers are rebuilt, once you load the job <code>amap-sandy.py cadence</code> prints.</dd></div>
         </dl>
         <p class="note">This works as written: every sandbox launched with claude is selected, and every one may task every other. <strong>To narrow it,</strong> edit <code>~/.sandy/features/amap/feature.json</code> in place and run <code>install --apply</code> again. A glob in its top-level <code>sandboxes.exclude</code> keeps a sandbox out, and explicit <code>task_graph</code> edges replace <code>"ALL"</code>. Nothing is delivered until you start the router in the next step: that is the approval.</p>
