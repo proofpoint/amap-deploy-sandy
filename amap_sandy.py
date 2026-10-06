@@ -3691,7 +3691,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             if args.command == 'verify':
                 import codex_pilot
                 registry = json.loads(pilot_registry.read_text())
-                return codex_pilot.verify(codex_pilot.load_plan(registry['plan']))
+                return codex_pilot.verify(codex_pilot.load_plan(registry['plan']), fleet=True)
             if args.command in {'install', 'router-config', 'teardown', 'fleet-domain'}:
                 raise ProvisionError('a Codex pilot owns this deployment; use codex_pilot.py '
                                      'preview/apply and scoped rollback so legacy rendering '

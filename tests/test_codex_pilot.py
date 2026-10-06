@@ -2,10 +2,11 @@ import json
 import os
 from pathlib import Path
 import sys
-import tomllib
 from unittest import mock
 
 import pytest
+
+tomllib = pytest.importorskip("tomllib", reason="optional Codex pilot requires Python 3.11+")
 
 import amap_sandy as deployment
 import codex_pilot as pilot
@@ -129,3 +130,14 @@ def test_runtime_configuration_uses_read_only_payload_and_does_not_mutate(tmp_pa
     trusted=tomllib.loads(plan['outputs'][controller['trusted_config_file']])
     assert trusted['model_reasoning_effort']=='low'
     assert set(trusted['mcp_servers'])=={'inbox','delegation','inbox_submit'}
+
+
+def test_legacy_fleet_verify_cannot_pass_only_two_endpoint_checks(tmp_path, capsys):
+    plan=fixture(tmp_path)
+    pilot.apply_plan(plan)
+    capsys.readouterr()
+    with mock.patch.object(pilot,'current_container',side_effect=RuntimeError('runtime unavailable')):
+        assert pilot.verify(plan,fleet=True)==1
+    report=json.loads(capsys.readouterr().out)
+    assert report['rollout_ready'] is False
+    assert any(c['name']=='whole-fleet acceptance' and c['result']=='UNKNOWN' for c in report['checks'])

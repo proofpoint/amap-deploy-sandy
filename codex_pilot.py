@@ -593,7 +593,7 @@ def operator_runbook(plan):
     return '\n'.join(lines)+'\n'
 
 
-def verify(plan):
+def verify(plan, *, fleet=False):
     checks=[]
     for path,expected in plan['outputs'].items():
         checks.append({'name':path,'result':'PASS' if Path(path).is_file() and Path(path).read_text()==expected else 'FAIL'})
@@ -622,6 +622,9 @@ def verify(plan):
                 state=json.loads(output.stdout)['state']
                 checks.append({'name':kind+':'+lane+':execution','result':'PASS' if state=='running' else 'FAIL'})
         except Exception as exc: checks.append({'name':kind+':runtime','result':'UNKNOWN','detail':type(exc).__name__})
+    if fleet:
+        checks.append({'name':'whole-fleet acceptance','result':'UNKNOWN',
+                       'detail':'pilot checks cover two endpoints; retain other-Claude, router/admission, inference and recovery observations'})
     print(json_text({'checks':checks,'configuration_and_runtime_checks_passed':all(c['result']=='PASS' for c in checks),
                      'rollout_ready':False,
                      'remaining_live_gates':'agent-uid mutation probes, router admission, startup inference, round trips and recovery'}))

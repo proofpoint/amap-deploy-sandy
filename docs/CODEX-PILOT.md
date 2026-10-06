@@ -46,6 +46,8 @@ Follow generated commands in order: apply, scoped sandbox restart, rebuild/repla
 the recorded router with retained state, wait for first sight, isolation-probe,
 doctor --probe, services, verify, roundtrip/check-roundtrip for each direction.
 `apply` writes reviewed files and rollback preimages but starts no services.
+Legacy verify reports the whole-fleet gate UNKNOWN until its external observations
+are retained; it cannot turn a two-endpoint check into a healthy fleet.
 The legacy installer refuses install/router-config/fleet-domain/teardown while the
 pilot registry is active to prevent clobbering the mixed deployment.
 
