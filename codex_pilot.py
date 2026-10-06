@@ -589,6 +589,12 @@ def operator_runbook(plan):
     lines += ['', '```bash',core(c)+' status',cli+' verify','```','',
         'Verification reports configuration/runtime checks separately from pending live gates.',
         'In the existing Claude session, confirm exactly one delivery target and the effective AMAP tools.',
+        '', '## Synthetic startup inference before any peer traffic','', '```bash',
+        python+' -c '+q('from pathlib import Path; p=Path('+repr(str(services/'startup-instructions.txt'))+'); p.write_text('+repr('Operator-authorized synthetic startup check START1. Call inbox.list_messages once and delegation.list_messages once to verify the local read tools. Use no submission tools, send no messages, execute no shell commands. Return AMAP_STARTUP_OK and finish.')+'); p.chmod(0o600)'),
+        core(c)+' kickoff START1 --instructions-file '+q(str(services/'startup-instructions.txt')),
+        core(c)+' status','```','',
+        'Wait for START1 to finish in the existing thread and retain its actual MCP tool traces/marker.',
+        'Do not proceed on a blocked, failed or uncertain probe; no additional app-server is attached.',
         '', '## Run both directions','', '```bash',cli+' roundtrip --direction codex-claude --run-id R1',
         cli+' check-roundtrip --run-id R1',cli+' roundtrip --direction claude-codex --run-id R2',
         cli+' check-roundtrip --run-id R2','```','',
@@ -642,6 +648,11 @@ def verify(plan, *, fleet=False):
             checks.append({'name':kind+':controller','result':'PASS' if status.get('claim_state')=='held' and (kind!='codex' or status.get('thread_id')) else 'FAIL'})
             for lane in ('mail','peer'):
                 claim=json.loads((Path(instance['state_dir'])/(lane+'.claim.json')).read_text())
+                from amap_codex.claims import _holder_is_live
+                if (claim.get('owner_domain')!=plan['owner_domain'] or claim.get('deployment_id')!=instance['deployment_id']
+                    or claim.get('pid')!=status['supervisor_pid'] or not _holder_is_live(claim)
+                    or claim.get('execution_id')!=status.get('execution_id')):
+                    raise ValueError('host controller/guard binding is not live')
                 request={'version':1,'deployment_id':instance['deployment_id'],'execution_id':claim['execution_id']}
                 output=subprocess.run([plan['python'],str(HERE/'codex_pilot.py'),'--plan',plan['plan_path'],'control','--kind',kind,'inspect'],
                     input=json.dumps(request),capture_output=True,text=True,timeout=18,check=True)
