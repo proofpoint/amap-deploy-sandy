@@ -60,9 +60,11 @@ This clones (or updates) the three repos side by side in `~/amap`, with the
 router and the connector at their pinned commits, runs
 step 4's `install --apply`, and builds and starts the router: the first half
 of step 5. Then make your workspaces (step 3), start agents as in the second
-half of step 5, and verify (step 6). It is safe to run again, and leaves a
-router that is already running alone. `AMAP_DIR` and `SANDY_HOME` override
-where it puts things.
+half of step 5, and verify (step 6). It is safe to run again: it leaves a
+running router alone and starts a stopped one. It never changes an existing
+host's fleet domain. When that domain differs from the one this host would
+derive, it says so; `AMAP_MOVE_FLEET_DOMAIN=1` moves it (then relaunch every
+agent). `AMAP_DIR` and `SANDY_HOME` override where it puts things.
 
 ## 3. Make two workspaces
 
