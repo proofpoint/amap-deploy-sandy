@@ -11,7 +11,9 @@
 # started afterwards, whenever and in any order, with `sandy --start`.
 #
 # Safe to run again: the checkouts are brought up to date, install is
-# idempotent, and a router container that already exists is left running.
+# idempotent, a running router container is left running, and a stopped one
+# is started. An existing host's fleet domain is never changed unless
+# AMAP_MOVE_FLEET_DOMAIN=1 asks for it: every agent's address carries it.
 #
 # It needs no root and no credentials, and installs nothing outside $AMAP_DIR
 # and $SANDY_HOME/features/amap (plus the router's state directory).
@@ -21,6 +23,8 @@
 #   AMAP_REPO_BASE  where the repositories come from (default: GitHub)
 #   AMAP_FLEET_DOMAIN_BASE  a fresh host's fleet domain is sandy.<host>.<this>
 #                   (default: internal, non-routable)
+#   AMAP_MOVE_FLEET_DOMAIN=1  move an EXISTING host to sandy.<host>.<base>;
+#                   every agent's address changes, so relaunch them after
 set -euo pipefail
 
 AMAP_DIR="${AMAP_DIR:-$HOME/amap}"
@@ -61,9 +65,36 @@ say "putting the router and the connector at their pinned commits"
 AMAP_REPO_BASE="$AMAP_REPO_BASE" python3 "$dest/amap-siblings.py" --apply --base "$AMAP_DIR" \
   || die "a sibling checkout could not be put at its pin; see above."
 
+# --- an existing host's fleet domain ---------------------------------------
+# A fresh host's template gets sandy.<host>.<base> from install below. An
+# existing host keeps its domain: it is reported when it differs from this
+# host's, and moved only on AMAP_MOVE_FLEET_DOMAIN=1.
+MANIFEST="$SANDY_HOME/features/amap/feature.json"
+AMAP_SANDY="$AMAP_DIR/amap-deploy-sandy/amap-sandy.py"
+BASE_ARGS=()
+[ -n "${AMAP_FLEET_DOMAIN_BASE:-}" ] && BASE_ARGS=(--base "$AMAP_FLEET_DOMAIN_BASE")
+MOVED=0
+if [ -f "$MANIFEST" ]; then
+  if [ "${AMAP_MOVE_FLEET_DOMAIN:-}" = "1" ]; then
+    say "moving this host's fleet domain (AMAP_MOVE_FLEET_DOMAIN=1)"
+    out=$(SANDY_HOME="$SANDY_HOME" python3 "$AMAP_SANDY" fleet-domain --apply ${BASE_ARGS[@]+"${BASE_ARGS[@]}"}) \
+      || die "fleet-domain --apply failed; see above."
+    printf '%s\n' "$out"
+    case "$out" in *"already set"*) ;; *) MOVED=1 ;; esac
+  else
+    out=$(SANDY_HOME="$SANDY_HOME" python3 "$AMAP_SANDY" fleet-domain ${BASE_ARGS[@]+"${BASE_ARGS[@]}"} 2>&1) || out=""
+    case "$out" in
+      *"already set"*|"") ;;
+      *) say "note: this host's fleet domain is not the one it would derive; nothing was changed."
+         printf '%s\n' "$out"
+         say "  To move it: re-run with AMAP_MOVE_FLEET_DOMAIN=1, then relaunch every agent." ;;
+    esac
+  fi
+fi
+
 # --- the manifest, the payload, the router's config and its directories ---
 say "installing the AMAP feature into $SANDY_HOME/features/amap"
-SANDY_HOME="$SANDY_HOME" python3 "$AMAP_DIR/amap-deploy-sandy/amap-sandy.py" install --apply \
+SANDY_HOME="$SANDY_HOME" python3 "$AMAP_SANDY" install --apply \
   ${AMAP_FLEET_DOMAIN_BASE:+--fleet-domain-base "$AMAP_FLEET_DOMAIN_BASE"}
 CONFIG="$SANDY_HOME/features/amap/router.json"
 [ -f "$CONFIG" ] || die "install did not write $CONFIG; see its output above."
@@ -71,14 +102,25 @@ CONFIG="$SANDY_HOME/features/amap/router.json"
 # --- the router -------------------------------------------------------------
 say "building the router image"
 "$AMAP_DIR/amap-router-local/docker/build.sh" --quiet >/dev/null
-if docker container inspect "$ROUTER_CONTAINER" >/dev/null 2>&1; then
-  say "a router container named $ROUTER_CONTAINER already exists; it was left running."
-  say "  It re-reads its config on every poll. To run the image just built:"
-  say "  docker rm -f $ROUTER_CONTAINER, then re-run this script."
-else
-  say "starting the router"
-  "$AMAP_DIR/amap-router-local/docker/run.sh" --config "$CONFIG" --detach >/dev/null
-fi
+# Running, stopped, or absent: a stopped container still holds the name, so
+# run.sh would fail on it; it is started instead.
+running=$(docker container inspect -f '{{.State.Running}}' "$ROUTER_CONTAINER" 2>/dev/null) \
+  || running=absent
+case "$running" in
+  true)
+    say "the router container $ROUTER_CONTAINER is running; it was left running."
+    say "  It re-reads its config on every poll. To run the image just built:"
+    say "  docker rm -f $ROUTER_CONTAINER, then re-run this script." ;;
+  absent)
+    say "starting the router"
+    "$AMAP_DIR/amap-router-local/docker/run.sh" --config "$CONFIG" --detach >/dev/null ;;
+  *)
+    say "the router container $ROUTER_CONTAINER exists but is stopped; starting it"
+    docker start "$ROUTER_CONTAINER" >/dev/null \
+      || die "docker start $ROUTER_CONTAINER failed; read: docker logs --tail 50 $ROUTER_CONTAINER"
+    say "  It runs the image it was created from. To run the image just built:"
+    say "  docker rm -f $ROUTER_CONTAINER, then re-run this script." ;;
+esac
 
 cat <<EOF
 
@@ -91,3 +133,10 @@ cat <<EOF
 [amap] Narrow the policy: edit $SANDY_HOME/features/amap/feature.json, then
 [amap]   python3 $AMAP_DIR/amap-deploy-sandy/amap-sandy.py install --apply
 EOF
+if [ "$MOVED" = "1" ]; then
+  cat <<EOF
+[amap] THE FLEET DOMAIN CHANGED. Relaunch EVERY amap agent now (sandy --stop,
+[amap] then sandy --start): until then each one carries its old address, and
+[amap] messages to old addresses are not delivered.
+EOF
+fi

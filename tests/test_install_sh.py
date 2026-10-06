@@ -61,8 +61,12 @@ echo "docker $*" >> "$FAKE_LOG"
 case "$1" in
   info|build) exit 0 ;;
   image) exit 1 ;;
-  container) [ -f "$FAKE_RUNNING" ] && exit 0 || exit 1 ;;
+  container)
+    if [ -f "$FAKE_RUNNING" ]; then echo true; exit 0; fi
+    if [ -f "$FAKE_STOPPED" ]; then echo false; exit 0; fi
+    exit 1 ;;
   run) : > "$FAKE_RUNNING"; echo fakecontainerid; exit 0 ;;
+  start) rm -f "$FAKE_STOPPED"; : > "$FAKE_RUNNING"; echo amap-router-local; exit 0 ;;
 esac
 exit 0
 """
@@ -93,6 +97,7 @@ class InstallShTest(unittest.TestCase):
             "AMAP_DIR": str(self.amap_dir), "SANDY_HOME": str(self.sandy_home),
             "AMAP_REPO_BASE": str(self.remotes),
             "FAKE_LOG": str(self.log), "FAKE_RUNNING": str(self.root / "running"),
+            "FAKE_STOPPED": str(self.root / "stopped"),
             "PYTHONDONTWRITEBYTECODE": "1", **GIT_ENV})
 
     def _remotes(self):
@@ -172,7 +177,60 @@ class InstallShTest(unittest.TestCase):
         self.assertEqual(len([c for c in calls if c.startswith("docker run")]), 1, calls)
         self.assertIn("updating", out)
         self.assertEqual(out.count(": present "), 2, out)
-        self.assertIn("already exists; it was left running", out)
+        self.assertIn("is running; it was left running", out)
+        self.assertNotIn("docker start", "\n".join(calls))
+        self.assertNotIn("not the one it would derive", out,
+                         "the manifest holds this host's own domain")
+
+    def test_a_stopped_router_is_started_not_reported_as_running(self):
+        """A stopped container still holds the name, so run.sh would fail on
+        it, and "left running" would be false. It is `docker start`ed."""
+        rc, out = self._run()
+        self.assertEqual(rc, 0, out)
+        (self.root / "running").unlink()
+        (self.root / "stopped").write_text("")
+        rc, out = self._run()
+        self.assertEqual(rc, 0, out)
+        calls = self._calls()
+        self.assertIn("docker start amap-router-local", calls)
+        self.assertEqual(len([c for c in calls if c.startswith("docker run")]), 1, calls)
+        self.assertIn("exists but is stopped; starting it", out)
+        self.assertNotIn("left running", out)
+
+    def _set_domain(self, domain):
+        manifest = self.sandy_home / "features/amap/feature.json"
+        doc = json.loads(manifest.read_text())
+        doc["feature"]["fleet_domain"] = domain
+        manifest.write_text(json.dumps(doc, indent=2) + "\n")
+        return manifest
+
+    def test_an_existing_hosts_other_domain_is_reported_and_kept(self):
+        rc, out = self._run()
+        self.assertEqual(rc, 0, out)
+        manifest = self._set_domain("agents.internal")
+        rc, out = self._run()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("not the one it would derive; nothing was changed", out)
+        self.assertIn("AMAP_MOVE_FLEET_DOMAIN=1", out)
+        self.assertEqual(json.loads(manifest.read_text())["feature"]["fleet_domain"],
+                         "agents.internal")
+        self.assertNotIn("THE FLEET DOMAIN CHANGED", out)
+
+    def test_the_opt_in_moves_an_existing_host_and_says_to_relaunch(self):
+        rc, out = self._run()
+        self.assertEqual(rc, 0, out)
+        manifest = self._set_domain("agents.internal")
+        moving = {**self.env, "AMAP_MOVE_FLEET_DOMAIN": "1"}
+        rc, out = self._run(moving)
+        self.assertEqual(rc, 0, out)
+        doc = json.loads(manifest.read_text())
+        self.assertEqual(doc["feature"]["fleet_domain"], prov.derived_fleet_domain())
+        self.assertIn(prov.derived_fleet_domain(), json.dumps(doc["expose"]),
+                      "install re-rendered the exposed domain after the move")
+        self.assertIn("THE FLEET DOMAIN CHANGED", out)
+        rc, out = self._run(moving)
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn("THE FLEET DOMAIN CHANGED", out, "already moved: nothing to say")
 
     def test_a_missing_prerequisite_stops_before_anything_is_written(self):
         env = dict(self.env)
