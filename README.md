@@ -194,3 +194,9 @@ or sandy.
 ## License
 
 Apache License 2.0. See `LICENSE`.
+
+A dedicated Codex sandbox is prepared through the separate
+[Codex pilot adapter](docs/CODEX-PILOT.md). It renders reviewed plans and exact
+host runbooks before any apply. Existing non-pilot installations keep their
+current commands; mixed pilot installations guard against legacy configuration
+rewrites. Live fleet and round-trip verification remain explicit operator gates.

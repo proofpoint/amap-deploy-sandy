@@ -3686,6 +3686,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     boxes_dir = sandboxes_dir(home)
 
     try:
+        pilot_registry = home / 'amap-codex-pilot.json'
+        if pilot_registry.exists():
+            if args.command == 'verify':
+                import codex_pilot
+                registry = json.loads(pilot_registry.read_text())
+                return codex_pilot.verify(codex_pilot.load_plan(registry['plan']))
+            if args.command in {'install', 'router-config', 'teardown', 'fleet-domain'}:
+                raise ProvisionError('a Codex pilot owns this deployment; use codex_pilot.py '
+                                     'preview/apply and scoped rollback so legacy rendering '
+                                     'cannot restore a second relay or discard protected mounts')
         if args.command == "install":
             return run_sync(args, home, boxes_dir)
 
