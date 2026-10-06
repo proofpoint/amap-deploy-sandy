@@ -229,9 +229,16 @@ def prepare_runtime_config(plan,kind):
         config['trusted_config_file']=str(path)
         plan['outputs'][instance['controller_config']]=config_text(config)
     instance['container_identity']=identity
+    instance['pre_migration_container_id']=cid
+    if kind=='claude':
+        instance['legacy_claim_paths']=[identity['home']+'/.claude/connector/claims/'+lane+'.amap-consumer.json' for lane in ('mail','peer')]
 
 
 def apply_plan(plan):
+    for instance in plan['instances'].values():
+        prior=instance.get('pre_migration_container_id')
+        if prior and current_container(instance['workspace'])!=prior:
+            raise ValueError('runtime identity changed since preview; re-plan before migration')
     for path,expected in plan['dependency_hashes'].items():
         if sha(path)!=expected: raise ValueError('dependency changed since preview: '+path)
     for path,prior in plan['preimages'].items():
@@ -542,7 +549,9 @@ def operator_runbook(plan):
         sandy+' --stop --workspace '+q(b['workspace']),sandy+' --stop --workspace '+q(c['workspace']),
         sandy+' --start --workspace '+q(b['workspace'])+' --agent claude',
         sandy+' --start --workspace '+q(c['workspace'])+' --agent codex', '```','',
-        'Stopping the original Claude container establishes the legacy relay cleanup gate.',
+        'Stopping the original recorded Claude container establishes the legacy relay cleanup gate.',
+        'The plan maps its container-domain legacy claims to private canonical mail/peer guards.',
+        'If a legacy claim survives normal stop, retain it for positive cleanup inspection; do not guess from its PID.',
         '', '## Verify the isolation and Codex configuration','', '```bash',
         cli+' isolation-probe',core(c)+' doctor',core(c)+' doctor --probe',cli+' services --output '+q(str(services)), '```','',
         'Run the actual agent-uid mutation probes for results, processed, ext and config.toml.',

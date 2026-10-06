@@ -143,3 +143,11 @@ def test_legacy_fleet_verify_cannot_pass_only_two_endpoint_checks(tmp_path, caps
     report=json.loads(capsys.readouterr().out)
     assert report['rollout_ready'] is False
     assert any(c['name']=='whole-fleet acceptance' and c['result']=='UNKNOWN' for c in report['checks'])
+
+
+def test_apply_refuses_changed_pre_migration_container(tmp_path):
+    plan=fixture(tmp_path)
+    plan['instances']['claude']['pre_migration_container_id']='a'*64
+    with mock.patch.object(pilot,'current_container',return_value='b'*64):
+        with pytest.raises(ValueError,match='runtime identity changed'): pilot.apply_plan(plan)
+    assert not (tmp_path/'rollback').exists()
