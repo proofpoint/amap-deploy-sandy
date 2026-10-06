@@ -490,6 +490,9 @@ def roundtrip(plan,direction,run_id):
         'by that tool. Both agents must call the MCP submit_result tool and check the runtime accepted result. '
         'A queued receipt is insufficient. The receiver replies to runtime-asserted peer_from with in_reply_to equal '
         'to peer_message_id. Keep the run ID in both subjects. Consume the reply and finish without an acknowledgment. '
+        'After checking acceptance of the initiating submission, finish this initiating turn; do not wait or poll '
+        'for the reply inside it. The serial controller delivers the reply as a later turn on the same thread. '
+        'Preserve this run ID, marker and hash expectations in context for that continuation. '
         'No extra sends, no task_id submit argument, no direct spool writes. Report the two actual request/message IDs.')
     directory.mkdir(mode=0o700,parents=True)
     write(directory/'fixture.json',json_text({'run_id':run_id,'direction':direction,'marker':marker,

@@ -151,3 +151,18 @@ def test_apply_refuses_changed_pre_migration_container(tmp_path):
     with mock.patch.object(pilot,'current_container',return_value='b'*64):
         with pytest.raises(ValueError,match='runtime identity changed'): pilot.apply_plan(plan)
     assert not (tmp_path/'rollback').exists()
+
+
+def test_roundtrip_kickoff_ends_initiating_turn_and_queues_once(tmp_path):
+    plan=fixture(tmp_path)
+    with mock.patch.object(pilot,'current_container',return_value='a'*64), \
+         mock.patch.object(pilot,'container_identity',return_value={'home':'/home/agent','cwd':'/work/agent','slug':plan['instances']['codex']['slug']}), \
+         mock.patch.object(pilot,'run',return_value='queued') as run:
+        pilot.roundtrip(plan,'codex-claude','R1')
+        assert sum('-m' in call.args[0] for call in run.call_args_list)==1
+        instructions=(tmp_path/'evidence'/'R1'/'kickoff.txt').read_text()
+        assert 'finish this initiating turn' in instructions
+        assert 'do not wait or poll' in instructions
+        assert 'peer_message_id' in instructions
+        with pytest.raises(ValueError,match='already prepared'): pilot.roundtrip(plan,'codex-claude','R1')
+        assert sum('-m' in call.args[0] for call in run.call_args_list)==1
