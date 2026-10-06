@@ -104,6 +104,8 @@ def test_apply_and_scoped_rollback_keep_router_state_and_evidence(tmp_path):
     pilot.rollback(plan)
     for path,content in original.items(): assert Path(path).read_bytes()==content
     assert journal.read_text()=='keep'
+    assert not (Path(plan['home'])/'features'/'amap-claude').exists()
+    assert (tmp_path/'rollback'/'retained-amap-claude-feature'/'payload'/'relay').is_file()
     assert not (Path(plan['home'])/'amap-codex-pilot.json').exists()
 
 

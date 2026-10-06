@@ -87,6 +87,8 @@ def choose(boxes, workspace, kind):
 
 def render(home, boxes, c, b, model, codex_src, sandy_src, python, plan_path, schema):
     feature=home/'features'/'amap'
+    if (home/'features'/'amap-claude').exists():
+        raise ValueError('reserved pilot feature amap-claude already exists; review it before preparing')
     base=json.loads((feature/'feature.json').read_text())
     if 'submounts' not in schema.get('manifest',{}).get('top_level_keys',[]):
         raise ValueError('Sandy must advertise manifest.top_level_keys submounts')
@@ -249,7 +251,7 @@ def apply_plan(plan):
                     raise ValueError('original rollback preimage unavailable: '+path)
                 write(backup/str(index),target.read_bytes())
             saved.append({'path':path,'backup':str(index) if prior is not None else None,
-                          'applied_sha256':hashlib.sha256(content.encode()).hexdigest()})
+                          'applied_sha256':hashlib.sha256(content.encode()).hexdigest(),'prior_sha256':prior})
         write(manifest,json_text(saved))
     for directory in plan['directories']: Path(directory).mkdir(parents=True,exist_ok=True)
     for instance in plan['instances'].values():
@@ -282,12 +284,17 @@ def rollback(plan):
         entries=json.loads((backup/'manifest.json').read_text())
         for entry in entries:
             target=Path(entry['path'])
-            if target.exists() and sha(target)!=entry['applied_sha256']:
+            if target.exists() and sha(target) not in {entry['applied_sha256'],entry['prior_sha256']}:
                 raise ValueError('rollback target changed: '+str(target))
         for entry in entries:
             target=Path(entry['path'])
             if entry['backup'] is None:
-                if target.exists(): target.unlink()
+                legacy=Path(plan['home'])/'features'/'amap-claude'
+                if target==legacy/'feature.json' and legacy.exists():
+                    # A nested feature without a manifest would block all Sandy
+                    # launches. Archive the complete new feature outside features.
+                    legacy.rename(backup/'retained-amap-claude-feature')
+                elif target.exists(): target.unlink()
             else: write(target,(backup/entry['backup']).read_bytes(),0o644)
         print(json_text({'restored':True,'services_started':False,'journals_and_router_state_preserved':True}))
     finally:
@@ -446,7 +453,7 @@ def service(plan,kind):
           'run' if kind=='codex' else 'guard-command']
     if platform.system()=='Darwin':
         return label,plistlib.dumps({'Label':label,'ProgramArguments':argv,'RunAtLoad':True,'KeepAlive':True,
-            'ThrottleInterval':10,'StandardOutPath':instance['state_dir']+'/service.stdout.log',
+            'ThrottleInterval':10,'ExitTimeOut':90,'StandardOutPath':instance['state_dir']+'/service.stdout.log',
             'StandardErrorPath':instance['state_dir']+'/service.stderr.log',
             'EnvironmentVariables':{'PATH':os.environ['PATH']}})
     return label,('[Unit]\nDescription=AMAP isolated controller\n[Service]\nExecStart='+
@@ -569,6 +576,16 @@ def operator_runbook(plan):
         lines += ['systemctl --user daemon-reload']
         lines += ['systemctl --user enable --now '+q('org.amap.controller.'+i['slug']+'.service') for i in (b,c)]
         lines += ['```']
+    stop_commands=[]
+    restart_commands=[]
+    for instance in (c,b):
+        label='org.amap.controller.'+instance['slug']
+        if platform.system()=='Darwin':
+            stop_commands.append('launchctl bootout gui/'+str(os.getuid())+'/'+label)
+            restart_commands.append('launchctl kill SIGTERM gui/'+str(os.getuid())+'/'+label)
+        else:
+            stop_commands.append('systemctl --user disable --now '+q(label+'.service'))
+            restart_commands.append('systemctl --user restart '+q(label+'.service'))
     lines += ['', '```bash',core(c)+' status',cli+' verify','```','',
         'Verification reports configuration/runtime checks separately from pending live gates.',
         'In the existing Claude session, confirm exactly one delivery target and the effective AMAP tools.',
@@ -579,13 +596,22 @@ def operator_runbook(plan):
         'Run each evidence check after its reply settles. Keep attachment-read tool traces and the terminal',
         'receiving turn evidence; router acceptance alone leaves those checks UNKNOWN. Observe two idle polls',
         'with no additional send. Reusing a prepared run ID never queues another kickoff.',
+        '', '## Restart check after the demonstrations','',
+        '```bash',restart_commands[0],core(c)+' status',cli+' check-roundtrip --run-id R1',cli+' check-roundtrip --run-id R2','```','',
+        'Compare the original thread ID and accepted request IDs; require no new send.',
         '', '## Recovery and rollback','',
         'Stop only the affected controller service. For a host-controller crash, acquire cleanup through:',
         '', '```bash',core(c)+' cleanup --stop',core(c)+' status','```','',
         'Unknown cleanup remains blocked. If the root execution supervisor was killed, stop the exact recorded',
         'container through Sandy and verify its termination before restarting. Retain the journal and runtime home.',
-        '', 'After stopping both host services and completing cleanup for both endpoints:',
-        '', '```bash',core(b)+' cleanup --stop',cli+' rollback','```','',
+        '', 'For complete pilot rollback, stop both services, then clean both recorded executions:',
+        '', '```bash',*stop_commands,core(c)+' cleanup --stop',core(b)+' cleanup --stop',
+        cli+' rollback',sandy+' --stop --workspace '+q(b['workspace']),
+        sandy+' --stop --workspace '+q(c['workspace']),
+        sandy+' --start --workspace '+q(b['workspace'])+' --agent claude',
+        sandy+' --start --workspace '+q(c['workspace'])+' --agent codex','```','',
+        'A graceful service stop removes process.json. If cleanup reports it absent, inspect both retained '
+        'guards and bindings before proceeding; missing records alone are not runtime proof.',
         'Rollback restores the retained feature/router manifests, removing only the',
         'two new policy edges and Codex selection, and recreate the affected sandbox after positive cleanup.',
         'Restore Claude activation once; never run both the feature entry and the host guard service.',

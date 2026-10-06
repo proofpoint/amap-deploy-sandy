@@ -70,3 +70,9 @@ files and restores only saved manifests/configs. Runtime homes, journals, spools
 router state and source payload snapshots remain. Recreate the affected endpoints,
 restore exactly one Claude activation, and replace the router with the restored
 configuration. Never use fleet teardown or remove uncertainty records to recover.
+
+The new canonical connector repository is proofpoint/amap-connector-codex; it
+has not yet been created. Prepare records per-file SHA-256 source/dependency
+locks for the reviewed local connector artifact. A Git pin and connector PR
+must be established after repository creation before the final source release.
+The existing Claude/router sibling pins are retained rather than replaced.
