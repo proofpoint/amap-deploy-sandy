@@ -310,7 +310,8 @@ also holds if the image's Codex build is not one the connector has
 reviewed; that hold names the build.
 
 The supervisor uses the agent's own model, `model` in the sandbox's
-`~/.codex/config.toml`, the one the Codex pane uses. Change it there; the
+`~/.codex/config.toml`, or Codex's default where that names none. Change it
+there, not with sandy's `CODEX_MODEL`, which reaches only the pane; the
 supervisor picks it up on its next start.
 
 **Verify.** `python3 amap-sandy.py verify` checks the Codex sandbox through

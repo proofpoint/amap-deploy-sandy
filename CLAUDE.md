@@ -286,8 +286,10 @@ connector's `docs/DESIGN.md` §1.2.
   unless a thread's effective registry is exactly these three servers.
 - **The model is the agent's own**: `model` in its `~/.codex/config.toml`,
   as a Claude agent's model is its pane's. The policy and the manifest
-  carry none. No model there is a hold; a change takes effect when the
-  supervisor next starts, and the connector's journal audits it.
+  carry none. No model there leaves the choice to Codex's default, as for
+  the pane. A change takes effect when the supervisor next starts, and the
+  connector's journal audits it. A `CODEX_MODEL` in sandy's config reaches
+  only the pane (as `codex -m`), not the supervisor.
 - **verify reads the supervisor's own snapshot**, `status.json` in the
   entry's state directory, which the connector rewrites on every poll.
   Fixtures for it are written by the connector's real `Supervisor`.

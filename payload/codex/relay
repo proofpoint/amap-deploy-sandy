@@ -60,20 +60,16 @@ if ! python3 -c 'import sys; from amap_codex.config import SUPPORTED_CODEX_VERSI
 fi
 
 # The model is the one the agent's own Codex uses: `model` in its
-# config.toml, as a Claude agent's model is its pane's. None there is a hold,
-# re-read until one is set; it takes effect when the supervisor starts.
-AMAP_CODEX_CONFIG="${CODEX_HOME:-$HOME/.codex}/config.toml"
-AMAP_READ_MODEL='import sys, tomllib
+# config.toml, as a Claude agent's model is its pane's. None there leaves the
+# choice to Codex's own default, as it does for the pane. It takes effect
+# when the supervisor starts.
+MODEL=$(python3 -c '
+import sys, tomllib
 try:
     model = tomllib.load(open(sys.argv[1], "rb")).get("model")
 except (OSError, ValueError):
     model = None
-if not isinstance(model, str) or not model:
-    sys.exit(1)
-print(model)'
-export AMAP_CODEX_CONFIG AMAP_READ_MODEL
-hold_until "no model in $AMAP_CODEX_CONFIG; set one there" 'python3 -c "$AMAP_READ_MODEL" "$AMAP_CODEX_CONFIG"'
-MODEL=$(python3 -c "$AMAP_READ_MODEL" "$AMAP_CODEX_CONFIG")
+print(model if isinstance(model, str) else "")' "${CODEX_HOME:-$HOME/.codex}/config.toml")
 
 SANDY_SESSION_FILE=/etc/sandy-session.json
 if [ ! -r "$SANDY_SESSION_FILE" ]; then
@@ -110,7 +106,6 @@ lines = [
     f"instance_id = {q(name)}",
     f"launch_argv = {q(['codex', 'app-server', '--listen', 'stdio://'])}",
     f"state_dir = {q(state)}",
-    f"codex_model = {q(model)}",
     f"codex_version = {q(version)}",
     f"cwd = {q(workspace)}",
     'sandbox = "danger-full-access"',
@@ -122,6 +117,8 @@ lines = [
 ]
 if address:
     lines.insert(1, f"self_address = {q(address)}")
+if model:
+    lines.append(f"codex_model = {q(model)}")
 lanes = [("mail", env["AMAP_INBOX_DIR"])]
 if address:
     lanes.append(("peer", env["AMAP_PEER_DIR"]))

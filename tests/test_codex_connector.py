@@ -284,12 +284,15 @@ class CodexRelayTest(unittest.TestCase):
         self.assertEqual(Config.load(self.state / "codex/controller.toml").codex_model,
                          "gpt-test")
 
-    def test_no_model_in_the_agents_config_holds_with_the_file_named(self):
+    def test_no_model_in_the_agents_config_leaves_the_choice_to_codex(self):
         (self.root / "logged-in").write_text("")
         self.codex_config.write_text('sandbox_mode = "danger-full-access"\n')
-        reason = self._hold_reason(self._start())
-        self.assertIn("no model", reason)
-        self.assertIn(str(self.codex_config), reason)
+        proc = subprocess.run(["/bin/sh", str(self.payload / "codex/relay")], env=self.env,
+                              capture_output=True, text=True, timeout=30)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        controller = self.state / "codex/controller.toml"
+        self.assertNotIn("codex_model", controller.read_text())
+        self.assertIsNone(Config.load(controller).codex_model)
 
     def test_an_unreviewed_build_holds_with_the_build_named(self):
         (self.root / "logged-in").write_text("")
