@@ -1574,7 +1574,8 @@ class SyncTest(_ConnectorFixtureMixin, unittest.TestCase):
         self.assertEqual(manifest["agents"], {"include": ["claude"], "exclude": []})
         self.assertEqual(manifest["feature"][fp.TASK_GRAPH_KEY], fp.TASK_GRAPH_ALL)
         self.assertEqual(manifest["feature"]["default_peers"], [])
-        self.assertEqual(manifest["expose"], {prov.EXPOSE_FLEET_DOMAIN: prov.derived_fleet_domain()})
+        self.assertEqual(manifest["expose"], {prov.EXPOSE_FLEET_DOMAIN: prov.derived_fleet_domain(),
+                                              prov.EXPOSE_CODEX_MODEL: prov.DEFAULT_CODEX_MODEL})
         self.assertEqual(manifest["feature"][fp.FLEET_DOMAIN_KEY], prov.derived_fleet_domain())
         self.assertEqual(manifest[prov.AGENT_ARGS_KEY], prov.agent_args_for_manifest())
         self.assertTrue(prov.payload_entry_path(self.tmp).is_file(), "the payload lands too")
@@ -1686,7 +1687,8 @@ class FleetDomainTest(_ConnectorFixtureMixin, unittest.TestCase):
         self.assertEqual(rc, 0, out)
         doc = json.loads(prov.feature_manifest_path(self.tmp).read_text())
         self.assertEqual(doc["feature"][fp.FLEET_DOMAIN_KEY], "sandy.laptop2.internal")
-        self.assertEqual(doc["expose"], {prov.EXPOSE_FLEET_DOMAIN: "sandy.laptop2.internal"})
+        self.assertEqual(doc["expose"], {prov.EXPOSE_FLEET_DOMAIN: "sandy.laptop2.internal",
+                                         prov.EXPOSE_CODEX_MODEL: prov.DEFAULT_CODEX_MODEL})
         self.assertIn("<slug>@sandy.laptop2.internal", out)
         rc, out = self._fresh("--apply", "--fleet-domain-base", "agents.example.org")
         doc = json.loads(prov.feature_manifest_path(self.tmp).read_text())

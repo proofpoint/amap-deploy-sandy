@@ -1,0 +1,12 @@
+#!/bin/sh
+# payload/codex/mcp-reader — shipped by amap-deploy-sandy and copied VERBATIM
+# onto the feature payload. payload/codex/mcp.toml registers it as the
+# `inbox` (mail) and `delegation` (peer) MCP servers. It translates sandy's
+# lane export into the reader's variables and execs the connector's reader.
+SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+case "$1" in
+    mail) root=${AMAP_INBOX_DIR:?mcp-reader: no AMAP_INBOX_DIR; the inbox lane is not mounted} ;;
+    peer) root=${AMAP_PEER_DIR:?mcp-reader: no AMAP_PEER_DIR; the peer lane is not mounted} ;;
+    *) echo "mcp-reader: usage: mcp-reader mail|peer" >&2; exit 2 ;;
+esac
+INBOX_MESSAGE_DIR="$root/messages" INBOX_LANE="$1" exec "$SELF_DIR/bin/inbox-mcp-vol"

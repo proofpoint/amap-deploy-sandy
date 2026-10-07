@@ -1,0 +1,35 @@
+# payload/codex/mcp.toml — shipped by amap-deploy-sandy and copied VERBATIM
+# onto the feature payload. The Codex supervisor's trusted MCP configuration:
+# it passes this on every thread start and resume, and refuses to dispatch
+# unless the thread's effective registry is exactly these three servers with
+# exactly these tools (amap-connector-codex, `Config.trusted_overrides`).
+#
+# A constant. Codex hands an MCP server only HOME and PATH plus what
+# `env_vars` names (measured on codex-cli 0.160.1), so each server receives
+# sandy's lane exports through `env_vars`, and the wrappers beside this file
+# translate them into the connector's variables. The commands are
+# payload-rooted: sandy mounts the payload read-only at this path.
+
+[mcp_servers.inbox]
+command = "/opt/sandy/features/amap/codex/mcp-reader"
+args = ["mail"]
+required = true
+enabled_tools = ["list_messages", "read_message", "read_attachment"]
+default_tools_approval_mode = "approve"
+env_vars = ["AMAP_INBOX_DIR"]
+
+[mcp_servers.delegation]
+command = "/opt/sandy/features/amap/codex/mcp-reader"
+args = ["peer"]
+required = true
+enabled_tools = ["list_messages", "read_message", "read_attachment"]
+default_tools_approval_mode = "approve"
+env_vars = ["AMAP_PEER_DIR"]
+
+[mcp_servers.inbox_submit]
+command = "/opt/sandy/features/amap/codex/mcp-submit"
+args = ["mcp"]
+required = true
+enabled_tools = ["submit", "submit_result", "peers"]
+default_tools_approval_mode = "approve"
+env_vars = ["AMAP_OUTBOX_DIR", "AMAP_ROSTER_DIR", "AMAP_FLEET_DOMAIN"]

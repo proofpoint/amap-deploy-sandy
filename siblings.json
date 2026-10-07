@@ -12,6 +12,13 @@
       "url": "https://github.com/proofpoint/amap-connector-claude",
       "commit": "ca9b40647c5c002e6e6fe30b4fea54e64a76af57",
       "override": "AMAP_CONNECTOR_REPO"
+    },
+    {
+      "name": "amap-connector-codex",
+      "url": "https://github.com/proofpoint/amap-connector-codex",
+      "commit": "9c49efc3ff84292d289b2da951349f465e403298",
+      "override": "AMAP_CODEX_CONNECTOR_REPO",
+      "opt_in": "AMAP_CODEX"
     }
   ]
 }

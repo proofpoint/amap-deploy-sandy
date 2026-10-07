@@ -1,0 +1,10 @@
+#!/bin/sh
+# payload/codex/mcp-submit — shipped by amap-deploy-sandy and copied VERBATIM
+# onto the feature payload. payload/codex/mcp.toml registers it as the
+# `inbox_submit` MCP server. It names the drop box from sandy's outbox
+# export, then execs submit-server beside it (a copy of payload/submit-server,
+# which derives AMAP_SELF and execs the connector's inbox-submit).
+SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+OUTBOX_DIR=${AMAP_OUTBOX_DIR:?mcp-submit: no AMAP_OUTBOX_DIR; the outbox lane is not mounted}
+export OUTBOX_DIR
+exec "$SELF_DIR/submit-server" "$@"

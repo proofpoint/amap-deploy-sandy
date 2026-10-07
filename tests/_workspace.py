@@ -60,3 +60,21 @@ def checkout_fingerprint(root):
     except (OSError, subprocess.CalledProcessError):
         return None
     return status + "\n" + diff
+
+
+# The Codex connector, found the same way. Keep in step with
+# `amap_sandy.CODEX_CONNECTOR_REPO_NAME`.
+_CODEX_CONNECTOR_REPO_NAME = "amap-connector-codex"
+
+
+def codex_connector_root() -> Path:
+    env = os.environ.get("AMAP_CODEX_CONNECTOR_REPO")
+    if env:
+        return Path(env).absolute()
+    for cand in _HERE.parents:
+        if (cand / _CODEX_CONNECTOR_REPO_NAME / "src" / "amap_codex").is_dir():
+            return cand / _CODEX_CONNECTOR_REPO_NAME
+    return _HERE.parents[2] / _CODEX_CONNECTOR_REPO_NAME
+
+
+CODEX_CONNECTOR_ROOT = codex_connector_root()

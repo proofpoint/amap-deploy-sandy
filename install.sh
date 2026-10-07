@@ -25,6 +25,8 @@
 #                   (default: internal, non-routable)
 #   AMAP_MOVE_FLEET_DOMAIN=1  move an EXISTING host to sandy.<host>.<base>;
 #                   every agent's address changes, so relaunch them after
+#   AMAP_CODEX=1    also check out amap-connector-codex, so Codex sandboxes
+#                   get a delivery supervisor (git must be able to reach it)
 set -euo pipefail
 
 AMAP_DIR="${AMAP_DIR:-$HOME/amap}"
@@ -33,7 +35,7 @@ AMAP_REPO_BASE="${AMAP_REPO_BASE:-https://github.com/proofpoint}"
 ROUTER_CONTAINER=amap-router-local
 # The checkouts are the ones under $AMAP_DIR: an override pointing elsewhere
 # would install and build from a tree this script did not put at its pin.
-unset AMAP_ROUTER_REPO AMAP_CONNECTOR_REPO
+unset AMAP_ROUTER_REPO AMAP_CONNECTOR_REPO AMAP_CODEX_CONNECTOR_REPO
 
 say() { printf '[amap] %s\n' "$*"; }
 die() { printf '[amap] error: %s\n' "$*" >&2; exit 1; }

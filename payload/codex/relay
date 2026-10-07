@@ -1,0 +1,135 @@
+#!/bin/sh
+# payload/codex/relay — shipped by amap-deploy-sandy and copied VERBATIM onto
+# the feature payload. payload/relay execs it when the sandbox's agent is
+# codex. Edit it HERE, then re-run install --apply; an edit to a deployed
+# copy is drift.
+#
+# It starts the Codex connector's supervisor (amap-connector-codex,
+# `amap_codex.cli run`), which drives one persistent `codex app-server`
+# thread from this sandbox's AMAP notices. Like payload/relay, it is a
+# constant: every value comes from sandy's exports, sandy's session file or
+# the agent's own Codex configuration, and is written into a supervisor
+# configuration under this entry's own state directory on every start.
+#
+# Two conditions HOLD the entry rather than fail it: Codex is not logged in
+# yet (`sandy --login codex` starts entries too), or the image's Codex build
+# is not one the connector has reviewed. Exiting would fail the launch
+# inside sandy's startup window, or crash-loop after it. Instead the reason
+# is written to $STATE/hold.json, which verify reports, and the entry waits.
+# Every other gap is fatal, as in payload/relay: a guessed value is a wrong
+# value used silently.
+#
+# This file and everything it execs sit behind the read-only payload mount.
+set -e
+
+SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+
+: "${AMAP_INBOX_DIR:?codex relay: sandy exported no AMAP_INBOX_DIR; the inbox lane is not mounted}"
+: "${AMAP_OUTBOX_DIR:?codex relay: sandy exported no AMAP_OUTBOX_DIR; the outbox lane is not mounted}"
+: "${AMAP_PEER_DIR:?codex relay: sandy exported no AMAP_PEER_DIR; the peer lane is not mounted}"
+: "${SANDY_FEATURE_STATE:?codex relay: sandy exported no SANDY_FEATURE_STATE; this sandy predates per-entry state}"
+
+STATE="$SANDY_FEATURE_STATE/codex"
+mkdir -p "$STATE"
+chmod 700 "$STATE"
+HOLD="$STATE/hold.json"
+
+# hold REASON: record why the supervisor is not running, then wait until
+# CHECK (a shell command) succeeds, re-checking every 30 seconds.
+hold_until() {
+    reason=$1; check=$2
+    while ! sh -c "$check" >/dev/null 2>&1; do
+        if [ ! -f "$HOLD" ] || ! grep -qF "\"$reason\"" "$HOLD"; then
+            python3 -c 'import json, sys, time; print(json.dumps({"reason": sys.argv[1], "since": int(time.time())}))' "$reason" > "$HOLD.tmp"
+            mv "$HOLD.tmp" "$HOLD"
+            echo "codex relay: holding: $reason" >&2
+        fi
+        sleep 30
+    done
+    rm -f "$HOLD"
+}
+
+hold_until "codex is not logged in; run sandy --login codex" "codex login status"
+
+CODEX_VERSION=$(codex --version 2>/dev/null | head -n 1)
+export PYTHONPATH="$SELF_DIR/src"
+if ! python3 -c 'import sys; from amap_codex.config import SUPPORTED_CODEX_VERSIONS as v; sys.exit(sys.argv[1] not in v)' "$CODEX_VERSION"; then
+    # The image's build will not change without a rebuild, so this holds for
+    # the life of the container.
+    hold_until "codex build '$CODEX_VERSION' is not reviewed by this connector" "false"
+fi
+
+# The model: the fleet policy's `codex_model` (the manifest's
+# AMAP_CODEX_MODEL export); else CODEX_MODEL; else the one the agent's own
+# Codex uses, from its ~/.codex/config.toml.
+MODEL=${AMAP_CODEX_MODEL:-${CODEX_MODEL:-$(python3 -c '
+import sys, tomllib
+try:
+    print(tomllib.load(open(sys.argv[1], "rb")).get("model") or "")
+except (OSError, ValueError):
+    print("")' "${CODEX_HOME:-$HOME/.codex}/config.toml")}}
+: "${MODEL:?codex relay: no model; set codex_model in the fleet policy}"
+
+SANDY_SESSION_FILE=/etc/sandy-session.json
+if [ ! -r "$SANDY_SESSION_FILE" ]; then
+    echo "codex relay: $SANDY_SESSION_FILE is missing or unreadable; sandy composes it before launch" >&2
+    exit 1
+fi
+read_session() {
+    python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get(sys.argv[2]) or "")' "$SANDY_SESSION_FILE" "$1"
+}
+sandbox_name=$(read_session sandbox_name)
+: "${sandbox_name:?codex relay: $SANDY_SESSION_FILE carries no sandbox_name}"
+workspace=$(read_session workspace)
+: "${workspace:?codex relay: $SANDY_SESSION_FILE carries no workspace}"
+
+# The peer lane needs the agent's own address; a fleet without a domain has
+# none, and the router places no peer notices there. Mail only, then.
+self_address=""
+if [ -n "${AMAP_FLEET_DOMAIN+x}" ]; then
+    : "${AMAP_FLEET_DOMAIN:?codex relay: AMAP_FLEET_DOMAIN is exported but empty; re-run amap-sandy.py install --apply}"
+    self_address="$sandbox_name@$AMAP_FLEET_DOMAIN"
+fi
+
+# The connector's outcome directory sits in its own extension space; it
+# creates the leaf, and its parent must exist.
+mkdir -p "$AMAP_OUTBOX_DIR/ext/codex"
+mkdir -p "$STATE/claims"
+
+python3 - "$STATE/controller.toml" "$sandbox_name" "$self_address" "$MODEL" "$CODEX_VERSION" "$workspace" "$STATE" "$SELF_DIR" <<'PY'
+import json, os, sys
+path, name, address, model, version, workspace, state, payload = sys.argv[1:]
+env = os.environ
+q = json.dumps  # a JSON string is a valid TOML basic string
+lines = [
+    f"instance_id = {q(name)}",
+    f"launch_argv = {q(['codex', 'app-server', '--listen', 'stdio://'])}",
+    f"state_dir = {q(state)}",
+    f"codex_model = {q(model)}",
+    f"codex_version = {q(version)}",
+    f"cwd = {q(workspace)}",
+    'sandbox = "danger-full-access"',
+    'approval_policy = "never"',
+    f"operator_instructions = {q(payload + '/operator-instructions.md')}",
+    f"trusted_config_file = {q(payload + '/mcp.toml')}",
+    f"outcome_dir = {q(env['AMAP_OUTBOX_DIR'] + '/ext/codex/outcomes')}",
+    "operator_kickoff_enabled = true",
+]
+if address:
+    lines.insert(1, f"self_address = {q(address)}")
+lanes = [("mail", env["AMAP_INBOX_DIR"])]
+if address:
+    lanes.append(("peer", env["AMAP_PEER_DIR"]))
+for lane, root in lanes:
+    lines += ["", f"[lanes.{lane}]",
+              f"notice_dir = {q(root + '/notices')}",
+              f"message_dir = {q(root + '/messages')}",
+              f"claim_path = {q(state + '/claims/' + lane + '.amap-consumer.json')}"]
+tmp = path + ".tmp"
+with open(tmp, "w") as f:
+    f.write("\n".join(lines) + "\n")
+os.chmod(tmp, 0o600)
+os.replace(tmp, path)
+PY
+
+exec python3 -m amap_codex.cli --config "$STATE/controller.toml" run
