@@ -144,4 +144,30 @@ os.chmod(tmp, 0o600)
 os.replace(tmp, path)
 PY
 
-exec python3 -m amap_codex.cli --config "$STATE/controller.toml" run
+# The supervisor runs as a child, never exec'd: a supervisor that fails to
+# start (an app-server that will not come up, an MCP registry that is not
+# exactly the trusted one) is a hold with its exit status, retried with
+# backoff, never an exit that fails the agent's launch. Its own output is
+# in this entry's log. A stop request reaches it, and ends the loop.
+supervisor=""
+trap 'stopping=1; [ -n "$supervisor" ] && kill -TERM "$supervisor" 2>/dev/null' TERM INT
+stopping=""
+backoff=30
+while :; do
+    rm -f "$HOLD"
+    python3 -m amap_codex.cli --config "$STATE/controller.toml" run &
+    supervisor=$!
+    rc=0
+    wait "$supervisor" || rc=$?
+    # A trapped signal interrupts the first wait; the second reaps the child.
+    [ -n "$stopping" ] && { wait "$supervisor" 2>/dev/null || true; exit 0; }
+    [ "$rc" -eq 0 ] && exit 0
+    python3 -c 'import json, sys, time; print(json.dumps({"reason": sys.argv[1], "since": int(time.time())}))' \
+        "codex supervisor exited $rc; its output is in /opt/sandy/feature-state/amap/supervisor.log; retrying in ${backoff}s" > "$HOLD.tmp"
+    mv "$HOLD.tmp" "$HOLD"
+    echo "codex relay: supervisor exited $rc; retrying in ${backoff}s" >&2
+    sleep "$backoff" &
+    wait $! || true
+    [ -n "$stopping" ] && exit 0
+    [ "$backoff" -lt 600 ] && backoff=$((backoff * 2))
+done

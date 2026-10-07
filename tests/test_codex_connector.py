@@ -23,6 +23,7 @@ records the final `exec` instead of running it.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shutil
@@ -67,7 +68,12 @@ esac
 # python3 call (the relay's own helpers) runs for real.
 PYTHON_SHIM = """#!/bin/sh
 if [ "$1" = "-m" ] && [ "$2" = "amap_codex.cli" ]; then
-  printf '%s\\n' "$@" > "$SHIM_ARGV"; exit 0
+  printf '%s\\n' "$@" > "$SHIM_ARGV"
+  if [ -n "$SHIM_RUN_UNTIL_TERM" ]; then
+    trap 'echo stopped > "$SHIM_RUN_UNTIL_TERM"; exit 0' TERM
+    while :; do sleep 1; done
+  fi
+  exit "${{SHIM_RC:-0}}"
 fi
 exec {python} "$@"
 """
@@ -294,6 +300,30 @@ class CodexRelayTest(unittest.TestCase):
         controller = self.state / "codex/controller.toml"
         self.assertNotIn("codex_model", controller.read_text())
         self.assertIsNone(Config.load(controller).codex_model)
+
+    def test_a_supervisor_that_fails_is_a_hold_not_an_exit(self):
+        """An exit inside sandy's startup window fails the agent's whole
+        launch, so a supervisor that cannot start is held and retried."""
+        (self.root / "logged-in").write_text("")
+        reason = self._hold_reason(self._start(SHIM_RC="1"))
+        self.assertIn("codex supervisor exited 1", reason)
+
+    def test_a_stop_reaches_the_supervisor_and_ends_the_relay(self):
+        (self.root / "logged-in").write_text("")
+        stopped = self.root / "stopped"
+        proc = self._start(SHIM_RUN_UNTIL_TERM=str(stopped))
+        try:
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline and not (self.root / "argv").exists():
+                time.sleep(0.05)
+            self.assertIsNone(proc.poll(), "the relay runs while its supervisor does")
+            proc.send_signal(signal.SIGTERM)
+            proc.communicate(timeout=20)
+            self.assertEqual(proc.returncode, 0)
+            self.assertEqual(stopped.read_text().strip(), "stopped")
+        finally:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(proc.pid, signal.SIGKILL)
 
     def test_an_unreviewed_build_runs_and_is_stated(self):
         (self.root / "logged-in").write_text("")
