@@ -51,13 +51,23 @@ hold_until() {
 
 hold_until "codex is not logged in; run sandy --login codex" "codex login status"
 
-CODEX_VERSION=$(codex --version 2>/dev/null | head -n 1)
+# Any Codex build runs; the supervisor reports whether the connector has
+# reviewed it. A build that cannot state its version (a broken install)
+# holds, since the supervisor checks the launched app-server against it.
 export PYTHONPATH="$SELF_DIR/src"
-if ! python3 -c 'import sys; from amap_codex.config import SUPPORTED_CODEX_VERSIONS as v; sys.exit(sys.argv[1] not in v)' "$CODEX_VERSION"; then
-    # The image's build will not change without a rebuild, so this holds for
-    # the life of the container.
-    hold_until "codex build '$CODEX_VERSION' is not reviewed by this connector" "false"
-fi
+AMAP_CODEX_BUILD='import subprocess, sys
+from amap_codex.config import CODEX_VERSION
+try:
+    out = subprocess.run(["codex", "--version"], capture_output=True, text=True, timeout=30).stdout
+except (OSError, subprocess.SubprocessError):
+    out = ""
+build = out.split("\n")[0].strip()
+if not CODEX_VERSION.fullmatch(build):
+    sys.exit(1)
+print(build)'
+export AMAP_CODEX_BUILD
+hold_until "codex --version reports no build; the image's Codex install is broken (rebuild it)" 'python3 -c "$AMAP_CODEX_BUILD"'
+CODEX_VERSION=$(python3 -c "$AMAP_CODEX_BUILD")
 
 # The model is the one the agent's own Codex uses: `model` in its
 # config.toml, as a Claude agent's model is its pane's. None there leaves the

@@ -276,12 +276,16 @@ need the checkout and fail without it, like the router's.
 host service. Host-side supervision is a deferred design, recorded in the
 connector's `docs/DESIGN.md` §1.2.
 
-- **A hold is not an exit.** Not logged in, or a Codex build the connector
-  has not reviewed: the relay writes `hold.json` with the reason and waits.
-  An exit inside sandy's startup window fails the agent's whole launch.
+- **A hold is not an exit.** Not logged in, or a Codex install that reports
+  no build: the relay writes `hold.json` with the reason and waits. An exit
+  inside sandy's startup window fails the agent's whole launch.
+- **Any Codex build runs.** Sandy installs Codex at npm's latest and cannot
+  hold a version, so the connector's reviewed builds are information: an
+  unreviewed one is a verify note, never a hold. Delivery relies on the
+  connector's live checks.
 - **`payload/codex/mcp.toml` is one constant.** Codex gives an MCP server
   only `HOME` and `PATH` plus what `env_vars` names (measured on
-  codex-cli 0.160.1), so the lane exports travel through `env_vars` and
+  codex-cli 0.160.1 and 0.161.0), so the lane exports travel through `env_vars` and
   the wrappers beside it translate them. The connector refuses to dispatch
   unless a thread's effective registry is exactly these three servers.
 - **The model is the agent's own**: `model` in its `~/.codex/config.toml`,

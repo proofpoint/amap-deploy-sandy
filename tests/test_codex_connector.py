@@ -14,7 +14,8 @@ rather than skipping it. What it proves:
 - the SHIPPED payload/codex/relay writes a supervisor configuration the
   connector's own `Config.load` accepts (lanes, trusted MCP file, operator
   instructions, private state), and holds, with a recorded reason, while
-  Codex is not logged in or its build is not reviewed;
+  Codex is not logged in or its install reports no build, and runs any
+  build it can name;
 - verify reads the status snapshot the connector's own `Supervisor` writes.
 
 `codex` is a stub and the supervisor is never started: a `python3` shim
@@ -47,7 +48,7 @@ if not (CODEX_ROOT / "src" / prov.CODEX_PACKAGE).is_dir():
     raise RuntimeError(f"amap-connector-codex checkout not found at {CODEX_ROOT}: set "
                        f"$AMAP_CODEX_CONNECTOR_REPO or check it out beside this repository")
 sys.path.insert(0, str(CODEX_ROOT / "src"))
-from amap_codex.config import Config, Lane, SUPPORTED_CODEX_VERSIONS  # noqa: E402
+from amap_codex.config import Config, Lane, REVIEWED_CODEX_VERSIONS  # noqa: E402
 from amap_codex.journal import Journal  # noqa: E402
 from amap_codex.supervisor import Supervisor  # noqa: E402
 
@@ -216,7 +217,7 @@ class CodexRelayTest(unittest.TestCase):
                     "SANDY_FEATURE_STATE": str(self.state), "SANDY_AGENT": "codex",
                     "AMAP_FLEET_DOMAIN": "sandy.host.internal",
                     "FAKE_LOGGED_IN": str(root / "logged-in"),
-                    "FAKE_CODEX_VERSION": SUPPORTED_CODEX_VERSIONS[0],
+                    "FAKE_CODEX_VERSION": REVIEWED_CODEX_VERSIONS[0],
                     "SHIM_ARGV": str(root / "argv"),
                     **{k: str(v) for k, v in lanes.items()}}
 
@@ -294,11 +295,19 @@ class CodexRelayTest(unittest.TestCase):
         self.assertNotIn("codex_model", controller.read_text())
         self.assertIsNone(Config.load(controller).codex_model)
 
-    def test_an_unreviewed_build_holds_with_the_build_named(self):
+    def test_an_unreviewed_build_runs_and_is_stated(self):
         (self.root / "logged-in").write_text("")
-        reason = self._hold_reason(self._start(FAKE_CODEX_VERSION="codex-cli 9.9.9"))
-        self.assertIn("codex-cli 9.9.9", reason)
-        self.assertIn("not reviewed", reason)
+        proc = subprocess.run(["/bin/sh", str(self.payload / "codex/relay")],
+                              env={**self.env, "FAKE_CODEX_VERSION": "codex-cli 9.9.9"},
+                              capture_output=True, text=True, timeout=30)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        config = Config.load(self.state / "codex/controller.toml")
+        self.assertEqual(config.codex_version, "codex-cli 9.9.9")
+        self.assertFalse(config.codex_reviewed)
+
+    def test_a_codex_that_reports_no_build_holds(self):
+        (self.root / "logged-in").write_text("")
+        self.assertIn("reports no build", self._hold_reason(self._start(FAKE_CODEX_VERSION="")))
 
 
 class VerifyCodexSupervisorTest(unittest.TestCase):
@@ -327,6 +336,7 @@ class VerifyCodexSupervisorTest(unittest.TestCase):
             "state_dir": str(self.entry_state)}}}
 
     def _snapshot(self, *, held=True, thread="thread-1", uncertain=False):
+        self.config.validate()
         supervisor = Supervisor(self.config)
         supervisor.journal = Journal(self.config.state_dir, self.config.instance_id,
                                      self.config.fingerprint(), self.config.codex_version,
@@ -381,6 +391,14 @@ class VerifyCodexSupervisorTest(unittest.TestCase):
         (self.codex_state / prov.CODEX_STATUS_NAME).unlink()
         problems, _ = self._verify()
         self.assertTrue(problems and "UNKNOWN" in problems[0], problems)
+
+    def test_an_unreviewed_build_is_a_note_not_a_problem(self):
+        self.config.codex_version = "codex-cli 9.9.9"
+        self._snapshot()
+        problems, notes = self._verify()
+        self.assertEqual(problems, [])
+        self.assertEqual(len(notes), 1, notes)
+        self.assertIn("'codex-cli 9.9.9' is not one the connector has reviewed", notes[0])
 
     def test_a_stopped_sandbox_reports_only_what_persists(self):
         self._snapshot(held=False, uncertain=True)

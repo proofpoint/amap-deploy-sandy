@@ -305,9 +305,8 @@ cd ~/amap-demo/gamma && sandy --start
 ```
 
 Log Codex in inside the sandbox if it is not already. Until it is, the
-supervisor waits, and `verify` reports it as holding with the reason. It
-also holds if the image's Codex build is not one the connector has
-reviewed; that hold names the build.
+supervisor waits, and `verify` reports it as holding with the reason. Any
+Codex build runs; `verify` notes one the connector has not reviewed.
 
 The supervisor uses the agent's own model, `model` in the sandbox's
 `~/.codex/config.toml`, or Codex's default where that names none. Change it

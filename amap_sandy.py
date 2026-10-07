@@ -2639,7 +2639,7 @@ def verify_codex_supervisor(home: Path, slug: str, record: Optional[dict], *,
     Always, running or not: a payload without `codex/` (nothing to run), and
     work the journal holds as UNCERTAIN, which never replays by itself and
     waits for the operator. Only while running: a recorded HOLD (Codex not
-    logged in, or a build the connector has not reviewed); and liveness, the
+    logged in, or a Codex install that reports no build); and liveness, the
     snapshot no older than HEARTBEAT_MAX_AGE_SECONDS with both claims held.
     A missing or unreadable snapshot on a running sandbox is UNKNOWN, a
     problem, never a pass."""
@@ -2667,6 +2667,10 @@ def verify_codex_supervisor(home: Path, slug: str, record: Optional[dict], *,
                             f"the journal to clear it)")
         if status.get("last_error"):
             notes.append(f"{slug}: codex supervisor's last recorded error: {status['last_error']}")
+        if status.get("codex_reviewed") is False:
+            notes.append(f"{slug}: Codex build {status.get('codex_version')!r} is not one the "
+                         f"connector has reviewed; delivery runs on its live checks (the exact "
+                         f"MCP registry per thread, protocol errors that fail loudly)")
     if not running:
         return problems, notes
     hold = _read_json(state / CODEX_HOLD_NAME)
