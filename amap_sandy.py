@@ -116,7 +116,7 @@ CODEX_CONNECTOR_BINARIES = ("inbox-mcp-vol", "inbox-submit", "_inboxlib.py")
 CODEX_INSTRUCTIONS = "operator-instructions.md"
 # What payload/codex/ ships from THIS checkout, `(name, executable)`.
 CODEX_PAYLOAD_FILES = (("relay", True), ("mcp.toml", False), ("mcp-reader", True),
-                       ("mcp-submit", True), ("kickoff", True))
+                       ("mcp-submit", True), ("kickoff", True), ("status", True))
 # The agent names sandy reports, and which connector serves a sandbox: the
 # Claude daemon wherever claude is among its agents, the Codex supervisor
 # where codex is and claude is not. payload/relay applies the same rule.

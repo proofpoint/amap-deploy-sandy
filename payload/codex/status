@@ -1,0 +1,14 @@
+#!/bin/sh
+# payload/codex/status — shipped by amap-deploy-sandy and copied VERBATIM onto
+# the feature payload. Prints the Codex supervisor's state: its thread, its
+# event counts, its claims and its operator runs (amap-connector-codex
+# `status`, which reads the journal and changes nothing). Run it inside the
+# Codex sandbox:
+#
+#   sandy --exec -- /opt/sandy/features/amap/codex/status
+set -e
+SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+STATE=/opt/sandy/feature-state/amap/codex
+[ -r "$STATE/controller.toml" ] || { echo "status: no supervisor configuration at $STATE; is this the Codex sandbox, and has its entry started?" >&2; [ -r "$STATE/hold.json" ] && cat "$STATE/hold.json" >&2; exit 1; }
+[ -r "$STATE/hold.json" ] && { echo "HOLDING:" >&2; cat "$STATE/hold.json" >&2; }
+PYTHONPATH="$SELF_DIR/src" exec python3 -m amap_codex.cli --config "$STATE/controller.toml" status
