@@ -4,7 +4,7 @@
     {
       "name": "amap-router-local",
       "url": "https://github.com/proofpoint/amap-router-local",
-      "commit": "e43dbba7ac1a44f06b4fbc5dc8c2ffb2777363c0",
+      "commit": "972cb7096bf4110811cbafc20a6a8019d7408576",
       "override": "AMAP_ROUTER_REPO"
     },
     {
