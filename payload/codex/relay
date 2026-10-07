@@ -59,16 +59,21 @@ if ! python3 -c 'import sys; from amap_codex.config import SUPPORTED_CODEX_VERSI
     hold_until "codex build '$CODEX_VERSION' is not reviewed by this connector" "false"
 fi
 
-# The model: the fleet policy's `codex_model` (the manifest's
-# AMAP_CODEX_MODEL export); else CODEX_MODEL; else the one the agent's own
-# Codex uses, from its ~/.codex/config.toml.
-MODEL=${AMAP_CODEX_MODEL:-${CODEX_MODEL:-$(python3 -c '
-import sys, tomllib
+# The model is the one the agent's own Codex uses: `model` in its
+# config.toml, as a Claude agent's model is its pane's. None there is a hold,
+# re-read until one is set; it takes effect when the supervisor starts.
+AMAP_CODEX_CONFIG="${CODEX_HOME:-$HOME/.codex}/config.toml"
+AMAP_READ_MODEL='import sys, tomllib
 try:
-    print(tomllib.load(open(sys.argv[1], "rb")).get("model") or "")
+    model = tomllib.load(open(sys.argv[1], "rb")).get("model")
 except (OSError, ValueError):
-    print("")' "${CODEX_HOME:-$HOME/.codex}/config.toml")}}
-: "${MODEL:?codex relay: no model; set codex_model in the fleet policy}"
+    model = None
+if not isinstance(model, str) or not model:
+    sys.exit(1)
+print(model)'
+export AMAP_CODEX_CONFIG AMAP_READ_MODEL
+hold_until "no model in $AMAP_CODEX_CONFIG; set one there" 'python3 -c "$AMAP_READ_MODEL" "$AMAP_CODEX_CONFIG"'
+MODEL=$(python3 -c "$AMAP_READ_MODEL" "$AMAP_CODEX_CONFIG")
 
 SANDY_SESSION_FILE=/etc/sandy-session.json
 if [ ! -r "$SANDY_SESSION_FILE" ]; then

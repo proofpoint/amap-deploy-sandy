@@ -85,17 +85,14 @@ class ServingConnectorTest(unittest.TestCase):
 
 class ManifestAndRouterTest(unittest.TestCase):
 
-    def test_the_model_is_exposed_only_when_the_policy_names_one(self):
+    def test_the_manifest_carries_no_model(self):
+        """The model is the agent's own: a `codex_model` left in the policy
+        is kept verbatim and reaches no sandbox."""
         policy = fp.default_policy()
-        self.assertNotIn(prov.EXPOSE_CODEX_MODEL, prov.render_manifest(policy)["expose"])
-        policy[prov.CODEX_MODEL_KEY] = "gpt-test.1"
-        self.assertEqual(prov.render_manifest(policy)["expose"][prov.EXPOSE_CODEX_MODEL],
-                         "gpt-test.1")
-        for bad in ("", "has space", 7, "a" * 101):
-            with self.subTest(model=bad):
-                policy[prov.CODEX_MODEL_KEY] = bad
-                with self.assertRaises(prov.ProvisionError):
-                    prov.render_manifest(policy)
+        policy["codex_model"] = "gpt-test.1"
+        doc = prov.render_manifest(policy)
+        self.assertEqual(doc["feature"]["codex_model"], "gpt-test.1")
+        self.assertNotIn("gpt-test.1", json.dumps(doc["expose"]))
 
     def test_the_router_config_names_both_outcome_directories_and_the_router_loads_it(self):
         with TemporaryDirectory() as d:
@@ -212,10 +209,12 @@ class CodexRelayTest(unittest.TestCase):
                 (lanes[export] / leaf).mkdir(parents=True)
         self.state = root / "feature-state"
         self.state.mkdir()
-        (root / "agent-home").mkdir()
+        self.codex_config = root / "agent-home" / ".codex" / "config.toml"
+        self.codex_config.parent.mkdir(parents=True)
+        self.codex_config.write_text('model = "gpt-test"\nsandbox_mode = "danger-full-access"\n')
         self.env = {"PATH": f"{bindir}:{os.environ['PATH']}", "HOME": str(root / "agent-home"),
                     "SANDY_FEATURE_STATE": str(self.state), "SANDY_AGENT": "codex",
-                    "AMAP_FLEET_DOMAIN": "sandy.host.internal", "AMAP_CODEX_MODEL": "gpt-test",
+                    "AMAP_FLEET_DOMAIN": "sandy.host.internal",
                     "FAKE_LOGGED_IN": str(root / "logged-in"),
                     "FAKE_CODEX_VERSION": SUPPORTED_CODEX_VERSIONS[0],
                     "SHIM_ARGV": str(root / "argv"),
@@ -273,6 +272,25 @@ class CodexRelayTest(unittest.TestCase):
     def test_not_logged_in_holds_with_the_reason(self):
         self.assertIn("not logged in", self._hold_reason(self._start()))
 
+    def test_the_model_is_the_agents_own_and_nothing_else(self):
+        """An AMAP_CODEX_MODEL or CODEX_MODEL in the environment is not a
+        source: the agent's config.toml is the only one."""
+        (self.root / "logged-in").write_text("")
+        proc = subprocess.run(["/bin/sh", str(self.payload / "codex/relay")],
+                              env={**self.env, "AMAP_CODEX_MODEL": "gpt-env",
+                                   "CODEX_MODEL": "gpt-env"},
+                              capture_output=True, text=True, timeout=30)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(Config.load(self.state / "codex/controller.toml").codex_model,
+                         "gpt-test")
+
+    def test_no_model_in_the_agents_config_holds_with_the_file_named(self):
+        (self.root / "logged-in").write_text("")
+        self.codex_config.write_text('sandbox_mode = "danger-full-access"\n')
+        reason = self._hold_reason(self._start())
+        self.assertIn("no model", reason)
+        self.assertIn(str(self.codex_config), reason)
+
     def test_an_unreviewed_build_holds_with_the_build_named(self):
         (self.root / "logged-in").write_text("")
         reason = self._hold_reason(self._start(FAKE_CODEX_VERSION="codex-cli 9.9.9"))
@@ -308,7 +326,8 @@ class VerifyCodexSupervisorTest(unittest.TestCase):
     def _snapshot(self, *, held=True, thread="thread-1", uncertain=False):
         supervisor = Supervisor(self.config)
         supervisor.journal = Journal(self.config.state_dir, self.config.instance_id,
-                                     self.config.fingerprint(), self.config.codex_version)
+                                     self.config.fingerprint(), self.config.codex_version,
+                                     self.config.codex_model)
         try:
             if thread:
                 supervisor.journal.bind_thread(thread)

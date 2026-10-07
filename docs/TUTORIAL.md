@@ -287,12 +287,10 @@ curl -fsSL https://raw.githubusercontent.com/proofpoint/amap-deploy-sandy/main/i
 ```
 
 **Select Codex sandboxes.** In `$SANDY_HOME/features/amap/feature.json`, add
-`"codex"` to `agents.include`, and give the fleet's Codex model in the
-`feature` section (a fresh host's template already has one):
+`"codex"` to `agents.include`:
 
 ```json
 "agents": {"include": ["claude", "codex"], "exclude": []},
-"feature": { "...": "...", "codex_model": "gpt-6.1-sol" }
 ```
 
 Then `python3 amap-sandy.py install --apply`.
@@ -310,6 +308,10 @@ Log Codex in inside the sandbox if it is not already. Until it is, the
 supervisor waits, and `verify` reports it as holding with the reason. It
 also holds if the image's Codex build is not one the connector has
 reviewed; that hold names the build.
+
+The supervisor uses the agent's own model, `model` in the sandbox's
+`~/.codex/config.toml`, the one the Codex pane uses. Change it there; the
+supervisor picks it up on its next start.
 
 **Verify.** `python3 amap-sandy.py verify` checks the Codex sandbox through
 the supervisor's own status: both lanes claimed, a thread bound, nothing

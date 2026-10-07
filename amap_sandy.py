@@ -122,13 +122,6 @@ CODEX_PAYLOAD_FILES = (("relay", True), ("mcp.toml", False), ("mcp-reader", True
 # where codex is and claude is not. payload/relay applies the same rule.
 AGENT_CLAUDE = "claude"
 AGENT_CODEX = "codex"
-# The fleet policy's model for every Codex supervisor, a key of this repo's
-# own (the shared policy module keeps unknown keys verbatim), reaching the
-# sandbox as an `expose` export.
-CODEX_MODEL_KEY = "codex_model"
-EXPOSE_CODEX_MODEL = "AMAP_CODEX_MODEL"
-DEFAULT_CODEX_MODEL = "gpt-6.1-sol"
-CODEX_MODEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
 
 
 def _default_codex_connector_src() -> Path:
@@ -1234,12 +1227,6 @@ def render_manifest(policy: Dict[str, Any], *,
     domain = policy.get(fp.FLEET_DOMAIN_KEY)
     if domain is not None:
         doc["expose"][EXPOSE_FLEET_DOMAIN] = domain
-    model = policy.get(CODEX_MODEL_KEY)
-    if model is not None:
-        if not isinstance(model, str) or not model or not CODEX_MODEL_RE.fullmatch(model):
-            raise ProvisionError(f"policy `{CODEX_MODEL_KEY}` is {model!r}: a model name "
-                                 f"(letters, digits, '.', '_', '-')")
-        doc["expose"][EXPOSE_CODEX_MODEL] = model
     _check_manifest_names(doc)
     return doc
 
@@ -3607,7 +3594,6 @@ def run_sync(args: argparse.Namespace, home: Path, boxes_dir: Path) -> int:
     base = getattr(args, "fleet_domain_base", None)
     if policy.get(fp.SOURCE_KEY) == fp.SOURCE_DEFAULT:
         policy[fp.FLEET_DOMAIN_KEY] = derived_fleet_domain(base)
-        policy[CODEX_MODEL_KEY] = DEFAULT_CODEX_MODEL
         print(f"note: no {policy_path} yet — install --apply writes the TEMPLATE, which works "
               f"as written: every sandbox launched with claude is selected and nothing is "
               f"excluded; every selected sandbox may task every other (task_graph \"ALL\", "

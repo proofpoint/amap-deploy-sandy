@@ -284,9 +284,10 @@ connector's `docs/DESIGN.md` §1.2.
   codex-cli 0.160.1), so the lane exports travel through `env_vars` and
   the wrappers beside it translate them. The connector refuses to dispatch
   unless a thread's effective registry is exactly these three servers.
-- **The model is the fleet policy's** `codex_model`, exposed as
-  `AMAP_CODEX_MODEL`. It is a key of this repo's template, not of the
-  shared `fleet_policy` default.
+- **The model is the agent's own**: `model` in its `~/.codex/config.toml`,
+  as a Claude agent's model is its pane's. The policy and the manifest
+  carry none. No model there is a hold; a change takes effect when the
+  supervisor next starts, and the connector's journal audits it.
 - **verify reads the supervisor's own snapshot**, `status.json` in the
   entry's state directory, which the connector rewrites on every poll.
   Fixtures for it are written by the connector's real `Supervisor`.
