@@ -269,3 +269,60 @@ The router checks report the container as not running, the health checks
 report **UNKNOWN** with the reason, and `verify` exits 1. No check rounds a
 question it could not answer up to a pass. Start the router again with the
 `docker/run.sh` command from step 5.
+
+## 9. Add a Codex agent
+
+A sandbox launched with **codex** as its only agent is served by the Codex
+connector (`amap-connector-codex`). Its supervisor runs inside the sandbox,
+as this feature's entry, and drives one persistent Codex thread from the
+sandbox's AMAP notices. The thread is separate from the Codex pane you type
+in; you give it work with `kickoff` below.
+
+**Get the connector.** It is an optional sibling: run the installer with
+`AMAP_CODEX=1` (your git must be able to reach the repository), or put a
+checkout beside this one and pass nothing.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/proofpoint/amap-deploy-sandy/main/install.sh | AMAP_CODEX=1 bash
+```
+
+**Select Codex sandboxes.** In `$SANDY_HOME/features/amap/feature.json`, add
+`"codex"` to `agents.include`, and give the fleet's Codex model in the
+`feature` section (a fresh host's template already has one):
+
+```json
+"agents": {"include": ["claude", "codex"], "exclude": []},
+"feature": { "...": "...", "codex_model": "gpt-6.1-sol" }
+```
+
+Then `python3 amap-sandy.py install --apply`.
+
+**Make a Codex workspace.** Sandy reads the agent from the workspace's
+config, which holds through restarts:
+
+```sh
+mkdir -p ~/amap-demo/gamma/.sandy
+echo SANDY_AGENT=codex > ~/amap-demo/gamma/.sandy/config
+cd ~/amap-demo/gamma && sandy --start
+```
+
+Log Codex in inside the sandbox if it is not already. Until it is, the
+supervisor waits, and `verify` reports it as holding with the reason. It
+also holds if the image's Codex build is not one the connector has
+reviewed; that hold names the build.
+
+**Verify.** `python3 amap-sandy.py verify` checks the Codex sandbox through
+the supervisor's own status: both lanes claimed, a thread bound, nothing
+UNCERTAIN, no hold.
+
+**Delegate from Codex.** Give the supervisor's thread a task, from the
+workspace, with a run id of your choosing (a repeated one is refused, never
+sent twice):
+
+```sh
+cd ~/amap-demo/gamma && sandy --exec -- /opt/sandy/features/amap/codex/kickoff R1 'Ask <alpha address> to list the files in its workspace, and report the reply.'
+```
+
+The thread submits the delegation and finishes its turn. alpha's reply
+arrives as a later turn on the same thread. **Delegate to Codex** the same
+way as to any agent: ask alpha to task gamma's address.
