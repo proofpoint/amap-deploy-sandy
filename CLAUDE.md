@@ -267,7 +267,10 @@ same one to `$SANDY_AGENT`. The two never run side by side.
 `amap-connector-codex` with `opt_in: AMAP_CODEX`, so a default install never
 clones it. Without its checkout, `install` writes no `payload/codex/` and a
 Codex sandbox has no supervisor, which verify reports as a problem. Its tests
-need the checkout and fail without it, like the router's.
+need the checkout and fail without it, like the router's. The ones that run
+the connector's own code need Python 3.11, its floor, since it runs in the
+sandbox and not on the host; below that they are skipped, and the host-side
+ones still run.
 
 **The supervisor runs inside the sandbox, as this feature's entry**
 (`payload/codex/relay`, checked in like `payload/relay`). It spawns
