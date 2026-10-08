@@ -744,6 +744,7 @@ class DiscoveryReportTest(HealthTestCase):
         ctx, cs = self._health("")
         self.assertIs(self.one(cs, rh.HEALTH_DISCOVERY).result, rh.PASS)
         self.assertEqual([w for w in ctx.warnings if "discovery" in w], [])
+        self.assertEqual(ctx.discovery, [])
 
     def test_every_starred_line_fails_and_every_plain_line_is_a_warning(self):
         ctx, cs = self._health(self.EXCERPT)
@@ -752,17 +753,22 @@ class DiscoveryReportTest(HealthTestCase):
         self.assertEqual(len(c.actual), 2, c.actual)
         self.assertTrue(any("typoo-0badcafe" in line for line in c.actual))
         self.assertTrue(any("ghost-c0ffee01" in line for line in c.actual))
+        tags = {tag: slugs for tag, _why, slugs in ctx.discovery}
+        self.assertEqual(tags, {"NO VERDICT": ["orphan-0badcafe"],
+                                "INERT EDGE": ["later-1a2b3c4d"]}, ctx.discovery)
+        # A slug with a space is not in the router's line shape: it is kept
+        # verbatim, as a warning, rather than dropped.
         warned = [w for w in ctx.warnings if "discovery" in w]
         self.assertEqual(len(warned), 1, ctx.warnings)
-        for plain in ("SKIPPED", "NO VERDICT", "later-1a2b3c4d"):
-            self.assertIn(plain, warned[0])
-        self.assertNotIn("typoo", warned[0], "the probable typo is a failure, not a warning")
+        self.assertIn("SKIPPED  has space-1a2b3c4d", warned[0])
+        self.assertNotIn("typoo-0badcafe", str(ctx.discovery),
+                         "the probable typo is a failure, not a note")
 
     def test_the_two_inert_tiers_differ(self):
         pending = "discovery:\n       INERT EDGE  later-1a2b3c4d: not discovered yet — the host has a verdict for it (pending)\n"
         ctx, cs = self._health(pending)
         self.assertIs(self.one(cs, rh.HEALTH_DISCOVERY).result, rh.PASS)
-        self.assertTrue(any("later-1a2b3c4d" in w for w in ctx.warnings))
+        self.assertEqual([slugs for _t, _w, slugs in ctx.discovery], [["later-1a2b3c4d"]])
 
     def test_verdict_unavailable_fails_by_name(self):
         _, cs = self._health(self.UNAVAILABLE)
@@ -947,7 +953,7 @@ class HostFactsDocumentTest(FleetTestCase):
         self.assertEqual(doc["phases"], [])
         self.assertNotIn("not_enrolled", doc)
 
-        def fine(args, servers, home, boxes_dir, facts=None):
+        def fine(args, servers, home, boxes_dir, facts=None, **_):
             facts.ctx, facts.outcomes = self.ctx(), self._outcomes()
             return 1
         with patch.object(prov, "run_provision", lambda *a, **k: 0), \

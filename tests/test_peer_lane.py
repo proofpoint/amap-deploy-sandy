@@ -1882,7 +1882,8 @@ class VerifyEndToEndTest(SandboxFixture):
     helpers. A first cut of these called the check functions directly, which
     would have stayed green over a `main()` that never called them."""
 
-    def _run(self, selected=(None,), manifest_block=None, extra=None):
+    def _run(self, selected=(None,), manifest_block=None, extra=None, host_args=(),
+             verify_args=()):
         """`selected` is the slugs whose last launch selected the feature —
         both, by default."""
         chosen = list(selected) if selected != (None,) else [self.SLUG, self.OTHER]
@@ -1909,8 +1910,60 @@ class VerifyEndToEndTest(SandboxFixture):
             rc = prov.main(["--sandy", str(fake),
                             "--sandy-home", str(self.home),
                             "--connector-src", str(self.src),
-                            "verify"])
+                            *host_args, "verify", *verify_args])
         return rc, out.getvalue() + err.getvalue()
+
+    def _row(self, out, condition):
+        """The one printed row carrying `condition`, at a width that never
+        wraps; its last column is the workspaces."""
+        rows = [line for line in out.splitlines() if condition in line]
+        self.assertEqual(len(rows), 1, (condition, rows))
+        return rows[0]
+
+    def test_one_condition_about_two_sandboxes_is_one_row_naming_both(self):
+        """Sandy's verdict, carried from the install pass, and the not-running
+        coverage gap: each one row, naming both sandboxes by workspace name,
+        after the summary line."""
+        names = prov.vr.display_names([self.SLUG, self.OTHER])
+        with unittest.mock.patch.dict(os.environ, {"COLUMNS": "400"}):
+            _rc, unselected = self._run(selected=())
+            _rc, stopped = self._run()
+        for out, condition in ((unselected, f"not selected — {prov.FEATURE_NAME}: excluded"),
+                               (stopped, "not running, so its relay was not checked")):
+            row = self._row(out, condition)
+            for slug in (self.SLUG, self.OTHER):
+                self.assertIn(names[slug], row.split("  ")[-1])
+                self.assertNotIn(slug, row)
+            self.assertLess(out.index("\nverify: "), out.index("NOTES"))
+
+    def test_the_routers_discovery_groups_are_rows_and_all_lists_every_one(self):
+        orphans = [f"orphan{i:02d}-0badca{i:02d}" for i in range(10)]
+
+        def sections(ctx):
+            ctx.discovery = [("NO VERDICT", "a directory with no entry in selected.json",
+                              orphans)]
+            return []
+        with unittest.mock.patch.object(prov.rh, "run_sections", sections), \
+                unittest.mock.patch.dict(os.environ, {"COLUMNS": "400"}):
+            _rc, out = self._run()
+            _rc, out_all = self._run(verify_args=("--all",))
+        row = self._row(out, "router reports NO VERDICT: a directory with no entry")
+        self.assertIn("orphan00", row)
+        self.assertNotIn("orphan09", row)
+        self.assertIn("… 2 more (--all to list)", row)
+        row = self._row(out_all, "router reports NO VERDICT: a directory with no entry")
+        self.assertIn("orphan09", row)
+        self.assertNotIn("more", row)
+
+    def test_an_install_already_in_place_is_one_line(self):
+        no_codex = self.root / "no-codex-connector"
+        prov.install_feature_payload(self.home, self.src, dry_run=False, codex_src=no_codex)
+        prov.install_roster_dir(self.home, dry_run=False)
+        prov.install_instances_dir(self.home, dry_run=False)
+        _rc, out = self._run(host_args=("--codex-connector-src", str(no_codex)))
+        line = self._row(out, "in place, nothing to change:")
+        self.assertRegex(line, r"manifest, payload \(\d+ files\), roster, instances$")
+        self.assertNotIn("host: 0 part(s)", out)
 
     def setUp(self):
         super().setUp()
@@ -1963,10 +2016,18 @@ class VerifyEndToEndTest(SandboxFixture):
                      "pinned": {"value": None, "source": None, "status": "not_written"},
                      "user_settings": {"value": None, "status": "file_absent"},
                      "workspace_settings": {"value": None, "status": "file_absent"}}}
-        rc, out = self._run(extra=extra)
+        # Wide enough that no table row wraps, so each verdict is one line.
+        with unittest.mock.patch.dict(os.environ, {"COLUMNS": "400"}):
+            rc, out = self._run(extra=extra)
         self.assertEqual(rc, 1)
-        self.assertIn(f"agent_args unverifiable: {self.SLUG}", out)
-        self.assertIn(f"cross-session inbound not set: {self.SLUG}", out)
+        # Each verdict is a condition row naming the sandbox by workspace name.
+        name = prov.vr.display_names([self.SLUG])[self.SLUG]
+        rows = out.splitlines()
+        for condition in ("agent_args unverifiable: sandy reports its marker as 'unreadable'",
+                          "cross-session inbound not set:"):
+            row = [r for r in rows if condition in r]
+            self.assertEqual(len(row), 1, condition)
+            self.assertIn(name, row[0].split("  ")[-1], row[0])
         self.assertIn(prov.CROSS_SESSION_COVERAGE, out)
 
     def test_payload_drift_exits_1(self):
