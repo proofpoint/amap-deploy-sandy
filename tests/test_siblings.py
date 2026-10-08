@@ -57,7 +57,7 @@ class SiblingsTest(unittest.TestCase):
         patcher = mock.patch.dict(os.environ, {}, clear=False)
         patcher.start()
         self.addCleanup(patcher.stop)
-        for var in ("AMAP_TEST_DEMO_REPO", siblings.REPO_BASE_ENV):
+        for var in ("AMAP_TEST_DEMO_REPO", "AMAP_TEST_DEMO_OPT_IN", siblings.REPO_BASE_ENV):
             os.environ.pop(var, None)
 
     def _put(self):
@@ -97,6 +97,22 @@ class SiblingsTest(unittest.TestCase):
             siblings.plan(self.sib, self.base)
         self.assertIn("not a git checkout", str(cm.exception))
 
+    def test_an_opt_in_sibling_is_skipped_unless_its_variable_is_one(self):
+        self.sib["opt_in"] = "AMAP_TEST_DEMO_OPT_IN"
+        for value in (None, "", "0", "yes"):
+            with self.subTest(value=value):
+                if value is None:
+                    os.environ.pop("AMAP_TEST_DEMO_OPT_IN", None)
+                else:
+                    os.environ["AMAP_TEST_DEMO_OPT_IN"] = value
+                action, detail = siblings.plan(self.sib, self.base)
+                self.assertEqual(action, "skip")
+                self.assertIn("AMAP_TEST_DEMO_OPT_IN=1", detail)
+        self.assertFalse((self.base / "demo").exists())
+        os.environ["AMAP_TEST_DEMO_OPT_IN"] = "1"
+        self.assertEqual(self._put(), "clone")
+        self.assertEqual(self._head(), self.old)
+
     def test_an_override_leaves_the_operators_checkout_alone(self):
         os.environ["AMAP_TEST_DEMO_REPO"] = "/somewhere/else"
         action, detail = siblings.plan(self.sib, self.base)
@@ -131,9 +147,25 @@ class ShippedPinsTest(unittest.TestCase):
 
     def test_the_shipped_pins_load_and_name_both_siblings_with_their_overrides(self):
         pins = {p["name"]: p for p in siblings.load_pins()}
-        self.assertEqual(set(pins), {"amap-router-local", "amap-connector-claude"})
+        self.assertEqual(set(pins), {"amap-router-local", "amap-connector-claude",
+                                     "amap-connector-codex"})
         self.assertEqual(pins["amap-router-local"]["override"], "AMAP_ROUTER_REPO")
         self.assertEqual(pins["amap-connector-claude"]["override"], "AMAP_CONNECTOR_REPO")
+        self.assertEqual(pins["amap-connector-codex"]["override"], "AMAP_CODEX_CONNECTOR_REPO")
+        # Optional: a default install never clones it.
+        self.assertEqual(pins["amap-connector-codex"].get("opt_in"), "AMAP_CODEX")
+        self.assertNotIn("opt_in", pins["amap-router-local"])
+        self.assertNotIn("opt_in", pins["amap-connector-claude"])
+
+    def test_an_unknown_key_or_an_empty_opt_in_is_refused(self):
+        with TemporaryDirectory() as d:
+            base = {"name": "x", "url": "u", "commit": "a" * 40, "override": "V"}
+            for extra in ({"optional": True}, {"opt_in": ""}, {"opt_in": 1}):
+                with self.subTest(extra=extra):
+                    p = Path(d) / "pins.json"
+                    p.write_text(json.dumps({"schema": 1, "siblings": [{**base, **extra}]}))
+                    with self.assertRaises(siblings.SiblingError):
+                        siblings.load_pins(p)
 
     def test_a_short_or_missing_commit_is_refused(self):
         with TemporaryDirectory() as d:

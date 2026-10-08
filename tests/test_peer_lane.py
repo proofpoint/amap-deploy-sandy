@@ -652,7 +652,8 @@ class RouterSiblingRenderTest(unittest.TestCase):
         del raw[fp.FLEET_DOMAIN_KEY]
         doc = self._render(policy=raw)["_doc"]
         self.assertEqual(sorted(doc), sorted([prov.SIBLING_STATE_DIR, prov.SIBLING_INSTANCES_DIR,
-                                              prov.SIBLING_SELECTED_JSON]))
+                                              prov.SIBLING_SELECTED_JSON,
+                                              prov.SIBLING_OUTCOME_IDS]))
 
     def test_an_empty_selected_set_renders_rather_than_refusing(self):
         """Discovery's point: the document can exist before the first launch,

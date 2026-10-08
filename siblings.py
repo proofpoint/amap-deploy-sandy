@@ -14,7 +14,9 @@ that loads a sibling, because it runs before they exist. It refuses, per
 sibling, a path that is not a git checkout and a checkout with uncommitted
 changes to tracked files. A sibling whose override variable is set
 ($AMAP_ROUTER_REPO, $AMAP_CONNECTOR_REPO) is the operator's own checkout
-and is left alone. $AMAP_REPO_BASE replaces the base of every clone URL,
+and is left alone. A sibling with an `opt_in` variable ($AMAP_CODEX for
+the Codex connector) is put at its pin only when that variable is `1`, and
+skipped otherwise. $AMAP_REPO_BASE replaces the base of every clone URL,
 for a mirror.
 
 Exit 0 when every sibling is at its pin or would be put there; 1 when any
@@ -45,7 +47,8 @@ class SiblingError(Exception):
 
 def load_pins(path: Path = PINS_FILE) -> List[Dict[str, str]]:
     """The pinned siblings, validated: a name, a clone URL, a full 40-character
-    commit, and the variable that overrides the checkout's location."""
+    commit, the variable that overrides the checkout's location, and,
+    optionally, the variable that opts in to it."""
     try:
         doc = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as e:
@@ -64,7 +67,12 @@ def load_pins(path: Path = PINS_FILE) -> List[Dict[str, str]]:
             raise SiblingError(f"{where}: name {s['name']!r} is not a directory name")
         if not COMMIT_RE.match(s["commit"]):
             raise SiblingError(f"{where}: commit {s['commit']!r} is not a full 40-character sha")
-        out.append({k: s[k] for k in ("name", "url", "commit", "override")})
+        unknown = sorted(set(s) - {"name", "url", "commit", "override", "opt_in"})
+        if unknown:
+            raise SiblingError(f"{where} has unknown key(s) {unknown}")
+        if "opt_in" in s and (not isinstance(s["opt_in"], str) or not s["opt_in"]):
+            raise SiblingError(f"{where}: opt_in must name a variable")
+        out.append({k: s[k] for k in ("name", "url", "commit", "override", "opt_in") if k in s})
     if not out:
         raise SiblingError(f"{path}: no siblings listed")
     return out
@@ -89,6 +97,9 @@ def _head(dest: Path) -> Optional[str]:
 def plan(sibling: Dict[str, str], base: Path) -> Tuple[str, str]:
     """`(action, detail)`: one of `skip` (override set), `present` (at its
     pin), `clone` or `checkout`. Raises SiblingError for a refusal."""
+    opt_in = sibling.get("opt_in")
+    if opt_in and os.environ.get(opt_in) != "1":
+        return "skip", f"optional; set {opt_in}=1 to put it at its pin"
     var = sibling["override"]
     if os.environ.get(var):
         return "skip", (f"${var} names {os.environ[var]}; that checkout is the operator's "

@@ -34,7 +34,8 @@ import fleet_policy as fp  # noqa: E402
 
 INSTALLER = HERE / "install.sh"
 SOURCES = {"amap-deploy-sandy": HERE, "amap-router-local": _workspace.ROUTER_ROOT,
-           "amap-connector-claude": Path(prov._default_connector_src()).parent}
+           "amap-connector-claude": Path(prov._default_connector_src()).parent,
+           "amap-connector-codex": _workspace.CODEX_CONNECTOR_ROOT}
 
 # sandy 2.6's --print-schema, reduced to what install reads (schema 4, the
 # manifest block with `receives`, and the agent names), and a host with no
@@ -105,7 +106,7 @@ class InstallShTest(unittest.TestCase):
         the commits the sibling checkouts this suite runs against are at."""
         self.remotes.mkdir()
         pins = {}
-        for name in ("amap-router-local", "amap-connector-claude"):
+        for name in ("amap-router-local", "amap-connector-claude", "amap-connector-codex"):
             dest = self.remotes / name
             _git("clone", "--quiet", str(SOURCES[name]), str(dest))
             pins[name] = _git("rev-parse", "HEAD", cwd=dest)
@@ -153,8 +154,25 @@ class InstallShTest(unittest.TestCase):
         self.assertIn(str(self.sandy_home / "router-state"), runs[0])
         self.assertIn("sandy --start", out)
         for name, commit in self.pins.items():
+            if name == prov.CODEX_CONNECTOR_REPO_NAME:
+                continue
             with self.subTest(sibling=name):
                 self.assertEqual(_git("rev-parse", "HEAD", cwd=self.amap_dir / name), commit)
+        # The Codex connector is opt-in: a default install never clones it,
+        # and says a Codex sandbox gets no supervisor.
+        self.assertFalse((self.amap_dir / prov.CODEX_CONNECTOR_REPO_NAME).exists())
+        self.assertFalse((self.sandy_home / "features/amap/payload/codex").exists())
+        self.assertIn("a Codex sandbox gets no supervisor", out)
+
+    def test_amap_codex_checks_out_the_codex_connector_and_installs_its_payload(self):
+        rc, out = self._run({**self.env, "AMAP_CODEX": "1"})
+        self.assertEqual(rc, 0, out)
+        name = prov.CODEX_CONNECTOR_REPO_NAME
+        self.assertEqual(_git("rev-parse", "HEAD", cwd=self.amap_dir / name), self.pins[name])
+        payload = self.sandy_home / "features/amap/payload"
+        self.assertTrue((payload / "codex/relay").is_file())
+        self.assertTrue((payload / "codex/src/amap_codex/supervisor.py").is_file())
+        self.assertNotIn("a Codex sandbox gets no supervisor", out)
 
     def test_the_fleet_domain_is_this_hosts_and_takes_a_base_from_the_environment(self):
         rc, out = self._run()

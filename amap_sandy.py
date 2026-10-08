@@ -57,6 +57,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -101,6 +102,54 @@ def _default_connector_src() -> Path:
 
 
 DEFAULT_CONNECTOR_SRC = _default_connector_src()
+
+# THE CODEX CONNECTOR, a second sibling, OPTIONAL: a host without its
+# checkout installs exactly what it did before, and a Codex sandbox there has
+# no supervisor to run (verify says so). Its supervisor runs in the Codex
+# sandbox as this feature's entry (payload/codex/relay), so the payload
+# carries its source package, its two MCP binaries and their module, and its
+# operator instructions, under `codex/`.
+CODEX_CONNECTOR_REPO_NAME = "amap-connector-codex"
+CODEX_PAYLOAD_SUBDIR = "codex"
+CODEX_PACKAGE = "amap_codex"
+CODEX_CONNECTOR_BINARIES = ("inbox-mcp-vol", "inbox-submit", "_inboxlib.py")
+CODEX_INSTRUCTIONS = "operator-instructions.md"
+# What payload/codex/ ships from THIS checkout, `(name, executable)`.
+CODEX_PAYLOAD_FILES = (("relay", True), ("mcp.toml", False), ("mcp-reader", True),
+                       ("mcp-submit", True), ("kickoff", True), ("status", True))
+# The agent names sandy reports, and which connector serves a sandbox: the
+# Claude daemon wherever claude is among its agents, the Codex supervisor
+# where codex is and claude is not. payload/relay applies the same rule.
+AGENT_CLAUDE = "claude"
+AGENT_CODEX = "codex"
+
+
+def _default_codex_connector_src() -> Path:
+    """The amap-connector-codex checkout's root: `$AMAP_CODEX_CONNECTOR_REPO`,
+    else the nearest `amap-connector-codex` beside an ancestor of this file,
+    else the path looked for first, so a message names the layout expected."""
+    env = fp.amap_env("CODEX_CONNECTOR_REPO")
+    if env:
+        return Path(env).absolute()
+    for parent in HERE.absolute().parents:
+        cand = parent / CODEX_CONNECTOR_REPO_NAME
+        if (cand / "src" / CODEX_PACKAGE).is_dir():
+            return cand
+    return HERE.absolute().parent / CODEX_CONNECTOR_REPO_NAME
+
+
+DEFAULT_CODEX_CONNECTOR_SRC = _default_codex_connector_src()
+
+
+def serving_connector(agents: Any) -> Optional[str]:
+    """Which connector serves a sandbox launched with `agents` (sandy's list):
+    `codex` where codex is among them and claude is not, else `claude`. None
+    when sandy reported no list, which nothing here guesses at."""
+    if not isinstance(agents, list):
+        return None
+    return AGENT_CODEX if AGENT_CODEX in agents and AGENT_CLAUDE not in agents else AGENT_CLAUDE
+
+
 # The two MCP binaries on the payload. They run IN-ANCESTRY, as MCP servers of
 # the agent's own session — an agent that could rewrite one would gain nothing
 # it does not already have, because it already chose what to say to them.
@@ -989,8 +1038,34 @@ def payload_sources(connector_src: Path,
     ) + tuple((f"{FEATURE_BIN_SUBDIR}/{name}", src / name, True) for name in CONNECTOR_BINARIES)
 
 
+def codex_payload_sources(codex_src: Path) -> Tuple[Tuple[str, Path, bool], ...]:
+    """`(relative path in the payload, source file, executable)` for the Codex
+    connector's part of the payload, all under `codex/`: the files
+    payload/codex/ ships from this checkout, a copy of payload/submit-server
+    (it execs the `bin/inbox-submit` beside it, here the Codex connector's),
+    the connector's source package, its MCP binaries and their module, and
+    its operator instructions. Empty when `codex_src` holds no package: the
+    Codex part is optional."""
+    src = Path(codex_src)
+    package = src / "src" / CODEX_PACKAGE
+    if not package.is_dir():
+        return ()
+    sub = CODEX_PAYLOAD_SUBDIR
+    parts = [(f"{sub}/{name}", PAYLOAD_DIR / sub / name, executable)
+             for name, executable in CODEX_PAYLOAD_FILES]
+    parts.append((f"{sub}/{SUBMIT_SERVER_NAME}", PAYLOAD_DIR / SUBMIT_SERVER_NAME, True))
+    parts += [(f"{sub}/src/{CODEX_PACKAGE}/{p.name}", p, False)
+              for p in sorted(package.glob("*.py"))]
+    parts += [(f"{sub}/{FEATURE_BIN_SUBDIR}/{name}", src / FEATURE_BIN_SUBDIR / name,
+               not name.endswith(".py"))
+              for name in CODEX_CONNECTOR_BINARIES]
+    parts.append((f"{sub}/{CODEX_INSTRUCTIONS}", src / "config" / CODEX_INSTRUCTIONS, False))
+    return tuple(parts)
+
+
 def install_feature_payload(home: Path, connector_src: Path, *, dry_run: bool,
-                            servers_path: Path = DEFAULT_SERVERS) -> str:
+                            servers_path: Path = DEFAULT_SERVERS,
+                            codex_src: Optional[Path] = None) -> str:
     """Install the payload ONCE, at `$SANDY_HOME/features/amap/payload/`: the
     copied chain and binaries. Nothing rendered lives here — the fleet domain
     reaches the wrapper as the manifest's `expose` export.
@@ -1001,7 +1076,8 @@ def install_feature_payload(home: Path, connector_src: Path, *, dry_run: bool,
     `os.replace` onto a symlink would follow it."""
     dest = feature_payload_dir(home)
     parts = []
-    for rel, src_file, executable in payload_sources(connector_src, servers_path):
+    codex = codex_payload_sources(codex_src) if codex_src is not None else ()
+    for rel, src_file, executable in payload_sources(connector_src, servers_path) + codex:
         try:
             data = src_file.read_text(encoding="utf-8")
         except OSError as e:
@@ -1506,7 +1582,8 @@ def verify_manifest_domain(home: Path) -> List[str]:
 
 
 def verify_feature_payload(home: Path, connector_src: Optional[Path],
-                           servers_path: Path = DEFAULT_SERVERS) -> List[str]:
+                           servers_path: Path = DEFAULT_SERVERS,
+                           codex_src: Optional[Path] = None) -> List[str]:
     """What the payload IS, against what it should be — byte for byte, real
     files, executable where the chain execs them. The host side of the mount
     is an ordinary directory under the operator's uid; a hand-edited copy is
@@ -1517,6 +1594,7 @@ def verify_feature_payload(home: Path, connector_src: Optional[Path],
         return [f"payload absent: {dest} does not exist — run install --apply; "
                 f"sandy mounts nothing for a selected sandbox until it does"]
     sources = payload_sources(connector_src, servers_path) if connector_src is not None else ()
+    sources += codex_payload_sources(codex_src) if codex_src is not None else ()
     for rel, src_file, executable in sources:
         path = dest / rel
         if path.is_symlink():
@@ -1656,7 +1734,11 @@ def run_provision(
         print(f"  manifest {feature_manifest_path(home)}: {report}")
     try:
         report = install_feature_payload(home, args.connector_src, dry_run=dry,
-                                         servers_path=args.servers)
+                                         servers_path=args.servers,
+                                         codex_src=args.codex_connector_src)
+        if not codex_payload_sources(args.codex_connector_src):
+            print(f"  note  no Codex connector at {args.codex_connector_src}: the payload "
+                  f"has no {CODEX_PAYLOAD_SUBDIR}/, so a Codex sandbox gets no supervisor")
     except ProvisionError as e:
         print(f"  FAIL  payload {feature_payload_dir(home)}: {e}", file=sys.stderr)
         failed += 1
@@ -2531,6 +2613,93 @@ def _heartbeat_age_seconds(value: Any, now: Optional[float] = None) -> Optional[
     return (reference - when).total_seconds()
 
 
+# The Codex supervisor's own files, under this feature's entry state
+# directory (payload/codex/relay writes the hold record; the connector writes
+# the status snapshot on every poll and once more as it stops).
+CODEX_STATE_SUBDIR = "codex"
+CODEX_STATUS_NAME = "status.json"
+CODEX_HOLD_NAME = "hold.json"
+CODEX_CLAIMS_HELD = "held"
+
+
+def codex_state_dir(record: Optional[dict]) -> Optional[Path]:
+    """This sandbox's Codex supervisor state, a HOST path: the feature entry's
+    `state_dir` as sandy reports it, joined with `codex/`. None when sandy
+    names no state directory for this feature's entry."""
+    log = supervisor_log_path(record)
+    return log.parent / CODEX_STATE_SUBDIR if log is not None else None
+
+
+def verify_codex_supervisor(home: Path, slug: str, record: Optional[dict], *,
+                            running: bool, now: Optional[float] = None) -> Tuple[List[str], List[str]]:
+    """`(problems, notes)` for a sandbox the Codex supervisor serves
+    (`serving_connector`), read host-side from the files the supervisor and
+    its relay keep in the entry's state directory.
+
+    Always, running or not: a payload without `codex/` (nothing to run), and
+    work the journal holds as UNCERTAIN, which never replays by itself and
+    waits for the operator. Only while running: a recorded HOLD (Codex not
+    logged in, or a Codex install that reports no build); and liveness, the
+    snapshot no older than HEARTBEAT_MAX_AGE_SECONDS with both claims held.
+    A missing or unreadable snapshot on a running sandbox is UNKNOWN, a
+    problem, never a pass."""
+    problems: List[str] = []
+    notes: List[str] = []
+    if not (feature_payload_dir(home) / CODEX_PAYLOAD_SUBDIR / "relay").is_file():
+        problems.append(f"codex supervisor absent: {slug} is a Codex sandbox and the payload has "
+                        f"no {CODEX_PAYLOAD_SUBDIR}/ — run install --apply with the "
+                        f"{CODEX_CONNECTOR_REPO_NAME} checkout (--codex-connector-src)")
+        return problems, notes
+    state = codex_state_dir(record)
+    if state is None:
+        problems.append(f"codex supervisor UNKNOWN: {slug}: sandy reports no {FEATURE_NAME} entry "
+                        f"state directory for its last launch — relaunch it")
+        return problems, notes
+    status = _read_json(state / CODEX_STATUS_NAME)
+    if isinstance(status, dict):
+        uncertain = status.get("uncertain_count")
+        if isinstance(uncertain, int) and uncertain > 0:
+            problems.append(f"codex delivery paused: {slug}: {uncertain} event(s) UNCERTAIN — a "
+                            f"dispatch may or may not have reached Codex, and nothing replays "
+                            f"it. Inspect the thread, then record the decision in the sandbox: "
+                            f"python3 -m amap_codex.cli --config <state>/controller.toml recover "
+                            f"EVENT_ID --action handled|hold|retry --note ... (do not delete "
+                            f"the journal to clear it)")
+        if status.get("last_error"):
+            notes.append(f"{slug}: codex supervisor's last recorded error: {status['last_error']}")
+        if status.get("codex_reviewed") is False:
+            notes.append(f"{slug}: Codex build {status.get('codex_version')!r} is not one the "
+                         f"connector has reviewed; delivery runs on its live checks (the exact "
+                         f"MCP registry per thread, protocol errors that fail loudly)")
+    if not running:
+        return problems, notes
+    hold = _read_json(state / CODEX_HOLD_NAME)
+    if isinstance(hold, dict):
+        problems.append(f"codex supervisor holding: {slug}: {hold.get('reason')!r} — nothing is "
+                        f"delivered until it clears")
+        return problems, notes
+    if not isinstance(status, dict):
+        problems.append(f"codex supervisor UNKNOWN: {slug}: no readable "
+                        f"{state / CODEX_STATUS_NAME} ({status}) — it has not started, or its "
+                        f"startup fails; read {state.parent / SUPERVISOR_LOG_NAME}")
+        return problems, notes
+    updated = status.get("updated_at")
+    age = ((now if now is not None else time.time()) - updated
+           if isinstance(updated, (int, float)) else None)
+    if age is None:
+        problems.append(f"codex supervisor UNKNOWN: {slug}: its status carries no updated_at")
+    elif age > HEARTBEAT_MAX_AGE_SECONDS:
+        problems.append(f"codex supervisor stale: {slug}: its status is {int(age)}s old (max "
+                        f"{HEARTBEAT_MAX_AGE_SECONDS}s) — it has stopped; read "
+                        f"{state.parent / SUPERVISOR_LOG_NAME}")
+    elif status.get("claim_state") != CODEX_CLAIMS_HELD:
+        problems.append(f"codex supervisor not consuming: {slug}: claim_state is "
+                        f"{status.get('claim_state')!r}, not {CODEX_CLAIMS_HELD!r}")
+    elif not status.get("thread_id"):
+        problems.append(f"codex supervisor UNKNOWN: {slug}: no thread is bound yet")
+    return problems, notes
+
+
 def running_containers(sandy_bin: str = "sandy",
                        docker_bin: str = "docker") -> Dict[str, str]:
     """`{slug: container}` for every running sandy container.
@@ -2794,9 +2963,16 @@ SIBLING_TASK_GRAPH = "task_graph"
 SIBLING_PEER_SENDERS = "peer_senders"
 SIBLING_MAIL_GRAPH = "mail_graph"
 SIBLING_PEERS = "peers"
+SIBLING_OUTCOME_IDS = "connector_outcome_ids"
 SIBLING_KEYS = (SIBLING_STATE_DIR, SIBLING_INSTANCES_DIR, SIBLING_SELECTED_JSON,
                 SIBLING_FLEET_DOMAIN, SIBLING_TASK_GRAPH, SIBLING_PEER_SENDERS,
-                SIBLING_MAIL_GRAPH, SIBLING_PEERS)
+                SIBLING_MAIL_GRAPH, SIBLING_PEERS, SIBLING_OUTCOME_IDS)
+# The connector ids whose `outbox/ext/<id>/outcomes/` the router reads, in
+# scan order. Each is the id its connector chose, once (AMAP §4.1): the
+# Claude daemon writes under `claude-code`, the Codex supervisor under
+# `codex`. Rendered for every fleet, whichever connectors it runs: a
+# directory nobody writes costs the router one failed open per poll.
+CONNECTOR_OUTCOME_IDS = ("claude-code", "codex")
 # The router's WHOLE top-level vocabulary — its `config._TOP_KEYS` — so that `SIBLING_KEYS` is pinned as a SUBSET of it and this renderer can
 # never emit a key the loader refuses. `instances` is the AUTHORED
 # alternative to discovery and is never rendered; `intake_dir` is optional
@@ -2809,7 +2985,7 @@ SIBLING_KEYS = (SIBLING_STATE_DIR, SIBLING_INSTANCES_DIR, SIBLING_SELECTED_JSON,
 ROUTER_TOP_KEYS = (
     SIBLING_STATE_DIR, SIBLING_INSTANCES_DIR, SIBLING_SELECTED_JSON, "instances",
     SIBLING_FLEET_DOMAIN, SIBLING_TASK_GRAPH, SIBLING_PEER_SENDERS,
-    SIBLING_MAIL_GRAPH, SIBLING_PEERS, "intake_dir",
+    SIBLING_MAIL_GRAPH, SIBLING_PEERS, SIBLING_OUTCOME_IDS, "intake_dir",
     "attachment_max_bytes", "attachment_max_count", "attachment_max_total_bytes",
     "sender_exposure_window_seconds", "peer_reply_window_seconds",
 )
@@ -2907,6 +3083,7 @@ def render_router_sibling(policy: Dict[str, Any], members: Dict[str, dict],
         SIBLING_STATE_DIR: str(state),
         SIBLING_INSTANCES_DIR: str(instances),
         SIBLING_SELECTED_JSON: str(_sibling_path(feature_selected_path(home))),
+        SIBLING_OUTCOME_IDS: list(CONNECTOR_OUTCOME_IDS),
     }
     domain = policy.get(fp.FLEET_DOMAIN_KEY)
     if domain is not None:
@@ -3196,7 +3373,8 @@ def run_verify(args: argparse.Namespace, servers: Dict[str, dict], home: Path,
     if not ok:
         problems.append(f"sandy without feature manifests: {why}")
     problems += verify_manifest(home, policy, receives=sandy_accepts_receives(args.sandy))
-    problems += verify_feature_payload(home, args.connector_src, servers_path=args.servers)
+    problems += verify_feature_payload(home, args.connector_src, servers_path=args.servers,
+                                       codex_src=args.codex_connector_src)
     problems += verify_roster_source(home)
     problems += verify_router_mount_sources(home, sibling_state_dir(home, args.state_dir))
     problems += verify_roster(home)
@@ -3220,6 +3398,7 @@ def run_verify(args: argparse.Namespace, servers: Dict[str, dict], home: Path,
                              f"its last launch predates sandy 2.2.0, which names the "
                              f"supervisor's state directory")
         problems += verify_relay_supervisor(sandbox_dir, slug, record=records.get(slug))
+        connector = serving_connector((records.get(slug) or {}).get("agents"))
         # SANDY_RELAY=0 at the last launch, off sandy's own record — for a
         # STOPPED sandbox too, which the marker read below cannot reach.
         problems += verify_relay_disabled_record(slug, records.get(slug))
@@ -3227,17 +3406,26 @@ def run_verify(args: argparse.Namespace, servers: Dict[str, dict], home: Path,
         # manifest declares now. Host-side, from sandy's own record, for a
         # stopped sandbox too — and every disagreement is LAG (relaunch),
         # never drift: the manifest is verified against its rendering above.
-        _args_problems, _args_notes = verify_agent_args(sandbox_dir, slug,
-                                                        record=records.get(slug))
-        problems += _args_problems
-        notes += _args_notes
-        # Unconditional, and deliberately NOT gated on the sandbox running:
-        # the value is resolved at launch and sits on disk afterwards, so a
-        # stopped sandbox's answer is both readable and the one it will use.
-        _refuse_problems, _refuse_notes = verify_cross_session_inbound(
-            sandbox_dir, slug, workspace, record=records.get(slug))
-        problems += _refuse_problems
-        notes += _refuse_notes
+        # The launch arguments and the cross-session posture are Claude
+        # Code's; a sandbox the Codex supervisor serves has neither, and its
+        # own state stands in for both (verify_codex_supervisor).
+        if connector == AGENT_CODEX:
+            _codex_problems, _codex_notes = verify_codex_supervisor(
+                home, slug, records.get(slug), running=slug in running)
+            problems += _codex_problems
+            notes += _codex_notes
+        else:
+            _args_problems, _args_notes = verify_agent_args(sandbox_dir, slug,
+                                                            record=records.get(slug))
+            problems += _args_problems
+            notes += _args_notes
+            # Unconditional, and deliberately NOT gated on the sandbox running:
+            # the value is resolved at launch and sits on disk afterwards, so a
+            # stopped sandbox's answer is both readable and the one it will use.
+            _refuse_problems, _refuse_notes = verify_cross_session_inbound(
+                sandbox_dir, slug, workspace, record=records.get(slug))
+            problems += _refuse_problems
+            notes += _refuse_notes
         # Liveness, the authority, and the invariant — all three only for
         # what sandy reports as running. A stopped sandbox has no relay by
         # definition, no session file to read it out of and no mount to probe,
@@ -3251,7 +3439,8 @@ def run_verify(args: argparse.Namespace, servers: Dict[str, dict], home: Path,
             problems += verify_roster_mount(home, slug, running[slug])
             problems += verify_feature_env(slug, running[slug],
                                            fleet_domain=policy.get(fp.FLEET_DOMAIN_KEY))
-            problems += verify_relay_alive(sandbox_dir, slug, container=running[slug])
+            if connector != AGENT_CODEX:
+                problems += verify_relay_alive(sandbox_dir, slug, container=running[slug])
 
     # The router's config, once for the fleet: the sibling on disk is the
     # rendering, byte for byte.
@@ -3604,6 +3793,9 @@ def build_parser() -> argparse.ArgumentParser:
                          f"(default: payload/{DEFAULT_SERVERS.name})")
     ap.add_argument("--connector-src", type=Path, default=DEFAULT_CONNECTOR_SRC,
                     help="directory holding the connector binaries")
+    ap.add_argument("--codex-connector-src", type=Path, default=DEFAULT_CODEX_CONNECTOR_SRC,
+                    help=f"the {CODEX_CONNECTOR_REPO_NAME} checkout (optional: without it, "
+                         f"a Codex sandbox gets no supervisor)")
     ap.add_argument("--sandy-home", type=Path, default=None,
                     help="override $SANDY_HOME (default: ~/.sandy)")
     ap.add_argument("--sandy", default="sandy", help="sandy executable (for --print-state)")

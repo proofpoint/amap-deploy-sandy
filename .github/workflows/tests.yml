@@ -13,10 +13,11 @@ on:
 
 jobs:
   # The required checks, `suite (3.9)` and `suite (3.13)`. The router and the
-  # connector are put BESIDE this repo at the commits pinned in siblings.json,
+  # connectors are put BESIDE this repo at the commits pinned in siblings.json,
   # by the same step the installer and the runbook use, so CI tests exactly
-  # what a host runs. Without them the suite fails rather than passing as a
-  # smaller green.
+  # what a host runs. The Codex connector is an opt-in sibling, so the step
+  # opts in. Without them the suite fails rather than passing as a smaller
+  # green.
   suite:
     runs-on: ubuntu-latest
     strategy:
@@ -34,6 +35,8 @@ jobs:
           python-version: ${{ matrix.python }}
 
       - name: the siblings, at their pins
+        env:
+          AMAP_CODEX: "1"
         run: python amap-deploy-sandy/amap-siblings.py --apply
 
       - name: install pytest
@@ -66,6 +69,11 @@ jobs:
         with:
           repository: proofpoint/amap-connector-claude
           path: amap-connector-claude
+
+      - uses: actions/checkout@v4
+        with:
+          repository: proofpoint/amap-connector-codex
+          path: amap-connector-codex
 
       - uses: actions/setup-python@v5
         with:

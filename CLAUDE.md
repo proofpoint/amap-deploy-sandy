@@ -256,6 +256,51 @@ the agent's only way to send and `AMAP_SELF` only labels a roster entry: a
 gap leaves it unset and starts the server anyway.
 `tests/test_submit_server.py` executes the shipped file.
 
+### Codex sandboxes: a second connector, in the sandbox
+
+**One connector serves each sandbox.** The Claude daemon serves any sandbox
+with claude among its agents; the Codex supervisor serves one with codex and
+no claude. `serving_connector` is the rule, and `payload/relay` applies the
+same one to `$SANDY_AGENT`. The two never run side by side.
+
+**The Codex connector is an optional, opt-in sibling.** `siblings.json` pins
+`amap-connector-codex` with `opt_in: AMAP_CODEX`, so a default install never
+clones it. Without its checkout, `install` writes no `payload/codex/` and a
+Codex sandbox has no supervisor, which verify reports as a problem. Its tests
+need the checkout and fail without it, like the router's. The ones that run
+the connector's own code need Python 3.11, its floor, since it runs in the
+sandbox and not on the host; below that they are skipped, and the host-side
+ones still run.
+
+**The supervisor runs inside the sandbox, as this feature's entry**
+(`payload/codex/relay`, checked in like `payload/relay`). It spawns
+`codex app-server` as its own child, and Codex uses the sandbox's own
+`~/.codex`: nothing here touches Codex credentials, runs as root, or adds a
+host service. Host-side supervision is a deferred design, recorded in the
+connector's `docs/DESIGN.md` §1.2.
+
+- **A hold is not an exit.** Not logged in, or a Codex install that reports
+  no build: the relay writes `hold.json` with the reason and waits. An exit
+  inside sandy's startup window fails the agent's whole launch.
+- **Any Codex build runs.** Sandy installs Codex at npm's latest and cannot
+  hold a version, so the connector's reviewed builds are information: an
+  unreviewed one is a verify note, never a hold. Delivery relies on the
+  connector's live checks.
+- **`payload/codex/mcp.toml` is one constant.** Codex gives an MCP server
+  only `HOME` and `PATH` plus what `env_vars` names (measured on
+  codex-cli 0.160.1 and 0.161.0), so the lane exports travel through `env_vars` and
+  the wrappers beside it translate them. The connector refuses to dispatch
+  unless a thread's effective registry is exactly these three servers.
+- **The model is the agent's own**: `model` in its `~/.codex/config.toml`,
+  as a Claude agent's model is its pane's. The policy and the manifest
+  carry none. No model there leaves the choice to Codex's default, as for
+  the pane. A change takes effect when the supervisor next starts, and the
+  connector's journal audits it. A `CODEX_MODEL` in sandy's config reaches
+  only the pane (as `codex -m`), not the supervisor.
+- **verify reads the supervisor's own snapshot**, `status.json` in the
+  entry's state directory, which the connector rewrites on every poll.
+  Fixtures for it are written by the connector's real `Supervisor`.
+
 ### Authorisation is the router's
 
 The daemon holds **no allowlist**, and nothing on the agent's side names whom

@@ -1,0 +1,21 @@
+#!/bin/sh
+# payload/codex/kickoff — shipped by amap-deploy-sandy and copied VERBATIM
+# onto the feature payload. The operator's way to give the Codex supervisor's
+# thread work, such as "delegate X to <address>". Run it inside the sandbox
+# (a shell in the Codex sandbox, as the agent user):
+#
+#   /opt/sandy/features/amap/codex/kickoff RUN_ID 'instructions'
+#
+# RUN_ID is yours to choose, unique per request: a repeated one is refused,
+# never sent twice. The request queues on the supervisor's own thread and
+# runs after any work already in progress (amap-connector-codex, `kickoff`).
+set -e
+SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+STATE=/opt/sandy/feature-state/amap/codex
+[ "$#" -eq 2 ] || { echo "usage: kickoff RUN_ID 'instructions'" >&2; exit 2; }
+[ -r "$STATE/controller.toml" ] || { echo "kickoff: no supervisor configuration at $STATE; is this the Codex sandbox, and has its entry started?" >&2; exit 1; }
+umask 077
+file=$(mktemp)
+trap 'rm -f "$file"' EXIT
+printf '%s\n' "$2" > "$file"
+PYTHONPATH="$SELF_DIR/src" python3 -m amap_codex.cli --config "$STATE/controller.toml" kickoff "$1" --instructions-file "$file"

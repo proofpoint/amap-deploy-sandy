@@ -4,7 +4,7 @@
     {
       "name": "amap-router-local",
       "url": "https://github.com/proofpoint/amap-router-local",
-      "commit": "e43dbba7ac1a44f06b4fbc5dc8c2ffb2777363c0",
+      "commit": "972cb7096bf4110811cbafc20a6a8019d7408576",
       "override": "AMAP_ROUTER_REPO"
     },
     {
@@ -12,6 +12,13 @@
       "url": "https://github.com/proofpoint/amap-connector-claude",
       "commit": "ca9b40647c5c002e6e6fe30b4fea54e64a76af57",
       "override": "AMAP_CONNECTOR_REPO"
+    },
+    {
+      "name": "amap-connector-codex",
+      "url": "https://github.com/proofpoint/amap-connector-codex",
+      "commit": "87347ad49837563678f50c4119248ecd2dda048d",
+      "override": "AMAP_CODEX_CONNECTOR_REPO",
+      "opt_in": "AMAP_CODEX"
     }
   ]
 }

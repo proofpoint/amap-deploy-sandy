@@ -28,6 +28,23 @@ set -e
 # module are its neighbours, and are found no other way.
 SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 
+# Which connector serves this sandbox. SANDY_AGENT is sandy's: the agent, or
+# a comma list for a combination, in pane order. The Claude daemon serves any
+# sandbox with claude in it; the Codex supervisor one with codex and no
+# claude (amap_sandy.serving_connector is the same rule, for verify). One
+# consumer per sandbox: the two never run side by side.
+case ",${SANDY_AGENT:-}," in
+    *,claude,*) ;;
+    *,codex,*)
+        if [ ! -x "$SELF_DIR/codex/relay" ]; then
+            # Waits rather than exits: an exit inside sandy's startup window
+            # would fail the agent's whole launch.
+            echo "relay: this is a Codex sandbox and the payload has no codex/ (install ran without the amap-connector-codex checkout); nothing is delivered here" >&2
+            while :; do sleep 3600; done
+        fi
+        exec "$SELF_DIR/codex/relay" "$@" ;;
+esac
+
 # Where sandy mounted the three lanes, in its own words: the manifest's
 # per-mount `export` (feature.json `mounts[].export`, `AMAP_*_DIR`), which
 # sandy passes into the container environment verbatim. REQUIRED: ${VAR:?}
