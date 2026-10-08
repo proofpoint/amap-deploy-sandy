@@ -49,9 +49,17 @@ if not (CODEX_ROOT / "src" / prov.CODEX_PACKAGE).is_dir():
     raise RuntimeError(f"amap-connector-codex checkout not found at {CODEX_ROOT}: set "
                        f"$AMAP_CODEX_CONNECTOR_REPO or check it out beside this repository")
 sys.path.insert(0, str(CODEX_ROOT / "src"))
-from amap_codex.config import Config, Lane, REVIEWED_CODEX_VERSIONS  # noqa: E402
-from amap_codex.journal import Journal  # noqa: E402
-from amap_codex.supervisor import Supervisor  # noqa: E402
+# The connector's own code needs Python 3.11 (tomllib), its floor: it runs in
+# the Codex sandbox, not on the host. Tests that run it are skipped below
+# that; the host-side ones run on every version this repo supports.
+CONNECTOR_PYTHON = (3, 11)
+RUNS_CONNECTOR = sys.version_info >= CONNECTOR_PYTHON
+needs_connector = unittest.skipUnless(
+    RUNS_CONNECTOR, "runs the connector's own code, which needs Python 3.11")
+if RUNS_CONNECTOR:
+    from amap_codex.config import Config, Lane, REVIEWED_CODEX_VERSIONS  # noqa: E402
+    from amap_codex.journal import Journal  # noqa: E402
+    from amap_codex.supervisor import Supervisor  # noqa: E402
 
 SESSION_LINE = "SANDY_SESSION_FILE=/etc/sandy-session.json"
 
@@ -185,6 +193,7 @@ class RelayDispatchTest(unittest.TestCase):
         self.assertEqual(self._run("codex", with_codex=False), (None, "waited"))
 
 
+@needs_connector
 class CodexRelayTest(unittest.TestCase):
     """The SHIPPED payload/codex/relay, from an installed payload."""
 
@@ -340,6 +349,7 @@ class CodexRelayTest(unittest.TestCase):
         self.assertIn("reports no build", self._hold_reason(self._start(FAKE_CODEX_VERSION="")))
 
 
+@needs_connector
 class VerifyCodexSupervisorTest(unittest.TestCase):
     """verify against the snapshot the connector's own Supervisor writes."""
 
