@@ -71,6 +71,7 @@ DEFAULT_SERVERS = PAYLOAD_DIR / "mcp-servers.json"
 
 import launchd_job as lj   # the recreation cadence: renders and reads, never loads
 import router_health as rh  # the router process: its container and its health, read only
+import verify_report as vr  # how verify prints: one row per condition, its workspaces beside it
 
 # `fleet_policy.py` sits beside this module. Guarded rather than bare: this
 # module is imported by its tests and by its sibling tools, where HERE is not
@@ -1691,10 +1692,26 @@ def selection_notes(states: Dict[str, Tuple[str, str]]) -> List[str]:
     return lines
 
 
+def selection_rows(states: Dict[str, Tuple[str, str]]) -> List[vr.Row]:
+    """Sandy's word on the sandboxes in `states`, as rows: one per verdict
+    and reason, naming every sandbox it covers, and one for every sandbox
+    not launched since the manifest was written."""
+    rows: Dict[Tuple[str, str], vr.Row] = {}
+    for slug, (state, detail) in sorted(states.items()):
+        key = (state, "" if state == STATE_UNKNOWN else detail)
+        if key not in rows:
+            rows[key] = vr.Row(
+                f"{STATE_UNKNOWN} — not launched since the manifest was written; sandy "
+                f"decides at launch" if state == STATE_UNKNOWN else f"{state} — {detail}")
+        rows[key].slugs.append(slug)
+    return [r for (state, _), r in rows.items() if state != STATE_UNKNOWN] + \
+           [r for (state, _), r in rows.items() if state == STATE_UNKNOWN]
+
+
 def run_provision(
     args: argparse.Namespace, servers: Dict[str, dict], home: Path, boxes_dir: Path, dry: bool,
     policy: Optional[Dict[str, Any]] = None, states_reported: bool = False,
-    verifying: bool = False,
+    verifying: bool = False, notes_out: Optional[List[vr.Row]] = None,
 ) -> int:
     """The manifest and the payload once per host, then every selected
     sandbox. Exit 1 on any part that failed; the count of parts that needed
@@ -1721,6 +1738,17 @@ def run_provision(
 
     stale = 0
     failed = 0
+    # Under `verify`, a part already in place is one word on a summary line,
+    # and only a part that needs something is printed whole.
+    settled_parts: List[str] = []
+
+    def part(label: str, where: Path, report: str) -> None:
+        summary = vr.part_summary(label, report, _part_is_settled(report)) if verifying else None
+        if summary is not None:
+            settled_parts.append(summary)
+        else:
+            print(f"  {label} {where}: {report}")
+
     # THE MANIFEST AND THE PAYLOAD, ONCE, FIRST.
     try:
         report = install_manifest(home, policy, dry_run=dry,
@@ -1731,7 +1759,7 @@ def run_provision(
     else:
         if not _part_is_settled(report):
             stale += 1
-        print(f"  manifest {feature_manifest_path(home)}: {report}")
+        part("manifest", feature_manifest_path(home), report)
     try:
         report = install_feature_payload(home, args.connector_src, dry_run=dry,
                                          servers_path=args.servers,
@@ -1745,7 +1773,7 @@ def run_provision(
     else:
         if not _part_is_settled(report):
             stale += 1
-        print(f"  payload {feature_payload_dir(home)}: {report}")
+        part("payload", feature_payload_dir(home), report)
     try:
         report = install_roster_dir(home, dry_run=dry)
     except ProvisionError as e:
@@ -1754,7 +1782,7 @@ def run_provision(
     else:
         if not _part_is_settled(report):
             stale += 1
-        print(f"  roster {feature_roster_dir(home)}: {report}")
+        part("roster", feature_roster_dir(home), report)
     try:
         report = install_instances_dir(home, dry_run=dry)
     except ProvisionError as e:
@@ -1763,7 +1791,9 @@ def run_provision(
     else:
         if not _part_is_settled(report):
             stale += 1
-        print(f"  instances {feature_instances_dir(home)}: {report}")
+        part("instances", feature_instances_dir(home), report)
+    if settled_parts:
+        print(f"  in place, nothing to change: {', '.join(settled_parts)}")
 
     boxes = discover_sandboxes(args.sandy)
     by_name = {b["name"]: b for b in boxes}
@@ -1787,8 +1817,12 @@ def run_provision(
     # report, in which case repeating it is noise at fleet size.
     if not states_reported:
         states = selection_states(home, boxes)
-        for line in selection_notes({s: st for s, st in states.items() if s not in members}):
-            print(f"  note: {line}", file=sys.stderr)
+        outside = {s: st for s, st in states.items() if s not in members}
+        if notes_out is not None:
+            notes_out.extend(selection_rows(outside))
+        else:
+            for line in selection_notes(outside):
+                print(f"  note: {line}", file=sys.stderr)
 
     # NOTHING PER SANDBOX IS WRITTEN. What remains per selected slug is the
     # one thing that must be said before the router's config is rendered
@@ -1805,6 +1839,8 @@ def run_provision(
         print(f"no sandbox selected yet (selection is {membership_source(home)}; sandy "
               f"decides at each launch, and applies the manifest's {AGENT_ARGS_KEY} then)")
 
+    if verifying and not stale and not failed:
+        return 0
     print(f"\nhost: {stale} part(s) needed changes"
           f"{' (nothing written — dry run)' if dry else ''}"
           + (f"; {failed} FAILED" if failed else ""))
@@ -3331,7 +3367,8 @@ class HostFacts:
 
 
 def run_verify(args: argparse.Namespace, servers: Dict[str, dict], home: Path,
-               boxes_dir: Path, facts: Optional[HostFacts] = None) -> int:
+               boxes_dir: Path, facts: Optional[HostFacts] = None,
+               install_notes: Optional[List[vr.Row]] = None) -> int:
     """Every check, over every selected sandbox, then the router process.
     Exit 1 on any problem — an UNKNOWN about the router included, because
     "could not tell" is not a clean bill.
@@ -3464,26 +3501,35 @@ def run_verify(args: argparse.Namespace, servers: Dict[str, dict], home: Path,
     notes += [f"router: {w}" for w in rctx.warnings]
     passed = sum(1 for o in outcomes for c in o.checks if c.result is rh.PASS)
     total = sum(len(o.checks) for o in outcomes)
-    notes.append(f"router: {passed} of {total} checks passed over "
-                 f"{', '.join(o.section.id for o in outcomes)} (container "
-                 f"{rctx.value('container')})")
+    router_line = (f"{passed} of {total} checks passed over "
+                   f"{', '.join(o.section.id for o in outcomes)} (container "
+                   f"{rctx.value('container')})")
 
-    for note in notes:
-        print(f"note: {note}")
-    if problems:
-        print(f"\nverify: {len(problems)} problem(s):", file=sys.stderr)
-        for problem in problems:
-            print(f"  {problem}", file=sys.stderr)
-        return 1
+    # THE REPORT. Every finding above is a sentence naming its sandbox; the
+    # same sentence about many sandboxes is one row naming them all.
+    known = sorted(set(records) | {slug for _t, _w, slugs in rctx.discovery for slug in slugs})
+    problem_rows = vr.group(problems, known)
+    note_rows = list(install_notes or []) + vr.group(notes, known)
+    note_rows += [vr.Row(f"router reports {tag}: {why}", list(slugs))
+                  for tag, why, slugs in rctx.discovery]
     skipped = sorted(set(enrolled) - set(live))
     if skipped:
-        print(f"note: relay liveness was NOT checked for {len(skipped)} enrolled "
-              f"sandbox(es) — {', '.join(skipped)} — because they are not running. "
-              f"A clean verdict says nothing about them.")
-    print(f"verify: {len(enrolled)} sandbox(es), {len(live)} of them relay-checked "
-          f"({len(running)} containers running fleet-wide) — no problems"
-          + (f" ({len(notes)} note(s) above)" if notes else ""))
-    return 0
+        note_rows.append(vr.Row("not running, so its relay was not checked: a clean verdict "
+                                "says nothing about it", skipped))
+    names = vr.display_names(known)
+    show_all = bool(getattr(args, "all", False))
+    verdict = (f"{len(problems)} problem(s)" if problems else "no problems")
+    print(f"\nverify: {len(enrolled)} sandbox(es), {len(live)} of them relay-checked "
+          f"({len(running)} containers running fleet-wide) — {verdict}"
+          + (f", {len(note_rows)} note(s)" if note_rows else ""))
+    print(f"router: {router_line}\n")
+    sys.stdout.flush()
+    if problems:
+        print("\n".join(vr.render("PROBLEMS", problem_rows, names, show_all=show_all)) + "\n",
+              file=sys.stderr)
+        sys.stderr.flush()
+    print("\n".join(vr.render("NOTES", note_rows, names, show_all=show_all)))
+    return 1 if problems else 0
 
 
 # ------------------------------------------------------------------ install
@@ -3836,6 +3882,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="limit to sandboxes whose NAME exactly matches this (repeatable)")
     verify.add_argument("--match", action="append", default=[],
                         help="limit to sandboxes whose NAME contains this substring (repeatable)")
+    verify.add_argument("--all", action="store_true",
+                        help=f"list every workspace a condition applies to (by default a "
+                             f"list longer than {vr.COLLAPSE_AFTER} is a count)")
     verify.add_argument("--host-facts", type=Path, metavar="PATH",
                         help="also write the router-process facts (docker liveness, the mount "
                              "set, config freshness, sandy's not-selected slugs) to PATH as "
@@ -3937,9 +3986,11 @@ def run_verify_command(args: argparse.Namespace, home: Path, boxes_dir: Path) ->
     try:
         servers = load_servers(args.servers)
         print("verify (1/2): is the install up to date?")
-        stale_rc = run_provision(args, servers, home, boxes_dir, dry=True, verifying=True)
+        install_notes: List[vr.Row] = []
+        stale_rc = run_provision(args, servers, home, boxes_dir, dry=True, verifying=True,
+                                 notes_out=install_notes)
         print("\nverify (2/2): the checks the install cannot make")
-        live_rc = run_verify(args, servers, home, boxes_dir, facts)
+        live_rc = run_verify(args, servers, home, boxes_dir, facts, install_notes=install_notes)
         rc = stale_rc or live_rc
         return rc
     finally:

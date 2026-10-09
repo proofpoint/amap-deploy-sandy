@@ -663,6 +663,9 @@ class Ctx:
         self.home = Path(home)
         self._facts: Dict[str, Fact] = {}
         self.warnings: List[str] = []
+        # The router's discovery report, grouped: (tag, reason, slugs) per
+        # fact, so a caller can name the slugs as a list rather than a line.
+        self.discovery: List[Tuple[str, str, List[str]]] = []
 
     def fact(self, name: str) -> Fact:
         if name not in FACT_SOURCES:
@@ -1217,10 +1220,10 @@ def _discovery_checks(ctx):
                 do_not="do not silence a line by removing the slug from the policy without "
                        "reading why the router printed it")
     if plain:
-        ctx.warn(f"the router's discovery report: {'; '.join(_condensed(plain))} — not "
-                 f"drained, not deleted, not an error; a NO VERDICT directory is what every "
-                 f"workspace rename leaves behind, and a pending INERT EDGE resolves at that "
-                 f"sandbox's launch")
+        ctx.discovery = [g for g in _grouped(plain) if not isinstance(g, str)]
+        unshaped = [g for g in _grouped(plain) if isinstance(g, str)]
+        if unshaped:
+            ctx.warn(f"the router's discovery report: {'; '.join(unshaped)}")
 
 
 # The router's discovery line shape: `TAG  slug: reason` (two spaces after
@@ -1230,9 +1233,10 @@ def _discovery_checks(ctx):
 _DISCOVERY_LINE_RE = re.compile(r"^(?P<tag>[A-Z][A-Z ]*?)  (?P<slug>\S+): (?P<why>.*)$")
 
 
-def _condensed(lines: List[str]) -> List[str]:
-    """One entry per (tag, reason), naming every slug; a line that is not
-    in the router's shape is kept verbatim. Order is first appearance."""
+def _grouped(lines: List[str]) -> List[Any]:
+    """One `(tag, reason, slugs)` per (tag, reason), naming every slug; a
+    line that is not in the router's shape is kept verbatim as a string.
+    Order is first appearance."""
     slugs: Dict[Tuple[str, str], List[str]] = {}
     order: List[Any] = []
     for line in lines:
@@ -1245,9 +1249,14 @@ def _condensed(lines: List[str]) -> List[str]:
             slugs[key] = []
             order.append(key)
         slugs[key].append(m.group("slug"))
-    return [item if isinstance(item, str)
-            else f"{item[0]} ×{len(slugs[item])} ({', '.join(slugs[item])}): {item[1]}"
+    return [item if isinstance(item, str) else (item[0], item[1], slugs[item])
             for item in order]
+
+
+def _condensed(lines: List[str]) -> List[str]:
+    """`_grouped` as text: one entry per (tag, reason), naming every slug."""
+    return [g if isinstance(g, str) else f"{g[0]} ×{len(g[2])} ({', '.join(g[2])}): {g[1]}"
+            for g in _grouped(lines)]
 
 
 def _age_seconds(ts) -> Any:

@@ -120,6 +120,17 @@ hour.** A faithful assertion of a retired mechanism passes its own mutation
 perfectly: it is green, mutation-proven, and about nothing. Delete the half of
 each check that can no longer fire, and keep the half that still bites.
 
+### How verify prints
+
+Checks return findings as sentences; `verify_report` groups them for the
+terminal. Write a per-sandbox finding as `label: slug: detail` (or
+`slug: detail`): the slug is lifted out, sentences that then read the same
+are one row naming every sandbox, and a slug inside a path becomes
+`<slug>`. A slug anywhere else is kept verbatim, because a sentence that
+names it as a value (a policy entry to edit) must show the exact string.
+Sandboxes are shown by workspace name, with the hash kept where two share a
+name. Only the terminal changes: the exit code and `--host-facts` do not.
+
 ### The router's facts come from its own document
 
 `router_health` reads the router's view of the fleet (`admitted`) and its
