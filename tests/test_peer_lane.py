@@ -640,6 +640,23 @@ class RouterSiblingRenderTest(unittest.TestCase):
         self.assertNotEqual(prov.ROUTER_TASK_GRAPH_ALL, fp.TASK_GRAPH_ALL,
                             "the policy's spelling and the router's differ on purpose")
 
+    def test_the_wildcard_with_a_deny_renders_the_expansion_without_the_denied_pair(self):
+        """The router's word has no exceptions, so passing it for a policy
+        with a deny would let the denied sender task. The expansion is
+        rendered instead, total, and the router's real loader accepts it."""
+        policy = _policy(**{fp.TASK_GRAPH_KEY: fp.TASK_GRAPH_ALL,
+                            fp.TASK_DENY_KEY: [["alpha", "bravo"]]})
+        doc = self._render(policy=policy)["_doc"]
+        self.assertNotIn(prov.SIBLING_TASK_GRAPH, doc)
+        self.assertEqual(doc[prov.SIBLING_PEER_SENDERS], {"alpha": ["bravo"], "bravo": []})
+        self.assertIsNone(prov.validate_with_router(doc))
+
+    def test_the_wildcard_with_an_empty_deny_still_renders_the_routers_word(self):
+        doc = self._render(policy=_policy(**{fp.TASK_GRAPH_KEY: fp.TASK_GRAPH_ALL,
+                                             fp.TASK_DENY_KEY: []}))["_doc"]
+        self.assertEqual(doc[prov.SIBLING_TASK_GRAPH], prov.ROUTER_TASK_GRAPH_ALL)
+        self.assertNotIn(prov.SIBLING_PEER_SENDERS, doc)
+
     def test_a_mutual_mail_pair_renders_the_peers_map(self):
         policy = _policy(**{fp.TASK_GRAPH_KEY: {}, "peers": {"alpha": ["bravo"], "bravo": ["alpha"]}})
         doc = self._render(policy=policy)["_doc"]

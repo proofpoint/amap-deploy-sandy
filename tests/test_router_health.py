@@ -530,11 +530,13 @@ class MountSetFollowsTheConfigTest(FleetTestCase):
 
 class HealthTestCase(FleetTestCase):
     def _health(self, plain="", rc=0, polls=3, age_s=1, instances=None, totals=None,
-                interval_s=5.0, admitted=None, omit=(), markers=True, extra=None):
+                interval_s=5.0, admitted=None, omit=(), markers=True, extra=None,
+                graph=None):
         """The health checks with `status --json` answered by a document
         built from the arguments (plus `extra` fields, minus the field names
-        in `omit`) and plain `status` by `plain`. `admitted` defaults to the
-        fleet, as a router that has polled writes it."""
+        in `omit`), plain `status` by `plain`, and `peers --json` by `graph`
+        (a refusal when None). `admitted` defaults to the fleet, as a router
+        that has polled writes it."""
         if markers:
             for slug in self.fleet.slugs:
                 self.fleet.first_seen(slug)
@@ -556,6 +558,10 @@ class HealthTestCase(FleetTestCase):
             if argv[0] == "docker":            # no docker answer is needed for health
                 return rh.Proc(tuple(argv), 1, "", "")
             self.assertIn("--name", argv, "every run.sh argv carries a name of our own")
+            if "peers" in argv:
+                if graph is None:
+                    return rh.Proc(tuple(argv), 1, "", "router: config refused")
+                return rh.Proc(tuple(argv), 0, json.dumps(graph, indent=2, sort_keys=True), "")
             if "--json" in argv:
                 return rh.Proc(tuple(argv), 0, doc, "")
             return rh.Proc(tuple(argv), rc, "instances:\n  a  ok\n" + plain, "")
@@ -723,6 +729,142 @@ class StatusJsonCarriesTheAdmittedSetAndTheIntervalTest(HealthTestCase):
                 patch.object(rh, "run", run), patch.object(rh, "_inspect", inspect):
             cs = list(rh.verify_container(ctx))
         self.assertIs(self.one(cs, rh.CONTAINER_VIEW).result, rh.PASS)
+
+
+DOMAIN = "sandy.host.example.org"
+
+
+class DelegationGraphIsThePolicysTest(HealthTestCase):
+    """The router's delegation graph (`peers --json`) against the graph the
+    manifest's policy declares. The renderer and the router's own expansion
+    sit between the two, so a fault in either (a deny dropped, a hand edit,
+    a sandbox selected since the last install) shows only here."""
+
+    def setUp(self):
+        super().setUp()
+        self.fleet.write_router_json(fleet_domain=DOMAIN, task_graph="all")
+
+    def deny(self, *pairs):
+        path = prov.feature_manifest_path(self.fleet.home)
+        manifest = json.loads(path.read_text())
+        manifest["feature"][fp.TASK_DENY_KEY] = [list(p) for p in pairs]
+        path.write_text(json.dumps(manifest, indent=2))
+
+    def addr(self, slug):
+        return f"{slug}@{DOMAIN}"
+
+    def full_mesh(self):
+        """`peers --json` for the router's word `all`, as the router prints it."""
+        a, b = sorted(self.fleet.slugs)
+        return {self.addr(a): [self.addr(b)], self.addr(b): [self.addr(a)]}
+
+    def test_the_routers_graph_equal_to_the_policys_passes_after_the_instance_set(self):
+        _, cs = self._health(graph=self.full_mesh())
+        self.assertIs(self.one(cs, rh.HEALTH_GRAPH).result, rh.PASS,
+                      self.one(cs, rh.HEALTH_GRAPH).remedy)
+        claims = [c.claim for c in cs]
+        self.assertEqual(claims.index(rh.HEALTH_GRAPH), claims.index(rh.HEALTH_INSTANCES) + 1)
+
+    def test_a_deny_the_router_does_not_enforce_FAILS_naming_the_sender(self):
+        """The defect this check exists for: the policy denies a -> b, and
+        the router's config still says `all`, so the router lets a task b."""
+        a, b = sorted(self.fleet.slugs)
+        self.deny((a, b))
+        ctx, cs = self._health(graph=self.full_mesh())
+        c = self.one(cs, rh.HEALTH_GRAPH)
+        self.assertIs(c.result, rh.FAIL)
+        self.assertEqual(ctx.value("policy_graph")[self.addr(b)], [])
+        self.assertIn(f"{self.addr(b)}: +{self.addr(a)}", c.remedy)
+        self.assertIn("install --apply", c.remedy)
+
+    def test_an_edge_the_policy_grants_and_the_router_lacks_FAILS(self):
+        a, b = sorted(self.fleet.slugs)
+        graph = self.full_mesh()
+        graph[self.addr(b)] = []
+        _, cs = self._health(graph=graph)
+        c = self.one(cs, rh.HEALTH_GRAPH)
+        self.assertIs(c.result, rh.FAIL)
+        self.assertIn(f"{self.addr(b)}: -{self.addr(a)}", c.remedy)
+
+    def test_an_instance_missing_from_the_routers_graph_FAILS(self):
+        a, b = sorted(self.fleet.slugs)
+        _, cs = self._health(graph={self.addr(a): [self.addr(b)]})
+        self.assertIs(self.one(cs, rh.HEALTH_GRAPH).result, rh.FAIL)
+
+    def test_the_order_of_senders_is_not_a_difference(self):
+        slugs = ["alpha-1111aaaa", "alpha-b-3333cccc", "bravo-2222bbbb"]
+        self.fleet = Fleet(self.tmp / "three", slugs=slugs)
+        self.fleet.write_router_json(fleet_domain=DOMAIN, task_graph="all")
+        graph = {self.addr(r): sorted((self.addr(s) for s in slugs if s != r), reverse=True)
+                 for r in slugs}
+        _, cs = self._health(graph=graph)
+        self.assertIs(self.one(cs, rh.HEALTH_GRAPH).result, rh.PASS)
+
+    def test_no_graph_from_the_router_is_UNKNOWN_with_its_words(self):
+        _, cs = self._health(graph=None)
+        c = self.one(cs, rh.HEALTH_GRAPH)
+        self.assertIs(c.result, rh.UNKNOWN)
+        self.assertIn("config refused", c.reason)
+
+    def test_a_policy_that_does_not_resolve_is_UNKNOWN(self):
+        self.deny(("alpha-1111aaaa", "nobody-0000dead"))
+        ctx, cs = self._health(graph=self.full_mesh())
+        self.assertIs(self.one(cs, rh.HEALTH_GRAPH).result, rh.UNKNOWN)
+        self.assertIn("could not be resolved", ctx.value("policy_graph").reason)
+
+    def test_a_config_with_no_domain_has_no_delegation_lane_to_compare(self):
+        self.fleet.write_router_json()
+        _, cs = self._health(graph=self.full_mesh())
+        self.assertNotIn(rh.HEALTH_GRAPH, [c.claim for c in cs])
+
+
+class TheRoutersExpansionOfTheRenderingIsThePolicysTest(unittest.TestCase):
+    """The renderer's output read back through the router's REAL loader and
+    its real `peers --json` derivation, compared with the policy's graph as
+    verify computes it. This is the fix for a dropped deny pinned end to
+    end: rendering `task_graph: "all"` for a policy with a deny makes the
+    router's graph include the denied edge, and this test goes red."""
+
+    def setUp(self):
+        self._t = TemporaryDirectory()
+        self.addCleanup(self._t.cleanup)
+        self.tmp = Path(self._t.name)
+        self.fleet = Fleet(self.tmp)
+
+    def routers_graph(self, policy):
+        from router.config import load_obj
+        from router.peers import peer_graph_addresses
+        doc = prov.render_router_sibling(policy, {n: {} for n in self.fleet.slugs},
+                                         self.fleet.home, self.fleet.state_dir)["_doc"]
+        return doc, peer_graph_addresses(load_obj(json.loads(json.dumps(doc))))
+
+    def policy_graph(self, policy):
+        path = prov.feature_manifest_path(self.fleet.home)
+        manifest = json.loads(path.read_text())
+        manifest["feature"].update({k: policy[k] for k in manifest["feature"] if k in policy})
+        path.write_text(json.dumps(manifest, indent=2))
+        self.fleet.write_router_json(fleet_domain=policy[fp.FLEET_DOMAIN_KEY])
+        ctx = rh.Ctx(SimpleNamespace(sandy="", state_dir=None, container="", image=""),
+                     self.fleet.home)
+        return ctx.value("policy_graph")
+
+    def test_with_a_deny_the_routers_graph_lacks_the_denied_edge(self):
+        a, b = sorted(self.fleet.slugs)
+        policy = {**fp.default_policy(), fp.FLEET_DOMAIN_KEY: DOMAIN,
+                  fp.RECREATE_INTERVAL_KEY: 24, fp.TASK_DENY_KEY: [[a, b]]}
+        doc, graph = self.routers_graph(policy)
+        self.assertNotIn(prov.SIBLING_TASK_GRAPH, doc)
+        self.assertEqual(graph[f"{b}@{DOMAIN}"], [])
+        self.assertEqual(graph[f"{a}@{DOMAIN}"], [f"{b}@{DOMAIN}"])
+        self.assertEqual(graph, self.policy_graph(policy))
+
+    def test_without_a_deny_the_router_gets_its_word_and_the_same_graph(self):
+        policy = {**fp.default_policy(), fp.FLEET_DOMAIN_KEY: DOMAIN,
+                  fp.RECREATE_INTERVAL_KEY: 24}
+        doc, graph = self.routers_graph(policy)
+        self.assertEqual(doc[prov.SIBLING_TASK_GRAPH], prov.ROUTER_TASK_GRAPH_ALL)
+        self.assertNotIn(prov.SIBLING_PEER_SENDERS, doc)
+        self.assertEqual(graph, self.policy_graph(policy))
 
 
 class DiscoveryReportTest(HealthTestCase):

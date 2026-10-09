@@ -3,7 +3,8 @@
 Two sections: `router-container` (docker: running, no network, restart
 policy, the exact mount set, the router's own view of the fleet) and
 `router-health` (`status`: polls, freshness, the discovered instance set,
-every instance first-seen, the discovery report, no errors). `amap-sandy.py
+the delegation graph against the policy's, every instance first-seen, the
+discovery report, no errors). `amap-sandy.py
 verify` runs both after its per-sandbox checks, and `verify --host-facts
 PATH` writes them as the schema-2 document amap-router-local's operator
 console keys on by those two ids.
@@ -146,6 +147,8 @@ WIRE_NAMES: Dict[str, str] = {
     "run.sh": "the router's container launcher, docker/run.sh",
     "derive-mounts.py": "the router's mount emitter, docker/derive-mounts.py",
     "status": "the router subcommand that prints its status document",
+    "peers": "the router subcommand that prints its derived delegation graph; with --json, "
+             "`{recipient address: [sender address, ...]}` and nothing else",
     "--json": "the router's flag making `status` print JSON on stdout",
     "--config": "run.sh's flag naming the router config",
     "--name": "run.sh's flag naming the container",
@@ -560,6 +563,48 @@ def _f_admitted(ctx):
             "status.json admitted")
 
 
+def _f_policy_graph(ctx):
+    """The delegation graph the manifest's policy declares, resolved over
+    the instances the router discovers (`config_instances`) and rendered as
+    the router's `peers --json` renders its own: `{recipient address:
+    [sender address, ...]}`, every instance present, lists sorted. Computed
+    by `fleet_policy.resolve_task_graph`, the same function the renderer
+    uses, so `task_deny` is applied whichever form the graph takes."""
+    for name in ("config_instances", "router_doc"):
+        if isinstance(ctx.value(name), Unresolved):
+            return ctx.value(name), ctx.fact(name).provenance
+    names, doc = ctx.value("config_instances"), ctx.value("router_doc")
+    fp = fleet_policy_mod()
+    path = provisioner().feature_manifest_path(Path(ctx.value("sandy_home")))
+    try:
+        graph = fp.resolve_task_graph(fp.load_policy(path), names)
+    except Exception as e:
+        return _unresolved(f"the policy could not be resolved: {e}"), str(path)
+    domain = doc.get("fleet_domain")
+    return ({fp.address_for(r, domain): [fp.address_for(s, domain) for s in senders]
+             for r, senders in graph.items()},
+            f"resolve_task_graph over the policy in {path} (task_graph minus task_deny), "
+            f"for the instances the router discovers")
+
+
+def _f_router_graph(ctx):
+    """The graph the router enforces: `peers --json` through its own run.sh
+    one-shot, which loads the same config the running router re-reads on
+    every poll and prints the expansion `binding.check_peer_edge` reads."""
+    argv = runsh_argv(ctx, SECTION_HEALTH, "peers", "--json")
+    where = "the router's `peers --json`, through docker/run.sh"
+    if not argv:
+        return _unresolved("no router checkout"), where
+    try:
+        p = run(argv, timeout=ONESHOT_TIMEOUT, extra_env={"IMAGE": str(ctx.value("image"))})
+    except CannotRun as e:
+        return _unresolved(str(e)), where
+    doc, _noise = _status_doc(p.out)
+    if p.rc != 0 or not isinstance(doc, dict):
+        return _unresolved((p.err.strip() or p.out.strip())[:200] or "no graph document"), where
+    return doc, where
+
+
 def _f_max_poll_age(ctx):
     interval = ctx.value("announced_interval")
     if isinstance(interval, Unresolved):
@@ -599,6 +644,8 @@ FACT_SOURCES: Dict[str, Callable[["Ctx"], Tuple[Any, str]]] = {
     "announced_interval": _f_announced_interval,
     "admitted": _f_admitted,
     "max_poll_age": _f_max_poll_age,
+    "policy_graph": _f_policy_graph,
+    "router_graph": _f_router_graph,
     "true": _f_true,
     "zero": _f_zero,
     "empty": _f_empty,
@@ -947,6 +994,7 @@ HEALTH_STATUS = "the router reports itself healthy"
 HEALTH_POLLED = "the poll loop has run at least once"
 HEALTH_FRESH = "the last poll is recent relative to the interval the router announced"
 HEALTH_INSTANCES = "the router's instance set is the config's"
+HEALTH_GRAPH = "the router's delegation graph is the one the policy declares"
 HEALTH_FIRST_SEEN = "every configured instance has been first-seen: its marker exists"
 HEALTH_MARKERS = ("each marker names its instance and carries a first_seen_ts (its "
                   "declared_root is provenance, never compared)")
@@ -988,6 +1036,7 @@ def verify_health(ctx: Ctx) -> Iterator[Check]:
                 actual=sorted(doc.get("instances") or {}), ok=same_set,
                 remedy="an instance that has never been polled simply does not appear — "
                        "absence is `never seen`, not `zero traffic`")
+    yield from _graph_checks(ctx)
     yield from _first_sight_checks(ctx)
     yield from _discovery_checks(ctx)
     totals = doc.get("totals") or {}
@@ -999,6 +1048,46 @@ def verify_health(ctx: Ctx) -> Iterator[Check]:
                        "not a ledger",
                 do_not="do not assert absolute counter values: totals are PER-PROCESS-"
                        "LIFETIME and reset to zero on every container restart")
+
+
+def _graph_differences(expected: Dict[str, List[str]],
+                       actual: Dict[str, List[str]]) -> List[str]:
+    """Each recipient whose senders differ, as `recipient: +granted -missing`
+    — `+` a sender the router lets task it that the policy does not, `-` one
+    the policy grants that the router does not."""
+    out = []
+    for r in sorted(set(expected) | set(actual)):
+        want, got = set(expected.get(r, [])), set(actual.get(r, []))
+        if want != got:
+            extra = [f"+{s}" for s in sorted(got - want)]
+            missing = [f"-{s}" for s in sorted(want - got)]
+            out.append(f"{r}: {' '.join(extra + missing)}")
+    return out
+
+
+def _graph_checks(ctx):
+    """The router's delegation graph against the policy's. The renderer
+    turns the policy into the router's config, and the router expands that
+    config into the edges it enforces; a fault in either step (a deny the
+    rendering dropped, a hand edit, a sandbox selected since the last
+    install under an explicit graph) shows only here. A config with no
+    `fleet_domain` has no delegation lane, so there is no graph to compare;
+    the policy check refuses edges without one."""
+    doc = ctx.value("router_doc")
+    if not isinstance(doc, Unresolved) and not doc.get("fleet_domain"):
+        return
+    expected, actual = ctx.fact("policy_graph"), ctx.value("router_graph")
+    diff = ([] if isinstance(actual, Unresolved) or not expected.known
+            else _graph_differences(expected.value, actual))
+    yield check(claim=HEALTH_GRAPH, expected=expected, actual=actual,
+                ok=lambda e, a: not _graph_differences(e, a),
+                remedy="re-run install --apply, which renders the policy into the router's "
+                       "config; the router re-reads it on its next poll. A sandbox selected "
+                       "since the last install has no edges under an explicit graph (or a "
+                       "task_deny) until then. Differences, by recipient (+ the router allows, "
+                       f"- the policy grants): {'; '.join(diff) or 'none computed'}",
+                do_not="do not edit the router's config by hand: install overwrites it, and "
+                       "the policy in the manifest is what this compares against")
 
 
 def _marker_paths(ctx) -> Any:
