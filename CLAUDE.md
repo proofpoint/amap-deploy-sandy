@@ -127,6 +127,12 @@ poll interval (`interval_s`) from the router's `status.json`, never from its
 logs and never from an option. A field the router omitted is UNKNOWN, never
 defaulted. The freshness bound is `FRESHNESS_MULTIPLE` × `interval_s`.
 
+The delegation graph the router enforces is its own `peers --json`, compared
+with `fleet_policy.resolve_task_graph` over the policy, so a fault in the
+renderer or a hand edit shows as a difference rather than as a config the
+router happens to accept. The router's `task_graph: "all"` has no
+exceptions: the renderer passes it only when `task_deny` is empty.
+
 ### `--host-facts` is a consumed contract
 
 amap-router-local's operator console reads `verify --host-facts PATH` and

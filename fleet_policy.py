@@ -235,14 +235,15 @@ FLEET_DOMAIN_KEY = "fleet_domain"
 TASK_GRAPH_KEY = "task_graph"
 # The wildcard form of `task_graph`. "Every enrolled instance may task every
 # other" — the common case on a single-host fleet, where adding an agent
-# should not mean editing an edge list. EXPANDED HERE, never passed through:
-# the router refuses a wildcard in `peer_senders` ("the task graph names
-# instances, never a wildcard") so that the stored graph, `peers --json` and
-# `derive_matrix` all keep enumerating who may task whom. Expanding in the
-# renderer keeps that audit surface intact and needs no router change.
+# should not mean editing an edge list. `resolve_task_graph` expands it into
+# the edges it means. The router has its own top-level word for the same
+# graph (`task_graph: "all"`) and refuses a wildcard inside `peer_senders`;
+# its word has no exceptions, so a renderer may pass the wildcard as that
+# word only when `task_deny` is empty, and otherwise renders the expansion.
 TASK_GRAPH_ALL = "ALL"
 # Ordered pairs subtracted from whatever `task_graph` resolves to, wildcard
-# or explicit. Deny always wins, so a block reads the same either way.
+# or explicit. Deny always wins, so a block reads the same either way, and a
+# renderer that cannot carry the deny must not carry the graph without it.
 TASK_DENY_KEY = "task_deny"
 RECREATE_INTERVAL_KEY = "container_recreate_interval_hours"
 
@@ -551,11 +552,10 @@ def load_policy(path: Path) -> Dict[str, Any]:
     graph_raw = raw.get(TASK_GRAPH_KEY, {})
     _check_task_deny_shape(raw.get(TASK_DENY_KEY) or [],
                            f"{path}: {TASK_DENY_KEY!r}")
-    # The wildcard form. Accepted HERE; expanded in `resolve_task_graph` for
-    # this repo's own checks (the lane-overlap check), and RENDERED AS THE
-    # ROUTER'S OWN TOP-LEVEL WORD (`task_graph: "all"`) into the router's
-    # config. The per-edge checks below police an edge LIST, and `ALL`
-    # declares no edges to police.
+    # The wildcard form. Accepted HERE and expanded in `resolve_task_graph`
+    # (see TASK_GRAPH_ALL for how a renderer may carry it). The per-edge
+    # checks below police an edge LIST, and `ALL` declares no edges to
+    # police.
     graph_is_wildcard = graph_raw == TASK_GRAPH_ALL
     if isinstance(graph_raw, str) and not graph_is_wildcard:
         raise PolicyError(
@@ -912,12 +912,13 @@ def resolve_task_graph(
     tasking every other. `task_deny` is subtracted from EITHER, so a block
     reads the same whichever form the graph takes.
 
-    THE WILDCARD IS EXPANDED HERE FOR THIS REPO'S OWN CHECKS — the lane
-    overlap check — and is NOT what the router is sent: the router's config
-    carries its own top-level `task_graph: "all"`, which the router expands
-    at load into exactly the sets this function produces, so `peers --json`
-    and this agree. `router/config.py` refuses a wildcard INSIDE
-    `peer_senders`, so a per-instance list always names instances.
+    This is the graph the router must end up enforcing. With no deny, a
+    renderer may send the router its own top-level `task_graph: "all"`,
+    which the router expands at load into exactly these sets; with a deny,
+    the router's word cannot carry it, so the renderer sends this expansion
+    as `peer_senders`. Either way `peers --json` and this agree.
+    `router/config.py` refuses a wildcard INSIDE `peer_senders`, so a
+    per-instance list always names instances.
 
     SELF IS EXCLUDED from the expansion. An instance tasking itself is
     meaningless, `derive_matrix` already special-cases `a == b`, and the
