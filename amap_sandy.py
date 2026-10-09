@@ -3125,14 +3125,20 @@ def render_router_sibling(policy: Dict[str, Any], members: Dict[str, dict],
     if domain is not None:
         doc[SIBLING_FLEET_DOMAIN] = domain
         # The delegation lane exists only under a domain (the router's loader
-        # refuses `peer_senders` without one). The wildcard is PASSED THROUGH
-        # as the router's one word — rendering its expansion would put N
-        # lists in the file that say what one word says, every one of them
-        # drift the day a sandbox is selected. An explicit graph is total:
-        # an instance nobody may task maps to [], because `verify` diffs
-        # this element for element against the router's `peers --json`,
+        # refuses `peer_senders` without one). The wildcard with no deny is
+        # PASSED THROUGH as the router's one word — rendering its expansion
+        # would put N lists in the file that say what one word says, every
+        # one of them drift the day a sandbox is selected. The router's word
+        # has no exceptions, so a wildcard WITH a deny is rendered expanded,
+        # minus the denied pairs: passing the word would drop the deny, and
+        # the router would let the denied sender task. That map, like any
+        # explicit graph, names only the instances enrolled at render, so a
+        # sandbox selected later has no edges until `install` re-renders.
+        # An explicit graph is total: an instance nobody may task maps to [],
+        # because `verify` diffs it against the router's `peers --json`,
         # which emits [] for exactly that reason.
-        if policy.get(fp.TASK_GRAPH_KEY) == fp.TASK_GRAPH_ALL:
+        if policy.get(fp.TASK_GRAPH_KEY) == fp.TASK_GRAPH_ALL \
+                and not policy.get(fp.TASK_DENY_KEY):
             doc[SIBLING_TASK_GRAPH] = ROUTER_TASK_GRAPH_ALL
         else:
             doc[SIBLING_PEER_SENDERS] = {n: list(task_graph[n]) for n in names}
