@@ -24,7 +24,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 HERE = Path(__file__).resolve().parents[1]
 if str(HERE) not in sys.path:
@@ -81,6 +81,16 @@ class _Staged:
         tmux.chmod(0o755)
         self.bindir = bindir
 
+    def socket_for(self, pid: int) -> None:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.bind(str(self.socks / f"{pid}.sock"))
+        self._servers.append(s)
+        (self.keys / f"{pid}.k1.key").write_text("{}")
+
+    def session_file(self, pid: int, text: str) -> None:
+        """Claude Code's `<pid>.json` beside the key files."""
+        (self.keys / f"{pid}.json").write_text(text)
+
     def _proc(self, pid: int, comm: str, ppid: int) -> None:
         d = self.proc / str(pid)
         d.mkdir()
@@ -93,12 +103,17 @@ class _Staged:
 
 
 def run_lister(panes: List[Pane], sandy_agent: str, *, session_exists: bool = True,
-               fallback_socket: bool = False) -> Tuple[int, str, List[Dict[str, str]]]:
-    """`(rc, stderr, rows)`, each row keyed by the six column names."""
+               fallback_socket: bool = False,
+               stage: Optional[Callable[["_Staged"], None]] = None,
+               ) -> Tuple[int, str, List[Dict[str, str]]]:
+    """`(rc, stderr, rows)`, each row keyed by the six column names. `stage`
+    adds to the staged tree (session files, more processes) before the run."""
     text = LISTER.read_text()
     with TemporaryDirectory(dir="/tmp") as d:
         staged = _Staged(Path(d), panes, session_exists=session_exists,
                          fallback_socket=fallback_socket)
+        if stage:
+            stage(staged)
         try:
             for line, repl in zip(ROOT_LINES, (f"PROC={staged.proc}",
                                                f'SOCK_DIRS="{staged.socks} {staged.socks_uid}"',
@@ -211,6 +226,110 @@ class PaneIdentityContractTest(unittest.TestCase):
         rows as "no session yet"; a missing session is the second."""
         rc, err, rows = run_lister([(0, 100, "", "claude")], "claude", session_exists=False)
         self.assertEqual((rc, rows), (0, []), err)
+
+
+class AParkedSessionIsFollowedToItsSuccessorTest(unittest.TestCase):
+    """A conversation sent to the background leaves the pane's claude alive
+    with its socket, but parked: it queues a frame unread. The shape staged
+    here is the one measured on a live sandbox: the pane's session file
+    carries `parkedJobId`, the background session's carries the same
+    `jobId`, and the background session descends from the pane's claude
+    through Claude Code's own daemon processes (pane claude -> `claude daemon
+    run` -> pty host -> background claude)."""
+
+    PANE = [(0, 100, "claude", "claude")]        # the pane's claude is pid 101
+
+    @staticmethod
+    def parked(staged, *, successor_ppid=103, successor_socket=True,
+               successor_json='{"pid": 104, "jobId": "505fa38b", "kind": "bg"}'):
+        staged.session_file(101, '{"pid": 101, "status": "idle", "parkedJobId": "505fa38b"}')
+        staged._proc(102, "claude", 101)          # `claude daemon run`: no socket
+        staged._proc(103, "bg-pty-host", 102)
+        staged._proc(104, "claude", successor_ppid)
+        if successor_socket:
+            staged.socket_for(104)
+        if successor_json is not None:
+            staged.session_file(104, successor_json)
+
+    def test_a_live_pane_session_keeps_its_row(self):
+        rc, err, rows = run_lister(self.PANE, "claude", stage=lambda st: st.session_file(
+            101, '{"pid": 101, "status": "busy"}'))
+        self.assertEqual(rc, 0, err)
+        self.assertEqual([(r["agent_pid"], r["socket"]) for r in rows], [("101", "101.sock")])
+
+    def test_the_successor_takes_the_one_row_with_its_own_socket_and_key(self):
+        """Exactly one row, never the parked pid beside it: two rows would
+        make the daemon refuse every notice as ambiguous_target."""
+        rc, err, rows = run_lister(self.PANE, "claude", stage=self.parked)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(rows, [{"agent": "claude", "pane_index": "0", "pane_pid": "100",
+                                 "agent_pid": "104", "socket": "104.sock",
+                                 "keyfile": "104.k1.key"}])
+        self.assertIn("parked", err)
+
+    def test_no_session_file_carries_the_job_so_no_row(self):
+        rc, err, rows = run_lister(self.PANE, "claude",
+                                   stage=lambda st: self.parked(st, successor_json=None))
+        self.assertEqual((rc, rows), (0, []), err)
+        self.assertIn("505fa38b", err)
+
+    def test_two_sessions_carrying_the_job_give_no_row(self):
+        """Never guess between them, even when both are live under the pane."""
+        def two(st):
+            self.parked(st)
+            st._proc(105, "claude", 103)
+            st.socket_for(105)
+            st.session_file(105, '{"pid": 105, "jobId": "505fa38b", "kind": "bg"}')
+        rc, err, rows = run_lister(self.PANE, "claude", stage=two)
+        self.assertEqual((rc, rows), (0, []), err)
+        self.assertIn("2 session files", err)
+
+    def test_a_successor_file_whose_pid_is_not_its_name_is_not_the_successor(self):
+        rc, err, rows = run_lister(self.PANE, "claude", stage=lambda st: self.parked(
+            st, successor_json='{"pid": 999, "jobId": "505fa38b"}'))
+        self.assertEqual((rc, rows), (0, []), err)
+
+    def test_a_successor_outside_the_pane_is_not_followed(self):
+        """The session files are writable by any process in the sandbox, so
+        a successor is believed only when the process tree agrees."""
+        rc, err, rows = run_lister(self.PANE, "claude",
+                                   stage=lambda st: self.parked(st, successor_ppid=1))
+        self.assertEqual((rc, rows), (0, []), err)
+        self.assertIn("not a live claude", err)
+
+    def test_a_successor_without_a_socket_is_not_followed(self):
+        rc, err, rows = run_lister(self.PANE, "claude",
+                                   stage=lambda st: self.parked(st, successor_socket=False))
+        self.assertEqual((rc, rows), (0, []), err)
+
+    def test_a_session_file_that_does_not_parse_gives_no_row(self):
+        rc, err, rows = run_lister(self.PANE, "claude",
+                                   stage=lambda st: st.session_file(101, '{"pid": 101, "par'))
+        self.assertEqual((rc, rows), (0, []), err)
+        self.assertIn("does not parse", err)
+
+    def test_parked_sessions_that_name_each_other_give_no_row(self):
+        def loop(st):
+            self.parked(st, successor_json='{"pid": 104, "jobId": "505fa38b", '
+                                            '"parkedJobId": "a1"}')
+            st.session_file(101, '{"pid": 101, "jobId": "a1", "parkedJobId": "505fa38b"}')
+        rc, err, rows = run_lister(self.PANE, "claude", stage=loop)
+        self.assertEqual((rc, rows), (0, []), err)
+        self.assertIn("loop", err)
+
+    def test_once_the_pane_claude_has_exited_the_background_session_gets_no_row(self):
+        """Claude Code's daemon is then reparented away from the pane, so the
+        background session is no longer under it. Nothing ties it to this
+        pane, so it is not a target: the pane's row names no session and no
+        socket, as it does for a pane whose claude has not started."""
+        def gone(st):
+            st._proc(102, "claude", 1)
+            st._proc(104, "claude", 102)
+            st.socket_for(104)
+            st.session_file(104, '{"pid": 104, "jobId": "505fa38b", "kind": "bg"}')
+        rc, err, rows = run_lister([(0, 100, "claude", None)], "claude", stage=gone)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual([(r["agent_pid"], r["socket"]) for r in rows], [("-", "-")])
 
 
 if __name__ == "__main__":
