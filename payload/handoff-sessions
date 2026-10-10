@@ -37,6 +37,21 @@
 # variable is set only in claude's children, not in its environment, so it
 # cannot be read from the process.
 #
+# A PARKED SESSION IS FOLLOWED TO ITS SUCCESSOR. When a conversation is sent
+# to the background, the pane's claude stays alive and keeps its socket, but
+# it is parked: Claude Code's session file for it ($KEY_DIR/<pid>.json)
+# carries `parkedJobId`, and the conversation continues in the session whose
+# file carries the same `jobId`. A parked session accepts a frame and queues
+# it unread, so the row names the successor instead: its pid, socket and key
+# file. The successor must be the only session file carrying that jobId,
+# descend from the pane and have a socket, or it is not followed. A parked
+# session whose successor cannot be resolved gets NO row: the daemon waits and re-polls, and nothing is recorded as delivered.
+# Both fields are Claude Code internals, not a published contract. A missing
+# session file reads as "not parked" (the pane's session is the
+# conversation); one that exists but does not parse gets no row this poll.
+# Each decision other than "not parked" is said on stderr, which the daemon
+# does not log when the lister succeeds; run the file by hand to see it.
+#
 # This file sits behind the read-only payload mount with the rest of the
 # relay chain: the daemon execs it, so it must be no more writable than the
 # daemon itself.
@@ -83,6 +98,69 @@ descendants() {  # breadth-first over $PROC; prints pids nearest first
     done
 }
 
+# $1 a session pid. Prints one line: `live`, `follow <pid>` (its successor,
+# by the session files alone), or `none <reason>`. A successor that is itself
+# parked is followed again, a bounded number of times.
+park_state() {
+    python3 -I - "$KEY_DIR" "$1" <<'PY'
+import json, os, sys
+keydir, pid = sys.argv[1], sys.argv[2]
+
+def read(p):
+    try:
+        with open(os.path.join(keydir, f"{p}.json"), encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as e:
+        raise SystemExit(f"none session file for {p} does not parse: {e}")
+
+def successors(job):
+    found = []
+    for name in sorted(os.listdir(keydir)):
+        stem, ext = os.path.splitext(name)
+        if ext != ".json" or not stem.isdigit():
+            continue
+        try:
+            with open(os.path.join(keydir, name), encoding="utf-8") as f:
+                doc = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if isinstance(doc, dict) and doc.get("jobId") == job and str(doc.get("pid")) == stem:
+            found.append(stem)
+    return found
+
+cur, seen = pid, set()
+while True:
+    doc = read(cur)
+    job = doc.get("parkedJobId") if isinstance(doc, dict) else None
+    if not job:
+        print("live" if cur == pid else f"follow {cur}")
+        break
+    seen.add(cur)
+    found = successors(job)
+    if len(found) != 1:
+        print(f"none {cur} is parked as job {job} and "
+              + (f"{len(found)} session files carry that jobId ({', '.join(found)})"
+                 if found else "no session file carries that jobId"))
+        break
+    nxt = found[0]
+    if nxt in seen or len(seen) > 8:
+        print(f"none the parked sessions from {pid} form a loop")
+        break
+    cur = nxt
+PY
+}
+
+is_descendant() {  # $1 pid, $2 ancestor pid
+    local p="$1"
+    while [ -n "$p" ] && [ "$p" -gt 1 ] 2>/dev/null; do
+        p="$(ppid_of "$p")" || return 1
+        [ "$p" = "$2" ] && return 0
+    done
+    return 1
+}
+
 IFS=',' read -ra ORDER <<< "${SANDY_AGENT:-claude}"
 rows="$(panes)"; [ -n "$rows" ] || exit 0
 count="$(printf '%s\n' "$rows" | grep -c .)"
@@ -106,6 +184,25 @@ for a in "${ORDER[@]}"; do
             if [ "$a" = "claude" ] && sock_of "$d" >/dev/null; then apid="$d"; break; fi
             [ "$apid" = "-" ] && apid="$d"
         done
+        if [ "$a" = "claude" ] && [ "$apid" != "-" ] && sock_of "$apid" >/dev/null; then
+            state="$(park_state "$apid" 2>&1)"
+            case "$state" in
+                live) ;;
+                follow\ *)
+                    next="${state#follow }"
+                    if is_descendant "$next" "$ppid" && is_agent "$next" claude \
+                            && sock_of "$next" >/dev/null; then
+                        echo "handoff-sessions: $apid is parked; its successor $next takes the row" >&2
+                        apid="$next"
+                    else
+                        echo "handoff-sessions: $apid is parked; its successor $next is not a live claude with a socket under this pane, so no row" >&2
+                        continue
+                    fi ;;
+                *)
+                    echo "handoff-sessions: no row for $apid: ${state#none }" >&2
+                    continue ;;
+            esac
+        fi
         if [ "$a" = "claude" ] && [ "$apid" != "-" ]; then
             sock=$(sock_of "$apid") || sock="-"
             for k in "$KEY_DIR/$apid".*.key; do [ -f "$k" ] && { key="$k"; break; }; done

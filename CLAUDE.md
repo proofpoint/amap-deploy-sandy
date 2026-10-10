@@ -262,7 +262,11 @@ identity only through sandy's published pane-identity contract: the tmux
 session `sandy`, the `@sandy_pane_agent` option, and `$SANDY_AGENT` as spawn
 order. When any pane carries the option, only the options identify; a pane
 without one is a user split or a teammate. **Never identify a pane by
-`pane_index`**; in the four-agent grid it is not spawn order. `tests/test_handoff_sessions.py`
+`pane_index`**; in the four-agent grid it is not spawn order. A pane
+session that Claude Code has **parked** (its `sessions/<pid>.json` carries
+`parkedJobId`) queues frames unread, so the row names the session whose
+file carries that `jobId`, and only if it descends from the pane and has a
+socket; otherwise there is no row. Never emit both. `tests/test_handoff_sessions.py`
 executes the shipped file against a fake `tmux` and a staged `/proc`.
 
 **`payload/submit-server` is checked in the same way.** It is the
