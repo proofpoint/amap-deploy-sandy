@@ -145,11 +145,24 @@ selected sandbox the registry has not seen (with the workspace sandy
 reports) and makes its `by-slug/` link, so a new agent needs no import:
 after its first launch, `install --apply` and a relaunch. It registers
 nothing until the registry exists: import today's slugs first with
-`migrate-registry`, so no existing agent is given a new name. That guard is
-for the registry as a whole, not per agent: an existing agent the import
-missed (one sandy had not yet selected when the batch was written) is
-registered by a later `install --apply` under a new name. Check the
-import's plan against `list` before turning `identity` on. The relay reads name.json once, when it starts: a name the
+`migrate-registry`, so no existing agent is given a new name. Per agent,
+the first `install --apply` with `identity` on records the router's roster
+as it stands at that moment (`pre-identity.json`, beside `roster/`; no
+roster, an empty record), and never rewrites it: an agent in that record
+that the registry has not bound is refused, by name, and pointed at
+`migrate-registry`, while an agent launched later registers with no import.
+A record that cannot be read registers nothing. An agent that existed but
+was not in the roster when the record was made (not launched since the
+manifest, so not admitted) is not protected: a later `install --apply`
+registers it under a new name. Check the import's plan against `list`
+before turning `identity` on. A forced retire
+is not undone by `install`: after the registry's `retire --force` of a
+sandbox whose workspace still exists, the next `install --apply` registers it
+again as a NEW identity, with a new logical_id and a new name, and prints
+`registered as <address>`. The old name is never reused. So after a forced
+retire, run `install --apply` only when that agent is meant to come back;
+then relaunch it, so its relay reads the new name, and give its peers the
+new address. The relay reads name.json once, when it starts: a name the
 registry changes later (an operator override) takes effect when the sandbox
 relaunches, and `verify`, which reads the file, does not see the
 difference.

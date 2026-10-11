@@ -62,7 +62,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, FrozenSet, List, Optional, Set, Tuple
 
 HERE = Path(__file__).resolve().parent
 # The repo's `payload/` IS the host's `$SANDY_HOME/features/amap/payload/`
@@ -4168,6 +4168,104 @@ def identity_links_dir(home: Path) -> Path:
     return feature_root(home) / FEATURE_IDENTITY_SUBDIR
 
 
+# The agents that existed before identity was turned on: the roster's members
+# when the first `install --apply` with identity on ran, written once beside
+# roster/ and never rewritten. Such an agent is live under its slug address,
+# and a `register` would give it a new name; it is imported with
+# migrate-registry instead. An agent launched later is not in it, and is
+# registered zero-touch.
+PRE_IDENTITY_FILE = "pre-identity.json"
+PRE_IDENTITY_SCHEMA = "amap-deploy-sandy.pre-identity/1"
+#: The roster's `contract_version` this repo has reviewed.
+ROSTER_CONTRACT_VERSION = "2"
+#: The roster schema's member address: one bare addr-spec.
+_ROSTER_ADDRESS = re.compile(r"[A-Za-z0-9!#$%&'*+/=?^_`{|}~.-]+@[A-Za-z0-9.-]+")
+
+
+class PreIdentityError(Exception):
+    """The roster or the snapshot cannot be read; no sandbox is registered."""
+
+
+def pre_identity_path(home: Path) -> Path:
+    return feature_root(home) / PRE_IDENTITY_FILE
+
+
+def roster_slugs(home: Path) -> Optional[FrozenSet[str]]:
+    """The slugs the router's roster lists (each member's local part), or
+    None when there is no roster file: a host whose router has never
+    written one. A roster that exists but cannot be read raises."""
+    f = feature_roster_dir(home) / ROSTER_FILE_NAME
+    try:
+        doc = json.loads(f.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as e:
+        raise PreIdentityError(f"the roster {f} is unreadable: {e}") from None
+    if not isinstance(doc, dict) or doc.get("contract_version") != ROSTER_CONTRACT_VERSION \
+            or not isinstance(doc.get("members"), list) or not isinstance(doc.get("router"), str) \
+            or not isinstance(doc.get("written_at"), str):
+        raise PreIdentityError(f"the roster {f} is not a contract_version "
+                               f"{ROSTER_CONTRACT_VERSION} roster")
+    slugs = set()
+    for m in doc["members"]:
+        addr = m.get("address") if isinstance(m, dict) else None
+        if not isinstance(addr, str) or not _ROSTER_ADDRESS.fullmatch(addr) \
+                or not isinstance(m.get("state"), str) or not m["state"]:
+            raise PreIdentityError(f"the roster {f} has a member that is not one bare address "
+                                   f"with a state")
+        slugs.add(addr.partition("@")[0])
+    return frozenset(slugs)
+
+
+def read_pre_identity(path: Path) -> Optional[FrozenSet[str]]:
+    """The recorded pre-identity slugs, or None when none is recorded. A
+    record that exists but cannot be read raises."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        raise PreIdentityError(f"the pre-identity record {path} is unreadable: {e}") from None
+    try:
+        with os.fdopen(fd, encoding="utf-8") as fh:
+            doc = json.loads(fh.read())
+    except (OSError, ValueError) as e:
+        raise PreIdentityError(f"the pre-identity record {path} is unreadable: {e}") from None
+    if not isinstance(doc, dict):
+        doc = {}
+    slugs = doc.get("slugs")
+    if doc.get("schema") != PRE_IDENTITY_SCHEMA or not isinstance(slugs, list) \
+            or not all(isinstance(s, str) and s for s in slugs):
+        raise PreIdentityError(f"the pre-identity record {path} is not a {PRE_IDENTITY_SCHEMA} "
+                               f"record")
+    return frozenset(slugs)
+
+
+def pre_identity(home: Path, *, apply: bool) -> Tuple[FrozenSet[str], Optional[str]]:
+    """`(slugs, note)`: the pre-identity agents. The record when there is one;
+    otherwise the roster's members, which `--apply` records (once, created
+    exclusively, never rewritten) and a dry run only shows. No roster is a
+    fresh host: an empty record. `note` says what was recorded."""
+    path = pre_identity_path(home)
+    recorded = read_pre_identity(path)
+    if recorded is not None:
+        return recorded, None
+    slugs = roster_slugs(home) or frozenset()
+    if not apply:
+        return slugs, f"would record {len(slugs)} pre-identity agent(s) in {path}"
+    doc = {"schema": PRE_IDENTITY_SCHEMA, "recorded_ts": datetime.now(timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"), "slugs": sorted(slugs)}
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+    except FileExistsError:
+        return read_pre_identity(path) or frozenset(), None
+    except OSError as e:
+        raise PreIdentityError(f"cannot record the pre-identity agents in {path}: {e}") from None
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps(doc, indent=2) + "\n")
+    return slugs, f"recorded {len(slugs)} pre-identity agent(s) in {path}; it is never rewritten"
+
+
 def plan_identity_links(links_dir: Path, members: Dict[str, Path],
                         shown: Dict[str, "ha.Result"]) -> List[Tuple[str, str, str, str]]:
     """`[(action, slug, target, why)]`: what `link-identity` would do for
@@ -4255,7 +4353,7 @@ def apply_identity_links(links_dir: Path, plan: List[Tuple[str, str, str, str]])
 
 
 def install_identity(client: "ha.Client", links_dir: Path, members: Dict[str, Path], *,
-                     apply: bool) -> Tuple[List[str], bool]:
+                     apply: bool, pre: Any = frozenset()) -> Tuple[List[str], bool]:
     """`(lines, failed)`: install's registration of every selected sandbox,
     then its by-slug link. Zero-touch: a sandbox sandy selected and the
     registry has never seen is registered with the workspace sandy reports,
@@ -4266,7 +4364,12 @@ def install_identity(client: "ha.Client", links_dir: Path, members: Dict[str, Pa
     it and binds today's slugs as names; a `register` before that would give
     an existing agent a new name, and names are never reused. Each sandbox
     fails closed on its own: one the registry does not answer, or refuses,
-    is named and gets no link, and the others go on."""
+    is named and gets no link, and the others go on.
+
+    Per agent: a slug in `pre` (the agents that existed before identity was
+    turned on) that the registry has not bound is refused, so the agent is
+    imported under its own name rather than registered under a new one.
+    When `pre` is a PreIdentityError, no sandbox is registered."""
     lines: List[str] = []
     listed = client.list()
     if listed.outcome != ha.REGISTERED:
@@ -4280,6 +4383,25 @@ def install_identity(client: "ha.Client", links_dir: Path, members: Dict[str, Pa
     shown: Dict[str, ha.Result] = {}
     for slug in sorted(members):
         ws = str(members[slug])
+        if isinstance(pre, PreIdentityError) or slug in pre:
+            r = client.show(ws)
+            shown[slug] = r
+            if isinstance(pre, PreIdentityError):
+                failed = True
+                lines.append(f"  UNKNOWN register {slug}: {pre}; not registered")
+                continue
+            if r.code == ha.CODE_NOT_FOUND:
+                failed = True
+                lines.append(f"  FAIL  register {slug}: it existed before identity was turned on "
+                             f"and was never imported; registering would give it a new name. "
+                             f"Import it with migrate-registry")
+                continue
+            if r.outcome != ha.REGISTERED:
+                failed = True
+                lines.append(f"  UNKNOWN register {slug}: it existed before identity was turned "
+                             f"on, and the registry did not say whether it is bound "
+                             f"({r.code}: {r.detail}); not registered")
+                continue
         if not apply:
             r = client.show(ws)
             if r.code == ha.CODE_NOT_FOUND:
@@ -4335,8 +4457,14 @@ def run_install_identity(args: argparse.Namespace, home: Path, policy: Dict[str,
         return 1
     workspaces = {b["name"]: Path(b["workspace_path"]) for b in boxes if b.get("workspace_path")}
     members, excluded = migration_members(states, workspaces)
+    try:
+        pre, note = pre_identity(home, apply=args.apply)
+    except PreIdentityError as e:
+        pre, note = e, None
+    if note:
+        print(f"  {note}")
     lines, failed = install_identity(ha.Client(registry, repo, ids), identity_links_dir(home),
-                                     members, apply=args.apply)
+                                     members, apply=args.apply, pre=pre)
     for line in lines or ["  every selected sandbox is registered and linked"]:
         print(line)
     for slug, why in sorted(excluded.items()):

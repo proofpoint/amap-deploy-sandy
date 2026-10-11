@@ -1,0 +1,6 @@
+{
+  "contract_version": "2",
+  "router": "amap.router@fleet.example",
+  "written_at": "2026-09-24T12:00:00Z",
+  "members": []
+}
