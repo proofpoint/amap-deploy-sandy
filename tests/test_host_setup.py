@@ -137,8 +137,8 @@ class PlanTest(unittest.TestCase):
         self.assertLess(args.index("/srv/example/a/b/inner"), args.index("/srv/example/a"))
 
     def test_each_side_gets_the_other_sides_uid(self):
-        self.assertIn(f"# downstream's runtime environment: {"EX_PEER_UID"}={UP}", self.plan)
-        self.assertIn(f"# upstream's runtime environment: {"EX_PEER_UID"}={DOWN}", self.plan)
+        self.assertIn(f"# downstream's runtime environment: EX_PEER_UID={UP}", self.plan)
+        self.assertIn(f"# upstream's runtime environment: EX_PEER_UID={DOWN}", self.plan)
 
     def test_the_overlay_is_installed_root_owned_0444_and_names_its_digest(self):
         line = next(l for l in self.plan if l.startswith("install -o 0"))
