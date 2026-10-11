@@ -72,3 +72,11 @@ def _docker_and_the_router_are_never_run_by_the_suite():
     rh.run = refuse
     yield
     rh.run = real_run
+
+
+# The operator's deployment overlay names a live host's registry and host
+# setup. A test that inherited it would check the operator's host; each test
+# that wants an overlay passes its own.
+@pytest.fixture(autouse=True)
+def _the_operators_overlay_is_never_read(monkeypatch):
+    monkeypatch.delenv("AMAP_DEPLOY_OVERLAY", raising=False)

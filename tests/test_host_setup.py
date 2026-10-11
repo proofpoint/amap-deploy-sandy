@@ -3,7 +3,9 @@
 Every path, principal and group here is invented. The module knows no
 runtime's directory names, and a real host's document is operator data. The
 filesystem is a fake `lstat` over a dict, so each owner, mode and ancestor
-can be broken one at a time.
+can be broken one at a time. Docker is never run: each probe is a fake
+built from what the real command prints (`docker inspect`'s JSON fields,
+`/proc/<pid>/status` in kernel field order, `stat -c`, `openssl version`).
 """
 
 import copy
@@ -11,6 +13,7 @@ import hashlib
 import json
 import os
 import stat
+import tempfile
 import unittest
 from collections import namedtuple
 
@@ -19,11 +22,12 @@ import router_health as rh
 
 St = namedtuple("St", "st_mode st_uid st_gid st_ino", defaults=(0,))
 UP, DOWN, GID = 2101, 2102, 2100
+UPGRP = 2201
 
 
 def doc():
     return {"schema": hs.SPEC_SCHEMA,
-            "groups": {"hopgrp": GID, "upgrp": 2201, "downgrp": 2202},
+            "groups": {"hopgrp": GID, "upgrp": UPGRP, "downgrp": 2202},
             "principals": {"upstream": {"uid": UP, "groups": ["upgrp", "hopgrp"]},
                            "downstream": {"uid": DOWN, "groups": ["downgrp", "hopgrp"]}},
             "hops": [{"name": "h1", "upstream": "upstream", "downstream": "downstream", "peer_uid_env": "EX_PEER_UID"}],
@@ -36,22 +40,26 @@ def doc():
             "overlay": {"path": "/srv/example/overlay/plugin.py",
                         "pin": hs.stub_pin("/opt/example/plugin.py")},
             "agent_paths": ["/srv/example/agents"],
-            "openssl": {"img-up": {"version": "3.0.13", "floor": "3.0", "source": "example base image"}},
-            "mounts": [{"principal": "downstream", "image": "img-down", "host": "/srv/example/a/b",
-                        "container": "/data/root"}],
-            "runtimes": [{"principal": "upstream", "container": "ex-up", "umask": "0027"},
-                         {"principal": "downstream", "container": "ex-down", "umask": "0022"}]}
+            "openssl": {"img-up": {"version": "3.0.13", "floor": "3.0", "source": "example base image"},
+                        "img-down": {"version": "3.0.13", "floor": "3.0", "source": "example base image",
+                                     "path": "/usr/bin/openssl"}},
+            "runtimes": [{"principal": "upstream", "container": "ex-up", "image": "img-up", "umask": "0027",
+                          "umasks": ["0027"]},
+                         {"principal": "downstream", "container": "ex-down", "image": "img-down",
+                          "umask": "0022"}],
+            "mounts": [{"principal": "downstream", "host": "/srv/example/a/b", "container": "/data/root"},
+                       {"principal": "upstream", "host": "/srv/example/state/up", "container": "/state"}]}
 
 
-def d(mode, uid=0, gid=0):
-    return St(stat.S_IFDIR | mode, uid, gid)
+def d(mode, uid=0, gid=0, ino=0):
+    return St(stat.S_IFDIR | mode, uid, gid, ino)
 
 
 def good_fs():
     return {"/": d(0o755), "/srv": d(0o755), "/srv/example": d(0o755), "/srv/example/a": d(0o755),
-            "/srv/example/a/b": St(stat.S_IFDIR | 0o2750, UP, GID, 4242),
+            "/srv/example/a/b": d(0o2750, UP, GID, 4242),
             "/srv/example/a/b/inner": d(0o2750, DOWN, GID),
-            "/srv/example/state": d(0o755), "/srv/example/state/up": d(0o700, UP, 2201),
+            "/srv/example/state": d(0o755), "/srv/example/state/up": d(0o700, UP, UPGRP, 77),
             "/srv/example/overlay": d(0o755),
             "/srv/example/overlay/plugin.py": St(stat.S_IFREG | 0o444, 0, 0)}
 
@@ -66,16 +74,47 @@ def lstat_of(fs, denied=()):
     return lstat
 
 
+def good_containers():
+    return {"ex-up": {"image": "img-up", "binds": [("/srv/example/state/up", "/state")]},
+            "ex-down": {"image": "img-down", "binds": [("/srv/example/a/b", "/data/root")]}}
+
+
+def good_mount(container, path, marker):
+    return {("ex-down", "/data/root"): ((4242, UP, GID, 0o2750), None),
+            ("ex-up", "/state"): ((77, UP, UPGRP, 0o700), None)}[(container, path)]
+
+
+def good_umasks(c):
+    return [(UP, 0o027)] if c == "ex-up" else [(DOWN, 0o022)]
+
+
 def results(checks):
     return {c.claim: c.result for c in checks}
+
+
+def fake_docker(test, answer):
+    """Replace router_health.run with `answer(argv)` for one test; return the argv list seen."""
+    seen = []
+
+    def run(argv, **kw):
+        seen.append(list(argv))
+        return answer(argv)
+    orig = rh.run
+    rh.run = run
+    test.addCleanup(setattr, rh, "run", orig)
+    return seen
 
 
 class SpecTest(unittest.TestCase):
 
     def test_a_good_document_loads(self):
         s = hs.load_spec(doc())
-        self.assertEqual(s.principals["upstream"].gids, (2201, GID))
+        self.assertEqual(s.principals["upstream"].gids, (UPGRP, GID))
         self.assertEqual(s.roots[0].mode, 0o2750)
+        self.assertEqual(s.runtime_of("upstream")["umasks"], (0o027,))
+        self.assertEqual(s.runtime_of("downstream")["umasks"], (0o027, 0o022))
+        self.assertEqual(s.openssl["img-up"]["path"], "openssl")
+        self.assertFalse(s.production)
 
     def refused(self, mutate, says):
         x = doc()
@@ -88,25 +127,33 @@ class SpecTest(unittest.TestCase):
         self.refused(lambda x: x["principals"]["downstream"].update(uid=UP), "needs its own uid")
         self.refused(lambda x: x["principals"]["upstream"].update(uid=0), "never runs as root")
         self.refused(lambda x: x.update(extra=1), "unknown member")
+        self.refused(lambda x: x.update(production="yes"), "true or false")
         self.refused(lambda x: x["roots"][0].update(group="nogrp"), "not declared")
         self.refused(lambda x: x["roots"][0].update(mode="rwx"), "octal")
         self.refused(lambda x: x["roots"].append(dict(x["roots"][0])), "listed twice")
         self.refused(lambda x: x["roots"][0].update(path="/srv/example/../x"), "normalised")
+        self.refused(lambda x: x["roots"][0].update(path="/"), "cannot be /")
         self.refused(lambda x: x["overlay"]["pin"].update(url="https://example.org"), "exactly sha256")
         self.refused(lambda x: x["roots"][0].update(readers=["nobody"]), "declared principals")
         self.refused(lambda x: x["openssl"]["img-up"].update(version="3"), "X.Y.Z")
         self.refused(lambda x: x["openssl"]["img-up"].update(floor="three"), "X.Y")
+        self.refused(lambda x: x["openssl"]["img-up"].update(path="openssl"), "absolute")
         self.refused(lambda x: x["hops"][0].update(peer_uid_env="bad name"), "environment variable")
         self.refused(lambda x: x["mounts"][0].update(host="/srv/example/other"), "one of the roots")
         self.refused(lambda x: x["mounts"][0].update(principal="nobody"), "not declared")
         self.refused(lambda x: x["openssl"]["img-up"].update(floor="1.1", version="1.1.1"), "below 3.0")
         self.refused(lambda x: x["openssl"]["img-up"].update(floor="3.2"), "below its own floor")
         for bad in ("0077", "0002", "0000", "027", 23):
-            self.refused(lambda x: x["runtimes"][0].update(umask=bad), "must be one of 0027, 0022")
+            self.refused(lambda x: x["runtimes"][1].update(umask=bad), "must be one of 0027, 0022")
+            self.refused(lambda x: x["runtimes"][1].update(umasks=[bad]), "must be one of 0027, 0022")
+        self.refused(lambda x: x["runtimes"][1].update(umasks=[]), "must list the umasks")
         self.refused(lambda x: x["runtimes"][0].update(principal="nobody"), "not declared")
         self.refused(lambda x: x["runtimes"][0].update(container="a b"), "container name")
-        self.refused(lambda x: x["runtimes"][0].pop("umask"), "exactly principal, container and umask")
+        self.refused(lambda x: x["runtimes"][0].pop("umask"), "must have principal, container, image and umask")
         self.refused(lambda x: x["runtimes"][1].update(container="ex-up"), "listed twice")
+
+    def test_a_runtime_pinned_to_0027_cannot_declare_0022(self):
+        self.refused(lambda x: x["runtimes"][0].update(umask="0022"), "is not one this runtime allows (0027)")
 
     def test_floor_3_0_is_accepted(self):
         self.assertEqual(hs.load_spec(doc()).openssl["img-up"]["floor"], (3, 0))
@@ -117,33 +164,94 @@ class SpecTest(unittest.TestCase):
         self.assertIsNone(hs.load_spec(x).overlay_pin)
 
 
+class NothingIsLeftUncheckedTest(unittest.TestCase):
+    """A document that leaves out what a check needs does not load, one
+    omission at a time: a missing check must never read as a passing one."""
+
+    def refused(self, mutate, says):
+        x = doc()
+        mutate(x)
+        with self.assertRaises(hs.SpecError) as e:
+            hs.load_spec(x)
+        self.assertIn(says, str(e.exception))
+
+    def test_a_schema_only_document(self):
+        with self.assertRaises(hs.SpecError) as e:
+            hs.load_spec({"schema": hs.SPEC_SCHEMA})
+        self.assertIn("names no hop", str(e.exception))
+
+    def test_no_hops(self):
+        self.refused(lambda x: x.update(hops=[]), "names no hop")
+
+    def test_a_hop_principal_without_a_runtime(self):
+        self.refused(lambda x: (x["runtimes"].pop(1), x["mounts"].pop(0)), "downstream has 0 runtimes entries")
+        self.refused(lambda x: x["runtimes"].pop(1), "downstream has no runtime to hold this mount")
+
+    def test_a_hop_principal_with_two_runtimes(self):
+        self.refused(lambda x: x["runtimes"].append(dict(x["runtimes"][1], container="ex-down-2")),
+                     "downstream has 2 runtimes entries")
+
+    def test_a_hop_principal_without_a_mount(self):
+        self.refused(lambda x: x["mounts"].pop(1), "upstream has no mounts entry")
+
+    def test_no_roots(self):
+        self.refused(lambda x: x.update(roots=[]), "one of the roots")
+
+    def test_a_runtime_image_without_openssl(self):
+        self.refused(lambda x: x["openssl"].pop("img-down"), "image 'img-down' has no openssl record")
+
+    def test_a_mount_for_a_principal_with_no_runtime(self):
+        def m(x):
+            x["principals"]["third"] = {"uid": 2103, "groups": ["hopgrp"]}
+            x["mounts"].append({"principal": "third", "host": "/srv/example/a/b", "container": "/x"})
+        self.refused(m, "third has no runtime")
+
+    def test_no_checks_never_pass(self):
+        lines = []
+        self.assertEqual(hs.report([], lines.append), 1)
+        self.assertIn("UNKNOWN", lines[0])
+
+
 class PlanTest(unittest.TestCase):
 
     def setUp(self):
         self.plan = hs.render_plan(hs.load_spec(doc()))
+        self.steps = f"python3 {hs.HOST_STEPS}"
 
     def test_roots_are_created_parents_first_with_owner_group_and_mode(self):
-        installs = [l for l in self.plan if l.startswith("install -d")]
-        self.assertEqual(installs[0], f"install -d -o {UP} -g {GID} -m 2750 /srv/example/a/b  # the shared root")
-        order = [l.split()[8] for l in installs]
+        roots = [l for l in self.plan if l.startswith(f"{self.steps} root ")]
+        self.assertEqual(roots[0], f"{self.steps} root /srv/example/a/b {UP} {GID} 2750  # the shared root")
+        order = [l.split()[3] for l in roots]
         self.assertLess(order.index("/srv/example/a/b"), order.index("/srv/example/a/b/inner"))
 
     def test_the_barrier_fsyncs_every_root_and_ancestor_deepest_first(self):
-        barrier = next(l for l in self.plan if l.startswith("python3 -c"))
-        args = barrier.split("' ", 1)[1].split()
-        for p in ("/srv", "/srv/example", "/srv/example/a", "/srv/example/a/b/inner",
+        barrier = next(l for l in self.plan if l.startswith(f"{self.steps} sync "))
+        args = barrier.split()[3:]
+        for p in ("/", "/srv", "/srv/example", "/srv/example/a", "/srv/example/a/b/inner",
                   "/srv/example/state/up"):
             self.assertIn(p, args)
         self.assertLess(args.index("/srv/example/a/b/inner"), args.index("/srv/example/a"))
+
+    def test_every_step_goes_through_the_no_follow_helper(self):
+        for line in self.plan:
+            if not line.startswith("#"):
+                self.assertTrue(line.startswith(self.steps), line)
+        self.assertFalse(any(l.startswith(("install ", "sh -c", "chown", "chmod")) for l in self.plan))
 
     def test_each_side_gets_the_other_sides_uid(self):
         self.assertIn(f"# downstream's runtime environment: EX_PEER_UID={UP}", self.plan)
         self.assertIn(f"# upstream's runtime environment: EX_PEER_UID={DOWN}", self.plan)
 
-    def test_the_overlay_is_installed_root_owned_0444_and_names_its_digest(self):
-        line = next(l for l in self.plan if l.startswith("install -o 0"))
-        self.assertIn("-m 0444", line)
+    def test_the_overlay_is_placed_and_names_its_digest(self):
+        line = next(l for l in self.plan if l.startswith(f"{self.steps} place "))
+        self.assertIn("/srv/example/overlay/plugin.py", line)
         self.assertIn(hs.STUB_SHA256, line)
+
+    def test_the_marker_is_created_by_the_helper(self):
+        x = doc()
+        x["mounts"][0]["marker"] = ".root-id"
+        line = next(l for l in hs.render_plan(hs.load_spec(x)) if "root marker" in l)
+        self.assertTrue(line.startswith(f"{self.steps} marker /srv/example/a/b/.root-id"))
 
     def test_nothing_is_run(self):
         self.assertTrue(self.plan[0].startswith("# Run as root"))
@@ -189,8 +297,20 @@ class RootsTest(unittest.TestCase):
 
     def test_a_symlink_is_not_the_root(self):
         fs = good_fs()
-        fs["/srv/example/state/up"] = St(stat.S_IFLNK | 0o777, UP, 2201)
+        fs["/srv/example/state/up"] = St(stat.S_IFLNK | 0o777, UP, UPGRP)
         self.assertFails(fs, "/srv/example/state/up is a directory")
+
+    def test_a_symlinked_ancestor_fails_every_root_beneath_it(self):
+        fs = good_fs()
+        fs["/srv/example/a"] = St(stat.S_IFLNK | 0o777, 0, 0)
+        bad = self.assertFails(fs, "every ancestor of /srv/example/a/b is a real directory")
+        self.assertIn("every ancestor of /srv/example/a/b/inner is a real directory", bad)
+        self.assertNotIn("every ancestor of /srv/example/state/up is a real directory", bad)
+
+    def test_an_absent_ancestor_fails(self):
+        fs = good_fs()
+        del fs["/srv/example/state"]
+        self.assertFails(fs, "every ancestor of /srv/example/state/up is a real directory")
 
     def test_absent(self):
         fs = good_fs()
@@ -200,9 +320,20 @@ class RootsTest(unittest.TestCase):
     def test_an_execute_only_ancestor_fails_the_reader_it_blocks(self):
         fs = good_fs()
         fs["/srv/example/a"] = d(0o711)
-        bad = self.assertFails(fs, "downstream (uid 2102) can read and search every directory down to "
+        bad = self.assertFails(fs, "upstream (uid 2101) can read and search every directory from / down to "
                                    "/srv/example/a/b")
         self.assertNotIn("/srv/example/state/up is a directory", bad)
+
+    def test_an_ancestor_above_a_readers_mount_does_not_block_it(self):
+        fs = good_fs()
+        fs["/srv/example/a"] = d(0o700)
+        r = self.verify(fs)
+        self.assertEqual(r["downstream (uid 2102) can read and search every directory from /srv/example/a/b "
+                           "down to /srv/example/a/b"], rh.PASS)
+        self.assertEqual(r["downstream (uid 2102) can read and search every directory from /srv/example/a/b "
+                           "down to /srv/example/a/b/inner"], rh.PASS)
+        self.assertEqual(r["upstream (uid 2101) can read and search every directory from / down to "
+                           "/srv/example/a/b"], rh.FAIL)
 
     def test_the_downstream_reader_needs_the_group_bit(self):
         fs = good_fs()
@@ -212,6 +343,8 @@ class RootsTest(unittest.TestCase):
     def test_an_uninspectable_path_is_unknown_not_fail(self):
         r = self.verify(good_fs(), denied=("/srv/example/state/up",))
         self.assertEqual(r["/srv/example/state/up is a directory owned by 2101:2201, mode 0700"], rh.UNKNOWN)
+        r = self.verify(good_fs(), denied=("/srv/example/state",))
+        self.assertEqual(r["every ancestor of /srv/example/state/up is a real directory"], rh.UNKNOWN)
 
 
 class OverlayTest(unittest.TestCase):
@@ -264,6 +397,14 @@ class OverlayTest(unittest.TestCase):
         x["overlay"]["pin"] = None
         self.assertEqual(hs.verify_overlay(hs.load_spec(x), production=True, lstat=lstat_of({})), [])
 
+    def test_the_documents_production_flag_refuses_the_stub(self):
+        x = doc()
+        x["production"] = True
+        r = results(hs.checks(hs.load_spec(x), production=False, lstat=lstat_of(good_fs()),
+                              digest=lambda p: hs.STUB_SHA256, openssl={}, containers=good_containers().get,
+                              mounts=good_mount, umasks=good_umasks))
+        self.assertEqual(r["the overlay pins a reviewed plugin, not the stub"], rh.FAIL)
+
 
 class StubTest(unittest.TestCase):
 
@@ -285,33 +426,90 @@ class StubTest(unittest.TestCase):
         self.assertEqual(json.loads(hs.overlay_record(None, "example.overlay/1"))["plugin"], None)
 
 
-class MountTopologyTest(unittest.TestCase):
-    """The runtime's durable root, seen from a throwaway container with its
-    own mount, is the directory the plan created: the inode, owner, group
-    and mode match, OR the root's marker does."""
+class ContainerTest(unittest.TestCase):
+    """The running container, from `docker inspect`: its image and its bind
+    mounts, as the runtime was actually started."""
 
-    CLAIM = "downstream's durable root /data/root in img-down is the host directory /srv/example/a/b"
+    INSPECT = ('true\t"img-down"\t[{"Type":"bind","Source":"/srv/example/a/b","Destination":"/data/root",'
+               '"Mode":"","RW":true,"Propagation":"rprivate"},{"Type":"volume","Name":"v","Source":'
+               '"/var/lib/docker/volumes/v/_data","Destination":"/cache","Driver":"local","Mode":"z",'
+               '"RW":true,"Propagation":""}]\n')
+
+    def test_inspect_is_read_into_image_and_binds(self):
+        seen = fake_docker(self, lambda argv: rh.Proc(tuple(argv), 0, self.INSPECT, ""))
+        self.assertEqual(hs.ask_container("ex-down"),
+                         {"image": "img-down", "binds": [("/srv/example/a/b", "/data/root")]})
+        self.assertEqual(seen[0][:3], ["docker", "inspect", "-f"])
+        self.assertEqual(seen[0][-1], "ex-down")
+
+    def test_a_stopped_container_is_unresolved(self):
+        fake_docker(self, lambda argv: rh.Proc(tuple(argv), 0, self.INSPECT.replace("true", "false", 1), ""))
+        self.assertIsInstance(hs.ask_container("ex-down"), rh.Unresolved)
+
+    def test_an_absent_container_or_garbage_is_unresolved(self):
+        fake_docker(self, lambda argv: rh.Proc(tuple(argv), 1, "", "Error: No such object: ex-down"))
+        self.assertIsInstance(hs.ask_container("ex-down"), rh.Unresolved)
+        fake_docker(self, lambda argv: rh.Proc(tuple(argv), 0, "nonsense\n", ""))
+        self.assertIsInstance(hs.ask_container("ex-down"), rh.Unresolved)
+
+    def test_the_declared_image(self):
+        spec = hs.load_spec(doc())
+        self.assertEqual(set(results(hs.verify_containers(spec, good_containers())).values()), {rh.PASS})
+        seen = good_containers()
+        seen["ex-up"]["image"] = "img-other"
+        r = results(hs.verify_containers(spec, seen))
+        self.assertEqual(r["upstream's running container ex-up is the image img-up"], rh.FAIL)
+        seen["ex-up"] = rh.Unresolved("ex-up is not running")
+        self.assertEqual(results(hs.verify_containers(spec, seen))[
+            "upstream's running container ex-up is the image img-up"], rh.UNKNOWN)
+
+
+class MountTopologyTest(unittest.TestCase):
+    """Each declared mount on the RUNNING container: it binds the host root at
+    the declared path, and that path, seen inside the running container, is
+    the directory the plan created (inode, owner, group and mode, or the
+    root's marker)."""
+
+    BIND = "ex-down binds /srv/example/a/b at /data/root"
+    CLAIM = "downstream's durable root /data/root in ex-down is the host directory /srv/example/a/b"
     SAME = (4242, UP, GID, 0o2750)
     OTHER = (9999, UP, GID, 0o2750)
 
-    def verify(self, answer, fs=None, marker=None, host_marker="f00d"):
+    def verify(self, answer, fs=None, marker=None, host_marker="f00d", seen=None):
         asked = []
         x = doc()
         if marker:
             x["mounts"][0]["marker"] = marker
 
-        def ask(image, host, container, mk):
-            asked.append((image, host, container, mk))
-            return answer
-        checks = hs.verify_mounts(hs.load_spec(x), lstat_of(fs or good_fs()), ask,
-                                  read_marker=lambda p: host_marker)
-        return {c.claim: c for c in checks}, asked
+        def ask(container, path, mk):
+            asked.append((container, path, mk))
+            return answer if container == "ex-down" else good_mount(container, path, mk)
+        checks = hs.verify_mounts(hs.load_spec(x), good_containers() if seen is None else seen,
+                                  lstat_of(fs or good_fs()), ask, read_marker=lambda p: host_marker)
+        return {c.claim: c for c in checks}, [a for a in asked if a[0] == "ex-down"]
 
     def test_the_same_directory_passes_by_inode_and_says_so(self):
         r, asked = self.verify((self.SAME, None))
+        self.assertEqual(r[self.BIND].result, rh.PASS)
         self.assertEqual(r[self.CLAIM].result, rh.PASS)
         self.assertIn("matched by inode", r[self.CLAIM].expected.provenance)
-        self.assertEqual(asked, [("img-down", "/srv/example/a/b", "/data/root", None)])
+        self.assertEqual(asked, [("ex-down", "/data/root", None)])
+
+    def test_a_running_container_without_the_declared_bind_fails(self):
+        for binds in ([], [("/srv/example/elsewhere", "/data/root")], [("/srv/example/a/b", "/data/other")],
+                      [("/srv/example/a/b", "/data/root"), ("/srv/example/x", "/data/root")]):
+            seen = good_containers()
+            seen["ex-down"]["binds"] = binds
+            with self.subTest(binds=binds):
+                self.assertEqual(self.verify((self.SAME, None), seen=seen)[0][self.BIND].result, rh.FAIL)
+
+    def test_a_container_not_running_is_unknown_and_nothing_is_asked(self):
+        seen = good_containers()
+        seen["ex-down"] = rh.Unresolved("ex-down is not running")
+        r, asked = self.verify((self.SAME, None), seen=seen)
+        self.assertEqual(r[self.BIND].result, rh.UNKNOWN)
+        self.assertEqual(r[self.CLAIM].result, rh.UNKNOWN)
+        self.assertEqual(asked, [])
 
     def test_another_directory_fails(self):
         for other in (self.OTHER, (4242, DOWN, GID, 0o2750), (4242, UP, GID, 0o2770)):
@@ -322,7 +520,7 @@ class MountTopologyTest(unittest.TestCase):
         r, asked = self.verify((self.OTHER, "f00d"), marker=".root-id")
         self.assertEqual(r[self.CLAIM].result, rh.PASS)
         self.assertIn("matched by the root's marker", r[self.CLAIM].expected.provenance)
-        self.assertEqual(asked[0][3], ".root-id")
+        self.assertEqual(asked[0][2], ".root-id")
 
     def test_neither_matching_fails(self):
         r, _ = self.verify((self.OTHER, "beef"), marker=".root-id")
@@ -343,13 +541,6 @@ class MountTopologyTest(unittest.TestCase):
         self.assertEqual(r[self.CLAIM].result, rh.UNKNOWN)
         self.assertEqual(asked, [])
 
-    def test_the_plan_writes_a_random_root_owned_read_only_marker(self):
-        x = doc()
-        x["mounts"][0]["marker"] = ".root-id"
-        line = next(l for l in hs.render_plan(hs.load_spec(x)) if "root marker" in l)
-        self.assertIn("/dev/urandom", line)
-        self.assertIn("chown 0:0 /srv/example/a/b/.root-id && chmod 0444 /srv/example/a/b/.root-id", line)
-
     def test_a_marker_must_be_one_name_inside_the_root(self):
         for bad in ("../x", "a/b", "..", ""):
             x = doc()
@@ -357,38 +548,38 @@ class MountTopologyTest(unittest.TestCase):
             with self.subTest(bad=bad), self.assertRaises(hs.SpecError):
                 hs.load_spec(x)
 
-    def test_the_throwaway_container_mounts_read_only_with_no_network(self):
-        seen = []
-
-        def fake_run(argv, **kw):
-            seen.append(list(argv))
-            return rh.Proc(tuple(argv), 0, "4242 2101 2100 2750\nf00d\n", "")
-        orig = rh.run
-        rh.run = fake_run
-        self.addCleanup(setattr, rh, "run", orig)
-        self.assertEqual(hs.ask_mount("img-down", "/srv/example/a/b", "/data/root", ".root-id"),
-                         ((4242, UP, GID, 0o2750), "f00d"))
-        self.assertEqual(seen[0][-2:], ["/data/root", ".root-id"])
+    def test_the_running_container_is_asked_read_only(self):
+        seen = fake_docker(self, lambda argv: rh.Proc(tuple(argv), 0, "4242 2101 2100 2750\nf00d\n", ""))
+        self.assertEqual(hs.ask_mount("ex-down", "/data/root", ".root-id"), ((4242, UP, GID, 0o2750), "f00d"))
         argv = seen[0]
-        self.assertIn("/srv/example/a/b:/data/root:ro", argv)
-        self.assertEqual(argv[argv.index("--network") + 1], "none")
-        self.assertIn("--rm", argv)
+        self.assertEqual(argv[:5], ["docker", "exec", "-u", "0", "ex-down"])
+        self.assertEqual(argv[-2:], ["/data/root", ".root-id"])
+        self.assertNotIn("run", argv)
 
     def test_garbled_stat_output_is_unknown(self):
-        orig = rh.run
-        rh.run = lambda argv, **kw: rh.Proc(tuple(argv), 0, "stat: not found\n", "")
-        self.addCleanup(setattr, rh, "run", orig)
-        self.assertIsInstance(hs.ask_mount("i", "/a", "/b"), rh.Unresolved)
+        fake_docker(self, lambda argv: rh.Proc(tuple(argv), 0, "stat: not found\n", ""))
+        self.assertIsInstance(hs.ask_mount("c", "/b"), rh.Unresolved)
 
     def test_the_device_number_is_not_compared(self):
         self.assertEqual(hs._identity(os.stat_result((stat.S_IFDIR | 0o750, 7, 99, 1, 5, 6, 0, 0, 0, 0))),
                          (7, 5, 6, 0o750))
 
+    def test_the_host_marker_is_not_read_through_a_link(self):
+        with tempfile.TemporaryDirectory() as t:
+            real = os.path.join(t, "real")
+            with open(real, "w") as f:
+                f.write("f00d")
+            os.symlink(real, os.path.join(t, "marker"))
+            self.assertIsInstance(hs._read_marker(os.path.join(t, "marker")), rh.Unresolved)
+            self.assertEqual(hs._read_marker(real), "f00d")
+            self.assertIsNone(hs._read_marker(os.path.join(t, "absent")))
+
 
 class OpensslTest(unittest.TestCase):
 
     def verify(self, out):
-        return results(hs.verify_openssl(hs.load_spec(doc()), {"img-up": out}))
+        r = results(hs.verify_openssl(hs.load_spec(doc()), {"img-up": out, "img-down": out}))
+        return {c: v for c, v in r.items() if c.startswith("img-up")}
 
     def test_the_recorded_version(self):
         self.assertEqual(set(self.verify("OpenSSL 3.0.13 30 Jan 2024 (Library: OpenSSL 3.0.13)").values()),
@@ -405,31 +596,41 @@ class OpensslTest(unittest.TestCase):
 
     def test_no_answer_is_unknown(self):
         self.assertEqual(set(self.verify(rh.Unresolved("docker absent")).values()), {rh.UNKNOWN})
-
-    def test_the_image_is_asked_in_a_throwaway_container(self):
-        seen = []
-
-        def fake_run(argv, **kw):
-            seen.append(list(argv))
-            return rh.Proc(tuple(argv), 0, "OpenSSL 3.0.13 30 Jan 2024\n", "") if argv[-1] == "version" \
-                else rh.Proc(tuple(argv), 1, "", "boom")
-        orig = rh.run
-        rh.run = fake_run
-        self.addCleanup(setattr, rh, "run", orig)
-        self.assertEqual(hs.ask_openssl(["img-up"]), {"img-up": "OpenSSL 3.0.13 30 Jan 2024\n"})
-        self.assertEqual(seen[0], ["docker", "run", "--rm", "--entrypoint", "openssl", "img-up", "version"])
-        rh.run = lambda argv, **kw: rh.Proc(tuple(argv), 1, "", "no such image")
-        self.assertIsInstance(hs.ask_openssl(["img-up"])["img-up"], rh.Unresolved)
         self.assertEqual(set(self.verify("LibreSSL 3.3.6").values()), {rh.UNKNOWN})
 
+    def test_the_image_is_asked_offline_never_pulling_at_its_recorded_path(self):
+        seen = fake_docker(self, lambda argv: rh.Proc(tuple(argv), 0, "OpenSSL 3.0.13 30 Jan 2024\n", ""))
+        self.assertEqual(hs.ask_openssl({"img-down": "/usr/bin/openssl"}),
+                         {"img-down": "OpenSSL 3.0.13 30 Jan 2024\n"})
+        self.assertEqual(seen[0], ["docker", "run", "--rm", "--pull", "never", "--network", "none",
+                                   "--entrypoint", "/usr/bin/openssl", "img-down", "version"])
+        fake_docker(self, lambda argv: rh.Proc(tuple(argv), 1, "", "No such image"))
+        self.assertIsInstance(hs.ask_openssl({"img-up": "openssl"})["img-up"], rh.Unresolved)
 
-def status(uid, umask=None, name="python3"):
+    def test_the_verb_asks_each_image_at_its_recorded_path(self):
+        asked = []
+        orig = hs.ask_openssl
+        hs.ask_openssl = lambda images: asked.append(dict(images)) or {}
+        self.addCleanup(setattr, hs, "ask_openssl", orig)
+        hs.checks(hs.load_spec(doc()), production=False, lstat=lstat_of(good_fs()),
+                  digest=lambda p: hs.STUB_SHA256, containers=good_containers().get,
+                  mounts=good_mount, umasks=good_umasks)
+        self.assertEqual(asked, [{"img-up": "openssl", "img-down": "/usr/bin/openssl"}])
+
+
+def status(pid, uid, umask=None, name="python3"):
     """One /proc/<pid>/status as Linux prints it (fields trimmed to the
     ones read, in kernel order; Umask is present from Linux 4.7)."""
     s = f"Name:\t{name}\n"
     if umask is not None:
         s += f"Umask:\t{umask}\n"
-    return s + f"State:\tS (sleeping)\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\nGid:\t{GID}\t{GID}\t{GID}\t{GID}\n"
+    return s + (f"State:\tS (sleeping)\nTgid:\t{pid}\nNgid:\t0\nPid:\t{pid}\nPPid:\t1\n"
+                f"Uid:\t{uid}\t{uid}\t{uid}\t{uid}\nGid:\t{GID}\t{GID}\t{GID}\t{GID}\n")
+
+
+def probe(pid, *rows):
+    """The probe's output: its own pid, then the status files it read."""
+    return f"probe {pid}\n" + "".join(rows)
 
 
 class UmaskTest(unittest.TestCase):
@@ -439,16 +640,29 @@ class UmaskTest(unittest.TestCase):
                 hs.verify_umasks(hs.load_spec(doc()), lambda c: answers[c])}
 
     def good(self):
-        return {"ex-up": hs.parse_proc_status(status(UP, "0027") + status(UP, "0027", "sh")
-                                              + status(0, "0022", "init")),
-                "ex-down": hs.parse_proc_status(status(DOWN, "0022"))}
+        return {"ex-up": hs.parse_proc_status(probe(90, status(1, UP, "0027"), status(7, UP, "0027", "sh"),
+                                                    status(8, 0, "0022", "init"))),
+                "ex-down": hs.parse_proc_status(probe(90, status(1, DOWN, "0022")))}
 
     def test_the_declared_umask_passes(self):
         self.assertEqual({c.result for c in self.verify(self.good()).values()}, {rh.PASS})
 
+    def test_the_probes_own_shell_is_not_read_even_at_the_runtimes_uid(self):
+        a = self.good()
+        a["ex-up"] = hs.parse_proc_status(probe(90, status(1, UP, "0027"), status(90, UP, "0022", "sh")))
+        self.assertEqual(a["ex-up"], [(UP, 0o027)])
+        self.assertEqual(self.verify(a)["every process of upstream"].result, rh.PASS)
+
+    def test_a_live_container_whose_runtime_is_gone_is_unknown(self):
+        a = self.good()
+        a["ex-up"] = hs.parse_proc_status(probe(90, status(1, 0, "0022", "tini"), status(90, UP, "0027", "sh")))
+        c = self.verify(a)["every process of upstream"]
+        self.assertEqual(c.result, rh.UNKNOWN)
+        self.assertIn("no process running as uid", c.reason)
+
     def test_a_process_under_another_umask_fails_its_runtime_only(self):
         a = self.good()
-        a["ex-up"] = hs.parse_proc_status(status(UP, "0027") + status(UP, "0077", "worker"))
+        a["ex-up"] = hs.parse_proc_status(probe(90, status(1, UP, "0027"), status(5, UP, "0077", "worker")))
         r = self.verify(a)
         self.assertEqual(r["every process of upstream"].result, rh.FAIL)
         self.assertEqual(r["every process of upstream"].actual, [0o027, 0o077])
@@ -456,24 +670,17 @@ class UmaskTest(unittest.TestCase):
 
     def test_0022_where_0027_is_declared_fails(self):
         a = self.good()
-        a["ex-up"] = hs.parse_proc_status(status(UP, "0022"))
+        a["ex-up"] = hs.parse_proc_status(probe(90, status(1, UP, "0022")))
         self.assertEqual(self.verify(a)["every process of upstream"].result, rh.FAIL)
 
     def test_only_the_runtimes_own_uid_is_read(self):
         a = self.good()
-        a["ex-up"] = hs.parse_proc_status(status(UP, "0027") + status(DOWN, "0077"))
+        a["ex-up"] = hs.parse_proc_status(probe(90, status(1, UP, "0027"), status(2, DOWN, "0077")))
         self.assertEqual(self.verify(a)["every process of upstream"].result, rh.PASS)
-
-    def test_no_process_of_its_uid_is_unknown(self):
-        a = self.good()
-        a["ex-up"] = hs.parse_proc_status(status(0, "0022"))
-        c = self.verify(a)["every process of upstream"]
-        self.assertEqual(c.result, rh.UNKNOWN)
-        self.assertIn("no process running as uid", c.reason)
 
     def test_a_kernel_without_the_umask_field_is_unknown(self):
         a = self.good()
-        a["ex-up"] = hs.parse_proc_status(status(UP, "0027") + status(UP))
+        a["ex-up"] = hs.parse_proc_status(probe(90, status(1, UP, "0027"), status(2, UP)))
         self.assertEqual(self.verify(a)["every process of upstream"].result, rh.UNKNOWN)
 
     def test_no_answer_is_unknown(self):
@@ -481,76 +688,85 @@ class UmaskTest(unittest.TestCase):
         a["ex-down"] = rh.Unresolved("no such container")
         self.assertEqual(self.verify(a)["every process of downstream"].result, rh.UNKNOWN)
 
-    def test_the_running_container_is_asked_read_only(self):
-        seen = []
-
-        def fake_run(argv, **kw):
-            seen.append(list(argv))
-            return rh.Proc(tuple(argv), 0, status(UP, "0027"), "")
-        orig = rh.run
-        rh.run = fake_run
-        self.addCleanup(setattr, rh, "run", orig)
+    def test_the_running_container_is_asked_read_only_as_a_uid_no_runtime_has(self):
+        seen = fake_docker(self, lambda argv: rh.Proc(tuple(argv), 0, probe(90, status(1, UP, "0027")), ""))
         self.assertEqual(hs.ask_umasks("ex-up"), [(UP, 0o027)])
-        self.assertEqual(seen[0][:5], ["docker", "exec", "ex-up", "sh", "-c"])
-        self.assertIn("cat", seen[0][5])
-        self.assertNotIn(">", seen[0][5].replace("2>/dev/null", ""))
-        rh.run = lambda argv, **kw: rh.Proc(tuple(argv), 1, "", "No such container: ex-up")
+        argv = seen[0]
+        self.assertEqual(argv[:7], ["docker", "exec", "-u", str(hs.PROBE_UID), "ex-up", "sh", "-c"])
+        script = argv[7]
+        self.assertTrue(script.startswith('echo "probe $$";'))
+        self.assertIn('"/proc/$$/status") continue', script)
+        self.assertNotIn(">", script.replace("2>/dev/null", ""))
+        fake_docker(self, lambda argv: rh.Proc(tuple(argv), 1, "", "No such container: ex-up"))
         self.assertIsInstance(hs.ask_umasks("ex-up"), rh.Unresolved)
 
+    def test_no_runtime_may_run_as_the_probes_uid(self):
+        x = doc()
+        x["principals"]["upstream"]["uid"] = hs.PROBE_UID
+        with self.assertRaises(hs.SpecError):
+            hs.load_spec(x)
+
     def test_the_effective_uid_is_the_one_read(self):
-        text = f"Name:\tx\nUmask:\t0027\nUid:\t0\t{UP}\t{UP}\t{UP}\n"
+        text = f"probe 9\nName:\tx\nUmask:\t0027\nPid:\t3\nUid:\t0\t{UP}\t{UP}\t{UP}\n"
         self.assertEqual(hs.parse_proc_status(text), [(UP, 0o027)])
 
 
 class VerbTest(unittest.TestCase):
     """The verb: the plan, then the checks, and an exit status that counts an
     UNKNOWN as a problem. Docker is never reached: conftest refuses it, and
-    the openssl answer is UNKNOWN."""
+    each probe here is a fake."""
 
     def write(self, x):
-        import tempfile
         p = os.path.join(tempfile.mkdtemp(), "host-setup.json")
         with open(p, "w") as f:
             json.dump(x, f)
         return p
 
+    def probes(self, **kw):
+        kw.setdefault("digest", lambda p: hs.STUB_SHA256)
+        kw.setdefault("containers", good_containers().get)
+        kw.setdefault("mounts", good_mount)
+        kw.setdefault("umasks", good_umasks)
+        return kw
+
     def run_verb(self, x, fs, **kw):
         lines = []
-        kw.setdefault("digest", lambda p: hs.STUB_SHA256)
-        kw.setdefault("mounts", lambda image, host, container, marker: ((4242, UP, GID, 0o2750), None))
-        kw.setdefault("umasks", lambda c: [(UP, 0o027)] if c == "ex-up" else [(DOWN, 0o022)])
-        rc = hs.run(None if x is None else self.write(x), production=False, lstat=lstat_of(fs), out=lines.append, **kw)
+        rc = hs.run(None if x is None else self.write(x), production=False, lstat=lstat_of(fs),
+                    out=lines.append, **self.probes(**kw))
         return rc, "\n".join(lines)
 
+    OPENSSL = {"img-up": "OpenSSL 3.0.13 x", "img-down": "OpenSSL 3.0.13 x"}
+
     def test_a_good_host_with_its_openssl_reported_exits_0(self):
-        rc, out = self.run_verb(doc(), good_fs(), openssl={"img-up": "OpenSSL 3.0.13 x"})
+        rc, out = self.run_verb(doc(), good_fs(), openssl=self.OPENSSL)
         self.assertEqual(rc, 0, out)
         self.assertIn("Nothing here has run", out)
 
     def test_unknown_is_a_problem(self):
-        rc, out = self.run_verb(doc(), good_fs())
+        rc, out = self.run_verb(doc(), good_fs(), openssl={})
         self.assertEqual(rc, 1)
         self.assertIn("UNKNOWN", out)
 
     def test_a_failure_names_its_fix(self):
         fs = good_fs()
         fs["/srv/example/a/b"] = d(0o2777, UP, GID)
-        rc, out = self.run_verb(doc(), fs, openssl={"img-up": "OpenSSL 3.0.13 x"})
+        rc, out = self.run_verb(doc(), fs, openssl=self.OPENSSL)
         self.assertEqual(rc, 1)
-        self.assertIn("fix: run the plan's `install -d` line for /srv/example/a/b", out)
+        self.assertIn("fix: run the plan's `root` step for /srv/example/a/b", out)
 
     def test_an_unusable_document_is_refused(self):
-        rc, out = self.run_verb({"schema": "other"}, good_fs())
-        self.assertEqual(rc, 2)
+        for bad in ({"schema": "other"}, {"schema": hs.SPEC_SCHEMA}):
+            rc, out = self.run_verb(bad, good_fs())
+            self.assertEqual(rc, 2, out)
 
     def test_the_document_can_come_from_the_overlays_section(self):
         overlay = self.write({"registry": {}, "host_setup": doc()})
-        rc, out = self.run_verb(None, good_fs(), openssl={"img-up": "OpenSSL 3.0.13 x"}, overlay=overlay)
+        rc, out = self.run_verb(None, good_fs(), openssl=self.OPENSSL, overlay=overlay)
         self.assertEqual(rc, 0, out)
 
     def test_spec_wins_over_the_overlay(self):
         overlay = self.write({"host_setup": {"schema": "other"}})
-        rc, out = self.run_verb(doc(), good_fs(), openssl={"img-up": "OpenSSL 3.0.13 x"}, overlay=overlay)
+        rc, out = self.run_verb(doc(), good_fs(), openssl=self.OPENSSL, overlay=overlay)
         self.assertEqual(rc, 0, out)
 
     def test_neither_a_spec_nor_an_overlay_section_is_refused(self):
@@ -562,12 +778,97 @@ class VerbTest(unittest.TestCase):
         self.assertIn("has no 'host_setup' object", out)
 
     def test_a_wrong_umask_fails_the_verb(self):
-        rc, out = self.run_verb(doc(), good_fs(), openssl={"img-up": "OpenSSL 3.0.13 x"},
+        rc, out = self.run_verb(doc(), good_fs(), openssl=self.OPENSSL,
                                 umasks=lambda c: [(UP, 0o077)] if c == "ex-up" else [(DOWN, 0o022)])
         self.assertEqual(rc, 1)
         self.assertIn("FAIL    every process of upstream (uid 2101) in ex-up runs under umask 0027", out)
         self.assertIn("fix: set UMask=0027 in upstream's service unit", out)
 
 
+class VerifySectionTest(unittest.TestCase):
+    """verify's host-setup part: configured by the overlay's section."""
+
+    def write(self, x):
+        p = os.path.join(tempfile.mkdtemp(), "overlay.json")
+        with open(p, "w") as f:
+            json.dump(x, f)
+        return p
+
+    def section(self, overlay, **kw):
+        lines = []
+        kw.setdefault("lstat", lstat_of(good_fs()))
+        kw.setdefault("digest", lambda p: hs.STUB_SHA256)
+        kw.setdefault("containers", good_containers().get)
+        kw.setdefault("mounts", good_mount)
+        kw.setdefault("umasks", good_umasks)
+        kw.setdefault("openssl", VerbTest.OPENSSL)
+        rc = hs.verify_section(overlay, out=lines.append, **kw)
+        return rc, "\n".join(lines)
+
+    def test_no_overlay_is_not_configured(self):
+        self.assertEqual(self.section(None), (0, ""))
+
+    def test_an_overlay_without_the_section_says_so(self):
+        rc, out = self.section(self.write({"registry": {}}))
+        self.assertEqual(rc, 0)
+        self.assertIn("not checked", out)
+
+    def test_a_configured_good_host_passes(self):
+        rc, out = self.section(self.write({"host_setup": doc()}))
+        self.assertEqual(rc, 0, out)
+        self.assertIn("PASS", out)
+
+    def test_an_unknown_fails_verify(self):
+        rc, out = self.section(self.write({"host_setup": doc()}), umasks=lambda c: rh.Unresolved("down"))
+        self.assertEqual(rc, 1)
+
+    def test_an_unusable_section_fails_verify(self):
+        for bad in ({"host_setup": {"schema": hs.SPEC_SCHEMA}}, {"host_setup": []}):
+            rc, out = self.section(self.write(bad))
+            self.assertEqual(rc, 1, out)
+            self.assertIn("UNKNOWN host setup", out)
+        rc, out = self.section("/nonexistent/overlay.json")
+        self.assertEqual(rc, 1)
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class VerifyRunsTheHostSetupTest(unittest.TestCase):
+    """`verify` itself runs the configured host-setup checks: the install
+    and fleet parts are made to pass, so the host setup is the only thing
+    that can decide the exit status. Docker is refused by conftest, so
+    every container probe is UNKNOWN."""
+
+    def verify(self, overlay):
+        import io
+        from contextlib import redirect_stdout
+        from pathlib import Path
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        import amap_sandy as prov
+        args = SimpleNamespace(host_facts=None, servers=prov.DEFAULT_SERVERS, overlay=overlay)
+        buf = io.StringIO()
+        with patch.object(prov, "run_provision", lambda *a, **k: 0), \
+                patch.object(prov, "run_verify", lambda *a, **k: 0), redirect_stdout(buf):
+            rc = prov.run_verify_command(args, Path(tempfile.mkdtemp()), Path(tempfile.mkdtemp()))
+        return rc, buf.getvalue()
+
+    def write(self, x):
+        p = os.path.join(tempfile.mkdtemp(), "overlay.json")
+        with open(p, "w") as f:
+            json.dump(x, f)
+        return p
+
+    def test_a_configured_host_setup_that_cannot_be_checked_fails_verify(self):
+        rc, out = self.verify(self.write({"host_setup": doc()}))
+        self.assertEqual(rc, 1, out)
+        self.assertIn("verify: the hop deployment's host setup", out)
+        self.assertIn("UNKNOWN", out)
+
+    def test_without_the_section_or_an_overlay_verify_is_unchanged(self):
+        self.assertEqual(self.verify(None), (0, "verify (1/2): is the install up to date?\n\n"
+                                               "verify (2/2): the checks the install cannot make\n"))
+        rc, out = self.verify(self.write({"registry": {}}))
+        self.assertEqual(rc, 0, out)

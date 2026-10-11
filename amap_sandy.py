@@ -4666,6 +4666,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 2
 
 
+def run_verify_host_setup(args: argparse.Namespace) -> int:
+    """verify's host-setup part: when the deployment overlay has a
+    `host_setup` section, every `host-setup` check, with an UNKNOWN a
+    problem like a FAIL. Silent without an overlay. `--host-facts` does not
+    carry these checks; its shape is the router's contract."""
+    overlay = ha.overlay_path(getattr(args, "overlay", None))
+    if overlay is None:
+        return 0
+    print("\nverify: the hop deployment's host setup")
+    return hsu.verify_section(overlay)
+
+
 def run_verify_command(args: argparse.Namespace, home: Path, boxes_dir: Path) -> int:
     """verify: the staleness question first, through the same path install
     answers it on, because "is the host installed at all" is a precondition
@@ -4684,7 +4696,8 @@ def run_verify_command(args: argparse.Namespace, home: Path, boxes_dir: Path) ->
                                  notes_out=install_notes)
         print("\nverify (2/2): the checks the install cannot make")
         live_rc = run_verify(args, servers, home, boxes_dir, facts, install_notes=install_notes)
-        rc = stale_rc or live_rc
+        hop_rc = run_verify_host_setup(args)
+        rc = stale_rc or live_rc or hop_rc
         return rc
     finally:
         if facts is not None:

@@ -1,47 +1,61 @@
 """The host setup a hop deployment needs before its runtimes start: distinct
 uids, the hop group, the configured roots with their owners and modes, and
-the plugin overlay. Rendered as a plan for the operator; checked by verify.
-NOTHING HERE APPLIES ANYTHING: every change is a printed step that the
-operator runs as root.
+the plugin overlay. Rendered as a plan for the operator; checked by
+`host-setup` and by `verify`. NOTHING HERE APPLIES ANYTHING: every change is
+a printed step that the operator runs as root.
 
 The plan is DATA, not code. A host's setup is a JSON document (`SPEC_SCHEMA`)
 that names the principals (one uid per runtime), the groups, the hops (which
-principal is upstream of which), every root directory with its owner, group,
-mode and the principals that must reach it, and the overlay. This module
-knows no runtime's directory names; the document supplies them.
+principal is upstream of which), the runtimes (each hop principal's running
+container, its image and its umask), every root directory with its owner,
+group, mode and the principals that must reach it, each runtime's mounts of
+those roots, each image's openssl, and the overlay. This module knows no
+runtime's directory names; the document supplies them. A document that
+leaves a hop principal without its runtime or its mounts, or an image
+without its openssl record, does not load: a check that was never
+configured must not read as a check that passed.
 
-What it renders, in order:
-1. one `install -d` per root, parents before children, so each is created with
-   its owner, group and mode in one step;
+What it renders, in order, as calls to `host_steps.py`, which reaches every
+path from `/` without following a symbolic link:
+1. each root, parents before children, created or re-owned and re-moded
+   through its own descriptor; a non-directory at a root path stops the step;
 2. a barrier that fsyncs each root and every ancestor, so a root's entry is
    durable before a runtime opens it (a runtime cannot make durable the top
    of a bind-mounted tree from inside it);
-3. the overlay file, root-owned and 0444;
-4. each runtime's peer-uid variable (named per hop): the uid on the other side of its hop;
-5. each hop runtime's umask, 0027 or 0022, set in its service unit or launcher,
-   and the rule that no runtime starts before the steps above.
+3. the overlay file, root-owned and 0444, renamed into place;
+4. each root marker, created exclusively;
+5. each runtime's peer-uid variable (named per hop): the uid on the other side of its hop;
+6. each hop runtime's umask, set in its service unit or launcher, and the
+   rule that no runtime starts before the steps above.
 
-What verify checks, through router_health's three outcomes:
-- every root exists as a real directory with the planned owner, group and mode;
-- every principal that must reach a root can READ and SEARCH every ancestor
-  and the root itself: a directory is opened to be fsynced, so an
-  execute-only ancestor fails a runtime's write;
+What it checks, through router_health's three outcomes:
+- every root, and every ancestor of it, is a real directory (a symbolic link
+  never is), and each root has the planned owner, group and mode;
+- every principal that must reach a root can READ and SEARCH each directory
+  from the top of its own mount down to the root (from `/` where no mount of
+  it holds the root): a directory is opened to be fsynced, so an
+  execute-only one fails a runtime's write;
 - the overlay is a regular file, owned by root, mode 0444, outside every
-  agent path, whose bytes hash to its pin;
-- a pin equal to the stub plugin's digest is the stub, never production;
-- each runtime's declared durable root, seen from a throwaway container with
-  the runtime's own mount, is the host directory the plan created and
-  synced (same-device ancestry inside a container proves nothing);
-- an image's openssl, as the image reports it, is at least the recorded floor
-  and is the recorded version; no floor below 3.0 is accepted;
-- every process of a hop runtime, as its running container reports it, runs
+  agent path, whose bytes hash to its pin; a production pin is not the stub;
+- each runtime's running container is the declared image, binds each
+  declared root at its declared path, and that path, seen inside the
+  running container, is the host directory the plan created (by inode,
+  owner, group and mode, or by the root's marker);
+- each image's openssl, as the image reports it, is the recorded version and
+  at least the recorded floor; no floor below 3.0 loads;
+- every process of a hop runtime, read from its running container, runs
   under the runtime's declared umask.
+
+None of these can see whether the barrier ran: durability rests on the plan
+having run before any runtime started.
 
 The umask is not taste. A runtime asks for 0750 item and 0700 .stage
 directories; a umask that strips a requested bit would need an fchmod after
 the mkdir, and a crash between the two leaves a narrowed directory that every
 later call refuses. Under 0027 or 0022 no requested bit is stripped, so that
-window does not exist. The runbook says what to do with a refused leftover.
+window does not exist. A runtime whose other paths create directories under
+the umask alone may need 0027 only, which its record pins with `umasks`.
+The runbook says what to do with a refused leftover.
 """
 
 import hashlib
@@ -63,6 +77,7 @@ OVERLAY_SECTION = "host_setup"
 
 HERE = Path(__file__).resolve().parent
 STUB_PLUGIN = HERE / "overlay" / "stub-plugin.py"
+HOST_STEPS = HERE / "host_steps.py"
 #: The stub's digest. A pin equal to it is plumbing, never production.
 STUB_SHA256 = "cb88b58e3bad8cb111572732edc0f807d22370644813f9c4c52fba15daad160d"
 #: The stub has no source commit; its pin says so with the all-zero commit.
@@ -75,13 +90,19 @@ _MODE_RE = re.compile(r"[0-7]{3,4}")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _COMMIT_RE = re.compile(r"[0-9a-f]{40}")
 _OPENSSL_RE = re.compile(r"OpenSSL (\d+)\.(\d+)\.(\d+)")
+_CONTAINER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 _R, _W, _X = 4, 2, 1
 #: The umasks a hop runtime may run under: neither strips a bit of 0750 or 0700.
 UMASKS = {"0027": 0o027, "0022": 0o022}
 #: The lowest openssl the plugin's pkeyutl -rawin fallback may run on.
 OPENSSL_FLOOR_MIN = (3, 0)
+#: The uid the in-container probes run as. No runtime may run as it, so a
+#: probe's own processes are never read as a runtime's.
+PROBE_UID = 0
 _UMASK_FIELD = re.compile(r"^Umask:\s*([0-7]{4})\s*$", re.M)
 _UID_FIELD = re.compile(r"^Uid:\s*(\d+)\s+(\d+)", re.M)
+_PID_FIELD = re.compile(r"^Pid:\s*(\d+)\s*$", re.M)
+_PROBE_LINE = re.compile(r"\Aprobe (\d+)\n")
 
 
 class SpecError(ValueError):
@@ -114,9 +135,13 @@ class Spec:
     overlay_path: Optional[str]
     overlay_pin: Optional[Dict[str, str]]
     agent_paths: Tuple[str, ...]
-    openssl: Dict[str, Dict[str, Any]]          # image -> {version, floor, source}
-    mounts: Tuple[Dict[str, str], ...] = ()     # {principal, image, host, container}
-    runtimes: Tuple[Dict[str, Any], ...] = ()   # {principal, container, umask}
+    openssl: Dict[str, Dict[str, Any]]          # image -> {version, floor, source, path}
+    mounts: Tuple[Dict[str, str], ...] = ()     # {principal, host, container, marker?}
+    runtimes: Tuple[Dict[str, Any], ...] = ()   # {principal, container, image, umask, umasks}
+    production: bool = False
+
+    def runtime_of(self, principal: str) -> Dict[str, Any]:
+        return next(r for r in self.runtimes if r["principal"] == principal)
 
 
 def _abs_normal(p: Any, what: str) -> str:
@@ -131,16 +156,27 @@ def _int(v: Any, what: str) -> int:
     return v
 
 
+def _umask(v: Any, what: str) -> int:
+    if not isinstance(v, str) or v not in UMASKS:
+        raise SpecError(f"{what} must be one of {', '.join(sorted(UMASKS, reverse=True))}: "
+                        f"any other strips a bit a hop directory's requested mode needs")
+    return UMASKS[v]
+
+
 def load_spec(doc: Any) -> Spec:
     """Parse and validate a host-setup document. Refuses rather than guesses:
     an unknown member, a shared uid on a hop, a root uid for a runtime, an
-    owner or group nobody declared."""
+    owner or group nobody declared, and any hop principal or image left
+    without what its checks need."""
     if not isinstance(doc, dict) or doc.get("schema") != SPEC_SCHEMA:
         raise SpecError(f"the document is not a {SPEC_SCHEMA} host setup")
     known = {"schema", "principals", "groups", "hops", "roots", "overlay", "agent_paths", "openssl",
-             "mounts", "runtimes"}
+             "mounts", "runtimes", "production"}
     if set(doc) - known:
         raise SpecError(f"unknown member(s): {', '.join(sorted(set(doc) - known))}")
+    production = doc.get("production", False)
+    if not isinstance(production, bool):
+        raise SpecError("production must be true or false")
     groups = {}
     for g, gid in (doc.get("groups") or {}).items():
         groups[g] = _int(gid, f"groups.{g}")
@@ -149,7 +185,7 @@ def load_spec(doc: Any) -> Spec:
         if not isinstance(p, dict) or set(p) != {"uid", "groups"}:
             raise SpecError(f"principals.{name} must have exactly uid and groups")
         uid = _int(p["uid"], f"principals.{name}.uid")
-        if uid == 0:
+        if uid == PROBE_UID:
             raise SpecError(f"principals.{name}: a runtime never runs as root")
         if not isinstance(p["groups"], list) or not p["groups"]:
             raise SpecError(f"principals.{name}.groups must name at least its primary group")
@@ -172,11 +208,15 @@ def load_spec(doc: Any) -> Spec:
             raise SpecError(f"hop {h['name']}: both sides run as uid "
                             f"{principals[h['upstream']].uid}; each side needs its own uid")
         hops.append((h["name"], h["upstream"], h["downstream"], h["peer_uid_env"]))
+    if not hops:
+        raise SpecError("the document names no hop: there is nothing to set up or check")
     roots = []
     for i, r in enumerate(doc.get("roots") or []):
         if not isinstance(r, dict) or set(r) != {"path", "owner", "group", "mode", "readers", "purpose"}:
             raise SpecError(f"roots[{i}] must have exactly path, owner, group, mode, readers, purpose")
         path = _abs_normal(r["path"], f"roots[{i}].path")
+        if path == "/":
+            raise SpecError(f"roots[{i}].path cannot be /")
         if r["owner"] not in principals:
             raise SpecError(f"roots[{i}]: owner {r['owner']!r} is not a principal")
         if r["group"] not in groups:
@@ -199,8 +239,9 @@ def load_spec(doc: Any) -> Spec:
     agent_paths = tuple(_abs_normal(p, "agent_paths[]") for p in doc.get("agent_paths") or [])
     openssl = {}
     for image, rec in (doc.get("openssl") or {}).items():
-        if not isinstance(rec, dict) or set(rec) != {"version", "floor", "source"}:
-            raise SpecError(f"openssl.{image} must have exactly version, floor and source")
+        if not isinstance(rec, dict) or not {"version", "floor", "source"} <= set(rec) \
+                or set(rec) - {"version", "floor", "source", "path"}:
+            raise SpecError(f"openssl.{image} must have version, floor and source, and optionally path")
         if openssl_version(f"OpenSSL {rec['version']}") is None:
             raise SpecError(f"openssl.{image}.version must be X.Y.Z")
         if not isinstance(rec["floor"], str) or not re.fullmatch(r"\d+\.\d+", rec["floor"]):
@@ -211,42 +252,64 @@ def load_spec(doc: Any) -> Spec:
                             f"the lowest the plugin's pkeyutl -rawin fallback may run on")
         if openssl_version(f"OpenSSL {rec['version']}")[:2] < floor:
             raise SpecError(f"openssl.{image}.version is below its own floor")
-        openssl[image] = {"version": rec["version"], "source": str(rec["source"]), "floor": floor}
+        binary = _abs_normal(rec["path"], f"openssl.{image}.path") if "path" in rec else "openssl"
+        openssl[image] = {"version": rec["version"], "source": str(rec["source"]), "floor": floor,
+                          "path": binary}
+    runtimes = []
+    for i, r in enumerate(doc.get("runtimes") or []):
+        if not isinstance(r, dict) or not {"principal", "container", "image", "umask"} <= set(r) \
+                or set(r) - {"principal", "container", "image", "umask", "umasks"}:
+            raise SpecError(f"runtimes[{i}] must have principal, container, image and umask, "
+                            f"and optionally umasks")
+        if r["principal"] not in principals:
+            raise SpecError(f"runtimes[{i}]: principal {r['principal']!r} is not declared")
+        if not isinstance(r["container"], str) or not _CONTAINER_RE.fullmatch(r["container"]):
+            raise SpecError(f"runtimes[{i}].container must be a container name")
+        if not isinstance(r["image"], str) or not r["image"]:
+            raise SpecError(f"runtimes[{i}].image must name the runtime's image")
+        if r["image"] not in openssl:
+            raise SpecError(f"runtimes[{i}]: image {r['image']!r} has no openssl record")
+        allowed = r.get("umasks", sorted(UMASKS, reverse=True))
+        if not isinstance(allowed, list) or not allowed:
+            raise SpecError(f"runtimes[{i}].umasks must list the umasks this runtime may run under")
+        allowed_set = {_umask(u, f"runtimes[{i}].umasks[]") for u in allowed}
+        umask = _umask(r["umask"], f"runtimes[{i}].umask")
+        if umask not in allowed_set:
+            raise SpecError(f"runtimes[{i}].umask {r['umask']} is not one this runtime allows "
+                            f"({', '.join(allowed)})")
+        runtimes.append({"principal": r["principal"], "container": r["container"], "image": r["image"],
+                         "umask": umask, "umasks": tuple(sorted(allowed_set, reverse=True))})
+    if len({r["container"] for r in runtimes}) != len(runtimes):
+        raise SpecError("a runtime's container is listed twice")
     root_paths = {r.path for r in roots}
     mounts = []
     for i, m in enumerate(doc.get("mounts") or []):
-        if not isinstance(m, dict) or not {"principal", "image", "host", "container"} <= set(m) \
-                or set(m) - {"principal", "image", "host", "container", "marker"}:
-            raise SpecError(f"mounts[{i}] must have principal, image, host and container, "
-                            f"and optionally marker")
+        if not isinstance(m, dict) or not {"principal", "host", "container"} <= set(m) \
+                or set(m) - {"principal", "host", "container", "marker"}:
+            raise SpecError(f"mounts[{i}] must have principal, host and container, and optionally marker")
         if "marker" in m and (not isinstance(m["marker"], str)
                               or not re.fullmatch(r"[A-Za-z0-9._-]+", m["marker"]) or m["marker"] in (".", "..")):
             raise SpecError(f"mounts[{i}].marker must be one file name inside the root")
         if m["principal"] not in principals:
             raise SpecError(f"mounts[{i}]: principal {m['principal']!r} is not declared")
+        if not any(r["principal"] == m["principal"] for r in runtimes):
+            raise SpecError(f"mounts[{i}]: {m['principal']} has no runtime to hold this mount")
         if _abs_normal(m["host"], f"mounts[{i}].host") not in root_paths:
             raise SpecError(f"mounts[{i}].host must be one of the roots: a runtime's durable "
                             f"root is a directory this plan creates and syncs")
         _abs_normal(m["container"], f"mounts[{i}].container")
-        if not isinstance(m["image"], str) or not m["image"]:
-            raise SpecError(f"mounts[{i}].image must name the runtime's image")
-        mounts.append({k: m[k] for k in ("principal", "image", "host", "container", "marker") if k in m})
-    runtimes = []
-    for i, r in enumerate(doc.get("runtimes") or []):
-        if not isinstance(r, dict) or set(r) != {"principal", "container", "umask"}:
-            raise SpecError(f"runtimes[{i}] must have exactly principal, container and umask")
-        if r["principal"] not in principals:
-            raise SpecError(f"runtimes[{i}]: principal {r['principal']!r} is not declared")
-        if not isinstance(r["container"], str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", r["container"]):
-            raise SpecError(f"runtimes[{i}].container must be a container name")
-        if r["umask"] not in UMASKS:
-            raise SpecError(f"runtimes[{i}].umask must be one of {', '.join(sorted(UMASKS, reverse=True))}: "
-                            f"any other strips a bit a hop directory's requested mode needs")
-        runtimes.append({"principal": r["principal"], "container": r["container"], "umask": UMASKS[r["umask"]]})
-    if len({r["container"] for r in runtimes}) != len(runtimes):
-        raise SpecError("a runtime's container is listed twice")
+        mounts.append({k: m[k] for k in ("principal", "host", "container", "marker") if k in m})
+    hop_principals = sorted({p for _, up, down, _ in hops for p in (up, down)})
+    for p in hop_principals:
+        n = sum(1 for r in runtimes if r["principal"] == p)
+        if n != 1:
+            raise SpecError(f"hop principal {p} has {n} runtimes entries; it needs exactly one, "
+                            f"so its container and umask are checked")
+        if not any(m["principal"] == p for m in mounts):
+            raise SpecError(f"hop principal {p} has no mounts entry; its durable root must be declared "
+                            f"so the running container's mount is checked")
     return Spec(principals, groups, tuple(hops), tuple(roots), ov_path, ov_pin, agent_paths, openssl,
-                tuple(mounts), tuple(runtimes))
+                tuple(mounts), tuple(runtimes), production)
 
 
 def parse_pin(pin: Any) -> Optional[Dict[str, str]]:
@@ -304,26 +367,23 @@ def _ancestors(path: str) -> List[str]:
 def render_plan(spec: Spec, overlay_source: Optional[Path] = None) -> List[str]:
     """The root-run steps, in order, as shell lines. Printed, never run."""
     q = shlex.quote
-    lines = ["# Run as root. Each line is one step; nothing here has run."]
+    steps = f"python3 {q(str(HOST_STEPS))}"
+    lines = ["# Run as root. Each line is one step; nothing here has run. No step follows a "
+             "symbolic link, and each is safe to run again."]
     for r in sorted(spec.roots, key=lambda r: (r.path.count("/"), r.path)):
         p = spec.principals[r.owner]
-        lines.append(f"install -d -o {p.uid} -g {spec.groups[r.group]} -m {r.mode:04o} {q(r.path)}"
-                     f"  # {r.purpose}")
+        lines.append(f"{steps} root {q(r.path)} {p.uid} {spec.groups[r.group]} {r.mode:04o}  # {r.purpose}")
     sync_dirs = sorted({a for r in spec.roots for a in _ancestors(r.path)} | {r.path for r in spec.roots},
                        key=lambda d: (-d.count("/"), d))
-    if sync_dirs:
-        lines.append("# The barrier: each root and every ancestor fsynced, deepest first.")
-        lines.append("python3 -c 'import os,sys\nfor d in sys.argv[1:]:\n    fd = os.open(d, os.O_RDONLY)\n"
-                     "    os.fsync(fd); os.close(fd)' " + " ".join(q(d) for d in sync_dirs))
+    lines.append("# The barrier: each root and every ancestor fsynced, deepest first.")
+    lines.append(f"{steps} sync " + " ".join(q(d) for d in sync_dirs))
     if spec.overlay_path is not None and spec.overlay_pin is not None:
         src = q(str(overlay_source)) if overlay_source else "<the pinned plugin artifact>"
-        lines.append(f"install -o {OVERLAY_OWNER_UID} -g 0 -m {OVERLAY_MODE:04o} {src} "
-                     f"{q(spec.overlay_path)}  # the overlay; sha256 must be {spec.overlay_pin['sha256']}")
+        lines.append(f"{steps} place {src} {q(spec.overlay_path)}"
+                     f"  # the overlay, root-owned 0444; sha256 must be {spec.overlay_pin['sha256']}")
     for m in spec.mounts:
         if "marker" in m:
-            path = posixpath.join(m["host"], m["marker"])
-            lines.append(f"sh -c 'umask 222; head -c 16 /dev/urandom | od -An -tx1 | tr -d \" \\n\" > \"$1\"' "
-                         f"sh {q(path)} && chown 0:0 {q(path)} && chmod 0444 {q(path)}"
+            lines.append(f"{steps} marker {q(posixpath.join(m['host'], m['marker']))}"
                          f"  # {m['principal']}'s root marker: random, root-owned, read-only")
     for (name, env), uid in sorted(peer_uids(spec).items()):
         lines.append(f"# {name}'s runtime environment: {env}={uid}")
@@ -361,15 +421,36 @@ def _lstat(path: str, lstat: Callable) -> Any:
         return rh.Unresolved(f"cannot inspect {path}: {e}")
 
 
+def _reach_from(spec: Spec, principal: str, root: str) -> str:
+    """Where `principal`'s reach to `root` begins: the deepest host path of
+    its own mounts that holds the root, or `/` where none does. A directory
+    above a container's mount is invisible to it."""
+    tops = [m["host"] for m in spec.mounts if m["principal"] == principal
+            and (root == m["host"] or root.startswith(m["host"] + "/"))]
+    return max(tops, key=len) if tops else "/"
+
+
 def verify_roots(spec: Spec, lstat: Callable = os.lstat) -> List[rh.Check]:
     checks: List[rh.Check] = []
     for r in spec.roots:
         src = f"the host setup's root for {r.purpose}"
         owner = spec.principals[r.owner]
+        chain = _ancestors(r.path)
+        sts = {d: _lstat(d, lstat) for d in chain}
+        bad = next((d for d in chain if isinstance(sts[d], rh.Unresolved)
+                    or sts[d] is None or not stat.S_ISDIR(sts[d].st_mode)), None)
+        anc_claim = f"every ancestor of {r.path} is a real directory"
+        anc_want = _fact("ancestors", True, "the plan's steps and barrier follow no symbolic link")
+        if bad is not None and isinstance(sts[bad], rh.Unresolved):
+            checks.append(rh.unknown(anc_claim, anc_want, sts[bad].reason, f"inspect {bad}"))
+        else:
+            checks.append(rh.check(anc_claim, anc_want, bad is None,
+                                   f"replace {bad} with a real directory" if bad else "nothing",
+                                   do_not="never point a symlink at another directory to satisfy this"))
         st = _lstat(r.path, lstat)
         want = _fact("root", (owner.uid, spec.groups[r.group], r.mode), src)
         claim = f"{r.path} is a directory owned by {owner.uid}:{spec.groups[r.group]}, mode {r.mode:04o}"
-        remedy = f"run the plan's `install -d` line for {r.path}, as root"
+        remedy = f"run the plan's `root` step for {r.path}, as root"
         if isinstance(st, rh.Unresolved):
             checks.append(rh.unknown(claim, want, st.reason, remedy))
             continue
@@ -380,27 +461,30 @@ def verify_roots(spec: Spec, lstat: Callable = os.lstat) -> List[rh.Check]:
             continue
         checks.append(rh.check(claim, want, (st.st_uid, st.st_gid, stat.S_IMODE(st.st_mode)), remedy,
                                do_not="never widen the mode to make a runtime's write succeed"))
+        sts[r.path] = st
         for name in r.readers:
             p = spec.principals[name]
+            top = _reach_from(spec, name, r.path)
+            walk = [d for d in chain + [r.path] if d == top or d.startswith(top.rstrip("/") + "/")]
             blocked: Any = None
-            for d in _ancestors(r.path) + [r.path]:
-                dst = _lstat(d, lstat)
+            for d in walk:
+                dst = sts[d]
                 if isinstance(dst, rh.Unresolved):
                     blocked = dst
                     break
                 if dst is None or not _can(dst, p.uid, p.gids, _R | _X):
                     blocked = d
                     break
-            reach = f"{name} (uid {p.uid}) can read and search every directory down to {r.path}"
+            reach = f"{name} (uid {p.uid}) can read and search every directory from {top} down to {r.path}"
             want_r = _fact("reach", True, f"{src}: {name} is one of its readers")
             fix = (f"make {blocked} readable AND searchable by uid {p.uid} or one of its groups; "
-                   f"a runtime opens each ancestor to fsync it") if isinstance(blocked, str) else \
-                  f"inspect {r.path}'s ancestors as uid {p.uid}"
+                   f"a runtime opens each directory below its mount to fsync it") if isinstance(blocked, str) \
+                else f"inspect {r.path}'s ancestors as uid {p.uid}"
             if isinstance(blocked, rh.Unresolved):
                 checks.append(rh.unknown(reach, want_r, blocked.reason, fix))
             else:
                 checks.append(rh.check(reach, want_r, blocked is None, fix,
-                                       do_not="an execute-only ancestor is not enough"))
+                                       do_not="an execute-only directory is not enough"))
     return checks
 
 
@@ -427,7 +511,7 @@ def verify_overlay(spec: Spec, *, production: bool, lstat: Callable = os.lstat,
     st = _lstat(path, lstat)
     want = _fact("overlay", (OVERLAY_OWNER_UID, OVERLAY_MODE), "the overlay rule: root-owned, 0444")
     claim = f"the overlay {path} is a regular file owned by root, mode 0444"
-    remedy = "run the plan's overlay `install` line, as root"
+    remedy = "run the plan's overlay `place` step, as root"
     if isinstance(st, rh.Unresolved):
         checks.append(rh.unknown(claim, want, st.reason, remedy))
     elif st is None or not stat.S_ISREG(st.st_mode):
@@ -472,6 +556,60 @@ def verify_openssl(spec: Spec, reported: Dict[str, Any]) -> List[rh.Check]:
     return checks
 
 
+# --- The running containers -----------------------------------------------------
+
+
+def _exec(container: str, script: str, *args: str) -> Any:
+    """`docker exec` as the probe uid into the RUNNING container: stdout, or an
+    Unresolved naming why it could not be asked. The scripts only read."""
+    try:
+        p = rh.run(["docker", "exec", "-u", str(PROBE_UID), container, "sh", "-c", script, "sh", *args])
+    except rh.CannotRun as e:
+        return rh.Unresolved(str(e))
+    if p.rc != 0:
+        return rh.Unresolved(f"`docker exec` into {container} exited {p.rc}: {p.err.strip()[:200]}")
+    return p.out
+
+
+def ask_container(container: str) -> Any:
+    """`{"image", "binds"}` of the RUNNING container, from `docker inspect`:
+    its configured image and each bind mount as `(source, destination)`, or
+    an Unresolved. A container that is not running is an Unresolved."""
+    try:
+        p = rh.run(["docker", "inspect", "-f", "{{json .State.Running}}\t{{json .Config.Image}}\t"
+                    "{{json .Mounts}}", container])
+    except rh.CannotRun as e:
+        return rh.Unresolved(str(e))
+    if p.rc != 0:
+        return rh.Unresolved(f"`docker inspect {container}` exited {p.rc}: {p.err.strip()[:200]}")
+    try:
+        running, image, mounts = (json.loads(x) for x in p.out.strip().split("\t"))
+    except ValueError:
+        return rh.Unresolved(f"`docker inspect {container}` printed {p.out.strip()[:80]!r}")
+    if running is not True:
+        return rh.Unresolved(f"{container} is not running")
+    if not isinstance(image, str) or not isinstance(mounts, list):
+        return rh.Unresolved(f"`docker inspect {container}` printed no image or mount table")
+    binds = [(m.get("Source"), m.get("Destination")) for m in mounts
+             if isinstance(m, dict) and m.get("Type") == "bind"]
+    return {"image": image, "binds": binds}
+
+
+def ask_mount(container: str, path: str, marker: Optional[str] = None) -> Any:
+    """`(identity, marker content or None)` of `path` as the RUNNING container
+    `container` sees it, or an Unresolved. Read-only: stat and cat."""
+    out = _exec(container, 'stat -c "%i %u %g %a" "$1" && if [ -n "$2" ]; then cat "$1/$2"; fi',
+                path, marker or "")
+    if isinstance(out, rh.Unresolved):
+        return out
+    first, _, rest = out.partition("\n")
+    parts = first.split()
+    if len(parts) != 4 or not all(x.isdigit() for x in parts):
+        return rh.Unresolved(f"stat in {container} printed {first.strip()[:80]!r}")
+    ident = (int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3], 8))
+    return ident, (rest.strip() if marker else None)
+
+
 def _identity(st) -> Tuple[int, int, int, int]:
     """What a directory is, as both the host and a container can see it:
     inode, owner, group, permission bits. The device number is left out: it
@@ -480,64 +618,72 @@ def _identity(st) -> Tuple[int, int, int, int]:
     return (st.st_ino, st.st_uid, st.st_gid, stat.S_IMODE(st.st_mode))
 
 
-def ask_mount(image: str, host: str, container: str, marker: Optional[str] = None) -> Any:
-    """`(identity, marker content or None)` of `container` as a throwaway
-    container of `image` sees it, with `host` bind-mounted there read-only,
-    exactly as the runtime declares it. Read-only; nothing is written."""
-    try:
-        p = rh.run(["docker", "run", "--rm", "--network", "none", "-v", f"{host}:{container}:ro",
-                    "--entrypoint", "sh", image, "-c",
-                    'stat -c "%i %u %g %a" "$1" && if [ -n "$2" ]; then cat "$1/$2"; fi',
-                    "sh", container, marker or ""])
-    except rh.CannotRun as e:
-        return rh.Unresolved(str(e))
-    if p.rc != 0:
-        return rh.Unresolved(f"the probe in {image} exited {p.rc}: {p.err.strip()[:200]}")
-    first, _, rest = p.out.partition("\n")
-    parts = first.split()
-    if len(parts) != 4 or not all(x.isdigit() for x in parts):
-        return rh.Unresolved(f"stat in {image} printed {first.strip()[:80]!r}")
-    ident = (int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3], 8))
-    return ident, (rest.strip() if marker else None)
-
-
 def _read_marker(path: str) -> Any:
     try:
-        with open(path, encoding="ascii") as f:
-            return f.read(256).strip() or None
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     except FileNotFoundError:
         return None
+    except OSError as e:
+        return rh.Unresolved(f"cannot read the marker {path}: {e}")
+    try:
+        with os.fdopen(fd, encoding="ascii") as f:
+            return f.read(256).strip() or None
     except (OSError, ValueError) as e:
         return rh.Unresolved(f"cannot read the marker {path}: {e}")
 
 
-def verify_mounts(spec: Spec, lstat: Callable = os.lstat,
+def verify_containers(spec: Spec, seen: Dict[str, Any]) -> List[rh.Check]:
+    """Each runtime's running container is its declared image. `seen` maps a
+    container to `ask_container`'s answer."""
+    checks = []
+    for r in spec.runtimes:
+        info = seen.get(r["container"], rh.Unresolved(f"{r['container']} was not asked"))
+        claim = f"{r['principal']}'s running container {r['container']} is the image {r['image']}"
+        want = _fact("image", r["image"], f"the host setup's runtime for {r['principal']}")
+        remedy = f"start {r['principal']}'s runtime as {r['container']} from {r['image']}"
+        if isinstance(info, rh.Unresolved):
+            checks.append(rh.unknown(claim, want, info.reason, remedy))
+        else:
+            checks.append(rh.check(claim, want, info["image"], remedy))
+    return checks
+
+
+def verify_mounts(spec: Spec, seen: Dict[str, Any], lstat: Callable = os.lstat,
                   ask: Callable[..., Any] = ask_mount,
-                  read_marker: Callable[[str], Any] = None) -> List[rh.Check]:
-    """Each runtime's declared durable root, as seen inside a container, is
-    the host directory this plan created and synced. Same-device ancestry
-    inside the container proves nothing about that, so it is compared here,
-    from a throwaway container with the runtime's own mount."""
+                  read_marker: Optional[Callable[[str], Any]] = None) -> List[rh.Check]:
+    """Each declared mount, on the RUNNING container: the container binds the
+    host root at the declared path, and that path, as the container sees it,
+    is the host directory this plan created and synced (by inode, owner,
+    group and mode, or by the root's marker)."""
     checks: List[rh.Check] = []
     for m in spec.mounts:
+        c = spec.runtime_of(m["principal"])["container"]
+        info = seen.get(c, rh.Unresolved(f"{c} was not asked"))
+        bind_claim = f"{c} binds {m['host']} at {m['container']}"
+        bind_want = _fact("bind", (m["host"], m["container"]), f"the host setup's mount for {m['principal']}")
+        bind_fix = f"start {c} with {m['host']} bound at {m['container']}, exactly as declared"
+        if isinstance(info, rh.Unresolved):
+            checks.append(rh.unknown(bind_claim, bind_want, info.reason, bind_fix))
+        else:
+            checks.append(rh.check(bind_claim, bind_want, [b for b in info["binds"] if b[1] == m["container"]],
+                                   bind_fix, ok=lambda want, have: list(have) == [want]))
         host_st = _lstat(m["host"], lstat)
-        claim = (f"{m['principal']}'s durable root {m['container']} in {m['image']} is the host "
-                 f"directory {m['host']}")
+        claim = f"{m['principal']}'s durable root {m['container']} in {c} is the host directory {m['host']}"
         remedy = (f"mount {m['host']} at {m['container']} exactly as declared, and change no "
                   f"mount between this check and activation")
         if host_st is None or isinstance(host_st, rh.Unresolved):
             reason = host_st.reason if host_st is not None else f"{m['host']} does not exist"
             checks.append(rh.unknown(claim, _fact("mount", rh.Unresolved(reason), "the host directory"),
-                                     reason, f"create {m['host']} first (the plan's install line)"))
+                                     reason, f"create {m['host']} first (the plan's root step)"))
             continue
         marker = m.get("marker")
         host_marker = (read_marker or _read_marker)(posixpath.join(m["host"], marker)) if marker else None
-        seen = ask(m["image"], m["host"], m["container"], marker)
-        if isinstance(seen, rh.Unresolved):
+        got = info if isinstance(info, rh.Unresolved) else ask(c, m["container"], marker)
+        if isinstance(got, rh.Unresolved):
             checks.append(rh.unknown(claim, _fact("mount", _identity(host_st), "the host directory"),
-                                     seen.reason, remedy))
+                                     got.reason, remedy))
             continue
-        ident, seen_marker = seen
+        ident, seen_marker = got
         by_inode = ident == _identity(host_st)
         by_marker = isinstance(host_marker, str) and host_marker == seen_marker
         how = ("matched by inode, owner, group and mode" if by_inode else
@@ -551,13 +697,25 @@ def verify_mounts(spec: Spec, lstat: Callable = os.lstat,
     return checks
 
 
+#: Every process's status, except the probe shell's own: its pid comes first.
+_PROC_SCRIPT = ('echo "probe $$"; for f in /proc/[0-9]*/status; do '
+                'case "$f" in "/proc/$$/status") continue;; esac; cat "$f" 2>/dev/null; done; true')
+
+
 def parse_proc_status(text: str) -> List[Tuple[int, Optional[int]]]:
-    """`[(effective uid, umask or None)]`, one per process, from the
-    concatenated /proc/<pid>/status files of one container."""
+    """`[(effective uid, umask or None)]`, one per process, from the probe's
+    output: its own pid on the first line, then concatenated
+    /proc/<pid>/status files. The probe's own process is dropped."""
+    text = text or ""
+    probe = _PROBE_LINE.match(text)
+    me = int(probe.group(1)) if probe else None
     procs = []
-    for block in re.split(r"(?m)^(?=Name:)", text or ""):
+    for block in re.split(r"(?m)^(?=Name:)", text[probe.end():] if probe else text):
         uid = _UID_FIELD.search(block)
         if uid is None:
+            continue
+        pid = _PID_FIELD.search(block)
+        if pid is not None and me is not None and int(pid.group(1)) == me:
             continue
         mask = _UMASK_FIELD.search(block)
         procs.append((int(uid.group(2)), int(mask.group(1), 8) if mask else None))
@@ -565,17 +723,11 @@ def parse_proc_status(text: str) -> List[Tuple[int, Optional[int]]]:
 
 
 def ask_umasks(container: str) -> Any:
-    """Every process in the RUNNING container `container`, as
-    `parse_proc_status` reads it, or an Unresolved naming why it could not
-    be asked. Read-only: the container's own /proc, read with cat."""
-    try:
-        p = rh.run(["docker", "exec", container, "sh", "-c",
-                    'for f in /proc/[0-9]*/status; do cat "$f" 2>/dev/null; done; true'])
-    except rh.CannotRun as e:
-        return rh.Unresolved(str(e))
-    if p.rc != 0:
-        return rh.Unresolved(f"reading {container}'s processes exited {p.rc}: {p.err.strip()[:200]}")
-    return parse_proc_status(p.out)
+    """Every process in the RUNNING container `container` but the probe's
+    own, as `parse_proc_status` reads it, or an Unresolved. The probe runs as
+    `PROBE_UID`, which no runtime may run as."""
+    out = _exec(container, _PROC_SCRIPT)
+    return out if isinstance(out, rh.Unresolved) else parse_proc_status(out)
 
 
 def verify_umasks(spec: Spec, ask: Callable[[str], Any] = ask_umasks) -> List[rh.Check]:
@@ -606,25 +758,43 @@ def verify_umasks(spec: Spec, ask: Callable[[str], Any] = ask_umasks) -> List[rh
     return checks
 
 
-def ask_openssl(images: Sequence[str]) -> Dict[str, Any]:
-    """Each image's own `openssl version`, run in a throwaway container, or
-    an Unresolved naming why it could not be asked. Read-only."""
+def ask_openssl(images: Dict[str, str]) -> Dict[str, Any]:
+    """Each image's own `openssl version` (`images` maps an image to the
+    openssl it runs), in a throwaway container with no network that never
+    pulls, or an Unresolved naming why it could not be asked. Read-only."""
     out: Dict[str, Any] = {}
-    for image in images:
+    for image, binary in sorted(images.items()):
         try:
-            p = rh.run(["docker", "run", "--rm", "--entrypoint", "openssl", image, "version"])
+            p = rh.run(["docker", "run", "--rm", "--pull", "never", "--network", "none",
+                        "--entrypoint", binary, image, "version"])
         except rh.CannotRun as e:
             out[image] = rh.Unresolved(str(e))
             continue
         out[image] = p.out if p.rc == 0 else \
-            rh.Unresolved(f"`openssl version` in {image} exited {p.rc}: {p.err.strip()[:200]}")
+            rh.Unresolved(f"`{binary} version` in {image} exited {p.rc}: {p.err.strip()[:200]}")
     return out
+
+
+# --- The verb ---------------------------------------------------------------------
+
+
+def overlay_section(overlay: Path) -> Any:
+    """The overlay's `host_setup` section, or None when it has none. An
+    unreadable overlay, or a section that is not an object, raises SpecError."""
+    try:
+        doc = json.loads(Path(overlay).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        raise SpecError(f"deployment overlay {overlay} is unreadable: {e}") from None
+    sec = doc.get(OVERLAY_SECTION) if isinstance(doc, dict) else None
+    if sec is not None and not isinstance(sec, dict):
+        raise SpecError(f"deployment overlay {overlay}: {OVERLAY_SECTION} is not an object")
+    return sec
 
 
 def read_spec(spec_path: Optional[Path], overlay: Optional[Path]) -> Any:
     """The host-setup document: the file `spec_path`, else the deployment
-    overlay's `host_setup` section. With neither, or a section that is not
-    an object, raises SpecError; nothing is guessed."""
+    overlay's `host_setup` section. With neither, raises SpecError; nothing
+    is guessed."""
     if spec_path is not None:
         try:
             return json.loads(Path(spec_path).read_text(encoding="utf-8"))
@@ -633,21 +803,48 @@ def read_spec(spec_path: Optional[Path], overlay: Optional[Path]) -> Any:
     if overlay is None:
         raise SpecError("no host-setup document: pass --spec, or a deployment overlay (--overlay, "
                         "or its environment variable) with a host_setup section")
-    try:
-        doc = json.loads(Path(overlay).read_text(encoding="utf-8"))
-    except (OSError, ValueError) as e:
-        raise SpecError(f"deployment overlay {overlay} is unreadable: {e}") from None
-    sec = doc.get(OVERLAY_SECTION) if isinstance(doc, dict) else None
-    if not isinstance(sec, dict):
+    sec = overlay_section(overlay)
+    if sec is None:
         raise SpecError(f"deployment overlay {overlay} has no {OVERLAY_SECTION!r} object")
     return sec
 
 
-def run(spec_path: Optional[Path], *, production: bool, overlay: Optional[Path] = None, lstat: Callable = os.lstat,
-        digest: Callable[[str], Any] = _sha256,
-        openssl: Optional[Dict[str, Any]] = None,
-        mounts: Optional[Callable[..., Any]] = None,
-        umasks: Optional[Callable[[str], Any]] = None, out=print) -> int:
+def checks(spec: Spec, *, production: bool, lstat: Callable = os.lstat,
+           digest: Callable[[str], Any] = _sha256,
+           openssl: Optional[Dict[str, Any]] = None,
+           containers: Optional[Callable[[str], Any]] = None,
+           mounts: Optional[Callable[..., Any]] = None,
+           umasks: Optional[Callable[[str], Any]] = None) -> List[rh.Check]:
+    """Every check of the host against the plan. `production` is ORed with
+    the document's own."""
+    seen = {r["container"]: (containers or ask_container)(r["container"]) for r in spec.runtimes}
+    out = verify_roots(spec, lstat)
+    out += verify_overlay(spec, production=production or spec.production, lstat=lstat, digest=digest)
+    out += verify_containers(spec, seen)
+    out += verify_mounts(spec, seen, lstat, ask_mount if mounts is None else mounts)
+    out += verify_openssl(spec, openssl if openssl is not None else
+                          ask_openssl({i: rec["path"] for i, rec in spec.openssl.items()}))
+    out += verify_umasks(spec, ask_umasks if umasks is None else umasks)
+    return out
+
+
+def report(found: List[rh.Check], out=print) -> int:
+    """Print each check; 0 only when there is at least one and all pass. An
+    UNKNOWN is a problem like a FAIL, and no checks at all is never a pass."""
+    if not found:
+        out("  UNKNOWN the host setup configured nothing to check")
+        return 1
+    for c in found:
+        out(f"  {c.result:7} {c.claim}")
+        if c.result != rh.PASS:
+            out(f"          expected {c.expected.value!r} ({c.expected.provenance})")
+            out(f"          {('why: ' + c.reason) if c.reason else 'found: ' + repr(c.actual)}")
+            out(f"          fix: {c.remedy}" + (f"; do not {c.do_not}" if c.do_not else ""))
+    return 0 if all(c.result == rh.PASS for c in found) else 1
+
+
+def run(spec_path: Optional[Path], *, production: bool, overlay: Optional[Path] = None,
+        out=print, **probes: Any) -> int:
     """The `host-setup` verb: print the plan, then verify the host against it.
     Exit 0 only when every check passes; an UNKNOWN is a problem like a FAIL."""
     try:
@@ -659,16 +856,24 @@ def run(spec_path: Optional[Path], *, production: bool, overlay: Optional[Path] 
     for line in render_plan(spec, STUB_PLUGIN if spec.overlay_pin and
                             spec.overlay_pin["sha256"] == STUB_SHA256 else None):
         out(f"  {line}")
-    checks = verify_roots(spec, lstat) + verify_overlay(spec, production=production, lstat=lstat,
-                                                        digest=digest)
-    checks += verify_mounts(spec, lstat, ask_mount if mounts is None else mounts)
-    checks += verify_openssl(spec, openssl if openssl is not None else ask_openssl(sorted(spec.openssl)))
-    checks += verify_umasks(spec, ask_umasks if umasks is None else umasks)
     out("host-setup (2/2): the host against the plan.")
-    for c in checks:
-        out(f"  {c.result:7} {c.claim}")
-        if c.result != rh.PASS:
-            out(f"          expected {c.expected.value!r} ({c.expected.provenance})")
-            out(f"          {('why: ' + c.reason) if c.reason else 'found: ' + repr(c.actual)}")
-            out(f"          fix: {c.remedy}" + (f"; do not {c.do_not}" if c.do_not else ""))
-    return 0 if all(c.result == rh.PASS for c in checks) else 1
+    return report(checks(spec, production=production, **probes), out)
+
+
+def verify_section(overlay: Optional[Path], out=print, **probes: Any) -> int:
+    """`verify`'s part: when the deployment overlay has a `host_setup`
+    section, every check of the host against it, printed; 0 only when all
+    pass. No overlay, or one without the section, is not configured: 0. An
+    unusable overlay or document is 1."""
+    if overlay is None:
+        return 0
+    try:
+        sec = overlay_section(overlay)
+        if sec is None:
+            out("  (the deployment overlay has no host_setup section: the host setup is not checked)")
+            return 0
+        spec = load_spec(sec)
+    except ValueError as e:
+        out(f"  UNKNOWN host setup: {e}")
+        return 1
+    return report(checks(spec, production=False, **probes), out)
