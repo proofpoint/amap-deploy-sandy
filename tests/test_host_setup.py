@@ -377,6 +377,21 @@ class RootsTest(unittest.TestCase):
         self.assertEqual(r["upstream (uid 2101) can read and search every directory from /srv/example/a/b "
                            "down to /srv/example/a/b"], rh.PASS)
 
+    def test_an_owner_who_is_not_a_reader_is_checked_for_reach(self):
+        x = doc()
+        x["roots"][0].update(mode="0050", readers=["downstream"])
+        fs = good_fs()
+        fs["/srv/example/a/b"] = d(0o050, UP, GID, 4242)
+        checks = hs.verify_roots(hs.load_spec(x), lstat_of(fs))
+        r = results(checks)
+        self.assertEqual(r["/srv/example/a/b is a directory owned by 2101:2100, mode 0050"], rh.PASS)
+        self.assertEqual(r["upstream (uid 2101) can read and search every directory from /srv/example/a/b "
+                           "down to /srv/example/a/b"], rh.FAIL)
+        self.assertEqual(len(checks), len({c.claim for c in checks}), "each principal is checked once")
+        x["roots"][0]["readers"] = ["upstream", "downstream"]
+        again = hs.verify_roots(hs.load_spec(x), lstat_of(fs))
+        self.assertEqual(len(again), len({c.claim for c in again}), "an owner who reads is checked once")
+
     def test_the_downstream_reader_needs_the_group_bit(self):
         fs = good_fs()
         fs["/srv/example/a/b"] = d(0o2700, UP, GID)

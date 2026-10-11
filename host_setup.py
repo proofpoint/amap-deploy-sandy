@@ -477,7 +477,7 @@ def verify_roots(spec: Spec, lstat: Callable = os.lstat) -> List[rh.Check]:
         checks.append(rh.check(claim, want, (st.st_uid, st.st_gid, stat.S_IMODE(st.st_mode)), remedy,
                                do_not="never widen the mode to make a runtime's write succeed"))
         sts[r.path] = st
-        for name in r.readers:
+        for name in dict.fromkeys((r.owner,) + r.readers):   # the owner reaches it too
             p = spec.principals[name]
             top = _reach_from(spec, name, r.path)
             walk = [d for d in chain + [r.path] if _holds(top, d)]
