@@ -4593,8 +4593,9 @@ def build_parser() -> argparse.ArgumentParser:
         "host-setup", help="a hop deployment's host plan, from a host-setup document: print "
                            "the root-run steps (uids, groups, directories, the overlay), then "
                            "check the host against them. Applies nothing")
-    hsetup.add_argument("--spec", type=Path, required=True,
-                        help="the host-setup document (operator data)")
+    hsetup.add_argument("--spec", type=Path, default=None,
+                        help="the host-setup document (operator data; default: the deployment "
+                             "overlay's host_setup section)")
     hsetup.add_argument("--production", action="store_true",
                         help="refuse the stub plugin's pin (default: plumbing, where the stub "
                              "is expected)")
@@ -4643,7 +4644,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             return run_teardown(args, home, boxes_dir)
 
         if args.command == "host-setup":
-            return hsu.run(args.spec, production=args.production)
+            return hsu.run(args.spec, production=args.production, overlay=ha.overlay_path(args.overlay))
 
         if args.command == "migrate-registry":
             return run_migrate_registry(args, home)

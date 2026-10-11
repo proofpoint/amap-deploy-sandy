@@ -328,3 +328,49 @@ cd ~/amap-demo/gamma && sandy --exec -- /opt/sandy/features/amap/codex/kickoff R
 The thread submits the delegation and finishes its turn. alpha's reply
 arrives as a later turn on the same thread. **Delegate to Codex** the same
 way as to any agent: ask alpha to task gamma's address.
+
+## 10. A hop deployment's host setup
+
+A hop deployment runs each side of a hop as its own uid, against roots the
+operator creates as root. Its host is described by a host-setup document
+(operator data, kept outside this repository: the deployment overlay's
+`host_setup` section, or a file given with `--spec`), and one verb prints the
+plan and checks the host against it. It runs none of the plan:
+
+```sh
+python3 amap-sandy.py --overlay <deployment overlay> host-setup
+```
+
+Run the printed steps as root, in order, **before any hop runtime starts**:
+every root is created with its owner, group and mode, then it and every
+ancestor are fsynced, so a runtime never opens a root that is not durable.
+Start each hop runtime under the umask the plan names for it (`UMask=0027`
+in its service unit, or `umask 0027` in its launcher before it execs; 0022
+is also accepted). Then run the verb again: it exits 0 only when every check
+passes, and an UNKNOWN (a runtime not running, a container it could not ask)
+is a problem, not a pass.
+
+### A refused leftover item or `.stage` directory
+
+A hop runtime never repairs a directory it finds already there. If a crash
+left one behind that is not exactly what the runtime would have made, the
+runtime refuses it with an ERROR that names the path, and its replay stops
+there. As the operator, check the named directory. `ls -lnd <path> <path>/..`
+shows the owner's uid and the mode of it and of its parent:
+
+1. it is **empty**: `ls -A <path>` prints nothing;
+2. it is **owned by the writer's uid**, the runtime that refused it;
+3. its permission bits are **a subset of the requested ones**, 0750
+   (`rwxr-x---`) for an item directory and 0700 (`rwx------`) for a `.stage`
+   directory, and its setgid bit (`s` in the group's execute place) is the
+   same as its parent's.
+
+If all three hold, remove it with `rmdir <path>` and restart the runtime;
+the replay creates it again. That is safe: a writer-owned 0700 or 0750
+directory can hold only the writer's own entries, and nothing is committed
+there before the runtime's checks pass.
+
+If any of the three fails, **do not remove it**. A directory that is not
+empty, or is owned by someone else, or has bits the runtime never asks for,
+may have been planted. Leave it in place, keep the runtime stopped, and
+escalate.

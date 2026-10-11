@@ -38,7 +38,9 @@ def doc():
             "agent_paths": ["/srv/example/agents"],
             "openssl": {"img-up": {"version": "3.0.13", "floor": "3.0", "source": "example base image"}},
             "mounts": [{"principal": "downstream", "image": "img-down", "host": "/srv/example/a/b",
-                        "container": "/data/root"}]}
+                        "container": "/data/root"}],
+            "runtimes": [{"principal": "upstream", "container": "ex-up", "umask": "0027"},
+                         {"principal": "downstream", "container": "ex-down", "umask": "0022"}]}
 
 
 def d(mode, uid=0, gid=0):
@@ -97,6 +99,17 @@ class SpecTest(unittest.TestCase):
         self.refused(lambda x: x["hops"][0].update(peer_uid_env="bad name"), "environment variable")
         self.refused(lambda x: x["mounts"][0].update(host="/srv/example/other"), "one of the roots")
         self.refused(lambda x: x["mounts"][0].update(principal="nobody"), "not declared")
+        self.refused(lambda x: x["openssl"]["img-up"].update(floor="1.1", version="1.1.1"), "below 3.0")
+        self.refused(lambda x: x["openssl"]["img-up"].update(floor="3.2"), "below its own floor")
+        for bad in ("0077", "0002", "0000", "027", 23):
+            self.refused(lambda x: x["runtimes"][0].update(umask=bad), "must be one of 0027, 0022")
+        self.refused(lambda x: x["runtimes"][0].update(principal="nobody"), "not declared")
+        self.refused(lambda x: x["runtimes"][0].update(container="a b"), "container name")
+        self.refused(lambda x: x["runtimes"][0].pop("umask"), "exactly principal, container and umask")
+        self.refused(lambda x: x["runtimes"][1].update(container="ex-up"), "listed twice")
+
+    def test_floor_3_0_is_accepted(self):
+        self.assertEqual(hs.load_spec(doc()).openssl["img-up"]["floor"], (3, 0))
 
     def test_a_null_pin_is_no_plugin(self):
         x = doc()
@@ -134,6 +147,13 @@ class PlanTest(unittest.TestCase):
 
     def test_nothing_is_run(self):
         self.assertTrue(self.plan[0].startswith("# Run as root"))
+
+    def test_each_runtime_is_told_its_umask_and_none_starts_before_the_steps(self):
+        self.assertIn("# upstream's runtime (ex-up) starts under umask 0027: UMask=0027 in its service unit, "
+                      "or `umask 0027` in its launcher before it execs", self.plan)
+        self.assertIn("# downstream's runtime (ex-down) starts under umask 0022: UMask=0022 in its service "
+                      "unit, or `umask 0022` in its launcher before it execs", self.plan)
+        self.assertTrue(self.plan[-1].startswith("# Start no runtime until every step above has run"))
 
 
 class RootsTest(unittest.TestCase):
@@ -403,8 +423,83 @@ class OpensslTest(unittest.TestCase):
         self.assertEqual(set(self.verify("LibreSSL 3.3.6").values()), {rh.UNKNOWN})
 
 
-if __name__ == "__main__":
-    unittest.main()
+def status(uid, umask=None, name="python3"):
+    """One /proc/<pid>/status as Linux prints it (fields trimmed to the
+    ones read, in kernel order; Umask is present from Linux 4.7)."""
+    s = f"Name:\t{name}\n"
+    if umask is not None:
+        s += f"Umask:\t{umask}\n"
+    return s + f"State:\tS (sleeping)\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\nGid:\t{GID}\t{GID}\t{GID}\t{GID}\n"
+
+
+class UmaskTest(unittest.TestCase):
+
+    def verify(self, answers):
+        return {c.claim.split(" (")[0]: c for c in
+                hs.verify_umasks(hs.load_spec(doc()), lambda c: answers[c])}
+
+    def good(self):
+        return {"ex-up": hs.parse_proc_status(status(UP, "0027") + status(UP, "0027", "sh")
+                                              + status(0, "0022", "init")),
+                "ex-down": hs.parse_proc_status(status(DOWN, "0022"))}
+
+    def test_the_declared_umask_passes(self):
+        self.assertEqual({c.result for c in self.verify(self.good()).values()}, {rh.PASS})
+
+    def test_a_process_under_another_umask_fails_its_runtime_only(self):
+        a = self.good()
+        a["ex-up"] = hs.parse_proc_status(status(UP, "0027") + status(UP, "0077", "worker"))
+        r = self.verify(a)
+        self.assertEqual(r["every process of upstream"].result, rh.FAIL)
+        self.assertEqual(r["every process of upstream"].actual, [0o027, 0o077])
+        self.assertEqual(r["every process of downstream"].result, rh.PASS)
+
+    def test_0022_where_0027_is_declared_fails(self):
+        a = self.good()
+        a["ex-up"] = hs.parse_proc_status(status(UP, "0022"))
+        self.assertEqual(self.verify(a)["every process of upstream"].result, rh.FAIL)
+
+    def test_only_the_runtimes_own_uid_is_read(self):
+        a = self.good()
+        a["ex-up"] = hs.parse_proc_status(status(UP, "0027") + status(DOWN, "0077"))
+        self.assertEqual(self.verify(a)["every process of upstream"].result, rh.PASS)
+
+    def test_no_process_of_its_uid_is_unknown(self):
+        a = self.good()
+        a["ex-up"] = hs.parse_proc_status(status(0, "0022"))
+        c = self.verify(a)["every process of upstream"]
+        self.assertEqual(c.result, rh.UNKNOWN)
+        self.assertIn("no process running as uid", c.reason)
+
+    def test_a_kernel_without_the_umask_field_is_unknown(self):
+        a = self.good()
+        a["ex-up"] = hs.parse_proc_status(status(UP, "0027") + status(UP))
+        self.assertEqual(self.verify(a)["every process of upstream"].result, rh.UNKNOWN)
+
+    def test_no_answer_is_unknown(self):
+        a = self.good()
+        a["ex-down"] = rh.Unresolved("no such container")
+        self.assertEqual(self.verify(a)["every process of downstream"].result, rh.UNKNOWN)
+
+    def test_the_running_container_is_asked_read_only(self):
+        seen = []
+
+        def fake_run(argv, **kw):
+            seen.append(list(argv))
+            return rh.Proc(tuple(argv), 0, status(UP, "0027"), "")
+        orig = rh.run
+        rh.run = fake_run
+        self.addCleanup(setattr, rh, "run", orig)
+        self.assertEqual(hs.ask_umasks("ex-up"), [(UP, 0o027)])
+        self.assertEqual(seen[0][:5], ["docker", "exec", "ex-up", "sh", "-c"])
+        self.assertIn("cat", seen[0][5])
+        self.assertNotIn(">", seen[0][5].replace("2>/dev/null", ""))
+        rh.run = lambda argv, **kw: rh.Proc(tuple(argv), 1, "", "No such container: ex-up")
+        self.assertIsInstance(hs.ask_umasks("ex-up"), rh.Unresolved)
+
+    def test_the_effective_uid_is_the_one_read(self):
+        text = f"Name:\tx\nUmask:\t0027\nUid:\t0\t{UP}\t{UP}\t{UP}\n"
+        self.assertEqual(hs.parse_proc_status(text), [(UP, 0o027)])
 
 
 class VerbTest(unittest.TestCase):
@@ -423,7 +518,8 @@ class VerbTest(unittest.TestCase):
         lines = []
         kw.setdefault("digest", lambda p: hs.STUB_SHA256)
         kw.setdefault("mounts", lambda image, host, container, marker: ((4242, UP, GID, 0o2750), None))
-        rc = hs.run(self.write(x), production=False, lstat=lstat_of(fs), out=lines.append, **kw)
+        kw.setdefault("umasks", lambda c: [(UP, 0o027)] if c == "ex-up" else [(DOWN, 0o022)])
+        rc = hs.run(None if x is None else self.write(x), production=False, lstat=lstat_of(fs), out=lines.append, **kw)
         return rc, "\n".join(lines)
 
     def test_a_good_host_with_its_openssl_reported_exits_0(self):
@@ -446,3 +542,32 @@ class VerbTest(unittest.TestCase):
     def test_an_unusable_document_is_refused(self):
         rc, out = self.run_verb({"schema": "other"}, good_fs())
         self.assertEqual(rc, 2)
+
+    def test_the_document_can_come_from_the_overlays_section(self):
+        overlay = self.write({"registry": {}, "host_setup": doc()})
+        rc, out = self.run_verb(None, good_fs(), openssl={"img-up": "OpenSSL 3.0.13 x"}, overlay=overlay)
+        self.assertEqual(rc, 0, out)
+
+    def test_spec_wins_over_the_overlay(self):
+        overlay = self.write({"host_setup": {"schema": "other"}})
+        rc, out = self.run_verb(doc(), good_fs(), openssl={"img-up": "OpenSSL 3.0.13 x"}, overlay=overlay)
+        self.assertEqual(rc, 0, out)
+
+    def test_neither_a_spec_nor_an_overlay_section_is_refused(self):
+        rc, out = self.run_verb(None, good_fs())
+        self.assertEqual(rc, 2)
+        self.assertIn("no host-setup document", out)
+        rc, out = self.run_verb(None, good_fs(), overlay=self.write({"registry": {}}))
+        self.assertEqual(rc, 2)
+        self.assertIn("has no 'host_setup' object", out)
+
+    def test_a_wrong_umask_fails_the_verb(self):
+        rc, out = self.run_verb(doc(), good_fs(), openssl={"img-up": "OpenSSL 3.0.13 x"},
+                                umasks=lambda c: [(UP, 0o077)] if c == "ex-up" else [(DOWN, 0o022)])
+        self.assertEqual(rc, 1)
+        self.assertIn("FAIL    every process of upstream (uid 2101) in ex-up runs under umask 0027", out)
+        self.assertIn("fix: set UMask=0027 in upstream's service unit", out)
+
+
+if __name__ == "__main__":
+    unittest.main()

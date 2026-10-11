@@ -135,8 +135,10 @@ Host-wide options (`--sandy-home`, `--sandy`, `--servers`, `--connector-src`,
 overlay**: a private JSON file whose `registry` section holds the host
 registry's identifiers (its interface token, its CLI and operator-verb
 modules, and the name.json schema id) and, optionally, its checkout and its
-directory. This repository names none of them. Only the registry verbs, and
-a policy whose `identity` is `registry`, need it; without it they refuse by
+directory. Its optional `host_setup` section is the host-setup document
+`host-setup` reads when no `--spec` is given. This repository names none of
+them. Only the registry verbs, `host-setup` without `--spec`, and a policy
+whose `identity` is `registry`, need it; without it they refuse by
 name and nothing else changes. With `identity` on, `verify` also asks the
 registry (read-only `show`) about every running sandbox and compares the
 name.json that sandbox's container reads; any gap is a problem for that
@@ -165,7 +167,7 @@ difference.
 | `migrate-registry --registry DIR --batch FILE [--registry-repo DIR] [--apply]` | the host registry's import of every selected sandbox, prepared: writes the batch (slug and workspace) and prints the registry's two operator commands, `plan` and `apply`. It runs neither |
 | `link-identity --registry DIR [--registry-repo DIR] [--apply]` | one `by-slug/<slug>` link per selected, registered sandbox, to the identity directory the registry names. It removes nothing and refuses a path that is not a link; a sandbox gains or changes the mount when it relaunches |
 | `teardown [--apply] [--force]` | takes the host back to before `install`: removes the payload, the router's config and its state. It keeps the manifest and `instances/`. `--force` also empties every lane |
-| `host-setup --spec FILE [--production]` | a hop deployment's host plan, from a host-setup document (operator data): prints the root-run steps (uids, groups, directories created with owner and mode, a barrier syncing each one and its ancestors, the overlay root-owned 0444) and runs none of them, then checks the host against them, including each runtime's durable root as a container sees it. `--production` refuses the stub plugin's pin |
+| `host-setup [--spec FILE] [--production]` | a hop deployment's host plan, from a host-setup document (operator data: `--spec`, else the overlay's `host_setup` section): prints the root-run steps (uids, groups, directories created with owner and mode, a barrier syncing each one and its ancestors, the overlay root-owned 0444) and runs none of them, then checks the host against them, including each runtime's durable root as a container sees it, each image's openssl (3.0 or later, at its recorded version) and each running hop runtime's umask (0027 or 0022, as declared). No runtime starts before the plan has run; the [runbook](docs/TUTORIAL.md#10-a-hop-deployments-host-setup) has the steps and what to do with a refused leftover directory. The umask is read from each runtime's running container, so a hop runtime that runs outside a container is not verified: it is reported UNKNOWN, and the verb exits 1. `--production` refuses the stub plugin's pin |
 
 `verify` has three outcomes: PASS, FAIL and **UNKNOWN**. UNKNOWN is reported
 as a problem, never as a pass: a router that cannot be read is not a router

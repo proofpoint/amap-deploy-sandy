@@ -17,7 +17,9 @@ What it renders, in order:
    durable before a runtime opens it (a runtime cannot make durable the top
    of a bind-mounted tree from inside it);
 3. the overlay file, root-owned and 0444;
-4. each runtime's peer-uid variable (named per hop): the uid on the other side of its hop.
+4. each runtime's peer-uid variable (named per hop): the uid on the other side of its hop;
+5. each hop runtime's umask, 0027 or 0022, set in its service unit or launcher,
+   and the rule that no runtime starts before the steps above.
 
 What verify checks, through router_health's three outcomes:
 - every root exists as a real directory with the planned owner, group and mode;
@@ -31,7 +33,15 @@ What verify checks, through router_health's three outcomes:
   the runtime's own mount, is the host directory the plan created and
   synced (same-device ancestry inside a container proves nothing);
 - an image's openssl, as the image reports it, is at least the recorded floor
-  and is the recorded version.
+  and is the recorded version; no floor below 3.0 is accepted;
+- every process of a hop runtime, as its running container reports it, runs
+  under the runtime's declared umask.
+
+The umask is not taste. A runtime asks for 0750 item and 0700 .stage
+directories; a umask that strips a requested bit would need an fchmod after
+the mkdir, and a crash between the two leaves a narrowed directory that every
+later call refuses. Under 0027 or 0022 no requested bit is stripped, so that
+window does not exist. The runbook says what to do with a refused leftover.
 """
 
 import hashlib
@@ -48,6 +58,8 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 import router_health as rh
 
 SPEC_SCHEMA = "amap-deploy-sandy.host-setup/1"
+#: The deployment overlay's section that holds a host-setup document.
+OVERLAY_SECTION = "host_setup"
 
 HERE = Path(__file__).resolve().parent
 STUB_PLUGIN = HERE / "overlay" / "stub-plugin.py"
@@ -64,6 +76,12 @@ _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _COMMIT_RE = re.compile(r"[0-9a-f]{40}")
 _OPENSSL_RE = re.compile(r"OpenSSL (\d+)\.(\d+)\.(\d+)")
 _R, _W, _X = 4, 2, 1
+#: The umasks a hop runtime may run under: neither strips a bit of 0750 or 0700.
+UMASKS = {"0027": 0o027, "0022": 0o022}
+#: The lowest openssl the plugin's pkeyutl -rawin fallback may run on.
+OPENSSL_FLOOR_MIN = (3, 0)
+_UMASK_FIELD = re.compile(r"^Umask:\s*([0-7]{4})\s*$", re.M)
+_UID_FIELD = re.compile(r"^Uid:\s*(\d+)\s+(\d+)", re.M)
 
 
 class SpecError(ValueError):
@@ -98,6 +116,7 @@ class Spec:
     agent_paths: Tuple[str, ...]
     openssl: Dict[str, Dict[str, Any]]          # image -> {version, floor, source}
     mounts: Tuple[Dict[str, str], ...] = ()     # {principal, image, host, container}
+    runtimes: Tuple[Dict[str, Any], ...] = ()   # {principal, container, umask}
 
 
 def _abs_normal(p: Any, what: str) -> str:
@@ -119,7 +138,7 @@ def load_spec(doc: Any) -> Spec:
     if not isinstance(doc, dict) or doc.get("schema") != SPEC_SCHEMA:
         raise SpecError(f"the document is not a {SPEC_SCHEMA} host setup")
     known = {"schema", "principals", "groups", "hops", "roots", "overlay", "agent_paths", "openssl",
-             "mounts"}
+             "mounts", "runtimes"}
     if set(doc) - known:
         raise SpecError(f"unknown member(s): {', '.join(sorted(set(doc) - known))}")
     groups = {}
@@ -186,8 +205,13 @@ def load_spec(doc: Any) -> Spec:
             raise SpecError(f"openssl.{image}.version must be X.Y.Z")
         if not isinstance(rec["floor"], str) or not re.fullmatch(r"\d+\.\d+", rec["floor"]):
             raise SpecError(f"openssl.{image}.floor must be X.Y")
-        openssl[image] = {"version": rec["version"], "source": str(rec["source"]),
-                          "floor": tuple(int(x) for x in rec["floor"].split("."))}
+        floor = tuple(int(x) for x in rec["floor"].split("."))
+        if floor < OPENSSL_FLOOR_MIN:
+            raise SpecError(f"openssl.{image}.floor is below {OPENSSL_FLOOR_MIN[0]}.{OPENSSL_FLOOR_MIN[1]}, "
+                            f"the lowest the plugin's pkeyutl -rawin fallback may run on")
+        if openssl_version(f"OpenSSL {rec['version']}")[:2] < floor:
+            raise SpecError(f"openssl.{image}.version is below its own floor")
+        openssl[image] = {"version": rec["version"], "source": str(rec["source"]), "floor": floor}
     root_paths = {r.path for r in roots}
     mounts = []
     for i, m in enumerate(doc.get("mounts") or []):
@@ -207,8 +231,22 @@ def load_spec(doc: Any) -> Spec:
         if not isinstance(m["image"], str) or not m["image"]:
             raise SpecError(f"mounts[{i}].image must name the runtime's image")
         mounts.append({k: m[k] for k in ("principal", "image", "host", "container", "marker") if k in m})
+    runtimes = []
+    for i, r in enumerate(doc.get("runtimes") or []):
+        if not isinstance(r, dict) or set(r) != {"principal", "container", "umask"}:
+            raise SpecError(f"runtimes[{i}] must have exactly principal, container and umask")
+        if r["principal"] not in principals:
+            raise SpecError(f"runtimes[{i}]: principal {r['principal']!r} is not declared")
+        if not isinstance(r["container"], str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", r["container"]):
+            raise SpecError(f"runtimes[{i}].container must be a container name")
+        if r["umask"] not in UMASKS:
+            raise SpecError(f"runtimes[{i}].umask must be one of {', '.join(sorted(UMASKS, reverse=True))}: "
+                            f"any other strips a bit a hop directory's requested mode needs")
+        runtimes.append({"principal": r["principal"], "container": r["container"], "umask": UMASKS[r["umask"]]})
+    if len({r["container"] for r in runtimes}) != len(runtimes):
+        raise SpecError("a runtime's container is listed twice")
     return Spec(principals, groups, tuple(hops), tuple(roots), ov_path, ov_pin, agent_paths, openssl,
-                tuple(mounts))
+                tuple(mounts), tuple(runtimes))
 
 
 def parse_pin(pin: Any) -> Optional[Dict[str, str]]:
@@ -289,6 +327,12 @@ def render_plan(spec: Spec, overlay_source: Optional[Path] = None) -> List[str]:
                          f"  # {m['principal']}'s root marker: random, root-owned, read-only")
     for (name, env), uid in sorted(peer_uids(spec).items()):
         lines.append(f"# {name}'s runtime environment: {env}={uid}")
+    for r in spec.runtimes:
+        lines.append(f"# {r['principal']}'s runtime ({r['container']}) starts under umask {r['umask']:04o}: "
+                     f"UMask={r['umask']:04o} in its service unit, or `umask {r['umask']:04o}` in its "
+                     f"launcher before it execs")
+    lines.append("# Start no runtime until every step above has run: each root exists and is synced "
+                 "before a runtime opens it.")
     return lines
 
 
@@ -507,6 +551,61 @@ def verify_mounts(spec: Spec, lstat: Callable = os.lstat,
     return checks
 
 
+def parse_proc_status(text: str) -> List[Tuple[int, Optional[int]]]:
+    """`[(effective uid, umask or None)]`, one per process, from the
+    concatenated /proc/<pid>/status files of one container."""
+    procs = []
+    for block in re.split(r"(?m)^(?=Name:)", text or ""):
+        uid = _UID_FIELD.search(block)
+        if uid is None:
+            continue
+        mask = _UMASK_FIELD.search(block)
+        procs.append((int(uid.group(2)), int(mask.group(1), 8) if mask else None))
+    return procs
+
+
+def ask_umasks(container: str) -> Any:
+    """Every process in the RUNNING container `container`, as
+    `parse_proc_status` reads it, or an Unresolved naming why it could not
+    be asked. Read-only: the container's own /proc, read with cat."""
+    try:
+        p = rh.run(["docker", "exec", container, "sh", "-c",
+                    'for f in /proc/[0-9]*/status; do cat "$f" 2>/dev/null; done; true'])
+    except rh.CannotRun as e:
+        return rh.Unresolved(str(e))
+    if p.rc != 0:
+        return rh.Unresolved(f"reading {container}'s processes exited {p.rc}: {p.err.strip()[:200]}")
+    return parse_proc_status(p.out)
+
+
+def verify_umasks(spec: Spec, ask: Callable[[str], Any] = ask_umasks) -> List[rh.Check]:
+    """Each hop runtime's processes, as its running container reports them,
+    run under its declared umask. A runtime with no process to read, or a
+    kernel that reports no umask, is UNKNOWN."""
+    checks: List[rh.Check] = []
+    for r in spec.runtimes:
+        p = spec.principals[r["principal"]]
+        claim = f"every process of {r['principal']} (uid {p.uid}) in {r['container']} runs under umask {r['umask']:04o}"
+        want = _fact("umask", [r["umask"]], f"the host setup's umask for {r['principal']}'s runtime")
+        remedy = (f"set UMask={r['umask']:04o} in {r['principal']}'s service unit, or `umask {r['umask']:04o}` "
+                  f"in its launcher before it execs, and restart it")
+        procs = ask(r["container"])
+        if isinstance(procs, rh.Unresolved):
+            checks.append(rh.unknown(claim, want, procs.reason, remedy))
+            continue
+        mine = [m for uid, m in procs if uid == p.uid]
+        if not mine:
+            checks.append(rh.unknown(claim, want, f"{r['container']} has no process running as uid {p.uid}",
+                                     f"start {r['principal']}'s runtime, then check again"))
+        elif None in mine:
+            checks.append(rh.unknown(claim, want, f"{r['container']}'s kernel reports no umask for a process",
+                                     f"read {r['principal']}'s service unit or launcher for its umask"))
+        else:
+            checks.append(rh.check(claim, want, sorted(set(mine)), remedy,
+                                   do_not="never widen a hop directory's mode to suit a runtime's umask"))
+    return checks
+
+
 def ask_openssl(images: Sequence[str]) -> Dict[str, Any]:
     """Each image's own `openssl version`, run in a throwaway container, or
     an Unresolved naming why it could not be asked. Read-only."""
@@ -522,16 +621,39 @@ def ask_openssl(images: Sequence[str]) -> Dict[str, Any]:
     return out
 
 
-def run(spec_path: Path, *, production: bool, lstat: Callable = os.lstat,
+def read_spec(spec_path: Optional[Path], overlay: Optional[Path]) -> Any:
+    """The host-setup document: the file `spec_path`, else the deployment
+    overlay's `host_setup` section. With neither, or a section that is not
+    an object, raises SpecError; nothing is guessed."""
+    if spec_path is not None:
+        try:
+            return json.loads(Path(spec_path).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            raise SpecError(f"cannot use {spec_path}: {e}") from None
+    if overlay is None:
+        raise SpecError("no host-setup document: pass --spec, or a deployment overlay (--overlay, "
+                        "or its environment variable) with a host_setup section")
+    try:
+        doc = json.loads(Path(overlay).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        raise SpecError(f"deployment overlay {overlay} is unreadable: {e}") from None
+    sec = doc.get(OVERLAY_SECTION) if isinstance(doc, dict) else None
+    if not isinstance(sec, dict):
+        raise SpecError(f"deployment overlay {overlay} has no {OVERLAY_SECTION!r} object")
+    return sec
+
+
+def run(spec_path: Optional[Path], *, production: bool, overlay: Optional[Path] = None, lstat: Callable = os.lstat,
         digest: Callable[[str], Any] = _sha256,
         openssl: Optional[Dict[str, Any]] = None,
-        mounts: Optional[Callable[..., Any]] = None, out=print) -> int:
+        mounts: Optional[Callable[..., Any]] = None,
+        umasks: Optional[Callable[[str], Any]] = None, out=print) -> int:
     """The `host-setup` verb: print the plan, then verify the host against it.
     Exit 0 only when every check passes; an UNKNOWN is a problem like a FAIL."""
     try:
-        spec = load_spec(json.loads(Path(spec_path).read_text(encoding="utf-8")))
-    except (OSError, ValueError) as e:
-        out(f"host-setup: cannot use {spec_path}: {e}")
+        spec = load_spec(read_spec(spec_path, overlay))
+    except ValueError as e:     # SpecError included
+        out(f"host-setup: {e}")
         return 2
     out("host-setup (1/2): the plan. Nothing here has run; each step is the operator's, as root.")
     for line in render_plan(spec, STUB_PLUGIN if spec.overlay_pin and
@@ -541,6 +663,7 @@ def run(spec_path: Path, *, production: bool, lstat: Callable = os.lstat,
                                                         digest=digest)
     checks += verify_mounts(spec, lstat, ask_mount if mounts is None else mounts)
     checks += verify_openssl(spec, openssl if openssl is not None else ask_openssl(sorted(spec.openssl)))
+    checks += verify_umasks(spec, ask_umasks if umasks is None else umasks)
     out("host-setup (2/2): the host against the plan.")
     for c in checks:
         out(f"  {c.result:7} {c.claim}")
