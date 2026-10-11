@@ -46,9 +46,10 @@ def doc():
             "runtimes": [{"principal": "upstream", "container": "ex-up", "image": "img-up", "umask": "0027",
                           "umasks": ["0027"]},
                          {"principal": "downstream", "container": "ex-down", "image": "img-down",
-                          "umask": "0022"}],
+                          "umask": "0022", "umasks": ["0027", "0022"]}],
             "mounts": [{"principal": "downstream", "host": "/srv/example/a/b", "container": "/data/root"},
-                       {"principal": "upstream", "host": "/srv/example/state/up", "container": "/state"}]}
+                       {"principal": "upstream", "host": "/srv/example/state/up", "container": "/state"},
+                       {"principal": "upstream", "host": "/srv/example/a/b", "container": "/hop"}]}
 
 
 def d(mode, uid=0, gid=0, ino=0):
@@ -75,13 +76,15 @@ def lstat_of(fs, denied=()):
 
 
 def good_containers():
-    return {"ex-up": {"image": "img-up", "binds": [("/srv/example/state/up", "/state")]},
+    return {"ex-up": {"image": "img-up", "binds": [("/srv/example/state/up", "/state"),
+                                                   ("/srv/example/a/b", "/hop")]},
             "ex-down": {"image": "img-down", "binds": [("/srv/example/a/b", "/data/root")]}}
 
 
 def good_mount(container, path, marker):
     return {("ex-down", "/data/root"): ((4242, UP, GID, 0o2750), None),
-            ("ex-up", "/state"): ((77, UP, UPGRP, 0o700), None)}[(container, path)]
+            ("ex-up", "/state"): ((77, UP, UPGRP, 0o700), None),
+            ("ex-up", "/hop"): ((4242, UP, GID, 0o2750), None)}[(container, path)]
 
 
 def good_umasks(c):
@@ -152,6 +155,12 @@ class SpecTest(unittest.TestCase):
         self.refused(lambda x: x["runtimes"][0].pop("umask"), "must have principal, container, image and umask")
         self.refused(lambda x: x["runtimes"][1].update(container="ex-up"), "listed twice")
 
+    def test_without_umasks_a_runtime_may_run_only_under_0027(self):
+        x = doc()
+        del x["runtimes"][0]["umasks"]
+        self.assertEqual(hs.load_spec(x).runtime_of("upstream")["umasks"], (0o027,))
+        self.refused(lambda x: x["runtimes"][1].pop("umasks"), "is not one this runtime allows (0027)")
+
     def test_a_runtime_pinned_to_0027_cannot_declare_0022(self):
         self.refused(lambda x: x["runtimes"][0].update(umask="0022"), "is not one this runtime allows (0027)")
 
@@ -192,13 +201,46 @@ class NothingIsLeftUncheckedTest(unittest.TestCase):
                      "downstream has 2 runtimes entries")
 
     def test_a_hop_principal_without_a_mount(self):
-        self.refused(lambda x: x["mounts"].pop(1), "upstream has no mounts entry")
+        self.refused(lambda x: (x["mounts"].pop(2), x["mounts"].pop(1)), "upstream has no mounts entry")
 
     def test_no_roots(self):
         self.refused(lambda x: x.update(roots=[]), "one of the roots")
 
     def test_a_runtime_image_without_openssl(self):
         self.refused(lambda x: x["openssl"].pop("img-down"), "image 'img-down' has no openssl record")
+
+    def test_a_root_its_owner_reaches_through_no_mount(self):
+        self.refused(lambda x: x["mounts"].pop(2), "root /srv/example/a/b: upstream owns or reads it, but "
+                                                   "no mount of upstream's runtime holds it")
+
+    def test_an_unrelated_mount_does_not_cover_a_root(self):
+        def m(x):
+            x["mounts"][2]["host"] = "/srv/example/state/up"
+            x["mounts"][2]["container"] = "/other"
+        self.refused(m, "root /srv/example/a/b: upstream owns or reads it")
+
+    def test_a_reader_without_a_covering_mount(self):
+        def m(x):
+            x["roots"][2]["readers"] = ["upstream", "downstream"]
+        self.refused(m, "root /srv/example/state/up: downstream owns or reads it")
+
+    def test_an_owner_who_is_not_a_reader_still_needs_a_covering_mount(self):
+        def m(x):
+            x["roots"][0]["readers"] = ["downstream"]
+            x["mounts"].pop(2)
+        self.refused(m, "root /srv/example/a/b: upstream owns or reads it")
+
+    def test_a_sibling_whose_name_extends_the_mount_is_not_covered(self):
+        def m(x):
+            x["roots"].append({"path": "/srv/example/a/bx", "owner": "downstream", "group": "hopgrp",
+                               "mode": "2750", "readers": ["downstream"], "purpose": "a sibling"})
+        self.refused(m, "root /srv/example/a/bx: downstream owns or reads it")
+
+    def test_a_mount_above_the_root_covers_it(self):
+        x = doc()
+        x["mounts"][2]["host"] = "/srv/example/a/b"
+        x["roots"][1]["readers"] = ["downstream", "upstream"]
+        self.assertTrue(hs.load_spec(x))
 
     def test_a_mount_for_a_principal_with_no_runtime(self):
         def m(x):
@@ -317,12 +359,12 @@ class RootsTest(unittest.TestCase):
         del fs["/srv/example/a/b/inner"]
         self.assertFails(fs, "inner is a directory")
 
-    def test_an_execute_only_ancestor_fails_the_reader_it_blocks(self):
+    def test_an_execute_only_directory_fails_the_reader_it_blocks(self):
         fs = good_fs()
-        fs["/srv/example/a"] = d(0o711)
-        bad = self.assertFails(fs, "upstream (uid 2101) can read and search every directory from / down to "
-                                   "/srv/example/a/b")
-        self.assertNotIn("/srv/example/state/up is a directory", bad)
+        fs["/srv/example/a/b"] = d(0o2710, UP, GID)
+        bad = self.assertFails(fs, "downstream (uid 2102) can read and search every directory from "
+                                   "/srv/example/a/b down to /srv/example/a/b/inner")
+        self.assertNotIn("/srv/example/state/up is a directory owned by 2101:2201, mode 0700", bad)
 
     def test_an_ancestor_above_a_readers_mount_does_not_block_it(self):
         fs = good_fs()
@@ -332,8 +374,8 @@ class RootsTest(unittest.TestCase):
                            "down to /srv/example/a/b"], rh.PASS)
         self.assertEqual(r["downstream (uid 2102) can read and search every directory from /srv/example/a/b "
                            "down to /srv/example/a/b/inner"], rh.PASS)
-        self.assertEqual(r["upstream (uid 2101) can read and search every directory from / down to "
-                           "/srv/example/a/b"], rh.FAIL)
+        self.assertEqual(r["upstream (uid 2101) can read and search every directory from /srv/example/a/b "
+                           "down to /srv/example/a/b"], rh.PASS)
 
     def test_the_downstream_reader_needs_the_group_bit(self):
         fs = good_fs()
@@ -563,6 +605,11 @@ class MountTopologyTest(unittest.TestCase):
     def test_the_device_number_is_not_compared(self):
         self.assertEqual(hs._identity(os.stat_result((stat.S_IFDIR | 0o750, 7, 99, 1, 5, 6, 0, 0, 0, 0))),
                          (7, 5, 6, 0o750))
+
+    def test_a_fifo_at_the_host_marker_is_unresolved_not_a_hang(self):
+        with tempfile.TemporaryDirectory() as t:
+            os.mkfifo(os.path.join(t, "marker"))
+            self.assertIsInstance(hs._read_marker(os.path.join(t, "marker")), rh.Unresolved)
 
     def test_the_host_marker_is_not_read_through_a_link(self):
         with tempfile.TemporaryDirectory() as t:

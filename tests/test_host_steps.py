@@ -67,6 +67,15 @@ class RootTest(Tree):
             st.root(self.p("f"), self.uid, self.gid, 0o700)
         self.assertTrue(stat.S_ISREG(os.lstat(self.p("f")).st_mode))
 
+    def test_a_foreign_non_empty_root_is_not_re_owned(self):
+        os.mkdir(self.p("r"))
+        open(self.p("r", "f"), "w").close()
+        os.chmod(self.p("r"), 0o777)
+        with self.assertRaises(st.StepError) as e:
+            st.root(self.p("r"), self.uid, self.gid + 1, 0o700)
+        self.assertIn("not re-owned", str(e.exception))
+        self.assertEqual(self.mode(self.p("r")), 0o777)
+
     def test_a_relative_or_unnormalised_path_is_refused(self):
         for bad in ("rel/x", self.t + "/a/../b", "//x"):
             with self.subTest(bad=bad), self.assertRaises(st.StepError):
@@ -147,6 +156,21 @@ class MarkerTest(Tree):
         with self.assertRaises(st.StepError):
             st.marker(self.p("r", ".root-id"))
         self.assertEqual(open(victim).read(), "keep\n")
+
+    def test_a_fifo_at_the_marker_is_refused_without_hanging(self):
+        os.mkdir(self.p("r"))
+        os.mkfifo(self.p("r", ".root-id"))
+        with self.assertRaises(st.StepError):
+            st.marker(self.p("r", ".root-id"))
+
+    def test_a_hard_link_to_another_read_only_file_is_not_kept(self):
+        os.mkdir(self.p("r"))
+        with open(self.p("other"), "w") as f:
+            f.write("0" * 32)
+        os.chmod(self.p("other"), 0o444)
+        os.link(self.p("other"), self.p("r", ".root-id"))
+        with self.assertRaises(st.StepError):
+            st.marker(self.p("r", ".root-id"))
 
     def test_a_file_that_is_not_ours_is_left_alone(self):
         os.mkdir(self.p("r"))

@@ -11,9 +11,11 @@ Every path is walked from `/` one component at a time, each opened with
 O_NOFOLLOW | O_DIRECTORY, so a symbolic link anywhere on the way, or a
 non-directory where a directory belongs, stops the step with an error and
 changes nothing beneath it. A step is safe to run again: an existing root
-is re-owned and re-moded through its own descriptor, an existing marker is
-kept only if it is already a root-owned 0444 regular file, and the overlay
-replaces its destination by rename, never by writing through it.
+is re-owned and re-moded through its own descriptor (unless it is owned by
+someone else and not empty, which stops the step), an existing marker is
+kept only if it is already a root-owned 0444 regular file with one link,
+and the overlay replaces its destination by rename, never by writing
+through it.
 """
 
 import os
@@ -46,11 +48,12 @@ def open_dir(path, create=None):
     try:
         for i, name in enumerate(parts):
             last = i == len(parts) - 1
+            existed = False
             if last and create is not None:
                 try:
                     os.mkdir(name, 0o700, dir_fd=fd)
                 except FileExistsError:
-                    pass
+                    existed = True
             try:
                 nxt = os.open(name, _DIR, dir_fd=fd)
             except OSError as e:
@@ -61,6 +64,10 @@ def open_dir(path, create=None):
             fd = nxt
         if create is not None:
             uid, gid, mode = create
+            st = os.fstat(fd)
+            if existed and (st.st_uid, st.st_gid) != (uid, gid) and os.listdir(fd):
+                raise StepError(f"{path}: already exists, owned by {st.st_uid}:{st.st_gid} and not "
+                                f"empty; not re-owned. Find out whose it is before running this again")
             os.fchown(fd, uid, gid)
             os.fchmod(fd, mode)
         return fd
@@ -124,15 +131,17 @@ def marker(path):
             fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dfd)
         except FileExistsError:
             try:
-                fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dfd)
+                fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
             except OSError as e:
                 raise StepError(f"{path}: exists and is not a regular file ({e.strerror})") from None
             try:
                 st = os.fstat(fd)
             finally:
                 os.close(fd)
-            if not stat.S_ISREG(st.st_mode) or st.st_uid != OWNER_UID or stat.S_IMODE(st.st_mode) != MARKER_MODE:
-                raise StepError(f"{path}: exists, but is not a root-owned 0444 file; not ours, left alone")
+            if not stat.S_ISREG(st.st_mode) or st.st_uid != OWNER_UID or st.st_nlink != 1 \
+                    or stat.S_IMODE(st.st_mode) != MARKER_MODE:
+                raise StepError(f"{path}: exists, but is not a root-owned 0444 file with one link; "
+                                f"not ours, left alone")
             print(f"{path}: kept")
             return
         try:

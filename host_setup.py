@@ -31,16 +31,18 @@ path from `/` without following a symbolic link:
 What it checks, through router_health's three outcomes:
 - every root, and every ancestor of it, is a real directory (a symbolic link
   never is), and each root has the planned owner, group and mode;
-- every principal that must reach a root can READ and SEARCH each directory
-  from the top of its own mount down to the root (from `/` where no mount of
-  it holds the root): a directory is opened to be fsynced, so an
-  execute-only one fails a runtime's write;
+- every principal that owns or must reach a root has a mount that holds it
+  (a document without one does not load), and can READ and SEARCH each
+  directory from the top of that mount down to the root: a directory is
+  opened to be fsynced, so an execute-only one fails a runtime's write;
 - the overlay is a regular file, owned by root, mode 0444, outside every
   agent path, whose bytes hash to its pin; a production pin is not the stub;
 - each runtime's running container is the declared image, binds each
   declared root at its declared path, and that path, seen inside the
   running container, is the host directory the plan created (by inode,
-  owner, group and mode, or by the root's marker);
+  owner, group and mode, or by the root's marker). The container is read
+  with `docker inspect`, and inside it with `docker exec` as root running
+  only `stat`, `cat` and a shell loop over /proc: nothing is written;
 - each image's openssl, as the image reports it, is the recorded version and
   at least the recorded floor; no floor below 3.0 loads;
 - every process of a hop runtime, read from its running container, runs
@@ -53,8 +55,9 @@ The umask is not taste. A runtime asks for 0750 item and 0700 .stage
 directories; a umask that strips a requested bit would need an fchmod after
 the mkdir, and a crash between the two leaves a narrowed directory that every
 later call refuses. Under 0027 or 0022 no requested bit is stripped, so that
-window does not exist. A runtime whose other paths create directories under
-the umask alone may need 0027 only, which its record pins with `umasks`.
+window does not exist. A runtime may run under 0027 only, unless its
+record lists 0022 in `umasks`: one whose other paths create directories
+under the umask alone would otherwise make them readable by every uid.
 The runbook says what to do with a refused leftover.
 """
 
@@ -94,6 +97,10 @@ _CONTAINER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 _R, _W, _X = 4, 2, 1
 #: The umasks a hop runtime may run under: neither strips a bit of 0750 or 0700.
 UMASKS = {"0027": 0o027, "0022": 0o022}
+#: What a runtime record that names no `umasks` may run under. 0022 is
+#: allowed only where a record lists it: a runtime that creates directories
+#: under the umask alone would make them readable by every uid.
+DEFAULT_UMASKS = ("0027",)
 #: The lowest openssl the plugin's pkeyutl -rawin fallback may run on.
 OPENSSL_FLOOR_MIN = (3, 0)
 #: The uid the in-container probes run as. No runtime may run as it, so a
@@ -269,7 +276,7 @@ def load_spec(doc: Any) -> Spec:
             raise SpecError(f"runtimes[{i}].image must name the runtime's image")
         if r["image"] not in openssl:
             raise SpecError(f"runtimes[{i}]: image {r['image']!r} has no openssl record")
-        allowed = r.get("umasks", sorted(UMASKS, reverse=True))
+        allowed = r.get("umasks", list(DEFAULT_UMASKS))
         if not isinstance(allowed, list) or not allowed:
             raise SpecError(f"runtimes[{i}].umasks must list the umasks this runtime may run under")
         allowed_set = {_umask(u, f"runtimes[{i}].umasks[]") for u in allowed}
@@ -308,6 +315,11 @@ def load_spec(doc: Any) -> Spec:
         if not any(m["principal"] == p for m in mounts):
             raise SpecError(f"hop principal {p} has no mounts entry; its durable root must be declared "
                             f"so the running container's mount is checked")
+    for r in roots:
+        for p in (r.owner,) + r.readers:
+            if not any(m["principal"] == p and _holds(m["host"], r.path) for m in mounts):
+                raise SpecError(f"root {r.path}: {p} owns or reads it, but no mount of {p}'s runtime "
+                                f"holds it; declare the mount that reaches it")
     return Spec(principals, groups, tuple(hops), tuple(roots), ov_path, ov_pin, agent_paths, openssl,
                 tuple(mounts), tuple(runtimes), production)
 
@@ -421,13 +433,16 @@ def _lstat(path: str, lstat: Callable) -> Any:
         return rh.Unresolved(f"cannot inspect {path}: {e}")
 
 
+def _holds(top: str, path: str) -> bool:
+    return path == top or path.startswith(top.rstrip("/") + "/")
+
+
 def _reach_from(spec: Spec, principal: str, root: str) -> str:
     """Where `principal`'s reach to `root` begins: the deepest host path of
-    its own mounts that holds the root, or `/` where none does. A directory
+    its own mounts that holds the root (load guarantees one). A directory
     above a container's mount is invisible to it."""
-    tops = [m["host"] for m in spec.mounts if m["principal"] == principal
-            and (root == m["host"] or root.startswith(m["host"] + "/"))]
-    return max(tops, key=len) if tops else "/"
+    return max((m["host"] for m in spec.mounts if m["principal"] == principal and _holds(m["host"], root)),
+               key=len)
 
 
 def verify_roots(spec: Spec, lstat: Callable = os.lstat) -> List[rh.Check]:
@@ -465,7 +480,7 @@ def verify_roots(spec: Spec, lstat: Callable = os.lstat) -> List[rh.Check]:
         for name in r.readers:
             p = spec.principals[name]
             top = _reach_from(spec, name, r.path)
-            walk = [d for d in chain + [r.path] if d == top or d.startswith(top.rstrip("/") + "/")]
+            walk = [d for d in chain + [r.path] if _holds(top, d)]
             blocked: Any = None
             for d in walk:
                 dst = sts[d]
@@ -620,11 +635,14 @@ def _identity(st) -> Tuple[int, int, int, int]:
 
 def _read_marker(path: str) -> Any:
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError:
         return None
     except OSError as e:
         return rh.Unresolved(f"cannot read the marker {path}: {e}")
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        return rh.Unresolved(f"the marker {path} is not a regular file")
     try:
         with os.fdopen(fd, encoding="ascii") as f:
             return f.read(256).strip() or None

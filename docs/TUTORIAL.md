@@ -358,11 +358,15 @@ runtime never opens a root that is not durable. The steps are safe to run
 again.
 
 Start each hop runtime under the umask the plan names for it: `UMask=0027`
-in its service unit, or `umask 0027` in its launcher before it execs. 0022 is
-accepted only for a runtime whose record allows it. A runtime whose older
-paths still create directories under the umask alone is pinned to 0027
-(`"umasks": ["0027"]`), because under 0022 those directories are readable
-by every uid on the host.
+in its service unit, or `umask 0027` in its launcher before it execs. 0027
+is the only umask a runtime record accepts unless it lists 0022 in
+`umasks`. Never list it for a runtime whose paths create directories under
+the umask alone: under 0022 those directories are readable by every uid on
+the host.
+
+With the stub plugin pinned, the router refuses to start (`exec_failed`):
+that is the expected outcome while the plumbing is checked, and it ends
+when the reviewed plugin's digest is pinned.
 
 Then run the verb again; `verify` runs the same checks whenever the
 overlay has a `host_setup` section. Each exits non-zero unless every check
