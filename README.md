@@ -155,10 +155,16 @@ A record that cannot be read registers nothing. An agent that existed but
 was not in the roster when the record was made (not launched since the
 manifest, so not admitted) is not protected: a later `install --apply`
 registers it under a new name. Check the import's plan against `list`
-before turning `identity` on. The record is written whole or not at all; if
-it cannot be read, remove it and run `install --apply` again, which records
-the roster as it stands then. That is always the safe direction: an agent
-listed then that the registry has not bound is refused, never renamed.
+before turning `identity` on. The record is written whole or not at all. If
+one cannot be read (damaged by hand, for example), **do not just delete it**:
+a new record lists only the roster at that moment, so an agent the old
+record protected that is not admitted now (a stopped sandbox) would then be
+registered under a new name. Replace it with a superset instead: every slug
+in the old record (from a backup, if the file is lost), every slug the
+roster lists now, and every sandbox that existed before `identity` was
+turned on. Write it as `{"schema": "amap-deploy-sandy.pre-identity/1",
+"slugs": [...]}`, then run `install --apply`. A slug wrongly kept there is
+refused until it is imported; a slug wrongly left out can be renamed.
 
 A forced retire is not undone by `install` unnoticed. After the registry's
 `retire --force` of a sandbox whose workspace still exists:

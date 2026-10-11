@@ -4188,6 +4188,15 @@ class PreIdentityError(Exception):
     """The roster or the snapshot cannot be read; no sandbox is registered."""
 
 
+def _no_constant(name: str) -> Any:
+    raise ValueError(f"{name} is not JSON")
+
+
+def _strict_json(text: str) -> Any:
+    """json.loads, refusing the NaN and Infinity it otherwise accepts."""
+    return json.loads(text, parse_constant=_no_constant)
+
+
 def pre_identity_path(home: Path) -> Path:
     return feature_root(home) / PRE_IDENTITY_FILE
 
@@ -4198,7 +4207,7 @@ def roster_slugs(home: Path) -> Optional[FrozenSet[str]]:
     written one. A roster that exists but cannot be read raises."""
     f = feature_roster_dir(home) / ROSTER_FILE_NAME
     try:
-        doc = json.loads(f.read_text(encoding="utf-8"))
+        doc = _strict_json(f.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return None
     except (OSError, ValueError) as e:
@@ -4227,7 +4236,7 @@ def roster_schema_problem(doc: Any) -> Optional[str]:
         return "written_at is empty or has a control character"
     if "interval_s" in doc:
         v = doc["interval_s"]
-        if isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0:
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not v >= 0 or v == float("inf"):
             return "interval_s is not a number of at least 0"
     if not isinstance(doc.get("members"), list):
         return "members is not a list"
@@ -4250,7 +4259,7 @@ def read_pre_identity(path: Path) -> Optional[FrozenSet[str]]:
         raise PreIdentityError(f"the pre-identity record {path} is unreadable: {e}") from None
     try:
         with os.fdopen(fd, encoding="utf-8") as fh:
-            doc = json.loads(fh.read())
+            doc = _strict_json(fh.read())
     except (OSError, ValueError) as e:
         raise PreIdentityError(f"the pre-identity record {path} is unreadable: {e}") from None
     if not isinstance(doc, dict):

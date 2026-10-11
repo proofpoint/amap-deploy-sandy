@@ -413,13 +413,29 @@ class PreIdentityRecordTest(unittest.TestCase):
             self.assertTrue(events[0][1].endswith(".tmp"), events)
             self.assertEqual(events[2][1], prov.pre_identity_path(self.home).parent.name, events)
 
-    def test_an_empty_record_is_unreadable_and_removing_it_retakes_it(self):
+    def test_an_unreadable_record_registers_nothing_until_a_superset_replaces_it(self):
         self.path.write_text("")
         with self.assertRaises(prov.PreIdentityError):
             prov.pre_identity(self.home, apply=True)
-        self.path.unlink()
-        self.write_roster(roster({"alpha-1a2b3c4d"}))
-        self.assertEqual(prov.pre_identity(self.home, apply=True)[0], {"alpha-1a2b3c4d"})
+        self.write_roster(roster({"alpha-1a2b3c4d"}))         # the stopped bravo is not listed now
+        self.path.write_text(json.dumps({"schema": prov.PRE_IDENTITY_SCHEMA,
+                                         "slugs": ["alpha-1a2b3c4d", "bravo-5e6f7a8b"]}))
+        self.assertEqual(prov.pre_identity(self.home, apply=True),
+                         (frozenset({"alpha-1a2b3c4d", "bravo-5e6f7a8b"}), None))
+
+    def test_a_raw_roster_with_a_non_json_number_is_refused(self):
+        raw = (ROSTERS / "valid-roster-basic.json").read_text()
+        for value in ("NaN", "Infinity", "-Infinity", "1e999"):
+            self.write_roster(raw.replace('"interval_s": 5.0', f'"interval_s": {value}'))
+            with self.subTest(value=value), self.assertRaises(prov.PreIdentityError):
+                prov.pre_identity(self.home, apply=True)
+            self.assertFalse(self.path.exists())
+        self.write_roster(raw.replace('"interval_s": 5.0', '"interval_s": 5.0, "extra": NaN'))
+        with self.assertRaises(prov.PreIdentityError):      # not JSON, even where the schema is open
+            prov.pre_identity(self.home, apply=True)
+        self.path.write_text('{"schema": "%s", "slugs": [], "x": NaN}' % prov.PRE_IDENTITY_SCHEMA)
+        with self.assertRaises(prov.PreIdentityError):
+            prov.read_pre_identity(self.path)
 
     def test_every_invalid_spec_roster_records_nothing(self):
         fixtures = sorted(ROSTERS.glob("invalid-*.json"))
