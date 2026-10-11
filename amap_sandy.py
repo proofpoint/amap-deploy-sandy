@@ -72,6 +72,7 @@ DEFAULT_SERVERS = PAYLOAD_DIR / "mcp-servers.json"
 import launchd_job as lj   # the recreation cadence: renders and reads, never loads
 import router_health as rh  # the router process: its container and its health, read only
 import verify_report as vr  # how verify prints: one row per condition, its workspaces beside it
+import host_setup as hsu    # a hop deployment's host plan: rendered and checked, never applied
 
 # `fleet_policy.py` sits beside this module. Guarded rather than bare: this
 # module is imported by its tests and by its sibling tools, where HERE is not
@@ -3916,6 +3917,16 @@ def build_parser() -> argparse.ArgumentParser:
                         "never runs")
     cadence.add_argument("--apply", action="store_true", help="write the plist (default: show it)")
 
+    hsetup = sub.add_parser(
+        "host-setup", help="a hop deployment's host plan, from a host-setup document: print "
+                           "the root-run steps (uids, groups, directories, the overlay), then "
+                           "check the host against them. Applies nothing")
+    hsetup.add_argument("--spec", type=Path, required=True,
+                        help="the host-setup document (operator data)")
+    hsetup.add_argument("--production", action="store_true",
+                        help="refuse the stub plugin's pin (default: plumbing, where the stub "
+                             "is expected)")
+
     teardown = sub.add_parser(
         "teardown", help="the fleet back to its pre-install state for a clean rebuild: "
                          "remove the payload, the router's config and router-state/ (held "
@@ -3958,6 +3969,9 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         if args.command == "teardown":
             return run_teardown(args, home, boxes_dir)
+
+        if args.command == "host-setup":
+            return hsu.run(args.spec, production=args.production)
 
         return run_verify_command(args, home, boxes_dir)
     except ProvisionError as e:

@@ -139,6 +139,7 @@ Host-wide options (`--sandy-home`, `--sandy`, `--servers`, `--connector-src`,
 | `fleet-domain [--base BASE] [--apply]` | this host's derived fleet domain, `sandy.<host>.<base>` (base: `internal`), beside the manifest's; `--apply` writes it into `feature.fleet_domain`. Every agent's address changes, so relaunch them after |
 | `cadence [--apply]` | the container-recreation job (macOS launchd), rendered from the policy's cadence. It prints the `launchctl` line and never runs it |
 | `teardown [--apply] [--force]` | takes the host back to before `install`: removes the payload, the router's config and its state. It keeps the manifest and `instances/`. `--force` also empties every lane |
+| `host-setup --spec FILE [--production]` | a hop deployment's host plan, from a host-setup document (operator data): prints the root-run steps (uids, groups, directories created with owner and mode, a barrier syncing each one and its ancestors, the overlay root-owned 0444) and runs none of them, then checks the host against them, including each runtime's durable root as a container sees it. `--production` refuses the stub plugin's pin |
 
 `verify` has three outcomes: PASS, FAIL and **UNKNOWN**. UNKNOWN is reported
 as a problem, never as a pass: a router that cannot be read is not a router
