@@ -55,12 +55,14 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
+import tempfile
 import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 HERE = Path(__file__).resolve().parent
 # The repo's `payload/` IS the host's `$SANDY_HOME/features/amap/payload/`
@@ -73,6 +75,7 @@ import launchd_job as lj   # the recreation cadence: renders and reads, never lo
 import router_health as rh  # the router process: its container and its health, read only
 import verify_report as vr  # how verify prints: one row per condition, its workspaces beside it
 import host_setup as hsu    # a hop deployment's host plan: rendered and checked, never applied
+import host_adapter as ha   # the host registry's CLI, run as a subprocess, never imported
 
 # `fleet_policy.py` sits beside this module. Guarded rather than bare: this
 # module is imported by its tests and by its sibling tools, where HERE is not
@@ -916,6 +919,63 @@ def sandy_manifest_capable(sandy_bin: str = "sandy") -> Tuple[Optional[bool], st
                   f"{AGENT_ARGS_KEY} and names {MANIFEST_AGENT!r}")
 
 
+# The identity mount is rendered only for a sandy that SKIPS a declared mount
+# whose source is missing and still launches: a sandbox registered after its
+# launch must start without the mount, never fail to start. Read in sandy's
+# source at schema_version 4 (`[ ! -e "$_src" ]` then `skip`); an earlier
+# token is unreviewed for it. Membership, never order.
+IDENTITY_SCHEMA_VERSIONS = (4,)
+# The policy's opt-in, in the manifest's `feature` section, read only here.
+# Absent: no identity mount, no AMAP_IDENTITY, the slug addresses as before.
+IDENTITY_KEY = "identity"
+IDENTITY_REGISTRY = "registry"
+
+
+def identity_mode(policy: Dict[str, Any]) -> Optional[str]:
+    """The policy's identity source, or None when it names none. Anything
+    but the one known value refuses, by name."""
+    value = policy.get(IDENTITY_KEY)
+    if value is None:
+        return None
+    if value != IDENTITY_REGISTRY:
+        raise ProvisionError(f"the policy's {IDENTITY_KEY!r} is {value!r}; the only value is "
+                             f"{IDENTITY_REGISTRY!r}, or leave it out")
+    return value
+
+
+def sandy_skips_missing_mount(sandy_bin: str = "sandy") -> Optional[bool]:
+    """Does this sandy launch without a declared mount whose source is
+    missing? By `schema_version` membership in IDENTITY_SCHEMA_VERSIONS.
+    None when the schema cannot be read."""
+    schema = _sandy_json(sandy_bin, "--print-schema")
+    if not isinstance(schema, dict):
+        return None
+    version = schema.get("schema_version")
+    return any(version == known and type(version) is type(known)
+               for known in IDENTITY_SCHEMA_VERSIONS)
+
+
+def identity_schema_for(policy: Dict[str, Any], args: argparse.Namespace) -> Optional[str]:
+    """The name.json schema id the manifest exposes, or None when the
+    policy turns no identity mount on. On, it needs a sandy that skips a
+    missing mount source and the deployment overlay's registry section;
+    either missing refuses, by name."""
+    if identity_mode(policy) is None:
+        return None
+    ok = sandy_skips_missing_mount(args.sandy)
+    if ok is None:
+        raise ProvisionError(f"cannot read `{args.sandy} --print-schema` to confirm sandy launches "
+                             f"without a missing mount source")
+    if not ok:
+        raise ProvisionError(f"this sandy's schema_version is not one reviewed for the identity "
+                             f"mount ({', '.join(map(repr, IDENTITY_SCHEMA_VERSIONS))}); a sandbox "
+                             f"launched before its link exists might fail to start")
+    try:
+        return ha.load_identifiers(ha.overlay_path(args.overlay)).name_schema
+    except ha.OverlayError as e:
+        raise ProvisionError(str(e)) from None
+
+
 def sandy_accepts_receives(sandy_bin: str = "sandy") -> Optional[bool]:
     """Does this sandy's manifest parser accept `receives: ["cross_session"]`?
     MEMBERSHIP of the key in `--print-schema`'s `manifest.top_level_keys` and
@@ -1191,8 +1251,8 @@ def agent_args_for_manifest() -> Dict[str, List[str]]:
 EXIT_POLICY_UNRATIFIED = 3
 
 
-def render_manifest(policy: Dict[str, Any], *,
-                    receives: Optional[bool] = None) -> Dict[str, Any]:
+def render_manifest(policy: Dict[str, Any], *, receives: Optional[bool] = None,
+                    identity_schema: Optional[str] = None) -> Dict[str, Any]:
     """The manifest document for `policy`: selection verbatim; the lane
     tree under `create`; sibling lane mounts with their exports; the domain
     as an `expose` export; `receives` when `receives` is True (this host's
@@ -1211,6 +1271,14 @@ def render_manifest(policy: Dict[str, Any], *,
     # LAST, so every earlier mount keeps its position.
     mounts.append({"name": FEATURE_ROSTER_SUBDIR, "from": FEATURE_ROSTER_SUBDIR, "mode": "ro",
                    "export": EXPORT_ROSTER_DIR})
+    identity = identity_mode(policy)
+    if identity is not None:
+        if not identity_schema:
+            raise ProvisionError(f"the policy's {IDENTITY_KEY!r} is {identity!r}, and no name.json "
+                                 f"schema id was given for it")
+        mounts.append({"name": IDENTITY_MOUNT_NAME,
+                       "from": f"{FEATURE_IDENTITY_SUBDIR}/{MANIFEST_SLUG}", "mode": "ro",
+                       "export": EXPORT_IDENTITY_DIR})
     feature = {k: v for k, v in policy.items()
                if k not in (fp.SANDBOXES_KEY, fp.AGENTS_KEY, fp.SOURCE_KEY)}
     doc: Dict[str, Any] = {
@@ -1229,6 +1297,8 @@ def render_manifest(policy: Dict[str, Any], *,
     domain = policy.get(fp.FLEET_DOMAIN_KEY)
     if domain is not None:
         doc["expose"][EXPOSE_FLEET_DOMAIN] = domain
+    if identity is not None:
+        doc["expose"][EXPOSE_IDENTITY] = identity_schema
     _check_manifest_names(doc)
     return doc
 
@@ -1286,8 +1356,10 @@ def _check_manifest_names(doc: Dict[str, Any]) -> None:
                                      f"with it; use the -file form of the flag")
 
 
-def manifest_text(policy: Dict[str, Any], *, receives: Optional[bool] = None) -> str:
-    return json.dumps(render_manifest(policy, receives=receives), indent=2) + "\n"
+def manifest_text(policy: Dict[str, Any], *, receives: Optional[bool] = None,
+                  identity_schema: Optional[str] = None) -> str:
+    return json.dumps(render_manifest(policy, receives=receives,
+                                      identity_schema=identity_schema), indent=2) + "\n"
 
 
 def _owned_keys(receives: Optional[bool]) -> Tuple[str, ...]:
@@ -1306,7 +1378,8 @@ def _read_manifest(path: Path) -> Any:
 
 
 def install_manifest(home: Path, policy: Dict[str, Any], *, dry_run: bool,
-                     receives: Optional[bool] = None) -> str:
+                     receives: Optional[bool] = None,
+                     identity_schema: Optional[str] = None) -> str:
     """Write the manifest when it is ABSENT (the template rendered from
     `policy` — on a fresh host the default policy), or REPAIR the
     deployment-owned blocks of the one that is there, leaving the operator's keys and
@@ -1319,7 +1392,7 @@ def install_manifest(home: Path, policy: Dict[str, Any], *, dry_run: bool,
         if not isinstance(existing, dict):
             raise ProvisionError(f"{path} exists but is not a JSON object — it is the authored "
                                  f"policy, so it is not overwritten; fix it by hand")
-        rendered = render_manifest(policy, receives=receives)
+        rendered = render_manifest(policy, receives=receives, identity_schema=identity_schema)
         doc = dict(existing)
         for key in _owned_keys(receives):
             if key in rendered:
@@ -1328,7 +1401,7 @@ def install_manifest(home: Path, policy: Dict[str, Any], *, dry_run: bool,
                 doc.pop(key, None)
         want = json.dumps(doc, indent=2) + "\n"
     else:
-        want = manifest_text(policy, receives=receives)
+        want = manifest_text(policy, receives=receives, identity_schema=identity_schema)
     return _write_file(path, want, dry_run=dry_run, label=FEATURE_MANIFEST_NAME)
 
 
@@ -1351,7 +1424,8 @@ def manifest_changed_at(home: Path) -> Optional[str]:
 
 
 def verify_manifest(home: Path, policy: Dict[str, Any], *,
-                    receives: Optional[bool] = None) -> List[str]:
+                    receives: Optional[bool] = None,
+                    identity_schema: Optional[str] = None) -> List[str]:
     """The manifest on disk is current: its deployment-owned blocks equal
     what this deployment renders for its own policy, its `feature` section is an
     object (the policy loads — `policy` is that load), and its own `expose`
@@ -1373,7 +1447,7 @@ def verify_manifest(home: Path, policy: Dict[str, Any], *,
     if not isinstance(doc, dict) or not isinstance(doc.get("feature"), dict):
         return [f"manifest drift: {path} carries no `feature` object — the policy lives there"]
     problems = []
-    rendered = render_manifest(policy, receives=receives)
+    rendered = render_manifest(policy, receives=receives, identity_schema=identity_schema)
     stale = [k for k in _owned_keys(receives) if doc.get(k) != rendered.get(k)]
     if stale:
         problems.append(f"manifest drift: {path}: {', '.join(stale)} differ from what this "
@@ -1381,6 +1455,18 @@ def verify_manifest(home: Path, policy: Dict[str, Any], *,
                         f"--apply, which repairs them and leaves the policy keys alone")
     problems += verify_manifest_domain(home)
     return problems
+
+
+def manifest_problems(home: Path, policy: Dict[str, Any], args: argparse.Namespace) -> List[str]:
+    """`verify_manifest` with this host's answers. When the identity mount
+    the policy turns on cannot be rendered, that is the problem reported,
+    and the manifest is not compared against a guess."""
+    try:
+        identity_schema = identity_schema_for(policy, args)
+    except ProvisionError as e:
+        return [f"identity: {e}; the manifest is not compared until it is fixed"]
+    return verify_manifest(home, policy, receives=sandy_accepts_receives(args.sandy),
+                           identity_schema=identity_schema)
 
 
 VERDICT_AT_UNKNOWN = "?"     # sandy stamps `?` when its clock call fails; never ordered
@@ -1753,7 +1839,8 @@ def run_provision(
     # THE MANIFEST AND THE PAYLOAD, ONCE, FIRST.
     try:
         report = install_manifest(home, policy, dry_run=dry,
-                                  receives=sandy_accepts_receives(args.sandy))
+                                  receives=sandy_accepts_receives(args.sandy),
+                                  identity_schema=identity_schema_for(policy, args))
     except ProvisionError as e:
         print(f"  FAIL  manifest {feature_manifest_path(home)}: {e}", file=sys.stderr)
         failed += 1
@@ -2373,6 +2460,210 @@ def verify_feature_env(slug: str, container: str, *, fleet_domain: Optional[str]
                         f"declares {fleet_domain!r} — the wrapper computes the daemon's address "
                         f"from the former; relaunch after install --apply")
     return problems
+
+
+NAME_JSON = "name.json"
+
+
+# The relays' name.json checker, read from the shipped payload/relay and run
+# as it is, so verify refuses exactly what every runtime reader refuses.
+NAME_CHECK_FIRST = "import json, os, re, sys\n"
+NAME_CHECK_LAST = 'print("ok " + address)\n'
+
+
+def name_json_checker() -> str:
+    text = (PAYLOAD_DIR / "relay").read_text(encoding="utf-8")
+    start = text.index(NAME_CHECK_FIRST)
+    return text[start:text.index(NAME_CHECK_LAST, start) + len(NAME_CHECK_LAST)]
+
+
+def name_json_verdict(text: str, fleet_domain: Optional[str], name_schema: str) -> str:
+    """The checker's one line for `text`: "ok <address>" or "no <reason>",
+    under the fleet domain and schema id the relay would see."""
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "AMAP_IDENTITY": name_schema}
+    if fleet_domain is not None:
+        env["AMAP_FLEET_DOMAIN"] = fleet_domain
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / NAME_JSON
+        path.write_text(text, encoding="utf-8")
+        try:
+            p = subprocess.run([sys.executable, "-I", "-c", name_json_checker(), str(path)],
+                               env=env, capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.SubprocessError) as e:
+            return f"the name.json checker could not run: {e}"
+    return p.stdout.strip() or f"the name.json checker gave no verdict: {p.stderr.strip()[-200:]}"
+
+
+def identity_findings(slug: str, shown: "ha.Result", env: Dict[str, str],
+                      name_json: Optional[str], read_error: str,
+                      fleet_domain: Optional[str], name_schema: str) -> List[str]:
+    """What is wrong with one running sandbox's registry identity, from
+    the registry's binding (`shown`), the container's environment, and the
+    name.json the container reads (`name_json`, or None with `read_error`).
+
+    The comparison is by the binding's logical_id and address against the
+    file the CONTAINER sees, never by a mount path: a mount's recorded root
+    is relative to its filesystem and differs between hosts. Every gap is a
+    problem, because each one leaves the relay holding or wrong.
+
+    It compares the FILE, not the running daemon: the relay reads name.json
+    once, before it starts the daemon, so a name the registry changes later
+    (an operator override) reaches the daemon at the sandbox's next
+    relaunch, and this check passes in between."""
+    if shown.outcome == ha.UNKNOWN:
+        return [f"identity unknown: {slug}: the registry's `show` did not answer "
+                f"({shown.code}: {shown.detail})"]
+    if shown.outcome != ha.REGISTERED or not isinstance(shown.binding, dict):
+        if shown.code == ha.CODE_NOT_FOUND:
+            return [f"identity not registered: {slug}: the registry has no binding for its "
+                    f"workspace, so its relay holds; run migrate-registry, then "
+                    f"link-identity --apply, then relaunch"]
+        return [f"identity refused: {slug}: the registry's `show` refused ({shown.code}: "
+                f"{shown.detail})"]
+    b = shown.binding
+    if not env.get(EXPORT_IDENTITY_DIR):
+        return [f"identity mount absent: {slug}: the container has no {EXPORT_IDENTITY_DIR}, "
+                f"so its relay holds; it launched before its link existed. Run link-identity "
+                f"--apply, then relaunch"]
+    if name_json is None:
+        return [f"identity unreadable: {slug}: {NAME_JSON} cannot be read in the container "
+                f"({read_error}), so its relay holds"]
+    problems: List[str] = []
+    verdict = name_json_verdict(name_json, fleet_domain, name_schema)
+    doc = json.loads(name_json) if verdict.startswith("ok ") else None
+    if doc is None:
+        why = verdict[len("no "):] if verdict.startswith("no ") else verdict
+        problems.append(f"identity refused: {slug}: {why}; its relay holds")
+    elif doc.get("logical_id") != b.get("logical_id"):
+        problems.append(f"identity lag: {slug}: the container reads the identity directory of "
+                        f"{doc.get('logical_id')!r}, and the registry binds "
+                        f"{b.get('logical_id')!r}; relaunch, so the mount follows the link")
+    elif (doc.get("address"), doc.get("epoch")) != (b.get("address"), b.get("epoch")):
+        problems.append(f"identity stale: {slug}: {NAME_JSON} names {doc.get('address')!r} at "
+                        f"epoch {doc.get('epoch')!r}, and the registry binds "
+                        f"{b.get('address')!r} at epoch {b.get('epoch')!r}; the registry has "
+                        f"not rewritten it")
+    dom = ha.address_domain(b)
+    if dom != fleet_domain:
+        problems.append(f"identity domain: {slug}: the registry's address is in {dom!r}, and "
+                        f"the policy's fleet domain is {fleet_domain!r}; the relay holds")
+    state = b.get("name_json")
+    if state != ha.NAME_JSON_CURRENT:
+        problems.append(f"identity delivery: {slug}: the registry reports its {NAME_JSON} as "
+                        f"{state!r}, not {ha.NAME_JSON_CURRENT!r}; registering the workspace "
+                        f"again redelivers it")
+    return problems
+
+
+def container_identity_findings(slug: str, container: str, shown: "ha.Result", *,
+                                fleet_domain: Optional[str], name_schema: str,
+                                docker_bin: str = "docker") -> List[str]:
+    """`identity_findings` for a running container: its environment, and
+    the name.json at the directory its own AMAP_IDENTITY_DIR names."""
+    r = subprocess.run([docker_bin, "exec", container, "env"],
+                       capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        return [f"identity unknown: {slug}: cannot read the environment of {container} "
+                f"({r.stderr.strip() or 'no output'})"]
+    env = dict(line.split("=", 1) for line in r.stdout.splitlines() if "=" in line)
+    text, why = None, ""
+    if env.get(EXPORT_IDENTITY_DIR):
+        c = subprocess.run([docker_bin, "exec", container, "cat", "--",
+                            f"{env[EXPORT_IDENTITY_DIR]}/{NAME_JSON}"],
+                           capture_output=True, text=True, timeout=60)
+        if c.returncode == 0:
+            text = c.stdout
+        else:
+            why = c.stderr.strip() or "no output"
+    return identity_findings(slug, shown, env, text, why, fleet_domain, name_schema)
+
+
+IdentityCheck = Callable[[str, str, Optional[Path], bool, Optional[Path]], List[str]]
+CODEX_CONTROLLER_NAME = "controller.toml"
+_CODEX_SELF_ADDRESS = re.compile(r'^self_address = ("(?:[^"\\]|\\.)*")$', re.M)
+
+
+def codex_self_address(state: Path) -> Tuple[Optional[str], str]:
+    """The address payload/codex/relay last configured the supervisor with,
+    from `controller.toml` in its state directory, which the relay writes
+    with each value as a JSON string. `(None, why)` when it cannot be read;
+    `("", ...)` for a configuration with no self_address (mail only)."""
+    try:
+        text = (state / CODEX_CONTROLLER_NAME).read_text(encoding="utf-8")
+    except OSError as e:
+        return None, f"cannot read {state / CODEX_CONTROLLER_NAME}: {e}"
+    m = _CODEX_SELF_ADDRESS.search(text)
+    if m is None:
+        return "", "no self_address"
+    try:
+        return json.loads(m.group(1)), ""
+    except ValueError as e:
+        return None, f"{CODEX_CONTROLLER_NAME} self_address is not a string: {e}"
+
+
+def codex_identity_findings(slug: str, state: Optional[Path], shown: "ha.Result") -> List[str]:
+    """For a Codex sandbox: the supervisor runs under the registry's address.
+    Nothing while its relay holds (verify reports the hold), and nothing
+    when the registry has no binding (the identity check reports that)."""
+    if shown.outcome != ha.REGISTERED or not isinstance(shown.binding, dict):
+        return []
+    if state is None:
+        return [f"identity unknown: {slug}: sandy reports no state directory for its Codex "
+                f"supervisor"]
+    if (state / CODEX_HOLD_NAME).exists():
+        return []
+    have, why = codex_self_address(state)
+    want = shown.binding.get("address")
+    if have is None:
+        return [f"identity unknown: {slug}: {why}"]
+    if have != want:
+        return [f"identity not applied: {slug}: the Codex supervisor runs as "
+                f"{have or 'no address'!r}, and the registry names {want!r}; relaunch the "
+                f"sandbox"]
+    return []
+
+
+def identity_check(policy: Dict[str, Any], args: argparse.Namespace) -> Optional[IdentityCheck]:
+    """None when the policy turns no identity on: verify is then what it was.
+    Otherwise `(slug, container, workspace, codex, codex_state) -> findings`
+    for one running sandbox (a Codex sandbox adds `codex_identity_findings`,
+    from its supervisor's state directory), asking the registry's read-only `show` for its workspace. Any
+    gap (the overlay, the registry's directory or checkout, sandy's report
+    of the workspace, a `show` with no answer) is UNKNOWN for that sandbox,
+    never a pass, and never stops the others."""
+    try:
+        on = identity_mode(policy) is not None
+    except ProvisionError as e:
+        bad = str(e)
+        return lambda slug, *_: [f"identity unknown: {slug}: {bad}"]
+    if not on:
+        return None
+    try:
+        ids = ha.load_identifiers(ha.overlay_path(args.overlay))
+    except ha.OverlayError as e:
+        why = str(e)
+        return lambda slug, *_: [f"identity unknown: {slug}: {why}"]
+    repo = ha.registry_checkout(ids)
+    if ids.directory is None or repo is None:
+        why = ("the overlay names no registry.directory" if ids.directory is None else
+               f"no registry checkout holding {ids.module}/cli.py (${ha.CHECKOUT_ENV}, or "
+               f"the overlay's registry.checkout)")
+        return lambda slug, *_: [f"identity unknown: {slug}: {why}"]
+    client = ha.Client(Path(ids.directory), repo, ids)
+    domain = policy.get(fp.FLEET_DOMAIN_KEY)
+
+    def check(slug: str, container: str, workspace: Optional[Path], codex: bool = False,
+              codex_state: Optional[Path] = None) -> List[str]:
+        if workspace is None:
+            return [f"identity unknown: {slug}: sandy reports no workspace for it, so the "
+                    f"registry cannot be asked"]
+        shown = client.show(str(workspace))
+        found = container_identity_findings(slug, container, shown,
+                                            fleet_domain=domain, name_schema=ids.name_schema)
+        if codex:
+            found += codex_identity_findings(slug, codex_state, shown)
+        return found
+    return check
 
 
 def verify_feature_mount(home: Path, slug: str, container: str, *,
@@ -3416,7 +3707,8 @@ def run_verify(args: argparse.Namespace, servers: Dict[str, dict], home: Path,
     ok, why = sandy_manifest_capable(args.sandy)
     if not ok:
         problems.append(f"sandy without feature manifests: {why}")
-    problems += verify_manifest(home, policy, receives=sandy_accepts_receives(args.sandy))
+    problems += manifest_problems(home, policy, args)
+    check_identity = identity_check(policy, args)
     problems += verify_feature_payload(home, args.connector_src, servers_path=args.servers,
                                        codex_src=args.codex_connector_src)
     problems += verify_roster_source(home)
@@ -3483,6 +3775,10 @@ def run_verify(args: argparse.Namespace, servers: Dict[str, dict], home: Path,
             problems += verify_roster_mount(home, slug, running[slug])
             problems += verify_feature_env(slug, running[slug],
                                            fleet_domain=policy.get(fp.FLEET_DOMAIN_KEY))
+            if check_identity is not None:
+                problems += check_identity(slug, running[slug], workspace,
+                                           connector == AGENT_CODEX,
+                                           codex_state_dir(records.get(slug)))
             if connector != AGENT_CODEX:
                 problems += verify_relay_alive(sandbox_dir, slug, container=running[slug])
 
@@ -3695,6 +3991,10 @@ def run_sync(args: argparse.Namespace, home: Path, boxes_dir: Path) -> int:
     print()
     run_render_router(args, home, boxes, policy, apply=apply)
 
+    # Step 4: the registry's names, only when the policy turns them on.
+    if identity_mode(policy) is not None:
+        print()
+        prov_rc = max(prov_rc, run_install_identity(args, home, policy, boxes, states))
     return prov_rc
 
 
@@ -3740,6 +4040,348 @@ def _count_files(top: Path, depth: Optional[int] = None) -> int:
     if depth == 1:
         return sum(1 for p in top.iterdir() if p.is_file())
     return sum(1 for p in top.rglob("*") if p.is_file())
+
+
+def migration_members(states: Dict[str, Tuple[str, str]],
+                      workspaces: Dict[str, Path]) -> Tuple[Dict[str, Path], Dict[str, str]]:
+    """`({slug: workspace}, {slug: why excluded})` for the registry migration.
+
+    Only sandboxes sandy has SELECTED are imported: they are the fleet's
+    members, the agents that hold an address today. A sandbox sandy has not
+    decided yet (`unknown`) is excluded and named, never guessed: once it
+    has launched, a re-run imports it, because the import is idempotent. A
+    selected slug the router refuses holds no address, so it is excluded too."""
+    members: Dict[str, Path] = {}
+    excluded: Dict[str, str] = {}
+    for slug, (state, detail) in sorted(states.items()):
+        if state != STATE_SELECTED:
+            excluded[slug] = f"{state}: {detail}"
+        elif slug not in workspaces:
+            excluded[slug] = "sandy reports no workspace path for it"
+        elif router_refusal(slug):
+            excluded[slug] = f"the router refuses it: {router_refusal(slug)}"
+        else:
+            members[slug] = workspaces[slug]
+    return members, excluded
+
+
+def registry_setup(args: argparse.Namespace) -> Tuple["ha.Identifiers", Path]:
+    """The registry's identifiers, from the deployment overlay, and its
+    checkout. Either missing refuses the verb by name."""
+    try:
+        ids = ha.load_identifiers(ha.overlay_path(args.overlay))
+    except ha.OverlayError as e:
+        raise ProvisionError(str(e)) from None
+    repo = ha.registry_checkout(ids, getattr(args, "registry_repo", None))
+    if repo is None:
+        raise ProvisionError(f"no registry checkout holding {ids.module}/cli.py: pass "
+                             f"--registry-repo, set ${ha.CHECKOUT_ENV}, or name `checkout` in "
+                             f"the overlay")
+    return ids, repo
+
+
+def registry_dir(args: argparse.Namespace, ids: "ha.Identifiers") -> Path:
+    """The registry's directory: --registry, else the overlay's
+    `registry.directory`, which is the one verify uses. Both, and different,
+    refuses: two commands must not ask two registries."""
+    flag = Path(args.registry).absolute() if args.registry else None
+    named = Path(ids.directory) if ids.directory else None
+    if flag and named and os.path.normpath(flag) != os.path.normpath(named):
+        raise ProvisionError(f"--registry {flag} is not the overlay's registry.directory {named}, "
+                             f"which verify uses; drop the flag or fix the overlay")
+    if flag or named:
+        return flag or named
+    raise ProvisionError("no registry directory: pass --registry, or name registry.directory "
+                         "in the overlay")
+
+
+def run_migrate_registry(args: argparse.Namespace, home: Path) -> int:
+    """`migrate-registry`: the registry migration, PREPARED, never run.
+
+    Writes (with --apply) the batch of every selected sandbox's slug and
+    workspace path, and prints the two registry operator commands that
+    import it: `plan`, which shows the change and a confirmation code, and
+    `apply`, which takes that code and the operator's name and reason. The
+    verbs are the operator's; this tool runs neither. A re-run after more
+    sandboxes are selected writes a batch whose already-imported items come
+    back `already_bound`."""
+    boxes = discover_sandboxes(args.sandy)
+    states = selection_states(home, boxes)
+    workspaces = {b["name"]: Path(b["workspace_path"]) for b in boxes if b.get("workspace_path")}
+    members, excluded = migration_members(states, workspaces)
+    print(f"migrate-registry: {len(members)} selected sandbox(es) to import under their "
+          f"current slug, so no address's local part changes")
+    for slug in sorted(members):
+        print(f"  import  {slug}")
+    for slug, why in sorted(excluded.items()):
+        print(f"  skip    {slug}: {why}")
+    if not members:
+        print("  nothing to import")
+        return 0
+    ids, repo = registry_setup(args)
+    text = ha.import_batch_text(members)
+    registry = registry_dir(args, ids)
+    if not (registry / "host.json").is_file():
+        print(f"  note: {args.registry}/host.json does not exist yet; the import refuses "
+              f"(config_absent) until it does")
+    if not args.apply:
+        print(f"  dry run (pass --apply to write the batch to {args.batch}):")
+        print(text, end="")
+    else:
+        print("  " + _write_file(Path(args.batch), text, dry_run=False, label="import batch"))
+    plan, apply_ = ha.import_commands(repo, registry, Path(args.batch), ids)
+    print("Then, as the operator (this tool runs neither):")
+    print(f"  1. {plan}")
+    print(f"  2. {apply_}")
+    print("  Step 2 takes the code step 1 prints. Every imported agent's sender quarantine "
+          "starts at the import (24 h before a cross-host delegation from it is accepted).")
+    return 0
+
+
+# The identity mount. The host registry keys each agent's identity directory by
+# logical_id, and sandy substitutes only `${slug}` in a mount's `from`, so
+# the manifest mounts `by-slug/${slug}`: a symlink, one per sandbox, to the
+# directory the registry names. Docker binds the link's TARGET at launch, so
+# a running sandbox keeps the directory it started with until it relaunches,
+# and sees every rename the registry makes inside it live. A sandbox launched
+# before its link exists starts without the mount (sandy skips a declared
+# mount with no source), and gains it only by relaunching.
+FEATURE_IDENTITY_SUBDIR = "by-slug"
+IDENTITY_MOUNT_NAME = "identity"
+EXPORT_IDENTITY_DIR = "AMAP_IDENTITY_DIR"
+# The one `expose` that says this fleet's addresses are the registry's. A
+# mount sandy skipped exports nothing, so without this the relay could not
+# tell "not registered yet" from "no registry". Its value is name.json's
+# schema id, from the deployment overlay, which the relay checks the file
+# against: the payload names no registry token of its own.
+EXPOSE_IDENTITY = "AMAP_IDENTITY"
+
+LINK_CREATE = "create"
+LINK_KEEP = "keep"
+LINK_REPOINT = "repoint"
+LINK_REFUSE = "refuse"
+LINK_SKIP = "skip"
+LINK_UNKNOWN = "unknown"
+LINK_STRAY = "stray"
+
+
+def identity_links_dir(home: Path) -> Path:
+    return feature_root(home) / FEATURE_IDENTITY_SUBDIR
+
+
+def plan_identity_links(links_dir: Path, members: Dict[str, Path],
+                        shown: Dict[str, "ha.Result"]) -> List[Tuple[str, str, str, str]]:
+    """`[(action, slug, target, why)]`: what `link-identity` would do for
+    each member, from what the registry's `show` answered for its workspace.
+
+    Nothing is ever removed. A path that is not a symlink is refused, never
+    replaced. A link pointing elsewhere is a REPOINT, named as one, because
+    the sandbox keeps the old directory until it relaunches. A link for a
+    slug that is not a member is a STRAY: reported, left alone. A `show`
+    that could not be answered is UNKNOWN, never a skip."""
+    plan: List[Tuple[str, str, str, str]] = []
+    for slug in sorted(members):
+        r = shown.get(slug)
+        if r is None or r.outcome == ha.UNKNOWN:
+            why = "the registry was not asked" if r is None else f"{r.code}: {r.detail}"
+            plan.append((LINK_UNKNOWN, slug, "", why))
+            continue
+        if r.outcome != ha.REGISTERED or not isinstance(r.binding, dict):
+            if r.code == ha.CODE_NOT_FOUND:
+                why = ("not registered: install --apply registers it (migrate-registry imports "
+                       "an existing slug)")
+            else:
+                why = f"the registry refused show: {r.code}: {r.detail}"
+            plan.append((LINK_SKIP, slug, "", why))
+            continue
+        target = r.binding.get("identity_dir")
+        lid = r.binding.get("logical_id")
+        if (not isinstance(target, str) or not os.path.isabs(target)
+                or not isinstance(lid, str) or os.path.basename(target) != lid):
+            plan.append((LINK_REFUSE, slug, str(target),
+                         f"the binding's identity_dir is not an absolute directory named "
+                         f"by its logical_id {lid!r}"))
+            continue
+        path = links_dir / slug
+        try:
+            st = path.lstat()
+        except FileNotFoundError:
+            plan.append((LINK_CREATE, slug, target, ""))
+            continue
+        except OSError as e:
+            plan.append((LINK_UNKNOWN, slug, target, f"cannot read {path}: {e}"))
+            continue
+        if not stat.S_ISLNK(st.st_mode):
+            plan.append((LINK_REFUSE, slug, target,
+                         f"{path} exists and is not a symlink; it is left as it is"))
+            continue
+        have = os.readlink(path)
+        if have == target:
+            plan.append((LINK_KEEP, slug, target, ""))
+        else:
+            plan.append((LINK_REPOINT, slug, target,
+                         f"it points at {have}; the sandbox keeps that directory "
+                         f"until it relaunches"))
+    try:
+        present = sorted(e.name for e in os.scandir(links_dir))
+    except FileNotFoundError:
+        present = []
+    for name in present:
+        if name not in members and not name.startswith("."):
+            plan.append((LINK_STRAY, name, "", "not a selected, registered sandbox; left "
+                                                "as it is"))
+    return plan
+
+
+def apply_identity_links(links_dir: Path, plan: List[Tuple[str, str, str, str]]) -> List[str]:
+    """Make the plan's CREATE and REPOINT links, each by a temporary link
+    renamed over the name, so a reader sees the old target or the new one
+    and never neither. Each path is looked at again first: a CREATE whose
+    path now exists, or a REPOINT whose path is no longer a link, is left
+    alone and returned, by slug, as changed since the plan."""
+    links_dir.mkdir(parents=True, exist_ok=True)
+    moved: List[str] = []
+    for action, slug, target, _ in plan:
+        if action not in (LINK_CREATE, LINK_REPOINT):
+            continue
+        path = links_dir / slug
+        if (action == LINK_CREATE and os.path.lexists(path)) or \
+                (action == LINK_REPOINT and not path.is_symlink()):
+            moved.append(slug)
+            continue
+        tmp = links_dir / f".{slug}.{os.getpid()}.tmp"
+        os.symlink(target, tmp)
+        os.replace(tmp, path)
+    return moved
+
+
+def install_identity(client: "ha.Client", links_dir: Path, members: Dict[str, Path], *,
+                     apply: bool) -> Tuple[List[str], bool]:
+    """`(lines, failed)`: install's registration of every selected sandbox,
+    then its by-slug link. Zero-touch: a sandbox sandy selected and the
+    registry has never seen is registered with the workspace sandy reports,
+    and linked, with no operator import. Dry run asks only the read-only
+    `show`; --apply calls the idempotent `register`.
+
+    Never before the registry exists. The import (migrate-registry) creates
+    it and binds today's slugs as names; a `register` before that would give
+    an existing agent a new name, and names are never reused. Each sandbox
+    fails closed on its own: one the registry does not answer, or refuses,
+    is named and gets no link, and the others go on."""
+    lines: List[str] = []
+    listed = client.list()
+    if listed.outcome != ha.REGISTERED:
+        if listed.code == ha.CODE_REGISTRY_ABSENT:
+            why = ("the registry does not exist yet: import today's slugs with migrate-registry "
+                   "first, so no existing agent is renamed")
+        else:
+            why = f"the registry did not answer `list` ({listed.code}: {listed.detail})"
+        return [f"  FAIL  identity: {why}; nothing registered or linked"], True
+    failed = False
+    shown: Dict[str, ha.Result] = {}
+    for slug in sorted(members):
+        ws = str(members[slug])
+        if not apply:
+            r = client.show(ws)
+            if r.code == ha.CODE_NOT_FOUND:
+                lines.append(f"  register  {slug}: would register {ws}")
+            shown[slug] = r
+            continue
+        r = client.register(ws)
+        if r.outcome == ha.REGISTERED:
+            if r.created:
+                lines.append(f"  register  {slug}: registered as {r.binding.get('address')}")
+        elif r.outcome == ha.UNDELIVERED:
+            failed = True
+            lines.append(f"  FAIL  register {slug}: bound as {r.binding.get('address')}, but "
+                         f"name.json was not delivered ({r.code}: {r.detail}); its relay holds "
+                         f"until a later install delivers it")
+        else:
+            failed = True
+            lines.append(f"  FAIL  register {slug}: {r.outcome} ({r.code}: {r.detail}); no link")
+        shown[slug] = (ha.Result(ha.REGISTERED, binding=r.binding)
+                       if r.binding is not None and r.outcome in (ha.REGISTERED, ha.UNDELIVERED)
+                       else r)
+    plan = plan_identity_links(links_dir, members, shown)
+    for action, slug, target, why in plan:
+        if action == LINK_KEEP or (action == LINK_SKIP and not apply):
+            continue
+        lines.append(f"  link {action:8}{slug}" + (f" -> {target}" if target else "")
+                     + (f": {why}" if why else ""))
+    failed = failed or any(p[0] in (LINK_UNKNOWN, LINK_REFUSE) for p in plan)
+    if apply:
+        try:
+            moved = apply_identity_links(links_dir, plan)
+        except OSError as e:
+            return lines + [f"  FAIL  identity: cannot write the links in {links_dir}: {e}"], True
+        for slug in moved:
+            lines.append(f"  FAIL  link {slug}: changed since the plan; left as it is")
+        failed = failed or bool(moved)
+    return lines, failed
+
+
+def run_install_identity(args: argparse.Namespace, home: Path, policy: Dict[str, Any],
+                         boxes: List[dict], states: Dict[str, Tuple[str, str]]) -> int:
+    """install's identity step, only when the policy's `identity` is on:
+    0, or 1 when any sandbox failed. A setup gap (the overlay, the registry
+    directory or checkout) fails the step, by name."""
+    if identity_mode(policy) is None:
+        return 0
+    print("identity (the host registry's names):")
+    try:
+        ids, repo = registry_setup(args)
+        registry = registry_dir(argparse.Namespace(registry=None), ids)
+    except ProvisionError as e:
+        print(f"  FAIL  identity: {e}")
+        return 1
+    workspaces = {b["name"]: Path(b["workspace_path"]) for b in boxes if b.get("workspace_path")}
+    members, excluded = migration_members(states, workspaces)
+    lines, failed = install_identity(ha.Client(registry, repo, ids), identity_links_dir(home),
+                                     members, apply=args.apply)
+    for line in lines or ["  every selected sandbox is registered and linked"]:
+        print(line)
+    for slug, why in sorted(excluded.items()):
+        print(f"  skip  {slug}: {why}")
+    if args.apply and not failed:
+        print("  a sandbox gains or changes its identity mount when it relaunches")
+    return 1 if failed else 0
+
+
+def run_link_identity(args: argparse.Namespace, home: Path) -> int:
+    """`link-identity`: one `by-slug/<slug>` link per selected, registered
+    sandbox, to the identity directory the registry names for it. Dry run by
+    default. Exits 1 when any sandbox's link is UNKNOWN or refused."""
+    boxes = discover_sandboxes(args.sandy)
+    states = selection_states(home, boxes)
+    workspaces = {b["name"]: Path(b["workspace_path"]) for b in boxes if b.get("workspace_path")}
+    members, excluded = migration_members(states, workspaces)
+    ids, repo = registry_setup(args)
+    client = ha.Client(registry_dir(args, ids), repo, ids)
+    shown = {slug: client.show(str(ws)) for slug, ws in members.items()}
+    links_dir = identity_links_dir(home)
+    try:
+        plan = plan_identity_links(links_dir, members, shown)
+    except OSError as e:
+        raise ProvisionError(f"cannot read the links in {links_dir}: {e}") from None
+    print(f"link-identity: {links_dir}")
+    for action, slug, target, why in plan:
+        tail = f" -> {target}" if target else ""
+        print(f"  {action:8}{slug}{tail}" + (f": {why}" if why else ""))
+    for slug, why in sorted(excluded.items()):
+        print(f"  {LINK_SKIP:8}{slug}: {why}")
+    failed = any(p[0] in (LINK_UNKNOWN, LINK_REFUSE) for p in plan)
+    if not args.apply:
+        print("  dry run (pass --apply to make the create and repoint links)")
+    else:
+        try:
+            moved = apply_identity_links(links_dir, plan)
+        except OSError as e:
+            raise ProvisionError(f"cannot write the links in {links_dir}: {e}") from None
+        for slug in moved:
+            print(f"  {LINK_REFUSE:8}{slug}: changed since the plan; left as it is, run again")
+        failed = failed or bool(moved)
+        print("  applied; a sandbox gains or changes its identity mount when it relaunches")
+    return 1 if failed else 0
 
 
 def run_teardown(args: argparse.Namespace, home: Path, boxes_dir: Path) -> int:
@@ -3852,6 +4494,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--sandy-home", type=Path, default=None,
                     help="override $SANDY_HOME (default: ~/.sandy)")
     ap.add_argument("--sandy", default="sandy", help="sandy executable (for --print-state)")
+    ap.add_argument("--overlay", type=Path, default=None,
+                    help="the deployment overlay, the private file naming the host registry's "
+                         "identifiers (default: $AMAP_DEPLOY_OVERLAY)")
     ap.add_argument("--state-dir", type=Path, default=None,
                     help=f"router-private state, rendered into the router's config as "
                          f"`state_dir` (default: $SANDY_HOME/{ROUTER_STATE_SUBDIR})")
@@ -3917,6 +4562,33 @@ def build_parser() -> argparse.ArgumentParser:
                         "never runs")
     cadence.add_argument("--apply", action="store_true", help="write the plist (default: show it)")
 
+    migrate = sub.add_parser(
+        "migrate-registry", help="prepare the registry migration: write the import batch "
+                                 "(every selected sandbox's slug and workspace) and print "
+                                 "the registry's operator commands that import it. This tool "
+                                 "never runs them")
+    migrate.add_argument("--registry", type=Path, default=None,
+                         help="the host registry's directory (default: the overlay's "
+                              "registry.directory)")
+    migrate.add_argument("--batch", type=Path, required=True,
+                         help="where to write the batch (operator data: it holds host paths)")
+    migrate.add_argument("--registry-repo", type=Path, default=None,
+                         help="the registry's checkout (default: $AMAP_REGISTRY_REPO, else the "
+                              "overlay's `checkout`)")
+    migrate.add_argument("--apply", action="store_true",
+                         help="write the batch (default: show it)")
+
+    link = sub.add_parser(
+        "link-identity", help="link each selected, registered sandbox's slug to the identity "
+                              "directory the registry names for it, which the manifest mounts")
+    link.add_argument("--registry", type=Path, default=None,
+                      help="the host registry's directory (default: the overlay's "
+                           "registry.directory)")
+    link.add_argument("--registry-repo", type=Path, default=None,
+                      help="the registry's checkout (default: $AMAP_REGISTRY_REPO, else the "
+                           "overlay's `checkout`)")
+    link.add_argument("--apply", action="store_true", help="make the links (default: show)")
+
     hsetup = sub.add_parser(
         "host-setup", help="a hop deployment's host plan, from a host-setup document: print "
                            "the root-run steps (uids, groups, directories, the overlay), then "
@@ -3972,6 +4644,12 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         if args.command == "host-setup":
             return hsu.run(args.spec, production=args.production)
+
+        if args.command == "migrate-registry":
+            return run_migrate_registry(args, home)
+
+        if args.command == "link-identity":
+            return run_link_identity(args, home)
 
         return run_verify_command(args, home, boxes_dir)
     except ProvisionError as e:

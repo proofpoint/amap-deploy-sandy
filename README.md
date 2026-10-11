@@ -67,6 +67,7 @@ Everything lives once per host, under `$SANDY_HOME/features/amap/`:
 | `selected.json` | **sandy's** verdict: which sandboxes the rule selected at their last launch | sandy |
 | `instances/` | the root of every instance's lanes, mounted whole by the router | created empty by `install` |
 | `instances/<slug>/` | each instance's lanes (inbox, peer, outbox), created by sandy at launch | sandy |
+| `by-slug/<slug>` | a symlink to the identity directory the host registry names for that sandbox, mounted read-only when the policy's `identity` is `registry` | `install --apply` (identity on) or `link-identity --apply` |
 
 Beside it, `$SANDY_HOME/router-state/` is the router's `state_dir`: first-sight
 markers, the reply ledger, held requests. `install` creates it empty, and
@@ -128,7 +129,30 @@ fresh `state_dir` means a fresh first sight.
 ## Verbs
 
 Host-wide options (`--sandy-home`, `--sandy`, `--servers`, `--connector-src`,
-`--state-dir`) go **before** the verb.
+`--state-dir`, `--overlay`) go **before** the verb.
+
+`--overlay PATH` (default `$AMAP_DEPLOY_OVERLAY`) names the **deployment
+overlay**: a private JSON file whose `registry` section holds the host
+registry's identifiers (its interface token, its CLI and operator-verb
+modules, and the name.json schema id) and, optionally, its checkout and its
+directory. This repository names none of them. Only the registry verbs, and
+a policy whose `identity` is `registry`, need it; without it they refuse by
+name and nothing else changes. With `identity` on, `verify` also asks the
+registry (read-only `show`) about every running sandbox and compares the
+name.json that sandbox's container reads; any gap is a problem for that
+sandbox alone. With `identity` on, `install --apply` also registers every
+selected sandbox the registry has not seen (with the workspace sandy
+reports) and makes its `by-slug/` link, so a new agent needs no import:
+after its first launch, `install --apply` and a relaunch. It registers
+nothing until the registry exists: import today's slugs first with
+`migrate-registry`, so no existing agent is given a new name. That guard is
+for the registry as a whole, not per agent: an existing agent the import
+missed (one sandy had not yet selected when the batch was written) is
+registered by a later `install --apply` under a new name. Check the
+import's plan against `list` before turning `identity` on. The relay reads name.json once, when it starts: a name the
+registry changes later (an operator override) takes effect when the sandbox
+relaunches, and `verify`, which reads the file, does not see the
+difference.
 
 | Verb | Does |
 |---|---|
@@ -138,6 +162,8 @@ Host-wide options (`--sandy-home`, `--sandy`, `--servers`, `--connector-src`,
 | `list` | every sandbox sandy reports, with sandy's verdict for this feature: `selected`, `not selected` (with the reason) or `unknown` (not launched since the manifest changed) |
 | `fleet-domain [--base BASE] [--apply]` | this host's derived fleet domain, `sandy.<host>.<base>` (base: `internal`), beside the manifest's; `--apply` writes it into `feature.fleet_domain`. Every agent's address changes, so relaunch them after |
 | `cadence [--apply]` | the container-recreation job (macOS launchd), rendered from the policy's cadence. It prints the `launchctl` line and never runs it |
+| `migrate-registry --registry DIR --batch FILE [--registry-repo DIR] [--apply]` | the host registry's import of every selected sandbox, prepared: writes the batch (slug and workspace) and prints the registry's two operator commands, `plan` and `apply`. It runs neither |
+| `link-identity --registry DIR [--registry-repo DIR] [--apply]` | one `by-slug/<slug>` link per selected, registered sandbox, to the identity directory the registry names. It removes nothing and refuses a path that is not a link; a sandbox gains or changes the mount when it relaunches |
 | `teardown [--apply] [--force]` | takes the host back to before `install`: removes the payload, the router's config and its state. It keeps the manifest and `instances/`. `--force` also empties every lane |
 | `host-setup --spec FILE [--production]` | a hop deployment's host plan, from a host-setup document (operator data): prints the root-run steps (uids, groups, directories created with owner and mode, a barrier syncing each one and its ancestors, the overlay root-owned 0444) and runs none of them, then checks the host against them, including each runtime's durable root as a container sees it. `--production` refuses the stub plugin's pin |
 

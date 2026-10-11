@@ -285,6 +285,65 @@ class CodexRelayTest(unittest.TestCase):
         self.assertIsNone(config.self_address)
         self.assertEqual([l.name for l in config.lanes], ["mail"])
 
+    # With the identity mount: the registry's address, never the slug.
+    SCHEMA = "example-registry.name/1"
+
+    def _identity(self, name_json=None):
+        ident = self.root / "identity"
+        ident.mkdir(exist_ok=True)
+        if name_json is not None:
+            (ident / "name.json").write_text(json.dumps(name_json))
+        return {"AMAP_IDENTITY": self.SCHEMA, "AMAP_IDENTITY_DIR": str(ident),
+                "AMAP_IDENTITY_POLL_SECONDS": "0.1"}
+
+    def _name_json(self, **over):
+        doc = {"schema": self.SCHEMA, "name": "gamma", "address": "gamma@sandy.host.internal",
+               "logical_id": "0123456789abcdef0123456789abcdef", "epoch": 1}
+        doc.update(over)
+        return doc
+
+    def test_with_identity_the_supervisor_runs_as_the_registrys_address(self):
+        (self.root / "logged-in").write_text("")
+        proc = subprocess.run(["/bin/sh", str(self.payload / "codex/relay")],
+                              env={**self.env, **self._identity(self._name_json())},
+                              capture_output=True, text=True, timeout=30)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        config = Config.load(self.state / "codex/controller.toml")
+        self.assertEqual(config.self_address, "gamma@sandy.host.internal")
+        self.assertEqual(prov.codex_self_address(self.state / "codex"),
+                         ("gamma@sandy.host.internal", ""))
+
+    def test_with_identity_and_no_mount_it_holds_and_names_the_relaunch(self):
+        (self.root / "logged-in").write_text("")
+        reason = self._hold_reason(self._start(AMAP_IDENTITY=self.SCHEMA))
+        self.assertIn("no identity mount", reason)
+        self.assertIn("relaunch", reason)
+        self.assertFalse((self.state / "codex/controller.toml").exists())
+
+    def test_with_identity_a_bad_name_json_holds_until_a_good_one_arrives(self):
+        (self.root / "logged-in").write_text("")
+        env = self._identity(self._name_json(epoch=0))
+        proc = self._start(**env)
+        hold = self.state / prov.CODEX_STATE_SUBDIR / prov.CODEX_HOLD_NAME
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline and not hold.is_file():
+            time.sleep(0.05)
+        self.assertIn("epoch", json.loads(hold.read_text())["reason"])
+        self.assertFalse((self.state / "codex/controller.toml").exists())
+        tmp = Path(env["AMAP_IDENTITY_DIR"]) / ".tmp"
+        tmp.write_text(json.dumps(self._name_json()))
+        os.replace(tmp, Path(env["AMAP_IDENTITY_DIR"]) / "name.json")
+        out, err = proc.communicate(timeout=30)
+        self.assertEqual(proc.returncode, 0, err)
+        self.assertEqual(Config.load(self.state / "codex/controller.toml").self_address,
+                         "gamma@sandy.host.internal")
+
+    def test_the_submit_server_is_handed_the_identity_variables(self):
+        text = (self.payload / "codex/mcp.toml").read_text()
+        block = text[text.index("[mcp_servers.inbox_submit]"):]
+        for name in (prov.EXPORT_IDENTITY_DIR, prov.EXPOSE_IDENTITY):
+            self.assertIn(f'"{name}"', block)
+
     def test_not_logged_in_holds_with_the_reason(self):
         self.assertIn("not logged in", self._hold_reason(self._start()))
 

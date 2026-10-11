@@ -1,0 +1,163 @@
+{
+  "cases": [
+    {
+      "case": "version",
+      "rc": 0,
+      "request": {
+        "op": "version"
+      },
+      "stdout": "{\"interfaces\": [\"example-registry.adapter/1\"], \"ok\": true}\n"
+    },
+    {
+      "case": "config_absent",
+      "rc": 1,
+      "request": {
+        "interface": "example-registry.adapter/1",
+        "op": "list"
+      },
+      "stdout": "{\"error\": {\"code\": \"config_absent\", \"detail\": \"no host.json in the registry directory\"}, \"ok\": false}\n"
+    },
+    {
+      "case": "registry_absent",
+      "rc": 1,
+      "request": {
+        "interface": "example-registry.adapter/1",
+        "op": "list"
+      },
+      "stdout": "{\"error\": {\"code\": \"registry_absent\", \"detail\": \"no snapshot has been written\"}, \"ok\": false}\n"
+    },
+    {
+      "case": "instances_dir_absent",
+      "rc": 1,
+      "request": {
+        "adapter": "sandy",
+        "interface": "example-registry.adapter/1",
+        "key": "/srv/example/ws/alpha",
+        "op": "register"
+      },
+      "stdout": "{\"binding\": {\"adapter\": \"sandy\", \"address\": \"alpha@fleet.example.org\", \"created\": true, \"epoch\": 1, \"first_registered_ts\": \"2026-10-11T05:31:23Z\", \"identity_dir\": \"/srv/example/identity/77ea5a574f4fb6007dd4a4972c2e580f\", \"logical_id\": \"77ea5a574f4fb6007dd4a4972c2e580f\", \"name\": \"alpha\", \"state\": \"active\"}, \"committed\": true, \"error\": {\"code\": \"instances_dir_absent\", \"detail\": \"instances_dir does not exist\"}, \"ok\": false}\n"
+    },
+    {
+      "case": "register_redelivers",
+      "rc": 0,
+      "request": {
+        "adapter": "sandy",
+        "interface": "example-registry.adapter/1",
+        "key": "/srv/example/ws/alpha",
+        "op": "register"
+      },
+      "stdout": "{\"binding\": {\"adapter\": \"sandy\", \"address\": \"alpha@fleet.example.org\", \"created\": false, \"epoch\": 1, \"first_registered_ts\": \"2026-10-11T05:31:23Z\", \"identity_dir\": \"/srv/example/identity/77ea5a574f4fb6007dd4a4972c2e580f\", \"logical_id\": \"77ea5a574f4fb6007dd4a4972c2e580f\", \"name\": \"alpha\", \"state\": \"active\"}, \"ok\": true}\n"
+    },
+    {
+      "case": "register_again",
+      "rc": 0,
+      "request": {
+        "adapter": "sandy",
+        "interface": "example-registry.adapter/1",
+        "key": "/srv/example/ws/alpha",
+        "op": "register"
+      },
+      "stdout": "{\"binding\": {\"adapter\": \"sandy\", \"address\": \"alpha@fleet.example.org\", \"created\": false, \"epoch\": 1, \"first_registered_ts\": \"2026-10-11T05:31:23Z\", \"identity_dir\": \"/srv/example/identity/77ea5a574f4fb6007dd4a4972c2e580f\", \"logical_id\": \"77ea5a574f4fb6007dd4a4972c2e580f\", \"name\": \"alpha\", \"state\": \"active\"}, \"ok\": true}\n"
+    },
+    {
+      "case": "show",
+      "rc": 0,
+      "request": {
+        "adapter": "sandy",
+        "interface": "example-registry.adapter/1",
+        "key": "/srv/example/ws/alpha",
+        "op": "show"
+      },
+      "stdout": "{\"binding\": {\"adapter\": \"sandy\", \"address\": \"alpha@fleet.example.org\", \"epoch\": 1, \"first_registered_ts\": \"2026-10-11T05:31:23Z\", \"identity_dir\": \"/srv/example/identity/77ea5a574f4fb6007dd4a4972c2e580f\", \"logical_id\": \"77ea5a574f4fb6007dd4a4972c2e580f\", \"name\": \"alpha\", \"name_json\": \"current\", \"state\": \"active\"}, \"ok\": true}\n"
+    },
+    {
+      "case": "list",
+      "rc": 0,
+      "request": {
+        "interface": "example-registry.adapter/1",
+        "op": "list"
+      },
+      "stdout": "{\"bindings\": [{\"adapter\": \"sandy\", \"address\": \"alpha@fleet.example.org\", \"epoch\": 1, \"first_registered_ts\": \"2026-10-11T05:31:23Z\", \"identity_dir\": \"/srv/example/identity/77ea5a574f4fb6007dd4a4972c2e580f\", \"logical_id\": \"77ea5a574f4fb6007dd4a4972c2e580f\", \"name\": \"alpha\", \"state\": \"active\"}], \"ok\": true}\n"
+    },
+    {
+      "case": "not_found",
+      "rc": 1,
+      "request": {
+        "adapter": "sandy",
+        "interface": "example-registry.adapter/1",
+        "key": "/srv/example/ws/missing",
+        "op": "show"
+      },
+      "stdout": "{\"error\": {\"code\": \"not_found\", \"detail\": \"no such binding\"}, \"ok\": false}\n"
+    },
+    {
+      "case": "interface",
+      "rc": 1,
+      "request": {
+        "interface": "example-registry.adapter/0",
+        "op": "list"
+      },
+      "stdout": "{\"error\": {\"code\": \"interface\", \"detail\": \"unsupported interface token\"}, \"interfaces\": [\"example-registry.adapter/1\"], \"ok\": false}\n"
+    },
+    {
+      "case": "bad_request_operator_verb",
+      "rc": 2,
+      "request": {
+        "interface": "example-registry.adapter/1",
+        "op": "retire"
+      },
+      "stdout": "{\"error\": {\"code\": \"bad_request\", \"detail\": \"op must be one of version, register, show, list\"}, \"ok\": false}\n"
+    },
+    {
+      "case": "bad_request_not_json",
+      "rc": 2,
+      "request": "{not json",
+      "stdout": "{\"error\": {\"code\": \"bad_request\", \"detail\": \"request is not JSON: Expecting property name enclosed in double quotes: line 1 column 2 (char 1)\"}, \"ok\": false}\n"
+    },
+    {
+      "case": "stable_key_relative",
+      "rc": 1,
+      "request": {
+        "adapter": "sandy",
+        "interface": "example-registry.adapter/1",
+        "key": "relative/path",
+        "op": "register"
+      },
+      "stdout": "{\"error\": {\"code\": \"stable_key\", \"detail\": \"a sandy key must be an absolute path\"}, \"ok\": false}\n"
+    },
+    {
+      "case": "internal",
+      "rc": 3,
+      "request": {
+        "adapter": "sandy",
+        "interface": "example-registry.adapter/1",
+        "key": "/srv/example/ws/beta",
+        "op": "register"
+      },
+      "stdout": "{\"committed\": \"unknown\", \"error\": {\"code\": \"internal\", \"detail\": \"OSError: [Errno 28] No space left on device\"}, \"ok\": false}\n"
+    },
+    {
+      "case": "register_after_internal",
+      "rc": 0,
+      "request": {
+        "adapter": "sandy",
+        "interface": "example-registry.adapter/1",
+        "key": "/srv/example/ws/beta",
+        "op": "register"
+      },
+      "stdout": "{\"binding\": {\"adapter\": \"sandy\", \"address\": \"beta@fleet.example.org\", \"created\": true, \"epoch\": 1, \"first_registered_ts\": \"2026-10-11T05:31:23Z\", \"identity_dir\": \"/srv/example/identity/56a25404d4d1f65b119a99d05a32cb75\", \"logical_id\": \"56a25404d4d1f65b119a99d05a32cb75\", \"name\": \"beta\", \"state\": \"active\"}, \"ok\": true}\n"
+    },
+    {
+      "case": "show_other_domain",
+      "rc": 0,
+      "request": {
+        "adapter": "sandy",
+        "interface": "example-registry.adapter/1",
+        "key": "/srv/example/ws/alpha",
+        "op": "show"
+      },
+      "stdout": "{\"binding\": {\"adapter\": \"sandy\", \"address\": \"alpha@other.example.org\", \"epoch\": 1, \"first_registered_ts\": \"2026-10-11T05:31:23Z\", \"identity_dir\": \"/srv/example/identity/77ea5a574f4fb6007dd4a4972c2e580f\", \"logical_id\": \"77ea5a574f4fb6007dd4a4972c2e580f\", \"name\": \"alpha\", \"name_json\": \"stale\", \"state\": \"active\"}, \"ok\": true}\n"
+    }
+  ],
+  "producer": "the host registry's CLI, captured at its reviewed pin; its identifiers replaced by the test overlay's (tests/_registry.py)"
+}

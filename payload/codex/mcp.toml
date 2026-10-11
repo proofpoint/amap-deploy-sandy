@@ -32,4 +32,5 @@ args = ["mcp"]
 required = true
 enabled_tools = ["submit", "submit_result", "peers"]
 default_tools_approval_mode = "approve"
-env_vars = ["AMAP_OUTBOX_DIR", "AMAP_ROSTER_DIR", "AMAP_FLEET_DOMAIN"]
+env_vars = ["AMAP_OUTBOX_DIR", "AMAP_ROSTER_DIR", "AMAP_FLEET_DOMAIN", "AMAP_IDENTITY",
+            "AMAP_IDENTITY_DIR"]
