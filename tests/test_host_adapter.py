@@ -267,6 +267,14 @@ class ReadOnlyOpsTest(unittest.TestCase):
         self.assertEqual(r.outcome, ha.REFUSED)
         self.assertNotIn("bindings", r.extra)
 
+    def test_interface_membership_is_whole_tokens_only(self):
+        for listed in ([IDS.interface + "0"], [IDS.interface[:-1]], ["x" + IDS.interface],
+                       [IDS.interface + "0", "other/1"]):
+            with self.subTest(listed=listed):
+                body = json.dumps({"ok": True, "interfaces": listed}) + "\n"
+                ok, _ = client(Raw((0, body, ""))).supports_interface()
+                self.assertIs(ok, False)
+
     def test_list(self):
         r = client(Replay("list")).list()
         self.assertEqual([b["name"] for b in r.extra["bindings"]], ["alpha"])

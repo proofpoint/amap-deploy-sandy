@@ -142,10 +142,14 @@ registry (read-only `show`) about every running sandbox and compares the
 name.json that sandbox's container reads; any gap is a problem for that
 sandbox alone. With `identity` on, `install --apply` also registers every
 selected sandbox the registry has not seen (with the workspace sandy
-reports) and makes its `by-slug/` link, so a new agent needs no operator
-step beyond a relaunch. It registers nothing until the registry exists:
-import today's slugs first with `migrate-registry`, so no existing agent is
-given a new name. The relay reads name.json once, when it starts: a name the
+reports) and makes its `by-slug/` link, so a new agent needs no import:
+after its first launch, `install --apply` and a relaunch. It registers
+nothing until the registry exists: import today's slugs first with
+`migrate-registry`, so no existing agent is given a new name. That guard is
+for the registry as a whole, not per agent: an existing agent the import
+missed (one sandy had not yet selected when the batch was written) is
+registered by a later `install --apply` under a new name. Check the
+import's plan against `list` before turning `identity` on. The relay reads name.json once, when it starts: a name the
 registry changes later (an operator override) takes effect when the sandbox
 relaunches, and `verify`, which reads the file, does not see the
 difference.

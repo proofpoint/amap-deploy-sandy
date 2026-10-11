@@ -178,5 +178,64 @@ class RunInstallIdentityTest(unittest.TestCase):
         self.assertIn("no deployment overlay", out.getvalue())
 
 
+class InstallVerbTest(unittest.TestCase):
+    """`install --apply` end to end, through `main`: with the policy's
+    identity on, a fresh selected sandbox ends up registered and linked.
+    The steps install shares with every mode (the payload, the router's
+    config) are replaced; sandy's report and the registry are stand-ins."""
+
+    def setUp(self):
+        import fleet_policy as fp
+        from _registry import write_overlay
+        self.home = Path(tempfile.mkdtemp())
+        policy = dict(fp.default_policy(), **{prov.IDENTITY_KEY: prov.IDENTITY_REGISTRY,
+                                              fp.FLEET_DOMAIN_KEY: DOMAIN})
+        path = prov.feature_manifest_path(self.home)
+        path.parent.mkdir(parents=True)
+        path.write_text(prov.manifest_text(policy, identity_schema=IDS.name_schema))
+        checkout = self.home / "checkout"
+        (checkout / IDS.module).mkdir(parents=True)
+        (checkout / IDS.module / "cli.py").write_text("")
+        self.overlay = write_overlay(self.home / "overlay.json", checkout=str(checkout),
+                                     directory=str(self.home / "registry"))
+        self.ws = "/srv/example/ws/fresh"
+        boxes = [{"name": "fresh-1a2b3c4d", "path": "/x", "workspace_path": self.ws}]
+        self.reg = Registry()
+        self.reg.bindings["/srv/example/ws/old"] = self.reg.binding("/srv/example/ws/old")
+        patches = {"discover_sandboxes": lambda sandy_bin="sandy": boxes,
+                   "selection_states": lambda home, b: {"fresh-1a2b3c4d": (prov.STATE_SELECTED, "t")},
+                   "run_provision": lambda *a, **k: 0,
+                   "run_render_router": lambda *a, **k: 0,
+                   "load_servers": lambda path: {}}
+        for name, value in patches.items():
+            orig = getattr(prov, name)
+            setattr(prov, name, value)
+            self.addCleanup(setattr, prov, name, orig)
+        orig = ha.Client.call
+        ha.Client.call = lambda c, req: self.reg(c, req)
+        self.addCleanup(setattr, ha.Client, "call", orig)
+
+    def main(self, *verb):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = prov.main(["--sandy-home", str(self.home), "--overlay", str(self.overlay), *verb])
+        return rc, out.getvalue()
+
+    def test_install_apply_registers_and_links_a_fresh_sandbox(self):
+        rc, out = self.main("install", "--apply")
+        self.assertEqual(rc, 0, out)
+        b = self.reg.bindings[self.ws]
+        self.assertEqual(os.readlink(prov.identity_links_dir(self.home) / "fresh-1a2b3c4d"),
+                         b["identity_dir"])
+        self.assertIn("registered as fresh@", out)
+
+    def test_install_without_apply_registers_nothing(self):
+        rc, out = self.main("install")
+        self.assertNotIn(self.ws, self.reg.bindings)
+        self.assertNotIn(ha.OP_REGISTER, self.reg.calls)
+        self.assertFalse(prov.identity_links_dir(self.home).exists())
+        self.assertIn("would register", out)
+
+
 if __name__ == "__main__":
     unittest.main()
