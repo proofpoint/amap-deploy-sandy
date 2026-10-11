@@ -108,6 +108,21 @@ class InstallIdentityTest(unittest.TestCase):
         self.assertIn("migrate-registry", lines[0])
         self.assertFalse(self.links.exists())
 
+    def test_a_list_that_exits_non_zero_never_opens_the_gate(self):
+        orig = self.reg.__call__
+        self.reg.exists = False
+
+        def answer(client, req):
+            if req["op"] == ha.OP_LIST:
+                self.reg.calls.append(req["op"])
+                return ha.Answer(3, {"ok": True, "bindings": []})
+            return orig(client, req)
+        ha.Client.call = answer
+        lines, failed = self.run_it({"fresh-1a2b3c4d": Path("/srv/example/ws/fresh")})
+        self.assertTrue(failed)
+        self.assertEqual(self.reg.calls, [ha.OP_LIST])
+        self.assertIn("did not answer", lines[0])
+
     def test_each_sandbox_fails_closed_alone(self):
         self.reg.fail["/srv/example/ws/bad"] = ha.Answer(
             3, {"ok": False, "committed": "unknown",

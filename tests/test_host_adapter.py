@@ -183,6 +183,20 @@ class ExitAndCodeTest(unittest.TestCase):
                 r = client(Raw(*[answer] * ha.RETRIES)).register(ALPHA)
                 self.assertEqual(r.outcome, want, r)
 
+    def test_a_success_body_with_a_failure_exit_is_never_believed(self):
+        for rc in (3, 1, 2):
+            with self.subTest(op="show", rc=rc):
+                r = client(Raw((rc, CASES["show"]["stdout"], ""))).show(ALPHA)
+                self.assertEqual((r.outcome, r.binding), (ha.UNKNOWN, None))
+            with self.subTest(op="list", rc=rc):
+                r = client(Raw((rc, CASES["list"]["stdout"], ""))).list()
+                self.assertEqual(r.outcome, ha.UNKNOWN)
+                self.assertNotIn("bindings", r.extra)
+            with self.subTest(op="version", rc=rc):
+                ok, why = client(Raw((rc, CASES["version"]["stdout"], ""))).supports_interface()
+                self.assertIsNone(ok)
+                self.assertIn(str(rc), why)
+
     def test_show_and_list(self):
         for op in ("show", "list"):
             for name, answer, want in (("exit 3", (3, self.err("x"), ""), ha.UNKNOWN),

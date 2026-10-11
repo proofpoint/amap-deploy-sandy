@@ -231,6 +231,8 @@ class Client:
         `version` lists. None, with the reason, when it could not be asked."""
         a = self.call({"op": OP_VERSION})
         toks = a.doc.get("interfaces") if a.doc is not None else None
+        if a.doc is not None and a.rc != EXIT_OK:
+            return None, f"version exited {a.rc}"
         if a.doc is None or not a.doc["ok"] or not isinstance(toks, list):
             return None, a.why or "version answered without an interface list"
         return self.ids.interface in toks, ", ".join(str(t) for t in toks)
@@ -254,6 +256,8 @@ class Client:
         a = self.call({"interface": self.ids.interface, "op": OP_SHOW, "adapter": ADAPTER, "key": workspace})
         if a.doc is None:
             return Result(UNKNOWN, CODE_NO_ANSWER, a.why)
+        if a.doc["ok"] and a.rc != EXIT_OK:
+            return _success_with_failure_exit(a)
         if a.doc["ok"] and isinstance(a.doc.get("binding"), dict):
             return Result(REGISTERED, binding=a.doc["binding"])
         return _refusal(a)
@@ -264,6 +268,8 @@ class Client:
         a = self.call({"interface": self.ids.interface, "op": OP_LIST})
         if a.doc is None:
             return Result(UNKNOWN, CODE_NO_ANSWER, a.why)
+        if a.doc["ok"] and a.rc != EXIT_OK:
+            return _success_with_failure_exit(a)
         if a.doc["ok"] and isinstance(a.doc.get("bindings"), list):
             return Result(REGISTERED, extra={"bindings": a.doc["bindings"]})
         return _refusal(a)
@@ -274,6 +280,12 @@ def _error(doc: Dict[str, Any]) -> Tuple[Optional[str], str]:
     if isinstance(err, dict):
         return err.get("code"), str(err.get("detail", ""))
     return None, ""
+
+
+def _success_with_failure_exit(a: Answer) -> Result:
+    """An ok:true document from a process that exited non-zero: neither
+    answer can be believed over the other, so it is UNKNOWN, never a pass."""
+    return Result(UNKNOWN, CODE_NO_ANSWER, f"ok:true with exit status {a.rc}")
 
 
 def _refusal(a: Answer) -> Result:

@@ -57,6 +57,7 @@ import re
 import shutil
 import stat
 import subprocess
+import tempfile
 import sys
 import time
 from datetime import datetime, timezone
@@ -2463,6 +2464,35 @@ def verify_feature_env(slug: str, container: str, *, fleet_domain: Optional[str]
 NAME_JSON = "name.json"
 
 
+# The relays' name.json checker, read from the shipped payload/relay and run
+# as it is, so verify refuses exactly what every runtime reader refuses.
+NAME_CHECK_FIRST = "import json, os, re, sys\n"
+NAME_CHECK_LAST = 'print("ok " + address)\n'
+
+
+def name_json_checker() -> str:
+    text = (PAYLOAD_DIR / "relay").read_text(encoding="utf-8")
+    start = text.index(NAME_CHECK_FIRST)
+    return text[start:text.index(NAME_CHECK_LAST, start) + len(NAME_CHECK_LAST)]
+
+
+def name_json_verdict(text: str, fleet_domain: Optional[str], name_schema: str) -> str:
+    """The checker's one line for `text`: "ok <address>" or "no <reason>",
+    under the fleet domain and schema id the relay would see."""
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "AMAP_IDENTITY": name_schema}
+    if fleet_domain is not None:
+        env["AMAP_FLEET_DOMAIN"] = fleet_domain
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / NAME_JSON
+        path.write_text(text, encoding="utf-8")
+        try:
+            p = subprocess.run([sys.executable, "-I", "-c", name_json_checker(), str(path)],
+                               env=env, capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.SubprocessError) as e:
+            return f"the name.json checker could not run: {e}"
+    return p.stdout.strip() or f"the name.json checker gave no verdict: {p.stderr.strip()[-200:]}"
+
+
 def identity_findings(slug: str, shown: "ha.Result", env: Dict[str, str],
                       name_json: Optional[str], read_error: str,
                       fleet_domain: Optional[str], name_schema: str) -> List[str]:
@@ -2497,15 +2527,13 @@ def identity_findings(slug: str, shown: "ha.Result", env: Dict[str, str],
     if name_json is None:
         return [f"identity unreadable: {slug}: {NAME_JSON} cannot be read in the container "
                 f"({read_error}), so its relay holds"]
-    try:
-        doc = json.loads(name_json)
-    except ValueError as e:
-        return [f"identity unreadable: {slug}: {NAME_JSON} is not JSON ({e}), so its relay "
-                f"holds"]
-    if not isinstance(doc, dict) or doc.get("schema") != name_schema:
-        return [f"identity unreadable: {slug}: {NAME_JSON} has no schema the relay supports"]
     problems: List[str] = []
-    if doc.get("logical_id") != b.get("logical_id"):
+    verdict = name_json_verdict(name_json, fleet_domain, name_schema)
+    doc = json.loads(name_json) if verdict.startswith("ok ") else None
+    if doc is None:
+        why = verdict[len("no "):] if verdict.startswith("no ") else verdict
+        problems.append(f"identity refused: {slug}: {why}; its relay holds")
+    elif doc.get("logical_id") != b.get("logical_id"):
         problems.append(f"identity lag: {slug}: the container reads the identity directory of "
                         f"{doc.get('logical_id')!r}, and the registry binds "
                         f"{b.get('logical_id')!r}; relaunch, so the mount follows the link")

@@ -157,11 +157,15 @@ class IdentityFindingsTest(unittest.TestCase):
             ("identity refused", dict(shown=ha.Result(ha.REFUSED, ha.CODE_REGISTRY_ABSENT, "x"))),
             ("identity mount absent", dict(env={})),
             ("identity unreadable", dict(text=None, why="No such file")),
-            ("identity unreadable", dict(text="{torn")),
-            ("identity unreadable", dict(text=name_json(SHOW, schema=IDS.name_schema + "x"))),
+            ("identity refused", dict(text="{torn")),
+            ("identity refused", dict(text=name_json(SHOW, schema=IDS.name_schema + "x"))),
             ("identity lag", dict(text=name_json(SHOW, logical_id="0" * 32))),
-            ("identity stale", dict(text=name_json(SHOW, address="old@" + DOMAIN))),
-            ("identity domain", dict(domain="other.example.org")),
+            ("identity stale", dict(text=name_json(SHOW, name="old", address="old@" + DOMAIN))),
+            ("identity refused", dict(text=name_json(SHOW, epoch=True))),
+            ("identity refused", dict(text=name_json(SHOW, note="extra"))),
+            ("identity refused", dict(text=name_json(SHOW, name="Al pha",
+                                                     address="Al pha@" + DOMAIN))),
+            ("identity refused", dict(text=name_json(SHOW, name="beta"))),
             ("identity delivery", dict(shown=ha.Result(ha.REGISTERED,
                                                        binding=dict(SHOW, name_json="absent")))),
         )
@@ -185,6 +189,26 @@ class IdentityFindingsTest(unittest.TestCase):
         self.assertIn("epoch 1", found[0])
         self.assertIn("epoch 2", found[0])
 
+    def test_verify_and_the_relays_refuse_the_same_files(self):
+        """Each file the shipped checker refuses, verify reports as refused,
+        with the checker's own reason."""
+        for over in (dict(epoch=True), dict(note="x"), dict(epoch=0),
+                     dict(name="Al pha", address="Al pha@" + DOMAIN),
+                     dict(logical_id=SHOW["logical_id"].upper())):
+            with self.subTest(**{k: str(v) for k, v in over.items()}):
+                text = name_json(SHOW, **over)
+                verdict = prov.name_json_verdict(text, DOMAIN, IDS.name_schema)
+                self.assertTrue(verdict.startswith("no "), verdict)
+                found = self.findings(text=text)
+                self.assertEqual(self.heads(found), ["identity refused"])
+                self.assertIn(verdict[len("no "):], found[0])
+
+    def test_the_checker_verify_runs_is_the_shipped_one(self):
+        relay = (prov.PAYLOAD_DIR / "relay").read_text()
+        self.assertIn(prov.name_json_checker(), relay)
+        self.assertEqual(prov.name_json_verdict(name_json(SHOW), DOMAIN, IDS.name_schema),
+                         "ok " + SHOW["address"])
+
     def test_a_lag_names_the_relaunch_and_both_logical_ids(self):
         found, = self.findings(text=name_json(SHOW, logical_id="0" * 32))
         self.assertIn("0" * 32, found)
@@ -195,8 +219,10 @@ class IdentityFindingsTest(unittest.TestCase):
         other = _binding("show_other_domain")
         found = prov.identity_findings(SLUG, ha.Result(ha.REGISTERED, binding=other), ENV,
                                        name_json(other), "", DOMAIN, IDS.name_schema)
-        self.assertEqual(self.heads(found), ["identity domain", "identity delivery"])
-        self.assertIn("'stale'", found[1])
+        self.assertEqual(self.heads(found), ["identity refused", "identity domain",
+                                             "identity delivery"])
+        self.assertIn("is for domain", found[0])
+        self.assertIn("'stale'", found[2])
 
 
 class VerifyIdentityTest(unittest.TestCase):
