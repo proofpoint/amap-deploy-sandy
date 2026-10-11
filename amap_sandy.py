@@ -4178,8 +4178,10 @@ PRE_IDENTITY_FILE = "pre-identity.json"
 PRE_IDENTITY_SCHEMA = "amap-deploy-sandy.pre-identity/1"
 #: The roster's `contract_version` this repo has reviewed.
 ROSTER_CONTRACT_VERSION = "2"
-#: The roster schema's member address: one bare addr-spec.
+#: The roster schema's address (`router`, each member's): one bare addr-spec.
 _ROSTER_ADDRESS = re.compile(r"[A-Za-z0-9!#$%&'*+/=?^_`{|}~.-]+@[A-Za-z0-9.-]+")
+#: The roster schema's free text (`written_at`, a member's `state`): no control characters.
+_ROSTER_TEXT = re.compile(r"[^\x00-\x1f\x7f]+")
 
 
 class PreIdentityError(Exception):
@@ -4201,20 +4203,40 @@ def roster_slugs(home: Path) -> Optional[FrozenSet[str]]:
         return None
     except (OSError, ValueError) as e:
         raise PreIdentityError(f"the roster {f} is unreadable: {e}") from None
-    if not isinstance(doc, dict) or doc.get("contract_version") != ROSTER_CONTRACT_VERSION \
-            or not isinstance(doc.get("members"), list) or not isinstance(doc.get("router"), str) \
-            or not isinstance(doc.get("written_at"), str):
-        raise PreIdentityError(f"the roster {f} is not a contract_version "
-                               f"{ROSTER_CONTRACT_VERSION} roster")
-    slugs = set()
+    why = roster_schema_problem(doc)
+    if why:
+        raise PreIdentityError(f"the roster {f} does not match the roster schema: {why}")
+    return frozenset(m["address"].partition("@")[0] for m in doc["members"])
+
+
+def _text(v: Any, pattern: "re.Pattern") -> bool:
+    return isinstance(v, str) and pattern.fullmatch(v) is not None
+
+
+def roster_schema_problem(doc: Any) -> Optional[str]:
+    """What in `doc` the roster schema refuses, or None. Every field the
+    schema names is checked; a field it does not name is ignored, because the
+    envelope is open at every level."""
+    if not isinstance(doc, dict):
+        return "not an object"
+    if doc.get("contract_version") != ROSTER_CONTRACT_VERSION:
+        return f"contract_version is not {ROSTER_CONTRACT_VERSION!r}"
+    if not _text(doc.get("router"), _ROSTER_ADDRESS):
+        return "router is not one bare address"
+    if not _text(doc.get("written_at"), _ROSTER_TEXT):
+        return "written_at is empty or has a control character"
+    if "interval_s" in doc:
+        v = doc["interval_s"]
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0:
+            return "interval_s is not a number of at least 0"
+    if not isinstance(doc.get("members"), list):
+        return "members is not a list"
     for m in doc["members"]:
-        addr = m.get("address") if isinstance(m, dict) else None
-        if not isinstance(addr, str) or not _ROSTER_ADDRESS.fullmatch(addr) \
-                or not isinstance(m.get("state"), str) or not m["state"]:
-            raise PreIdentityError(f"the roster {f} has a member that is not one bare address "
-                                   f"with a state")
-        slugs.add(addr.partition("@")[0])
-    return frozenset(slugs)
+        if not isinstance(m, dict) or not _text(m.get("address"), _ROSTER_ADDRESS):
+            return "a member's address is not one bare address"
+        if not _text(m.get("state"), _ROSTER_TEXT):
+            return "a member's state is empty or has a control character"
+    return None
 
 
 def read_pre_identity(path: Path) -> Optional[FrozenSet[str]]:
@@ -4256,14 +4278,42 @@ def pre_identity(home: Path, *, apply: bool) -> Tuple[FrozenSet[str], Optional[s
     doc = {"schema": PRE_IDENTITY_SCHEMA, "recorded_ts": datetime.now(timezone.utc).strftime(
         "%Y-%m-%dT%H:%M:%SZ"), "slugs": sorted(slugs)}
     try:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
-    except FileExistsError:
-        return read_pre_identity(path) or frozenset(), None
+        made = _publish_once(path, (json.dumps(doc, indent=2) + "\n").encode("utf-8"))
     except OSError as e:
         raise PreIdentityError(f"cannot record the pre-identity agents in {path}: {e}") from None
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.write(json.dumps(doc, indent=2) + "\n")
+    if not made:
+        return read_pre_identity(path) or frozenset(), None
     return slugs, f"recorded {len(slugs)} pre-identity agent(s) in {path}; it is never rewritten"
+
+
+def _publish_once(path: Path, data: bytes) -> bool:
+    """Put `data` at `path` only if nothing is there, whole or not at all:
+    written and fsynced under a temporary name, then link()ed into place
+    (which never replaces an existing file), and the directory fsynced. A
+    crash leaves either no record or a complete one. False when `path`
+    already existed."""
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+    try:
+        try:
+            view = memoryview(data)
+            while view:
+                view = view[os.write(fd, view):]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        try:
+            os.link(tmp, path, follow_symlinks=False)
+        except FileExistsError:
+            return False
+    finally:
+        os.unlink(tmp)
+    dfd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+    return True
 
 
 def plan_identity_links(links_dir: Path, members: Dict[str, Path],

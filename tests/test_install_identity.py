@@ -8,6 +8,7 @@ are made in a temporary directory.
 """
 
 import contextlib
+import copy
 import hashlib
 import io
 import json
@@ -31,13 +32,19 @@ class Registry:
 
     def __init__(self, exists=True):
         self.bindings = {}
+        self.retired = {}       # workspace -> its former binding, after `retire --force`
         self.exists = exists
         self.calls = []
         self.fail = {}          # workspace -> Answer to give `register` instead
 
+    def retire(self, ws):
+        """The operator's `retire --force`: the entry leaves the active set,
+        so `show` no longer finds it, and its name is never reused."""
+        self.retired[ws] = self.bindings.pop(ws)
+
     def binding(self, ws):
-        lid = hashlib.sha256(ws.encode()).hexdigest()[:32]
-        name = Path(ws).name
+        lid = hashlib.sha256((ws + ("#retired" if ws in self.retired else "")).encode()).hexdigest()[:32]
+        name = Path(ws).name + ("-2" if ws in self.retired else "")
         return dict(SHOW, address=f"{name}@{DOMAIN}", name=name, logical_id=lid,
                     identity_dir=f"/srv/example/identity/{lid}")
 
@@ -224,6 +231,30 @@ class PreIdentityGuardTest(unittest.TestCase):
         self.assertTrue(failed)
         self.assertNotIn("/srv/example/ws/live", self.reg.bindings)
 
+    def test_a_force_retired_agent_not_in_the_record_comes_back_as_a_new_identity(self):
+        m = {"fresh-1a2b3c4d": Path("/srv/example/ws/fresh")}
+        prov.install_identity(self.client, self.links, m, apply=True, pre=frozenset())
+        old = self.reg.bindings["/srv/example/ws/fresh"]
+        self.reg.retire("/srv/example/ws/fresh")
+        lines, failed = prov.install_identity(self.client, self.links, m, apply=True, pre=frozenset())
+        self.assertFalse(failed, lines)
+        new = self.reg.bindings["/srv/example/ws/fresh"]
+        self.assertNotEqual((new["logical_id"], new["name"]), (old["logical_id"], old["name"]))
+        self.assertTrue(any(f"registered as {new['address']}" in l for l in lines), lines)
+
+    def test_a_force_retired_agent_in_the_record_is_refused_until_its_slug_is_removed(self):
+        m = {"live-5e5e5e5e": Path("/srv/example/ws/live")}
+        self.reg.bindings["/srv/example/ws/live"] = self.reg.binding("/srv/example/ws/live")
+        self.reg.retire("/srv/example/ws/live")
+        lines, failed = prov.install_identity(self.client, self.links, m, apply=True,
+                                              pre=frozenset({"live-5e5e5e5e"}))
+        self.assertTrue(failed)
+        self.assertNotIn("/srv/example/ws/live", self.reg.bindings)
+        self.assertTrue(any("Import it with migrate-registry" in l for l in lines), lines)
+        lines, failed = prov.install_identity(self.client, self.links, m, apply=True, pre=frozenset())
+        self.assertFalse(failed, lines)
+        self.assertIn("/srv/example/ws/live", self.reg.bindings)
+
     def test_dry_run_shows_the_refusal_and_writes_nothing(self):
         lines, failed = prov.install_identity(self.client, self.links,
                                               {"live-5e5e5e5e": Path("/srv/example/ws/live")},
@@ -320,6 +351,75 @@ class PreIdentityRecordTest(unittest.TestCase):
                 self.assertIsInstance(prov.roster_slugs(self.home), frozenset)
         self.write_roster((ROSTERS / "valid-roster-basic.json").read_text())
         self.assertEqual(prov.roster_slugs(self.home), {"alpha-1a2b3c4d", "bravo-5e6f7a8b"})
+
+    def test_each_field_the_schema_names_is_checked_and_unknown_ones_are_not(self):
+        base = json.loads((ROSTERS / "valid-roster-basic.json").read_text())
+        bad = (("router", ""), ("router", "Router <r@x.example>"), ("router", "r@x.example\n"),
+               ("written_at", ""), ("written_at", "2026-09-24T12:00:00Z\u0007"), ("written_at", 7),
+               ("interval_s", -1), ("interval_s", True), ("interval_s", "5"),
+               ("contract_version", 2), ("members", {}),
+               ("state", ""), ("state", "admit\u0000ted"), ("state", 1), ("address", "a@b@c"),
+               ("address", "alpha@fleet.example\n"))
+        for key, value in bad:
+            doc = copy.deepcopy(base)
+            if key in ("state", "address"):
+                doc["members"][0][key] = value
+            else:
+                doc[key] = value
+            with self.subTest(key=key, value=value):
+                self.assertIsNotNone(prov.roster_schema_problem(doc))
+        open_doc = copy.deepcopy(base)
+        open_doc["extra"] = {"anything": [1]}
+        open_doc["members"][0]["since"] = "2026-09-24T11:00:00Z"
+        del open_doc["interval_s"]
+        self.assertIsNone(prov.roster_schema_problem(open_doc))
+        self.assertIsNone(prov.roster_schema_problem(dict(base, interval_s=0)))
+
+    def test_a_crash_before_the_record_is_in_place_leaves_no_record(self):
+        self.write_roster(roster({"alpha-1a2b3c4d"}))
+        real = os.link
+
+        def crash(*a, **k):
+            raise OSError(5, "simulated crash before link")
+        os.link = crash
+        self.addCleanup(setattr, os, "link", real)
+        with self.assertRaises(prov.PreIdentityError):
+            prov.pre_identity(self.home, apply=True)
+        self.assertFalse(self.path.exists())
+        self.assertEqual([p.name for p in self.path.parent.iterdir() if p.name.endswith(".tmp")], [])
+        os.link = real
+        slugs, note = prov.pre_identity(self.home, apply=True)
+        self.assertEqual(slugs, {"alpha-1a2b3c4d"})
+
+    def test_the_record_is_synced_before_it_is_linked_and_its_directory_after(self):
+        events = []
+        real_fsync, real_link = os.fsync, os.link
+
+        def fsync(fd):
+            events.append(("fsync", os.path.basename(os.readlink(f"/proc/self/fd/{fd}"))
+                           if os.path.exists("/proc/self/fd") else "fd"))
+            return real_fsync(fd)
+
+        def link(src, dst, **kw):
+            events.append(("link", os.path.basename(dst)))
+            return real_link(src, dst, **kw)
+        os.fsync, os.link = fsync, link
+        self.addCleanup(setattr, os, "fsync", real_fsync)
+        self.addCleanup(setattr, os, "link", real_link)
+        prov.pre_identity(self.home, apply=True)
+        kinds = [e[0] for e in events]
+        self.assertEqual(kinds, ["fsync", "link", "fsync"], events)
+        if events[0][1] != "fd":
+            self.assertTrue(events[0][1].endswith(".tmp"), events)
+            self.assertEqual(events[2][1], prov.pre_identity_path(self.home).parent.name, events)
+
+    def test_an_empty_record_is_unreadable_and_removing_it_retakes_it(self):
+        self.path.write_text("")
+        with self.assertRaises(prov.PreIdentityError):
+            prov.pre_identity(self.home, apply=True)
+        self.path.unlink()
+        self.write_roster(roster({"alpha-1a2b3c4d"}))
+        self.assertEqual(prov.pre_identity(self.home, apply=True)[0], {"alpha-1a2b3c4d"})
 
     def test_every_invalid_spec_roster_records_nothing(self):
         fixtures = sorted(ROSTERS.glob("invalid-*.json"))

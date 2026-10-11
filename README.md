@@ -155,14 +155,28 @@ A record that cannot be read registers nothing. An agent that existed but
 was not in the roster when the record was made (not launched since the
 manifest, so not admitted) is not protected: a later `install --apply`
 registers it under a new name. Check the import's plan against `list`
-before turning `identity` on. A forced retire
-is not undone by `install`: after the registry's `retire --force` of a
-sandbox whose workspace still exists, the next `install --apply` registers it
-again as a NEW identity, with a new logical_id and a new name, and prints
-`registered as <address>`. The old name is never reused. So after a forced
-retire, run `install --apply` only when that agent is meant to come back;
-then relaunch it, so its relay reads the new name, and give its peers the
-new address. The relay reads name.json once, when it starts: a name the
+before turning `identity` on. The record is written whole or not at all; if
+it cannot be read, remove it and run `install --apply` again, which records
+the roster as it stands then. That is always the safe direction: an agent
+listed then that the registry has not bound is refused, never renamed.
+
+A forced retire is not undone by `install` unnoticed. After the registry's
+`retire --force` of a sandbox whose workspace still exists:
+- if its slug is **not** in the pre-identity record, the next
+  `install --apply` registers it again as a NEW identity, with a new
+  logical_id and a new name, and prints `registered as <address>`;
+- if its slug **is** in the record, the registry no longer has an active
+  entry for it, so `install` refuses it like an agent never imported, and
+  nothing is registered.
+
+The old name is never reused either way. To bring a recorded agent back as
+a new identity, remove its slug from the `slugs` list in
+`pre-identity.json` (a JSON edit that leaves the file valid; a damaged file
+registers nothing), then run `install --apply`. In both cases, run it only
+when the agent is meant to come back; then relaunch the agent, so its relay
+reads the new name, and give its peers the new address.
+
+The relay reads name.json once, when it starts: a name the
 registry changes later (an operator override) takes effect when the sandbox
 relaunches, and `verify`, which reads the file, does not see the
 difference.
