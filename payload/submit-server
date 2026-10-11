@@ -26,7 +26,59 @@ SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 
 unset AMAP_SELF
 SANDY_SESSION_FILE=/etc/sandy-session.json
-if [ -z "${AMAP_FLEET_DOMAIN:-}" ]; then
+if [ -n "${AMAP_IDENTITY_DIR+x}" ] && [ -z "$AMAP_IDENTITY_DIR" ]; then
+    echo "submit-server: AMAP_IDENTITY_DIR is exported but empty (a bad render), so no AMAP_SELF" >&2
+elif [ -n "${AMAP_IDENTITY_DIR+x}" ]; then
+    # With an identity directory the address is the registry's: the name.json it
+    # delivered there, checked as the relay checks it. No fallback to the
+    # slug, which would label the wrong entry after a rename, and no wait:
+    # the relay holds, this server does not.
+    verdict=$(python3 -c '
+import json, os, re, sys
+path, domain = sys.argv[1], os.environ.get("AMAP_FLEET_DOMAIN")
+schema = os.environ.get("AMAP_IDENTITY")
+def no(why):
+    print("no " + why); sys.exit(0)
+if not domain:
+    no("no AMAP_FLEET_DOMAIN beside an identity directory: a bad render")
+if not schema:
+    no("no AMAP_IDENTITY beside an identity directory: a bad render")
+try:
+    with open(path, "rb") as f:
+        doc = json.loads(f.read(65536).decode("ascii"))
+except FileNotFoundError:
+    no("the registry has not delivered name.json yet")
+except (OSError, ValueError) as e:
+    no("name.json is unreadable: %s" % e)
+if not isinstance(doc, dict) or doc.get("schema") != schema:
+    no("name.json has no schema this connector supports")
+if set(doc) != {"schema", "name", "address", "logical_id", "epoch"}:
+    no("name.json does not carry exactly schema, name, address, logical_id and epoch")
+name, address, lid, epoch = doc["name"], doc["address"], doc["logical_id"], doc["epoch"]
+if not isinstance(lid, str) or not re.fullmatch("[0-9a-f]{32}", lid):
+    no("name.json logical_id is not 32 lower-case hex")
+if type(epoch) is not int or epoch < 1:
+    no("name.json epoch is not an integer of at least 1")
+if (not isinstance(name, str) or not re.fullmatch("[A-Za-z0-9][A-Za-z0-9._-]{0,63}", name)
+        or re.fullmatch("[0-9a-fA-F]{32}", name)):
+    no("name.json name is not a local part the registry assigns")
+if not isinstance(address, str) or address.count("@") != 1:
+    no("name.json carries no usable address")
+local, _, dom = address.partition("@")
+if dom != domain:
+    no("name.json is for domain %r, but the fleet domain is %r" % (dom, domain))
+if local != name:
+    no("name.json address local part is not its name")
+print("ok " + address)
+' "$AMAP_IDENTITY_DIR/name.json" 2>&1)
+    case "$verdict" in
+        "ok "*) AMAP_SELF=${verdict#ok }; export AMAP_SELF ;;
+        "no "*) echo "submit-server: ${verdict#no }, so no AMAP_SELF" >&2 ;;
+        *) echo "submit-server: cannot read name.json: $verdict, so no AMAP_SELF" >&2 ;;
+    esac
+elif [ -n "${AMAP_IDENTITY+x}" ]; then
+    echo "submit-server: this fleet's addresses are the registry's and this sandbox has no identity mount, so no AMAP_SELF" >&2
+elif [ -z "${AMAP_FLEET_DOMAIN:-}" ]; then
     echo "submit-server: no AMAP_FLEET_DOMAIN, so no AMAP_SELF; peers marks nothing self" >&2
 elif [ ! -r "$SANDY_SESSION_FILE" ]; then
     echo "submit-server: $SANDY_SESSION_FILE is unreadable, so no AMAP_SELF" >&2

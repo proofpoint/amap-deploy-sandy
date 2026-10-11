@@ -28,7 +28,9 @@ if [ -n "${AMAP_SELF+x}" ]; then printf 'AMAP_SELF=%s\\n' "$AMAP_SELF"; fi
 
 
 def run(*, domain: Optional[str] = "agents.example.org", session: Optional[dict] = None,
-        inherited_self: Optional[str] = None) -> Tuple[int, Dict[str, str], str]:
+        inherited_self: Optional[str] = None,
+        name_json: Optional[str] = None, identity: object = False,
+        expose_identity: Optional[bool] = None) -> Tuple[int, Dict[str, str], str]:
     text = WRAPPER.read_text()
     assert SESSION_LINE in text, "the session-file line is not in payload/submit-server"
     with TemporaryDirectory() as d:
@@ -48,6 +50,16 @@ def run(*, domain: Optional[str] = "agents.example.org", session: Optional[dict]
             env["AMAP_FLEET_DOMAIN"] = domain
         if inherited_self is not None:
             env["AMAP_SELF"] = inherited_self
+        if (identity or name_json is not None) if expose_identity is None else expose_identity:
+            env["AMAP_IDENTITY"] = SCHEMA
+        if identity == "":
+            env["AMAP_IDENTITY_DIR"] = ""
+        elif identity or name_json is not None:
+            ident = root / "identity"
+            ident.mkdir()
+            env["AMAP_IDENTITY_DIR"] = str(ident)
+            if name_json is not None:
+                (ident / "name.json").write_text(name_json)
         r = subprocess.run(["/bin/sh", str(script), "mcp"], env=env,
                            capture_output=True, text=True, timeout=30)
     values = dict(line.split("=", 1) for line in r.stdout.splitlines() if "=" in line)
@@ -94,3 +106,52 @@ class SubmitServerTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+SCHEMA = "example-registry.name/1"    # the test overlay's, as the manifest exposes it
+
+
+def _name_json(name="gamma", address="gamma@agents.example.org", schema=SCHEMA):
+    return json.dumps({"schema": schema, "name": name, "address": address,
+                       "logical_id": "0123456789abcdef0123456789abcdef", "epoch": 1},
+                      sort_keys=True, indent=2) + "\n"
+
+
+class WithAnIdentityDirectoryTest(unittest.TestCase):
+    """The address is the registry's name.json, never the slug, and a gap is
+    still never fatal."""
+
+    SESSION = {"sandbox_name": "gamma-0a1b2c3d"}
+
+    def test_the_delivered_address_labels_the_roster_entry(self):
+        rc, values, err = run(session=self.SESSION, name_json=_name_json())
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(values["AMAP_SELF"], "gamma@agents.example.org")
+
+    def test_every_gap_leaves_it_unset_with_no_slug_fallback(self):
+        rows = (("not delivered", dict(identity=True), "has not delivered name.json yet"),
+                ("torn", dict(name_json="{torn"), "unreadable"),
+                ("other domain", dict(name_json=_name_json(address="gamma@other.example.org")),
+                 "is for domain 'other.example.org'"),
+                ("local part not the name", dict(name_json=_name_json(address="delta@agents.example.org")),
+                 "local part is not its name"),
+                ("unknown schema", dict(name_json=_name_json(schema=SCHEMA + "x")),
+                 "no schema this connector supports"),
+                ("no domain", dict(domain=None, name_json=_name_json()), "no AMAP_FLEET_DOMAIN"),
+                ("no identity mount", dict(expose_identity=True), "no identity mount"),
+                ("identity directory exported empty", dict(identity="", expose_identity=True),
+                 "exported but empty"),
+                ("no schema exposed", dict(name_json=_name_json(), expose_identity=False),
+                 "no AMAP_IDENTITY"),
+                ("no schema exposed, none in the file",
+                 dict(name_json=_name_json(schema=None), expose_identity=False),
+                 "no AMAP_IDENTITY"))
+        for name, kwargs, says in rows:
+            with self.subTest(name):
+                rc, values, err = run(session=self.SESSION, inherited_self="stale@agents.example.org",
+                                      **kwargs)
+                self.assertEqual(rc, 0, err)
+                self.assertEqual(values["args"], "mcp", "the server started")
+                self.assertNotIn("AMAP_SELF", values)
+                self.assertIn(says, err)
+

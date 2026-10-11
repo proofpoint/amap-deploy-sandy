@@ -34,16 +34,22 @@ mkdir -p "$STATE"
 chmod 700 "$STATE"
 HOLD="$STATE/hold.json"
 
-# hold REASON: record why the supervisor is not running, then wait until
-# CHECK (a shell command) succeeds, re-checking every 30 seconds.
+# hold_record REASON: record why the supervisor is not running, once per
+# change of reason.
+hold_record() {
+    if [ ! -f "$HOLD" ] || ! grep -qF "\"$1\"" "$HOLD"; then
+        python3 -c 'import json, sys, time; print(json.dumps({"reason": sys.argv[1], "since": int(time.time())}))' "$1" > "$HOLD.tmp"
+        mv "$HOLD.tmp" "$HOLD"
+        echo "codex relay: holding: $1" >&2
+    fi
+}
+
+# hold_until REASON CHECK: record REASON, then wait until CHECK (a shell
+# command) succeeds, re-checking every 30 seconds.
 hold_until() {
     reason=$1; check=$2
     while ! sh -c "$check" >/dev/null 2>&1; do
-        if [ ! -f "$HOLD" ] || ! grep -qF "\"$reason\"" "$HOLD"; then
-            python3 -c 'import json, sys, time; print(json.dumps({"reason": sys.argv[1], "since": int(time.time())}))' "$reason" > "$HOLD.tmp"
-            mv "$HOLD.tmp" "$HOLD"
-            echo "codex relay: holding: $reason" >&2
-        fi
+        hold_record "$reason"
         sleep 30
     done
     rm -f "$HOLD"
@@ -96,8 +102,69 @@ workspace=$(read_session workspace)
 
 # The peer lane needs the agent's own address; a fleet without a domain has
 # none, and the router places no peer notices there. Mail only, then.
+#
+# With the manifest's AMAP_IDENTITY the address is the host registry's, as
+# in payload/relay: name.json in the identity directory, checked by the same
+# checker, byte for byte (a test holds the copies equal). The relay holds
+# until it passes, and never runs the supervisor under the slug. Without the
+# identity mount (launched before its link existed) it holds for good and
+# names the relaunch. The file is read once: a later change of name reaches
+# the supervisor at the next relaunch.
+AMAP_NAME_CHECK='
+import json, os, re, sys
+path, domain = sys.argv[1], os.environ.get("AMAP_FLEET_DOMAIN")
+schema = os.environ.get("AMAP_IDENTITY")
+def no(why):
+    print("no " + why); sys.exit(0)
+if not domain:
+    no("no AMAP_FLEET_DOMAIN beside an identity directory: a bad render")
+if not schema:
+    no("no AMAP_IDENTITY beside an identity directory: a bad render")
+try:
+    with open(path, "rb") as f:
+        doc = json.loads(f.read(65536).decode("ascii"))
+except FileNotFoundError:
+    no("the registry has not delivered name.json yet")
+except (OSError, ValueError) as e:
+    no("name.json is unreadable: %s" % e)
+if not isinstance(doc, dict) or doc.get("schema") != schema:
+    no("name.json has no schema this connector supports")
+if set(doc) != {"schema", "name", "address", "logical_id", "epoch"}:
+    no("name.json does not carry exactly schema, name, address, logical_id and epoch")
+name, address, lid, epoch = doc["name"], doc["address"], doc["logical_id"], doc["epoch"]
+if not isinstance(lid, str) or not re.fullmatch("[0-9a-f]{32}", lid):
+    no("name.json logical_id is not 32 lower-case hex")
+if type(epoch) is not int or epoch < 1:
+    no("name.json epoch is not an integer of at least 1")
+if (not isinstance(name, str) or not re.fullmatch("[A-Za-z0-9][A-Za-z0-9._-]{0,63}", name)
+        or re.fullmatch("[0-9a-fA-F]{32}", name)):
+    no("name.json name is not a local part the registry assigns")
+if not isinstance(address, str) or address.count("@") != 1:
+    no("name.json carries no usable address")
+local, _, dom = address.partition("@")
+if dom != domain:
+    no("name.json is for domain %r, but the fleet domain is %r" % (dom, domain))
+if local != name:
+    no("name.json address local part is not its name")
+print("ok " + address)
+'
 self_address=""
-if [ -n "${AMAP_FLEET_DOMAIN+x}" ]; then
+if [ -n "${AMAP_IDENTITY+x}" ] || [ -n "${AMAP_IDENTITY_DIR+x}" ]; then
+    if [ -z "${AMAP_IDENTITY_DIR+x}" ]; then
+        hold_until "this fleet's addresses are the registry's and this sandbox has no identity mount; register it, run amap-sandy.py link-identity --apply, then relaunch" false
+    fi
+    : "${AMAP_IDENTITY_DIR:?codex relay: AMAP_IDENTITY_DIR is exported but empty; re-run amap-sandy.py install --apply}"
+    while :; do
+        verdict=$(python3 -c "$AMAP_NAME_CHECK" "$AMAP_IDENTITY_DIR/name.json" 2>&1) || true
+        case "$verdict" in
+            "ok "*) self_address=${verdict#ok }; break ;;
+            "no "*) hold_record "${verdict#no }" ;;
+            *) hold_record "cannot read name.json: $verdict" ;;
+        esac
+        sleep "${AMAP_IDENTITY_POLL_SECONDS:-5}"
+    done
+    rm -f "$HOLD"
+elif [ -n "${AMAP_FLEET_DOMAIN+x}" ]; then
     : "${AMAP_FLEET_DOMAIN:?codex relay: AMAP_FLEET_DOMAIN is exported but empty; re-run amap-sandy.py install --apply}"
     self_address="$sandbox_name@$AMAP_FLEET_DOMAIN"
 fi

@@ -100,8 +100,90 @@ export AMAP_DELIVERY_MAIL_NOTICE_DIR AMAP_DELIVERY_MAIL_CLAIM AMAP_DELIVERY_PEER
 # fatal here, never guessed: an exported-but-empty domain is a bad render,
 # and a session file without a name is a sandy too old to have a feature
 # mount to run this from in the first place.
+#
+# WITH AN IDENTITY DIRECTORY the address is the host registry's, not derived
+# here. The registry, the host's single writer of names, delivers name.json
+# into the agent's identity directory, which the manifest mounts read-only
+# and exports as AMAP_IDENTITY_DIR. The relay HOLDS until that file exists
+# and is exactly the name schema: the schema id AMAP_IDENTITY names, its five
+# members and nothing else, each of its shape, and the address
+# <name>@<fleet domain>. While it holds it re-reads every
+# AMAP_IDENTITY_POLL_SECONDS (5 by default) and says why on stderr each time
+# the reason changes. It never exits, because an exit inside sandy's startup
+# window fails the agent's whole launch, and it never starts the daemon
+# under an address nobody delivered. Once the file passes it is not read
+# again: a name the registry changes later reaches the daemon at the next
+# relaunch. Without either export, the slug-derived address below is the one
+# used.
+#
+# AMAP_IDENTITY is the manifest's `expose`: the fleet's addresses are the
+# registry's, and its value is the schema id name.json must carry. Sandy
+# skips a mount whose source does not exist, and exports nothing for it, so
+# a sandbox launched before its identity link existed has AMAP_IDENTITY and
+# no AMAP_IDENTITY_DIR. The mount cannot appear in a running container, so
+# the relay holds and names the relaunch.
 SANDY_SESSION_FILE=/etc/sandy-session.json
-if [ -n "${AMAP_FLEET_DOMAIN+x}" ]; then
+unset AMAP_DELIVERY_SELF
+if [ -n "${AMAP_IDENTITY+x}" ] && [ -z "${AMAP_IDENTITY_DIR+x}" ]; then
+    echo "relay: holding: this fleet's addresses are the registry's and this sandbox has no identity mount; register it, run amap-sandy.py link-identity --apply, then relaunch" >&2
+    while :; do sleep 3600; done
+elif [ -n "${AMAP_IDENTITY_DIR+x}" ]; then
+    : "${AMAP_IDENTITY_DIR:?relay: AMAP_IDENTITY_DIR is exported but empty; re-run amap-sandy.py install --apply}"
+    held=""
+    while :; do
+        # One line: "ok <address>", or "no <reason>". The same checker as
+        # payload/submit-server's, byte for byte (a test holds them equal).
+        verdict=$(python3 -c '
+import json, os, re, sys
+path, domain = sys.argv[1], os.environ.get("AMAP_FLEET_DOMAIN")
+schema = os.environ.get("AMAP_IDENTITY")
+def no(why):
+    print("no " + why); sys.exit(0)
+if not domain:
+    no("no AMAP_FLEET_DOMAIN beside an identity directory: a bad render")
+if not schema:
+    no("no AMAP_IDENTITY beside an identity directory: a bad render")
+try:
+    with open(path, "rb") as f:
+        doc = json.loads(f.read(65536).decode("ascii"))
+except FileNotFoundError:
+    no("the registry has not delivered name.json yet")
+except (OSError, ValueError) as e:
+    no("name.json is unreadable: %s" % e)
+if not isinstance(doc, dict) or doc.get("schema") != schema:
+    no("name.json has no schema this connector supports")
+if set(doc) != {"schema", "name", "address", "logical_id", "epoch"}:
+    no("name.json does not carry exactly schema, name, address, logical_id and epoch")
+name, address, lid, epoch = doc["name"], doc["address"], doc["logical_id"], doc["epoch"]
+if not isinstance(lid, str) or not re.fullmatch("[0-9a-f]{32}", lid):
+    no("name.json logical_id is not 32 lower-case hex")
+if type(epoch) is not int or epoch < 1:
+    no("name.json epoch is not an integer of at least 1")
+if (not isinstance(name, str) or not re.fullmatch("[A-Za-z0-9][A-Za-z0-9._-]{0,63}", name)
+        or re.fullmatch("[0-9a-fA-F]{32}", name)):
+    no("name.json name is not a local part the registry assigns")
+if not isinstance(address, str) or address.count("@") != 1:
+    no("name.json carries no usable address")
+local, _, dom = address.partition("@")
+if dom != domain:
+    no("name.json is for domain %r, but the fleet domain is %r" % (dom, domain))
+if local != name:
+    no("name.json address local part is not its name")
+print("ok " + address)
+' "$AMAP_IDENTITY_DIR/name.json" 2>&1)
+        case "$verdict" in
+            "ok "*) AMAP_DELIVERY_SELF=${verdict#ok }; break ;;
+            "no "*) why=${verdict#no } ;;
+            *) why="cannot read name.json: $verdict" ;;
+        esac
+        if [ "$why" != "$held" ]; then
+            echo "relay: holding: $why" >&2
+            held=$why
+        fi
+        sleep "${AMAP_IDENTITY_POLL_SECONDS:-5}"
+    done
+    [ -z "$held" ] || echo "relay: name.json delivered; starting as $AMAP_DELIVERY_SELF" >&2
+elif [ -n "${AMAP_FLEET_DOMAIN+x}" ]; then
     fleet_domain="$AMAP_FLEET_DOMAIN"
     : "${fleet_domain:?relay: AMAP_FLEET_DOMAIN is exported but empty; re-run amap-sandy.py install --apply}"
     if [ ! -r "$SANDY_SESSION_FILE" ]; then
@@ -111,6 +193,10 @@ if [ -n "${AMAP_FLEET_DOMAIN+x}" ]; then
     sandbox_name=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("sandbox_name") or "")' "$SANDY_SESSION_FILE")
     : "${sandbox_name:?relay: $SANDY_SESSION_FILE carries no sandbox_name; sandy composes it before launch}"
     AMAP_DELIVERY_SELF="$sandbox_name@$fleet_domain"
+fi
+# One export, for whichever branch named the address. Nothing inherited
+# survives: the variable was unset above, so an unset one stays unset.
+if [ -n "${AMAP_DELIVERY_SELF+x}" ]; then
     export AMAP_DELIVERY_SELF
 fi
 
