@@ -388,9 +388,17 @@ class RootsTest(unittest.TestCase):
         self.assertEqual(r["upstream (uid 2101) can read and search every directory from /srv/example/a/b "
                            "down to /srv/example/a/b"], rh.FAIL)
         self.assertEqual(len(checks), len({c.claim for c in checks}), "each principal is checked once")
+        by_claim = {c.claim: c for c in checks}
+        reach = "can read and search every directory from /srv/example/a/b down to /srv/example/a/b"
+        self.assertEqual(by_claim[f"upstream (uid 2101) {reach}"].expected.provenance,
+                         "the host setup's root for the shared root: upstream owns it")
+        self.assertEqual(by_claim[f"downstream (uid 2102) {reach}"].expected.provenance,
+                         "the host setup's root for the shared root: downstream reads it")
         x["roots"][0]["readers"] = ["upstream", "downstream"]
         again = hs.verify_roots(hs.load_spec(x), lstat_of(fs))
         self.assertEqual(len(again), len({c.claim for c in again}), "an owner who reads is checked once")
+        self.assertEqual({c.claim: c for c in again}[f"upstream (uid 2101) {reach}"].expected.provenance,
+                         "the host setup's root for the shared root: upstream owns and reads it")
 
     def test_the_downstream_reader_needs_the_group_bit(self):
         fs = good_fs()

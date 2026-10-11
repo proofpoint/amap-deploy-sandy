@@ -491,7 +491,9 @@ def verify_roots(spec: Spec, lstat: Callable = os.lstat) -> List[rh.Check]:
                     blocked = d
                     break
             reach = f"{name} (uid {p.uid}) can read and search every directory from {top} down to {r.path}"
-            want_r = _fact("reach", True, f"{src}: {name} is one of its readers")
+            role = ("owns and reads it" if name == r.owner and name in r.readers else
+                    "owns it" if name == r.owner else "reads it")
+            want_r = _fact("reach", True, f"{src}: {name} {role}")
             fix = (f"make {blocked} readable AND searchable by uid {p.uid} or one of its groups; "
                    f"a runtime opens each directory below its mount to fsync it") if isinstance(blocked, str) \
                 else f"inspect {r.path}'s ancestors as uid {p.uid}"
