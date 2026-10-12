@@ -219,7 +219,7 @@ def load(sec: Any, principals: Dict[str, Any], runtimes: Sequence[Dict[str, Any]
             or any(not isinstance(v, list) for v in att.values()):
         raise SecretSpecError("secrets.attestations may hold native_agents and other_runtimes, each a list")
     exp = sec.get("exposure", {})
-    exp_keys = ("secret_roots", "integrity_roots", "engine_sockets", "authorized_keys")
+    exp_keys = ("secret_roots", "integrity_roots", "engine_sockets", "authorized_keys", "backup_excluded")
     if not isinstance(exp, dict) or set(exp) - set(exp_keys) \
             or any(not isinstance(v, list) for v in exp.values()):
         raise SecretSpecError(f"secrets.exposure may hold {', '.join(exp_keys)}, each a list of paths")

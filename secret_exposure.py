@@ -2,14 +2,18 @@
 this host runs, checked against the secret's volume and the paths that guard
 it. Read-only: `docker inspect`, `lstat`, and each tool's own listing.
 
-Every container, running or stopped, on every engine (each `docker context`
-endpoint, plus any engine socket the section lists that is no context) is
-held to five rules, each a FAIL-STOP:
+Every container, running or stopped, on every engine of THIS host (each
+`docker context` with a unix:// endpoint; a listed engine socket that no
+context names is UNKNOWN) is held to five rules, each a FAIL-STOP. A remote
+context (ssh://, tcp://) is guarded by its own host's lock and swept by that
+host's verify; it is named in the notes.
 
 0. **Direct mounts.** A mount of the secret's volume is allowed only in the
-   runtime's own container, read-only, at its container directory. The
-   checks run under the one-shots' lock, so a one-shot container seen at all
-   is a crash (exited) or an anomaly (running while the lock is held).
+   runtime's own container, on the engine that holds the volume, and only as
+   it is rendered: the pinned image's resolved ID, its user, one read-only
+   mount at its directory, every capability dropped and none added, no new
+   privileges. The checks run under the one-shots' lock, so a one-shot
+   container seen at all is a crash (exited) or an anomaly (running).
 1. **Overlap.** A bind's source is compared with every protected path by
    identity, (st_dev, st_ino) up each one's ancestor chain, so a macOS
    firmlink, a case variant, `/var` against `/private/var` or a symlink all
@@ -33,12 +37,11 @@ held to five rules, each a FAIL-STOP:
    machine (it sees the whole Mac filesystem) is a FAIL.
 """
 
-import fcntl
 import json
 import os
 import posixpath
 import stat
-import time
+import sys
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import router_health as rh
@@ -51,8 +54,6 @@ UNCONFINED = ("seccomp=unconfined", "seccomp:unconfined", "apparmor=unconfined",
               "label=disable", "label:disable")
 ROUTE_ENV = ("DOCKER_HOST", "SSH_AUTH_SOCK")
 ONESHOT_LABEL = "org.amap.oneshot"
-LOCK_WAIT_S = 60
-LOCK_POLL_S = 0.25
 
 
 def _fact(name: str, value: Any, provenance: str) -> rh.Fact:
@@ -63,9 +64,8 @@ def _fact(name: str, value: Any, provenance: str) -> rh.Fact:
 
 
 def chain(path: str, stat_: Callable) -> Any:
-    """The (st_dev, st_ino) of `path` and of every ancestor, following links
-    the way the kernel does, or None when some component does not exist, or
-    an Unresolved when one cannot be asked."""
+    """The (st_dev, st_ino) of `path` and of each of its TEXTUAL ancestors,
+    or None when some component does not exist, or an Unresolved."""
     out, p = [], path
     while True:
         try:
@@ -80,6 +80,19 @@ def chain(path: str, stat_: Callable) -> Any:
         p = posixpath.dirname(p)
 
 
+def identity(path: str, stat_: Callable, realpath: Callable[[str], str]) -> Any:
+    """(identity, ancestors) of `path` as the kernel walks it: its own
+    identity, and the union of the RESOLVED path's ancestors and the literal
+    path's (a symlinked source names its target's place, not its own). None
+    when it does not exist, or an Unresolved."""
+    resolved = ss.identity_chain(path, stat_, realpath)
+    if not isinstance(resolved, list):
+        return resolved
+    literal = chain(path, stat_)
+    ancestors = set(resolved[1:]) | (set(literal[1:]) if isinstance(literal, list) else set())
+    return resolved[0], ancestors
+
+
 def _text(path: str) -> Tuple[str, ...]:
     """The fallback comparison: lower-cased, macOS's data-volume and /private
     prefixes removed, as path components."""
@@ -88,6 +101,11 @@ def _text(path: str) -> Tuple[str, ...]:
         if p == prefix or p.startswith(prefix + "/"):
             p = p[len(prefix):] or "/"
     return tuple(c for c in p.split("/") if c)
+
+
+def _text_relation(a: Tuple[str, ...], b: Tuple[str, ...]) -> Optional[str]:
+    return ("equal" if a == b else "ancestor" if b[:len(a)] == a else
+            "descendant" if a[:len(b)] == b else None)
 
 
 class Unsure(rh.Unresolved):
@@ -100,22 +118,23 @@ class Unsure(rh.Unresolved):
         self.relation = relation
 
 
-def overlap(source: str, protected: str, stat_: Callable) -> Any:
+def overlap(source: str, protected: str, stat_: Callable,
+            realpath: Callable[[str], str] = os.path.realpath) -> Any:
     """How `source` relates to `protected`: "equal", "ancestor" (source above
-    it), "descendant" (source below it), None, or an Unresolved carrying the
-    relation found by text alone when either side could not be stat'ed."""
-    a, b = chain(source, stat_), chain(protected, stat_)
-    if isinstance(a, list) and isinstance(b, list):
+    it), "descendant" (source below it), None, or an Unsure carrying the
+    relation found by name when either side could not be stat'ed (the
+    source's literal and resolved names both count)."""
+    a, b = identity(source, stat_, realpath), identity(protected, stat_, realpath)
+    if isinstance(a, tuple) and isinstance(b, tuple):
         if a[0] == b[0]:
             return "equal"
-        if a[0] in b[1:]:
+        if a[0] in b[1]:
             return "ancestor"
-        if b[0] in a[1:]:
+        if b[0] in a[1]:
             return "descendant"
         return None
-    ta, tb = _text(source), _text(protected)
-    rel = ("equal" if ta == tb else "ancestor" if tb[:len(ta)] == ta else
-           "descendant" if ta[:len(tb)] == tb else None)
+    tb = _text(protected)
+    rel = _text_relation(_text(source), tb) or _text_relation(_text(realpath(source)), tb)
     why = getattr(a, "reason", None) or getattr(b, "reason", None) or \
         f"{source if a is None else protected} does not exist here, so it was compared by name"
     return Unsure(why, rel)
@@ -173,13 +192,24 @@ def containers(s: ss.SecretSpec, context: str) -> Any:
 
 
 def image_id(s: ss.SecretSpec, context: str) -> Any:
+    """The ID the pinned image resolves to on that engine, or an Unresolved."""
     out = _docker(s, context, "image", "inspect", "--format", "{{.Id}}", s.image)
     return out if isinstance(out, rh.Unresolved) else out.strip()
 
 
 def volume_mountpoint(s: ss.SecretSpec, context: str) -> Any:
+    """The volume's backing path on that engine: a path, None when the engine
+    proves it has no such volume (a listing that succeeds and holds none), or
+    an Unresolved when the engine could not be asked."""
+    names = _docker(s, context, "volume", "ls", "--quiet", "--filter", f"name=^{s.volume}$")
+    if isinstance(names, rh.Unresolved):
+        return names
+    if s.volume not in names.split():
+        return None
     out = _docker(s, context, "volume", "inspect", "--format", "{{.Mountpoint}}", s.volume)
-    return out if isinstance(out, rh.Unresolved) else out.strip()
+    if isinstance(out, rh.Unresolved):
+        return out
+    return out.strip() or rh.Unresolved(f"the engine {context} names no mountpoint for {s.volume}")
 
 
 # --- The rules ------------------------------------------------------------------
@@ -199,27 +229,61 @@ def _list(v: Any) -> List[Any]:
 
 
 def runtime_container(spec: Any, s: ss.SecretSpec) -> str:
-    principal = next(name for name, p in spec.principals.items() if p.uid == s.uid)
-    return spec.runtime_of(principal)["container"]
+    """The container of the principal the section declares."""
+    return spec.runtime_of(s.principal)["container"]
 
 
-def rule_mounts(c: Dict[str, Any], s: ss.SecretSpec, runtime: str) -> List[str]:
-    """Why this container's mounts of the volume break rule 0: [] if none."""
-    bad = []
-    for m in _list(c.get("Mounts")):
-        if not isinstance(m, dict) or m.get("Type") != "volume" or m.get("Name") != s.volume:
-            continue
-        labels = (c.get("Config") or {}).get("Labels") or {}
-        if ONESHOT_LABEL in labels:
-            running = bool((c.get("State") or {}).get("Running"))
-            bad.append(f"a one-shot ({labels[ONESHOT_LABEL]}) "
-                       + ("running while verify holds the lock" if running else "left behind by a crash"))
-        elif _name(c) != runtime:
-            bad.append(f"mounts the secret volume at {m.get('Destination')}")
-        elif m.get("RW") or m.get("Destination") != s.container_dir:
-            bad.append(f"mounts the secret volume {'read-write' if m.get('RW') else 'read-only'} at "
-                       f"{m.get('Destination')}, not read-only at {s.container_dir}")
-    return bad
+def _no_new_privileges(opts: Sequence[str]) -> bool:
+    return any(o in ("no-new-privileges", "no-new-privileges=true", "no-new-privileges:true") for o in opts)
+
+
+def rule_mounts(c: Dict[str, Any], s: ss.SecretSpec, runtime: str, engine: str, home: Optional[str],
+                runtime_image: Any, unsure: Sequence[str] = ()) -> Tuple[List[str], List[str]]:
+    """(failures, unknowns) of this container against rule 0. The runtime is
+    exempt only on the engine that holds the volume, and only as it is
+    rendered: the pinned image's resolved ID, its user, one read-only mount
+    at its directory, every capability dropped, none added, no new
+    privileges."""
+    bad: List[str] = []
+    unk: List[str] = []
+    mounts = [m for m in _list(c.get("Mounts")) if isinstance(m, dict)
+              and m.get("Type") == "volume" and m.get("Name") == s.volume]
+    if not mounts:
+        return bad, unk
+    labels = (c.get("Config") or {}).get("Labels") or {}
+    if ONESHOT_LABEL in labels:
+        running = bool((c.get("State") or {}).get("Running"))
+        bad.append(f"a one-shot ({labels[ONESHOT_LABEL]}) "
+                   + ("running while verify holds the lock" if running else "left behind by a crash"))
+        return bad, unk
+    if _name(c) != runtime:
+        bad.append(f"mounts the secret volume at {mounts[0].get('Destination')}")
+        return bad, unk
+    if engine != home:
+        if unsure:
+            unk.append(f"has the runtime's name, and which engine holds the volume is unknown "
+                       f"({', '.join(unsure)} could not say)")
+        else:
+            bad.append(f"has the runtime's name on {engine}, which does not hold the volume")
+        return bad, unk
+    h, cfg = _host(c), c.get("Config") or {}
+    if isinstance(runtime_image, rh.Unresolved):
+        unk.append(f"its image cannot be compared: {runtime_image.reason}")
+    elif c.get("Image") != runtime_image:
+        bad.append(f"runs image {c.get('Image')}, not the pinned image's {runtime_image}")
+    if cfg.get("User") != f"{s.uid}:{s.gid}":
+        bad.append(f"runs as {cfg.get('User')!r}, not {s.uid}:{s.gid}")
+    if len(mounts) != 1 or mounts[0].get("RW") or mounts[0].get("Destination") != s.container_dir:
+        bad.append(f"mounts the secret volume {len(mounts)} time(s), "
+                   f"{'read-write' if any(m.get('RW') for m in mounts) else 'read-only'}, at "
+                   f"{', '.join(str(m.get('Destination')) for m in mounts)}; the runtime mounts it once, "
+                   f"read-only, at {s.container_dir}")
+    if "ALL" not in {str(x).upper() for x in _list(h.get("CapDrop"))}:
+        bad.append("does not drop every capability")
+    opts = [str(x).replace(" ", "") for x in _list(h.get("SecurityOpt"))]
+    if not _no_new_privileges(opts):
+        bad.append("may gain privileges; the runtime runs with no-new-privileges")
+    return bad, unk
 
 
 def rule_privileges(c: Dict[str, Any], s: ss.SecretSpec, runtime: str) -> List[str]:
@@ -246,12 +310,13 @@ def rule_privileges(c: Dict[str, Any], s: ss.SecretSpec, runtime: str) -> List[s
         bad.append("runs unconfined")
     if any(str(v).split(":")[0] == runtime for v in _list(h.get("VolumesFrom"))):
         bad.append(f"takes volumes from {runtime}")
-    if _name(c) == runtime and "no-new-privileges" not in [o.split("=")[0].split(":")[0] for o in opts]:
-        bad.append("may gain privileges; the runtime runs with no-new-privileges")
     return bad
 
 
-def rule_routes(c: Dict[str, Any], s: ss.SecretSpec, lstat_: Callable) -> List[str]:
+def rule_routes(c: Dict[str, Any], s: ss.SecretSpec, lstat_: Callable, stat_: Callable) -> List[str]:
+    """An engine reachable from the container: a socket bound (judged by
+    lstat AND by stat, so a symlink to a socket counts), or DOCKER_HOST or
+    SSH_AUTH_SOCK in its environment."""
     bad = []
     for e in _list((c.get("Config") or {}).get("Env")):
         key = str(e).split("=", 1)[0]
@@ -261,27 +326,39 @@ def rule_routes(c: Dict[str, Any], s: ss.SecretSpec, lstat_: Callable) -> List[s
         if not isinstance(m, dict) or m.get("Type") != "bind":
             continue
         src = str(m.get("Source", ""))
-        try:
-            st = lstat_(src)
-            if stat.S_ISSOCK(st.st_mode):
-                bad.append(f"binds the socket {src}")
-        except OSError:
-            pass
+        for look in (lstat_, stat_):
+            try:
+                if stat.S_ISSOCK(look(src).st_mode):
+                    bad.append(f"binds the socket {src}")
+                    break
+            except OSError:
+                pass
         if src in s.extra["exposure"]["engine_sockets"]:
             bad.append(f"binds the engine socket {src}")
     return bad
 
 
 def rule_overlap(c: Dict[str, Any], secret_roots: Sequence[str], integrity_roots: Sequence[str],
-                 stat_: Callable) -> Tuple[List[str], List[str]]:
-    """(failures, unknowns) for this container's binds."""
+                 stat_: Callable, realpath: Callable[[str], str] = os.path.realpath
+                 ) -> Tuple[List[str], List[str]]:
+    """(failures, unknowns) for this container's binds. A source that cannot
+    be stat'ed here is UNKNOWN whatever its name suggests."""
     bad, unk = [], []
     for m in _list(c.get("Mounts")):
         if not isinstance(m, dict) or m.get("Type") != "bind":
             continue
         src, rw = str(m.get("Source", "")), bool(m.get("RW"))
+        mine = identity(src, stat_, realpath)
+        if not isinstance(mine, tuple):
+            rels = sorted({str(r.relation) for r in (overlap(src, root, stat_, realpath)
+                                                     for root in list(secret_roots) + list(integrity_roots))
+                           if isinstance(r, rh.Unresolved) and r.relation})
+            why = getattr(mine, "reason", "it does not exist here")
+            unk.append(f"binds {src}, which cannot be stat'ed here ({why}; compared by name: "
+                       f"{', '.join(rels) or 'no relation'})")
+            continue
         for root in secret_roots:
-            rel = overlap(src, root, stat_)
+            rel = overlap(src, root, stat_, realpath)
             if isinstance(rel, rh.Unresolved):
                 if rel.relation:
                     unk.append(f"binds {src}, which may be the {rel.relation} of the secret path {root}: "
@@ -289,7 +366,7 @@ def rule_overlap(c: Dict[str, Any], secret_roots: Sequence[str], integrity_roots
             elif rel:
                 bad.append(f"binds {src}, the {rel} of the secret path {root}")
         for root in integrity_roots:
-            rel = overlap(src, root, stat_)
+            rel = overlap(src, root, stat_, realpath)
             relation = rel.relation if isinstance(rel, rh.Unresolved) else rel
             if relation == "ancestor" or (relation and rw):
                 line = f"binds {src}{' read-write' if rw else ''}, the {relation} of {root}"
@@ -299,8 +376,11 @@ def rule_overlap(c: Dict[str, Any], secret_roots: Sequence[str], integrity_roots
 
 def protected_roots(s: ss.SecretSpec, mountpoints: Iterable[str],
                     realpath: Callable[[str], str] = os.path.realpath) -> Tuple[List[str], List[str]]:
+    """(secret, integrity) roots. Engine sockets are protected as themselves:
+    a bind of one, or of a directory above it, fails; their siblings do
+    not."""
     secret = list(dict.fromkeys(list(mountpoints) + list(s.extra["exposure"]["secret_roots"])
-                                + [posixpath.dirname(p) for p in s.extra["exposure"]["engine_sockets"]]))
+                                + list(s.extra["exposure"]["engine_sockets"])))
     integrity = [s.writer_dir, posixpath.dirname(s.anchor), posixpath.dirname(s.state_file),
                  s.run_dir, s.status_dir, s.uv["cache_dir"], s.uv["python_dir"], s.uv["binary"],
                  s.ssh["config"], s.ssh["known_hosts"]]
@@ -313,34 +393,6 @@ def protected_roots(s: ss.SecretSpec, mountpoints: Iterable[str],
 # --- The checks -----------------------------------------------------------------
 
 
-class _Lock:
-    """The one-shots' lock, held by verify for the whole sweep: nothing can
-    start a one-shot meanwhile, so any one-shot seen is a crash or an
-    anomaly."""
-
-    def __init__(self, path: str, wait_s: float):
-        self.path, self.wait_s, self.fd = path, wait_s, None
-
-    def __enter__(self) -> Any:
-        try:
-            self.fd = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
-        except OSError as e:
-            return rh.Unresolved(f"cannot open the lock {self.path}: {e}")
-        deadline = time.monotonic() + self.wait_s
-        while True:
-            try:
-                fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                return None
-            except BlockingIOError:
-                if time.monotonic() >= deadline:
-                    return rh.Unresolved(f"{self.path} stayed held for {self.wait_s:.0f}s")
-                time.sleep(LOCK_POLL_S)
-
-    def __exit__(self, *exc: Any) -> None:
-        if self.fd is not None:
-            os.close(self.fd)
-
-
 def _rule_check(claim: str, why: str, remedy: str, bad: List[str], unk: List[str],
                 do_not: str = "") -> rh.Check:
     want = _fact("findings", [], why)
@@ -351,21 +403,28 @@ def _rule_check(claim: str, why: str, remedy: str, bad: List[str], unk: List[str
     return rh.check(claim, want, [], remedy, do_not=do_not)
 
 
+def local(endpoint: str) -> bool:
+    """An engine on this host. A remote engine (ssh://, tcp://) is guarded by
+    its own host's lock and swept by that host's verify."""
+    return endpoint.startswith("unix://")
+
+
 def checks(spec: Any, s: ss.SecretSpec, *, lstat_: Callable = os.lstat, stat_: Callable = os.stat,
            realpath: Callable[[str], str] = os.path.realpath,
-           lock: Optional[Callable[[], Any]] = None) -> List[rh.Check]:
-    """Every exposure check, under the one-shots' lock."""
+           lock: Optional[Callable[[], Any]] = None, platform: str = sys.platform) -> List[rh.Check]:
+    """Every exposure check, under the one-shots' lock (verify passes its
+    own, already held)."""
     runtime = runtime_container(spec, s)
-    held = lock() if lock is not None else _Lock(posixpath.join(s.run_dir, ss.LOCK_FILE), LOCK_WAIT_S)
+    held = lock() if lock is not None else ss.Lock(s)
     with held as busy:
         if isinstance(busy, rh.Unresolved):
             return [rh.unknown("no container can reach the secret", _fact("findings", [], "the sweep needs "
                                "the one-shots' lock"), busy.reason, "run verify again when the lock is free")]
-        return _sweep(spec, s, runtime, lstat_, stat_, realpath)
+        return _sweep(spec, s, runtime, lstat_, stat_, realpath, platform)
 
 
 def _sweep(spec: Any, s: ss.SecretSpec, runtime: str, lstat_: Callable, stat_: Callable,
-           realpath: Callable[[str], str]) -> List[rh.Check]:
+           realpath: Callable[[str], str], platform: str) -> List[rh.Check]:
     out: List[rh.Check] = []
     ctx = contexts(s)
     claim = "every engine on this host can be asked"
@@ -384,16 +443,26 @@ def _sweep(spec: Any, s: ss.SecretSpec, runtime: str, lstat_: Callable, stat_: C
             continue
         if stat.S_ISSOCK(st.st_mode) and f"unix://{sock}" not in endpoints:
             unk_engines.append(f"{sock} is an engine socket that no docker context names")
-    by_engine, mountpoints = {}, []
-    for name, _ in ctx:
+    by_engine, mountpoints, holders, unsure = {}, [], [], []
+    for name, endpoint in ctx:
+        if not local(endpoint):
+            continue
         found = containers(s, name)
         if isinstance(found, rh.Unresolved):
             unk_engines.append(f"{name}: {found.reason}")
             continue
         by_engine[name] = found
         mp = volume_mountpoint(s, name)
-        if isinstance(mp, str) and mp:
+        if isinstance(mp, rh.Unresolved):
+            unk_engines.append(f"{name}: whether it holds {s.volume}: {mp.reason}")
+            unsure.append(name)
+        elif mp:
             mountpoints.append(mp)
+            holders.append(name)
+    if len(holders) > 1:
+        unk_engines.append(f"{s.volume} exists on more than one engine here: {', '.join(holders)}")
+    home = holders[0] if len(holders) == 1 else None
+    runtime_image = image_id(s, home) if home is not None else rh.Unresolved("no single engine holds the volume")
     want = _fact("engines", [], "a container on an engine nobody asked could hold the volume")
     out.append(rh.unknown(claim, want, "; ".join(unk_engines), "start the engine, or give it a context")
                if unk_engines else rh.check(claim, want, [], "nothing"))
@@ -405,18 +474,20 @@ def _sweep(spec: Any, s: ss.SecretSpec, runtime: str, lstat_: Callable, stat_: C
             if not isinstance(c, dict):
                 continue
             who = f"{engine}/{_name(c)}"
-            found["mounts"][0].extend(f"{who} {x}" for x in rule_mounts(c, s, runtime))
-            b, u = rule_overlap(c, secret_roots, integrity_roots, stat_)
+            b, u = rule_mounts(c, s, runtime, engine, home, runtime_image, unsure)
+            found["mounts"][0].extend(f"{who} {x}" for x in b)
+            found["mounts"][1].extend(f"{who} {x}" for x in u)
+            b, u = rule_overlap(c, secret_roots, integrity_roots, stat_, realpath)
             found["overlap"][0].extend(f"{who} {x}" for x in b)
             found["overlap"][1].extend(f"{who} {x}" for x in u)
             found["privileges"][0].extend(f"{who} {x}" for x in rule_privileges(c, s, runtime))
-            found["routes"][0].extend(f"{who} {x}" for x in rule_routes(c, s, lstat_))
-    out.append(_rule_check(f"only {runtime} mounts the volume {s.volume}, read-only at {s.container_dir}",
-                           "the volume is the secret; a one-shot is never seen while verify holds the lock",
-                           "remove the container (a crashed one-shot: `docker rm` it after checking it is "
-                           "not mid-write)", *found["mounts"], do_not="never copy the value out of it"))
+            found["routes"][0].extend(f"{who} {x}" for x in rule_routes(c, s, lstat_, stat_))
+    out.append(_rule_check(f"only {runtime} mounts the volume {s.volume}, read-only at {s.container_dir}, "
+                           f"as rendered", "the volume is the secret; a one-shot is never seen while verify "
+                           "holds the lock", "remove the container (a crashed one-shot: `docker rm` it after "
+                           "checking it is not mid-write)", *found["mounts"], do_not="never copy the value out of it"))
     out.append(_rule_check("no container binds a path that overlaps the secret or the code that handles it",
-                           "a bind of the volume's backing path, an engine or ssh directory, or a core "
+                           "a bind of the volume's backing path, an engine socket, an ssh directory or a core "
                            "directory reaches the secret; a writable bind of the tooling changes it",
                            "remove the bind, or narrow it to a path outside every protected one", *found["overlap"]))
     out.append(_rule_check("no container holds a privilege that reaches another process or the host's files",
@@ -427,9 +498,9 @@ def _sweep(spec: Any, s: ss.SecretSpec, runtime: str, lstat_: Callable, stat_: C
     out.append(_rule_check("no container can reach an engine", "an engine socket, DOCKER_HOST or an ssh agent "
                            "is root on the host for whoever holds it", "remove the socket bind or the variable",
                            *found["routes"]))
+    claim = "no OrbStack machine runs on this host"
+    want = _fact("machines", [], "a machine sees the whole Mac filesystem, OrbStack's volume view included")
     if "orb" in s.tools:
-        claim = "no OrbStack machine runs on this host"
-        want = _fact("machines", [], "a machine sees the whole Mac filesystem, OrbStack's volume view included")
         try:
             p = rh.run([s.tools["orb"], "list", "--quiet"])
             if p.rc != 0:
@@ -438,12 +509,21 @@ def _sweep(spec: Any, s: ss.SecretSpec, runtime: str, lstat_: Callable, stat_: C
                 out.append(rh.check(claim, want, p.out.split(), "stop and delete the machine"))
         except rh.CannotRun as e:
             out.append(rh.unknown(claim, want, str(e), "ask OrbStack"))
+    elif platform == "darwin":
+        out.append(rh.unknown(claim, want, "tools has no orb to ask", "record orb's path in tools"))
     return out
 
 
-def notes(s: ss.SecretSpec) -> List[str]:
-    """What verify prints for the operator to confirm, not a pass or fail:
-    the attestations and the keys that admit a docker-capable account."""
+#: Agent CLIs whose processes on the host, outside every container, the
+#: native_agents attestation answers for.
+AGENT_CLIS = ("claude", "codex")
+SSHD_LINES = ("passwordauthentication", "kbdinteractiveauthentication", "trustedusercakeys",
+              "authorizedkeyscommand", "authorizedprincipalsfile")
+
+
+def notes(s: ss.SecretSpec, ctx: Any = None) -> List[str]:
+    """What verify prints for the operator to confirm, not a pass or fail."""
+    ctx = contexts(s) if ctx is None else ctx
     out = []
     att = s.extra["attestations"]
     for key in ("native_agents", "other_runtimes"):
@@ -455,4 +535,31 @@ def notes(s: ss.SecretSpec) -> List[str]:
                                       if p.rc == 0 else f"ssh-keygen -l exited {p.rc}"))
         except rh.CannotRun as e:
             out.append(f"{keys}: {e}")
+    if "sshd" in s.tools:
+        try:
+            p = rh.run([s.tools["sshd"], "-T"])
+            lines = [line.strip() for line in p.out.splitlines() if line.split(" ", 1)[0] in SSHD_LINES]
+            out.append("sshd -T: " + ("; ".join(lines) if p.rc == 0 else f"exited {p.rc} (run it as root)"))
+        except rh.CannotRun as e:
+            out.append(f"sshd -T: {e}")
+    if "ps" in s.tools:
+        try:
+            p = rh.run([s.tools["ps"], "-axo", "comm="])
+            seen = sorted({posixpath.basename(line.strip()) for line in p.out.splitlines()
+                           if posixpath.basename(line.strip()) in AGENT_CLIS})
+            out.append(f"agent CLIs running on this host outside containers: {seen or 'none'} "
+                       f"(sandy runs agents in containers; reconcile with native_agents)")
+        except rh.CannotRun as e:
+            out.append(f"processes: {e}")
+    if "tmutil" in s.tools:
+        for path in s.extra["exposure"]["backup_excluded"]:
+            try:
+                p = rh.run([s.tools["tmutil"], "isexcluded", path])
+                out.append(f"tmutil isexcluded {path}: {p.out.strip() or f'exited {p.rc}'}")
+            except rh.CannotRun as e:
+                out.append(f"tmutil isexcluded {path}: {e}")
+    if isinstance(ctx, list):
+        remote = [f"{n} ({ep})" for n, ep in ctx if not local(ep)]
+        if remote:
+            out.append(f"not swept here, each is swept by its own host's verify: {', '.join(remote)}")
     return out

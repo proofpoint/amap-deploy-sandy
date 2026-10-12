@@ -481,18 +481,24 @@ root, the lock file and the state, and checks, without reading the secret:
   within 15, and not failed TLS twice in a row.
 
 **Who else could reach it.** With the section, `host-setup` and `verify`
-also check every container on every engine (each `docker context`, running
-or stopped), holding the one-shots' lock so nothing starts meanwhile. Each
-of these is a failure:
+also check every container on every engine of this host (each `docker
+context` with a `unix://` endpoint, running or stopped; a remote context is
+swept by its own host's verify and named in the notes), holding the
+one-shots' lock so nothing starts meanwhile. Each of these is a failure:
 - a mount of the secret's volume by anything but the runtime's own
-  container, read-only at its container directory; a one-shot container
-  still there (a crash, or one running while the lock is held);
+  container, on the engine that holds the volume, as rendered: the pinned
+  image's resolved ID, its user, one read-only mount at its directory,
+  every capability dropped and none added, no new privileges; a one-shot
+  container still there (a crash, or one running while the lock is held);
 - a bind that overlaps a secret path (the volume's backing directory, an
   engine socket's directory, ssh's directory, a core directory, any listed
   in `exposure.secret_roots`) in either direction, or that is writable over
   the tooling, or sits above it. Paths are compared by device and inode up
-  each ancestor chain, so an alias, a case variant or a firmlink matches; a
-  path that cannot be stat'ed is compared by name and is UNKNOWN at best;
+  each ancestor chain, the resolved path's and the literal one's, so an
+  alias, a case variant, a firmlink or a symlink matches; a bind source
+  that cannot be stat'ed is UNKNOWN, whatever its name suggests. An engine
+  socket is protected as itself, so a bind of it or of a directory above
+  it fails and its siblings do not;
 - a privileged container, a capability not in `caps_allow` (or one no
   allowlist admits: those that reach another process's memory or the
   host's files), a host or shared namespace, a device, an unconfined
@@ -501,8 +507,12 @@ of these is a failure:
 - an engine socket bound, or `DOCKER_HOST` or `SSH_AUTH_SOCK` set;
 - an engine socket no context names, or an OrbStack machine.
 
-It then prints, for you to confirm, the attestations the section records
-and the fingerprints of the listed `authorized_keys` files.
+It then prints, for you to confirm: the attestations the section records;
+the fingerprints of the listed `authorized_keys` files; `sshd -T`'s
+password, keyboard-interactive, CA and authorized-keys-command lines; any
+agent CLI running on the host outside a container; `tmutil isexcluded` for
+each path in `exposure.backup_excluded`; and the remote contexts it left to
+their own hosts.
 
 `place <src> <dest> --sha256 <hex>` installs a file root-owned 0444 only if
 its bytes have the given sha256, so the route the file arrived by need not be
