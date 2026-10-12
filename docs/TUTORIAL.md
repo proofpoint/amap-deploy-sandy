@@ -328,3 +328,86 @@ cd ~/amap-demo/gamma && sandy --exec -- /opt/sandy/features/amap/codex/kickoff R
 The thread submits the delegation and finishes its turn. alpha's reply
 arrives as a later turn on the same thread. **Delegate to Codex** the same
 way as to any agent: ask alpha to task gamma's address.
+
+## 10. A hop deployment's host setup
+
+A hop deployment runs each side of a hop as its own uid, against roots the
+operator creates as root. Its host is described by a host-setup document
+(operator data, kept outside this repository: the deployment overlay's
+`host_setup` section, or a file given with `--spec`), and one verb prints the
+plan and checks the host against it. It runs none of the plan:
+
+```sh
+python3 amap-sandy.py --overlay <deployment overlay> host-setup
+```
+
+**Which directories are roots.** Every directory a hop runtime opens as the
+top of a tree it writes is a root in the document, with that runtime's
+principal among its readers: its hop root and private roots, its state
+directory, its lock directory (unless that is on tmpfs), any archive
+directory it is configured with, and the directory that holds any state file
+it is configured with (a file's parent is the root, not the file). The
+private overlay's documentation lists them for each runtime. A directory left
+out is one the plan never creates, syncs or checks.
+
+Run the printed steps as root, in order, **before any hop runtime starts**.
+Each step goes through `host_steps.py`, which reaches every path from `/`
+without following a symbolic link and stops at one. Every root is created
+with its owner, group and mode, then it and every ancestor are fsynced, so a
+runtime never opens a root that is not durable. The steps are safe to run
+again.
+
+Start each hop runtime under the umask the plan names for it: `UMask=0027`
+in its service unit, or `umask 0027` in its launcher before it execs. 0027
+is the only umask a runtime record accepts unless it lists 0022 in
+`umasks`. Never list it for a runtime whose paths create directories under
+the umask alone: under 0022 those directories are readable by every uid on
+the host.
+
+With the stub plugin pinned, the router refuses to start (`exec_failed`):
+that is the expected outcome while the plumbing is checked, and it ends
+when the reviewed plugin's digest is pinned.
+
+Then run the verb again; `verify` runs the same checks whenever the
+overlay has a `host_setup` section. Each exits non-zero unless every check
+passes, and an UNKNOWN (a runtime not running, a container that could not be
+asked, a runtime outside a container) is a problem, not a pass. No check can
+see whether the barrier ran: durability rests on the steps having run before
+the runtimes started.
+
+### A refused leftover item or `.stage` directory
+
+A hop runtime never repairs a directory it finds already there. If a crash
+left one behind that is not exactly what the runtime would have made, the
+runtime refuses it with an ERROR that names the path, and its replay stops
+there.
+
+1. **Stop the runtime.**
+2. **Check the named directory.** `ls -lnd <path> <path>/..` shows the type,
+   the mode, and the owner's uid of it and of its parent. Every one of these
+   must hold:
+   - it is a **real directory**: its line starts with `d`, not `l`;
+   - it is **empty**: `ls -A <path>` prints nothing;
+   - it is **owned by the writer's uid**, the runtime that refused it;
+   - its permission bits are **a subset of the requested ones**: 0750
+     (`rwxr-x---`) for an item directory, 0700 (`rwx------`) for a `.stage`
+     directory;
+   - it has **no setuid and no sticky bit**: no `s` in the owner's execute
+     place, and no `t` or `T` at the end;
+   - its **setgid bit** (`s` or `S` in the group's execute place) is the
+     same as its parent's.
+3. **If all hold, remove it** with `rmdir <path>`, never `rm -r`, and
+   **start the runtime**. The replay creates it again. That is safe: a
+   writer-owned 0700 or 0750 directory can hold only the writer's own
+   entries, and nothing is committed there before the runtime's checks pass.
+
+**One mismatch has a known cause.** An empty, writer-owned directory whose
+only difference is a missing setgid bit is what a umask that strips a
+requested bit leaves behind when the parent's group is not one of the
+writer's groups. It is a deployment error, not a plant: fix the runtime's
+umask (the check above names it), then `rmdir` it and start the runtime.
+
+**Any other mismatch: do not remove it.** A directory that is not a real
+directory, not empty, owned by someone else, or carrying bits the runtime
+never asks for may have been planted. Leave it in place, keep the runtime
+stopped, and escalate.

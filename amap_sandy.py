@@ -74,6 +74,7 @@ DEFAULT_SERVERS = PAYLOAD_DIR / "mcp-servers.json"
 import launchd_job as lj   # the recreation cadence: renders and reads, never loads
 import router_health as rh  # the router process: its container and its health, read only
 import verify_report as vr  # how verify prints: one row per condition, its workspaces beside it
+import host_setup as hsu    # a hop deployment's host plan: rendered and checked, never applied
 import host_adapter as ha   # the host registry's CLI, run as a subprocess, never imported
 
 # `fleet_policy.py` sits beside this module. Guarded rather than bare: this
@@ -4775,6 +4776,17 @@ def build_parser() -> argparse.ArgumentParser:
                            "overlay's `checkout`)")
     link.add_argument("--apply", action="store_true", help="make the links (default: show)")
 
+    hsetup = sub.add_parser(
+        "host-setup", help="a hop deployment's host plan, from a host-setup document: print "
+                           "the root-run steps (uids, groups, directories, the overlay), then "
+                           "check the host against them. Applies nothing")
+    hsetup.add_argument("--spec", type=Path, default=None,
+                        help="the host-setup document (operator data; default: the deployment "
+                             "overlay's host_setup section)")
+    hsetup.add_argument("--production", action="store_true",
+                        help="refuse the stub plugin's pin (default: plumbing, where the stub "
+                             "is expected)")
+
     teardown = sub.add_parser(
         "teardown", help="the fleet back to its pre-install state for a clean rebuild: "
                          "remove the payload, the router's config and router-state/ (held "
@@ -4818,6 +4830,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         if args.command == "teardown":
             return run_teardown(args, home, boxes_dir)
 
+        if args.command == "host-setup":
+            return hsu.run(args.spec, production=args.production, overlay=ha.overlay_path(args.overlay))
+
         if args.command == "migrate-registry":
             return run_migrate_registry(args, home)
 
@@ -4838,6 +4853,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 2
 
 
+def run_verify_host_setup(args: argparse.Namespace) -> int:
+    """verify's host-setup part: when the deployment overlay has a
+    `host_setup` section, every `host-setup` check, with an UNKNOWN a
+    problem like a FAIL. Silent without an overlay. `--host-facts` does not
+    carry these checks; its shape is the router's contract."""
+    overlay = ha.overlay_path(getattr(args, "overlay", None))
+    if overlay is None:
+        return 0
+    print("\nverify: the hop deployment's host setup")
+    return hsu.verify_section(overlay)
+
+
 def run_verify_command(args: argparse.Namespace, home: Path, boxes_dir: Path) -> int:
     """verify: the staleness question first, through the same path install
     answers it on, because "is the host installed at all" is a precondition
@@ -4856,7 +4883,8 @@ def run_verify_command(args: argparse.Namespace, home: Path, boxes_dir: Path) ->
                                  notes_out=install_notes)
         print("\nverify (2/2): the checks the install cannot make")
         live_rc = run_verify(args, servers, home, boxes_dir, facts, install_notes=install_notes)
-        rc = stale_rc or live_rc
+        hop_rc = run_verify_host_setup(args)
+        rc = stale_rc or live_rc or hop_rc
         return rc
     finally:
         if facts is not None:
