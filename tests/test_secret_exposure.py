@@ -294,13 +294,9 @@ class PrivilegesTest(Base):
     def test_an_allowlisted_cap_with_its_reason_passes(self):
         self.assertEqual(self.bad(self.one(container("vpn", CapAdd=["NET_ADMIN"]))), {})
 
-    def test_a_hard_denied_cap_fails_even_when_allowlisted(self):
-        s = specs(caps_allow={"SYS_PTRACE": "a debugger"})
-        orig = rh.run
-        found = self.sweep(engine(by_context={"default": [runtime(), container("x", CapAdd=["SYS_PTRACE"])]}),
-                           s=s)
-        rh.run = orig
-        self.assertOnly(found, "no container holds a privilege")
+    def test_a_hard_denied_cap_cannot_be_allowlisted_the_section_does_not_load(self):
+        with self.assertRaises(hs.SpecError):
+            specs(caps_allow={"SYS_PTRACE": "a debugger"})
 
     def test_default_namespace_modes_pass(self):
         c = container("x", IpcMode="shareable", PidMode="", UsernsMode="", CgroupnsMode="private")

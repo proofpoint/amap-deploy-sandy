@@ -64,6 +64,7 @@ under the umask alone would otherwise make them readable by every uid.
 The runbook says what to do with a refused leftover.
 """
 
+import contextlib
 import hashlib
 import json
 import os
@@ -850,9 +851,12 @@ def checks(spec: Spec, *, production: bool, lstat: Callable = os.lstat,
            mounts: Optional[Callable[..., Any]] = None,
            umasks: Optional[Callable[[str], Any]] = None,
            secrets: Optional[Dict[str, Any]] = None,
-           exposure: Optional[Dict[str, Any]] = None) -> List[rh.Check]:
+           exposure: Optional[Dict[str, Any]] = None, overlay: Optional[Path] = None,
+           secret_lock: Optional[Callable[[Any], Any]] = None) -> List[rh.Check]:
     """Every check of the host against the plan. `production` is ORed with
-    the document's own. `secrets` passes probes to the secret's checks."""
+    the document's own. `secrets` passes probes to the secret's checks;
+    `overlay` is the file the document was read from (None for --spec). The
+    secret's checks run under the one-shots' lock, taken once."""
     seen = {r["container"]: (containers or ask_container)(r["container"]) for r in spec.runtimes}
     out = verify_roots(spec, lstat)
     out += verify_overlay(spec, production=production or spec.production, lstat=lstat, digest=digest)
@@ -862,8 +866,15 @@ def checks(spec: Spec, *, production: bool, lstat: Callable = os.lstat,
                           ask_openssl({i: rec["path"] for i, rec in spec.openssl.items()}))
     out += verify_umasks(spec, ask_umasks if umasks is None else umasks)
     if spec.secrets is not None:
-        out += ss.checks(spec.secrets, lstat=lstat, digest=digest, **(secrets or {}))
-        out += se.checks(spec, spec.secrets, **(exposure or {}))
+        with (secret_lock or ss.Lock)(spec.secrets) as busy:
+            if isinstance(busy, rh.Unresolved):
+                out.append(rh.unknown("the secret's checks ran under the one-shots' lock",
+                                      rh.Fact("lock", True, "no one-shot may start while verify looks"),
+                                      busy.reason, "run verify again when the lock is free"))
+            else:
+                out += ss.checks(spec.secrets, lstat=lstat, digest=digest, held=True,
+                                 overlay=None if overlay is None else str(overlay), **(secrets or {}))
+                out += se.checks(spec, spec.secrets, lock=contextlib.nullcontext, **(exposure or {}))
     return out
 
 
@@ -903,7 +914,8 @@ def run(spec_path: Optional[Path], *, production: bool, overlay: Optional[Path] 
                             spec.overlay_pin["sha256"] == STUB_SHA256 else None):
         out(f"  {line}")
     out("host-setup (2/2): the host against the plan.")
-    rc = report(checks(spec, production=production, **probes), out)
+    rc = report(checks(spec, production=production, overlay=None if spec_path is not None else overlay,
+                       **probes), out)
     print_notes(spec, out)
     return rc
 
@@ -924,6 +936,6 @@ def verify_section(overlay: Optional[Path], out=print, **probes: Any) -> int:
     except ValueError as e:
         out(f"  UNKNOWN host setup: {e}")
         return 1
-    rc = report(checks(spec, production=False, **probes), out)
+    rc = report(checks(spec, production=False, overlay=overlay, **probes), out)
     print_notes(spec, out)
     return rc

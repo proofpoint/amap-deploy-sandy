@@ -44,10 +44,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 import router_health as rh
 import secret_setup as ss
 
-#: Capabilities no allowlist can admit: each reaches another process's memory
-#: or the host's files, and so the volume's backing store.
-HARD_DENY = frozenset({"ALL", "SYS_ADMIN", "SYS_PTRACE", "DAC_READ_SEARCH", "SYS_MODULE",
-                       "SYS_RAWIO", "BPF", "PERFMON", "SYS_BOOT", "MAC_ADMIN", "MAC_OVERRIDE"})
+HARD_DENY = ss.HARD_DENY
 #: Namespace modes that share the host's or another container's.
 SHARED_PREFIXES = ("host", "container:")
 UNCONFINED = ("seccomp=unconfined", "seccomp:unconfined", "apparmor=unconfined", "apparmor:unconfined",
