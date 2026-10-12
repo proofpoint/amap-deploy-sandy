@@ -87,6 +87,16 @@ _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 _ALIAS = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 #: The weekly job's run id, as host_steps' probe-weekly checks it.
 _RUN_ID = re.compile(r"[A-Za-z0-9._-]{1,64}")
+_LOCK_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\.lock")
+#: The probe's own phase budgets, set so the whole probe fits well inside the
+#: weekly job's timeout (connect, then each command, each at most this long).
+PROBE_BUDGET_S = 30
+PROBE_BUDGETS = ("RELAY_SMTP_CONNECT_TIMEOUT", "RELAY_SMTP_COMMAND_TIMEOUT", "RELAY_SMTP_DATA_TIMEOUT",
+                 "RELAY_SMTP_DOT_TIMEOUT")
+#: apport, Ubuntu's crash handler: its hook and the units that enable it.
+APPORT_HOOK = "/usr/share/apport/apport"
+APPORT_DEFAULT = "/etc/default/apport"
+APPORT_UNITS = ("apport.service", "apport-forward.socket")
 
 
 class SecretSpecError(ValueError):
@@ -116,6 +126,10 @@ class SecretSpec:
     operator_uid: int
     docker_via_sudo: bool
     extra: Dict[str, Any]                   # caps_allow, attestations: read by the exposure checks
+    principal: str = ""
+    pipeline_locks: Tuple[str, ...] = ()    # further operator lock files in run_dir
+    probe: Optional[Dict[str, Any]] = None  # network, smtp_host, smtp_port, username
+    zsh: Optional[Dict[str, str]] = None    # version, module_path: the recorded zsh
 
     @property
     def writer(self) -> str:
@@ -142,7 +156,8 @@ def load(sec: Any, principals: Dict[str, Any], runtimes: Sequence[Dict[str, Any]
     a tag where a digest belongs, a clone without its sha, a tool missing."""
     keys = ("volume", "label", "principal", "file", "container_dir", "image", "writer", "anchor",
             "state_file", "clones", "tools", "uv", "status_dir", "run_dir", "ssh", "operator_uid")
-    sec = _exact(sec, keys, "(the section)", ("docker_via_sudo", "caps_allow", "attestations"))
+    sec = _exact(sec, keys, "(the section)", ("docker_via_sudo", "caps_allow", "attestations",
+                                                "pipeline_locks", "probe", "zsh"))
     if not isinstance(sec["volume"], str) or not _NAME.fullmatch(sec["volume"]):
         raise SecretSpecError("secrets.volume must be a volume name")
     if not isinstance(sec["label"], str) or not _LABEL.fullmatch(sec["label"]):
@@ -188,6 +203,24 @@ def load(sec: Any, principals: Dict[str, Any], runtimes: Sequence[Dict[str, Any]
         raise SecretSpecError("secrets.docker_via_sudo must be true or false")
     if via_sudo and "sudo" not in tools:
         raise SecretSpecError("secrets.docker_via_sudo needs tools.sudo")
+    locks = sec.get("pipeline_locks", [])
+    if not isinstance(locks, list) or any(not isinstance(n, str) or not _LOCK_NAME.fullmatch(n)
+                                          or n == LOCK_FILE for n in locks):
+        raise SecretSpecError("secrets.pipeline_locks must list plain <name>.lock file names")
+    probe = sec.get("probe")
+    if probe is not None:
+        probe = _exact(probe, ("network", "smtp_host", "smtp_port", "username"), "probe")
+        if not all(isinstance(probe[k], str) and _NAME.fullmatch(probe[k])
+                   for k in ("network", "smtp_host")) or not isinstance(probe["username"], str) \
+                or isinstance(probe["smtp_port"], bool) or not isinstance(probe["smtp_port"], int):
+            raise SecretSpecError("secrets.probe: network and smtp_host are names, smtp_port a number, "
+                                  "username a string")
+    zsh = sec.get("zsh")
+    if zsh is not None:
+        zsh = _exact(zsh, ("version", "module_path"), "zsh")
+        _abs(zsh["module_path"], "zsh.module_path")
+        if "zsh" not in tools or not isinstance(zsh["version"], str):
+            raise SecretSpecError("secrets.zsh needs tools.zsh and a version string")
     op = sec["operator_uid"]
     if isinstance(op, bool) or not isinstance(op, int) or op <= 0:
         raise SecretSpecError("secrets.operator_uid must be the operator's (non-root) uid")
@@ -201,7 +234,8 @@ def load(sec: Any, principals: Dict[str, Any], runtimes: Sequence[Dict[str, Any]
         status_dir=_abs(sec["status_dir"], "status_dir"), run_dir=_abs(sec["run_dir"], "run_dir"),
         ssh={"config": _abs(ssh["config"], "ssh.config"),
              "known_hosts": _abs(ssh["known_hosts"], "ssh.known_hosts"), "alias": ssh["alias"]},
-        operator_uid=op, docker_via_sudo=via_sudo,
+        operator_uid=op, docker_via_sudo=via_sudo, principal=sec["principal"],
+        pipeline_locks=tuple(locks), probe=probe, zsh=zsh,
         extra={k: sec[k] for k in ("caps_allow", "attestations") if k in sec})
 
 
@@ -244,6 +278,27 @@ def locked(s: SecretSpec, argv: List[str]) -> List[str]:
 WRITER_CAPS = ("CHOWN", "FOWNER", "DAC_OVERRIDE")
 
 
+def probe(s: SecretSpec, run_id: str) -> List[str]:
+    """The one-shot login probe (the design's §6): the runtime's image, uid,
+    read-only mount, network and SMTP settings, running only `probe-login`,
+    with its phase budgets set so the whole probe fits inside the weekly
+    job's timeout."""
+    if s.probe is None:
+        raise SecretSpecError("secrets.probe is needed to render the probe")
+    pr = s.probe
+    argv = docker(s) + [
+        "run", "--rm", "--pull", "never", "--log-driver", "none", "--read-only", "--ulimit", "core=0",
+        "--security-opt", "no-new-privileges", "--cap-drop", "ALL", "--network", pr["network"],
+        "--user", f"{s.uid}:{s.gid}", "--label", "org.amap.oneshot=probe", "--label", f"org.amap.run={run_id}",
+        "--mount", f"type=volume,src={s.volume},dst={s.container_dir},readonly,volume-nocopy",
+        "-e", f"SMTP_PASSWORD_FILE={posixpath.join(s.container_dir, s.file)}",
+        "-e", f"SMTP_USERNAME={pr['username']}", "-e", f"SMTP_HOST={pr['smtp_host']}",
+        "-e", f"SMTP_PORT={pr['smtp_port']}", "-e", "SMTP_AUTH_METHOD=password"]
+    for budget in PROBE_BUDGETS:
+        argv += ["-e", f"{budget}={PROBE_BUDGET_S}"]
+    return argv + [s.image, "probe-login"]
+
+
 def render(s: SecretSpec, q: Callable[[str], str]) -> List[str]:
     """The secret's root-run steps, as shell lines, in order. Printed, never run."""
     t = s.tools
@@ -264,15 +319,25 @@ def render(s: SecretSpec, q: Callable[[str], str]) -> List[str]:
         f"{sudo} {install} -o 0 -g 0 -m 0444 {q(posixpath.join(s.clones['deploy']['path'], WRITER))} "
         f"{q(s.writer)}",
         f"{hash_cmd} {q(s.writer)}",
-        "# The volume and its root, owned by the runtime's uid, 0700, made in a one-shot container.",
-        " ".join(q(a) for a in docker(s)) + f" volume create --label {q(s.label)} {q(s.volume)}",
-        " ".join(q(a) for a in oneshot(s, "root", "<run-id>", user="0:0", rw=True, caps=WRITER_CAPS))
-        + f" root {IN_VOLUME} {s.uid} {s.gid} {ROOT_MODE:04o}",
-        "# As the operator: the lock file the one-shots and verify share.",
+        "# As the operator, before any one-shot: the run directory and the lock files the one-shots, "
+        "verify and the runbook share.",
         f"{install} -d -m 0700 {q(s.run_dir)}",
-        f"{install} -m 0600 /dev/null {q(posixpath.join(s.run_dir, LOCK_FILE))}",
-        f"# The state, until the secret is written: {STATES[0]}.",
-        f"printf '{STATES[0]}\\n' | {sudo} {install} -o 0 -g 0 -m 0444 /dev/stdin {q(s.state_file)}",
+    ]
+    for name in (LOCK_FILE,) + s.pipeline_locks:
+        lines.append(f"{install} -m 0600 /dev/null {q(posixpath.join(s.run_dir, name))}")
+    state_tmp = posixpath.join(s.run_dir, "state.tmp")
+    lines += [
+        "# The runtime's network is DS-12b's render, with the runtime itself.",
+        "# The volume and its root, owned by the runtime's uid, 0700, made in a one-shot container under "
+        "the lock, the root locked as the writer locks it.",
+        " ".join(q(a) for a in docker(s)) + f" volume create --label {q(s.label)} {q(s.volume)}",
+        " ".join(q(a) for a in locked(s, oneshot(s, "root", "<run-id>", user="0:0", rw=True, caps=WRITER_CAPS)))
+        + f" root {IN_VOLUME} {s.uid} {s.gid} {ROOT_MODE:04o} --exclusive",
+        f"# The state, until the secret is written: {STATES[0]}. Written to a file first: BSD install "
+        f"refuses a pipe as its source.",
+        f"printf '{STATES[0]}\\n' > {q(state_tmp)}",
+        f"{sudo} {install} -o 0 -g 0 -m 0444 {q(state_tmp)} {q(s.state_file)}",
+        f"rm {q(state_tmp)}",
     ]
     return lines
 
@@ -404,13 +469,24 @@ def verify_pins(s: SecretSpec, lstat: Callable, digest: Callable[[str], Any],
     return out
 
 
+def git_env(path: str) -> Dict[str, str]:
+    """The environment every git call gets: no system or user configuration,
+    and the repository named outright, so no inherited GIT_DIR, GIT_WORK_TREE
+    or GIT_COMMON_DIR can point it elsewhere and no GIT_CONFIG_COUNT or
+    GIT_CONFIG_PARAMETERS can inject configuration."""
+    git_dir = posixpath.join(path, ".git")
+    return {"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_DIR": git_dir,
+            "GIT_WORK_TREE": path, "GIT_COMMON_DIR": git_dir, "GIT_CONFIG_COUNT": "0",
+            "GIT_CONFIG_PARAMETERS": ""}
+
+
 def _git(s: SecretSpec, path: str, *args: str) -> Any:
     """git in `path` with system and user configuration ignored and no hook or
     fsmonitor able to run: stdout, or an Unresolved."""
     try:
         p = rh.run([s.tools["git"], "-C", path, "-c", "core.hooksPath=/dev/null",
                     "-c", "core.fsmonitor=false", *args],
-                   extra_env={"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"})
+                   extra_env=git_env(path))
     except rh.CannotRun as e:
         return rh.Unresolved(str(e))
     if p.rc != 0:
@@ -467,6 +543,54 @@ def verify_clones(s: SecretSpec, lstat: Callable, read: Callable[[str], Any],
     return out
 
 
+def identity_chain(path: str, stat_: Callable, realpath: Callable[[str], str]) -> Any:
+    """(st_dev, st_ino) of `path` resolved, then of every ancestor of the
+    resolved path: a list, None when some component is absent, or an
+    Unresolved when one cannot be asked."""
+    out, p = [], realpath(path)
+    while True:
+        try:
+            st = stat_(p)
+        except FileNotFoundError:
+            return None
+        except OSError as e:
+            return rh.Unresolved(f"cannot stat {p}: {e}")
+        out.append((st.st_dev, st.st_ino))
+        if p == "/":
+            return out
+        p = posixpath.dirname(p)
+
+
+def verify_overlay_source(s: SecretSpec, overlay: Optional[str], stat_: Callable,
+                          realpath: Callable[[str], str]) -> List[rh.Check]:
+    """The document just read, which supplies every other pin, is a tracked
+    file inside the anchored overlay clone: the overlay never vouches for its
+    own sha, the anchor does, and only for that clone."""
+    clone = s.clones["overlay"]["path"]
+    claim = f"the host-setup document was read from the anchored overlay clone {clone}"
+    want = _fact("overlay source", True, "every pin is trusted only as the anchored clone holds it")
+    remedy = f"run verify with the overlay file inside {clone}, never a copy or a working checkout"
+    if overlay is None:
+        return [rh.check(claim, want, "read from --spec, not the overlay", remedy)]
+    mine, top = identity_chain(overlay, stat_, realpath), identity_chain(clone, stat_, realpath)
+    for c in (mine, top):
+        if isinstance(c, rh.Unresolved):
+            return [rh.unknown(claim, want, c.reason, remedy)]
+    if mine is None or top is None or top[0] not in mine[1:]:
+        return [rh.check(claim, want, f"{overlay} is not inside {clone}", remedy)]
+    rel = posixpath.relpath(realpath(overlay), realpath(clone))
+    claim2 = f"{rel} is a tracked file of the anchored overlay clone"
+    try:
+        p = rh.run([s.tools["git"], "-C", clone, "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
+                    "ls-files", "--error-unmatch", "--", rel], extra_env=git_env(clone))
+    except rh.CannotRun as e:
+        return [rh.check(claim, want, True, remedy), rh.unknown(claim2, want, str(e), remedy)]
+    # --error-unmatch exits 1 for a path git does not track; anything else is git not answering.
+    second = (rh.check(claim2, want, p.rc == 0, remedy) if p.rc in (0, 1)
+              else rh.unknown(claim2, want, f"git ls-files exited {p.rc}", remedy))
+    return [rh.check(claim, want, True, remedy), second]
+
+
 def verify_tools(s: SecretSpec, lstat: Callable,
                  realpath: Callable[[str], str] = os.path.realpath) -> List[rh.Check]:
     out = []
@@ -515,23 +639,29 @@ def verify_dirs(s: SecretSpec, lstat: Callable) -> List[rh.Check]:
         _dir(f"the status directory {s.status_dir} is root's and not group- or world-writable",
              s.status_dir, (0,), None, "the weekly probe's result is read from it", lstat),
     ]
-    lock = posixpath.join(s.run_dir, LOCK_FILE)
-    st = _lst(lock, lstat)
-    claim = f"the lock file {lock} is a regular file owned by the operator, 0600"
-    want = _fact("lock file", (s.operator_uid, LOCK_MODE), "made by the plan; `lock` never creates it")
-    remedy = f"create {lock} as the plan does"
-    if isinstance(st, rh.Unresolved):
-        out.append(rh.unknown(claim, want, st.reason, remedy))
-    elif st is None or not stat.S_ISREG(st.st_mode):
-        out.append(rh.check(claim, want, "absent" if st is None else "not a regular file", remedy))
-    else:
-        out.append(rh.check(claim, want, (st.st_uid, stat.S_IMODE(st.st_mode)), remedy))
+    for name in (LOCK_FILE,) + s.pipeline_locks:
+        lock = posixpath.join(s.run_dir, name)
+        out.append(_operator_file(f"the lock file {lock} is a regular file owned by the operator, 0600",
+                                  lock, LOCK_MODE, s, "made by the plan; nothing creates it later", lstat))
     return out
+
+
+def _operator_file(claim: str, path: str, mode: int, s: SecretSpec, why: str, lstat: Callable) -> rh.Check:
+    st = _lst(path, lstat)
+    want = _fact("file", (s.operator_uid, mode), why)
+    remedy = f"create {path} as the plan does, operator-owned {mode:04o}"
+    if isinstance(st, rh.Unresolved):
+        return rh.unknown(claim, want, st.reason, remedy)
+    if st is None or not stat.S_ISREG(st.st_mode):
+        return rh.check(claim, want, "absent" if st is None else "not a regular file", remedy)
+    return rh.check(claim, want, (st.st_uid, stat.S_IMODE(st.st_mode)), remedy)
 
 
 def verify_ssh(s: SecretSpec, lstat: Callable) -> List[rh.Check]:
     out = []
     kh, cfg, alias = s.ssh["known_hosts"], s.ssh["config"], s.ssh["alias"]
+    out.append(_operator_file(f"the hub ssh config {cfg} is the operator's, 0600", cfg, LOCK_MODE, s,
+                              "it replaces every other ssh config for the producer's ssh", lstat))
     st = _lst(kh, lstat)
     claim = f"the pinned known_hosts {kh} is the operator's, 0400"
     want = _fact("known_hosts", (s.operator_uid, KNOWN_HOSTS_MODE), "nothing may append a key to it")
@@ -569,11 +699,46 @@ def verify_ssh(s: SecretSpec, lstat: Callable) -> List[rh.Check]:
     return out
 
 
-def ask_volume(s: SecretSpec, run_id: str) -> Any:
-    """The volume's metadata from a one-shot container under the lock, by
-    lstat alone: a dict, or an Unresolved."""
-    argv = locked(s, oneshot(s, "stat", run_id, user=f"{s.uid}:{s.gid}", rw=False)
-                  + ["stat-secret", IN_VOLUME])
+LOCK_WAIT_S = 60
+LOCK_POLL_S = 0.25
+
+
+class Lock:
+    """The one-shots' lock, taken in-process by verify around every secret
+    check and the exposure sweep, so no one-shot can start between them.
+    Entering gives None, or an Unresolved naming why it was not taken."""
+
+    def __init__(self, s: SecretSpec, wait_s: float = LOCK_WAIT_S):
+        self.path, self.wait_s, self.fd = posixpath.join(s.run_dir, LOCK_FILE), wait_s, None
+
+    def __enter__(self) -> Any:
+        import fcntl
+        try:
+            self.fd = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        except OSError as e:
+            return rh.Unresolved(f"cannot open the lock {self.path}: {e}")
+        deadline = time.monotonic() + self.wait_s
+        while True:
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return None
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    return rh.Unresolved(f"{self.path} stayed held for {self.wait_s:.0f}s")
+                time.sleep(LOCK_POLL_S)
+
+    def __exit__(self, *exc: Any) -> None:
+        if self.fd is not None:
+            os.close(self.fd)
+
+
+def ask_volume(s: SecretSpec, run_id: str, held: bool = False) -> Any:
+    """The volume's metadata from a one-shot container, by lstat alone: a
+    dict, or an Unresolved. Under the lock: verify's own (`held`), or the
+    `lock` wrapper's."""
+    argv = oneshot(s, "stat", run_id, user=f"{s.uid}:{s.gid}", rw=False) + ["stat-secret", IN_VOLUME]
+    if not held:
+        argv = locked(s, argv)
     try:
         p = rh.run(argv)
     except rh.CannotRun as e:
@@ -606,10 +771,16 @@ def verify_volume(s: SecretSpec, st_: Any, seen: Any) -> List[rh.Check]:
     names = [e.get("name") for e in entries if isinstance(e, dict)]
     if st_ == "active":
         want = _fact("entries", [s.file], f"{s.state_file} says active")
-        out.append(rh.check(f"the volume holds exactly {s.file}", want, names,
-                            remedy_b5 if not names else "remove the stray entry with `secret-remove`, "
-                            "then write the secret again", do_not="never open a stray entry; never copy "
-                            "the value from another host or a pane"))
+        tmp = f".{s.file}.tmp"
+        stray = [n for n in names if n != s.file]
+        remedy = (remedy_b5 if not names else
+                  "remove the crash temp with `secret-remove`, then write the secret again"
+                  if stray == [tmp] else
+                  "do not open it; record it and escalate: `secret-remove` refuses any name but the file "
+                  "and its crash temp")
+        out.append(rh.check(f"the volume holds exactly {s.file}", want, names, remedy,
+                            do_not="never open a stray entry; never copy the value from another host or a "
+                            "pane"))
         mine = next((e for e in entries if isinstance(e, dict) and e.get("name") == s.file), None)
         if mine is not None:
             got = (mine.get("regular"), mine.get("uid"), mine.get("gid"), mine.get("mode"),
@@ -620,13 +791,15 @@ def verify_volume(s: SecretSpec, st_: Any, seen: Any) -> List[rh.Check]:
                                 f"not empty", want, got, remedy_b5))
     else:
         want = _fact("entries", [], f"{s.state_file} says {st_}")
-        remedy = remedy_b5 + ", then record active" if st_ == "pending_b5" else "remove it with `secret-remove`"
+        remedy = ("record active after the probe passes, or `secret-remove`" if st_ == "pending_b5"
+                  else "remove it with `secret-remove` (any other name: do not open it; escalate)")
         out.append(rh.check(f"the volume holds nothing in the {st_} state", want, names, remedy,
                             do_not="never open an entry to see what it is"))
     return out
 
 
-def verify_core(s: SecretSpec, platform: str, read: Callable[[str], Any]) -> List[rh.Check]:
+def verify_core(s: SecretSpec, platform: str, read: Callable[[str], Any],
+                exists: Callable[[str], bool] = os.path.lexists) -> List[rh.Check]:
     """No root service that relays the value may leave a persistent core."""
     out = []
     if platform.startswith("linux"):
@@ -660,6 +833,7 @@ def verify_core(s: SecretSpec, platform: str, read: Callable[[str], Any]) -> Lis
             if line.startswith("Storage="):
                 value = line.split("=", 1)[1].strip()
         out.append(rh.check(claim, want, value, remedy))
+        out.append(verify_apport(s, read, exists))
         return out
     claim = "the kernel writes no core files (kern.coredump=0)"
     want = _fact("kern.coredump", "0", "a crashing root service holds the value in memory")
@@ -676,10 +850,69 @@ def verify_core(s: SecretSpec, platform: str, read: Callable[[str], Any]) -> Lis
     return [rh.check(claim, want, p.out.strip(), remedy)]
 
 
+def verify_apport(s: SecretSpec, read: Callable[[str], Any],
+                  exists: Callable[[str], bool] = os.path.lexists) -> rh.Check:
+    """apport is absent, or disabled both in its defaults and in systemd: with
+    it, a packaged daemon's core goes to /var/crash whatever core_pattern
+    says."""
+    claim = "apport is absent or disabled"
+    want = _fact("apport", True, "with apport on, a crashing sshd or dockerd leaves its memory in /var/crash")
+    remedy = "remove apport, or set enabled=0 in /etc/default/apport and disable its units"
+    if not exists(APPORT_HOOK):
+        return rh.check(claim, want, True, remedy)
+    text = _read_small(APPORT_DEFAULT, read)
+    if isinstance(text, rh.Unresolved):
+        return rh.unknown(claim, want, text.reason, remedy)
+    enabled = None
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if line.startswith("enabled="):
+            enabled = line.split("=", 1)[1].strip()
+    if enabled != "0":
+        return rh.check(claim, want, f"{APPORT_DEFAULT}: enabled={enabled}", remedy)
+    tool = s.tools.get("systemctl")
+    if tool is None:
+        return rh.unknown(claim, want, "tools has no systemctl to ask about apport's units", remedy)
+    for unit in APPORT_UNITS:
+        try:
+            p = rh.run([tool, "is-enabled", unit])
+        except rh.CannotRun as e:
+            return rh.unknown(claim, want, str(e), remedy)
+        state_ = p.out.strip()
+        if p.rc == 0 or state_ in ("enabled", "enabled-runtime", "static", "indirect", "alias"):
+            return rh.check(claim, want, f"{unit} is {state_ or 'enabled'}", remedy)
+        if state_ not in ("disabled", "masked", "not-found", "masked-runtime", ""):
+            return rh.unknown(claim, want, f"systemctl says {unit} is {state_!r}", remedy)
+    return rh.check(claim, want, True, remedy)
+
+
+def verify_zsh(s: SecretSpec, lstat: Callable) -> List[rh.Check]:
+    """The recorded zsh, run clean, is the version and module directory the
+    section records, and that directory is not writable by anyone but root."""
+    if s.zsh is None:
+        return []
+    claim = "the recorded zsh is its recorded version, with its recorded module directory"
+    want = _fact("zsh", (s.zsh["version"], s.zsh["module_path"]), "amap_b5 refuses any other shell")
+    remedy = "record the zsh this host actually runs, or run amap_b5 in it"
+    try:
+        p = rh.run([s.tools["zsh"], "-f", "-c", "print -r -- $ZSH_VERSION; print -r -- $module_path"])
+    except rh.CannotRun as e:
+        return [rh.unknown(claim, want, str(e), remedy)]
+    lines = p.out.splitlines()
+    got = (lines[0], lines[1]) if p.rc == 0 and len(lines) >= 2 else f"zsh exited {p.rc}"
+    out = [rh.check(claim, want, got, remedy)]
+    out.append(_owned_chain(f"the zsh module directory {s.zsh['module_path']} and every directory above it "
+                            f"are root's and not group- or world-writable",
+                            posixpath.join(s.zsh["module_path"], "zsh"), (0,),
+                            "zmodload zsh/system loads code from it", lstat))
+    return out
+
+
 STATUS_FILE = "hub-probe.json"
 
 
-def verify_status(s: SecretSpec, st_: Any, read: Callable[[str], Any], now: float) -> List[rh.Check]:
+def verify_status(s: SecretSpec, st_: Any, read: Callable[[str], Any], now: float,
+                  lstat: Callable = os.lstat) -> List[rh.Check]:
     """The weekly probe's last result, in the active state only: nothing is
     probed before the secret exists, and nothing after it is retired."""
     if st_ != "active":
@@ -702,6 +935,15 @@ def verify_status(s: SecretSpec, st_: Any, read: Callable[[str], Any], now: floa
                            f"run_id, previous_class, last_ok_at)", remedy)]
     out = [rh.check(claim, want, isinstance(at, int) and now - at <= STATUS_MAX_AGE_S
                     and cls in PROBE_CLASSES_NOT_FAILURES, remedy)]
+    st = _lst(path, lstat)
+    meta = "the weekly probe's status file is root's, 0644, with one link"
+    mwant = _fact("status file", (0, 0o644, 1), "only the root job writes it")
+    if isinstance(st, rh.Unresolved):
+        out.append(rh.unknown(meta, mwant, st.reason, remedy))
+    elif st is None or not stat.S_ISREG(st.st_mode):
+        out.append(rh.check(meta, mwant, "absent" if st is None else "not a regular file", remedy))
+    else:
+        out.append(rh.check(meta, mwant, (st.st_uid, stat.S_IMODE(st.st_mode), st.st_nlink), remedy))
     out.append(rh.check("the probe has passed within 15 days", _fact("last_ok_at", True,
                         "a pair that has not authenticated for two weeks is presumed broken"),
                         isinstance(last_ok, int) and now - last_ok <= LAST_OK_MAX_AGE_S, remedy))
@@ -716,19 +958,27 @@ def checks(s: SecretSpec, *, lstat: Callable = os.lstat, digest: Optional[Callab
            volume: Optional[Callable[[SecretSpec, str], Any]] = None,
            listdir: Callable[[str], List[str]] = os.listdir,
            realpath: Callable[[str], str] = os.path.realpath,
-           now: Optional[float] = None) -> List[rh.Check]:
-    """Every check of the secret's layout on this host."""
+           now: Optional[float] = None, overlay: Optional[str] = None,
+           stat_: Callable = os.stat, held: bool = False,
+           exists: Callable[[str], bool] = os.path.lexists) -> List[rh.Check]:
+    """Every check of the secret's layout on this host. `overlay` is the file
+    the document was read from (None for --spec); `held` says the caller
+    holds the one-shots' lock, as verify does."""
     if digest is None:
         import host_setup
         digest = host_setup._sha256
     when = time.time() if now is None else now
     st_ = state(s, read)
-    out = verify_pins(s, lstat, digest, read)
+    out = verify_overlay_source(s, overlay, stat_, realpath)
+    out += verify_pins(s, lstat, digest, read)
     out += verify_clones(s, lstat, read, listdir)
     out += verify_tools(s, lstat, realpath)
     out += verify_dirs(s, lstat)
     out += verify_ssh(s, lstat)
-    out += verify_volume(s, st_, (volume or ask_volume)(s, f"verify-{int(when)}"))
-    out += verify_core(s, platform, read)
-    out += verify_status(s, st_, read, when)
+    out += verify_zsh(s, lstat)
+    run_id = f"verify-{int(when)}"
+    seen = volume(s, run_id) if volume is not None else ask_volume(s, run_id, held=held)
+    out += verify_volume(s, st_, seen)
+    out += verify_core(s, platform, read, exists)
+    out += verify_status(s, st_, read, when, lstat)
     return out

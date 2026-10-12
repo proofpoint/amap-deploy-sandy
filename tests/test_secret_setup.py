@@ -24,11 +24,13 @@ import secret_setup as ss
 from test_host_setup import doc as host_doc, good_fs, lstat_of
 
 St = namedtuple("St", "st_mode st_uid st_gid st_ino st_nlink", defaults=(0, 1))
+Ident = namedtuple("Ident", "st_dev st_ino")
 OP = 501
 DOWN, DOWNGRP = 2102, 2202
 ANCHOR = "d" * 40
 NOW = 2_000_000_000
 STATUS = "/var/ex/status/" + ss.STATUS_FILE
+OVERLAY = "/srv/op/clones/overlay/overlay.json"
 
 
 def sec():
@@ -85,6 +87,7 @@ def fs():
               "/srv/op/uv-cache": dr(0o700, OP), "/srv/op/uv-python": dr(0o700, OP),
               "/srv/op/run": dr(0o700, OP), "/srv/op/run/oneshot.lock": fl(0o600, OP),
               "/srv/op/ssh": dr(0o700, OP), "/srv/op/ssh/known_hosts": fl(0o400, OP),
+              "/srv/op/ssh/config": fl(0o600, OP), OVERLAY: fl(0o644, OP), STATUS: fl(0o644),
               "/var": dr(0o755), "/var/ex": dr(0o755), "/var/ex/status": dr(0o755)})
     for role in ss.CLONE_ROLES:
         f[f"/srv/op/clones/{role}"] = dr(0o700, OP)
@@ -111,6 +114,17 @@ def reader(f):
     return read
 
 
+def identity_of(table):
+    """A fake os.stat: each path in the table has its own identity."""
+    ids = {p: i for i, p in enumerate(sorted(table), 1)}
+
+    def st(p):
+        if p not in ids:
+            raise FileNotFoundError(p)
+        return Ident(1, ids[p])
+    return st
+
+
 def volume_of(names=("credential",), mode="0400", root=(DOWN, DOWNGRP, "0700")):
     entries = [{"name": n, "regular": True, "uid": DOWN, "gid": DOWNGRP, "mode": mode, "nlink": 1,
                 "nonempty": True} for n in names]
@@ -133,6 +147,8 @@ def tools_answer(over=None):
             return rh.Proc(tuple(argv), 0, SHAS[argv[2]] + "\n", "")
         if argv[0].endswith("git") and "status" in argv:
             return rh.Proc(tuple(argv), 0, "", "")
+        if argv[0].endswith("git") and "ls-files" in argv:
+            return rh.Proc(tuple(argv), 0, argv[-1] + "\n", "")
         if argv[0].endswith("ssh-keygen"):
             return rh.Proc(tuple(argv), 0, "# Host exhub found: line 1 \nexhub ssh-ed25519 AAAA\n", "")
         if argv[0].endswith("/ssh"):
@@ -150,7 +166,8 @@ def tools_answer(over=None):
 class Base(unittest.TestCase):
 
     def run_checks(self, s=None, *, f=None, files_=None, volume=None, answer=None, platform="linux",
-                   hooks=("pre-commit.sample",), digest="b" * 64, realpath=lambda p: p):
+                   hooks=("pre-commit.sample",), digest="b" * 64, realpath=lambda p: p, overlay=OVERLAY,
+                   exists=lambda p: False):
         seen = []
 
         def run(argv, **kw):
@@ -160,10 +177,12 @@ class Base(unittest.TestCase):
         rh.run = run
         self.addCleanup(setattr, rh, "run", orig)
         self.seen = seen
-        return ss.checks(s or spec(), lstat=lstat_of(f if f is not None else fs()),
+        table = f if f is not None else fs()
+        return ss.checks(s or spec(), lstat=lstat_of(table),
                          digest=lambda p: digest, read=reader(files_ if files_ is not None else files()),
                          platform=platform, volume=volume or volume_of(),
-                         listdir=lambda p: list(hooks), realpath=realpath, now=NOW)
+                         listdir=lambda p: list(hooks), realpath=realpath, now=NOW, overlay=overlay,
+                         stat_=identity_of(table), exists=exists)
 
     def results(self, found):
         return {c.claim: c.result for c in found}
@@ -198,7 +217,11 @@ class GoodHostTest(Base):
         for argv, kw in gits:
             self.assertIn("core.hooksPath=/dev/null", argv)
             self.assertIn("core.fsmonitor=false", argv)
-            self.assertEqual(kw["extra_env"], {"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"})
+            repo = argv[argv.index("-C") + 1]
+            self.assertEqual(kw["extra_env"], {
+                "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_DIR": repo + "/.git",
+                "GIT_WORK_TREE": repo, "GIT_COMMON_DIR": repo + "/.git", "GIT_CONFIG_COUNT": "0",
+                "GIT_CONFIG_PARAMETERS": ""})
 
     def test_ssh_is_asked_in_the_producers_option_order(self):
         self.run_checks()
@@ -515,6 +538,206 @@ class CoreAndStatusTest(Base):
         self.assertEqual([c.claim for c in found if c.result != rh.PASS], [])
 
 
+class OverlaySourceTest(Base):
+
+    def test_a_document_from_outside_the_anchored_clone_fails(self):
+        f = fs()
+        f["/srv/op/copy.json"] = fl(0o644, OP)
+        self.assertOnly(self.run_checks(f=f, overlay="/srv/op/copy.json"), "read from the anchored overlay clone")
+
+    def test_a_document_given_by_spec_fails(self):
+        self.assertOnly(self.run_checks(overlay=None), "read from the anchored overlay clone")
+
+    def test_a_symlink_into_the_clone_passes_only_by_its_target(self):
+        f = fs()
+        f["/srv/op/link.json"] = fl(0o644, OP)
+        found = self.run_checks(f=f, overlay="/srv/op/link.json",
+                                realpath=lambda p: OVERLAY if p == "/srv/op/link.json" else p)
+        self.assertEqual([c.claim for c in found if c.result != rh.PASS], [])
+
+    def test_an_untracked_document_fails(self):
+        found = self.run_checks(answer=tools_answer({
+            lambda a: a[0].endswith("git") and "ls-files" in a: (1, "", "error: pathspec did not match")}))
+        self.assertOnly(found, "is a tracked file of the anchored overlay clone")
+
+
+class ApportTest(Base):
+
+    def apport(self, default, units=None, exists=True):
+        f = files()
+        if default is not None:
+            f[ss.APPORT_DEFAULT] = default
+        s = spec(tools=dict(sec()["tools"], systemctl="/usr/bin/systemctl"))
+        table = fs()
+        table["/usr/bin/systemctl"] = fl(0o755)
+        units = units or {}
+
+        def unit(argv):
+            return argv[0].endswith("systemctl")
+
+        def answer(argv, **kw):
+            if unit(argv):
+                state = units.get(argv[-1], "disabled")
+                return rh.Proc(tuple(argv), 0 if state == "enabled" else 1, state + "\n", "")
+            return tools_answer()(argv, **kw)
+        return self.run_checks(s, f=table, files_=f, answer=answer, exists=lambda p: exists)
+
+    def test_absent_apport_passes(self):
+        self.assertEqual([c.claim for c in self.apport(None, exists=False) if c.result != rh.PASS], [])
+
+    def test_disabled_in_defaults_and_units_passes(self):
+        self.assertEqual([c.claim for c in self.apport("enabled=0\n") if c.result != rh.PASS], [])
+
+    def test_enabled_in_defaults_fails(self):
+        self.assertOnly(self.apport("# comment\nenabled=1\n"), "apport is absent or disabled")
+
+    def test_disabled_in_defaults_but_a_unit_enabled_fails(self):
+        self.assertOnly(self.apport("enabled=0\n", {"apport.service": "enabled"}), "apport is absent or disabled")
+
+    def test_an_unreadable_default_is_unknown(self):
+        def read(p):
+            if p == ss.APPORT_DEFAULT:
+                raise PermissionError(13, "denied", p)
+            return files()[p]
+        s = spec(tools=dict(sec()["tools"], systemctl="/usr/bin/systemctl"))
+        table = fs()
+        table["/usr/bin/systemctl"] = fl(0o755)
+        orig = rh.run
+        rh.run = tools_answer()
+        self.addCleanup(setattr, rh, "run", orig)
+        found = ss.checks(s, lstat=lstat_of(table), digest=lambda p: "b" * 64, read=read, platform="linux",
+                          volume=volume_of(), listdir=lambda p: [], realpath=lambda p: p, now=NOW,
+                          overlay=OVERLAY, stat_=identity_of(table), exists=lambda p: True)
+        bad = {c.claim: c.result for c in found if c.result != rh.PASS}
+        self.assertEqual(bad, {"apport is absent or disabled": rh.UNKNOWN})
+
+
+class PipelineLocksTest(Base):
+
+    def test_a_missing_or_open_pipeline_lock_fails(self):
+        s = spec(pipeline_locks=["b5-one.lock"])
+        found = self.run_checks(s)
+        self.assertOnly(found, "the lock file /srv/op/run/b5-one.lock")
+        f = fs()
+        f["/srv/op/run/b5-one.lock"] = fl(0o644, OP)
+        self.assertOnly(self.run_checks(s, f=f), "the lock file /srv/op/run/b5-one.lock")
+        f["/srv/op/run/b5-one.lock"] = fl(0o600, OP)
+        self.assertEqual([c.claim for c in self.run_checks(s, f=f) if c.result != rh.PASS], [])
+
+    def test_the_plan_creates_every_pipeline_lock(self):
+        lines = hs.render_plan(hs.load_spec(full_doc(pipeline_locks=["b5-one.lock", "b5-two.lock"])))
+        for name in ("oneshot.lock", "b5-one.lock", "b5-two.lock"):
+            self.assertTrue(any(line.endswith(f"/srv/op/run/{name}") and "-m 0600 /dev/null" in line
+                                for line in lines), name)
+
+
+class ZshAndFilesTest(Base):
+
+    def zsh(self, out, module_dir_mode=0o755):
+        s = spec(tools=dict(sec()["tools"], zsh="/bin/zsh"),
+                 zsh={"version": "5.9", "module_path": "/usr/lib/zsh/5.9"})
+        f = fs()
+        f.update({"/bin": dr(0o755), "/bin/zsh": fl(0o755), "/usr/lib": dr(0o755),
+                  "/usr/lib/zsh": dr(0o755), "/usr/lib/zsh/5.9": dr(module_dir_mode)})
+        return self.run_checks(s, f=f, answer=tools_answer({lambda a: a[0] == "/bin/zsh": (0, out, "")}))
+
+    def test_the_recorded_zsh_passes(self):
+        self.assertEqual([c.claim for c in self.zsh("5.9\n/usr/lib/zsh/5.9\n") if c.result != rh.PASS], [])
+
+    def test_another_zsh_fails(self):
+        self.assertOnly(self.zsh("5.8\n/opt/homebrew/lib/zsh/5.8\n"), "the recorded zsh is its recorded version")
+
+    def test_a_writable_module_directory_fails(self):
+        self.assertOnly(self.zsh("5.9\n/usr/lib/zsh/5.9\n", 0o775), "the zsh module directory")
+
+    def test_an_open_hub_ssh_config_fails(self):
+        f = fs()
+        f["/srv/op/ssh/config"] = fl(0o644, OP)
+        self.assertOnly(self.run_checks(f=f), "the hub ssh config")
+
+    def test_a_status_file_not_roots_fails(self):
+        f = fs()
+        f[STATUS] = fl(0o666)
+        self.assertOnly(self.run_checks(f=f), "the weekly probe's status file is root's")
+
+
+class RemedyAndProbeTest(Base):
+
+    def remedy(self, found, fragment):
+        return next(c.remedy for c in found if fragment in c.claim and c.result != rh.PASS)
+
+    def test_a_foreign_stray_is_escalated_and_a_crash_temp_removed(self):
+        foreign = self.run_checks(volume=volume_of(names=("credential", "planted")))
+        self.assertIn("escalate", self.remedy(foreign, "the volume holds exactly"))
+        temp = self.run_checks(volume=volume_of(names=("credential", ".credential.tmp")))
+        self.assertIn("remove the crash temp with `secret-remove`", self.remedy(temp, "the volume holds exactly"))
+
+    def test_the_probe_runs_probe_login_with_its_budgets(self):
+        s = spec(probe={"network": "ex-net", "smtp_host": "hub.example.org", "smtp_port": 587,
+                        "username": "router@ex.example.org"})
+        argv = ss.probe(s, "w-1")
+        self.assertEqual(argv[-2:], ["ex/runtime@sha256:" + "a" * 64, "probe-login"])
+        for env in ("SMTP_PASSWORD_FILE=/run/secrets/ex/credential", "SMTP_AUTH_METHOD=password",
+                    "SMTP_PORT=587", "RELAY_SMTP_CONNECT_TIMEOUT=30", "RELAY_SMTP_COMMAND_TIMEOUT=30",
+                    "RELAY_SMTP_DATA_TIMEOUT=30", "RELAY_SMTP_DOT_TIMEOUT=30"):
+            self.assertEqual(argv[argv.index(env) - 1], "-e")
+        self.assertIn("type=volume,src=ex-secret,dst=/run/secrets/ex,readonly,volume-nocopy", argv)
+        self.assertEqual(argv[argv.index("--user") + 1], f"{DOWN}:{DOWNGRP}")
+        self.assertNotIn("--cap-add", argv)
+
+    def test_held_runs_the_stat_one_shot_without_the_wrapper(self):
+        s = spec()
+        seen = []
+
+        def run(argv, **kw):
+            seen.append(list(argv))
+            return rh.Proc(tuple(argv), 0, json.dumps({"uid": DOWN, "gid": DOWNGRP, "mode": "0700",
+                                                       "entries": []}), "")
+        orig = rh.run
+        rh.run = run
+        self.addCleanup(setattr, rh, "run", orig)
+        ss.ask_volume(s, "r1", held=True)
+        self.assertEqual(seen[0][0], "/usr/local/bin/docker")
+        self.assertNotIn("lock", seen[0][:6])
+
+
+class HostSetupLockTest(unittest.TestCase):
+
+    def test_a_busy_lock_is_one_unknown_and_no_secret_check_runs(self):
+        import contextlib
+
+        @contextlib.contextmanager
+        def busy(s):
+            yield rh.Unresolved("held for 60s")
+        spec_ = hs.load_spec(full_doc())
+        called = []
+        orig = ss.checks
+        ss.checks = lambda *a, **k: called.append(k) or []
+        self.addCleanup(setattr, ss, "checks", orig)
+        found = hs.checks(spec_, production=False, lstat=lstat_of(fs()), digest=lambda p: "x",
+                          openssl={}, containers=lambda c: rh.Unresolved("n/a"), umasks=lambda c: [],
+                          secret_lock=busy)
+        self.assertEqual(called, [])
+        self.assertIn("the secret's checks ran under the one-shots' lock",
+                      [c.claim for c in found if c.result == rh.UNKNOWN])
+
+    def test_a_free_lock_runs_the_secret_checks_as_held_with_the_overlay(self):
+        import contextlib
+
+        @contextlib.contextmanager
+        def free(s):
+            yield None
+        spec_ = hs.load_spec(full_doc())
+        called = []
+        orig = ss.checks
+        ss.checks = lambda *a, **k: called.append(k) or []
+        self.addCleanup(setattr, ss, "checks", orig)
+        hs.checks(spec_, production=False, lstat=lstat_of(fs()), digest=lambda p: "x", openssl={},
+                  containers=lambda c: rh.Unresolved("n/a"), umasks=lambda c: [], secret_lock=free,
+                  overlay="/srv/op/clones/overlay/overlay.json")
+        self.assertEqual((called[0]["held"], called[0]["overlay"]), (True, "/srv/op/clones/overlay/overlay.json"))
+
+
 class LoadTest(unittest.TestCase):
 
     def test_bad_sections_do_not_load(self):
@@ -532,6 +755,10 @@ class LoadTest(unittest.TestCase):
                                           tools={k: v for k, v in sec()["tools"].items() if k != "sudo"}),
             "root as the operator": dict(sec(), operator_uid=0),
             "a short writer pin": dict(sec(), writer=dict(sec()["writer"], sha256="b" * 63)),
+            "a pipeline lock that is a path": dict(sec(), pipeline_locks=["../x.lock"]),
+            "the one-shots' lock as a pipeline lock": dict(sec(), pipeline_locks=["oneshot.lock"]),
+            "a probe without its port": dict(sec(), probe={"network": "n", "smtp_host": "h", "username": "u"}),
+            "a zsh without its tool": dict(sec(), zsh={"version": "5.9", "module_path": "/usr/lib/zsh/5.9"}),
         }
         for what, s in cases.items():
             with self.subTest(what=what):
@@ -549,13 +776,14 @@ class PlanTest(unittest.TestCase):
     def test_the_plan_creates_the_volume_root_lock_and_state_in_order(self):
         lines = hs.render_plan(hs.load_spec(full_doc()))
         text = "\n".join(lines)
-        order = ["/opt/ex/etc/overlay.sha", "/opt/ex/libexec/host_steps.py",
+        order = ["/opt/ex/etc/overlay.sha", "/opt/ex/libexec/host_steps.py", "/srv/op/run/oneshot.lock",
                  "volume create --label org.example.role=secret ex-secret",
-                 f"root /v {DOWN} {DOWNGRP} 0700", "/srv/op/run/oneshot.lock",
-                 "pending_b5"]
+                 f"root /v {DOWN} {DOWNGRP} 0700 --exclusive", "pending_b5"]
         at = [text.index(x) for x in order]
         self.assertEqual(at, sorted(at))
-        root = next(line for line in lines if line.endswith(f"root /v {DOWN} {DOWNGRP} 0700"))
+        root = next(line for line in lines if line.endswith(f"root /v {DOWN} {DOWNGRP} 0700 --exclusive"))
+        self.assertTrue(root.startswith("/usr/bin/python3 -I -S /opt/ex/libexec/host_steps.py lock /srv/op/run --"))
+        self.assertNotIn("/dev/stdin", text)
         for flag in ("--pull never", "--network none", "--cap-drop ALL", "--cap-add CHOWN",
                      "volume-nocopy", "/w,readonly"):
             self.assertIn(flag, root)

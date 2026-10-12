@@ -459,6 +459,8 @@ file (`pending_b5`, `active` or `retired`), the fresh clones the tooling
 runs from, and the absolute path of every tool. `host-setup` then prints the
 steps that create the anchor, install the writer, create the volume and its
 root, the lock file and the state, and checks, without reading the secret:
+- the document itself was read from the anchored overlay clone, as a file
+  that clone tracks, never from a copy or a working checkout;
 - the writer, the anchor and the state file are root-owned 0444 with one
   link under root-owned directories, and the writer hashes to its pin;
 - each clone is the operator's 0700, at its recorded commit, with no hook
@@ -472,7 +474,9 @@ root, the lock file and the state, and checks, without reading the secret:
 - the volume holds exactly what the state says, read by `stat-secret` in a
   one-shot container under the lock;
 - the host keeps no core file (Linux: every core to systemd-coredump with
-  `Storage=none`; macOS: `kern.coredump=0`);
+  `Storage=none`, and apport absent or disabled; macOS: `kern.coredump=0`);
+- the lock files: `oneshot.lock` and each name in `pipeline_locks`, each the
+  operator's, 0600, created by the plan, never later;
 - in the `active` state, the weekly probe has run within 8 days, passed
   within 15, and not failed TLS twice in a row.
 
