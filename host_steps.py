@@ -2,7 +2,9 @@
 the operator runs, so that no step follows a symbolic link. `host-setup`
 prints the calls; this module is what they run. Standard library only.
 
-  python3 host_steps.py root  PATH UID GID MODE   a root directory, created or fixed
+  python3 host_steps.py root  PATH UID GID MODE [--exclusive]
+                                                  a root directory, created or fixed;
+                                                  --exclusive: under the secret writer's lock
   python3 host_steps.py sync  DIR...              fsync each directory
   python3 host_steps.py place SRC DEST            the overlay, root-owned 0444
   python3 host_steps.py marker PATH               a random root marker, root-owned 0444
@@ -16,7 +18,7 @@ A runtime's secret file, in a directory that only that runtime's uid can open:
   python3 -I -S host_steps.py secret-remove PATH           the file and any crash temp removed
   python3 -I -S host_steps.py stat-secret DIR              its entries' metadata, as one JSON line
   python3 -I -S host_steps.py lock RUN_DIR -- ARGV...      ARGV run under RUN_DIR/oneshot.lock
-  python3 -I -S host_steps.py probe-weekly STATUS RUN_ID -- ARGV...
+  python3 -I -S host_steps.py probe-weekly STATUS RUN_ID [--engine unix:///SOCK] [--docker ABS] -- ARGV...
                                                   ARGV's one-line result kept in STATUS
 
 Every path is walked from `/` one component at a time, each opened with
@@ -40,7 +42,6 @@ until the command exits even when the wrapper is killed; it never reads
 stdin.
 """
 
-import ctypes
 import fcntl
 import hashlib
 import json
@@ -70,10 +71,12 @@ def _parts(path):
     return [p for p in path.split("/") if p]
 
 
-def open_dir(path, create=None):
+def open_dir(path, create=None, exclusive=False):
     """A descriptor for directory `path`, reached from / without following
     any link. With `create=(uid, gid, mode)`, the last component is made if
-    absent, and owner and mode are set through its descriptor."""
+    absent, and owner and mode are set through its descriptor. With
+    `exclusive`, the directory is flock'd first (as the secret writer locks
+    it), and a held lock stops the step before anything changes."""
     parts = _parts(path)
     fd = os.open("/", _DIR)
     try:
@@ -93,6 +96,11 @@ def open_dir(path, create=None):
                                 f"was touched") from None
             os.close(fd)
             fd = nxt
+        if exclusive:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise StepError(f"{path}: concurrent writer; nothing changed") from None
         if create is not None:
             uid, gid, mode = create
             st = os.fstat(fd)
@@ -107,8 +115,8 @@ def open_dir(path, create=None):
         raise
 
 
-def root(path, uid, gid, mode):
-    fd = open_dir(path, create=(uid, gid, mode))
+def root(path, uid, gid, mode, exclusive=False):
+    fd = open_dir(path, create=(uid, gid, mode), exclusive=exclusive)
     os.close(fd)
 
 
@@ -224,6 +232,7 @@ def no_dumps():
     refuses."""
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     if sys.platform.startswith("linux"):
+        import ctypes   # here, so the other steps never depend on it
         libc = ctypes.CDLL(None, use_errno=True)
         if libc.prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) != 0:
             raise Refused("dumpable")
@@ -478,38 +487,100 @@ ENGINE_EXIT = 125
 RUN_ID = re.compile(r"[A-Za-z0-9._-]{1,64}")
 
 
+#: An SMTP reply code, or "-" when none was reached.
+SMTP_CODE = re.compile(r"\d{3}|-")
+#: The most of the probe's stdout that is ever read: one short line.
+PROBE_OUT_MAX = 4096
+
+
 def probe_class(stdout, returncode):
     """(class, code) from the probe's one line and its exit: the line's class
-    only when its exit is exactly the contract's for that class."""
+    only when its exit is exactly the contract's for that class and its code
+    is an SMTP code or "-". engine_unavailable is never the probe's to say."""
     if returncode == ENGINE_EXIT:
         return "engine_unavailable", "-"
+    if len(stdout) > PROBE_OUT_MAX:
+        return "protocol_error", "-"
     words = stdout.decode("ascii", "replace").split()
-    if len(words) == 2 and PROBE_EXITS.get(words[0]) == returncode:
+    if len(words) == 2 and PROBE_EXITS.get(words[0]) == returncode and SMTP_CODE.fullmatch(words[1]):
         return words[0], words[1]
     return "protocol_error", "-"
 
 
-def probe_weekly(status_path, run_id, argv, now=None):
+def engine_answers(endpoint):
+    """Whether the engine at `unix:///abs/path` is there to ask: the path is
+    a socket and accepts a connection. Anything else is a stopped engine."""
+    import socket
+    if not endpoint.startswith("unix:///"):
+        raise Refused("probe")
+    path = endpoint[len("unix://"):]
+    try:
+        if not stat.S_ISSOCK(os.stat(path).st_mode):
+            return False
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(5)
+            sock.connect(path)
+        return True
+    except OSError:
+        return False
+
+
+#: How long the probe may run. Its own phase budgets keep it well inside.
+PROBE_TIMEOUT_S = 300
+RUN_LABEL = "org.amap.run"
+
+
+def _remove_run(docker, run_id):
+    """Remove every container labelled with this run: a timeout kills the
+    docker client, not the container, which would go on holding the secret
+    volume. Best effort; the sweep reports any that remain."""
+    try:
+        ids = subprocess.run(docker + ["ps", "--all", "--quiet", "--filter", f"label={RUN_LABEL}={run_id}"],
+                             shell=False, close_fds=True, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, timeout=60).stdout.decode("ascii", "replace").split()
+        if ids:
+            subprocess.run(docker + ["rm", "--force"] + ids, shell=False, close_fds=True,
+                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def probe_weekly(status_path, run_id, argv, now=None, engine=None, docker=None):
     """Run the probe command and keep its result in `status_path`: the class,
     its SMTP code, the time, this run's id, the previous run's class, and
-    when the probe last passed. Exits with the probe's status."""
-    if not argv or not os.path.isabs(argv[0]) or not RUN_ID.fullmatch(run_id):
+    when the probe last passed. With `engine`, a stopped engine is recorded
+    as engine_unavailable without running anything. With `docker` (the
+    engine's client argv), a probe that outruns its timeout has its
+    containers removed by this run's label, and is recorded as timeout.
+    Exits with the probe's
+    status. Run it under `lock`, never the reverse: a busy lock is the
+    wrapper's refusal, not a probe result."""
+    if not argv or not os.path.isabs(argv[0]) or not RUN_ID.fullmatch(run_id) \
+            or (docker is not None and not (docker and os.path.isabs(docker[0]))):
         raise Refused("probe")
     at = int(now if now is not None else time.time())
-    try:
-        done = subprocess.run(argv, shell=False, close_fds=True, stdin=subprocess.DEVNULL,
-                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                              restore_signals=True, timeout=300)
-        rc = _exit_status(done.returncode)
-        cls, code = probe_class(done.stdout, rc)
-    except (OSError, subprocess.TimeoutExpired):
+    if engine is not None and not engine_answers(engine):
         cls, code, rc = "engine_unavailable", "-", REFUSED
+    else:
+        try:
+            done = subprocess.run(argv, shell=False, close_fds=True, stdin=subprocess.DEVNULL,
+                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                  restore_signals=True, timeout=PROBE_TIMEOUT_S)
+            rc = _exit_status(done.returncode)
+            cls, code = probe_class(done.stdout, rc)
+        except subprocess.TimeoutExpired:
+            if docker is not None:
+                _remove_run(docker, run_id)
+            cls, code, rc = "timeout", "-", REFUSED
+        except OSError:
+            cls, code, rc = "engine_unavailable", "-", REFUSED
     parent, name = _split(status_path)
     previous = {}
     dfd = open_dir(parent)
     try:
         try:
-            pfd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
+            pfd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dfd)
             with os.fdopen(pfd, "rb") as f:
                 previous = json.loads(f.read(65536) or b"{}")
         except (OSError, ValueError):
@@ -520,18 +591,41 @@ def probe_weekly(status_path, run_id, argv, now=None):
                "previous_class": previous.get("class"),
                "last_ok_at": at if cls == PROBE_OK else previous.get("last_ok_at")}
         tmp = f".{name}.{os.getpid()}.tmp"
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644, dir_fd=dfd)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o644,
+                     dir_fd=dfd)
         try:
-            os.write(fd, (json.dumps(doc, sort_keys=True) + "\n").encode("ascii"))
-            os.fchmod(fd, 0o644)
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-        os.rename(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)
+            try:
+                os.write(fd, (json.dumps(doc, sort_keys=True) + "\n").encode("ascii"))
+                os.fchmod(fd, 0o644)
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.rename(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)
+        except BaseException:
+            try:
+                os.unlink(tmp, dir_fd=dfd)
+            except OSError:
+                pass
+            raise
         os.fsync(dfd)
     finally:
         os.close(dfd)
     return rc
+
+
+def _probe_weekly_main(argv):
+    """probe-weekly STATUS RUN_ID [--engine unix:///SOCK] [--docker ABS] -- ARGV"""
+    cut = argv.index("--", 3)
+    opts, rest = argv[3:cut], argv[cut + 1:]
+    engine = docker = None
+    while opts:
+        if opts[0] == "--engine" and len(opts) > 1 and engine is None:
+            engine, opts = opts[1], opts[2:]
+        elif opts[0] == "--docker" and len(opts) > 1 and docker is None:
+            docker, opts = [opts[1]], opts[2:]
+        else:
+            raise Refused("usage")
+    return probe_weekly(argv[1], argv[2], rest, engine=engine, docker=docker)
 
 
 def _secret_main(argv):
@@ -549,8 +643,8 @@ def _secret_main(argv):
             stat_secret(argv[1])
         elif len(argv) >= 4 and argv[0] == "lock" and argv[2] == "--":
             return lock(argv[1], argv[3:])
-        elif len(argv) >= 5 and argv[0] == "probe-weekly" and argv[3] == "--":
-            return probe_weekly(argv[1], argv[2], argv[4:])
+        elif len(argv) >= 5 and argv[0] == "probe-weekly" and "--" in argv[3:]:
+            return _probe_weekly_main(argv)
         else:
             raise Refused("usage")
         sys.stdout.flush()
@@ -576,6 +670,8 @@ def main(argv):
     try:
         if len(argv) == 5 and argv[0] == "root":
             root(argv[1], int(argv[2]), int(argv[3]), int(argv[4], 8))
+        elif len(argv) == 6 and argv[0] == "root" and argv[5] == "--exclusive":
+            root(argv[1], int(argv[2]), int(argv[3]), int(argv[4], 8), exclusive=True)
         elif len(argv) >= 2 and argv[0] == "sync":
             sync(*argv[1:])
         elif len(argv) == 3 and argv[0] == "place":

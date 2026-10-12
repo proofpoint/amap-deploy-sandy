@@ -164,6 +164,66 @@ class WrittenFileTest(Secret):
         self.assertEqual(os.listdir(self.d), [])
 
 
+@unittest.skipUnless(sys.platform.startswith("linux"), "RLIMIT_CORE and PR_SET_DUMPABLE are read from /proc")
+class NoDumpsTest(Secret):
+
+    def test_the_writer_keeps_no_core_and_is_not_dumpable_while_it_reads(self):
+        """While the writer waits on stdin (after no_dumps, before any byte of
+        the value), its own /proc entry shows both settings."""
+        feeder = subprocess.Popen([sys.executable, "-c", "import time;time.sleep(3)"],
+                                  stdout=subprocess.PIPE)
+        writer = subprocess.Popen([sys.executable, "-I", "-S", HOST_STEPS, "secret", self.path,
+                                   str(self.uid), str(self.gid)], stdin=feeder.stdout,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        feeder.stdout.close()
+        try:
+            limits = ""
+            for _ in range(100):
+                with open(f"/proc/{writer.pid}/limits") as f:
+                    limits = f.read()
+                if "Max core file size        0                    0" in limits:
+                    break
+                time.sleep(0.05)
+            self.assertIn("Max core file size        0                    0", limits)
+            if os.getuid() != 0:
+                self.assertEqual(os.stat(f"/proc/{writer.pid}/status").st_uid, 0,
+                                 "a non-dumpable process's /proc entries belong to root")
+        finally:
+            writer.kill()
+            writer.communicate(timeout=10)
+            feeder.kill()
+            feeder.wait(timeout=10)
+
+    def test_a_failing_prctl_refuses_and_writes_nothing(self):
+        repo = os.path.dirname(HOST_STEPS)
+        prog = ("import sys, ctypes\nsys.path.insert(0, %r)\n"
+                "class L:\n    def prctl(self, *a):\n        return -1\n"
+                "ctypes.CDLL = lambda *a, **k: L()\nimport host_steps as st\n"
+                "sys.exit(st.main(['secret', %r, %r, %r]))\n" % (repo, self.path, str(self.uid), str(self.gid)))
+        done = subprocess.run([sys.executable, "-I", "-S", "-c", prog], input=VALUE + b"\n",
+                              capture_output=True, timeout=30)
+        self.assertRefused(done, "dumpable")
+        self.assertEqual(os.listdir(self.d), [])
+
+
+class ExclusiveRootTest(Secret):
+
+    def test_root_exclusive_refuses_under_the_writer_lock_and_changes_nothing(self):
+        os.chmod(self.d, 0o750)
+        fd = os.open(self.d, os.O_RDONLY | os.O_DIRECTORY)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        self.addCleanup(os.close, fd)
+        with self.assertRaises(st.StepError) as e:
+            st.root(self.d, self.uid, self.gid, 0o700, exclusive=True)
+        self.assertIn("concurrent writer", str(e.exception))
+        self.assertEqual(stat.S_IMODE(os.lstat(self.d).st_mode), 0o750)
+
+    def test_root_exclusive_works_when_the_lock_is_free(self):
+        os.chmod(self.d, 0o750)
+        self.assertEqual(st.main(["root", self.d, str(self.uid), str(self.gid), "0700", "--exclusive"]), 0)
+        self.assertEqual(stat.S_IMODE(os.lstat(self.d).st_mode), 0o700)
+
+
 class DirectoryTest(Secret):
 
     def test_a_directory_with_group_or_world_bits_is_refused(self):
@@ -233,6 +293,22 @@ class EntryTest(Secret):
 
 class WriterLockTest(Secret):
 
+    def wait_for_dir_lock(self):
+        """Until the directory's flock is held, read from /proc/locks (by
+        inode) where it exists, so no probe of ours can race the writer."""
+        ino = os.lstat(self.d).st_ino
+        for _ in range(200):
+            if os.path.exists("/proc/locks"):
+                with open("/proc/locks") as f:
+                    if any(line.split()[1] == "FLOCK" and line.split()[5].endswith(f":{ino}")
+                           for line in f if len(line.split()) > 5):
+                        return
+            else:
+                time.sleep(0.5)
+                return
+            time.sleep(0.05)
+        self.fail("the first writer never took the directory lock")
+
     def hold(self):
         fd = os.open(self.d, os.O_RDONLY | os.O_DIRECTORY)
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -255,7 +331,7 @@ class WriterLockTest(Secret):
                                   str(self.uid), str(self.gid)], stdin=feeder.stdout,
                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         feeder.stdout.close()
-        time.sleep(0.5)
+        self.wait_for_dir_lock()
         second = self.write(b"synthetic-second\n")
         out, err = first.communicate(timeout=30)
         feeder.wait(timeout=30)
@@ -438,6 +514,31 @@ class LockTest(Secret):
         wrapper.wait(timeout=10)
         self.assertTrue(self.free())
 
+    def test_via_a_sudo_that_closes_fds_the_writer_side_lock_still_refuses_a_second_writer(self):
+        """The host-side lock is gone with the wrapper on this route; a writer
+        still holding the directory lock is what keeps a second one out."""
+        stub = os.path.join(self.t, "stub-sudo")
+        with open(stub, "w") as f:
+            f.write(f"#!{sys.executable}\nimport os,sys\nos.closerange(3, 65536)\n"
+                    f"os.execv(sys.argv[1], sys.argv[1:])\n")
+        os.chmod(stub, 0o700)
+        pidfile = os.path.join(self.t, "child.pid")
+        holder = (f"import fcntl,os,time;fd=os.open({self.d!r},os.O_RDONLY|os.O_DIRECTORY);"
+                  f"fcntl.flock(fd,fcntl.LOCK_EX);open({pidfile!r},'w').write(str(os.getpid()));time.sleep(60)")
+        wrapper = subprocess.Popen([sys.executable, "-I", "-S", HOST_STEPS, "lock", self.run_dir, "--",
+                                    stub, sys.executable, "-c", holder])
+        for _ in range(200):
+            if os.path.exists(pidfile) and os.path.getsize(pidfile):
+                break
+            time.sleep(0.05)
+        with open(pidfile) as f:
+            child = int(f.read())
+        self.addCleanup(lambda: os.kill(child, signal.SIGKILL))
+        os.kill(wrapper.pid, signal.SIGKILL)
+        wrapper.wait(timeout=10)
+        self.assertTrue(self.free())
+        self.assertRefused(self.write(), "concurrent writer")
+
 
 class ProbeWeeklyTest(Secret):
 
@@ -491,6 +592,83 @@ class ProbeWeeklyTest(Secret):
         rc = st.probe_weekly(self.status, "w-9", [os.path.join(self.t, "absent")], now=5)
         self.assertEqual(rc, st.REFUSED)
         self.assertEqual(self.doc()["class"], "engine_unavailable")
+
+    def test_a_code_that_is_not_an_smtp_code_is_a_protocol_error(self):
+        for line in ("ok 2x5\n", "ok 2350\n", "ok OK\n"):
+            with self.subTest(line=line):
+                self.probe(line, rc=0)
+                self.assertEqual(self.doc()["class"], "protocol_error")
+
+    def test_more_than_a_line_of_output_is_a_protocol_error(self):
+        self.probe("ok 235" + " " * st.PROBE_OUT_MAX + "\n", rc=0)
+        self.assertEqual(self.doc()["class"], "protocol_error")
+
+    def test_a_probe_that_outruns_its_timeout_has_its_run_removed_and_is_a_timeout(self):
+        log = os.path.join(self.t, "docker.log")
+        fake = os.path.join(self.t, "fake-docker")
+        with open(fake, "w") as f:
+            f.write(f"#!{sys.executable}\nimport sys\nopen({log!r},'a').write(' '.join(sys.argv[1:])+'\\n')\n"
+                    f"print('c1') if sys.argv[1] == 'ps' else None\n")
+        os.chmod(fake, 0o700)
+        orig = st.PROBE_TIMEOUT_S
+        st.PROBE_TIMEOUT_S = 0.5
+        self.addCleanup(setattr, st, "PROBE_TIMEOUT_S", orig)
+        rc = st.probe_weekly(self.status, "w-t", [sys.executable, "-c", "import time;time.sleep(5)"],
+                             now=10, docker=[fake])
+        self.assertEqual((rc, self.doc()["class"]), (st.REFUSED, "timeout"))
+        with open(log) as f:
+            self.assertEqual(f.read().splitlines(), ["ps --all --quiet --filter label=org.amap.run=w-t",
+                                                     "rm --force c1"])
+
+    def test_the_cli_takes_engine_and_docker_in_either_order(self):
+        for opts in (["--engine", "unix:///nowhere.sock", "--docker", "/bin/true"],
+                     ["--docker", "/bin/true", "--engine", "unix:///nowhere.sock"]):
+            with self.subTest(opts=opts):
+                done = run("probe-weekly", self.status, "w-c", *opts, "--", sys.executable, "-c", "pass")
+                self.assertEqual(done.returncode, st.REFUSED, done)
+                self.assertEqual(self.doc()["class"], "engine_unavailable")
+        self.assertRefused(run("probe-weekly", self.status, "w-c", "--bogus", "x", "--", "/bin/true"), "usage")
+
+    def test_the_probe_cannot_claim_engine_unavailable_itself(self):
+        self.probe("engine_unavailable -\n", rc=0)
+        self.assertEqual(self.doc()["class"], "protocol_error")
+
+    def engine_probe(self, endpoint, line="ok 235\n", rc=0):
+        ran = os.path.join(self.t, "ran")
+        prog = f"open({ran!r},'w').close();import sys;sys.stdout.write({line!r});raise SystemExit({rc})"
+        out = st.probe_weekly(self.status, "w-e", [sys.executable, "-c", prog], now=10, engine=endpoint)
+        return out, os.path.exists(ran)
+
+    def test_a_stopped_engine_is_recorded_without_running_the_probe(self):
+        import socket
+        absent = os.path.join(self.t, "absent.sock")
+        refusing = os.path.join(self.t, "refusing.sock")
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.bind(refusing)
+        s.close()
+        notsock = os.path.join(self.t, "plain")
+        open(notsock, "w").close()
+        for path in (absent, refusing, notsock):
+            with self.subTest(path=path):
+                rc, ran = self.engine_probe(f"unix://{path}")
+                self.assertEqual((rc, ran, self.doc()["class"]), (st.REFUSED, False, "engine_unavailable"))
+
+    def test_a_live_engine_runs_the_probe_and_its_silence_is_a_protocol_error(self):
+        import socket
+        live = os.path.join(self.t, "live.sock")
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.bind(live)
+        s.listen(1)
+        self.addCleanup(s.close)
+        rc, ran = self.engine_probe(f"unix://{live}", line="", rc=1)
+        self.assertTrue(ran)
+        self.assertEqual(self.doc()["class"], "protocol_error")
+        rc, ran = self.engine_probe(f"unix://{live}")
+        self.assertEqual(self.doc()["class"], "ok")
+
+    def test_an_engine_that_is_not_a_unix_endpoint_is_refused(self):
+        with self.assertRaises(st.Refused):
+            self.engine_probe("tcp://127.0.0.1:2375")
 
     def test_a_malformed_run_id_is_refused_and_nothing_written(self):
         for bad in ("", "has space", "x" * 65, "a/b"):

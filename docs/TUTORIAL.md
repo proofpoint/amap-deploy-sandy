@@ -484,3 +484,12 @@ trusted.
 which host-setup creates. The command gets its own descriptor on the lock,
 so the lock lasts until the command exits even if the wrapper is killed. The
 wrapper never reads stdin. A command killed by signal n exits 128+n.
+
+The weekly probe job runs `lock <run_dir> -- python3 -I -S host_steps.py
+probe-weekly <status> <run_id> --engine unix://<socket> --docker <docker> --
+<probe command>`: `lock` outside, never inside, so a busy lock is the
+wrapper's refusal rather than a probe result. `probe-weekly` keeps a class
+only when the probe's exit is that class's own; a stopped engine is
+recorded as `engine_unavailable` without running anything, and a probe that
+outruns its time has its containers removed by the run's label and is
+recorded as `timeout`.
