@@ -16,7 +16,7 @@ A runtime's secret file, in a directory that only that runtime's uid can open:
   python3 -I -S host_steps.py secret-remove PATH           the file and any crash temp removed
   python3 -I -S host_steps.py stat-secret DIR              its entries' metadata, as one JSON line
   python3 -I -S host_steps.py lock RUN_DIR -- ARGV...      ARGV run under RUN_DIR/oneshot.lock
-  python3 -I -S host_steps.py probe-weekly STATUS -- ARGV...
+  python3 -I -S host_steps.py probe-weekly STATUS RUN_ID -- ARGV...
                                                   ARGV's one-line result kept in STATUS
 
 Every path is walked from `/` one component at a time, each opened with
@@ -45,6 +45,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import resource
 import signal
 import stat
@@ -467,29 +468,40 @@ def lock(run_dir, argv):
     return _exit_status(child.wait())
 
 
-#: The probe classes that are not failures in themselves (§5 of the design):
-#: an engine, a network or a TLS problem, or a 4xx.
+#: RE's probe contract: each class with the one exit code it comes with.
+#: A line and an exit that disagree are a protocol error, never a pass.
 PROBE_OK = "ok"
-PROBE_CLASSES = frozenset({"ok", "secret_unavailable", "auth_failed", "hub_unreachable",
-                           "tls_failed", "connect_failed", "protocol_error", "temporary",
-                           "engine_unavailable"})
+PROBE_EXITS = {"ok": 0, "secret_unavailable": 5, "auth_failed": 6, "hub_unreachable": 7,
+               "tls_failed": 8, "connect_failed": 9, "protocol_error": 10, "temporary": 11}
+#: The container engine's own "could not run the container" exit.
+ENGINE_EXIT = 125
+RUN_ID = re.compile(r"[A-Za-z0-9._-]{1,64}")
 
 
-def probe_weekly(status_path, argv, now=None):
-    """Run the probe command, keep its one-line result in `status_path`
-    (class, code, time, the previous class, and when it last passed), and
-    exit with its status. Only the class and the code are kept."""
-    if not argv or not os.path.isabs(argv[0]):
+def probe_class(stdout, returncode):
+    """(class, code) from the probe's one line and its exit: the line's class
+    only when its exit is exactly the contract's for that class."""
+    if returncode == ENGINE_EXIT:
+        return "engine_unavailable", "-"
+    words = stdout.decode("ascii", "replace").split()
+    if len(words) == 2 and PROBE_EXITS.get(words[0]) == returncode:
+        return words[0], words[1]
+    return "protocol_error", "-"
+
+
+def probe_weekly(status_path, run_id, argv, now=None):
+    """Run the probe command and keep its result in `status_path`: the class,
+    its SMTP code, the time, this run's id, the previous run's class, and
+    when the probe last passed. Exits with the probe's status."""
+    if not argv or not os.path.isabs(argv[0]) or not RUN_ID.fullmatch(run_id):
         raise Refused("probe")
     at = int(now if now is not None else time.time())
     try:
         done = subprocess.run(argv, shell=False, close_fds=True, stdin=subprocess.DEVNULL,
                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                               restore_signals=True, timeout=300)
-        words = done.stdout.decode("ascii", "replace").split()
-        cls = words[0] if len(words) == 2 and words[0] in PROBE_CLASSES else "protocol_error"
-        code = words[1] if len(words) == 2 else "-"
         rc = _exit_status(done.returncode)
+        cls, code = probe_class(done.stdout, rc)
     except (OSError, subprocess.TimeoutExpired):
         cls, code, rc = "engine_unavailable", "-", REFUSED
     parent, name = _split(status_path)
@@ -504,7 +516,8 @@ def probe_weekly(status_path, argv, now=None):
             previous = {}
         if not isinstance(previous, dict):
             previous = {}
-        doc = {"class": cls, "smtp_code": code, "at": at, "previous_class": previous.get("class"),
+        doc = {"class": cls, "smtp_code": code, "at": at, "run_id": run_id,
+               "previous_class": previous.get("class"),
                "last_ok_at": at if cls == PROBE_OK else previous.get("last_ok_at")}
         tmp = f".{name}.{os.getpid()}.tmp"
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644, dir_fd=dfd)
@@ -536,8 +549,8 @@ def _secret_main(argv):
             stat_secret(argv[1])
         elif len(argv) >= 4 and argv[0] == "lock" and argv[2] == "--":
             return lock(argv[1], argv[3:])
-        elif len(argv) >= 4 and argv[0] == "probe-weekly" and argv[2] == "--":
-            return probe_weekly(argv[1], argv[3:])
+        elif len(argv) >= 5 and argv[0] == "probe-weekly" and argv[3] == "--":
+            return probe_weekly(argv[1], argv[2], argv[4:])
         else:
             raise Refused("usage")
         sys.stdout.flush()
