@@ -77,6 +77,10 @@ CLONE_ROLES = ("deploy", "overlay", "producer", "runtime")
 #: a last pass older than the second is a problem whatever the last class.
 STATUS_MAX_AGE_S = 8 * 86400
 LAST_OK_MAX_AGE_S = 15 * 86400
+#: Every class host_steps' probe-weekly records: the probe's own and its two.
+PROBE_CLASSES = ("ok", "secret_unavailable", "auth_failed", "hub_unreachable", "tls_failed",
+                 "connect_failed", "protocol_error", "temporary", "engine_unavailable", "timeout")
+_SMTP_CODE = re.compile(r"\d{3}|-")
 PROBE_CLASSES_NOT_FAILURES = ("ok", "engine_unavailable", "hub_unreachable", "tls_failed",
                               "connect_failed", "temporary")
 _HEX40 = re.compile(r"[0-9a-f]{40}")
@@ -327,7 +331,7 @@ def render(s: SecretSpec, q: Callable[[str], str]) -> List[str]:
         lines.append(f"{install} -m 0600 /dev/null {q(posixpath.join(s.run_dir, name))}")
     state_tmp = posixpath.join(s.run_dir, "state.tmp")
     lines += [
-        "# The runtime's network is DS-12b's render, with the runtime itself.",
+        "# The runtime's network is rendered with the runtime itself, not here.",
         "# The volume and its root, owned by the runtime's uid, 0700, made in a one-shot container under "
         "the lock, the root locked as the writer locks it.",
         " ".join(q(a) for a in docker(s)) + f" volume create --label {q(s.label)} {q(s.volume)}",
@@ -926,10 +930,17 @@ def verify_status(s: SecretSpec, st_: Any, read: Callable[[str], Any], now: floa
         return [rh.unknown(claim, want, getattr(text, "reason", f"{path} is absent"), remedy)]
     try:
         doc = json.loads(text)
-        cls, at, run_id = doc["class"], doc["at"], doc["run_id"]
+        cls, code, at, run_id = doc["class"], doc["smtp_code"], doc["at"], doc["run_id"]
         last_ok, prev = doc["last_ok_at"], doc["previous_class"]
         if not isinstance(run_id, str) or not _RUN_ID.fullmatch(run_id):
             raise ValueError("run_id")
+        if cls not in PROBE_CLASSES or not (prev is None or prev in PROBE_CLASSES):
+            raise ValueError("class")
+        if not isinstance(code, str) or not _SMTP_CODE.fullmatch(code):
+            raise ValueError("smtp_code")
+        if isinstance(at, bool) or not isinstance(at, int) \
+                or not (last_ok is None or (isinstance(last_ok, int) and not isinstance(last_ok, bool))):
+            raise ValueError("time")
     except (ValueError, KeyError, TypeError):
         return [rh.unknown(claim, want, f"{path} is not the probe job's status (class, smtp_code, at, "
                            f"run_id, previous_class, last_ok_at)", remedy)]

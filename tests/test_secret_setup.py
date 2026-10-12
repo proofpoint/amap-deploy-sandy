@@ -518,11 +518,13 @@ class CoreAndStatusTest(Base):
         self.assertOnly(found, "failed TLS twice")
 
     def test_a_status_without_a_valid_run_id_or_a_member_is_unknown(self):
-        for over in ({"run_id": ""}, {"run_id": "has space"}, {"run_id": 7}):
+        for over in ({"run_id": ""}, {"run_id": "has space"}, {"run_id": 7}, {"smtp_code": "2x5"},
+                     {"smtp_code": 235}, {"previous_class": "fine"}, {"class": "great"}, {"at": "yesterday"},
+                     {"last_ok_at": "yesterday"}):
             with self.subTest(over=over):
                 found = self.run_checks(files_=files(**over))
                 self.assertOnly(found, "the weekly probe has run within 8 days", rh.UNKNOWN)
-        for member in ("run_id", "previous_class", "last_ok_at"):
+        for member in ("run_id", "previous_class", "last_ok_at", "smtp_code", "class", "at"):
             with self.subTest(member=member):
                 f = files()
                 doc = json.loads(f[STATUS])
@@ -674,7 +676,7 @@ class RemedyAndProbeTest(Base):
 
     def test_the_probe_runs_probe_login_with_its_budgets(self):
         s = spec(probe={"network": "ex-net", "smtp_host": "hub.example.org", "smtp_port": 587,
-                        "username": "router@ex.example.org"})
+                        "username": "probe-user@ex.example.org"})
         argv = ss.probe(s, "w-1")
         self.assertEqual(argv[-2:], ["ex/runtime@sha256:" + "a" * 64, "probe-login"])
         for env in ("SMTP_PASSWORD_FILE=/run/secrets/ex/credential", "SMTP_AUTH_METHOD=password",
