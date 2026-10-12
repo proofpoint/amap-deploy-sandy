@@ -445,30 +445,58 @@ class ProbeWeeklyTest(Secret):
         super().setUp()
         self.status = os.path.join(self.t, "hub-probe.json")
 
-    def probe(self, line, rc=0, now=1000):
+    def probe(self, line, rc=0, now=1000, run_id="w-1"):
         prog = f"import sys;sys.stdout.write({line!r});raise SystemExit({rc})"
-        return st.probe_weekly(self.status, [sys.executable, "-c", prog], now=now)
+        return st.probe_weekly(self.status, run_id, [sys.executable, "-c", prog], now=now)
 
     def doc(self):
         with open(self.status) as f:
             return json.load(f)
 
-    def test_the_class_and_code_are_kept_with_when_it_last_passed(self):
-        self.assertEqual(self.probe("ok 235\n", now=1000), 0)
-        self.assertEqual(self.doc(), {"class": "ok", "smtp_code": "235", "at": 1000,
+    def test_the_class_code_and_run_are_kept_with_when_it_last_passed(self):
+        self.assertEqual(self.probe("ok 235\n", now=1000, run_id="w-1"), 0)
+        self.assertEqual(self.doc(), {"class": "ok", "smtp_code": "235", "at": 1000, "run_id": "w-1",
                                       "previous_class": None, "last_ok_at": 1000})
-        self.assertEqual(self.probe("tls_failed -\n", rc=8, now=2000), 8)
-        self.assertEqual(self.doc(), {"class": "tls_failed", "smtp_code": "-", "at": 2000,
+        self.assertEqual(self.probe("tls_failed -\n", rc=8, now=2000, run_id="w-2"), 8)
+        self.assertEqual(self.doc(), {"class": "tls_failed", "smtp_code": "-", "at": 2000, "run_id": "w-2",
                                       "previous_class": "ok", "last_ok_at": 1000})
+
+    def test_every_class_passes_only_with_its_own_exit(self):
+        for cls, rc in st.PROBE_EXITS.items():
+            with self.subTest(cls=cls):
+                self.probe(f"{cls} -\n", rc=rc)
+                self.assertEqual(self.doc()["class"], cls)
+
+    def test_a_line_and_an_exit_that_disagree_are_a_protocol_error(self):
+        for line, rc in (("ok 235\n", 7), ("ok 235\n", 1), ("auth_failed 535\n", 0),
+                         ("hub_unreachable -\n", 6)):
+            with self.subTest(line=line, rc=rc):
+                self.probe(line, rc=rc)
+                self.assertEqual(self.doc()["class"], "protocol_error")
+
+    def test_a_mismatched_ok_does_not_advance_the_last_pass(self):
+        self.probe("ok 235\n", now=1000)
+        self.probe("ok 235\n", rc=6, now=5000)
+        self.assertEqual((self.doc()["class"], self.doc()["last_ok_at"]), ("protocol_error", 1000))
+
+    def test_the_engines_own_failure_is_engine_unavailable(self):
+        self.probe("", rc=st.ENGINE_EXIT)
+        self.assertEqual(self.doc()["class"], "engine_unavailable")
 
     def test_anything_else_on_stdout_is_a_protocol_error(self):
         self.probe("garbage line with words\n", rc=0)
         self.assertEqual(self.doc()["class"], "protocol_error")
 
     def test_a_command_that_cannot_start_is_engine_unavailable(self):
-        rc = st.probe_weekly(self.status, [os.path.join(self.t, "absent")], now=5)
+        rc = st.probe_weekly(self.status, "w-9", [os.path.join(self.t, "absent")], now=5)
         self.assertEqual(rc, st.REFUSED)
         self.assertEqual(self.doc()["class"], "engine_unavailable")
+
+    def test_a_malformed_run_id_is_refused_and_nothing_written(self):
+        for bad in ("", "has space", "x" * 65, "a/b"):
+            with self.subTest(bad=bad), self.assertRaises(st.Refused):
+                self.probe("ok 235\n", run_id=bad)
+        self.assertFalse(os.path.exists(self.status))
 
 
 class PlaceShaTest(Secret):
