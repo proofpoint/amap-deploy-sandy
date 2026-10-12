@@ -80,7 +80,7 @@ LAST_OK_MAX_AGE_S = 15 * 86400
 #: Every class host_steps' probe-weekly records: the probe's own and its two.
 PROBE_CLASSES = ("ok", "secret_unavailable", "auth_failed", "hub_unreachable", "tls_failed",
                  "connect_failed", "protocol_error", "temporary", "engine_unavailable", "timeout")
-_SMTP_CODE = re.compile(r"\d{3}|-")
+_SMTP_CODE = re.compile(r"[0-9]{3}|-")   # ASCII only: \d also matches other scripts' digits
 PROBE_CLASSES_NOT_FAILURES = ("ok", "engine_unavailable", "hub_unreachable", "tls_failed",
                               "connect_failed", "temporary")
 _HEX40 = re.compile(r"[0-9a-f]{40}")

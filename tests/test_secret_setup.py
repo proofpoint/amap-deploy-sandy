@@ -518,7 +518,7 @@ class CoreAndStatusTest(Base):
         self.assertOnly(found, "failed TLS twice")
 
     def test_a_status_without_a_valid_run_id_or_a_member_is_unknown(self):
-        for over in ({"run_id": ""}, {"run_id": "has space"}, {"run_id": 7}, {"smtp_code": "2x5"},
+        for over in ({"run_id": ""}, {"run_id": "has space"}, {"run_id": 7}, {"smtp_code": "2x5"}, {"smtp_code": "\u0662\u0663\u0665"},
                      {"smtp_code": 235}, {"previous_class": "fine"}, {"class": "great"}, {"at": "yesterday"},
                      {"last_ok_at": "yesterday"}):
             with self.subTest(over=over):
