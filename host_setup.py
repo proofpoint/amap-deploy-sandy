@@ -48,6 +48,9 @@ What it checks, through router_health's three outcomes:
 - every process of a hop runtime, read from its running container, runs
   under the runtime's declared umask.
 
+A document with a `secrets` section adds a runtime's secret file: its plan
+steps and its checks are secret_setup's.
+
 None of these can see whether the barrier ran: durability rests on the plan
 having run before any runtime started.
 
@@ -73,6 +76,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import router_health as rh
+import secret_setup as ss   # a runtime's secret file: its section, plan steps and checks
 
 SPEC_SCHEMA = "amap-deploy-sandy.host-setup/1"
 #: The deployment overlay's section that holds a host-setup document.
@@ -146,6 +150,7 @@ class Spec:
     mounts: Tuple[Dict[str, str], ...] = ()     # {principal, host, container, marker?}
     runtimes: Tuple[Dict[str, Any], ...] = ()   # {principal, container, image, umask, umasks}
     production: bool = False
+    secrets: Optional[ss.SecretSpec] = None     # a runtime's secret file, when the document has one
 
     def runtime_of(self, principal: str) -> Dict[str, Any]:
         return next(r for r in self.runtimes if r["principal"] == principal)
@@ -178,7 +183,7 @@ def load_spec(doc: Any) -> Spec:
     if not isinstance(doc, dict) or doc.get("schema") != SPEC_SCHEMA:
         raise SpecError(f"the document is not a {SPEC_SCHEMA} host setup")
     known = {"schema", "principals", "groups", "hops", "roots", "overlay", "agent_paths", "openssl",
-             "mounts", "runtimes", "production"}
+             "mounts", "runtimes", "production", ss.SECTION}
     if set(doc) - known:
         raise SpecError(f"unknown member(s): {', '.join(sorted(set(doc) - known))}")
     production = doc.get("production", False)
@@ -320,8 +325,14 @@ def load_spec(doc: Any) -> Spec:
             if not any(m["principal"] == p and _holds(m["host"], r.path) for m in mounts):
                 raise SpecError(f"root {r.path}: {p} owns or reads it, but no mount of {p}'s runtime "
                                 f"holds it; declare the mount that reaches it")
+    secrets = None
+    if ss.SECTION in doc:
+        try:
+            secrets = ss.load(doc[ss.SECTION], principals, runtimes)
+        except ss.SecretSpecError as e:
+            raise SpecError(str(e)) from None
     return Spec(principals, groups, tuple(hops), tuple(roots), ov_path, ov_pin, agent_paths, openssl,
-                tuple(mounts), tuple(runtimes), production)
+                tuple(mounts), tuple(runtimes), production, secrets)
 
 
 def parse_pin(pin: Any) -> Optional[Dict[str, str]]:
@@ -403,6 +414,8 @@ def render_plan(spec: Spec, overlay_source: Optional[Path] = None) -> List[str]:
         lines.append(f"# {r['principal']}'s runtime ({r['container']}) starts under umask {r['umask']:04o}: "
                      f"UMask={r['umask']:04o} in its service unit, or `umask {r['umask']:04o}` in its "
                      f"launcher before it execs")
+    if spec.secrets is not None:
+        lines += ss.render(spec.secrets, q)
     lines.append("# Start no runtime until every step above has run: each root exists and is synced "
                  "before a runtime opens it.")
     return lines
@@ -834,9 +847,10 @@ def checks(spec: Spec, *, production: bool, lstat: Callable = os.lstat,
            openssl: Optional[Dict[str, Any]] = None,
            containers: Optional[Callable[[str], Any]] = None,
            mounts: Optional[Callable[..., Any]] = None,
-           umasks: Optional[Callable[[str], Any]] = None) -> List[rh.Check]:
+           umasks: Optional[Callable[[str], Any]] = None,
+           secrets: Optional[Dict[str, Any]] = None) -> List[rh.Check]:
     """Every check of the host against the plan. `production` is ORed with
-    the document's own."""
+    the document's own. `secrets` passes probes to the secret's checks."""
     seen = {r["container"]: (containers or ask_container)(r["container"]) for r in spec.runtimes}
     out = verify_roots(spec, lstat)
     out += verify_overlay(spec, production=production or spec.production, lstat=lstat, digest=digest)
@@ -845,6 +859,8 @@ def checks(spec: Spec, *, production: bool, lstat: Callable = os.lstat,
     out += verify_openssl(spec, openssl if openssl is not None else
                           ask_openssl({i: rec["path"] for i, rec in spec.openssl.items()}))
     out += verify_umasks(spec, ask_umasks if umasks is None else umasks)
+    if spec.secrets is not None:
+        out += ss.checks(spec.secrets, lstat=lstat, digest=digest, **(secrets or {}))
     return out
 
 
