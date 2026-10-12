@@ -411,3 +411,51 @@ umask (the check above names it), then `rmdir` it and start the runtime.
 directory, not empty, owned by someone else, or carrying bits the runtime
 never asks for may have been planted. Leave it in place, keep the runtime
 stopped, and escalate.
+
+### A runtime's secret file
+
+A runtime that needs a credential reads it from a file in a directory only
+its own uid can open: the directory 0700, the file 0400, both owned by the
+runtime's uid, mounted read-only into that runtime alone. `host_steps.py`
+writes and removes it. Run it with `python3 -I -S`, from a root-owned copy
+whose sha256 you have checked, never from a working checkout:
+
+```sh
+<producer> | python3 -I -S host_steps.py secret <dir>/<name> <uid> <gid>
+printf '' | python3 -I -S host_steps.py secret --check <dir>/<name> <uid> <gid>
+python3 -I -S host_steps.py secret-remove <dir>/<name>
+python3 -I -S host_steps.py stat-secret <dir>
+```
+
+- **The value arrives on a pipe, and nowhere else.** `secret` refuses a
+  terminal, a regular file or a device on stdin, so it cannot be typed,
+  pasted or read from a saved copy. Never put the value in an argument or
+  an environment variable: both show in `ps` and `docker inspect`.
+- **One line, ending in a newline.** The newline marks the line complete,
+  so a producer that dies mid-write leaves nothing that passes. The value
+  is at most 4096 bytes, printable ASCII without spaces, and is stored
+  without its newline.
+- **Nothing it prints carries the value.** A refusal is one line,
+  `refused: <rule>`, exit 2. On success it prints only the path, mode and
+  owner.
+- **It replaces the file whole:** written under `.<name>.tmp` in the same
+  directory, checked by fstat, fsynced, renamed over the file, and the
+  directory fsynced. A temp left by a crash is removed by the next run.
+  Any other entry in the directory is refused, and nothing is written.
+- **One writer at a time.** `secret` and `secret-remove` lock the
+  directory; a second one refuses with `refused: concurrent writer` before
+  changing anything.
+- `secret --check` makes every check `secret` makes before it reads, reads
+  nothing, and changes nothing: run it through the same route first, with a
+  pipe carrying no value on stdin. `stat-secret` reports the directory's and
+  each entry's owner, mode and link count from `lstat` alone, without
+  opening any file.
+
+`place <src> <dest> --sha256 <hex>` installs a file root-owned 0444 only if
+its bytes have the given sha256, so the route the file arrived by need not be
+trusted.
+
+`lock <run_dir> -- <command>` runs a command under `<run_dir>/oneshot.lock`,
+which host-setup creates. The command gets its own descriptor on the lock,
+so the lock lasts until the command exits even if the wrapper is killed. The
+wrapper never reads stdin. A command killed by signal n exits 128+n.
