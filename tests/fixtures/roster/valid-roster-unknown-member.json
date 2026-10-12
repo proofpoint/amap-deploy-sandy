@@ -1,0 +1,13 @@
+{
+  "contract_version": "2",
+  "router": "amap.router@fleet.example",
+  "written_at": "2026-09-24T12:00:00Z",
+  "roster_epoch": 7,
+  "members": [
+    {
+      "address": "alpha-1a2b3c4d@fleet.example",
+      "state": "draining",
+      "since": "2026-09-24T11:00:00Z"
+    }
+  ]
+}

@@ -145,11 +145,44 @@ selected sandbox the registry has not seen (with the workspace sandy
 reports) and makes its `by-slug/` link, so a new agent needs no import:
 after its first launch, `install --apply` and a relaunch. It registers
 nothing until the registry exists: import today's slugs first with
-`migrate-registry`, so no existing agent is given a new name. That guard is
-for the registry as a whole, not per agent: an existing agent the import
-missed (one sandy had not yet selected when the batch was written) is
-registered by a later `install --apply` under a new name. Check the
-import's plan against `list` before turning `identity` on. The relay reads name.json once, when it starts: a name the
+`migrate-registry`, so no existing agent is given a new name. Per agent,
+the first `install --apply` with `identity` on records the router's roster
+as it stands at that moment (`pre-identity.json`, beside `roster/`; no
+roster, an empty record), and never rewrites it: an agent in that record
+that the registry has not bound is refused, by name, and pointed at
+`migrate-registry`, while an agent launched later registers with no import.
+A record that cannot be read registers nothing. An agent that existed but
+was not in the roster when the record was made (not launched since the
+manifest, so not admitted) is not protected: a later `install --apply`
+registers it under a new name. Check the import's plan against `list`
+before turning `identity` on. The record is written whole or not at all. If
+one cannot be read (damaged by hand, for example), **do not just delete it**:
+a new record lists only the roster at that moment, so an agent the old
+record protected that is not admitted now (a stopped sandbox) would then be
+registered under a new name. Replace it with a superset instead: every slug
+in the old record (from a backup, if the file is lost), every slug the
+roster lists now, and every sandbox that existed before `identity` was
+turned on. Write it as `{"schema": "amap-deploy-sandy.pre-identity/1",
+"slugs": [...]}`, then run `install --apply`. A slug wrongly kept there is
+refused until it is imported; a slug wrongly left out can be renamed.
+
+A forced retire is not undone by `install` unnoticed. After the registry's
+`retire --force` of a sandbox whose workspace still exists:
+- if its slug is **not** in the pre-identity record, the next
+  `install --apply` registers it again as a NEW identity, with a new
+  logical_id and a new name, and prints `registered as <address>`;
+- if its slug **is** in the record, the registry no longer has an active
+  entry for it, so `install` refuses it like an agent never imported, and
+  nothing is registered.
+
+The old name is never reused either way. To bring a recorded agent back as
+a new identity, remove its slug from the `slugs` list in
+`pre-identity.json` (a JSON edit that leaves the file valid; a damaged file
+registers nothing), then run `install --apply`. In both cases, run it only
+when the agent is meant to come back; then relaunch the agent, so its relay
+reads the new name, and give its peers the new address.
+
+The relay reads name.json once, when it starts: a name the
 registry changes later (an operator override) takes effect when the sandbox
 relaunches, and `verify`, which reads the file, does not see the
 difference.

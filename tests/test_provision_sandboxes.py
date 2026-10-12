@@ -1655,7 +1655,7 @@ class FleetDomainTest(_ConnectorFixtureMixin, unittest.TestCase):
     _fleet = SyncTest._fleet
 
     def test_the_host_label_is_one_lowercase_dns_label(self):
-        rows = (("Daniels-MacBook-Pro.local", "daniels-macbook-pro"),
+        rows = (("Example-Work-Laptop.local", "example-work-laptop"),
                 ("My_Laptop", "my-laptop"), ("host--two", "host-two"),
                 ("-edge-", "edge"), ("", None), ("___", None),
                 ("a" * 80, "a" * fp.DNS_LABEL_MAX))

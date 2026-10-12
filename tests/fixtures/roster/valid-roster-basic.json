@@ -1,0 +1,16 @@
+{
+  "contract_version": "2",
+  "router": "amap.router@fleet.example",
+  "written_at": "2026-09-24T12:00:00Z",
+  "interval_s": 5.0,
+  "members": [
+    {
+      "address": "alpha-1a2b3c4d@fleet.example",
+      "state": "admitted"
+    },
+    {
+      "address": "bravo-5e6f7a8b@fleet.example",
+      "state": "admitted"
+    }
+  ]
+}

@@ -80,7 +80,7 @@ class SharedPolicySurfaceTest(unittest.TestCase):
         self.assertEqual(fp.derived_fleet_domain("openshell", "My_Box", "agents.example.org"),
                          "openshell.my-box.agents.example.org")
         self.assertEqual(fp.derived_fleet_domain("openshell", "___"), "openshell.internal")
-        self.assertEqual(fp.host_label("Daniels-MacBook-Pro.local"), "daniels-macbook-pro")
+        self.assertEqual(fp.host_label("Example-Work-Laptop.local"), "example-work-laptop")
         self.assertIsNone(fp.host_label(""))
         for runtime, base in (("Sandy", "internal"), ("a.b", "internal"),
                               ("sandy", "Not_A.Domain"), ("", "internal")):
