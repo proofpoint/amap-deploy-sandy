@@ -95,8 +95,8 @@ def fs():
 
 
 def files(state="active", **over):
-    status = {"class": "ok", "smtp_code": "235", "at": NOW - 3600, "previous_class": "ok",
-              "last_ok_at": NOW - 3600}
+    status = {"class": "ok", "smtp_code": "235", "at": NOW - 3600, "run_id": "w-41",
+              "previous_class": "ok", "last_ok_at": NOW - 3600}
     status.update(over)
     return {"/opt/ex/etc/overlay.sha": ANCHOR + "\n", "/opt/ex/etc/state": state + "\n",
             "/proc/sys/kernel/core_pattern": "|/usr/lib/systemd/systemd-coredump %P %u\n",
@@ -493,6 +493,20 @@ class CoreAndStatusTest(Base):
         found = self.run_checks(files_=files(**{"class": "tls_failed", "smtp_code": "-",
                                                 "previous_class": "tls_failed"}))
         self.assertOnly(found, "failed TLS twice")
+
+    def test_a_status_without_a_valid_run_id_or_a_member_is_unknown(self):
+        for over in ({"run_id": ""}, {"run_id": "has space"}, {"run_id": 7}):
+            with self.subTest(over=over):
+                found = self.run_checks(files_=files(**over))
+                self.assertOnly(found, "the weekly probe has run within 8 days", rh.UNKNOWN)
+        for member in ("run_id", "previous_class", "last_ok_at"):
+            with self.subTest(member=member):
+                f = files()
+                doc = json.loads(f[STATUS])
+                del doc[member]
+                f[STATUS] = json.dumps(doc)
+                self.assertOnly(self.run_checks(files_=f), "the weekly probe has run within 8 days",
+                                rh.UNKNOWN)
 
     def test_no_status_is_asked_for_before_the_secret_exists(self):
         f = files("pending_b5")

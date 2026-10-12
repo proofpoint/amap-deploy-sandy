@@ -40,7 +40,9 @@ What it checks, through router_health's three outcomes:
   effective host-key checking strict in the producer's own option order;
 - the volume's entries, by lstat in a one-shot container, against the state;
 - the host's core-dump settings, which no container limit covers;
-- the weekly probe's status, in the `active` state.
+- the weekly probe's status, in the `active` state: the document
+  host_steps' probe-weekly writes, {class, smtp_code, at, run_id,
+  previous_class, last_ok_at}, every member required.
 """
 
 import json
@@ -83,6 +85,8 @@ _IMAGE = re.compile(r"[a-z0-9][a-z0-9._/:-]*@sha256:[0-9a-f]{64}")
 _LABEL = re.compile(r"[a-z0-9][a-z0-9._-]*=[A-Za-z0-9._-]+")
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 _ALIAS = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+#: The weekly job's run id, as host_steps' probe-weekly checks it.
+_RUN_ID = re.compile(r"[A-Za-z0-9._-]{1,64}")
 
 
 class SecretSpecError(ValueError):
@@ -689,10 +693,13 @@ def verify_status(s: SecretSpec, st_: Any, read: Callable[[str], Any], now: floa
         return [rh.unknown(claim, want, getattr(text, "reason", f"{path} is absent"), remedy)]
     try:
         doc = json.loads(text)
-        cls, at = doc["class"], doc["at"]
-        last_ok, prev = doc.get("last_ok_at"), doc.get("previous_class")
+        cls, at, run_id = doc["class"], doc["at"], doc["run_id"]
+        last_ok, prev = doc["last_ok_at"], doc["previous_class"]
+        if not isinstance(run_id, str) or not _RUN_ID.fullmatch(run_id):
+            raise ValueError("run_id")
     except (ValueError, KeyError, TypeError):
-        return [rh.unknown(claim, want, f"{path} is not the probe job's status", remedy)]
+        return [rh.unknown(claim, want, f"{path} is not the probe job's status (class, smtp_code, at, "
+                           f"run_id, previous_class, last_ok_at)", remedy)]
     out = [rh.check(claim, want, isinstance(at, int) and now - at <= STATUS_MAX_AGE_S
                     and cls in PROBE_CLASSES_NOT_FAILURES, remedy)]
     out.append(rh.check("the probe has passed within 15 days", _fact("last_ok_at", True,
