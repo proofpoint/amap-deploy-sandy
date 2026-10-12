@@ -476,6 +476,30 @@ root, the lock file and the state, and checks, without reading the secret:
 - in the `active` state, the weekly probe has run within 8 days, passed
   within 15, and not failed TLS twice in a row.
 
+**Who else could reach it.** With the section, `host-setup` and `verify`
+also check every container on every engine (each `docker context`, running
+or stopped), holding the one-shots' lock so nothing starts meanwhile. Each
+of these is a failure:
+- a mount of the secret's volume by anything but the runtime's own
+  container, read-only at its container directory; a one-shot container
+  still there (a crash, or one running while the lock is held);
+- a bind that overlaps a secret path (the volume's backing directory, an
+  engine socket's directory, ssh's directory, a core directory, any listed
+  in `exposure.secret_roots`) in either direction, or that is writable over
+  the tooling, or sits above it. Paths are compared by device and inode up
+  each ancestor chain, so an alias, a case variant or a firmlink matches; a
+  path that cannot be stat'ed is compared by name and is UNKNOWN at best;
+- a privileged container, a capability not in `caps_allow` (or one no
+  allowlist admits: those that reach another process's memory or the
+  host's files), a host or shared namespace, a device, an unconfined
+  profile, or volumes taken from the runtime's container; the runtime
+  itself adds no capability and runs with `no-new-privileges`;
+- an engine socket bound, or `DOCKER_HOST` or `SSH_AUTH_SOCK` set;
+- an engine socket no context names, or an OrbStack machine.
+
+It then prints, for you to confirm, the attestations the section records
+and the fingerprints of the listed `authorized_keys` files.
+
 `place <src> <dest> --sha256 <hex>` installs a file root-owned 0444 only if
 its bytes have the given sha256, so the route the file arrived by need not be
 trusted.

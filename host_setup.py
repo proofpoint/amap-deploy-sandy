@@ -76,6 +76,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import router_health as rh
+import secret_exposure as se   # who else could reach that secret: every container, every engine
 import secret_setup as ss   # a runtime's secret file: its section, plan steps and checks
 
 SPEC_SCHEMA = "amap-deploy-sandy.host-setup/1"
@@ -848,7 +849,8 @@ def checks(spec: Spec, *, production: bool, lstat: Callable = os.lstat,
            containers: Optional[Callable[[str], Any]] = None,
            mounts: Optional[Callable[..., Any]] = None,
            umasks: Optional[Callable[[str], Any]] = None,
-           secrets: Optional[Dict[str, Any]] = None) -> List[rh.Check]:
+           secrets: Optional[Dict[str, Any]] = None,
+           exposure: Optional[Dict[str, Any]] = None) -> List[rh.Check]:
     """Every check of the host against the plan. `production` is ORed with
     the document's own. `secrets` passes probes to the secret's checks."""
     seen = {r["container"]: (containers or ask_container)(r["container"]) for r in spec.runtimes}
@@ -861,7 +863,15 @@ def checks(spec: Spec, *, production: bool, lstat: Callable = os.lstat,
     out += verify_umasks(spec, ask_umasks if umasks is None else umasks)
     if spec.secrets is not None:
         out += ss.checks(spec.secrets, lstat=lstat, digest=digest, **(secrets or {}))
+        out += se.checks(spec, spec.secrets, **(exposure or {}))
     return out
+
+
+def print_notes(spec: Spec, out=print) -> None:
+    """What the operator confirms by reading, never a pass or fail."""
+    if spec.secrets is not None:
+        for line in se.notes(spec.secrets):
+            out(f"  NOTE    {line}")
 
 
 def report(found: List[rh.Check], out=print) -> int:
@@ -893,7 +903,9 @@ def run(spec_path: Optional[Path], *, production: bool, overlay: Optional[Path] 
                             spec.overlay_pin["sha256"] == STUB_SHA256 else None):
         out(f"  {line}")
     out("host-setup (2/2): the host against the plan.")
-    return report(checks(spec, production=production, **probes), out)
+    rc = report(checks(spec, production=production, **probes), out)
+    print_notes(spec, out)
+    return rc
 
 
 def verify_section(overlay: Optional[Path], out=print, **probes: Any) -> int:
@@ -912,4 +924,6 @@ def verify_section(overlay: Optional[Path], out=print, **probes: Any) -> int:
     except ValueError as e:
         out(f"  UNKNOWN host setup: {e}")
         return 1
-    return report(checks(spec, production=False, **probes), out)
+    rc = report(checks(spec, production=False, **probes), out)
+    print_notes(spec, out)
+    return rc
