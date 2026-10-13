@@ -91,6 +91,10 @@ def good_umasks(c):
     return [(UP, 0o027)] if c == "ex-up" else [(DOWN, 0o022)]
 
 
+def good_groups(c):
+    return [(UP, (UPGRP, (GID,)))] if c == "ex-up" else [(DOWN, (2202, (GID,)))]
+
+
 def results(checks):
     return {c.claim: c.result for c in checks}
 
@@ -327,6 +331,11 @@ class RootsTest(unittest.TestCase):
         fs["/srv/example/a/b"] = d(0o2770, UP, GID)
         self.assertFails(fs, "/srv/example/a/b is a directory")
 
+    def test_a_root_without_its_setgid_bit_fails(self):
+        fs = good_fs()
+        fs["/srv/example/a/b/inner"] = d(0o750, DOWN, GID)
+        self.assertFails(fs, "/srv/example/a/b/inner is a directory")
+
     def test_wrong_owner(self):
         fs = good_fs()
         fs["/srv/example/a/b/inner"] = d(0o2750, UP, GID)
@@ -467,7 +476,7 @@ class OverlayTest(unittest.TestCase):
         x["production"] = True
         r = results(hs.checks(hs.load_spec(x), production=False, lstat=lstat_of(good_fs()),
                               digest=lambda p: hs.STUB_SHA256, openssl={}, containers=good_containers().get,
-                              mounts=good_mount, umasks=good_umasks))
+                              mounts=good_mount, umasks=good_umasks, groups=good_groups))
         self.assertEqual(r["the overlay pins a reviewed plugin, not the stub"], rh.FAIL)
 
 
@@ -753,6 +762,11 @@ class UmaskTest(unittest.TestCase):
         a["ex-up"] = hs.parse_proc_status(probe(90, status(1, UP, "0027"), status(2, UP)))
         self.assertEqual(self.verify(a)["every process of upstream"].result, rh.UNKNOWN)
 
+    def test_a_wrong_umask_beside_a_process_without_the_field_fails(self):
+        a = self.good()
+        a["ex-up"] = hs.parse_proc_status(probe(90, status(1, UP, "0077"), status(2, UP)))
+        self.assertEqual(self.verify(a)["every process of upstream"].result, rh.FAIL)
+
     def test_no_answer_is_unknown(self):
         a = self.good()
         a["ex-down"] = rh.Unresolved("no such container")
@@ -781,6 +795,112 @@ class UmaskTest(unittest.TestCase):
         self.assertEqual(hs.parse_proc_status(text), [(UP, 0o027)])
 
 
+def gstatus(pid, uid, gid, groups, name="python3"):
+    """One /proc/<pid>/status with the group fields, as Linux prints them:
+    Gid's four tab-separated ids, and Groups as space-separated ids each
+    followed by a space (an empty list prints nothing after the tab)."""
+    return (f"Name:\t{name}\nUmask:\t0027\nState:\tS (sleeping)\nTgid:\t{pid}\nNgid:\t0\n"
+            f"Pid:\t{pid}\nPPid:\t1\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n"
+            f"Gid:\t{gid}\t{gid}\t{gid}\t{gid}\nFDSize:\t64\n"
+            f"Groups:\t{''.join(f'{g} ' for g in groups)}\nNStgid:\t{pid}\n")
+
+
+class GroupsTest(unittest.TestCase):
+
+    def verify(self, answers):
+        return {c.claim.split(" (")[0]: c for c in
+                hs.verify_groups(hs.load_spec(doc()), lambda c: answers[c])}
+
+    def good(self):
+        return {"ex-up": hs.parse_proc_groups(probe(90, gstatus(1, UP, UPGRP, [GID]),
+                                                    gstatus(8, 0, 0, [], "init"))),
+                "ex-down": hs.parse_proc_groups(probe(90, gstatus(1, DOWN, 2202, [GID])))}
+
+    def test_the_declared_groups_pass(self):
+        self.assertEqual({c.result for c in self.verify(self.good()).values()}, {rh.PASS})
+
+    def test_the_primary_group_listed_again_among_the_supplementary_passes(self):
+        a = self.good()
+        a["ex-up"] = hs.parse_proc_groups(probe(90, gstatus(1, UP, UPGRP, [UPGRP, GID])))
+        self.assertEqual(self.verify(a)["every process of upstream"].result, rh.PASS)
+
+    def test_a_runtime_without_the_hop_group_fails_its_runtime_only(self):
+        a = self.good()
+        a["ex-up"] = hs.parse_proc_groups(probe(90, gstatus(1, UP, UPGRP, [])))
+        r = self.verify(a)
+        self.assertEqual(r["every process of upstream"].result, rh.FAIL)
+        self.assertEqual(r["every process of downstream"].result, rh.PASS)
+
+    def test_another_principals_group_fails(self):
+        a = self.good()
+        a["ex-up"] = hs.parse_proc_groups(probe(90, gstatus(1, UP, UPGRP, [GID, 2202])))
+        self.assertEqual(self.verify(a)["every process of upstream"].result, rh.FAIL)
+
+    def test_the_wrong_primary_group_fails(self):
+        a = self.good()
+        a["ex-up"] = hs.parse_proc_groups(probe(90, gstatus(1, UP, GID, [UPGRP])))
+        self.assertEqual(self.verify(a)["every process of upstream"].result, rh.FAIL)
+
+    def test_one_process_without_the_group_fails(self):
+        a = self.good()
+        a["ex-up"] = hs.parse_proc_groups(probe(90, gstatus(1, UP, UPGRP, [GID]),
+                                                gstatus(5, UP, UPGRP, [], "worker")))
+        self.assertEqual(self.verify(a)["every process of upstream"].result, rh.FAIL)
+
+    def test_the_probes_own_shell_is_not_read(self):
+        a = self.good()
+        a["ex-up"] = hs.parse_proc_groups(probe(90, gstatus(1, UP, UPGRP, [GID]),
+                                                gstatus(90, UP, 0, [], "sh")))
+        self.assertEqual(self.verify(a)["every process of upstream"].result, rh.PASS)
+
+    def test_no_process_no_field_or_no_answer_is_unknown(self):
+        for answer in (hs.parse_proc_groups(probe(90, gstatus(1, 0, 0, [], "tini"))),
+                       hs.parse_proc_groups(probe(90, status(1, UP, "0027"))),
+                       rh.Unresolved("no such container")):
+            a = self.good()
+            a["ex-up"] = answer
+            self.assertEqual(self.verify(a)["every process of upstream"].result, rh.UNKNOWN, answer)
+
+    def test_a_wrong_group_beside_a_process_without_the_fields_fails(self):
+        a = self.good()
+        a["ex-up"] = hs.parse_proc_groups(probe(90, gstatus(1, UP, UPGRP, []), status(2, UP, "0027")))
+        self.assertEqual(self.verify(a)["every process of upstream"].result, rh.FAIL)
+
+    def test_the_right_groups_beside_a_process_without_the_fields_is_unknown(self):
+        a = self.good()
+        a["ex-up"] = hs.parse_proc_groups(probe(90, gstatus(1, UP, UPGRP, [GID]), status(2, UP, "0027")))
+        c = self.verify(a)["every process of upstream"]
+        self.assertEqual(c.result, rh.UNKNOWN)
+        self.assertIn("reports no groups", c.reason)
+
+    def test_the_effective_ids_are_the_ones_read(self):
+        text = (f"probe 9\nName:\tx\nPid:\t3\nUid:\t0\t{UP}\t{UP}\t{UP}\n"
+                f"Gid:\t0\t{UPGRP}\t{UPGRP}\t{UPGRP}\nGroups:\t{GID} \n")
+        self.assertEqual(hs.parse_proc_groups(text), [(UP, (UPGRP, (GID,)))])
+
+    def test_the_verb_probes_each_container_once_for_both_umask_and_groups(self):
+        procs = {"ex-up": probe(90, gstatus(1, UP, UPGRP, [GID])),
+                 "ex-down": probe(90, gstatus(1, DOWN, 2202, [GID]).replace("Umask:\t0027", "Umask:\t0022"))}
+        seen = fake_docker(self, lambda argv: rh.Proc(tuple(argv), 0, procs[argv[4]], ""))
+        found = hs.checks(hs.load_spec(doc()), production=False, lstat=lstat_of(good_fs()),
+                          digest=lambda p: hs.STUB_SHA256, openssl={}, containers=good_containers().get,
+                          mounts=good_mount)
+        self.assertEqual(sorted(a[4] for a in seen if a[7] == hs._PROC_SCRIPT), ["ex-down", "ex-up"])
+        by = {c.claim.split(" (")[0] + c.claim.split(" runs ")[1][:4]: c.result for c in found
+              if c.claim.startswith("every process of")}
+        self.assertEqual(set(by.values()), {rh.PASS}, by)
+        self.assertEqual(len(by), 4)
+
+    def test_the_running_container_is_asked_with_the_same_read_only_probe(self):
+        seen = fake_docker(self, lambda argv: rh.Proc(tuple(argv), 0,
+                                                      probe(90, gstatus(1, UP, UPGRP, [GID])), ""))
+        self.assertEqual(hs.ask_groups("ex-up"), [(UP, (UPGRP, (GID,)))])
+        self.assertEqual(seen[0][:7], ["docker", "exec", "-u", str(hs.PROBE_UID), "ex-up", "sh", "-c"])
+        self.assertEqual(seen[0][7], hs._PROC_SCRIPT)
+        fake_docker(self, lambda argv: rh.Proc(tuple(argv), 1, "", "No such container: ex-up"))
+        self.assertIsInstance(hs.ask_groups("ex-up"), rh.Unresolved)
+
+
 class VerbTest(unittest.TestCase):
     """The verb: the plan, then the checks, and an exit status that counts an
     UNKNOWN as a problem. Docker is never reached: conftest refuses it, and
@@ -797,6 +917,7 @@ class VerbTest(unittest.TestCase):
         kw.setdefault("containers", good_containers().get)
         kw.setdefault("mounts", good_mount)
         kw.setdefault("umasks", good_umasks)
+        kw.setdefault("groups", good_groups)
         return kw
 
     def run_verb(self, x, fs, **kw):
@@ -847,6 +968,12 @@ class VerbTest(unittest.TestCase):
         self.assertEqual(rc, 2)
         self.assertIn("has no 'host_setup' object", out)
 
+    def test_a_missing_group_fails_the_verb(self):
+        rc, out = self.run_verb(doc(), good_fs(), openssl=self.OPENSSL,
+                                groups=lambda c: [(UP, (UPGRP, ()))] if c == "ex-up" else good_groups(c))
+        self.assertEqual(rc, 1)
+        self.assertIn(f"FAIL    every process of upstream (uid {UP}) in ex-up runs with gid {UPGRP}", out)
+
     def test_a_wrong_umask_fails_the_verb(self):
         rc, out = self.run_verb(doc(), good_fs(), openssl=self.OPENSSL,
                                 umasks=lambda c: [(UP, 0o077)] if c == "ex-up" else [(DOWN, 0o022)])
@@ -871,6 +998,7 @@ class VerifySectionTest(unittest.TestCase):
         kw.setdefault("containers", good_containers().get)
         kw.setdefault("mounts", good_mount)
         kw.setdefault("umasks", good_umasks)
+        kw.setdefault("groups", good_groups)
         kw.setdefault("openssl", VerbTest.OPENSSL)
         rc = hs.verify_section(overlay, out=lines.append, **kw)
         return rc, "\n".join(lines)
