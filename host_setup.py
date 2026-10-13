@@ -830,12 +830,17 @@ def verify_umasks(spec: Spec, ask: Callable[[str], Any] = ask_umasks) -> List[rh
         if not mine:
             checks.append(rh.unknown(claim, want, f"{r['container']} has no process running as uid {p.uid}",
                                      f"start {r['principal']}'s runtime, then check again"))
-        elif None in mine:
-            checks.append(rh.unknown(claim, want, f"{r['container']}'s kernel reports no umask for a process",
-                                     f"read {r['principal']}'s service unit or launcher for its umask"))
         else:
-            checks.append(rh.check(claim, want, sorted(set(mine)), remedy,
-                                   do_not="never widen a hop directory's mode to suit a runtime's umask"))
+            # As for the groups: a known wrong umask is a FAIL even beside a
+            # process that reported none.
+            seen = sorted({m for m in mine if m is not None})
+            if None in mine and seen in ([], want.value):
+                checks.append(rh.unknown(claim, want,
+                                         f"{r['container']}'s kernel reports no umask for a process",
+                                         f"read {r['principal']}'s service unit or launcher for its umask"))
+            else:
+                checks.append(rh.check(claim, want, seen, remedy,
+                                       do_not="never widen a hop directory's mode to suit a runtime's umask"))
     return checks
 
 
@@ -862,14 +867,19 @@ def verify_groups(spec: Spec, ask: Callable[[str], Any] = ask_groups) -> List[rh
         if not mine:
             checks.append(rh.unknown(claim, want, f"{r['container']} has no process running as uid {p.uid}",
                                      f"start {r['principal']}'s runtime, then check again"))
-        elif None in mine:
-            checks.append(rh.unknown(claim, want, f"{r['container']}'s kernel reports no groups for a process",
-                                     f"read {r['principal']}'s container settings for its groups"))
         else:
-            seen = sorted({(egid, tuple(sorted(set(sup) | {egid}))) for egid, sup in mine})
-            checks.append(rh.check(claim, want, seen, remedy,
-                                   do_not="never give a runtime another principal's group to reach a root; "
-                                          "fix the root's group in the document"))
+            # A known wrong answer is a FAIL even beside a process that
+            # reported nothing; only an all-correct partial read is UNKNOWN.
+            seen = sorted({(egid, tuple(sorted(set(sup) | {egid}))) for egid, sup in
+                           (g for g in mine if g is not None)})
+            if None in mine and seen in ([], want.value):
+                checks.append(rh.unknown(claim, want,
+                                         f"{r['container']}'s kernel reports no groups for a process",
+                                         f"read {r['principal']}'s container settings for its groups"))
+            else:
+                checks.append(rh.check(claim, want, seen, remedy,
+                                       do_not="never give a runtime another principal's group to reach a "
+                                              "root; fix the root's group in the document"))
     return checks
 
 def ask_openssl(images: Dict[str, str]) -> Dict[str, Any]:

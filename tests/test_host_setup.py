@@ -762,6 +762,11 @@ class UmaskTest(unittest.TestCase):
         a["ex-up"] = hs.parse_proc_status(probe(90, status(1, UP, "0027"), status(2, UP)))
         self.assertEqual(self.verify(a)["every process of upstream"].result, rh.UNKNOWN)
 
+    def test_a_wrong_umask_beside_a_process_without_the_field_fails(self):
+        a = self.good()
+        a["ex-up"] = hs.parse_proc_status(probe(90, status(1, UP, "0077"), status(2, UP)))
+        self.assertEqual(self.verify(a)["every process of upstream"].result, rh.FAIL)
+
     def test_no_answer_is_unknown(self):
         a = self.good()
         a["ex-down"] = rh.Unresolved("no such container")
@@ -855,6 +860,18 @@ class GroupsTest(unittest.TestCase):
             a = self.good()
             a["ex-up"] = answer
             self.assertEqual(self.verify(a)["every process of upstream"].result, rh.UNKNOWN, answer)
+
+    def test_a_wrong_group_beside_a_process_without_the_fields_fails(self):
+        a = self.good()
+        a["ex-up"] = hs.parse_proc_groups(probe(90, gstatus(1, UP, UPGRP, []), status(2, UP, "0027")))
+        self.assertEqual(self.verify(a)["every process of upstream"].result, rh.FAIL)
+
+    def test_the_right_groups_beside_a_process_without_the_fields_is_unknown(self):
+        a = self.good()
+        a["ex-up"] = hs.parse_proc_groups(probe(90, gstatus(1, UP, UPGRP, [GID]), status(2, UP, "0027")))
+        c = self.verify(a)["every process of upstream"]
+        self.assertEqual(c.result, rh.UNKNOWN)
+        self.assertIn("reports no groups", c.reason)
 
     def test_the_effective_ids_are_the_ones_read(self):
         text = (f"probe 9\nName:\tx\nPid:\t3\nUid:\t0\t{UP}\t{UP}\t{UP}\n"
