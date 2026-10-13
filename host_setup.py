@@ -46,7 +46,10 @@ What it checks, through router_health's three outcomes:
 - each image's openssl, as the image reports it, is the recorded version and
   at least the recorded floor; no floor below 3.0 loads;
 - every process of a hop runtime, read from its running container, runs
-  under the runtime's declared umask.
+  under the runtime's declared umask, with the principal's primary group as
+  its effective gid and exactly the principal's groups. The reach checks
+  above assume those groups; a runtime started without one (a missing
+  `--group-add`) cannot reach the roots they say it can.
 
 A document with a `secrets` section adds a runtime's secret file: its plan
 steps and its checks are secret_setup's.
@@ -55,13 +58,21 @@ None of these can see whether the barrier ran: durability rests on the plan
 having run before any runtime started.
 
 The umask is not taste. A runtime asks for 0750 item and 0700 .stage
-directories; a umask that strips a requested bit would need an fchmod after
-the mkdir, and a crash between the two leaves a narrowed directory that every
-later call refuses. Under 0027 or 0022 no requested bit is stripped, so that
-window does not exist. A runtime may run under 0027 only, unless its
-record lists 0022 in `umasks`: one whose other paths create directories
-under the umask alone would otherwise make them readable by every uid.
-The runbook says what to do with a refused leftover.
+directories, and for 0770 inbound item directories, which land 2770 under
+their setgid parent so that the other side of the hop can empty them. A
+umask that strips a requested bit is repaired by an fchmod after the mkdir,
+and a crash between the two leaves a narrowed directory that every later call
+refuses. Under 0027 or 0022 no bit of 0750 or 0700 is stripped, so for those
+directories that window does not exist; both strip group write from 0770, so
+for an inbound item directory it does. A runtime may run under 0027 only,
+unless its record lists 0022 in `umasks`: one whose other paths create
+directories under the umask alone would otherwise make them readable by
+every uid. The runbook says what to do with a refused leftover.
+
+Nothing under a hop root's per-link directory is a root. That directory and
+everything beneath it are created by the runtimes, each level checked by its
+creator and never repaired, so the plan never creates, re-owns or checks
+them. A document must name none of them as a root.
 """
 
 import contextlib
@@ -101,7 +112,9 @@ _COMMIT_RE = re.compile(r"[0-9a-f]{40}")
 _OPENSSL_RE = re.compile(r"OpenSSL (\d+)\.(\d+)\.(\d+)")
 _CONTAINER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 _R, _W, _X = 4, 2, 1
-#: The umasks a hop runtime may run under: neither strips a bit of 0750 or 0700.
+#: The umasks a hop runtime may run under: neither strips a bit of 0750 or
+#: 0700. Both strip group write from 0770, which the runtime restores with an
+#: fchmod after the mkdir.
 UMASKS = {"0027": 0o027, "0022": 0o022}
 #: What a runtime record that names no `umasks` may run under. 0022 is
 #: allowed only where a record lists it: a runtime that creates directories
@@ -115,6 +128,8 @@ PROBE_UID = 0
 _UMASK_FIELD = re.compile(r"^Umask:\s*([0-7]{4})\s*$", re.M)
 _UID_FIELD = re.compile(r"^Uid:\s*(\d+)\s+(\d+)", re.M)
 _PID_FIELD = re.compile(r"^Pid:\s*(\d+)\s*$", re.M)
+_GID_FIELD = re.compile(r"^Gid:\s*(\d+)\s+(\d+)", re.M)
+_GROUPS_FIELD = re.compile(r"^Groups:[ \t]*([0-9 \t]*)$", re.M)
 _PROBE_LINE = re.compile(r"\Aprobe (\d+)\n")
 
 
@@ -741,20 +756,51 @@ def parse_proc_status(text: str) -> List[Tuple[int, Optional[int]]]:
     """`[(effective uid, umask or None)]`, one per process, from the probe's
     output: its own pid on the first line, then concatenated
     /proc/<pid>/status files. The probe's own process is dropped."""
-    text = text or ""
-    probe = _PROBE_LINE.match(text)
-    me = int(probe.group(1)) if probe else None
     procs = []
-    for block in re.split(r"(?m)^(?=Name:)", text[probe.end():] if probe else text):
+    for block in _proc_blocks(text):
         uid = _UID_FIELD.search(block)
         if uid is None:
-            continue
-        pid = _PID_FIELD.search(block)
-        if pid is not None and me is not None and int(pid.group(1)) == me:
             continue
         mask = _UMASK_FIELD.search(block)
         procs.append((int(uid.group(2)), int(mask.group(1), 8) if mask else None))
     return procs
+
+
+def _proc_blocks(text: str) -> List[str]:
+    """The status blocks of the probe's output, the probe's own dropped."""
+    text = text or ""
+    probe = _PROBE_LINE.match(text)
+    me = int(probe.group(1)) if probe else None
+    blocks = []
+    for block in re.split(r"(?m)^(?=Name:)", text[probe.end():] if probe else text):
+        pid = _PID_FIELD.search(block)
+        if pid is not None and me is not None and int(pid.group(1)) == me:
+            continue
+        blocks.append(block)
+    return blocks
+
+
+def parse_proc_groups(text: str) -> List[Tuple[int, Optional[Tuple[int, Tuple[int, ...]]]]]:
+    """`[(effective uid, (effective gid, supplementary gids) or None)]`, one
+    per process, from the same probe output as `parse_proc_status`. None is
+    a block with no Gid or no Groups field."""
+    procs = []
+    for block in _proc_blocks(text):
+        uid = _UID_FIELD.search(block)
+        if uid is None:
+            continue
+        gid, groups = _GID_FIELD.search(block), _GROUPS_FIELD.search(block)
+        procs.append((int(uid.group(2)),
+                      (int(gid.group(2)), tuple(sorted(int(g) for g in groups.group(1).split())))
+                      if gid and groups else None))
+    return procs
+
+
+def ask_groups(container: str) -> Any:
+    """Every process in the RUNNING container `container` but the probe's
+    own, as `parse_proc_groups` reads it, or an Unresolved."""
+    out = _exec(container, _PROC_SCRIPT)
+    return out if isinstance(out, rh.Unresolved) else parse_proc_groups(out)
 
 
 def ask_umasks(container: str) -> Any:
@@ -792,6 +838,39 @@ def verify_umasks(spec: Spec, ask: Callable[[str], Any] = ask_umasks) -> List[rh
                                    do_not="never widen a hop directory's mode to suit a runtime's umask"))
     return checks
 
+
+def verify_groups(spec: Spec, ask: Callable[[str], Any] = ask_groups) -> List[rh.Check]:
+    """Each hop runtime's processes, as its running container reports them,
+    run with the principal's primary group as their effective gid and with
+    exactly the principal's groups (the effective gid and the supplementary
+    list together). A runtime with no process to read, or a kernel that
+    reports no groups, is UNKNOWN."""
+    checks: List[rh.Check] = []
+    for r in spec.runtimes:
+        p = spec.principals[r["principal"]]
+        claim = (f"every process of {r['principal']} (uid {p.uid}) in {r['container']} runs with "
+                 f"gid {p.gids[0]} and the groups {' '.join(str(g) for g in sorted(set(p.gids)))}")
+        want = _fact("groups", [(p.gids[0], tuple(sorted(set(p.gids))))],
+                     f"the host setup's groups for {r['principal']}, its primary first")
+        remedy = (f"start {r['principal']}'s runtime as {p.uid}:{p.gids[0]} with each other group of its "
+                  f"own added (docker run --group-add) and no other, and restart it")
+        procs = ask(r["container"])
+        if isinstance(procs, rh.Unresolved):
+            checks.append(rh.unknown(claim, want, procs.reason, remedy))
+            continue
+        mine = [g for uid, g in procs if uid == p.uid]
+        if not mine:
+            checks.append(rh.unknown(claim, want, f"{r['container']} has no process running as uid {p.uid}",
+                                     f"start {r['principal']}'s runtime, then check again"))
+        elif None in mine:
+            checks.append(rh.unknown(claim, want, f"{r['container']}'s kernel reports no groups for a process",
+                                     f"read {r['principal']}'s container settings for its groups"))
+        else:
+            seen = sorted({(egid, tuple(sorted(set(sup) | {egid}))) for egid, sup in mine})
+            checks.append(rh.check(claim, want, seen, remedy,
+                                   do_not="never give a runtime another principal's group to reach a root; "
+                                          "fix the root's group in the document"))
+    return checks
 
 def ask_openssl(images: Dict[str, str]) -> Dict[str, Any]:
     """Each image's own `openssl version` (`images` maps an image to the
@@ -850,6 +929,7 @@ def checks(spec: Spec, *, production: bool, lstat: Callable = os.lstat,
            containers: Optional[Callable[[str], Any]] = None,
            mounts: Optional[Callable[..., Any]] = None,
            umasks: Optional[Callable[[str], Any]] = None,
+           groups: Optional[Callable[[str], Any]] = None,
            secrets: Optional[Dict[str, Any]] = None,
            exposure: Optional[Dict[str, Any]] = None, overlay: Optional[Path] = None,
            secret_lock: Optional[Callable[[Any], Any]] = None) -> List[rh.Check]:
@@ -865,6 +945,7 @@ def checks(spec: Spec, *, production: bool, lstat: Callable = os.lstat,
     out += verify_openssl(spec, openssl if openssl is not None else
                           ask_openssl({i: rec["path"] for i, rec in spec.openssl.items()}))
     out += verify_umasks(spec, ask_umasks if umasks is None else umasks)
+    out += verify_groups(spec, ask_groups if groups is None else groups)
     if spec.secrets is not None:
         with (secret_lock or ss.Lock)(spec.secrets) as busy:
             if isinstance(busy, rh.Unresolved):
