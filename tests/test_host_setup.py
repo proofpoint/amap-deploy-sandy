@@ -878,6 +878,19 @@ class GroupsTest(unittest.TestCase):
                 f"Gid:\t0\t{UPGRP}\t{UPGRP}\t{UPGRP}\nGroups:\t{GID} \n")
         self.assertEqual(hs.parse_proc_groups(text), [(UP, (UPGRP, (GID,)))])
 
+    def test_the_verb_probes_each_container_once_for_both_umask_and_groups(self):
+        procs = {"ex-up": probe(90, gstatus(1, UP, UPGRP, [GID])),
+                 "ex-down": probe(90, gstatus(1, DOWN, 2202, [GID]).replace("Umask:\t0027", "Umask:\t0022"))}
+        seen = fake_docker(self, lambda argv: rh.Proc(tuple(argv), 0, procs[argv[4]], ""))
+        found = hs.checks(hs.load_spec(doc()), production=False, lstat=lstat_of(good_fs()),
+                          digest=lambda p: hs.STUB_SHA256, openssl={}, containers=good_containers().get,
+                          mounts=good_mount)
+        self.assertEqual(sorted(a[4] for a in seen if a[7] == hs._PROC_SCRIPT), ["ex-down", "ex-up"])
+        by = {c.claim.split(" (")[0] + c.claim.split(" runs ")[1][:4]: c.result for c in found
+              if c.claim.startswith("every process of")}
+        self.assertEqual(set(by.values()), {rh.PASS}, by)
+        self.assertEqual(len(by), 4)
+
     def test_the_running_container_is_asked_with_the_same_read_only_probe(self):
         seen = fake_docker(self, lambda argv: rh.Proc(tuple(argv), 0,
                                                       probe(90, gstatus(1, UP, UPGRP, [GID])), ""))

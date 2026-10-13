@@ -72,7 +72,8 @@ every uid. The runbook says what to do with a refused leftover.
 Nothing under a hop root's per-link directory is a root. That directory and
 everything beneath it are created by the runtimes, each level checked by its
 creator and never repaired, so the plan never creates, re-owns or checks
-them. A document must name none of them as a root.
+them, and a document names none of them as a root. Nothing here can tell
+which directory is a per-link one, so that rule is the operator's.
 """
 
 import contextlib
@@ -882,6 +883,7 @@ def verify_groups(spec: Spec, ask: Callable[[str], Any] = ask_groups) -> List[rh
                                               "root; fix the root's group in the document"))
     return checks
 
+
 def ask_openssl(images: Dict[str, str]) -> Dict[str, Any]:
     """Each image's own `openssl version` (`images` maps an image to the
     openssl it runs), in a throwaway container with no network that never
@@ -948,14 +950,25 @@ def checks(spec: Spec, *, production: bool, lstat: Callable = os.lstat,
     `overlay` is the file the document was read from (None for --spec). The
     secret's checks run under the one-shots' lock, taken once."""
     seen = {r["container"]: (containers or ask_container)(r["container"]) for r in spec.runtimes}
+    # One /proc probe per container, read for both the umask and the groups,
+    # so the two checks see the same processes.
+    probed: Dict[str, Any] = {}
+
+    def read_with(parse: Callable[[str], Any]) -> Callable[[str], Any]:
+        def ask(container: str) -> Any:
+            if container not in probed:
+                probed[container] = _exec(container, _PROC_SCRIPT)
+            out = probed[container]
+            return out if isinstance(out, rh.Unresolved) else parse(out)
+        return ask
     out = verify_roots(spec, lstat)
     out += verify_overlay(spec, production=production or spec.production, lstat=lstat, digest=digest)
     out += verify_containers(spec, seen)
     out += verify_mounts(spec, seen, lstat, ask_mount if mounts is None else mounts)
     out += verify_openssl(spec, openssl if openssl is not None else
                           ask_openssl({i: rec["path"] for i, rec in spec.openssl.items()}))
-    out += verify_umasks(spec, ask_umasks if umasks is None else umasks)
-    out += verify_groups(spec, ask_groups if groups is None else groups)
+    out += verify_umasks(spec, read_with(parse_proc_status) if umasks is None else umasks)
+    out += verify_groups(spec, read_with(parse_proc_groups) if groups is None else groups)
     if spec.secrets is not None:
         with (secret_lock or ss.Lock)(spec.secrets) as busy:
             if isinstance(busy, rh.Unresolved):

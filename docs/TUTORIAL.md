@@ -370,6 +370,12 @@ is the only umask a runtime record accepts unless it lists 0022 in
 the umask alone: under 0022 those directories are readable by every uid on
 the host.
 
+Start each hop runtime with exactly its principal's groups: its uid and
+primary group as the container's user (`--user <uid>:<gid>`), and
+`--group-add` for each of its other groups and no more. `verify` reads
+every process's groups and fails a runtime that is missing one or holds
+another principal's, because the reach checks assume them.
+
 With the stub plugin pinned, the router refuses to start (`exec_failed`):
 that is the expected outcome while the plumbing is checked, and it ends
 when the reviewed plugin's digest is pinned.
@@ -396,9 +402,10 @@ there.
    - it is **empty**: `ls -A <path>` prints nothing;
    - it is **owned by the writer's uid**, the runtime that refused it;
    - its permission bits are **a subset of the requested ones**: 0770
-     (`rwxrwx---`) for an inbound item directory (a notice's attachments, a
-     candidate), 0750 (`rwxr-x---`) for any other item directory, 0700
-     (`rwx------`) for a `.stage` directory;
+     (`rwxrwx---`) for an inbound item directory (a notice's attachments or
+     a candidate, under a generation's `inbound/`), 0750 (`rwxr-x---`) for
+     any other item directory (a request's attachments, a host intake's
+     item), 0700 (`rwx------`) for a `.stage` directory;
    - it has **no setuid and no sticky bit**: no `s` in the owner's execute
      place, and no `t` or `T` at the end;
    - its **setgid bit** (`s` or `S` in the group's execute place) is the
@@ -418,8 +425,8 @@ check above and differs from the request in one way only:
 - **Any directory without the setgid bit its parent has.** A umask that
   strips a requested bit leaves this when the parent's group is not one of
   the writer's groups. It is a deployment error, not a plant: fix the
-  runtime's umask and its groups (the checks above name the umask), then
-  `rmdir` it and start the runtime.
+  runtime's umask and its groups (the umask and group checks above name
+  each), then `rmdir` it and start the runtime.
 
 **Any other mismatch: do not remove it.** A directory that is not a real
 directory, not empty, owned by someone else, or carrying bits the runtime
