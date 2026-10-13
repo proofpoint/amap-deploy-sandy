@@ -451,6 +451,35 @@ python3 -I -S host_steps.py stat-secret <dir>
   each entry's owner, mode and link count from `lstat` alone, without
   opening any file.
 
+**The host-setup document's `secrets` section** describes such a file on a
+host whose runtime keeps it in a container-engine volume: the volume and the
+principal that owns it, the runtime image by digest, the pinned writer, a
+root-owned anchor holding the reviewed overlay's sha, a root-owned state
+file (`pending_b5`, `active` or `retired`), the fresh clones the tooling
+runs from, and the absolute path of every tool. `host-setup` then prints the
+steps that create the anchor, install the writer, create the volume and its
+root, the lock file and the state, and checks, without reading the secret:
+- the document itself was read from the anchored overlay clone, as a file
+  that clone tracks, never from a copy or a working checkout;
+- the writer, the anchor and the state file are root-owned 0444 with one
+  link under root-owned directories, and the writer hashes to its pin;
+- each clone is the operator's 0700, at its recorded commit, with no hook
+  that can run and no changed or ignored file, asked with system and user
+  git configuration ignored;
+- each tool is a regular executable whose real path, and every directory
+  above it, is owned by root or the operator and not group- or
+  world-writable;
+- the hub ssh key is pinned in a 0400 known_hosts, and ssh's effective
+  host-key checking is strict in the producer's own option order;
+- the volume holds exactly what the state says, read by `stat-secret` in a
+  one-shot container under the lock;
+- the host keeps no core file (Linux: every core to systemd-coredump with
+  `Storage=none`, and apport absent or disabled; macOS: `kern.coredump=0`);
+- the lock files: `oneshot.lock` and each name in `pipeline_locks`, each the
+  operator's, 0600, created by the plan, never later;
+- in the `active` state, the weekly probe has run within 8 days, passed
+  within 15, and not failed TLS twice in a row.
+
 `place <src> <dest> --sha256 <hex>` installs a file root-owned 0444 only if
 its bytes have the given sha256, so the route the file arrived by need not be
 trusted.
