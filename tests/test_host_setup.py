@@ -885,6 +885,9 @@ class GroupsTest(unittest.TestCase):
         found = hs.checks(hs.load_spec(doc()), production=False, lstat=lstat_of(good_fs()),
                           digest=lambda p: hs.STUB_SHA256, openssl={}, containers=good_containers().get,
                           mounts=good_mount)
+        for argv in seen:   # every other probe is injected, so each call is the /proc exec
+            self.assertEqual(argv[:4], ["docker", "exec", "-u", str(hs.PROBE_UID)], argv)
+            self.assertGreater(len(argv), 7, argv)
         self.assertEqual(sorted(a[4] for a in seen if a[7] == hs._PROC_SCRIPT), ["ex-down", "ex-up"])
         by = {c.claim.split(" (")[0] + c.claim.split(" runs ")[1][:4]: c.result for c in found
               if c.claim.startswith("every process of")}
