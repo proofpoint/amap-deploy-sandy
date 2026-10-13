@@ -91,6 +91,10 @@ _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 _ALIAS = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 #: The weekly job's run id, as host_steps' probe-weekly checks it.
 _RUN_ID = re.compile(r"[A-Za-z0-9._-]{1,64}")
+#: Capabilities no allowlist can admit: each reaches another process's memory
+#: or the host's files, and so the volume's backing store.
+HARD_DENY = frozenset({"ALL", "SYS_ADMIN", "SYS_PTRACE", "DAC_READ_SEARCH", "SYS_MODULE",
+                       "SYS_RAWIO", "BPF", "PERFMON", "SYS_BOOT", "MAC_ADMIN", "MAC_OVERRIDE"})
 _LOCK_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\.lock")
 #: The probe's own phase budgets, set so the whole probe fits well inside the
 #: weekly job's timeout (connect, then each command, each at most this long).
@@ -160,7 +164,7 @@ def load(sec: Any, principals: Dict[str, Any], runtimes: Sequence[Dict[str, Any]
     a tag where a digest belongs, a clone without its sha, a tool missing."""
     keys = ("volume", "label", "principal", "file", "container_dir", "image", "writer", "anchor",
             "state_file", "clones", "tools", "uv", "status_dir", "run_dir", "ssh", "operator_uid")
-    sec = _exact(sec, keys, "(the section)", ("docker_via_sudo", "caps_allow", "attestations",
+    sec = _exact(sec, keys, "(the section)", ("docker_via_sudo", "caps_allow", "attestations", "exposure",
                                                 "pipeline_locks", "probe", "zsh"))
     if not isinstance(sec["volume"], str) or not _NAME.fullmatch(sec["volume"]):
         raise SecretSpecError("secrets.volume must be a volume name")
@@ -207,6 +211,23 @@ def load(sec: Any, principals: Dict[str, Any], runtimes: Sequence[Dict[str, Any]
         raise SecretSpecError("secrets.docker_via_sudo must be true or false")
     if via_sudo and "sudo" not in tools:
         raise SecretSpecError("secrets.docker_via_sudo needs tools.sudo")
+    caps = sec.get("caps_allow", {})
+    if not isinstance(caps, dict) or any(not isinstance(k, str) or not re.fullmatch(r"[A-Z_]+", k)
+                                         or not isinstance(v, str) or not v.strip() for k, v in caps.items()):
+        raise SecretSpecError("secrets.caps_allow maps each allowed capability to the reason it is allowed")
+    if set(caps) & HARD_DENY:
+        raise SecretSpecError(f"secrets.caps_allow lists {', '.join(sorted(set(caps) & HARD_DENY))}, which no "
+                              f"allowlist may admit")
+    att = sec.get("attestations", {})
+    if not isinstance(att, dict) or set(att) - {"native_agents", "other_runtimes"} \
+            or any(not isinstance(v, list) for v in att.values()):
+        raise SecretSpecError("secrets.attestations may hold native_agents and other_runtimes, each a list")
+    exp = sec.get("exposure", {})
+    exp_keys = ("secret_roots", "integrity_roots", "engine_sockets", "authorized_keys", "backup_excluded")
+    if not isinstance(exp, dict) or set(exp) - set(exp_keys) \
+            or any(not isinstance(v, list) for v in exp.values()):
+        raise SecretSpecError(f"secrets.exposure may hold {', '.join(exp_keys)}, each a list of paths")
+    exposure = {k: tuple(_abs(p, f"exposure.{k}[]") for p in exp.get(k, [])) for k in exp_keys}
     locks = sec.get("pipeline_locks", [])
     if not isinstance(locks, list) or any(not isinstance(n, str) or not _LOCK_NAME.fullmatch(n)
                                           or n == LOCK_FILE for n in locks):
@@ -240,7 +261,7 @@ def load(sec: Any, principals: Dict[str, Any], runtimes: Sequence[Dict[str, Any]
              "known_hosts": _abs(ssh["known_hosts"], "ssh.known_hosts"), "alias": ssh["alias"]},
         operator_uid=op, docker_via_sudo=via_sudo, principal=sec["principal"],
         pipeline_locks=tuple(locks), probe=probe, zsh=zsh,
-        extra={k: sec[k] for k in ("caps_allow", "attestations") if k in sec})
+        extra={"caps_allow": dict(caps), "attestations": dict(att), "exposure": exposure})
 
 
 # --- The plan -------------------------------------------------------------------
