@@ -369,9 +369,12 @@ def validate_with_hop_router(doc: Dict[str, Any], checkout: str) -> Optional[str
 
 def state_problems(state_dir: str, keys: Optional[Dict[str, Any]]) -> List[str]:
     """What `state_dir`'s durable hop records say against the rendering.
-    Every generation's `transport/hop.json` pins `hop_root` (and
-    `version_write`) for the life of state_dir; each identity's CURRENT
-    generation pins its link in `ingress/link.json`. With `keys` None (no
+    Every generation's `transport/hop.json` pins `hop_root` for the life of
+    state_dir, so all of them are compared. `version_write` is compared only
+    against each identity's CURRENT generation and the runtime namespace's
+    recorded one: a retired generation keeps the contract it was admitted
+    under, and a new contract begins in new generations. Each identity's
+    current generation pins its link in `ingress/link.json`. With `keys` None (no
     hop_link), any hop record is a problem: removing a link is an explicit
     decommission, never a silent render."""
     bad = []
@@ -392,9 +395,29 @@ def state_problems(state_dir: str, keys: Optional[Dict[str, Any]]) -> List[str]:
         if pin.get("hop_root") != hop["root"]:
             bad.append(f"{p} pins hop.root {pin.get('hop_root')!r}; the rendering says {hop['root']!r}. hop.root "
                        "is fixed for the life of state_dir: keep it, or start a new state_dir")
-        if pin.get("version_write") != hop["version_write"]:
-            bad.append(f"{p} pins version_write {pin.get('version_write')!r}; the constant says "
-                       f"{hop['version_write']}. A changed hop contract needs new generations")
+    current_pins = []
+    try:
+        rgen = json.loads((Path(state_dir) / "_runtime" / "generation.json").read_text(encoding="utf-8"))
+        if isinstance(rgen, dict) and isinstance(rgen.get("generation"), str):
+            current_pins.append(Path(state_dir) / "_runtime" / rgen["generation"] / "transport" / "hop.json")
+    except (OSError, ValueError):
+        pass
+    for gens in sorted(Path(state_dir).glob("*/generations.json")):
+        try:
+            cur = json.loads(gens.read_text(encoding="utf-8")).get("current")
+        except (OSError, ValueError, AttributeError):
+            continue                        # reported below
+        current_pins.append(gens.parent / f"gen-{cur}" / "transport" / "hop.json")
+    for p in current_pins:
+        try:
+            pin = json.loads(p.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError):
+            continue                        # already reported above
+        if isinstance(pin, dict) and pin.get("version_write") != hop["version_write"]:
+            bad.append(f"{p}, a CURRENT generation, pins version_write {pin.get('version_write')!r}; the "
+                       f"constant says {hop['version_write']}. A changed hop contract needs new generations")
     for gens in sorted(Path(state_dir).glob("*/generations.json")):
         try:
             current = json.loads(gens.read_text(encoding="utf-8")).get("current")
@@ -524,6 +547,18 @@ def live_problems(spec: Any, keys: Dict[str, Any], roots: Any, *, run: Callable 
     if host.get("UsernsMode") not in ("", None, "host"):
         bad.append(f"[1] runs in a remapped user namespace ({host.get('UsernsMode')!r}); the hop trees' "
                    "owners would not be what they seem")
+    # A daemon-wide remap (daemon.json userns-remap) leaves UsernsMode empty.
+    try:
+        info = run(["docker", "info", "--format", "{{json .SecurityOptions}}"])
+        options = json.loads(info.out) if info.rc == 0 else None
+    except (rh.CannotRun, ValueError):
+        options = None
+    if not isinstance(options, list):
+        bad.append("the engine's security options cannot be read, so a daemon-wide user-namespace remap "
+                   "cannot be ruled out")
+    elif any("name=userns" in str(o) for o in options):
+        bad.append("the engine remaps user namespaces daemon-wide (userns-remap); the hop trees' owners "
+                   "would not be what they seem")
     try:
         q = run(["docker", "image", "inspect", "--format", "{{json .RepoDigests}}", str(c.get("Image"))])
         digests = json.loads(q.out) if q.rc == 0 else None

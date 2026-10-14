@@ -145,8 +145,8 @@ class HopLoaderTest(unittest.TestCase):
         self.assertIsNone(hp.validate_with_hop_router(router_doc(keys), str(HOP_ROUTER_ROOT)))
         self.assertIsNone(hp.validate_with_hop_router(router_doc(keys), str(HOP_ROUTER_ROOT)))
         broken = {
-            "config.hop": lambda d: d["hop"].update(root="/srv/x/state/hop"),
-            "config.fleet_hosts": lambda d: d["fleet_hosts"].append(FLEET_DOMAIN),
+            "config.hop.root": lambda d: d["hop"].update(root="/srv/x/state/hop"),
+            "own domain": lambda d: d["fleet_hosts"].append(FLEET_DOMAIN),
             "config.trusted_fleet_hosts": lambda d: d["trusted_fleet_hosts"].append("delta.internal"),
             "config.hop.link": lambda d: d["hop"].update(link="Bad_Link"),
             "config.hop.caps.document": lambda d: d["hop"]["caps"].update(document=hp.caps()["document"] - 1),
@@ -158,6 +158,10 @@ class HopLoaderTest(unittest.TestCase):
                 refused = hp.validate_with_hop_router(d, str(HOP_ROUTER_ROOT))
                 self.assertIsNotNone(refused, rule)
                 self.assertIn(rule, refused)
+                if rule == "config.hop.root":
+                    self.assertIn("config.state_dir", refused)
+                if rule == "own domain":
+                    self.assertIn("config.fleet_hosts", refused)
 
 
 class RootsTest(HopLoaderTest):
@@ -263,9 +267,25 @@ class StateTest(unittest.TestCase):
         p.write_text(json.dumps({"hop_root": "/srv/elsewhere", "version_write": 1}))
         self.assertTrue(hp.state_problems(str(self.state), self.keys))
 
-    def test_a_changed_version_write_refuses(self):
-        self.pin(version=2)
+    def test_a_changed_version_write_refuses_in_a_current_generation_only(self):
+        """A retired generation keeps the contract it was admitted under: a
+        future contract bump begins in new generations and is never refused
+        forever because of an old one."""
+        self.pin(gen="1", version=2)
+        (self.state / "a" / "generations.json").write_text(json.dumps({"current": "1", "gens": []}))
         self.assertTrue(any("version_write" in p for p in hp.state_problems(str(self.state), self.keys)))
+        self.pin(gen="2")
+        (self.state / "a" / "generations.json").write_text(json.dumps({"current": "2", "gens": []}))
+        self.assertEqual(hp.state_problems(str(self.state), self.keys), [])
+
+    def test_the_runtime_namespaces_current_version_is_compared(self):
+        gen = "f" * 32
+        (self.state / "_runtime").mkdir(parents=True)
+        (self.state / "_runtime" / "generation.json").write_text(json.dumps({"generation": gen}))
+        p = self.state / "_runtime" / gen / "transport" / "hop.json"
+        p.parent.mkdir(parents=True)
+        p.write_text(json.dumps({"hop_root": self.keys["hop"]["root"], "version_write": 2}))
+        self.assertTrue(any("version_write" in x for x in hp.state_problems(str(self.state), self.keys)))
 
     def test_a_changed_link_in_the_current_generation_refuses_naming_the_step(self):
         self.linkpin(value="link-old")
@@ -368,6 +388,7 @@ class LiveTest(unittest.TestCase):
         self.s = spec()
         self.keys = hp.hop_keys(self.s, link(), FLEET_DOMAIN)
         self.calls = []
+        self.security = ["name=seccomp,profile=builtin", "name=cgroupns"]
 
     def container(self, **over):
         k = self.keys
@@ -392,6 +413,8 @@ class LiveTest(unittest.TestCase):
                 return Proc(0, json.dumps(digests))
             if argv[:2] == ["docker", "run"]:
                 return Proc(0 if preflight.startswith("ok") else 1, preflight)
+            if argv[:2] == ["docker", "info"]:
+                return Proc(0, json.dumps(self.security))
             raise AssertionError(argv)
         return hp.live_problems(self.s, self.keys, ["/srv/x/instances/a"], run=fake, uid=501, gid=20)
 
@@ -418,6 +441,11 @@ class LiveTest(unittest.TestCase):
         self.assertTrue(any("recorded image" in p for p in self.probe(digests=["other@sha256:" + "0" * 64])))
         self.assertTrue(any("refuse: refused parent_owner" in p for p in self.probe(preflight="refused parent_owner x")))
         self.assertTrue(any("not running" in p for p in self.probe(inspect_rc=1)))
+        self.security = ["name=userns"]
+        self.assertTrue(any("daemon-wide" in p for p in self.probe()), "a daemon-wide remap leaves UsernsMode empty")
+        self.security = "not a list"
+        self.assertTrue(any("cannot be ruled out" in p for p in self.probe()))
+        self.security = ["name=seccomp,profile=builtin"]
         unresolved = hp.live_problems(self.s, self.keys, hp.rh.Unresolved("no loader"),
                                       run=lambda argv, **k: Proc(0, json.dumps([self.container()]) if argv[1] == "inspect"
                                                                  else json.dumps([self.s.router.image_ref])),
@@ -441,7 +469,9 @@ class PreflightCodeTest(unittest.TestCase):
     """The preflight's code against the hop pin's checkout (in place of the
     image's /app): the private helpers it calls exist at this pin and refuse
     by name. A test-user-owned temporary directory is no root-owned ancestry,
-    so the expected answer is the router's own `parent_owner` refusal."""
+    so the expected answer is the router's own `parent_owner` refusal; this
+    reaches `_check_path` only (it refuses before `_read_pinned` and the
+    digest), which the live checks' fake-docker rows do not replace."""
 
     def test_the_router_helpers_answer_at_this_pin(self):
         with tempfile.TemporaryDirectory() as t:
