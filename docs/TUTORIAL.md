@@ -49,6 +49,14 @@ uncommitted changes. `amap-deploy-sandy` finds the other two by looking
 beside itself; `$AMAP_ROUTER_REPO` and `$AMAP_CONNECTOR_REPO` override that,
 and `amap-siblings.py` leaves an overridden checkout alone. You do not build
 the connector: `install` copies its binaries onto the read-only payload.
+`install` refuses a connector checkout that is not at its pin or has changed
+files, so an overridden checkout must be at the pin too. To install from one
+that is not, say why; the attempt is logged in `install.log` beside the
+manifest:
+
+```sh
+python3 amap-deploy-sandy/amap-sandy.py --allow-unpinned-connector "testing a connector fix" install --apply
+```
 
 **Or, in one command:**
 

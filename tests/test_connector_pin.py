@@ -111,6 +111,16 @@ class DirtyTest(Scratch):
         (self.repo / "bin" / "inbox-delivery").write_text("edited\n")
         with self.assertRaises(cp.PinRefused) as e:
             self.guard()
+        self.assertIn("bin/inbox-delivery are not the pinned commit's", str(e.exception))
+
+    def test_a_changed_tracked_file_outside_the_source_directory_is_refused(self):
+        (self.repo / "README").write_text("one\n")
+        git("add", "-A", cwd=self.repo)
+        git("commit", "--quiet", "-m", "readme", cwd=self.repo)
+        self.pin(git("rev-parse", "HEAD", cwd=self.repo))
+        (self.repo / "README").write_text("edited\n")
+        with self.assertRaises(cp.PinRefused) as e:
+            self.guard()
         self.assertIn("changes to tracked files", str(e.exception))
 
     def test_a_staged_change_at_the_pin_is_refused(self):
@@ -118,6 +128,37 @@ class DirtyTest(Scratch):
         git("add", "-A", cwd=self.repo)
         with self.assertRaises(cp.PinRefused):
             self.guard()
+
+
+class HiddenChangeTest(Scratch):
+    """A tracked file's bytes changed, then hidden from `git status` by an
+    index flag: still refused, naming the file."""
+
+    def hide(self, flag):
+        (self.repo / "bin" / "inbox-delivery").write_text("MODIFIED BYTES\n")
+        git("update-index", flag, "bin/inbox-delivery", cwd=self.repo)
+        self.assertEqual(git("status", "--porcelain", "--untracked-files=no", cwd=self.repo), "")
+
+    def test_assume_unchanged_does_not_hide_a_change(self):
+        self.hide("--assume-unchanged")
+        with self.assertRaises(cp.PinRefused) as e:
+            self.guard()
+        self.assertIn("bin/inbox-delivery", str(e.exception))
+        self.assertTrue(cp.check(self.repo / "bin", pins_path=self.pins).dirty)
+
+    def test_skip_worktree_does_not_hide_a_change(self):
+        self.hide("--skip-worktree")
+        with self.assertRaises(cp.PinRefused) as e:
+            self.guard()
+        self.assertIn("bin/inbox-delivery", str(e.exception))
+
+    def test_a_copied_file_the_pinned_commit_does_not_hold_is_refused(self):
+        (self.repo / "bin" / "inbox-submit").write_text("untracked\n")
+        with self.assertRaises(cp.PinRefused) as e:
+            cp.guard(self.repo / "bin", override=None, apply=False, log_dir=self.log_dir,
+                     out=self.said.append, pins_path=self.pins,
+                     files=("inbox-delivery", "inbox-submit"))
+        self.assertIn("bin/inbox-submit (not in HEAD)", str(e.exception))
 
 
 class OverrideTest(Scratch):
@@ -149,6 +190,19 @@ class OverrideTest(Scratch):
         self.guard(override="local patch", apply=True)
         self.assertTrue(self.log_lines()[0]["dirty"])
 
+    def test_the_reason_is_recorded_exactly_as_given(self):
+        self.guard(override="  two spaces either side  ", apply=True)
+        self.assertEqual(self.log_lines()[0]["reason"], "  two spaces either side  ")
+
+    def test_a_symlink_at_the_log_is_not_followed(self):
+        target = self.root / "elsewhere.log"
+        target.write_text("")
+        self.log_dir.mkdir(parents=True)
+        (self.log_dir / cp.LOG_NAME).symlink_to(target)
+        with self.assertRaises(OSError):
+            self.guard(override="testing", apply=True)
+        self.assertEqual(target.read_text(), "")
+
     def test_a_blank_reason_is_no_override(self):
         with self.assertRaises(cp.PinRefused):
             self.guard(override="   ", apply=True)
@@ -158,14 +212,60 @@ class InstallVerbTest(Scratch):
     """The verb, end to end, against a temporary $SANDY_HOME: the refusal
     comes before anything is written."""
 
-    def run_install(self, *extra):
+    def run_install(self, *extra, apply=True):
         import amap_sandy as prov
         home = self.root / "sandy-home"
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             rc = prov.main(["--sandy-home", str(home), "--connector-src", str(self.repo / "bin"),
-                            *extra, "install", "--apply"])
+                            *extra, "install", *(["--apply"] if apply else [])])
         return rc, home, out.getvalue() + err.getvalue()
+
+    def test_install_refuses_a_copied_file_the_pinned_commit_does_not_hold(self):
+        """At the pin and `git status` clean (the copied files untracked):
+        install names each copied file that is not in HEAD."""
+        self.pin_with_copied_files(commit_them=False)
+        rc, home, said = self.run_install()
+        self.assertEqual(rc, 2, said)
+        self.assertIn("bin/inbox-submit (not in HEAD)", said)
+
+    def test_install_dry_run_refuses_an_unpinned_checkout_too(self):
+        rc, home, said = self.run_install(apply=False)
+        self.assertEqual(rc, 2, said)
+        self.assertIn("not at its siblings.json pin", said)
+        self.assertFalse((home / "features").exists())
+
+    def pin_with_copied_files(self, commit_them=True):
+        """Write the other files install copies into the scratch `bin/`,
+        committed or not, and pin the scratch HEAD in a copy of this repo's
+        pins file that `install` reads."""
+        import amap_sandy as prov
+        import siblings
+        for name in (prov.DELIVERY_SUPPORT_NAME,) + prov.CONNECTOR_BINARIES:
+            (self.repo / "bin" / name).write_text(f"#!/bin/sh\necho {name}\n")
+        if commit_them:
+            git("add", "-A", cwd=self.repo)
+            git("commit", "--quiet", "-m", "the copied files", cwd=self.repo)
+            self.second = git("rev-parse", "HEAD", cwd=self.repo)
+        real = json.loads(siblings.PINS_FILE.read_text())
+        for entry in real["siblings"]:
+            if entry["name"] == cp.CONNECTOR:
+                entry["commit"] = self.second
+        self.pins.write_text(json.dumps(real))
+        self.addCleanup(setattr, cp, "pinned_commit", cp.pinned_commit)
+        original = cp.pinned_commit
+        cp.pinned_commit = lambda pins_path=None: original(self.pins)
+
+    def test_install_apply_at_the_pin_passes_the_guard_and_logs_nothing(self):
+        """The scratch checkout at its pin: the guard passes and install goes
+        on to its next step (asking sandy, absent here), with no install log
+        written."""
+        self.pin_with_copied_files()
+        rc, home, said = self.run_install("--sandy", str(self.root / "no-sandy"))
+        self.assertIn("at its pin", said)
+        self.assertNotIn("not at its siblings.json pin", said)
+        self.assertIn("no-sandy", said, "install stopped somewhere other than its next step")
+        self.assertFalse((home / "features" / "amap" / cp.LOG_NAME).exists())
 
     def test_install_apply_refuses_an_unpinned_checkout_before_writing(self):
         # The scratch checkout is not at this repo's real pin.

@@ -3947,7 +3947,8 @@ def run_sync(args: argparse.Namespace, home: Path, boxes_dir: Path) -> int:
     # copied from must be at its siblings.json pin (connector_pin).
     try:
         cpin.guard(args.connector_src, override=getattr(args, "allow_unpinned_connector", None),
-                   apply=args.apply, log_dir=feature_root(home))
+                   apply=args.apply, log_dir=feature_root(home),
+                   files=(DELIVERY_DAEMON_NAME, DELIVERY_SUPPORT_NAME) + CONNECTOR_BINARIES)
     except cpin.PinRefused as e:
         raise ProvisionError(str(e)) from None
     policy_path = feature_manifest_path(home)
