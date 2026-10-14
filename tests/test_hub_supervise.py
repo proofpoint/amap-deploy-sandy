@@ -485,14 +485,14 @@ class StartSweepTest(unittest.TestCase):
         self.assertTrue(fails)
         return found
 
-    def gate(self, exposure_found):
+    def gate(self, exposure_found, secrets_checks=None, overlay=None):
         good = [rh.check("x", rh.Fact("x", True, "a test"), True, "x")]
         built = spec()
 
         def same(*a, **k):
             return good
         patches = [(hs, "read_spec", lambda *a, **k: None), (hs, "load_spec", lambda doc: built),
-                   (hs.ss, "checks", same), (hs.se, "checks", lambda *a, **k: exposure_found),
+                   (hs.ss, "checks", secrets_checks or same), (hs.se, "checks", lambda *a, **k: exposure_found),
                    (hs.hr, "checks", same), (hs, "verify_overlay", same), (hs.hk, "verify_placement", same),
                    (hs.hk, "verify_no_delegation", same), (hs.hk, "verify_evidence_dir", same),
                    (hs.hk, "verify_evidence_binds", same), (hs.hk, "verify_evidence", same), (hs.hv, "checks", same)]
@@ -500,9 +500,22 @@ class StartSweepTest(unittest.TestCase):
             self.addCleanup(setattr, mod, name, getattr(mod, name))
             setattr(mod, name, value)
         said = []
-        rc = hs.hub_start_check(None, out=said.append, state="active", keys={"containers": []},
+        rc = hs.hub_start_check(None, overlay=overlay, out=said.append, state="active", keys={"containers": []},
                                 secret_lock=free_lock)
         return rc, "\n".join(said)
+
+    def test_a_start_check_from_the_overlay_hands_the_overlay_to_the_secrets_checks(self):
+        """The secret's own checks FAIL a document read from --spec rather than
+        the overlay (`verify_overlay_source`): the overlay hub-start-check read
+        must reach them, or every overlay run is refused."""
+        ov = Path("/srv/overlay/host.json")
+
+        def secrets(spec_, **k):
+            ok = k.get("overlay") == str(ov)
+            return [rh.check("the document was read from the overlay", rh.Fact("o", True, "a test"), ok, "x")]
+        clean = [rh.check("y", rh.Fact("y", True, "a test"), True, "x")]
+        rc, said = self.gate(clean, secrets_checks=secrets, overlay=ov)
+        self.assertEqual(rc, 0, said)
 
     def test_a_planted_overlap_refuses_the_start_step(self):
         rc, said = self.gate(self.planted_overlap())
@@ -641,6 +654,28 @@ class LaunchdEnablementTest(unittest.TestCase):
                 s = dataclasses.replace(spec(kind_), runtimes=[], secrets=None, hub=None, keys=None)
                 hs.checks(s, production=False, enablement=en)
                 self.assertEqual(calls, want)
+
+    def test_verify_from_the_overlay_hands_the_overlay_to_the_start_gate(self):
+        """HOST's probe: with every start check passing, an enabled label PASSes
+        only if verify's overlay reaches the start checks the gate runs."""
+        ov = Path("/srv/overlay/host.json")
+        seen = []
+
+        def start(s, **k):
+            seen.append(k.get("overlay"))
+            return [rh.check("x", rh.Fact("x", True, "a test"), k.get("overlay") == ov, "x")]
+        for mod, name in ((hs, "start_checks"), (hs, "secret_checks"), (hs.hv, "checks"), (hs.hr, "checks"),
+                          (hs.hk, "checks"), (hs, "verify_roots"), (hs, "verify_overlay"),
+                          (hs, "verify_containers"), (hs, "verify_mounts"), (hs, "verify_openssl"),
+                          (hs, "verify_umasks"), (hs, "verify_groups")):
+            self.addCleanup(setattr, mod, name, getattr(mod, name))
+            setattr(mod, name, lambda *a, **k: [])
+        hs.start_checks = start
+        s = dataclasses.replace(spec("launchd"), runtimes=[])
+        out = hs.checks(s, production=False, overlay=ov, enablement={"disabled": {}, "loaded": lambda l: False})
+        results = [c.result for c in out if "is disabled, or every start check passes" in c.claim]
+        self.assertEqual(results, [rh.PASS, rh.PASS])
+        self.assertEqual(seen, [ov])
 
     def test_the_gate_is_false_on_a_fail_and_unresolved_on_an_unknown(self):
         orig = hs.start_checks

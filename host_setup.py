@@ -446,7 +446,9 @@ def render_plan(spec: Spec, overlay_source: Optional[Path] = None,
     q = shlex.quote
     steps = f"python3 {q(str(HOST_STEPS))}"
     lines = ["# Run as root. Each line is one step; nothing here has run. No step follows a "
-             "symbolic link, and each is safe to run again."]
+             "symbolic link, and each is safe to run again.",
+             f"# Run them from a checkout no sandbox mounts read-write (a fresh clone at the recorded "
+             f"deploy commit), never from an agent's workspace: these steps run {HOST_STEPS.name} as root."]
     for r in sorted(spec.roots, key=lambda r: (r.path.count("/"), r.path)):
         p = spec.principals[r.owner]
         lines.append(f"{steps} root {q(r.path)} {p.uid} {spec.groups[r.group]} {r.mode:04o}  # {r.purpose}")
@@ -1029,8 +1031,10 @@ def checks(spec: Spec, *, production: bool, lstat: Callable = os.lstat,
             en = enablement or {}
             out += hv.verify_enablement(
                 spec, en["disabled"] if "disabled" in en else hv.ask_disabled(spec),
-                en.get("gate") or (lambda: start_gate(spec, lstat=lstat, hub=hub, keys=keys,
-                                                      supervision=supervision)),
+                en.get("gate") or (lambda: start_gate(spec, lstat=lstat, digest=digest, hub=hub, keys=keys,
+                                                      supervision=supervision, overlay=overlay,
+                                                      secrets=secrets, exposure=exposure,
+                                                      secret_lock=secret_lock)),
                 en.get("loaded") or hv.ask_loaded)
     if spec.router is not None:
         out += hp.checks(spec, **(router or {}))

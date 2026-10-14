@@ -94,6 +94,16 @@ class ConstantTest(unittest.TestCase):
         self.assertEqual(hp.HOP_VERSION_WRITE, 1)
 
 
+class PlanTest(unittest.TestCase):
+    def test_the_plan_says_which_checkout_its_root_steps_run_from(self):
+        """HOST's condition: root runs host_steps.py from the checkout that
+        printed the plan, so the plan says it must be one no sandbox can write."""
+        lines = hs.render_plan(spec())
+        self.assertTrue(lines[0].startswith("# Run as root."))
+        self.assertIn("a checkout no sandbox mounts read-write", lines[1])
+        self.assertIn("never from an agent's workspace", lines[1])
+
+
 class LoadTest(unittest.TestCase):
     def test_the_section_loads(self):
         r = spec().router
@@ -135,8 +145,8 @@ class ChecksTest(unittest.TestCase):
 
     def test_the_constant_is_versioned_with_the_plugin(self):
         s = spec()
-        self.assertEqual(self.by_claim(s, IMAGE["commit"], "reviewed for this transport plugin"),
-                         rh.PASS if s.overlay_pin.get("sha256") == hp.PLUGIN_SHA256 else rh.FAIL)
+        self.assertNotEqual(s.overlay_pin.get("sha256"), hp.PLUGIN_SHA256, "the fixture pins another plugin")
+        self.assertEqual(self.by_claim(s, IMAGE["commit"], "reviewed for this transport plugin"), rh.FAIL)
         import dataclasses
         moved = dataclasses.replace(s, overlay_pin=dict(s.overlay_pin, sha256=hp.PLUGIN_SHA256))
         self.assertEqual(self.by_claim(moved, IMAGE["commit"], "reviewed for this transport plugin"), rh.PASS)
