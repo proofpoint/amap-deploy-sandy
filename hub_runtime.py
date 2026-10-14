@@ -8,9 +8,12 @@ Starting the runtime is not rendered here at all.
 
 The host-setup document's `hub` section names, all operator data:
 - `host_label`, `own_domain` (`<label>.internal`; the ONE source for the
-  runtime's own domain, its logins and the D7 own-domain exclusion), the
-  login's local part and domain, the domains never delivered, the approved
-  attestation statement, and the local router's fleet hosts;
+  runtime's own domain, its logins and the D7 own-domain exclusion, and
+  checked against the D7 source's own `host_domains`), the login's local
+  part and domain, the probe's domain (required: it is never delivered,
+  whatever else the section lists), optionally further domains never
+  delivered, the approved attestation statement, and the local router's
+  fleet hosts;
 - `d7`: the directory that holds only the D7 file, the file's name, and the
   source's path inside the secrets section's producer clone;
 - `env_file`: where the root-owned environment file is placed;
@@ -158,9 +161,9 @@ def load(sec: Any, spec: Any) -> HubSpec:
     s = spec.secrets
     if s is None or s.probe is None:
         raise HubSpecError("the hub section needs a secrets section with its probe settings")
-    keys = ("host_label", "own_domain", "login", "excluded_domains", "statement", "fleet_hosts", "d7",
+    keys = ("host_label", "own_domain", "login", "probe_domain", "statement", "fleet_hosts", "d7",
             "env_file", "hop", "dirs", "prefix_template", "config_uid", "imap")
-    sec = _exact(sec, keys, "(the section)", ("log_driver",))
+    sec = _exact(sec, keys, "(the section)", ("log_driver", "excluded_domains"))
     m = _OWN.fullmatch(sec["own_domain"]) if isinstance(sec["own_domain"], str) else None
     if m is None:
         raise HubSpecError("hub.own_domain must be one lower-case <label>.internal")
@@ -170,10 +173,15 @@ def load(sec: Any, spec: Any) -> HubSpec:
     if not isinstance(login["local"], str) or not _NAME.fullmatch(login["local"]) \
             or not isinstance(login["domain"], str) or not _DOMAIN.fullmatch(login["domain"]):
         raise HubSpecError("hub.login must give a local part and a domain")
-    excl = sec["excluded_domains"]
+    probe = sec["probe_domain"]
+    if not isinstance(probe, str) or not _OWN.fullmatch(probe):
+        raise HubSpecError("hub.probe_domain must be the probe's <label>.internal: it is never delivered")
+    excl = sec.get("excluded_domains", [])
     if not isinstance(excl, list) or any(not isinstance(d, str) or not _DOMAIN.fullmatch(d) for d in excl):
         raise HubSpecError("hub.excluded_domains must list domains")
-    excluded = tuple(sorted(set(excl) | {login["domain"]}))
+    excluded = tuple(sorted(set(excl) | {login["domain"], probe}))
+    if sec["own_domain"] in excluded:
+        raise HubSpecError("hub.own_domain is one of the domains never delivered")
     if not isinstance(sec["statement"], str) or not sec["statement"].strip():
         raise HubSpecError("hub.statement must be the approved attestation statement")
     fleet = sec["fleet_hosts"]
@@ -255,7 +263,10 @@ def environment(spec: Any, hs: HubSpec) -> List[Tuple[str, str]]:
     s = spec.secrets
     p = s.probe
     inside = {k: _in_container(spec, s.principal, v) for k, v in hs.dirs.items()}
-    peer = next(uid for (who, _env), uid in _peer_uids(spec).items() if who == s.principal)
+    peers = [uid for (who, _env), uid in _peer_uids(spec).items() if who == s.principal]
+    if len(peers) != 1:
+        raise HubSpecError(f"{s.principal} has {len(peers)} hop peers; the hub-link router needs exactly one")
+    peer = peers[0]
     env = [
         ("RELAY_LINK_ROLE", ROLE),
         ("SMTP_AUTH_METHOD", AUTH_METHOD),
@@ -385,6 +396,7 @@ def view(spec_doc: Dict[str, Any], env: Sequence[Tuple[str, str]]) -> Dict[str, 
             "CapAdd": list(spec_doc["cap_add"]), "SecurityOpt": list(spec_doc["security_opt"]),
             "GroupAdd": list(spec_doc["group_add"]), "NetworkMode": spec_doc["network"],
             "RestartPolicy": {"Name": spec_doc["restart"]},
+            **({"LogConfig": {"Type": spec_doc["log_driver"]}} if "log_driver" in spec_doc else {}),
             "Ulimits": [{"Name": "core", "Soft": int(soft), "Hard": int(hard)}],
             "Mounts": [{"Type": m["type"], "Source": m["source"], "Target": m["target"],
                         "ReadOnly": m["readonly"], **({"VolumeOptions": {"NoCopy": True}} if m.get("nocopy") else {})}
@@ -446,7 +458,8 @@ def rules(c: Dict[str, Any], spec: Any, hs: HubSpec, *, lstat_: Callable = os.ls
               and m.get("Source") == s.volume and (m.get("VolumeOptions") or {}).get("NoCopy")]
     if len(vols) != 1 or vols[0].get("RW") or vols[0].get("Destination") != s.container_dir or len(nocopy) != 1:
         bad.append(f"does not mount the secret volume exactly once, read-only, without copy, at {s.container_dir}")
-    for d in (hs.d7_dir, posixpath.dirname(spec.overlay_path), hs.registry_dir):
+    for d in (hs.d7_dir, posixpath.dirname(spec.overlay_path), hs.registry_dir,
+              posixpath.dirname(hs.prefix_template)):
         hits = [m for m in c.get("Mounts") or [] if isinstance(m, dict) and m.get("Destination") == d]
         if len(hits) != 1 or hits[0].get("RW"):
             bad.append(f"does not mount {d} once, read-only")
@@ -455,29 +468,62 @@ def rules(c: Dict[str, Any], spec: Any, hs: HubSpec, *, lstat_: Callable = os.ls
     return bad
 
 
-def compare(live: Dict[str, Any], rendered: Dict[str, Any], image_env: Sequence[str]) -> List[str]:
-    """The running container against the rendering: each difference, named."""
-    bad = []
-    got, _ = _env_map(live)
-    want, _ = _env_map(rendered)
-    own = {str(e).partition("=")[0] for e in image_env}
-    for k, v in want.items():
-        if got.get(k) != v:
-            bad.append(f"{k} differs from the rendering")
-    for k in sorted(set(got) - set(want) - own):
-        bad.append(f"{k} is set, and neither the rendering nor the image sets it")
+def _norm_mounts(c: Dict[str, Any]) -> List[Tuple[str, str, str, bool, bool]]:
+    """HostConfig.Mounts, as the --mount options set them: type, source,
+    target, read-only and no-copy."""
+    out = []
+    for m in (c.get("HostConfig") or {}).get("Mounts") or []:
+        if isinstance(m, dict):
+            out.append((str(m.get("Type")), str(m.get("Source")), str(m.get("Target")), bool(m.get("ReadOnly")),
+                        bool((m.get("VolumeOptions") or {}).get("NoCopy"))))
+    return sorted(out)
 
-    def mounts(c):
-        return sorted((str(m.get("Type")), str(m.get("Name") or m.get("Source")), str(m.get("Destination")),
-                       bool(m.get("RW"))) for m in c.get("Mounts") or [] if isinstance(m, dict))
-    if mounts(live) != mounts(rendered):
+
+def _norm_ulimits(h: Dict[str, Any]) -> List[Tuple[str, Any, Any]]:
+    return sorted((str(u.get("Name")), u.get("Soft"), u.get("Hard")) for u in h.get("Ulimits") or []
+                  if isinstance(u, dict))
+
+
+def expected_env(rendered: Dict[str, Any], image_env: Sequence[str]) -> List[str]:
+    """Config.Env as the engine composes it: the image's entries whose key
+    the rendering does not set, then the rendering's."""
+    mine = list((rendered.get("Config") or {}).get("Env") or [])
+    keys = {str(e).partition("=")[0] for e in mine}
+    return [str(e) for e in image_env if str(e).partition("=")[0] not in keys] + mine
+
+
+def compare(live: Dict[str, Any], rendered: Dict[str, Any], image_env: Sequence[str]) -> List[str]:
+    """The running container against the rendering, over every field the
+    rendering sets that `docker inspect` shows: each difference, named."""
+    from collections import Counter
+    bad = []
+    got = Counter(str(e) for e in (live.get("Config") or {}).get("Env") or [])
+    want = Counter(expected_env(rendered, image_env))
+    for e in sorted((got - want) + (want - got)):
+        k = e.partition("=")[0]
+        if f"{k} differs from the rendering and the image" not in bad:
+            bad.append(f"{k} differs from the rendering and the image")
+    lc, rc = live.get("Config") or {}, rendered.get("Config") or {}
+    for key in ("Image", "User"):
+        if lc.get(key) != rc.get(key):
+            bad.append(f"its {key} differs from the rendering")
+    lh, rhc = live.get("HostConfig") or {}, rendered.get("HostConfig") or {}
+    for key in ("GroupAdd", "CapAdd", "CapDrop", "SecurityOpt"):
+        if sorted(str(x) for x in lh.get(key) or []) != sorted(str(x) for x in rhc.get(key) or []):
+            bad.append(f"its {key} differs from the rendering")
+    if lh.get("NetworkMode") != rhc.get("NetworkMode"):
+        bad.append("its NetworkMode differs from the rendering")
+    for key in ("ReadonlyRootfs", "Privileged"):
+        if bool(lh.get(key)) != bool(rhc.get(key)):
+            bad.append(f"its {key} differs from the rendering")
+    if _norm_ulimits(lh) != _norm_ulimits(rhc):
+        bad.append("its Ulimits differ from the rendering")
+    if (lh.get("RestartPolicy") or {}).get("Name") != (rhc.get("RestartPolicy") or {}).get("Name"):
+        bad.append("its RestartPolicy differs from the rendering")
+    if "LogConfig" in rhc and (lh.get("LogConfig") or {}).get("Type") != rhc["LogConfig"].get("Type"):
+        bad.append("its LogConfig differs from the rendering")
+    if _norm_mounts(live) != _norm_mounts(rendered):
         bad.append("its mounts differ from the rendering")
-    for key in ("User",):
-        if (live.get("Config") or {}).get(key) != (rendered.get("Config") or {}).get(key):
-            bad.append(f"its {key} differs from the rendering")
-    for key in ("NetworkMode", "ReadonlyRootfs"):
-        if (live.get("HostConfig") or {}).get(key) != (rendered.get("HostConfig") or {}).get(key):
-            bad.append(f"its {key} differs from the rendering")
     return bad
 
 
@@ -553,14 +599,7 @@ def write_files(spec: Any, hs: HubSpec, r: Rendered, *, apply: bool, out=print) 
         if not apply:
             out(f"hub-render: would write {path} (sha256 {_sha(data)}); run again with --apply")
             continue
-        tmp = f"{path}.{os.getpid()}.tmp"
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0), 0o600)
-        try:
-            os.write(fd, data)
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-        os.replace(tmp, path)
+        dd.write_atomically(path, data)
         out(f"hub-render: wrote {path} (sha256 {_sha(data)})")
     return rc
 
@@ -577,11 +616,14 @@ def inspect(spec: Any, name: str) -> Any:
     name, or an Unresolved."""
     s = spec.secrets
     try:
-        p = rh.run(ss.docker(s) + ["container", "inspect", "--type", "container", name])
+        p = rh.run(ss.docker(s) + ["inspect", "--type", "container", name])
     except rh.CannotRun as e:
         return rh.Unresolved(str(e))
     if p.rc != 0:
-        q = rh.run(ss.docker(s) + ["ps", "-a", "-q", "--filter", f"name=^/{name}$"])
+        try:
+            q = rh.run(ss.docker(s) + ["ps", "-a", "-q", "--filter", f"name=^/{name}$"])
+        except rh.CannotRun as e:
+            return rh.Unresolved(str(e))
         if q.rc == 0 and not q.out.strip():
             return None
         return rh.Unresolved(f"docker inspect {name} exited {p.rc}")

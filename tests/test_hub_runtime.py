@@ -1,6 +1,9 @@
 """hub_runtime: the hub-link router's environment file, run spec, rules,
 plan steps and checks.
 
+Imports test_host_setup and friends as plain modules: it needs conftest.py's
+path setup (tests/ on sys.path), or PYTHONPATH=tests under unittest.
+
 Every value is invented. The document is test_host_setup's with
 test_secret_setup's secrets section, plus the runtime's four private roots
 and the hub section. `docker inspect` answers are built in the shape the
@@ -35,7 +38,7 @@ PRIVATE = {"MAILBOX_ROOT_DIR": "/srv/example/down/mail", "RELAY_LEDGER_DIR": "/s
 def hub_sec():
     return {"host_label": "alpha", "own_domain": "alpha.internal",
             "login": {"local": "rt", "domain": "logins.internal"},
-            "excluded_domains": ["probe-x.internal"], "statement": STATEMENT,
+            "probe_domain": "probe-x.internal", "statement": STATEMENT,
             "fleet_hosts": ["beta.internal", "gamma.internal"],
             "d7": {"dir": "/opt/ex/d7", "file": "d7.json", "source": "gen/d7.json"},
             "env_file": "/opt/ex/env/hub.env",
@@ -78,6 +81,19 @@ class LoadTest(unittest.TestCase):
 
     def test_the_login_domain_is_always_excluded(self):
         self.assertIn("logins.internal", spec().hub.excluded)
+
+    def test_the_probe_domain_is_always_excluded(self):
+        self.assertIn("probe-x.internal", spec().hub.excluded)
+
+    def test_a_section_without_the_probe_domain_refuses(self):
+        d = full_doc()
+        del d[hr.SECTION]["probe_domain"]
+        self.refuses(d, "must have")
+
+    def test_an_own_domain_that_is_an_excluded_domain_refuses(self):
+        d = full_doc(own_domain="probe-x.internal", host_label="probe-x")
+        d[ss.SECTION]["probe"]["username"] = "rt@probe-x.logins.internal"
+        self.refuses(d, "never delivered")
 
     def test_a_host_label_that_is_not_the_own_domain_s_label_refuses(self):
         self.refuses(full_doc(host_label="beta"), "own_domain's label")
@@ -242,6 +258,13 @@ class RulesTest(unittest.TestCase):
             c["HostConfig"]["RestartPolicy"] = {"Name": "always"}
         self.assertTrue(any("restart policy" in b for b in self.broken(mutate=m)))
 
+    def test_a_writable_template_dir_breaks(self):
+        def m(c):
+            for x in c["Mounts"]:
+                if x.get("Destination") == "/opt/ex/tmpl":
+                    x["RW"] = True
+        self.assertIn("does not mount /opt/ex/tmpl once, read-only", self.broken(mutate=m))
+
     def test_a_writable_d7_dir_breaks(self):
         def m(c):
             for x in c["Mounts"]:
@@ -264,18 +287,122 @@ class CompareTest(unittest.TestCase):
         live = copy.deepcopy(self.rendered)
         live["Config"]["Env"] += ["EXTRA=1"]
         self.assertEqual(hr.compare(live, self.rendered, []),
-                         ["EXTRA is set, and neither the rendering nor the image sets it"])
+                         ["EXTRA differs from the rendering and the image"])
 
     def test_a_changed_value_is_named(self):
         live = copy.deepcopy(self.rendered)
         live["Config"]["Env"] = [e if not e.startswith("SMTP_PORT=") else "SMTP_PORT=25"
                                  for e in live["Config"]["Env"]]
-        self.assertEqual(hr.compare(live, self.rendered, []), ["SMTP_PORT differs from the rendering"])
+        self.assertEqual(hr.compare(live, self.rendered, []), ["SMTP_PORT differs from the rendering and the image"])
 
     def test_an_extra_mount_is_named(self):
         live = copy.deepcopy(self.rendered)
-        live["Mounts"].append({"Type": "bind", "Source": "/x", "Destination": "/x", "RW": False})
+        live["HostConfig"]["Mounts"].append({"Type": "bind", "Source": "/x", "Target": "/x", "ReadOnly": True})
         self.assertEqual(hr.compare(live, self.rendered, []), ["its mounts differ from the rendering"])
+
+
+class InspectTest(unittest.TestCase):
+    """inspect() against a fake docker that answers as the real CLI does."""
+
+    def setUp(self):
+        self.spec = spec()
+        self.calls = []
+        self.real = rh.run
+        self.addCleanup(setattr, rh, "run", self.real)
+
+    def answer(self, table):
+        def run(argv, **_):
+            self.calls.append(argv)
+            for key, proc in table.items():
+                if key in argv:
+                    return proc
+            raise AssertionError(argv)
+        rh.run = run
+
+    def test_the_argv_is_top_level_inspect_with_type(self):
+        self.answer({"inspect": rh.Proc((), 0, json.dumps([{"Name": "/ex-down"}]), "")})
+        hr.inspect(self.spec, "ex-down")
+        self.assertEqual(self.calls[0][1:], ["inspect", "--type", "container", "ex-down"])
+
+    def test_a_present_container_is_its_document(self):
+        self.answer({"inspect": rh.Proc((), 0, json.dumps([{"Name": "/ex-down"}]), "")})
+        self.assertEqual(hr.inspect(self.spec, "ex-down"), {"Name": "/ex-down"})
+
+    def test_an_absent_container_is_none(self):
+        self.answer({"inspect": rh.Proc((), 1, "", "Error: No such container: ex-down"), "ps": rh.Proc((), 0, "", "")})
+        self.assertIsNone(hr.inspect(self.spec, "ex-down"))
+
+    def test_an_engine_error_is_unknown(self):
+        self.answer({"inspect": rh.Proc((), 1, "", "Cannot connect to the Docker daemon"),
+                     "ps": rh.Proc((), 1, "", "Cannot connect to the Docker daemon")})
+        self.assertIsInstance(hr.inspect(self.spec, "ex-down"), rh.Unresolved)
+
+
+class FullCompareTest(unittest.TestCase):
+    def setUp(self):
+        self.spec = spec()
+        self.rendered = view_of(self.spec)
+
+    def differ(self, mutate, image_env=()):
+        live = copy.deepcopy(self.rendered)
+        mutate(live)
+        return hr.compare(live, self.rendered, list(image_env))
+
+    def test_another_image_differs(self):
+        self.assertIn("its Image differs from the rendering",
+                      self.differ(lambda c: c["Config"].__setitem__("Image", "other@sha256:" + "0" * 64)))
+
+    def test_an_added_capability_differs(self):
+        self.assertIn("its CapAdd differs from the rendering",
+                      self.differ(lambda c: c["HostConfig"].__setitem__("CapAdd", ["NET_RAW"])))
+
+    def test_a_dropped_security_option_differs(self):
+        self.assertIn("its SecurityOpt differs from the rendering",
+                      self.differ(lambda c: c["HostConfig"].__setitem__("SecurityOpt", [])))
+
+    def test_another_ulimit_differs(self):
+        self.assertIn("its Ulimits differ from the rendering",
+                      self.differ(lambda c: c["HostConfig"]["Ulimits"].append({"Name": "nofile", "Soft": 1, "Hard": 1})))
+
+    def test_another_restart_policy_differs(self):
+        self.assertIn("its RestartPolicy differs from the rendering",
+                      self.differ(lambda c: c["HostConfig"].__setitem__("RestartPolicy", {"Name": "always"})))
+
+    def test_another_group_differs(self):
+        self.assertIn("its GroupAdd differs from the rendering",
+                      self.differ(lambda c: c["HostConfig"].__setitem__("GroupAdd", [])))
+
+    def test_a_lost_nocopy_differs(self):
+        self.assertIn("its mounts differ from the rendering",
+                      self.differ(lambda c: c["HostConfig"]["Mounts"][0].pop("VolumeOptions")))
+
+    def test_an_overridden_image_default_differs(self):
+        def m(c):
+            c["Config"]["Env"].append("LANG=C")
+        self.assertEqual(self.differ(m, image_env=["LANG=C.UTF-8"]), ["LANG differs from the rendering and the image"])
+
+    def test_an_image_default_kept_passes(self):
+        def m(c):
+            c["Config"]["Env"].append("LANG=C.UTF-8")
+        self.assertEqual(self.differ(m, image_env=["LANG=C.UTF-8"]), [])
+
+    def test_a_rendered_key_replaces_the_image_s_value(self):
+        """The engine replaces an image default the rendering sets: the live
+        Env holds only the rendered value, and that matches."""
+        self.assertEqual(self.differ(lambda c: None, image_env=["SMTP_PORT=25"]), [])
+
+    def test_a_duplicated_entry_differs(self):
+        def m(c):
+            c["Config"]["Env"].append(c["Config"]["Env"][0])
+        self.assertTrue(self.differ(m))
+
+    def test_a_rendered_log_driver_is_compared(self):
+        doc = hr.run_spec(self.spec, self.spec.hub)
+        doc["log_driver"] = "local"
+        r = hr.view(doc, hr.environment(self.spec, self.spec.hub))
+        live = copy.deepcopy(r)
+        live["HostConfig"]["LogConfig"] = {"Type": "json-file"}
+        self.assertIn("its LogConfig differs from the rendering", hr.compare(live, r, []))
 
 
 def st(mode, uid=0, gid=0, nlink=1):
