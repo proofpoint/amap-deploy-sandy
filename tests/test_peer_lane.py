@@ -1976,6 +1976,23 @@ class VerifyEndToEndTest(SandboxFixture):
         self.assertIn(names[self.SLUG],
                       self._row(out, "unhandled count unknown:").split("  ")[-1])
 
+    def test_named_sessions_in_the_host_marker_are_named_without_the_field(self):
+        """A --print-state that does not report claude_sessions, over a last
+        launch whose host marker declared them: named, never pane."""
+        names = prov.vr.display_names([self.SLUG, self.OTHER])
+        (self.sandbox(self.SLUG) / prov.SANDY_SESSION_MARKER_NAME).write_text(json.dumps(
+            {"schema": 1, "sandy_version": "2.8.1-dev",
+             "claude_sessions": [{"slug": "monitor", "name": "monitor",
+                                  "receives": ["cross_session"]}]}))
+        (self.sandbox(self.OTHER) / prov.SANDY_SESSION_MARKER_NAME).write_text(json.dumps(
+            {"schema": 1, "sandy_version": "2.8.1-dev", "claude_sessions": []}))
+        with unittest.mock.patch.dict(os.environ, {"COLUMNS": "400"}):
+            rc, out = self._run(extra={"marker": {"state": "present"}})
+        self.assertEqual(rc, 1, out)
+        row = self._row(out, "named sessions unserved:")
+        self.assertIn(names[self.SLUG], row.split("  ")[-1])
+        self.assertNotIn(names[self.OTHER], row.split("  ")[-1])
+
     def test_unhandled_peer_notices_reach_the_notes_with_the_deployed_pattern(self):
         """The real daemon's bytes on the payload, one peer notice in a
         stopped sandbox's lane and no ledger: a note naming that sandbox."""

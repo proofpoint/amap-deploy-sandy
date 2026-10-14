@@ -1969,6 +1969,16 @@ def run_provision(
     return 1 if failed else 0
 
 
+def host_marker(sandbox_dir: Path) -> Any:
+    """The host copy of the launch marker: the parsed file, None when there
+    is none, or a string saying why it could not be read."""
+    path = sandbox_dir / SANDY_SESSION_MARKER_NAME
+    if not path.exists() and not path.is_symlink():
+        return None
+    doc = _read_json(path)
+    return doc if isinstance(doc, (dict, str)) else f"not an object ({path})"
+
+
 def read_session_marker(sandbox_dir: Path) -> Optional[Dict[str, Any]]:
     """sandy's session marker for this sandbox's LAST launch, read on the
     host. `None` when there is none (never launched, or a sandy too old to
@@ -3748,8 +3758,12 @@ def run_verify(args: argparse.Namespace, servers: Dict[str, dict], home: Path,
     problems += verify_roster_pointer_exposed(home)
     # WHICH DAEMON the payload runs, once: its bytes against the connector
     # pin, and its own notice pattern for the per-sandbox backlog below.
-    daemon = dc.daemon_version(feature_payload_dir(home) / DELIVERY_DAEMON_NAME,
-                               connector_checkout(args.connector_src), pinned_connector())
+    payload = feature_payload_dir(home)
+    daemon = dc.daemon_version(
+        payload / DELIVERY_DAEMON_NAME, connector_checkout(args.connector_src),
+        pinned_connector(),
+        companions=[(payload / DELIVERY_SUPPORT_NAME, f"bin/{DELIVERY_SUPPORT_NAME}")]
+        + [(payload / FEATURE_BIN_SUBDIR / n, f"bin/{n}") for n in CONNECTOR_BINARIES])
     problems += daemon.problems
     notes += daemon.notes
     notes.append(CROSS_SESSION_COVERAGE)
@@ -3801,8 +3815,9 @@ def run_verify(args: argparse.Namespace, servers: Dict[str, dict], home: Path,
             notes += _refuse_notes
             # Delivery itself: the lister this sandbox's sessions need, and
             # the peer notices its daemon has not handled.
-            _mode_problems, _mode_notes = dc.verify_sessions(slug, records.get(slug),
-                                                             CONTAINER_FEATURE_DIR)
+            _mode_problems, _mode_notes = dc.verify_sessions(
+                slug, records.get(slug), CONTAINER_FEATURE_DIR,
+                marker=host_marker(sandbox_dir))
             problems += _mode_problems
             notes += _mode_notes
             _backlog_problems, _backlog_notes = dc.verify_unhandled(

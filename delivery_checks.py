@@ -11,25 +11,33 @@ daemon already keep:
   lister (`payload/handoff-sessions`) lists panes only. A sandbox whose last
   launch declared named sessions therefore gets no delivery at all: the
   daemon finds no target, waits, and logs nothing. The mode is read from
-  `--print-state`'s `claude_sessions` (sandy 2.9.0, additive): `null` is
-  "cannot answer" and is read against `marker.state`; `declared` non-empty
-  is named mode.
+  `--print-state`'s `claude_sessions` (`{declared, status}`) where sandy
+  reports it, and otherwise from the host copy of the launch marker: a sandy
+  whose `--print-state` lacks the field can still have launched named
+  sessions. Neither answering, or the two disagreeing, is UNKNOWN; no
+  record from sandy is UNKNOWN; never pane by default.
 - POSTURE, in named mode only, AS SANDY REPORTS IT: `claude_sessions.status`
   is copied from a file in the agent's own home, so it is a report and not a
-  trust root. The claimant (the one declared session receiving
-  `cross_session`) must be `up` and must not have been created without this
-  feature's arguments (`drift` `missing:`); every other session must carry
-  the refuse pin (`inbound_pinned` `no` is a failure) and must not hold this
-  feature's arguments (`drift` `extra:`). Sandy diverts a receiving
-  feature's `agent_args` to the claimant alone, so this feature's arguments
-  on another session mean it was created before that, and it holds the
-  submit tools without being the one that receives.
+  trust root. Every value must be one sandy writes for a judged session:
+  the claimant (the one declared session receiving `cross_session`) `up`
+  with `inbound_pinned` `receiver`; every other session `yes` (`no` is a
+  failure); `drift` `none` or sandy's `missing:`/`extra:` text. Anything
+  else (`-`, which sandy writes when the session has no job to read;
+  `unknown`; a value it never writes) is posture UNKNOWN. The claimant must
+  not lack this feature's arguments (`missing:`), and no other session may
+  hold them (`extra:`): sandy diverts a receiving feature's `agent_args` to
+  the claimant alone, so this feature's arguments on another session mean
+  it was created before that, and it holds the submit tools without being
+  the one that receives. The clean note is written only when every row was
+  judged.
 - DAEMON VERSION. The payload's `inbox-delivery` is hashed (the file's
   sha256) and mapped to the connector commit whose `bin/inbox-delivery` has
   those bytes, by walking the file's history in the connector checkout. The
   siblings.json pin is what CI ran; deployed bytes that are another commit's
   are DRIFT, never "older", and bytes no commit has are UNKNOWN, naming the
-  hash.
+  hash. The payload's other connector files are compared with the pin's
+  bytes too, because the daemon file can be identical across commits that
+  differ elsewhere.
 - UNHANDLED. Peer notices with no ledger entry, counted with THE DEPLOYED
   DAEMON'S OWN `NOTICE_FILE_RE`, parsed out of the deployed file, because
   the pattern decides which notices a daemon sees at all. A ledger entry
@@ -59,6 +67,8 @@ RECEIVES_CROSS_SESSION = "cross_session"
 # The values sandy writes into a session's status row (`.sandy-sessions.tsv`).
 STATE_UP = "up"
 PINNED_NO = "no"
+PINNED_YES = "yes"
+PINNED_RECEIVER = "receiver"
 DRIFT_MISSING = "missing: "
 DRIFT_EXTRA = "extra: "
 
@@ -86,41 +96,86 @@ UNHANDLED_MAX_AGE_SECONDS = 15 * 60
 
 NAMED = "named"
 PANE = "pane"
+NOT_LAUNCHED = "not launched"
 
 
-def session_mode(record: Optional[Dict[str, Any]], marker_present: str = "present"
-                 ) -> Tuple[Optional[str], str]:
-    """`(mode, why)`: NAMED, PANE, or None when it cannot be told.
-
-    Absent key: this sandy predates named sessions, so none can run. `null`
-    with the marker present: the last launch was by a sandy predating the
-    field, which could not run them either. `null` otherwise: not launched,
-    or a marker sandy cannot read, so it cannot be told."""
-    if not isinstance(record, dict) or CLAUDE_SESSIONS_KEY not in record:
-        return PANE, "this sandy reports no claude_sessions, so it has no named sessions"
-    cs = record[CLAUDE_SESSIONS_KEY]
-    if cs is None:
-        marker = record.get("marker")
-        state = marker.get("state") if isinstance(marker, dict) else None
-        if state == marker_present:
-            return PANE, "its last launch predates named sessions"
-        return None, f"sandy cannot answer for it (marker {state!r})"
-    if not isinstance(cs, dict) or not isinstance(cs.get(DECLARED_KEY), list):
-        return None, f"sandy reports {CLAUDE_SESSIONS_KEY} as {cs!r}, a shape this does not know"
-    if cs[DECLARED_KEY]:
-        return NAMED, "its last launch declared named Claude sessions"
-    return PANE, "its last launch declared no named sessions"
+def _marker_declared(marker: Any) -> Tuple[Optional[List[Any]], str]:
+    """The named sessions the host copy of the launch marker declares:
+    `(list, why)`, or `(None, why)` when it cannot say. `marker` is the
+    parsed file, None when the file is absent, or a string saying why it
+    could not be read. A marker without the key was written by a sandy
+    without named sessions, which cannot have run them."""
+    if marker is None:
+        return None, "it has no launch marker on the host"
+    if isinstance(marker, str):
+        return None, f"its launch marker is {marker}"
+    if not isinstance(marker, dict):
+        return None, "its launch marker is not an object"
+    if CLAUDE_SESSIONS_KEY not in marker:
+        return [], "its launch marker predates named sessions"
+    declared = marker[CLAUDE_SESSIONS_KEY]
+    if not isinstance(declared, list):
+        return None, f"its launch marker carries {CLAUDE_SESSIONS_KEY}={declared!r}"
+    return declared, "its launch marker"
 
 
-def _drift_pairs(drift: Any, prefix: str) -> List[str]:
-    """The flag/value pairs sandy's drift text lists under `prefix`:
-    `missing: a | b; extra: c` (sandy's own format, `|`-joined pairs)."""
-    if not isinstance(drift, str):
-        return []
+def session_mode(record: Optional[Dict[str, Any]], marker: Any, *, marker_absent: str = "absent"
+                 ) -> Tuple[Optional[str], str, List[Any], Any]:
+    """`(mode, why, declared, status)`. `mode` is NAMED, PANE, NOT_LAUNCHED,
+    or None when it cannot be told.
+
+    `--print-state`'s `{declared, status}` is read where sandy reports it.
+    Where it does not (no key: a sandy whose `--print-state` predates the
+    field, which may still have LAUNCHED named sessions; or `null`), the
+    host copy of the launch marker decides, and the status is unknown. Both
+    present and disagreeing about whether any session was declared cannot
+    be told."""
+    if not isinstance(record, dict):
+        return None, "sandy reports no record for it", [], None
+    m_declared, m_why = _marker_declared(marker)
+    reported = record.get(CLAUDE_SESSIONS_KEY)
+    if isinstance(reported, dict):
+        declared = reported.get(DECLARED_KEY)
+        if not isinstance(declared, list):
+            return None, f"sandy reports {CLAUDE_SESSIONS_KEY} as {reported!r}", [], None
+        if m_declared is not None and bool(m_declared) != bool(declared):
+            return (None, f"sandy reports {len(declared)} declared session(s) and {m_why} "
+                          f"{len(m_declared)}", [], None)
+        return (NAMED if declared else PANE, "its last launch declared named Claude sessions",
+                declared, reported.get(STATUS_KEY))
+    if reported is not None:
+        return None, f"sandy reports {CLAUDE_SESSIONS_KEY} as {reported!r}", [], None
+    if m_declared is None:
+        state = (record.get("marker") or {}).get("state") if isinstance(record.get("marker"),
+                                                                         dict) else None
+        if marker is None and state == marker_absent:
+            return NOT_LAUNCHED, "not launched yet", [], None
+        return None, m_why, [], None
+    if m_declared:
+        return NAMED, f"{m_why} declares named Claude sessions", m_declared, None
+    return PANE, f"{m_why} declares no named sessions", [], None
+
+
+def _drift(drift: Any) -> Optional[Dict[str, List[str]]]:
+    """Sandy's drift text as `{"missing": [...], "extra": [...]}`: `none`, or
+    `missing: a | b`, `extra: c`, or both joined by `; `. None for anything
+    else (`-`, which sandy writes when the session has no job to read;
+    `unknown`; a non-string), which cannot be judged."""
+    out: Dict[str, List[str]] = {"missing": [], "extra": []}
+    if drift == "none":
+        return out
+    if not isinstance(drift, str) or not drift:
+        return None
     for part in drift.split("; "):
-        if part.startswith(prefix):
-            return [p.strip() for p in part[len(prefix):].split(" | ") if p.strip()]
-    return []
+        for key, prefix in (("missing", DRIFT_MISSING), ("extra", DRIFT_EXTRA)):
+            if part.startswith(prefix) and not out[key]:
+                out[key] = [p.strip() for p in part[len(prefix):].split(" | ") if p.strip()]
+                if not out[key]:
+                    return None
+                break
+        else:
+            return None
+    return out
 
 
 def _ours(pairs: Sequence[str], feature_dir: str) -> List[str]:
@@ -129,20 +184,25 @@ def _ours(pairs: Sequence[str], feature_dir: str) -> List[str]:
     return [p for p in pairs if (feature_dir.rstrip("/") + "/") in p]
 
 
-def verify_sessions(slug: str, record: Optional[Dict[str, Any]], feature_dir: str
-                    ) -> Tuple[List[str], List[str]]:
-    """`(problems, notes)`: the mode, and in named mode the posture."""
+def verify_sessions(slug: str, record: Optional[Dict[str, Any]], feature_dir: str, *,
+                    marker: Any) -> Tuple[List[str], List[str]]:
+    """`(problems, notes)`: the mode, and in named mode the posture.
+    `marker` is the host copy of the launch marker: the parsed file, None
+    when absent, or why it could not be read."""
     problems: List[str] = []
     notes: List[str] = []
-    mode, why = session_mode(record)
+    mode, why, declared, status = session_mode(record, marker)
     if mode is None:
         problems.append(f"delivery mode unknown: {slug}: {why} — whether its sessions can be "
                         f"served cannot be told; relaunch it")
         return problems, notes
+    if mode == NOT_LAUNCHED:
+        notes.append(f"{slug}: not launched yet, so whether its sessions can be served is not "
+                     f"knowable until it is")
+        return problems, notes
     if mode == PANE:
         return problems, notes
-    cs = record[CLAUDE_SESSIONS_KEY]
-    declared = [d for d in cs[DECLARED_KEY] if isinstance(d, dict)]
+    declared = [d for d in declared if isinstance(d, dict)]
     claimants = [d for d in declared if RECEIVES_CROSS_SESSION in (d.get("receives") or [])]
     if not DEPLOYED_LISTER_SERVES_NAMED_SESSIONS:
         problems.append(
@@ -155,49 +215,54 @@ def verify_sessions(slug: str, record: Optional[Dict[str, Any]], feature_dir: st
                         f"receive {RECEIVES_CROSS_SESSION}, not exactly one — relaunch with one")
         return problems, notes
     claimant = claimants[0].get("slug")
-    status = cs.get(STATUS_KEY)
     sessions = status.get("sessions") if isinstance(status, dict) else None
     if not isinstance(sessions, list):
-        problems.append(f"named-session posture unknown: {slug}: the container reported no "
-                        f"session status for its last launch — relaunch it")
+        problems.append(f"named-session posture unknown: {slug}: sandy reports no session "
+                        f"status for its last launch — relaunch it")
         return problems, notes
     rows = {s.get("slug"): s for s in sessions if isinstance(s, dict)}
-    clean = True
+    before = len(problems)
     for d in declared:
         s = d.get("slug")
         row = rows.get(s)
         if row is None:
             problems.append(f"named-session posture unknown: {slug}: session {s!r} has no "
                             f"status row — relaunch it")
-            clean = False
             continue
-        if s == claimant:
-            if row.get("state") != STATE_UP:
-                problems.append(f"named-session claimant down: {slug}: {s!r} is "
-                                f"{row.get('state')!r} ({row.get('reason')}), so nothing "
-                                f"receives peer notices — relaunch it")
-                clean = False
-            missing = _ours(_drift_pairs(row.get("drift"), DRIFT_MISSING), feature_dir)
-            if missing:
-                problems.append(f"named-session claimant posture: {slug}: {s!r} was created "
-                                f"without {' | '.join(missing)}, so it cannot answer delegations "
-                                f"through the router — recreate that session")
-                clean = False
-        else:
-            if row.get("inbound_pinned") == PINNED_NO:
-                problems.append(f"named-session posture: {slug}: {s!r} does not receive "
-                                f"{RECEIVES_CROSS_SESSION} but lacks the refuse pin, so a "
-                                f"misdirected frame lands in it — recreate that session")
-                clean = False
-            extra = _ours(_drift_pairs(row.get("drift"), DRIFT_EXTRA), feature_dir)
-            if extra:
-                problems.append(f"named-session posture: {slug}: {s!r} does not receive "
-                                f"{RECEIVES_CROSS_SESSION} but holds {' | '.join(extra)} — "
-                                f"recreate that session")
-                clean = False
-    if clean:
-        notes.append(f"{slug}: named sessions, as sandy reports: claimant {claimant!r} up, "
-                     f"every other session pinned to refuse")
+        is_claimant = s == claimant
+        pinned = row.get("inbound_pinned")
+        drift = _drift(row.get("drift"))
+        if is_claimant and row.get("state") != STATE_UP:
+            problems.append(f"named-session claimant down: {slug}: {s!r} is "
+                            f"{row.get('state')!r} ({row.get('reason')}), so nothing "
+                            f"receives peer notices — relaunch it")
+        if not is_claimant and pinned == PINNED_NO:
+            problems.append(f"named-session posture: {slug}: {s!r} does not receive "
+                            f"{RECEIVES_CROSS_SESSION} but lacks the refuse pin, so a "
+                            f"misdirected frame lands in it — recreate that session")
+        elif pinned != (PINNED_RECEIVER if is_claimant else PINNED_YES):
+            problems.append(f"named-session posture unknown: {slug}: {s!r} reports "
+                            f"inbound_pinned {pinned!r}, not "
+                            f"{PINNED_RECEIVER if is_claimant else PINNED_YES!r} — relaunch it")
+        if drift is None:
+            problems.append(f"named-session posture unknown: {slug}: {s!r} reports drift "
+                            f"{row.get('drift')!r}, which says nothing about its arguments — "
+                            f"relaunch it")
+            continue
+        if is_claimant and _ours(drift["missing"], feature_dir):
+            problems.append(f"named-session claimant posture: {slug}: {s!r} was created "
+                            f"without {' | '.join(_ours(drift['missing'], feature_dir))}, so it "
+                            f"cannot answer delegations through the router — recreate that "
+                            f"session")
+        if not is_claimant and _ours(drift["extra"], feature_dir):
+            problems.append(f"named-session posture: {slug}: {s!r} does not receive "
+                            f"{RECEIVES_CROSS_SESSION} but holds "
+                            f"{' | '.join(_ours(drift['extra'], feature_dir))} — recreate that "
+                            f"session")
+    if len(problems) == before:
+        notes.append(f"{slug}: named sessions, as sandy reports: claimant {claimant!r} up and "
+                     f"receiving, every other session pinned to refuse, no session's "
+                     f"arguments drifted from this feature's")
     return problems, notes
 
 
@@ -246,18 +311,47 @@ def notice_pattern(source: bytes) -> Tuple[Optional["re.Pattern[str]"], str]:
     if len(found) != 1:
         return None, f"the deployed daemon binds {NOTICE_RE_NAME} {len(found)} times at module level"
     call = found[0]
-    if not (isinstance(call, ast.Call) and len(call.args) == 1 and not call.keywords
+    if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
+            and call.func.attr == "compile" and isinstance(call.func.value, ast.Name)
+            and call.func.value.id == "re" and len(call.args) == 1 and not call.keywords
             and isinstance(call.args[0], ast.Constant) and isinstance(call.args[0].value, str)):
-        return None, f"the deployed daemon's {NOTICE_RE_NAME} is not a compile of one literal"
+        return None, f"the deployed daemon's {NOTICE_RE_NAME} is not re.compile of one literal"
     try:
-        return re.compile(call.args[0].value), ""
+        pattern = re.compile(call.args[0].value)
     except re.error as e:
         return None, f"the deployed daemon's {NOTICE_RE_NAME} does not compile ({e})"
+    if pattern.groups < 1:
+        return None, f"the deployed daemon's {NOTICE_RE_NAME} captures no notice id"
+    return pattern, ""
+
+
+def _companions_at_pin(companions: Sequence[Tuple[Path, str]], checkout: Path, pinned: str,
+                       git: Callable) -> List[str]:
+    """A problem for each of the payload's other connector files whose bytes
+    are not the pinned commit's (the daemon file alone can be identical across
+    commits that differ elsewhere)."""
+    out = []
+    for path, rel in companions:
+        at_pin = git(["show", f"{pinned}:{rel}"], checkout)
+        try:
+            have = path.read_bytes()
+        except OSError as e:
+            out.append(f"connector version unknown: cannot read the payload's {path.name}: {e}")
+            continue
+        if at_pin.returncode != 0:
+            out.append(f"connector version unknown: the pinned commit {pinned[:12]} has no {rel}")
+        elif sha256(have) != sha256(at_pin.stdout):
+            out.append(f"connector drift: the payload's {path.name} (sha256 {sha256(have)}) is "
+                       f"not the siblings.json pin {pinned[:12]}'s {rel}")
+    return out
 
 
 def daemon_version(payload_daemon: Path, checkout: Optional[Path], pinned: str,
-                   git: Callable = _git) -> DaemonVersion:
-    """The payload's daemon mapped to a connector commit, and against the pin."""
+                   git: Callable = _git, *,
+                   companions: Sequence[Tuple[Path, str]] = ()) -> DaemonVersion:
+    """The payload's daemon mapped to a connector commit, and against the pin;
+    `companions` are the payload's other connector files, as `(payload path,
+    path in the checkout)`, compared with the pin's bytes."""
     problems: List[str] = []
     notes: List[str] = []
     try:
@@ -279,10 +373,15 @@ def daemon_version(payload_daemon: Path, checkout: Optional[Path], pinned: str,
                         f"{DAEMON_REL}) is not in {checkout} — fetch it (amap-siblings.py "
                         f"--apply), then re-run verify")
         return DaemonVersion(problems, notes, notice_re, why)
+    companion_problems = _companions_at_pin(companions, checkout, pinned, git)
     if have == sha256(at_pin.stdout):
-        notes.append(f"daemon: the payload's {payload_daemon.name} is the pinned connector's "
-                     f"({pinned[:12]})")
+        problems += companion_problems
+        if not companion_problems:
+            notes.append(f"connector: the payload's {payload_daemon.name} and "
+                         f"{len(companions)} other connector file(s) equal the siblings.json "
+                         f"pin {pinned[:12]}'s bytes")
         return DaemonVersion(problems, notes, notice_re, why)
+    problems += companion_problems
     history, err = file_history(checkout, [pinned, "HEAD"], git=git)
     origin = history.get(have)
     if err:
@@ -296,9 +395,9 @@ def daemon_version(payload_daemon: Path, checkout: Optional[Path], pinned: str,
     else:
         problems.append(f"daemon drift: the payload's {payload_daemon.name} has the bytes "
                         f"connector {origin[-1][:12]} introduced, not the siblings.json pin "
-                        f"{pinned[:12]}'s — put the connector checkout at its pin "
-                        f"(amap-siblings.py --apply) and re-run install --apply; do not move the "
-                        f"pin to match the payload")
+                        f"{pinned[:12]}'s — reinstall from a checkout at the pin "
+                        f"(amap-siblings.py --apply, then install --apply), or move the pin by "
+                        f"its own reviewed PR")
     return DaemonVersion(problems, notes, notice_re, why)
 
 

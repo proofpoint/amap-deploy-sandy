@@ -47,100 +47,190 @@ def git(*args, cwd):
     return r.stdout.strip()
 
 
-def row(slug, state="up", pinned="-", drift="-", reason="-"):
+def row(slug, state="up", pinned="yes", drift="none", reason="-"):
     return {"slug": slug, "state": state, "session_id": f"{slug}-0000", "name": slug,
             "inbound_pinned": pinned, "drift": drift, "reason": reason}
+
+
+DECLARED = [{"slug": "designer", "name": "designer", "receives": []},
+            {"slug": "monitor", "name": "monitor", "receives": ["cross_session"]}]
 
 
 def named_record(rows, declared=None):
     """A sandbox whose last launch declared a `monitor` claimant and a
     `designer` that does not receive (the bug's own shape)."""
-    if declared is None:
-        declared = [{"slug": "designer", "name": "designer", "receives": []},
-                    {"slug": "monitor", "name": "monitor", "receives": ["cross_session"]}]
-    return {"claude_sessions": {"declared": declared,
+    return {"claude_sessions": {"declared": DECLARED if declared is None else declared,
                                 "status": None if rows is None else
                                 {"launch_id": "L1", "sessions": rows}},
             "marker": {"state": "present", "sandy_version": "2.9.0", "launched_at": "x"}}
 
 
+def marker_doc(declared):
+    """The host copy of the launch marker; `None` for one written before
+    the key existed."""
+    doc = {"schema": 1, "sandy_version": "2.8.1-dev"}
+    if declared is not None:
+        doc["claude_sessions"] = declared
+    return doc
+
+
 def healthy_rows():
-    return [row("designer", pinned="yes", drift="none"), row("monitor", pinned="receiver")]
+    return [row("designer"), row("monitor", pinned="receiver")]
+
+
+PRESENT = {"marker": {"state": "present"}}
 
 
 class ModeTest(unittest.TestCase):
-    def test_a_sandy_without_the_field_is_pane_mode(self):
-        self.assertEqual(dc.session_mode({"marker": {"state": "present"}})[0], dc.PANE)
+    def mode(self, record, marker):
+        return dc.session_mode(record, marker)[0]
 
-    def test_null_with_the_marker_present_is_a_launch_that_predates_the_field(self):
-        rec = {"claude_sessions": None, "marker": {"state": "present"}}
-        self.assertEqual(dc.session_mode(rec)[0], dc.PANE)
+    def test_no_record_from_sandy_cannot_be_told(self):
+        self.assertIsNone(self.mode(None, marker_doc([])))
+        [p], _ = dc.verify_sessions("box-1", None, FEATURE_DIR, marker=marker_doc([]))
+        self.assertTrue(p.startswith("delivery mode unknown: box-1: sandy reports no record"), p)
 
-    def test_null_without_a_readable_marker_cannot_be_told(self):
-        for state in ("absent", "unreadable"):
-            rec = {"claude_sessions": None, "marker": {"state": state}}
-            self.assertIsNone(dc.session_mode(rec)[0], state)
-            problems, _ = dc.verify_sessions("box-1", rec, FEATURE_DIR)
-            self.assertTrue(problems[0].startswith("delivery mode unknown: box-1:"), problems)
+    def test_without_the_field_the_host_marker_decides_and_named_is_named(self):
+        """A --print-state without claude_sessions over a launch that ran
+        them (a 2.8.1-dev marker with two sessions, as measured): named,
+        never pane, and its posture unknown."""
+        self.assertEqual(self.mode(PRESENT, marker_doc(DECLARED)), dc.NAMED)
+        self.addCleanup(setattr, dc, "DEPLOYED_LISTER_SERVES_NAMED_SESSIONS",
+                        dc.DEPLOYED_LISTER_SERVES_NAMED_SESSIONS)
+        dc.DEPLOYED_LISTER_SERVES_NAMED_SESSIONS = True
+        [p], notes = dc.verify_sessions("box-1", PRESENT, FEATURE_DIR, marker=marker_doc(DECLARED))
+        self.assertTrue(p.startswith("named-session posture unknown: box-1: sandy reports no "
+                                     "session status"), p)
+        self.assertEqual(notes, [])
 
-    def test_an_empty_declared_list_is_pane_mode_and_says_nothing(self):
-        rec = {"claude_sessions": {"declared": [], "status": None}, "marker": {"state": "present"}}
-        self.assertEqual(dc.verify_sessions("box-1", rec, FEATURE_DIR), ([], []))
+    def test_null_with_a_named_host_marker_is_named(self):
+        rec = {"claude_sessions": None, **PRESENT}
+        self.assertEqual(self.mode(rec, marker_doc(DECLARED)), dc.NAMED)
+
+    def test_the_host_marker_saying_none_is_pane(self):
+        for marker in (marker_doc([]), marker_doc(None)):
+            self.assertEqual(self.mode(PRESENT, marker), dc.PANE, marker)
+            self.assertEqual(dc.verify_sessions("box-1", PRESENT, FEATURE_DIR, marker=marker),
+                             ([], []))
+
+    def test_without_the_field_and_an_unreadable_host_marker_cannot_be_told(self):
+        for marker in ("unreadable (x): denied", {"claude_sessions": "x"}, ["not", "a", "doc"]):
+            self.assertIsNone(self.mode(PRESENT, marker), marker)
+
+    def test_no_host_marker_is_not_launched_only_when_sandy_says_so(self):
+        rec = {"marker": {"state": "absent"}}
+        problems, [n] = dc.verify_sessions("box-1", rec, FEATURE_DIR, marker=None)
+        self.assertEqual(problems, [])
+        self.assertIn("not launched yet", n)
+        self.assertIsNone(self.mode(PRESENT, None))
+
+    def test_print_state_and_the_host_marker_disagreeing_cannot_be_told(self):
+        rec = {"claude_sessions": {"declared": [], "status": None}, **PRESENT}
+        self.assertIsNone(self.mode(rec, marker_doc(DECLARED)))
+        self.assertIsNone(self.mode(named_record(healthy_rows()), marker_doc([])))
+
+    def test_print_state_is_read_where_the_host_marker_cannot_be(self):
+        self.assertEqual(self.mode(named_record(healthy_rows()), None), dc.NAMED)
+        self.assertEqual(self.mode({"claude_sessions": {"declared": [], "status": None}},
+                                   "unreadable"), dc.PANE)
+
+    def test_a_shape_this_does_not_know_cannot_be_told(self):
+        for cs in ({"declared": "x"}, ["x"]):
+            self.assertIsNone(self.mode({"claude_sessions": cs, **PRESENT}, marker_doc([])))
 
     def test_named_mode_is_a_problem_while_the_lister_serves_panes_only(self):
-        problems, _ = dc.verify_sessions("box-1", named_record(healthy_rows()), FEATURE_DIR)
+        problems, _ = dc.verify_sessions("box-1", named_record(healthy_rows()), FEATURE_DIR,
+                                         marker=marker_doc(DECLARED))
         self.assertEqual([p for p in problems if p.startswith("named sessions unserved: box-1:")],
                          problems)
+        self.assertTrue(problems)
 
     def test_the_unserved_problem_follows_the_lister_capability(self):
         self.addCleanup(setattr, dc, "DEPLOYED_LISTER_SERVES_NAMED_SESSIONS",
                         dc.DEPLOYED_LISTER_SERVES_NAMED_SESSIONS)
         dc.DEPLOYED_LISTER_SERVES_NAMED_SESSIONS = True
-        problems, notes = dc.verify_sessions("box-1", named_record(healthy_rows()), FEATURE_DIR)
+        problems, notes = dc.verify_sessions("box-1", named_record(healthy_rows()), FEATURE_DIR,
+                                             marker=marker_doc(DECLARED))
         self.assertEqual(problems, [])
         self.assertIn("as sandy reports", notes[0])
 
 
 class PostureTest(unittest.TestCase):
-    """Each posture fault, one at a time, must raise the finding that names it."""
+    """Each posture fault, one at a time, must raise the finding that names
+    it, and the clean note appears only when every row was judged."""
 
     def setUp(self):
         self.addCleanup(setattr, dc, "DEPLOYED_LISTER_SERVES_NAMED_SESSIONS",
                         dc.DEPLOYED_LISTER_SERVES_NAMED_SESSIONS)
         dc.DEPLOYED_LISTER_SERVES_NAMED_SESSIONS = True
 
-    def problems(self, rows, declared=None):
-        return dc.verify_sessions("box-1", named_record(rows, declared), FEATURE_DIR)[0]
+    def run_rows(self, rows, declared=None):
+        return dc.verify_sessions("box-1", named_record(rows, declared), FEATURE_DIR,
+                                  marker=marker_doc(DECLARED if declared is None else declared))
 
-    def test_a_healthy_posture_has_no_problem(self):
-        self.assertEqual(self.problems(healthy_rows()), [])
+    def problems(self, rows, declared=None):
+        return self.run_rows(rows, declared)[0]
+
+    def unknown(self, rows):
+        problems, notes = self.run_rows(rows)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertTrue(problems[0].startswith("named-session posture unknown: box-1:"), problems)
+        self.assertEqual(notes, [], "a clean note over a row that was not judged")
+        return problems[0]
+
+    def test_a_healthy_posture_has_no_problem_and_a_clean_note(self):
+        problems, [n] = self.run_rows(healthy_rows())
+        self.assertEqual(problems, [])
+        self.assertIn("every other session pinned to refuse", n)
 
     def test_a_non_claimant_without_the_refuse_pin(self):
-        [p] = self.problems([row("designer", pinned="no", drift="none"),
-                             row("monitor", pinned="receiver")])
+        [p] = self.problems([row("designer", pinned="no"), row("monitor", pinned="receiver")])
         self.assertIn("'designer' does not receive cross_session but lacks the refuse pin", p)
 
+    def test_every_other_non_claimant_pin_value_is_unknown(self):
+        for value in ("-", None, "receiver", "YES", 1):
+            with self.subTest(value=value):
+                designer = row("designer", pinned=value)
+                if value is None:
+                    del designer["inbound_pinned"]
+                self.assertIn("'designer' reports inbound_pinned",
+                              self.unknown([designer, row("monitor", pinned="receiver")]))
+
+    def test_every_claimant_pin_value_but_receiver_is_unknown(self):
+        for value in ("-", "yes", "no", None):
+            with self.subTest(value=value):
+                self.assertIn("'monitor' reports inbound_pinned",
+                              self.unknown([row("designer"), row("monitor", pinned=value)]))
+
+    def test_every_drift_value_sandy_cannot_judge_is_unknown(self):
+        for value in ("-", "unknown", "", None, 3, "missing: ", "something else",
+                      "missing: a; missing: b"):
+            with self.subTest(value=value):
+                self.assertIn("reports drift",
+                              self.unknown([row("designer", drift=value),
+                                            row("monitor", pinned="receiver")]))
+
     def test_a_claimant_created_without_this_features_arguments(self):
-        [p] = self.problems([row("designer", pinned="yes", drift="none"),
+        [p] = self.problems([row("designer"),
                              row("monitor", pinned="receiver",
                                  drift=f"missing: {MCP_PAIR} | {PROMPT_PAIR}")])
         self.assertIn("'monitor' was created without", p)
         self.assertIn(MCP_PAIR, p)
 
     def test_a_claimant_missing_only_another_features_argument_is_not_ours_to_report(self):
-        self.assertEqual(self.problems([row("designer", pinned="yes", drift="none"),
-                                        row("monitor", pinned="receiver",
-                                            drift="missing: --effort high")]), [])
+        problems, [n] = self.run_rows([row("designer"),
+                                       row("monitor", pinned="receiver",
+                                           drift="missing: --effort high")])
+        self.assertEqual(problems, [])
 
     def test_a_non_claimant_holding_this_features_arguments(self):
-        [p] = self.problems([row("designer", pinned="yes",
-                                 drift=f"missing: --effort high; extra: {MCP_PAIR}"),
+        [p] = self.problems([row("designer", drift=f"missing: --effort high; extra: {MCP_PAIR}"),
                              row("monitor", pinned="receiver")])
         self.assertIn(f"'designer' does not receive cross_session but holds {MCP_PAIR}", p)
 
     def test_a_claimant_that_is_not_up(self):
-        [p] = self.problems([row("designer", pinned="yes", drift="none"),
-                             row("monitor", state="missing", reason="no job")])
+        [p] = self.problems([row("designer"),
+                             row("monitor", state="missing", pinned="receiver", reason="no job")])
         self.assertTrue(p.startswith("named-session claimant down: box-1:"), p)
 
     def test_no_status_from_the_container_is_unknown_not_clean(self):
@@ -148,17 +238,18 @@ class PostureTest(unittest.TestCase):
         self.assertTrue(p.startswith("named-session posture unknown: box-1:"), p)
 
     def test_a_declared_session_with_no_status_row_is_unknown(self):
-        [p] = self.problems([row("monitor", pinned="receiver")])
-        self.assertIn("'designer' has no status row", p)
+        self.assertIn("'designer' has no status row",
+                      self.unknown([row("monitor", pinned="receiver")]))
 
     def test_no_claimant_is_a_problem(self):
         none = [{"slug": "a", "name": "a", "receives": []}]
-        [p] = self.problems([row("a", pinned="yes")], declared=none)
+        [p] = self.problems([row("a")], declared=none)
         self.assertIn("0 declared sessions receive cross_session", p)
 
     def test_two_claimants_is_a_problem(self):
         both = [{"slug": s, "name": s, "receives": ["cross_session"]} for s in ("a", "b")]
-        [p] = self.problems([row("a"), row("b")], declared=both)
+        [p] = self.problems([row("a", pinned="receiver"), row("b", pinned="receiver")],
+                            declared=both)
         self.assertIn("2 declared sessions receive cross_session", p)
 
 
@@ -237,6 +328,54 @@ class DaemonVersionTest(Scratch):
         id40 = "a" * 40
         self.assertIsNotNone(self.version(self.real).notice_re.match(f"notice-{id40}.json"))
         self.assertIsNone(self.version(self.older).notice_re.match(f"notice-{id40}.json"))
+
+    def test_drift_text_names_both_remedies(self):
+        [p] = self.version(self.older).problems
+        self.assertIn("move the pin by its own reviewed PR", p)
+        self.assertNotIn("do not move", p)
+
+    def test_a_companion_file_off_the_pin_is_drift_even_when_the_daemon_matches(self):
+        """F-1's shape: inbox-delivery can be byte-identical across commits
+        that differ elsewhere, so the other connector files are compared too."""
+        (self.repo / "bin" / "inbox-submit").write_text("pinned\n")
+        git("add", "-A", cwd=self.repo)
+        git("commit", "--quiet", "-m", "submit", cwd=self.repo)
+        pin = git("rev-parse", "HEAD", cwd=self.repo)
+        companion = self.payload.parent / "bin" / "inbox-submit"
+        companion.parent.mkdir()
+        self.payload.write_bytes(self.real)
+        companion.write_text("pinned\n")
+        v = dc.daemon_version(self.payload, self.repo, pin,
+                              companions=[(companion, "bin/inbox-submit")])
+        self.assertEqual(v.problems, [])
+        self.assertIn("1 other connector file(s) equal the siblings.json pin", v.notes[0])
+        companion.write_text("an older build\n")
+        v = dc.daemon_version(self.payload, self.repo, pin,
+                              companions=[(companion, "bin/inbox-submit")])
+        [p] = v.problems
+        self.assertTrue(p.startswith("connector drift: the payload's inbox-submit"), p)
+        self.assertEqual(v.notes, [])
+
+    def test_a_companion_the_pin_does_not_have_is_unknown(self):
+        companion = self.root / "payload" / "extra"
+        companion.write_text("x")
+        self.payload.write_bytes(self.real)
+        v = dc.daemon_version(self.payload, self.repo, self.pin, companions=[(companion, "bin/extra")])
+        self.assertTrue(v.problems[0].startswith("connector version unknown:"), v.problems)
+
+    def test_a_pattern_not_built_by_re_compile_has_none(self):
+        for call in (b'os.system("x")', b'regex.compile("^notice-(x)$")'):
+            with self.subTest(call=call):
+                v = self.version(self.real.replace(self.pattern_line.encode(),
+                                                   b"NOTICE_FILE_RE = " + call))
+                self.assertIsNone(v.notice_re)
+                self.assertIn("is not re.compile of one literal", v.why)
+
+    def test_a_pattern_capturing_no_id_has_none(self):
+        v = self.version(self.real.replace(self.pattern_line.encode(),
+                                           b'NOTICE_FILE_RE = re.compile(r"^notice-.+\\.json$")'))
+        self.assertIsNone(v.notice_re)
+        self.assertIn("captures no notice id", v.why)
 
     def test_a_daemon_without_the_pattern_has_none(self):
         v = self.version(self.real.replace(self.pattern_line.encode(), b"X = 1"))
