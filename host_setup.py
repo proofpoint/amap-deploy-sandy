@@ -982,7 +982,8 @@ def checks(spec: Spec, *, production: bool, lstat: Callable = os.lstat,
            secret_lock: Optional[Callable[[Any], Any]] = None,
            hub: Optional[Dict[str, Any]] = None,
            keys: Optional[Dict[str, Any]] = None,
-           supervision: Optional[Dict[str, Any]] = None) -> List[rh.Check]:
+           supervision: Optional[Dict[str, Any]] = None,
+           enablement: Optional[Dict[str, Any]] = None) -> List[rh.Check]:
     """Every check of the host against the plan. `production` is ORed with
     the document's own. `secrets` passes probes to the secret's checks;
     `overlay` is the file the document was read from (None for --spec). The
@@ -1023,7 +1024,26 @@ def checks(spec: Spec, *, production: bool, lstat: Callable = os.lstat,
         out += hk.checks(spec, spec.keys, lstat=lstat, **(keys or {}))
     if spec.supervision is not None:
         out += hv.checks(spec, lstat=lstat, **(supervision or {}))
+        if hv.labels(spec):
+            en = enablement or {}
+            out += hv.verify_enablement(
+                spec, en["disabled"] if "disabled" in en else hv.ask_disabled(spec),
+                en.get("gate") or (lambda: start_gate(spec, lstat=lstat, hub=hub, keys=keys,
+                                                      supervision=supervision)))
     return out
+
+
+def start_gate(spec: Spec, **probes: Any) -> Any:
+    """True when every start check passes now, False when one fails, an
+    Unresolved when none fails but one cannot be decided."""
+    if spec.hub is None:
+        return False
+    results = [c.result for c in start_checks(spec, **probes)]
+    if rh.FAIL in results:
+        return False
+    if rh.UNKNOWN in results:
+        return rh.Unresolved("a start check is UNKNOWN; run hub-start-check")
+    return True
 
 
 def print_notes(spec: Spec, out=print) -> None:
@@ -1192,4 +1212,3 @@ def hub_start_check(spec_path: Optional[Path], *, overlay: Optional[Path] = None
     for line in hv.start_commands(spec):
         out(f"  {line}")
     return 0
-

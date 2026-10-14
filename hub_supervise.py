@@ -2,9 +2,17 @@
 that start it and keep it running, the weekly login probe's job, and the
 live-start ancestry check. NOTHING HERE STARTS, LOADS OR ENABLES ANYTHING:
 the files are rendered into the operator's run directory under an explicit
-`--apply`, the plan's root steps place them, and the start step (enable or
-bootstrap) is printed only by `hub-start-check`, only when every check
-passes. Starting is the operator's act.
+`--apply`, the plan's root steps place them, and the start step (enable and
+start) is printed only by `hub-start-check`, only when every check passes.
+Starting is the operator's act.
+
+On macOS, launchd loads every plist in /Library/LaunchDaemons at boot, so
+placing one would start it at the next boot. The plan therefore runs
+`launchctl disable system/<label>` for both labels BEFORE placing them (a
+persistent override that launchd honours at boot), and the start step is
+`launchctl enable` followed by `launchctl bootstrap`. Verify reads the
+override back (`launchctl print-disabled system`): a label that is not
+disabled is a FAIL unless every start check passes now.
 
 The host-setup document's `supervision` section names, all operator data:
 - `kind`: `systemd` (Linux) or `launchd` (macOS);
@@ -14,8 +22,9 @@ The host-setup document's `supervision` section names, all operator data:
   `/etc/systemd/system/<name>.service` path. launchd: `label`, `plist` (a
   `/Library/LaunchDaemons/<label>.plist` path), `wrapper` and `status`;
 - `weekly`: the weekly login probe's job, at `weekday` (0 is Sunday),
-  `hour` and `minute`. systemd: `service` and `timer` paths. launchd:
-  `label` and `plist`;
+  `hour` and `minute`. systemd: `service` and `timer` paths, in
+  `/etc/systemd/system/`. launchd: `label` and `plist`, in
+  `/Library/LaunchDaemons/`;
 - `requires`: the reviewed merge commits the runtime's code must contain,
   each `{name, commit}`. The runtime image's commit is the secrets
   section's `runtime` clone sha; every required commit must be its
@@ -25,11 +34,15 @@ The host-setup document's `supervision` section names, all operator data:
 
 The runtime's restart policy: 0 and 2-11 never restart, every other code
 restarts after 30 s, rate-limited. On Linux that is the unit's
-`RestartPreventExitStatus`, with `SuccessExitStatus=143` so a planned
-`systemctl stop` (which `docker stop`s the container) is clean. On macOS a
-wrapper maps the codes for a LaunchDaemon whose KeepAlive restarts only on a
-non-zero wrapper exit; it is placed root 0444 by the pinned writer and run
-as `/bin/sh <wrapper>`, never directly. It starts `docker run` in the
+`RestartPreventExitStatus`, plus `SuccessExitStatus=143`, which classifies
+an actual docker-client exit of 143 as a success and does nothing else: a
+planned stop is clean because the router's SIGTERM handler, a required
+commit, makes it exit 0. Without the handler a planned stop runs out the
+`docker stop` timeout and exits 137, which this setting does not cover. On
+macOS a wrapper maps the codes for a LaunchDaemon whose KeepAlive restarts
+only on a non-zero wrapper exit; it passes 143 on, so launchd restarts it.
+The wrapper is placed root 0444 by the plan's `place --sha256` and run as
+`/bin/sh <wrapper>`, never directly. It starts `docker run` in the
 background and blocks in `wait`, because a POSIX shell defers a trap while a
 foreground command runs.
 """
@@ -50,7 +63,7 @@ SECTION = "supervision"
 KINDS = ("systemd", "launchd")
 #: The restart policy: these exits never restart; every other non-zero exit does.
 NO_RESTART = (2, 3, 4, 5, 6, 7, 8, 9, 10, 11)
-#: The code a planned stop may end with, treated as a success (the operator's ruling).
+#: The docker-client exit treated as a success on Linux (the operator's ruling).
 STOP_CODE = 143
 RESTART_SEC = 30
 START_LIMIT_INTERVAL_S = 600
@@ -63,12 +76,16 @@ STOP_TIMEOUT_S = 100
 #: TimeoutStopSec (90 s) and launchd's default ExitTimeOut (20 s) are below it.
 SUPERVISOR_STOP_S = 120
 ORPHAN = "orphan_running"
+LAUNCHCTL = "/bin/launchctl"
 WEEKLY_RUN_ID = "weekly"
 REVISION_LABEL = "org.opencontainers.image.revision"
 DAYS = ("Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat")
 _HEX40 = re.compile(r"[0-9a-f]{40}")
 _LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 _ENGINE = re.compile(r"unix:///[^\s]+")
+#: Where each supervisor reads its files: a unit or plist anywhere else is never loaded.
+SYSTEMD_DIR = "/etc/systemd/system"
+LAUNCHD_DIR = "/Library/LaunchDaemons"
 
 
 class SupervisionSpecError(ValueError):
@@ -102,6 +119,11 @@ def _int(v: Any, lo: int, hi: int, what: str) -> int:
     return v
 
 
+def _in(p: str, directory: str, what: str) -> None:
+    if posixpath.dirname(p) != directory:
+        raise SupervisionSpecError(f"supervision.{what} must be directly in {directory}/")
+
+
 def load(sec: Any, spec: Any) -> SupervisionSpec:
     """Parse and validate the section. It needs the hub section (the runtime
     it supervises) and the secrets section (the weekly probe, the writer,
@@ -119,6 +141,7 @@ def load(sec: Any, spec: Any) -> SupervisionSpec:
         hub = _exact(sec["hub"], ("unit",), "hub")
         if not _abs(hub["unit"], "hub.unit").endswith(".service"):
             raise SupervisionSpecError("supervision.hub.unit must be a .service path")
+        _in(hub["unit"], SYSTEMD_DIR, "hub.unit")
         wk_keys = ("service", "timer", "weekday", "hour", "minute")
     else:
         hub = _exact(sec["hub"], ("label", "plist", "wrapper", "status"), "hub")
@@ -128,6 +151,7 @@ def load(sec: Any, spec: Any) -> SupervisionSpec:
             raise SupervisionSpecError("supervision.hub.label must be a launchd label")
         if posixpath.basename(hub["plist"]) != f"{hub['label']}.plist":
             raise SupervisionSpecError("supervision.hub.plist must be <label>.plist")
+        _in(hub["plist"], LAUNCHD_DIR, "hub.plist")
         wk_keys = ("label", "plist", "weekday", "hour", "minute")
     weekly = _exact(sec["weekly"], wk_keys, "weekly")
     _int(weekly["weekday"], 0, 6, "weekly.weekday")
@@ -137,9 +161,13 @@ def load(sec: Any, spec: Any) -> SupervisionSpec:
         if not _abs(weekly["service"], "weekly.service").endswith(".service") \
                 or not _abs(weekly["timer"], "weekly.timer").endswith(".timer"):
             raise SupervisionSpecError("supervision.weekly needs a .service and a .timer path")
+        _in(weekly["service"], SYSTEMD_DIR, "weekly.service")
+        _in(weekly["timer"], SYSTEMD_DIR, "weekly.timer")
     elif not isinstance(weekly["label"], str) or not _LABEL.fullmatch(weekly["label"]) \
             or posixpath.basename(_abs(weekly["plist"], "weekly.plist")) != f"{weekly['label']}.plist":
         raise SupervisionSpecError("supervision.weekly needs a launchd label and its <label>.plist path")
+    else:
+        _in(weekly["plist"], LAUNCHD_DIR, "weekly.plist")
     req = sec["requires"]
     if not isinstance(req, list) or not req:
         raise SupervisionSpecError("supervision.requires must list the reviewed commits the runtime needs")
@@ -346,14 +374,39 @@ def write_files(spec: Any, *, apply: bool, out=print) -> int:
     return 0
 
 
+def labels(spec: Any) -> List[str]:
+    """The launchd labels, weekly first; none for systemd."""
+    sup = spec.supervision
+    return [sup.weekly["label"], sup.hub["label"]] if sup.kind == "launchd" else []
+
+
+#: A LaunchDaemon's plist is root:wheel 0644, as the reviewed design says; every other placed file is 0444.
+PLIST_MODE = 0o644
+FILE_MODE = 0o444
+
+
+def mode_of(spec: Any, path: str) -> int:
+    """The mode a placed supervision file must have."""
+    sup = spec.supervision
+    plists = (sup.hub["plist"], sup.weekly["plist"]) if sup.kind == "launchd" else ()
+    return PLIST_MODE if path in plists else FILE_MODE
+
+
 def plan(spec: Any, q: Callable[[str], str], steps: str) -> List[str]:
     """The root steps that place the files. Enabling them is NOT here: it is
-    the gated start step, which `hub-start-check` prints only on a pass."""
+    the gated start step, which `hub-start-check` prints only on a pass. On
+    macOS both labels are disabled BEFORE their plists are placed, because
+    launchd loads every placed plist at boot."""
     run_dir = spec.secrets.run_dir
     lines = ["# The hub-link router's supervision. First, as the operator: `amap-sandy.py hub-supervise "
              f"--apply` writes the files into {run_dir}. Placing them enables nothing."]
+    for label in labels(spec):
+        lines.append(f"{LAUNCHCTL} disable {q('system/' + label)}  # before placing: launchd would load "
+                     "it at the next boot")
     for path, data in rendered(spec):
-        lines.append(f"{steps} place {q(posixpath.join(run_dir, staged(path)))} {q(path)} --sha256 {hr._sha(data)}")
+        mode = mode_of(spec, path)
+        lines.append(f"{steps} place {q(posixpath.join(run_dir, staged(path)))} {q(path)} --sha256 {hr._sha(data)}"
+                     + (f" --mode {mode:04o}" if mode != FILE_MODE else ""))
     return lines
 
 
@@ -364,8 +417,62 @@ def start_commands(spec: Any) -> List[str]:
         return ["systemctl daemon-reload",
                 f"systemctl enable --now {posixpath.basename(sup.weekly['timer'])}",
                 f"systemctl enable --now {posixpath.basename(sup.hub['unit'])}"]
-    return [f"launchctl bootstrap system {sup.weekly['plist']}",
-            f"launchctl bootstrap system {sup.hub['plist']}"]
+    return [f"{LAUNCHCTL} enable system/{sup.weekly['label']}",
+            f"{LAUNCHCTL} bootstrap system {sup.weekly['plist']}",
+            f"{LAUNCHCTL} enable system/{sup.hub['label']}",
+            f"{LAUNCHCTL} bootstrap system {sup.hub['plist']}"]
+
+
+def parse_disabled(text: str) -> Dict[str, bool]:
+    """`launchctl print-disabled system` as {label: disabled}. A line is
+    `"<label>" => disabled|enabled` (`true|false` on older macOS, true
+    meaning disabled). A label absent from the output has no override."""
+    out = {}
+    for m in re.finditer(r'^\s*"([^"]+)"\s*=>\s*(disabled|enabled|true|false)\s*$', text, re.M):
+        out[m.group(1)] = m.group(2) in ("disabled", "true")
+    return out
+
+
+def ask_disabled(spec: Any) -> Any:
+    """{label: disabled} for the system domain, or an Unresolved."""
+    try:
+        p = rh.run([LAUNCHCTL, "print-disabled", "system"])
+    except rh.CannotRun as e:
+        return rh.Unresolved(str(e))
+    if p.rc != 0:
+        return rh.Unresolved(f"launchctl print-disabled system exited {p.rc}")
+    return parse_disabled(p.out)
+
+
+def verify_enablement(spec: Any, disabled: Any, gate: Callable[[], Any]) -> List[rh.Check]:
+    """Each launchd label stays disabled until the gated start: a label that
+    is not disabled (enabled, or with no override, which launchd loads at
+    boot) is a FAIL unless every start check passes now. `gate` answers
+    that, True, False or an Unresolved, and is asked only when needed."""
+    out = []
+    asked: List[Any] = []
+    for label in labels(spec):
+        claim = f"{label} is disabled, or every start check passes"
+        want = _fact("enablement", True, "placing a plist must not start the router at boot without "
+                                         "hub-start-check passing")
+        remedy = (f"run `{LAUNCHCTL} disable system/{label}` (and `{LAUNCHCTL} bootout system/{label}` if "
+                  "it is loaded) until hub-start-check passes, then use the start step it prints")
+        state = disabled if isinstance(disabled, rh.Unresolved) else disabled.get(label)
+        if isinstance(state, rh.Unresolved):
+            out.append(rh.unknown(claim, want, state.reason, remedy))
+            continue
+        if state is True:
+            out.append(rh.check(claim, want, True, remedy))
+            continue
+        if not asked:
+            asked.append(gate())
+        g = asked[0]
+        if isinstance(g, rh.Unresolved):
+            out.append(rh.unknown(claim, want, g.reason, remedy))
+        else:
+            out.append(rh.check(claim, want, g is True, remedy,
+                                do_not="never enable a label by hand; the start step is printed only on a pass"))
+    return out
 
 
 # --- Verify ---------------------------------------------------------------------
@@ -376,7 +483,8 @@ def _fact(name: str, value: Any, provenance: str) -> rh.Fact:
 
 
 def verify_files(spec: Any, lstat: Callable, read: Callable[[str], bytes]) -> List[rh.Check]:
-    """Each placed file: root-owned 0444, one link, under root-owned
+    """Each placed file: owned by uid 0 and gid 0 (root:wheel on macOS), one
+    link, mode 0644 for a plist and 0444 for everything else, under root-owned
     directories nobody else can write, and byte-identical to a fresh render.
     A placed file that differs is a FAIL whether or not it is enabled."""
     out = []
@@ -399,12 +507,13 @@ def verify_files(spec: Any, lstat: Callable, read: Callable[[str], bytes]) -> Li
             out.append(rh.check(claim, want, "absent" if got is None else got == data, remedy,
                                 do_not="never edit the placed file; change the overlay and render"))
         st = ss._lst(path, lstat)
-        claim = f"{path} is root-owned 0444 with one link"
-        want = _fact("mode", (0, 0o444, 1), why)
+        mode = mode_of(spec, path)
+        claim = f"{path} is owned by uid 0 and gid 0, mode {mode:04o}, with one link"
+        want = _fact("mode", (0, 0, mode, 1), why)
         if isinstance(st, rh.Unresolved):
             out.append(rh.unknown(claim, want, st.reason, remedy))
         elif st is not None:
-            out.append(rh.check(claim, want, (st.st_uid, st.st_mode & 0o7777, st.st_nlink), remedy))
+            out.append(rh.check(claim, want, (st.st_uid, st.st_gid, st.st_mode & 0o7777, st.st_nlink), remedy))
     return out
 
 

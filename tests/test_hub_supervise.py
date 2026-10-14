@@ -75,6 +75,20 @@ class LoadTest(unittest.TestCase):
             spec("launchd", hub=dict(sup_section("launchd")["hub"], plist="/Library/LaunchDaemons/other.plist"))
         self.assertIn("<label>.plist", str(e.exception))
 
+    def test_each_file_must_be_where_its_supervisor_reads_it(self):
+        """A unit outside /etc/systemd/system/ or a plist outside
+        /Library/LaunchDaemons/ is never loaded, so the section refuses it."""
+        for kind_, key, field, bad in (
+                ("systemd", "hub", "unit", "/etc/systemd/user/hub-link.service"),
+                ("systemd", "weekly", "service", "/opt/x/hub-link-probe.service"),
+                ("systemd", "weekly", "timer", "/etc/systemd/system/sub/hub-link-probe.timer"),
+                ("launchd", "hub", "plist", "/Library/LaunchAgents/org.example.hub.plist"),
+                ("launchd", "weekly", "plist", "/Users/op/org.example.hub-probe.plist")):
+            with self.subTest(field=f"{key}.{field}"):
+                with self.assertRaises(hs.SpecError) as e:
+                    spec(kind_, **{key: dict(sup_section(kind_)[key], **{field: bad})})
+                self.assertIn(f"supervision.{key}.{field} must be directly in", str(e.exception))
+
     def test_the_section_needs_the_hub_section(self):
         d = keys_doc()
         del d[hr.SECTION]
@@ -266,8 +280,8 @@ class WrapperTest(unittest.TestCase):
                 (self.stub / "hold").unlink()
 
 
-def st_(mode, uid=0, nlink=1, kind=stat.S_IFREG):
-    return os.stat_result((kind | mode, 0, 0, nlink, uid, 0, 0, 0, 0, 0))
+def st_(mode, uid=0, nlink=1, kind=stat.S_IFREG, gid=0):
+    return os.stat_result((kind | mode, 0, 0, nlink, uid, gid, 0, 0, 0, 0))
 
 
 class VerifyTest(unittest.TestCase):
@@ -281,8 +295,10 @@ class VerifyTest(unittest.TestCase):
             return data[p]
 
         def lstat(p):
+            if p in (mode_over or {}):
+                return mode_over[p]
             if p in data:
-                return (mode_over or {}).get(p, st_(0o444))
+                return st_(hv.mode_of(s, p))
             return st_(0o755, kind=stat.S_IFDIR)
         return lstat, read
 
@@ -290,9 +306,35 @@ class VerifyTest(unittest.TestCase):
         lstat, read = self.files(s, **kw)
         return [c for c in hv.verify_files(s, lstat, read)]
 
-    def test_placed_files_identical_and_root_0444_pass(self):
-        s = spec()
-        self.assertTrue(all(c.result == rh.PASS for c in self.results(s)))
+    def test_placed_files_identical_root_owned_plists_0644_and_the_rest_0444_pass(self):
+        for kind_ in ("systemd", "launchd"):
+            with self.subTest(kind=kind_):
+                self.assertTrue(all(c.result == rh.PASS for c in self.results(spec(kind_))))
+        s = spec("launchd")
+        self.assertEqual({p: hv.mode_of(s, p) for p, _ in hv.rendered(s)},
+                         {s.supervision.hub["wrapper"]: 0o444, s.supervision.hub["plist"]: 0o644,
+                          s.supervision.weekly["plist"]: 0o644})
+
+    def test_a_plist_at_0444_a_wrapper_at_0644_a_wrong_gid_or_a_writable_parent_fails(self):
+        """Erratum 5(a): the plist is root:wheel 0644 in /Library/LaunchDaemons;
+        the wrapper stays 0444. Each fault fails the check naming that file."""
+        s = spec("launchd")
+        sup = s.supervision
+        for path, over in ((sup.hub["plist"], st_(0o444)), (sup.weekly["plist"], st_(0o444)),
+                           (sup.hub["wrapper"], st_(0o644)), (sup.hub["plist"], st_(0o644, gid=20)),
+                           ("/Library/LaunchDaemons", st_(0o775, kind=stat.S_IFDIR))):
+            with self.subTest(path=path, mode=oct(over.st_mode & 0o7777), gid=over.st_gid):
+                bad = [c for c in self.results(s, mode_over={path: over}) if c.result != rh.PASS]
+                self.assertTrue(bad)
+                self.assertTrue(all(path in c.claim or path in str(c.actual) for c in bad), [c.claim for c in bad])
+
+    def test_the_plan_places_each_plist_with_mode_0644_and_nothing_else_with_a_mode(self):
+        s = spec("launchd")
+        places = [l for l in hv.plan(s, lambda x: x, "STEPS") if l.startswith("STEPS place ")]
+        self.assertEqual([l.split()[3] for l in places if l.endswith(" --mode 0644")],
+                         [s.supervision.hub["plist"], s.supervision.weekly["plist"]])
+        self.assertEqual(sum("--mode" in l for l in places), 2)
+        self.assertFalse(any("--mode" in l for l in hv.plan(spec(), lambda x: x, "STEPS")))
 
     def test_a_placed_file_that_differs_fails_naming_it(self):
         s = spec()
@@ -304,7 +346,7 @@ class VerifyTest(unittest.TestCase):
     def test_a_writable_or_foreign_owned_file_fails(self):
         s = spec()
         unit = s.supervision.hub["unit"]
-        for over in (st_(0o644), st_(0o444, uid=501), st_(0o444, nlink=2)):
+        for over in (st_(0o644), st_(0o444, uid=501), st_(0o444, nlink=2), st_(0o444, gid=20)):
             with self.subTest(over=over):
                 self.assertTrue(any(c.result != rh.PASS for c in self.results(s, mode_over={unit: over})))
 
@@ -383,10 +425,6 @@ class StartGateTest(unittest.TestCase):
                 self.assertNotIn("systemctl", said)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class StartChecksCompositionTest(unittest.TestCase):
     """The start check is the secret's state, the hub's
     files and rendering, the production overlay pin, the key probe's current
@@ -416,3 +454,102 @@ class StartChecksCompositionTest(unittest.TestCase):
                                       "evidence", "supervision"})
         not_active = hs.start_checks(spec(), state="pending_b5", keys={"containers": []})
         self.assertEqual(not_active[0].result, rh.FAIL)
+
+
+class LaunchdEnablementTest(unittest.TestCase):
+    """macOS: launchd loads every plist in /Library/LaunchDaemons at boot, so
+    both labels are disabled BEFORE placing, the start step enables then
+    bootstraps, and verify FAILs a label that is not disabled unless every
+    start check passes now."""
+
+    def test_the_plan_disables_both_labels_before_placing_anything(self):
+        s = spec("launchd")
+        lines = hv.plan(s, lambda x: x, "STEPS")
+        dis = [i for i, l in enumerate(lines) if l.startswith(f"{hv.LAUNCHCTL} disable system/")]
+        place = [i for i, l in enumerate(lines) if l.startswith("STEPS place ")]
+        self.assertEqual([lines[i].split()[2] for i in dis],
+                         ["system/org.example.hub-probe", "system/org.example.hub"])
+        self.assertTrue(place and max(dis) < min(place))
+        self.assertFalse(any("enable" in l.replace("enables nothing", "") and "disable" not in l for l in lines))
+
+    def test_systemd_needs_no_override(self):
+        self.assertEqual(hv.labels(spec()), [])
+        self.assertFalse(any("launchctl" in l for l in hv.plan(spec(), lambda x: x, "STEPS")))
+
+    def test_the_start_step_enables_each_label_then_bootstraps_it(self):
+        self.assertEqual(hv.start_commands(spec("launchd")), [
+            f"{hv.LAUNCHCTL} enable system/org.example.hub-probe",
+            f"{hv.LAUNCHCTL} bootstrap system /Library/LaunchDaemons/org.example.hub-probe.plist",
+            f"{hv.LAUNCHCTL} enable system/org.example.hub",
+            f"{hv.LAUNCHCTL} bootstrap system /Library/LaunchDaemons/org.example.hub.plist"])
+
+    def test_print_disabled_is_read_in_both_spellings(self):
+        """The two spellings `launchctl print-disabled system` is documented to
+        use (disabled/enabled, and true/false on older macOS). NOT measured
+        on a host here."""
+        text = ('disabled services = {\n\t"org.example.hub" => disabled\n'
+                '\t"org.example.hub-probe" => enabled\n\t"com.other" => true\n\t"com.more" => false\n}\n')
+        self.assertEqual(hv.parse_disabled(text), {"org.example.hub": True, "org.example.hub-probe": False,
+                                                   "com.other": True, "com.more": False})
+
+    def results(self, disabled, gate):
+        asked = []
+
+        def g():
+            asked.append(1)
+            return gate
+        return [c.result for c in hv.verify_enablement(spec("launchd"), disabled, g)], asked
+
+    def test_disabled_labels_pass_without_asking_the_gate(self):
+        r, asked = self.results({"org.example.hub": True, "org.example.hub-probe": True}, False)
+        self.assertEqual(r, [rh.PASS, rh.PASS])
+        self.assertEqual(asked, [])
+
+    def test_an_enabled_or_unoverridden_label_fails_unless_the_start_checks_pass_now(self):
+        for state in ({"org.example.hub": False, "org.example.hub-probe": True}, {"org.example.hub-probe": True}):
+            with self.subTest(state=state):
+                r, asked = self.results(state, False)
+                self.assertEqual(r, [rh.PASS, rh.FAIL])
+                r, asked = self.results(state, True)
+                self.assertEqual(r, [rh.PASS, rh.PASS])
+                self.assertEqual(len(asked), 1)
+
+    def test_an_unreadable_override_or_gate_is_unknown(self):
+        r, _ = self.results(rh.Unresolved("no launchctl"), True)
+        self.assertEqual(r, [rh.UNKNOWN, rh.UNKNOWN])
+        r, _ = self.results({}, rh.Unresolved("a start check is UNKNOWN"))
+        self.assertEqual(r, [rh.UNKNOWN, rh.UNKNOWN])
+
+    def test_host_verify_runs_the_enablement_check_for_launchd_only(self):
+        calls = []
+        orig = hs.hv.verify_enablement
+        self.addCleanup(setattr, hs.hv, "verify_enablement", orig)
+        hs.hv.verify_enablement = lambda s, d, g: calls.append((d, g())) or []
+        self.addCleanup(setattr, hs.hv, "checks", hs.hv.checks)
+        hs.hv.checks = lambda *a, **k: []
+        for name in ("verify_roots", "verify_overlay", "verify_containers", "verify_mounts", "verify_openssl",
+                     "verify_umasks", "verify_groups"):
+            self.addCleanup(setattr, hs, name, getattr(hs, name))
+            setattr(hs, name, lambda *a, **k: [])
+        en = {"disabled": {"org.example.hub": True}, "gate": lambda: "gate-asked"}
+        for kind_, want in (("launchd", [({"org.example.hub": True}, "gate-asked")]), ("systemd", [])):
+            with self.subTest(kind=kind_):
+                calls.clear()
+                s = dataclasses.replace(spec(kind_), runtimes=[], secrets=None, hub=None, keys=None)
+                hs.checks(s, production=False, enablement=en)
+                self.assertEqual(calls, want)
+
+    def test_the_gate_is_false_on_a_fail_and_unresolved_on_an_unknown(self):
+        orig = hs.start_checks
+        self.addCleanup(setattr, hs, "start_checks", orig)
+        want = rh.Fact("x", True, "a test")
+        for checks, expect in (([rh.check("a", want, True, "f")], True),
+                               ([rh.check("a", want, False, "f"), rh.unknown("b", want, "?", "f")], False)):
+            hs.start_checks = lambda s, **k: checks
+            self.assertIs(hs.start_gate(spec("launchd")), expect)
+        hs.start_checks = lambda s, **k: [rh.unknown("b", want, "?", "f")]
+        self.assertIsInstance(hs.start_gate(spec("launchd")), rh.Unresolved)
+
+
+if __name__ == "__main__":
+    unittest.main()
