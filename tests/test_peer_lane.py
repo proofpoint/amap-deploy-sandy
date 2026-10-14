@@ -1953,6 +1953,64 @@ class VerifyEndToEndTest(SandboxFixture):
                 self.assertNotIn(slug, row)
             self.assertLess(out.index("\nverify: "), out.index("NOTES"))
 
+    def test_named_sessions_are_one_problem_row_naming_both_sandboxes(self):
+        """Delivery's mode reaches the report: a last launch that declared
+        named sessions (sandy's `claude_sessions`, 52967c3's shape) is a
+        problem while the lister serves panes only, and exit 1."""
+        names = prov.vr.display_names([self.SLUG, self.OTHER])
+        named = {"claude_sessions": {
+                     "declared": [{"slug": "monitor", "name": "monitor",
+                                   "receives": ["cross_session"]}],
+                     "status": None},
+                 "marker": {"state": "present", "sandy_version": "2.9.0", "launched_at": "x"}}
+        with unittest.mock.patch.dict(os.environ, {"COLUMNS": "400"}):
+            rc, out = self._run(extra=named)
+        self.assertEqual(rc, 1, out)
+        row = self._row(out, "named sessions unserved:")
+        for slug in (self.SLUG, self.OTHER):
+            self.assertIn(names[slug], row.split("  ")[-1])
+        # The fixture's daemon is a shell stand-in in a directory no git
+        # checkout holds: its build and its notice pattern are UNKNOWN, and
+        # both reach the report as problems.
+        self._row(out, "daemon version unknown: the payload's inbox-delivery")
+        self.assertIn(names[self.SLUG],
+                      self._row(out, "unhandled count unknown:").split("  ")[-1])
+
+    def test_named_sessions_in_the_host_marker_are_named_without_the_field(self):
+        """A --print-state that does not report claude_sessions, over a last
+        launch whose host marker declared them: named, never pane."""
+        names = prov.vr.display_names([self.SLUG, self.OTHER])
+        (self.sandbox(self.SLUG) / prov.SANDY_SESSION_MARKER_NAME).write_text(json.dumps(
+            {"schema": 1, "sandy_version": "2.8.1-dev",
+             "claude_sessions": [{"slug": "monitor", "name": "monitor",
+                                  "receives": ["cross_session"]}]}))
+        (self.sandbox(self.OTHER) / prov.SANDY_SESSION_MARKER_NAME).write_text(json.dumps(
+            {"schema": 1, "sandy_version": "2.8.1-dev", "claude_sessions": []}))
+        with unittest.mock.patch.dict(os.environ, {"COLUMNS": "400"}):
+            rc, out = self._run(extra={"marker": {"state": "present"}})
+        self.assertEqual(rc, 1, out)
+        row = self._row(out, "named sessions unserved:")
+        self.assertIn(names[self.SLUG], row.split("  ")[-1])
+        self.assertNotIn(names[self.OTHER], row.split("  ")[-1])
+
+    def test_unhandled_peer_notices_reach_the_notes_with_the_deployed_pattern(self):
+        """The real daemon's bytes on the payload, one peer notice in a
+        stopped sandbox's lane and no ledger: a note naming that sandbox."""
+        real = (Path(prov.DEFAULT_CONNECTOR_SRC) / prov.DELIVERY_DAEMON_NAME).read_bytes()
+        (prov.feature_payload_dir(self.home) / prov.DELIVERY_DAEMON_NAME).write_bytes(real)
+        lane = prov.feature_instances_dir(self.home) / self.SLUG / "peer" / "notices"
+        lane.mkdir(parents=True)
+        nid = "a" * 32
+        (lane / f"notice-{nid}.json").write_text(json.dumps(
+            {"contract_version": "2", "kind": "peer", "message": "m", "notice_id": nid,
+             "ts": "2026-10-14T00:00:00Z"}))
+        with unittest.mock.patch.dict(os.environ, {"COLUMNS": "400"}):
+            _rc, out = self._run()
+        row = self._row(out, "1 peer notice(s) with no ledger entry (the daemon has written no "
+                             "ledger yet)")
+        self.assertIn("not running", row)
+        self.assertNotIn("unhandled count unknown:", out)
+
     def test_the_routers_discovery_groups_are_rows_and_all_lists_every_one(self):
         orphans = [f"orphan{i:02d}-0badca{i:02d}" for i in range(10)]
 
