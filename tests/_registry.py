@@ -11,7 +11,7 @@ from pathlib import Path
 import host_adapter as ha
 
 IDS = ha.Identifiers(interface="example-registry.adapter/1", module="example_registry",
-                     operator_module="example_registry.opverbs",
+                     operator_module="example_registry.operator",
                      name_schema="example-registry.name/1")
 
 
