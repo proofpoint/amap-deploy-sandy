@@ -32,6 +32,7 @@ class Server:
 
     def __init__(self):
         self.routes = {}
+        self.posts = {}
         self.auth = []
         outer = self
 
@@ -50,6 +51,17 @@ class Server:
                     fn(self)
                 except (BrokenPipeError, ConnectionResetError):
                     pass
+
+            def do_POST(self):
+                outer.auth.append((self.path, self.headers.get("Authorization")))
+                data = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                fn = outer.posts.get(self.path)
+                if fn is None:
+                    self.send_response(404)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                fn(self, json.loads(data))
 
             def log_message(self, *a):
                 pass
@@ -74,6 +86,25 @@ def body(data, status=200, headers=None, length=True):
             h.send_header("Content-Length", str(len(raw)))
         h.end_headers()
         h.wfile.write(raw)
+    return fn
+
+
+def sequence(*handlers):
+    """A route that answers with each handler in turn, then the last again."""
+    calls = []
+
+    def fn(h, *a):
+        calls.append(1)
+        handlers[min(len(calls), len(handlers)) - 1](h, *a)
+    fn.calls = calls
+    return fn
+
+
+def edits(*diffs):
+    def fn(h, query):
+        doc = {"data": {"repository": {"issueOrPullRequest": {"userContentEdits": {
+            "nodes": [{"diff": d} for d in diffs], "pageInfo": {"hasNextPage": False, "endCursor": None}}}}}}
+        body(doc)(h)
     return fn
 
 
@@ -214,6 +245,42 @@ class BoundedReadTest(Base):
         self.assertEqual((ha.PER_PAGE, ha.MAX_PAGES, ha.IO_TIMEOUT, ha.OBJECT_TIMEOUT), (100, 50, 30, 300))
 
 
+class LongLineTest(Base):
+    """A streamed line longer than MAX_CARRY is scanned in overlapping
+    pieces, so a name is never split between two of them."""
+
+    def test_a_name_across_the_carry_boundary_is_found_once(self):
+        self.patch(MAX_CARRY=4096)
+        lists = hg.Lists(hg.parse_names(NAMES), [], set(), set(), "d")
+        # 4096 - 300 puts the name wholly inside the overlap, so two pieces
+        # both hold it: it must still be reported once.
+        for pad in (4096 - 2, 4096, 4096 - 7, 4096 * 3 - 5, 4096 - 300):
+            with self.subTest(pad=pad):
+                m = hg.Matcher(lists, "r")
+                lines = ha.Lines(m, hg.Where("text", "r", path="log"))
+                data = b"x" * pad + b" zz" + b"-planted-host y" + b"z" * 5000 + b"\nnext\n"
+                for i in range(0, len(data), 700):   # in chunks: the line goes through the carry
+                    lines.feed(data[i:i + 700])
+                lines.finish()
+                self.assertEqual([(f.where.lineno, f.entry) for f in m.findings], [(1, 2)])
+                self.assertEqual(lines.n, 2)
+
+    def test_lines_after_a_long_line_are_whole_lines_again(self):
+        """After a long line, a fixture line and a repeated name are each
+        found on their own line."""
+        from test_hygiene_gate import SIG_LINE
+        self.patch(MAX_CARRY=4096)
+        lists = hg.Lists(hg.parse_names(NAMES), [], set(), {hg.fingerprint_digest(SIG_LINE)}, "d")
+        m = hg.Matcher(lists, "r")
+        lines = ha.Lines(m, hg.Where("text", "r", path="log"))
+        data = b"zz-planted-host " + b"x" * 9000 + b"\n" + SIG_LINE.encode() + b"\nzz-planted-host\n"
+        for i in range(0, len(data), 1000):       # in chunks, so the long line goes through the carry
+            lines.feed(data[i:i + 1000])
+        lines.finish()
+        self.assertEqual([(f.where.lineno, f.what) for f in m.findings],
+                         [(1, "name"), (2, "fixture line"), (3, "name")])
+
+
 class TokenTest(Base):
     def test_the_token_goes_to_the_api_host_and_not_across_a_redirect(self):
         self.api.routes["/repos/o/r/actions/runs/1/logs"] = redirect(self.store.url + "/blob/1")
@@ -321,6 +388,7 @@ class RunTest(Base):
             self.api.routes[f"/repos/o/zzfleet-a/{path}{'&' if '?' in path else '?'}per_page=100"] = body([])
         self.api.routes["/repos/o/zzfleet-a/actions/runs?per_page=100"] = body({"workflow_runs": []})
         self.api.routes["/repos/o/zzfleet-a/actions/artifacts?per_page=100"] = body({"artifacts": []})
+        self.api.posts["/graphql"] = edits()
         self.open_pulls([])
 
     def publish(self):
@@ -355,9 +423,16 @@ class RunTest(Base):
         self.assertEqual(v, [{"repo": "zzfleet-a", "sha": self.clean, "state": "success"}])
         self.assertIn("skipped 0 public repositories", out)
 
+    def issue(self, number, body_text, stamp="2026-10-14T10:00:00Z", pull=True):
+        item = {"number": number, "title": "t", "body": body_text, "updated_at": stamp}
+        if pull:
+            item["pull_request"] = {}
+        return item
+
     def test_a_name_in_a_pull_request_body_is_red_but_never_a_failed_verdict(self):
-        self.api.routes["/repos/o/zzfleet-a/pulls?state=all&per_page=100"] = body(
-            [{"number": 3, "title": "t", "body": "for zzplantedcorp"}])
+        self.api.routes["/repos/o/zzfleet-a/issues?state=all&per_page=100"] = body(
+            [self.issue(3, "for zzplantedcorp")])
+        self.api.routes["/repos/o/zzfleet-a/issues/3"] = body(self.issue(3, "for zzplantedcorp"))
         rc, out, v = self.run_ci()
         self.assertEqual(rc, 1, out)
         self.assertIn("text pull #3", out)
@@ -382,6 +457,76 @@ class RunTest(Base):
         rc, out, v = self.run_ci()
         self.assertEqual(rc, 1, out)
         self.assertEqual([x["state"] for x in v], ["success"])
+
+    def test_a_retained_body_revision_is_read(self):
+        """Text added and then edited away is still in the body's revisions."""
+        self.api.routes["/repos/o/zzfleet-a/issues?state=all&per_page=100"] = body(
+            [self.issue(4, "now clean", pull=False)])
+        self.api.routes["/repos/o/zzfleet-a/issues/4"] = body(self.issue(4, "now clean", pull=False))
+        self.api.posts["/graphql"] = edits("- was for zzplantedcorp\n+ now clean")
+        rc, out, _v = self.run_ci()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("text revision #4/1", out)
+
+    def test_an_object_edited_between_listing_and_read_is_read_again_then_a_limit(self):
+        listed = self.issue(5, "clean", stamp="T1", pull=False)
+        self.api.routes["/repos/o/zzfleet-a/issues?state=all&per_page=100"] = body([listed])
+        self.api.routes["/repos/o/zzfleet-a/issues/5"] = sequence(
+            body(self.issue(5, "edited to zzplantedcorp", stamp="T2", pull=False)),
+            body(self.issue(5, "edited again", stamp="T3", pull=False)))
+        rc, out, _v = self.run_ci()
+        self.assertIn("text issue #5", out, "the newer read is scanned")
+        self.assertIn("LIMIT: zzfleet-a issue #5: still changing", out)
+        self.assertEqual(rc, 1, out)
+
+    def test_an_object_read_once_and_unchanged_is_not_read_again(self):
+        cache = str(self.t / "cache.json")
+        self.api.routes["/repos/o/zzfleet-a/issues?state=all&per_page=100"] = body(
+            [self.issue(6, "fine", pull=False)])
+        read = sequence(body(self.issue(6, "fine", pull=False)))
+        self.api.routes["/repos/o/zzfleet-a/issues/6"] = read
+        self.assertEqual(self.run_ci(cache=cache)[0], 0)
+        self.assertEqual(self.run_ci(cache=cache)[0], 0)
+        self.assertEqual(len(read.calls), 1)
+
+    def test_a_run_whose_read_failed_is_read_again_next_time(self):
+        cache = str(self.t / "cache.json")
+        self.api.routes["/repos/o/zzfleet-a/actions/runs?per_page=100"] = body(
+            {"workflow_runs": [{"id": 5, "status": "completed"}]})
+        self.api.routes["/repos/o/zzfleet-a/actions/runs/5/logs"] = body({}, status=500)
+        rc, out, _ = self.run_ci(cache=cache)
+        self.assertEqual(rc, 2, out)
+        self.api.routes["/repos/o/zzfleet-a/actions/runs/5/logs"] = body(zipped({"s.txt": b"zz-planted-host\n"}))
+        rc, out, _ = self.run_ci(cache=cache)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("text log 5 s.txt:1", out)
+
+    def test_a_nested_archive_stays_a_limit_on_later_runs(self):
+        cache = str(self.t / "cache.json")
+        self.api.routes["/repos/o/zzfleet-a/actions/artifacts?per_page=100"] = body(
+            {"artifacts": [{"id": 8, "name": "a", "expired": False,
+                            "archive_download_url": f"{self.api.url}/repos/o/zzfleet-a/actions/artifacts/8/zip"}]})
+        self.api.routes["/repos/o/zzfleet-a/actions/artifacts/8/zip"] = body(zipped({"inner.zip": b"PK"}))
+        for _ in range(2):
+            rc, out, _ = self.run_ci(cache=cache)
+            self.assertEqual(rc, 2, out)
+            self.assertIn("inner.zip: nested archive", out)
+
+    def test_a_wiki_mirror_that_cannot_be_refreshed_is_a_limit_not_a_stale_scan(self):
+        wiki = Repo(self.t / "wsrc")
+        wiki.commit({"Home.md": "welcome\n"})
+        bare = self.t / "git" / "o" / "zzfleet-a.wiki.git"
+        subprocess.run(["git", "clone", "-q", "--bare", str(wiki.root), str(bare)], check=True, env=ENV,
+                       capture_output=True)
+        self.api.routes["/repos/o/zzfleet-a"] = body({"name": "zzfleet-a", "visibility": "public",
+                                                       "default_branch": "main", "has_wiki": True})
+        rc, out, _ = self.run_ci()
+        self.assertEqual(rc, 0, out)
+        import shutil
+        shutil.rmtree(bare)
+        rc, out, _ = self.run_ci()
+        self.assertEqual(rc, 2, out)
+        self.assertIn("LIMIT: zzfleet-a wiki all: could not be refreshed", out)
 
     def test_a_limit_alone_exits_2_and_still_hands_over_the_verdicts(self):
         self.api.routes["/repos/o/zzfleet-a/releases?per_page=100"] = body({"x": 1}, status=500)

@@ -20,7 +20,12 @@ where the private lists are present. In order:
    issues, their comments, review comments, commit comments, releases (and
    each asset's bytes, for the fixture file hashes), Actions logs and
    artifacts, and the wiki. Discussions are not read: a repository with
-   them enabled is a named limit.
+   them enabled is a named limit. An issue or pull request edited since it
+   was last read whole is read again by itself, with its retained body
+   revisions (GraphQL `userContentEdits`); an object still changing across
+   two reads is a limit. A run or artifact is remembered as read only after
+   a complete read with no limit; a wiki mirror that cannot be refreshed is
+   a limit and is not scanned stale.
 4. The verdicts: for the default branch's head and each open pull request's
    head, `{"repo", "sha", "state"}`, where `state` is `failure` when the
    tree at that sha or any commit reachable from it has a finding. Only
@@ -118,20 +123,23 @@ class Http:
         self.opener = urllib.request.build_opener(NoRedirect)
         self.api_host = urllib.parse.urlsplit(self.api).netloc
 
-    def open(self, url: str, token: Optional[str] = "default"):
+    def open(self, url: str, token: Optional[str] = "default", data: Optional[bytes] = None):
         """The response after redirects, each followed by hand so that the
-        Authorization header never leaves the host it was meant for."""
+        Authorization header never leaves the host it was meant for. A POST
+        (`data`) is never redirected."""
         token = self.token if token == "default" else token
         for _ in range(MAX_REDIRECTS + 1):
-            req = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json",
-                                                       "User-Agent": "amap-hygiene"})
+            req = urllib.request.Request(url, data=data, headers={"Accept": "application/vnd.github+json",
+                                                                  "User-Agent": "amap-hygiene"})
+            if data is not None:
+                req.add_header("Content-Type", "application/json")
             if token and urllib.parse.urlsplit(url).netloc == self.api_host:
                 req.add_header("Authorization", f"Bearer {token}")
             self.budget.requests += 1
             try:
                 resp = self.opener.open(req, timeout=IO_TIMEOUT)
             except urllib.error.HTTPError as e:
-                if e.code in (301, 302, 303, 307, 308) and e.headers.get("Location"):
+                if e.code in (301, 302, 303, 307, 308) and e.headers.get("Location") and data is None:
                     url = urllib.parse.urljoin(url, e.headers["Location"])
                     e.close()
                     continue
@@ -174,12 +182,13 @@ class Http:
             if declared is not None and declared.isdigit() and got != int(declared):
                 raise Limit("truncated")
 
-    def json(self, url: str, token: Optional[str] = "default") -> Tuple[object, Optional[str]]:
+    def json(self, url: str, token: Optional[str] = "default",
+             data: Optional[bytes] = None) -> Tuple[object, Optional[str]]:
         """One JSON document and the `next` link, read whole under MAX_OBJECT."""
         parts: List[bytes] = []
         resp_next: List[Optional[str]] = [None]
         start = time.monotonic()
-        resp = self.open(url, token)
+        resp = self.open(url, token, data)
         with resp:
             m = _NEXT.search(resp.headers.get("Link") or "")
             resp_next[0] = m.group(1) if m else None
@@ -226,7 +235,12 @@ class Http:
 
 
 class Lines:
-    """A streamed body's lines, fed to a Matcher, and its sha256."""
+    """A streamed body's lines, fed to a Matcher, and its sha256. A line
+    longer than MAX_CARRY is scanned in pieces that overlap by
+    hg.LINE_OVERLAP bytes, so a name no longer than that is never split
+    across two pieces; a piece is scanned for names only (it is not a whole
+    line, so it cannot be a fixture line), and a name found in two
+    overlapping pieces is reported once."""
 
     def __init__(self, m: hg.Matcher, where: hg.Where, text: bool = True):
         self.m, self.where, self.text = m, where, text
@@ -234,6 +248,8 @@ class Lines:
         self.carry = b""
         self.n = 0
         self.head = b""
+        self.piece_findings: Set[Tuple[int, int]] = set()
+        self.long = False             # the current line has been scanned in pieces
 
     def feed(self, chunk: bytes) -> None:
         self.sha.update(chunk)
@@ -247,14 +263,35 @@ class Lines:
         *lines, self.carry = data.split(b"\n")
         for line in lines:
             self._line(line)
-        if len(self.carry) > MAX_CARRY:
-            self._line(self.carry)
-            self.carry = b""
+        while len(self.carry) > MAX_CARRY:
+            self._piece(self.carry[:MAX_CARRY])
+            self.long = True
+            self.carry = self.carry[MAX_CARRY - hg.LINE_OVERLAP:]
+
+    def _where(self, lineno: int) -> hg.Where:
+        return hg.Where(self.where.surface, self.where.repo, self.where.commit, self.where.path, lineno)
+
+    def _piece(self, raw: bytes) -> None:
+        w = self._where(self.n + 1)
+        before = len(self.m.findings)
+        self.m.text(w, raw.decode("utf-8", "surrogateescape"))
+        fresh = self.m.findings[before:]
+        del self.m.findings[before:]
+        for f in fresh:
+            if (f.where.lineno, f.entry) not in self.piece_findings:
+                self.piece_findings.add((f.where.lineno, f.entry))
+                self.m.findings.append(f)
 
     def _line(self, raw: bytes) -> None:
+        if self.long:
+            self._piece(raw)            # the tail of a long line
+            self.n += 1
+            self.long = False
+            self.piece_findings = set()
+            return
         self.n += 1
         text = raw.decode("utf-8", "surrogateescape")
-        w = hg.Where(self.where.surface, self.where.repo, self.where.commit, self.where.path, self.n)
+        w = self._where(self.n)
         self.m.text(w, text)
         self.m.fixture_line(w, text)
 
@@ -422,29 +459,87 @@ def scan_git(m: hg.Matcher, repo: str, cache: Dict[str, dict]) -> Dict[str, List
     return {"commits": by_commit, "trees": tree_commits}
 
 
-def scan_api(m: hg.Matcher, http: Http, owner: str, name: str, info: dict, limits: List[str],
-             seen_runs: Set[str]) -> None:
-    """The mutable text surfaces. Each failure is a LIMIT for that surface."""
-    base = f"/repos/{owner}/{name}"
+_REVISIONS = (
+    "query($o:String!,$r:String!,$n:Int!,$after:String){repository(owner:$o,name:$r){"
+    "issueOrPullRequest(number:$n){"
+    "... on Issue{userContentEdits(first:100,after:$after){nodes{diff} pageInfo{hasNextPage endCursor}}}"
+    "... on PullRequest{userContentEdits(first:100,after:$after){nodes{diff} pageInfo{hasNextPage endCursor}}}"
+    "}}}")
 
-    def guarded(surface: str, ident: str, fn: Callable[[], None]) -> None:
+
+def revisions(http: Http, owner: str, name: str, number: int) -> Iterator[str]:
+    """Each retained edit of an issue's or pull request's body (its `diff`),
+    through GraphQL, every page under MAX_PAGES."""
+    after: Optional[str] = None
+    for _page in range(MAX_PAGES):
+        payload = json.dumps({"query": _REVISIONS, "variables": {"o": owner, "r": name, "n": number,
+                                                                 "after": after}}).encode()
+        doc, _ = http.json(f"{http.api}/graphql", data=payload)
+        try:
+            edits = doc["data"]["repository"]["issueOrPullRequest"]["userContentEdits"]
+            nodes, page = edits["nodes"], edits["pageInfo"]
+        except (TypeError, KeyError):
+            raise Limit("revisions unreadable")
+        for node in nodes:
+            if isinstance(node, dict) and isinstance(node.get("diff"), str):
+                yield node["diff"]
+        if not page.get("hasNextPage"):
+            return
+        after = page.get("endCursor")
+    raise Limit("incomplete listing")
+
+
+def scan_api(m: hg.Matcher, http: Http, owner: str, name: str, info: dict, limits: List[str],
+             seen_runs: Set[str], objects: Optional[Dict[str, str]] = None) -> None:
+    """The mutable text surfaces. Each failure is a LIMIT for that surface.
+
+    `seen_runs` holds the Actions runs and artifacts already read whole: one
+    is added only after a complete read that hit no limit, so a failed or
+    partly unreadable one is read again next run. `objects` holds each issue
+    and pull request's `updated_at` as last read whole; one whose listing
+    shows a different value is read again by itself (and once more if that
+    read shows yet another value, after which it is a LIMIT), and its
+    retained body revisions are read."""
+    base = f"/repos/{owner}/{name}"
+    objects = {} if objects is None else objects
+
+    def guarded(surface: str, ident: str, fn: Callable[[], None]) -> bool:
+        """True when `fn` finished and added no LIMIT."""
+        before = len(limits)
         try:
             fn()
         except Limit as e:
             limits.append(f"LIMIT: {name} {surface} {ident}: {e}")
+        return len(limits) == before
 
     def text(surface: str, ident: str, *parts: Optional[str]) -> None:
         body = "\n".join(p for p in parts if isinstance(p, str))
         hg.scan_text(m, f"{surface} {ident}", body.encode("utf-8", "surrogateescape"))
 
-    def pulls():
-        for pr in http.listing(f"{base}/pulls?state=all"):
-            text("pull", f"#{pr.get('number')}", pr.get("title"), pr.get("body"))
-
     def issues():
+        """Issues and pull requests (the issues listing holds both)."""
         for it in http.listing(f"{base}/issues?state=all"):
-            if "pull_request" not in it:
-                text("issue", f"#{it.get('number')}", it.get("title"), it.get("body"))
+            kind = "pull" if "pull_request" in it else "issue"
+            number = it.get("number")
+            ident = f"#{number}"
+            text(kind, ident, it.get("title"), it.get("body"))
+            stamp = it.get("updated_at")
+            key = f"{kind} {ident}"
+            if not isinstance(number, int) or (stamp is not None and objects.get(key) == stamp):
+                continue
+
+            def consistent(it=it, number=number, ident=ident, kind=kind, key=key, stamp=stamp):
+                first, _ = http.json(f"{http.api}{base}/issues/{number}")
+                now = first.get("updated_at") if isinstance(first, dict) else None
+                if now != stamp:
+                    text(kind, ident, first.get("title"), first.get("body"))
+                    again, _ = http.json(f"{http.api}{base}/issues/{number}")
+                    if not isinstance(again, dict) or again.get("updated_at") != now:
+                        raise Limit("still changing")
+                for n, diff in enumerate(revisions(http, owner, name, number), 1):
+                    text("revision", f"{ident}/{n}", diff)
+                objects[key] = now
+            guarded(kind, ident, consistent)
 
     def comments(path: str, surface: str):
         def run():
@@ -471,9 +566,9 @@ def scan_api(m: hg.Matcher, http: Http, owner: str, name: str, info: dict, limit
             rid = str(run.get("id"))
             if rid in seen_runs or run.get("status") != "completed":
                 continue
-            guarded("log", rid, lambda rid=rid: scan_zip(m, http, f"{http.api}{base}/actions/runs/{rid}/logs",
-                                                         f"log {rid}", limits, name))
-            seen_runs.add(rid)
+            if guarded("log", rid, lambda rid=rid: scan_zip(m, http, f"{http.api}{base}/actions/runs/{rid}/logs",
+                                                            f"log {rid}", limits, name)):
+                seen_runs.add(rid)
 
     def artifacts():
         for art in http.listing(f"{base}/actions/artifacts", key="artifacts"):
@@ -481,11 +576,10 @@ def scan_api(m: hg.Matcher, http: Http, owner: str, name: str, info: dict, limit
             text("artifact", aid, art.get("name"))
             if art.get("expired") or f"artifact {aid}" in seen_runs:
                 continue
-            guarded("artifact", aid, lambda aid=aid, art=art: scan_zip(
-                m, http, art.get("archive_download_url") or "", f"artifact {aid}", limits, name))
-            seen_runs.add(f"artifact {aid}")
+            if guarded("artifact", aid, lambda aid=aid, art=art: scan_zip(
+                    m, http, art.get("archive_download_url") or "", f"artifact {aid}", limits, name)):
+                seen_runs.add(f"artifact {aid}")
 
-    guarded("pulls", "listing", pulls)
     guarded("issues", "listing", issues)
     guarded("issue-comments", "listing", comments("issues/comments", "comment"))
     guarded("review-comments", "listing", comments("pulls/comments", "review-comment"))
@@ -545,8 +639,11 @@ def scan_wiki(m: hg.Matcher, git_base: str, owner: str, name: str, workdir: str,
             limits.append(f"LIMIT: {name} wiki all: could not be read")
             return
     else:
-        subprocess.run(["git", "-C", dest, *cfg, "remote", "update", "--prune"], capture_output=True,
-                       env=hg.git_env())
+        p = subprocess.run(["git", "-C", dest, *cfg, "remote", "update", "--prune"], capture_output=True,
+                           env=hg.git_env())
+        if p.returncode:
+            limits.append(f"LIMIT: {name} wiki all: could not be refreshed, so the mirror is stale and was not scanned")
+            return
     wm = hg.Matcher(m.lists, m.repo)
     blobs = hg.Blobs(dest)
     try:
@@ -636,7 +733,8 @@ def run_ci(lists_dir: str, owner: str, repos_path: str, rule_path: str, workdir:
     unused: List[str] = []
     for name in view.public:
         m = hg.Matcher(lists, name)
-        state = cache["repos"].setdefault(name, {"commits": {}, "runs": []})
+        state = cache["repos"].setdefault(name, {"commits": {}, "runs": [], "objects": {}})
+        state.setdefault("objects", {})
         repo = mirror(git_base, owner, name, workdir)
         try:
             info, _ = http.json(f"{http.api}/repos/{owner}/{name}")
@@ -647,7 +745,7 @@ def run_ci(lists_dir: str, owner: str, repos_path: str, rule_path: str, workdir:
         got = scan_git(m, repo, state["commits"])
         dirty = {c for c, rec in state["commits"].items() if rec.get("findings")}
         seen = set(state.get("runs") or [])
-        scan_api(m, http, owner, name, info, limits, seen)
+        scan_api(m, http, owner, name, info, limits, seen, state["objects"])
         state["runs"] = sorted(seen)
         if info.get("has_wiki"):
             scan_wiki(m, git_base, owner, name, workdir, limits)
