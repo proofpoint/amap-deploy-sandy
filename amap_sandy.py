@@ -76,6 +76,8 @@ import router_health as rh  # the router process: its container and its health, 
 import verify_report as vr  # how verify prints: one row per condition, its workspaces beside it
 import host_setup as hsu    # a hop deployment's host plan: rendered and checked, never applied
 import host_adapter as ha   # the host registry's CLI, run as a subprocess, never imported
+import delivery_checks as dc  # delivery itself: lister mode, session posture, daemon build, backlog
+import connector_pin as cpin  # install refuses a connector checkout not at its siblings.json pin
 
 # `fleet_policy.py` sits beside this module. Guarded rather than bare: this
 # module is imported by its tests and by its sibling tools, where HERE is not
@@ -494,6 +496,11 @@ def discover_sandboxes(sandy_bin: str = "sandy") -> List[Dict[str, str]]:
             AGENT_ARGS_KEY: b.get(AGENT_ARGS_KEY),
             MARKER_KEY: b.get(MARKER_KEY),
             CROSS_SESSION_INBOUND_KEY: b.get(CROSS_SESSION_INBOUND_KEY),
+            # Named Claude sessions (sandy 2.9.0): carried ONLY where sandy
+            # reports the key, because absent (a sandy without them) and
+            # null (a last launch it cannot answer for) are different facts.
+            **({dc.CLAUDE_SESSIONS_KEY: b[dc.CLAUDE_SESSIONS_KEY]}
+               if dc.CLAUDE_SESSIONS_KEY in b else {}),
         }
         for b in boxes
         if b.get("name") and b.get("path")
@@ -1015,6 +1022,25 @@ def require_manifest_capable(sandy_bin: str = "sandy") -> None:
 # The private connector directory is inside sandy's own rw mount of
 # `<SANDBOX_DIR>/claude`; the lanes are the manifest's mounts, created by
 # sandy at launch.
+
+
+# The daemon's own layout under the connector state directory, and the lane
+# leaf it watches (payload/relay: AMAP_DELIVERY_STATE_DIR and
+# AMAP_DELIVERY_PEER_NOTICE_DIR; the connector's Ledger keeps `ledger/`).
+DELIVERY_STATE_SUBDIR = "delivery-state"
+DELIVERY_LEDGER_SUBDIR = "ledger"
+PEER_LANE = "peer"
+LANE_NOTICES = "notices"
+
+
+def connector_checkout(connector_src: Optional[Path]) -> Optional[Path]:
+    """The git checkout holding the connector source directory, or None."""
+    if connector_src is None or not Path(connector_src).is_dir():
+        return None
+    r = subprocess.run(["git", "-C", str(connector_src), "rev-parse", "--show-toplevel"],
+                       capture_output=True, text=True, timeout=60)
+    top = r.stdout.strip()
+    return Path(top) if r.returncode == 0 and top else None
 
 
 def connector_state_dir(sandbox_dir: Path) -> Path:
@@ -1938,6 +1964,16 @@ def run_provision(
     return 1 if failed else 0
 
 
+def host_marker(sandbox_dir: Path) -> Any:
+    """The host copy of the launch marker: the parsed file, None when there
+    is none, or a string saying why it could not be read."""
+    path = sandbox_dir / SANDY_SESSION_MARKER_NAME
+    if not path.exists() and not path.is_symlink():
+        return None
+    doc = _read_json(path)
+    return doc if isinstance(doc, (dict, str)) else f"not an object ({path})"
+
+
 def read_session_marker(sandbox_dir: Path) -> Optional[Dict[str, Any]]:
     """sandy's session marker for this sandbox's LAST launch, read on the
     host. `None` when there is none (never launched, or a sandy too old to
@@ -2823,7 +2859,7 @@ def verify_relay_alive(sandbox_dir: Path, slug: str, *, now: Optional[float] = N
     "some process currently numbered that", and the command line is what
     stops the agent pointing the claim at a shell it happens to own."""
     problems: List[str] = []
-    state = connector_state_dir(sandbox_dir) / "delivery-state" / "daemon.json"
+    state = connector_state_dir(sandbox_dir) / DELIVERY_STATE_SUBDIR / "daemon.json"
     doc = _read_json(state)
     if isinstance(doc, str):
         return [f"relay not alive: {slug}: heartbeat {doc}"]
@@ -3715,6 +3751,16 @@ def run_verify(args: argparse.Namespace, servers: Dict[str, dict], home: Path,
     problems += verify_router_mount_sources(home, sibling_state_dir(home, args.state_dir))
     problems += verify_roster(home)
     problems += verify_roster_pointer_exposed(home)
+    # WHICH DAEMON the payload runs, once: its bytes against the connector
+    # pin, and its own notice pattern for the per-sandbox backlog below.
+    payload = feature_payload_dir(home)
+    daemon = dc.daemon_version(
+        payload / DELIVERY_DAEMON_NAME, connector_checkout(args.connector_src),
+        cpin.pinned_commit(),
+        companions=[(payload / DELIVERY_SUPPORT_NAME, f"bin/{DELIVERY_SUPPORT_NAME}")]
+        + [(payload / FEATURE_BIN_SUBDIR / n, f"bin/{n}") for n in CONNECTOR_BINARIES])
+    problems += daemon.problems
+    notes += daemon.notes
     notes.append(CROSS_SESSION_COVERAGE)
     notes.append(f"feature: {feature_root(home)} (manifest, payload, instances; sandy mounts "
                  f"the payload at {CONTAINER_FEATURE_DIR} — the mount is what is verified "
@@ -3762,6 +3808,19 @@ def run_verify(args: argparse.Namespace, servers: Dict[str, dict], home: Path,
                 sandbox_dir, slug, workspace, record=records.get(slug))
             problems += _refuse_problems
             notes += _refuse_notes
+            # Delivery itself: the lister this sandbox's sessions need, and
+            # the peer notices its daemon has not handled.
+            _mode_problems, _mode_notes = dc.verify_sessions(
+                slug, records.get(slug), CONTAINER_FEATURE_DIR,
+                marker=host_marker(sandbox_dir))
+            problems += _mode_problems
+            notes += _mode_notes
+            _backlog_problems, _backlog_notes = dc.verify_unhandled(
+                slug, feature_instances_dir(home) / slug / PEER_LANE / LANE_NOTICES,
+                connector_state_dir(sandbox_dir) / DELIVERY_STATE_SUBDIR / DELIVERY_LEDGER_SUBDIR,
+                daemon.notice_re, daemon.why, now=time.time(), running=slug in running)
+            problems += _backlog_problems
+            notes += _backlog_notes
         # Liveness, the authority, and the invariant — all three only for
         # what sandy reports as running. A stopped sandbox has no relay by
         # definition, no session file to read it out of and no mount to probe,
@@ -3942,6 +4001,14 @@ def run_sync(args: argparse.Namespace, home: Path, boxes_dir: Path) -> int:
       3. The router's config, a generated sibling of the manifest
          (`router_sibling_path`): written under --apply, compared otherwise.
     """
+    # Before anything is written: the connector checkout the payload is
+    # copied from must be at its siblings.json pin (connector_pin).
+    try:
+        cpin.guard(args.connector_src, override=getattr(args, "allow_unpinned_connector", None),
+                   apply=args.apply, log_dir=feature_root(home),
+                   files=(DELIVERY_DAEMON_NAME, DELIVERY_SUPPORT_NAME) + CONNECTOR_BINARIES)
+    except cpin.PinRefused as e:
+        raise ProvisionError(str(e)) from None
     policy_path = feature_manifest_path(home)
     policy = fp.load_policy(policy_path)
     base = getattr(args, "fleet_domain_base", None)
@@ -4675,6 +4742,10 @@ def build_parser() -> argparse.ArgumentParser:
                          f"(default: payload/{DEFAULT_SERVERS.name})")
     ap.add_argument("--connector-src", type=Path, default=DEFAULT_CONNECTOR_SRC,
                     help="directory holding the connector binaries")
+    ap.add_argument(cpin.OVERRIDE_FLAG, dest="allow_unpinned_connector", metavar="REASON", default=None,
+                    help="let install use a connector checkout that is not at its siblings.json pin, "
+                         "or is dirty; the use, both commits and REASON are recorded in the install "
+                         f"log ({cpin.LOG_NAME} beside the manifest) under --apply")
     ap.add_argument("--codex-connector-src", type=Path, default=DEFAULT_CODEX_CONNECTOR_SRC,
                     help=f"the {CODEX_CONNECTOR_REPO_NAME} checkout (optional: without it, "
                          f"a Codex sandbox gets no supervisor)")

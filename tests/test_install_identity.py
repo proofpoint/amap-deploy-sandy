@@ -510,7 +510,11 @@ class InstallVerbTest(unittest.TestCase):
     def main(self, *verb):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            rc = prov.main(["--sandy-home", str(self.home), "--overlay", str(self.overlay), *verb])
+            # Identity, not the connector pin, is under test here: the canary
+            # runs this suite against the connector's main, not its pin.
+            rc = prov.main(["--sandy-home", str(self.home), "--overlay", str(self.overlay),
+                            "--allow-unpinned-connector", "identity tests: the pin is not under test",
+                            *verb])
         return rc, out.getvalue()
 
     def test_install_apply_registers_and_links_a_fresh_sandbox(self):
