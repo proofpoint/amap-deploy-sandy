@@ -12,10 +12,13 @@ Two things are pinned:
 1. the policy text names every label, subject and outcome in the fixture.
    An outcome the text has no words for is a failure, not a pass;
 2. the fixture equals the router checkout's own source, read by parsing it
-   (nothing is imported or run). While the pinned router predates these
-   modules (its pre-hop pin), that comparison is replaced by a check that
-   the pin IS the pre-hop one. Once the pin moves, a code added or renamed
-   in the router turns this red until the fixture and the text follow.
+   (nothing is imported or run), each part against its own module: the
+   local report (outcomes.py) and the `internal` label (deliver.py), which
+   the pinned router already has; the hub report and the two hub labels
+   (ingress.py); the control report (peercontrol.py). A module the checkout
+   lacks is allowed only while siblings.json pins the pre-hop router, and
+   its part is then not compared. A code added or renamed in a module the
+   checkout has turns this red until the fixture and the text follow.
 """
 
 import ast
@@ -59,10 +62,30 @@ class TextCoversTheVocabularyTest(unittest.TestCase):
     def test_the_control_report_subject_is_named(self):
         self.assertIn(f"`{FIXTURE['control_subject']}<id>`", self.text)
 
-    def test_every_control_outcome_has_words(self):
+    def control_sentence(self) -> str:
+        """The policy's bullet about the control report, alone."""
+        start = self.text.index(f"`{FIXTURE['control_subject']}<id>`")
+        end = self.text.find("**", start)
+        return self.text[start:end if end != -1 else None]
+
+    def test_every_control_outcome_has_words_in_the_control_bullet(self):
+        sentence = self.control_sentence()
         for outcome, _cause in FIXTURE["control_failure_text"]:
             self.assertIn(outcome, OUTCOME_WORDS, f"no words for the router's outcome {outcome!r}")
-            self.assertIn(OUTCOME_WORDS[outcome], self.text, outcome)
+            self.assertIn(OUTCOME_WORDS[outcome], sentence, outcome)
+
+    def test_the_local_report_is_the_receiving_sandboxs_claim(self):
+        """The router words it as what the receiving sandbox REPORTED, since
+        that sandbox writes the outcome; the policy must not state it as fact."""
+        self.assertIn("the receiving sandbox reported that a human declined", self.text)
+
+    def test_a_delay_is_not_called_a_failure(self):
+        if "delayed" in FIXTURE["hub_failure_subjects"]:
+            self.assertIn("A delay is not a failure: do not resend on it alone", self.text)
+
+    def test_a_label_the_router_does_not_write_yet_says_so(self):
+        for label in set(FIXTURE["provenance"]) - set(FIXTURE["provenance_emitted"]):
+            self.assertRegex(self.text, r"`" + re.escape(label) + r"`[^.]*\(not used yet\)", label)
 
     def test_a_duplicate_drop_is_not_called_a_failure(self):
         """The router's own text says a duplicate drop is not proof the task
@@ -107,29 +130,43 @@ def _module_literals(tree: ast.Module) -> dict:
     return out
 
 
+def _src(root: Path, name: str):
+    p = root / "router" / name
+    return p.read_text(encoding="utf-8") if p.is_file() else None
+
+
 def router_vocabulary(root: Path) -> dict:
-    """The fixture's members, read from the router checkout's source."""
-    def literals(name: str) -> dict:
-        return _module_literals(ast.parse((root / "router" / name).read_text(encoding="utf-8")))
-    ingress, outcomes, control = literals("ingress.py"), literals("outcomes.py"), literals("peercontrol.py")
-    control_src = (root / "router" / "peercontrol.py").read_text(encoding="utf-8")
-    subject = re.search(r'subject = f"(.+?)\{about\}"', control_src)
-    deliver_src = (root / "router" / "deliver.py").read_text(encoding="utf-8")
-    ingress_src = (root / "router" / "ingress.py").read_text(encoding="utf-8")
-    # The labels the router WRITES: its `provenance="..."` arguments, and the
-    # pair rule's two hub labels. A label it only compares against is not one.
-    emitted = set(re.findall(r'provenance="([a-z-]+)"', deliver_src + ingress_src))
-    pair = re.search(r'want = "([a-z-]+)" if fleet else "([a-z-]+)"', ingress_src)
-    if pair:
-        emitted |= set(pair.groups())
-    return {
-        "provenance_emitted": sorted(emitted),
-        "local_dsn_prefix": outcomes["DSN_SUBJECT_PREFIX"],
-        "local_dsn_outcomes": sorted(outcomes["DSN_OUTCOMES"]),
-        "hub_failure_subjects": dict(ingress["FAILURE_SUBJECT"]),
-        "control_subject": subject.group(1) if subject else None,
-        "control_failure_text": sorted([list(k) for k in control["FAILURE_TEXT"]]),
-    }
+    """{part: (members read from the router's source) or None when the
+    module that holds the part is absent}."""
+    out: dict = {}
+    outcomes, deliver = _src(root, "outcomes.py"), _src(root, "deliver.py")
+    ingress, control = _src(root, "ingress.py"), _src(root, "peercontrol.py")
+    if outcomes is not None:
+        lit = _module_literals(ast.parse(outcomes))
+        out["local"] = {"local_dsn_prefix": lit["DSN_SUBJECT_PREFIX"],
+                        "local_dsn_outcomes": sorted(lit["DSN_OUTCOMES"])}
+    else:
+        out["local"] = None
+    labels = set()
+    for s in (deliver, ingress):
+        if s is not None:
+            labels |= set(re.findall(r'provenance="([a-z-]+)"', s))
+    if ingress is not None:
+        pair = re.search(r'want = "([a-z-]+)" if fleet else "([a-z-]+)"', ingress)
+        if pair:
+            labels |= set(pair.groups())
+        out["hub"] = {"hub_failure_subjects": dict(_module_literals(ast.parse(ingress))["FAILURE_SUBJECT"])}
+    else:
+        out["hub"] = None
+    out["labels"] = sorted(labels)
+    if control is not None:
+        subject = re.search(r'subject = f"(.+?)\{about\}"', control)
+        out["control"] = {"control_subject": subject.group(1) if subject else None,
+                          "control_failure_text": sorted([list(k) for k in
+                                                          _module_literals(ast.parse(control))["FAILURE_TEXT"]])}
+    else:
+        out["control"] = None
+    return out
 
 
 def _pinned_router_commit() -> str:
@@ -138,22 +175,41 @@ def _pinned_router_commit() -> str:
 
 
 class FixtureIsTheRoutersTest(unittest.TestCase):
-    def test_the_fixture_matches_the_router_checkout(self):
-        root = _workspace.ROUTER_ROOT
-        if not (root / "router" / "peercontrol.py").is_file():
-            self.assertEqual(
-                _pinned_router_commit(), FIXTURE["source"]["pre_hop_pin"],
-                "the router checkout has no peercontrol.py, which is allowed only while siblings.json "
-                "pins the pre-hop router; a moved pin must carry the modules this text describes")
+    """Each part against its own module. A part whose module the checkout
+    lacks is allowed only at the pre-hop pin."""
+
+    def setUp(self):
+        self.live = router_vocabulary(_workspace.ROUTER_ROOT)
+
+    def compare(self, part: str):
+        got = self.live[part]
+        if got is None:
+            self.assertEqual(_pinned_router_commit(), FIXTURE["source"]["pre_hop_pin"],
+                             f"the router checkout lacks the module for the {part} report, which is "
+                             f"allowed only while siblings.json pins the pre-hop router")
             return
-        live = router_vocabulary(root)
-        for key, want in live.items():
-            got = FIXTURE[key]
-            if isinstance(got, list):
-                got = sorted(got)
-                want = sorted(want)
-            self.assertEqual(got, want, f"{key}: the router's source differs from the fixture; update "
-                                        f"the fixture, then the policy text")
+        for key, value in got.items():
+            want = FIXTURE[key]
+            self.assertEqual(sorted(want) if isinstance(want, list) else want,
+                             sorted(value) if isinstance(value, list) else value,
+                             f"{key}: the router's source differs from the fixture; update the "
+                             f"fixture, then the policy text")
+
+    def test_the_local_report_matches(self):
+        self.compare("local")
+
+    def test_the_hub_report_matches(self):
+        self.compare("hub")
+
+    def test_the_control_report_matches(self):
+        self.compare("control")
+
+    def test_the_labels_the_router_writes_are_in_the_fixture(self):
+        """Every label the checkout writes is one the fixture (and so the
+        text) has; with the hub module present, exactly the emitted set."""
+        self.assertLessEqual(set(self.live["labels"]), set(FIXTURE["provenance_emitted"]))
+        if self.live["hub"] is not None:
+            self.assertEqual(self.live["labels"], sorted(FIXTURE["provenance_emitted"]))
 
 
 if __name__ == "__main__":

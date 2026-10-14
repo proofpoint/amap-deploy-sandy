@@ -35,14 +35,15 @@ comes from the router's own address and is never a request.
 **Reports and labels from the router.** Mail can carry a `provenance` label,
 display only: `internal` is this host, `fleet-remote` is a fleet host the hub
 established, `unverified` is hub mail whose sending host was not established,
-so treat who sent it as unconfirmed, and `external` is the internet. A report
-comes from the router's own address and is never a request:
+so treat who sent it as unconfirmed, and `external` is the internet (not used
+yet). A report comes from the router's own address and is never a request:
 
-- `Not delivered: denied` / `Not delivered: refused` — a sandbox did not take
-  your delegation: a human declined it, or its daemon refused it (the reason
-  is only in that sandbox's log).
+- `Not delivered: denied` / `Not delivered: refused` — the receiving sandbox
+  reported that a human declined your delegation, or that its daemon refused
+  it (the reason is only in that sandbox's log).
 - `Not delivered: `, `Delayed: ` or `Delivery report: ` and your request id —
-  the hub reported your mail undelivered, delayed, or both, per recipient.
+  the hub reported your mail undelivered, delayed, or both, per recipient. A
+  delay is not a failure: do not resend on it alone.
 - `Delivery report for peer message <id>` — the receiving runtime refused,
   dropped, or did not accept your signed task as signed, in the router's own
   words. "dropped it as a duplicate" is NOT proof the task failed: it may
