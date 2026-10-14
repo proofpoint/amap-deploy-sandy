@@ -96,6 +96,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 import hub_keys as hk      # the local router's key, kept from the email router; no delegation block
 import hub_runtime as hr   # the hub-link router's files and rendering
 import hub_supervise as hv  # the hub-link router's supervision, weekly probe job and start check
+import hop_router as hp     # the local router's hop constant and recorded image (the router section)
 import router_health as rh
 import secret_exposure as se   # who else could reach that secret: every container, every engine
 import secret_setup as ss   # a runtime's secret file: its section, plan steps and checks
@@ -180,6 +181,7 @@ class Spec:
     hub: Optional[hr.HubSpec] = None            # the hub-link router's rendering, when the document has one
     keys: Optional[hk.KeySpec] = None           # the local router's signing key, when the document has one
     supervision: Optional[hv.SupervisionSpec] = None   # the hub-link router's supervisor, when the document has one
+    router: Optional[hp.RouterSpec] = None      # the local router's recorded image, when the document has one
 
     def runtime_of(self, principal: str) -> Dict[str, Any]:
         return next(r for r in self.runtimes if r["principal"] == principal)
@@ -212,7 +214,7 @@ def load_spec(doc: Any) -> Spec:
     if not isinstance(doc, dict) or doc.get("schema") != SPEC_SCHEMA:
         raise SpecError(f"the document is not a {SPEC_SCHEMA} host setup")
     known = {"schema", "principals", "groups", "hops", "roots", "overlay", "agent_paths", "openssl",
-             "mounts", "runtimes", "production", ss.SECTION, hr.SECTION, hk.SECTION, hv.SECTION}
+             "mounts", "runtimes", "production", ss.SECTION, hr.SECTION, hk.SECTION, hv.SECTION, hp.SECTION}
     if set(doc) - known:
         raise SpecError(f"unknown member(s): {', '.join(sorted(set(doc) - known))}")
     production = doc.get("production", False)
@@ -376,6 +378,11 @@ def load_spec(doc: Any) -> Spec:
         try:
             spec = dataclasses.replace(spec, supervision=hv.load(doc[hv.SECTION], spec))
         except hv.SupervisionSpecError as e:
+            raise SpecError(str(e)) from None
+    if hp.SECTION in doc:
+        try:
+            spec = dataclasses.replace(spec, router=hp.load(doc[hp.SECTION], spec))
+        except hp.RouterSpecError as e:
             raise SpecError(str(e)) from None
     return spec
 
@@ -983,7 +990,8 @@ def checks(spec: Spec, *, production: bool, lstat: Callable = os.lstat,
            hub: Optional[Dict[str, Any]] = None,
            keys: Optional[Dict[str, Any]] = None,
            supervision: Optional[Dict[str, Any]] = None,
-           enablement: Optional[Dict[str, Any]] = None) -> List[rh.Check]:
+           enablement: Optional[Dict[str, Any]] = None,
+           router: Optional[Dict[str, Any]] = None) -> List[rh.Check]:
     """Every check of the host against the plan. `production` is ORed with
     the document's own. `secrets` passes probes to the secret's checks;
     `overlay` is the file the document was read from (None for --spec). The
@@ -1009,15 +1017,8 @@ def checks(spec: Spec, *, production: bool, lstat: Callable = os.lstat,
     out += verify_umasks(spec, read_with(parse_proc_status) if umasks is None else umasks)
     out += verify_groups(spec, read_with(parse_proc_groups) if groups is None else groups)
     if spec.secrets is not None:
-        with (secret_lock or ss.Lock)(spec.secrets) as busy:
-            if isinstance(busy, rh.Unresolved):
-                out.append(rh.unknown("the secret's checks ran under the one-shots' lock",
-                                      rh.Fact("lock", True, "no one-shot may start while verify looks"),
-                                      busy.reason, "run verify again when the lock is free"))
-            else:
-                out += ss.checks(spec.secrets, lstat=lstat, digest=digest, held=True,
-                                 overlay=None if overlay is None else str(overlay), **(secrets or {}))
-                out += se.checks(spec, spec.secrets, lock=contextlib.nullcontext, **(exposure or {}))
+        out += secret_checks(spec, lstat=lstat, digest=digest, overlay=overlay, secrets=secrets,
+                             exposure=exposure, secret_lock=secret_lock)
     if spec.hub is not None:
         out += hr.checks(spec, spec.hub, lstat=lstat, **(hub or {}))
     if spec.keys is not None:
@@ -1029,8 +1030,27 @@ def checks(spec: Spec, *, production: bool, lstat: Callable = os.lstat,
             out += hv.verify_enablement(
                 spec, en["disabled"] if "disabled" in en else hv.ask_disabled(spec),
                 en.get("gate") or (lambda: start_gate(spec, lstat=lstat, hub=hub, keys=keys,
-                                                      supervision=supervision)))
+                                                      supervision=supervision)),
+                en.get("loaded") or hv.ask_loaded)
+    if spec.router is not None:
+        out += hp.checks(spec, **(router or {}))
     return out
+
+
+def secret_checks(spec: Spec, *, lstat: Callable, digest: Callable[[str], Any], overlay: Optional[Path] = None,
+                  secrets: Optional[Dict[str, Any]] = None, exposure: Optional[Dict[str, Any]] = None,
+                  secret_lock: Optional[Callable[[Any], Any]] = None) -> List[rh.Check]:
+    """The secret's own checks (§7b) and the exposure sweep over every
+    container (§7d), both under the one-shots' lock, taken once. Shared by
+    `checks` and `start_checks`, so neither calls the other."""
+    with (secret_lock or ss.Lock)(spec.secrets) as busy:
+        if isinstance(busy, rh.Unresolved):
+            return [rh.unknown("the secret's checks ran under the one-shots' lock",
+                               rh.Fact("lock", True, "no one-shot may start while verify looks"),
+                               busy.reason, "run verify again when the lock is free")]
+        return (ss.checks(spec.secrets, lstat=lstat, digest=digest, held=True,
+                          overlay=None if overlay is None else str(overlay), **(secrets or {}))
+                + se.checks(spec, spec.secrets, lock=contextlib.nullcontext, **(exposure or {})))
 
 
 def start_gate(spec: Spec, **probes: Any) -> Any:
@@ -1145,14 +1165,20 @@ def hub_keyprobe(spec_path: Optional[Path], *, apply: bool, overlay: Optional[Pa
 
 def start_checks(spec: Spec, *, lstat: Callable = os.lstat, digest: Callable[[str], Any] = _sha256,
                  hub: Optional[Dict[str, Any]] = None, keys: Optional[Dict[str, Any]] = None,
-                 supervision: Optional[Dict[str, Any]] = None, state: Any = hr.ASK) -> List[rh.Check]:
+                 supervision: Optional[Dict[str, Any]] = None, state: Any = hr.ASK,
+                 overlay: Optional[Path] = None, secrets: Optional[Dict[str, Any]] = None,
+                 exposure: Optional[Dict[str, Any]] = None,
+                 secret_lock: Optional[Callable[[Any], Any]] = None) -> List[rh.Check]:
     """Everything that must hold before the hub-link
-    router starts. The secret's state is active; the D7 file and the
-    environment file are placed and current and the rendering meets every
-    rule (hub_runtime); the production overlay pin; the key probe's CURRENT
-    evidence and the key's placement (hub_keys, without the in-container D7
-    read, which needs the router running); and the supervision's files and
-    the live-start ancestry check (hub_supervise)."""
+    router starts. The secret's state is active; the secret's own checks
+    and the exposure sweep over every container (`secret_checks`, §7b and
+    §7d); the D7 file and the environment file are placed and current and
+    the rendering meets every rule (hub_runtime); the production overlay
+    pin; the key probe's CURRENT evidence and the key's placement (hub_keys,
+    without the in-container D7 read, which needs the router running); and
+    the supervision's files and the live-start ancestry check
+    (hub_supervise). It never calls `checks`, which calls it back through
+    `start_gate`."""
     out: List[rh.Check] = []
     st = ss.state(spec.secrets) if state is hr.ASK else state
     claim = "the secret's state is active"
@@ -1160,6 +1186,8 @@ def start_checks(spec: Spec, *, lstat: Callable = os.lstat, digest: Callable[[st
     remedy = "finish B5 and write the state as the runbook does"
     out.append(rh.unknown(claim, want, st.reason, remedy) if isinstance(st, rh.Unresolved)
                else rh.check(claim, want, st, remedy))
+    out += secret_checks(spec, lstat=lstat, digest=digest, overlay=overlay, secrets=secrets,
+                         exposure=exposure, secret_lock=secret_lock)
     out += hr.checks(spec, spec.hub, lstat=lstat, state=st, **(hub or {}))
     out += verify_overlay(spec, production=True, lstat=lstat, digest=digest)
     if spec.keys is None:
@@ -1204,11 +1232,12 @@ def hub_start_check(spec_path: Optional[Path], *, overlay: Optional[Path] = None
     if spec.supervision is None or spec.hub is None:
         out("hub-start-check: the host-setup document has no hub and supervision sections")
         return 2
-    rc = report(start_checks(spec, **probes), out)
+    rc = report(start_checks(spec, overlay=overlay, **probes), out)
     if rc != 0:
         out("hub-start-check: REFUSED. The hub-link router may not start; nothing to run.")
         return rc
-    out("hub-start-check: every check passed. The start step, as root:")
+    out("hub-start-check: every check passed. `host-setup` (verify) must ALSO pass for this host before "
+        "the start: it checks the whole host, which this does not. The start step, as root:")
     for line in hv.start_commands(spec):
         out(f"  {line}")
     return 0

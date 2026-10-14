@@ -117,6 +117,17 @@ class PlaceTest(Tree):
                       hashlib.sha256(b"<plist/>\n").hexdigest(), "--mode", "0644"])
         self.assertEqual(rc, 0)
         self.assertEqual(self.mode(self.p("ld", "x.plist")), 0o644)
+        for bad_text in ("644x", "rw-r--r--", "0o644", "999"):
+            with self.subTest(mode=bad_text):
+                said = []
+                import io, contextlib
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    rc = st.main(["place", src, self.p("ld", "z.plist"), "--sha256",
+                                  hashlib.sha256(b"<plist/>\n").hexdigest(), "--mode", bad_text])
+                self.assertEqual(rc, 1)
+                self.assertIn("is not an octal mode", err.getvalue())
+                self.assertFalse(os.path.exists(self.p("ld", "z.plist")))
         for bad in (0o666, 0o755, 0o600):
             with self.subTest(mode=oct(bad)):
                 with self.assertRaises(st.StepError):

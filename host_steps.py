@@ -687,6 +687,8 @@ def main(argv):
         elif len(argv) == 5 and argv[0] == "place" and argv[3] == "--sha256":
             place(argv[1], argv[2], sha256=argv[4])
         elif len(argv) == 7 and argv[0] == "place" and argv[3] == "--sha256" and argv[5] == "--mode":
+            if not re.fullmatch(r"0?[0-7]{3}", argv[6]):
+                raise StepError(f"--mode {argv[6]!r} is not an octal mode; 0444 or 0644")
             place(argv[1], argv[2], sha256=argv[4], mode=int(argv[6], 8))
         elif len(argv) == 2 and argv[0] == "marker":
             marker(argv[1])
