@@ -282,11 +282,16 @@ def parse_fingerprints(text: str) -> Tuple[Set[str], Set[str]]:
     return set(files), set(lines)
 
 
-def load_lists(directory: str) -> Lists:
-    """Every list, or CannotRun. The digest is over the three files' bytes."""
+def load_lists(directory: str, fingerprints: bool = True) -> Lists:
+    """Every list, or CannotRun. The digest is over the files' bytes. With
+    `fingerprints` False (the explicit `--no-fingerprints`), fingerprints.json
+    is neither read nor required, the digest says so, and no fixture is
+    matched: a missing fingerprint file is never a silent skip."""
     h = hashlib.sha256()
     texts = {}
-    for name in LIST_FILES:
+    if not fingerprints:
+        h.update(b"no-fingerprints\0")
+    for name in LIST_FILES if fingerprints else LIST_FILES[:2]:
         p = os.path.join(directory, name)
         try:
             with open(p, "rb") as f:
@@ -298,7 +303,7 @@ def load_lists(directory: str) -> Lists:
             texts[name] = data.decode("utf-8")
         except UnicodeDecodeError:
             raise CannotRun(f"{name} is not UTF-8")
-    files, lines = parse_fingerprints(texts["fingerprints.json"])
+    files, lines = parse_fingerprints(texts["fingerprints.json"]) if fingerprints else (set(), set())
     return Lists(parse_names(texts["names.txt"]), parse_allow(texts["allow.txt"]), files, lines,
                  h.hexdigest())
 
@@ -919,11 +924,13 @@ def report(m: Matcher, out=print, show: bool = False) -> None:
             out(f"exceptions: {kind} applied {n} time(s)")
     for ex in m.unused():
         out(f"exceptions: allow.txt line {ex.line} ({ex.kind}) matched nothing")
+    if not m.lists.files and not m.lists.lines:
+        out("fingerprints: not used (--no-fingerprints): no fixture content was matched")
     out(f"lists: sha256 {m.lists.digest}")
 
 
 def scan(args: argparse.Namespace, out=print) -> int:
-    lists = load_lists(args.lists)
+    lists = load_lists(args.lists, not args.no_fingerprints)
     m = Matcher(lists, args.repo)
     needs_git = args.tree or args.range or args.all_history or args.refs
     if needs_git:
@@ -966,8 +973,11 @@ def main(argv: Optional[Sequence[str]] = None, out=print) -> int:
         s.add_argument("--refs", action="store_true")
         s.add_argument("--text", action="append", default=[])
         s.add_argument("--show", action="store_true", help="print each matched entry's text (local use only)")
+        s.add_argument("--no-fingerprints", action="store_true",
+                       help="match names only; fingerprints.json is not read")
     c = sub.add_parser("check-lists", help="load and check the lists, and print their digest")
     c.add_argument("--lists", required=True)
+    c.add_argument("--no-fingerprints", action="store_true")
     f = sub.add_parser("fingerprint", help="build fingerprints.json from the private fixture source")
     f.add_argument("--source", required=True)
     f.add_argument("--bundle", required=True)
@@ -986,6 +996,7 @@ def main(argv: Optional[Sequence[str]] = None, out=print) -> int:
     ci.add_argument("--private-token-env", help="the environment variable holding the metadata-only token")
     ci.add_argument("--verdicts", help="where to write the {repo, sha, state} hand-over")
     ci.add_argument("--cache", help="the incremental cache, keyed by the lists' digest")
+    ci.add_argument("--no-fingerprints", action="store_true", help="match names only")
     h = sub.add_parser("install-hook", help="install a pre-push hook that blocks on exit 1 and 2")
     h.add_argument("--lists", required=True)
     h.add_argument("--repo", required=True)
@@ -997,7 +1008,7 @@ def main(argv: Optional[Sequence[str]] = None, out=print) -> int:
         if args.command == "scan":
             return scan(args, out)
         if args.command == "check-lists":
-            lists = load_lists(args.lists)
+            lists = load_lists(args.lists, not args.no_fingerprints)
             out(f"lists: OK, sha256 {lists.digest}")
             return 0
         if args.command == "fingerprint":
@@ -1021,7 +1032,8 @@ def main(argv: Optional[Sequence[str]] = None, out=print) -> int:
                 args.lists, args.owner, args.repos, args.fleet_rule, args.workdir, api=args.api,
                 git_base=args.git_base, token=os.environ.get(args.token_env) if args.token_env else None,
                 private_token=os.environ.get(args.private_token_env) if args.private_token_env else None,
-                verdicts_out=args.verdicts, cache_path=args.cache, out=out)
+                verdicts_out=args.verdicts, cache_path=args.cache, out=out,
+                fingerprints=not args.no_fingerprints)
         if args.command == "install-hook":
             out(f"install-hook: wrote {install_hook(args.git, args.lists, args.repo)}")
             return 0

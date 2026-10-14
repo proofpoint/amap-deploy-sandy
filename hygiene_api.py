@@ -622,8 +622,8 @@ def load_cache(path: Optional[str], digest: str) -> dict:
 
 def run_ci(lists_dir: str, owner: str, repos_path: str, rule_path: str, workdir: str, *, api: str,
            git_base: str, token: Optional[str], private_token: Optional[str], verdicts_out: Optional[str],
-           cache_path: Optional[str], out=print) -> int:
-    lists = hg.load_lists(lists_dir)
+           cache_path: Optional[str], out=print, fingerprints: bool = True) -> int:
+    lists = hg.load_lists(lists_dir, fingerprints)
     fleet = load_fleet(repos_path, rule_path)
     budget = Budget()
     http = Http(api.rstrip("/"), token, budget)
@@ -680,6 +680,8 @@ def run_ci(lists_dir: str, owner: str, repos_path: str, rule_path: str, workdir:
         "repositories outside the fleet rule")
     out(f"api: {budget.requests} requests, {budget.used} bytes; rate limit remaining "
         f"{budget.rate_remaining if budget.rate_remaining is not None else 'not reported'}")
+    if not fingerprints:
+        out("fingerprints: not used (--no-fingerprints): no fixture content was matched")
     out(f"lists: sha256 {lists.digest}" + ("" if full else " (incremental: commits scanned before were skipped)"))
     if verdicts_out:
         tmp = verdicts_out + ".tmp"

@@ -325,6 +325,22 @@ class CannotRunTest(GateTest):
         self.refused(names="token zzplantedcorp\nallow abc[0-9]\n+ abcx\n- abd1\n")
         self.refused(names="token zzplantedcorp\nallow abc[0-9]\n+ abc1\n- abc2\n")
 
+    def test_no_fingerprints_is_explicit_never_a_silent_skip(self):
+        """Without the flag, a missing fingerprints.json cannot run; with it,
+        names are still matched, no fixture is, the output says so, and the
+        digest differs from a run with fingerprints."""
+        self.repo.commit({"copy.json": FIX_FILE, "n.txt": "zz-planted-host\n"})
+        with_fp = hg.load_lists(str(self.lists)).digest
+        (self.lists / "fingerprints.json").unlink()
+        rc, out = self.run_gate("--tree", "HEAD")
+        self.assertEqual(rc, 2, out)
+        rc, out = self.run_gate("--tree", "HEAD", "--no-fingerprints")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("n.txt:1", out)
+        self.assertNotIn("fixture", out.replace("no fixture content", ""))
+        self.assertIn("fingerprints: not used (--no-fingerprints)", out)
+        self.assertNotEqual(hg.load_lists(str(self.lists), False).digest, with_fp)
+
     def test_a_shallow_clone(self):
         self.repo.commit({"more.txt": "m\n"})
         shallow = self.t / "shallow"
