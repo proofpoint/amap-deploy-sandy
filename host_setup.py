@@ -1126,7 +1126,7 @@ def hub_keyprobe(spec_path: Optional[Path], *, apply: bool, overlay: Optional[Pa
 def start_checks(spec: Spec, *, lstat: Callable = os.lstat, digest: Callable[[str], Any] = _sha256,
                  hub: Optional[Dict[str, Any]] = None, keys: Optional[Dict[str, Any]] = None,
                  supervision: Optional[Dict[str, Any]] = None, state: Any = hr.ASK) -> List[rh.Check]:
-    """DS-12b §7.1 step 7: everything that must hold before the hub-link
+    """Everything that must hold before the hub-link
     router starts. The secret's state is active; the D7 file and the
     environment file are placed and current and the rendering meets every
     rule (hub_runtime); the production overlay pin; the key probe's CURRENT
@@ -1143,7 +1143,7 @@ def start_checks(spec: Spec, *, lstat: Callable = os.lstat, digest: Callable[[st
     out += hr.checks(spec, spec.hub, lstat=lstat, state=st, **(hub or {}))
     out += verify_overlay(spec, production=True, lstat=lstat, digest=digest)
     if spec.keys is None:
-        out.append(rh.unknown("the key probe's evidence is current", rh.Fact("keys", True, "DS-12b §7.1 step 7"),
+        out.append(rh.unknown("the key probe's evidence is current", rh.Fact("keys", True, "the router starts only on current key-probe evidence"),
                               "the document has no keys section", "add the keys section and run the key probe"))
     else:
         k = keys or {}

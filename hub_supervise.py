@@ -48,16 +48,16 @@ import secret_setup as ss
 
 SECTION = "supervision"
 KINDS = ("systemd", "launchd")
-#: Erratum 15: these exits never restart; every other non-zero exit does.
+#: The restart policy: these exits never restart; every other non-zero exit does.
 NO_RESTART = (2, 3, 4, 5, 6, 7, 8, 9, 10, 11)
-#: Dan's DS-12b-SYSTEMD-143 = B: the code a planned stop ends with.
+#: The code a planned stop may end with, treated as a success (the operator's ruling).
 STOP_CODE = 143
 RESTART_SEC = 30
 START_LIMIT_INTERVAL_S = 600
 START_LIMIT_BURST = 5
-#: `docker stop -t`: at least the rendered dot budget + 60 s (RE-PREMAIL-HOLD
-#: v2.2), so a stop during a slow dot ends in the hub's own join, never in the
-#: engine's kill.
+#: `docker stop -t`: at least the rendered dot budget + 60 s, the router's own
+#: join bound, so a stop during a slow dot ends in the router's join, never in
+#: the engine's kill.
 STOP_TIMEOUT_S = 100
 #: The supervisors' own bounds sit above the stop: systemd's default
 #: TimeoutStopSec (90 s) and launchd's default ExitTimeOut (20 s) are below it.
@@ -227,13 +227,13 @@ def systemd_weekly(spec: Any) -> Tuple[bytes, bytes]:
 
 
 def wrapper(spec: Any) -> bytes:
-    """amap-hub-run, POSIX sh (dash and bash --posix), d3 §7.3 with errata 5."""
+    """The macOS wrapper, POSIX sh (dash and bash --posix)."""
     sup = spec.supervision
     q = shlex.quote
     keep = "|".join(map(str, (0,) + NO_RESTART))
     run = " ".join(q(a) for a in run_argv(spec))
     return f"""#!/bin/sh
-# amap-hub-run. Rendered by amap-deploy-sandy hub-supervise from the anchored
+# hub-link-run. Rendered by amap-deploy-sandy hub-supervise from the anchored
 # overlay; placed root 0444 by the pinned writer and run by its LaunchDaemon as
 # /bin/sh <this file>. Never edit it.
 set -u
@@ -242,7 +242,7 @@ NAME={q(hub_name(spec))}
 STATUS={q(sup.hub['status'])}
 DOCKER_HOST={q(sup.engine)}
 export DOCKER_HOST
-say() {{ printf 'amap-hub-run: %s\\n' "$1" >&2; }}
+say() {{ printf 'hub-link-run: %s\\n' "$1" >&2; }}
 record() {{
     printf '%s %s\\n' "$1" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$STATUS.tmp" && mv -f "$STATUS.tmp" "$STATUS"
 }}

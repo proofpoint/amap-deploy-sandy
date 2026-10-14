@@ -35,13 +35,13 @@ REQ = [{"name": "the IMAP secret unit", "commit": "a" * 40}, {"name": "the image
 def sup_section(kind="systemd"):
     if kind == "systemd":
         return {"kind": "systemd", "engine": "unix:///var/run/docker.sock",
-                "hub": {"unit": "/etc/systemd/system/amap-hub.service"},
-                "weekly": {"service": "/etc/systemd/system/amap-hub-probe.service",
-                           "timer": "/etc/systemd/system/amap-hub-probe.timer", "weekday": 1, "hour": 4, "minute": 17},
+                "hub": {"unit": "/etc/systemd/system/hub-link.service"},
+                "weekly": {"service": "/etc/systemd/system/hub-link-probe.service",
+                           "timer": "/etc/systemd/system/hub-link-probe.timer", "weekday": 1, "hour": 4, "minute": 17},
                 "requires": REQ}
     return {"kind": "launchd", "engine": "unix:///Users/op/.orbstack/run/docker.sock",
             "hub": {"label": "org.example.hub", "plist": "/Library/LaunchDaemons/org.example.hub.plist",
-                    "wrapper": "/opt/ex/libexec/amap-hub-run", "status": "/opt/ex/status/hub-run"},
+                    "wrapper": "/opt/ex/libexec/hub-link-run", "status": "/opt/ex/status/hub-run"},
             "weekly": {"label": "org.example.hub-probe", "plist": "/Library/LaunchDaemons/org.example.hub-probe.plist",
                        "weekday": 1, "hour": 4, "minute": 17},
             "requires": REQ}
@@ -70,7 +70,7 @@ class LoadTest(unittest.TestCase):
         self.refuses("supervision.engine", engine="tcp://x:2375")
         self.refuses("supervision.requires", requires=[])
         self.refuses("full commit sha", requires=[{"name": "x", "commit": "abc"}])
-        self.refuses(".service path", hub={"unit": "/etc/systemd/system/amap-hub"})
+        self.refuses(".service path", hub={"unit": "/etc/systemd/system/hub-link"})
         with self.assertRaises(hs.SpecError) as e:
             spec("launchd", hub=dict(sup_section("launchd")["hub"], plist="/Library/LaunchDaemons/other.plist"))
         self.assertIn("<label>.plist", str(e.exception))
@@ -92,7 +92,7 @@ class SystemdTest(unittest.TestCase):
         [l] = [l for l in self.unit().splitlines() if l.startswith(key + "=")]
         return l.split("=", 1)[1]
 
-    def test_the_restart_policy_is_erratum_15s_with_143_a_success(self):
+    def test_the_restart_policy_never_restarts_0_or_2_to_11_and_143_is_a_success(self):
         self.assertEqual(self.line("RestartPreventExitStatus").split(), [str(c) for c in range(2, 12)])
         self.assertEqual(self.line("SuccessExitStatus"), "143")
         self.assertNotIn("143", self.line("RestartPreventExitStatus").split())
@@ -117,7 +117,7 @@ class SystemdTest(unittest.TestCase):
         plan = "\n".join(hv.plan(spec(), lambda x: x, "steps"))
         self.assertNotIn("systemctl", plan)
         self.assertNotIn("launchctl", hv.plan(spec("launchd"), lambda x: x, "steps")[-1])
-        self.assertIn("systemctl enable --now amap-hub.service", hv.start_commands(spec()))
+        self.assertIn("systemctl enable --now hub-link.service", hv.start_commands(spec()))
 
     def test_the_weekly_job_runs_the_probe_under_the_lock(self):
         service, timer = hv.systemd_weekly(spec())
@@ -126,7 +126,7 @@ class SystemdTest(unittest.TestCase):
         self.assertIn("probe-weekly", argv)
         self.assertIn("probe-login", argv)
         self.assertIn(b"OnCalendar=Mon *-*-* 04:17:00", timer)
-        self.assertIn(b"Unit=amap-hub-probe.service", timer)
+        self.assertIn(b"Unit=hub-link-probe.service", timer)
         self.assertIn(b"Type=oneshot", service)
 
 
@@ -134,11 +134,11 @@ class LaunchdTest(unittest.TestCase):
     def test_the_daemon_runs_the_wrapper_only_through_sh(self):
         s = spec("launchd")
         doc = plistlib.loads(hv.hub_plist(s))
-        self.assertEqual(doc["ProgramArguments"], ["/bin/sh", "/opt/ex/libexec/amap-hub-run"])
+        self.assertEqual(doc["ProgramArguments"], ["/bin/sh", "/opt/ex/libexec/hub-link-run"])
         self.assertEqual(doc["KeepAlive"], {"SuccessfulExit": False})
         self.assertGreater(doc["ExitTimeOut"], hv.STOP_TIMEOUT_S)
         others = [data for path, data in hv.rendered(s) if path != s.supervision.hub["plist"]]
-        self.assertFalse(any(b"/opt/ex/libexec/amap-hub-run" in d for d in others),
+        self.assertFalse(any(b"/opt/ex/libexec/hub-link-run" in d for d in others),
                          "something other than the daemon's plist invokes the wrapper")
 
     def test_the_weekly_daemon_sets_the_engine_and_the_schedule(self):
@@ -167,7 +167,7 @@ esac
 
 
 class WrapperTest(unittest.TestCase):
-    """d3 §7.3 and errata 5, on the rendered wrapper, under dash and bash --posix."""
+    """The rendered wrapper, under dash and bash --posix."""
 
     SHELLS = [["/bin/sh"], ["bash", "--posix"]]
 
@@ -183,7 +183,7 @@ class WrapperTest(unittest.TestCase):
         s = spec("launchd")
         sec = dataclasses.replace(s.secrets, tools=dict(s.secrets.tools, docker=str(docker)))
         sup = dataclasses.replace(s.supervision, hub=dict(s.supervision.hub, status=str(self.t / "status")))
-        self.script = self.t / "amap-hub-run"
+        self.script = self.t / "hub-link-run"
         self.script.write_bytes(hv.wrapper(dataclasses.replace(s, secrets=sec, supervision=sup)))
 
     def run_it(self, shell, code=None, state=None):
@@ -206,7 +206,7 @@ class WrapperTest(unittest.TestCase):
         p = self.t / "status"
         return p.read_text().split()[0] if p.exists() else None
 
-    def test_every_code_maps_as_erratum_15_says(self):
+    def test_every_code_maps_as_the_restart_policy_says(self):
         for shell in self.SHELLS:
             for code in list(range(0, 14)) + [125, 126, 127, 137, 143]:
                 with self.subTest(shell=shell, code=code):
@@ -372,7 +372,7 @@ class StartGateTest(unittest.TestCase):
     def test_a_pass_prints_the_start_step(self):
         rc, said = self.run_gate([rh.PASS, rh.PASS])
         self.assertEqual(rc, 0)
-        self.assertIn("systemctl enable --now amap-hub.service", said)
+        self.assertIn("systemctl enable --now hub-link.service", said)
 
     def test_any_fail_or_unknown_refuses_and_prints_no_start_step(self):
         for bad in (rh.FAIL, rh.UNKNOWN):
@@ -388,7 +388,7 @@ if __name__ == "__main__":
 
 
 class StartChecksCompositionTest(unittest.TestCase):
-    """DS-12b §7.1 step 7: the start check is the secret's state, the hub's
+    """The start check is the secret's state, the hub's
     files and rendering, the production overlay pin, the key probe's current
     evidence (without the in-container D7 read) and the supervision's files
     and ancestry. Each group is replaced by a marker to show it is called."""
