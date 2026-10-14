@@ -595,7 +595,8 @@ def live_problems(spec: Any, keys: Dict[str, Any], roots: Any, *, run: Callable 
     except rh.CannotRun as e:
         bad.append(f"the plugin preflight cannot run: {e}")
         return bad
-    if pf.out.strip() != "ok":
+    # Both: a container that exits non-zero has not passed, whatever it printed.
+    if pf.rc != 0 or pf.out.strip() != "ok":
         line = (pf.out.strip() or pf.err.strip()).splitlines()
         bad.append(f"the router's own plugin checks, in its image, refuse: {line[-1] if line else 'exit ' + str(pf.rc)}")
     return bad

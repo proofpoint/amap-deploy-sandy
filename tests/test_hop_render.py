@@ -427,6 +427,7 @@ class LiveTest(unittest.TestCase):
         self.keys = hp.hop_keys(self.s, link(), FLEET_DOMAIN)
         self.calls = []
         self.security = ["name=seccomp,profile=builtin", "name=cgroupns"]
+        self.preflight_rc = None
 
     def container(self, **over):
         k = self.keys
@@ -447,7 +448,8 @@ class LiveTest(unittest.TestCase):
             if argv[:2] == ["docker", "inspect"]:
                 return Proc(inspect_rc, json.dumps([c]) if inspect_rc == 0 else "")
             if argv[:2] == ["docker", "run"]:
-                return Proc(0 if preflight.startswith("ok") else 1, preflight)
+                return Proc(self.preflight_rc if self.preflight_rc is not None
+                            else (0 if preflight.startswith("ok") else 1), preflight)
             if argv[:2] == ["docker", "info"]:
                 return Proc(0, json.dumps(self.security))
             raise AssertionError(argv)
@@ -485,6 +487,9 @@ class LiveTest(unittest.TestCase):
         self.assertTrue(any("not the recorded" in p for p in self.probe(c=self.container(Image="sha256:" + "0" * 64))))
         self.assertTrue(any("refuse: refused parent_owner" in p for p in self.probe(preflight="refused parent_owner x")))
         self.assertTrue(any("not running" in p for p in self.probe(inspect_rc=1)))
+        self.preflight_rc = 125              # the engine failed, though "ok" reached stdout
+        self.assertTrue(any("refuse" in p for p in self.probe()), "a non-zero preflight exit never passes")
+        self.preflight_rc = None
         self.security = ["name=userns"]
         self.assertTrue(any("daemon-wide" in p for p in self.probe()), "a daemon-wide remap leaves UsernsMode empty")
         self.security = "not a list"
