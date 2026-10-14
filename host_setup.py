@@ -1236,7 +1236,9 @@ def hub_start_check(spec_path: Optional[Path], *, overlay: Optional[Path] = None
     if spec.supervision is None or spec.hub is None:
         out("hub-start-check: the host-setup document has no hub and supervision sections")
         return 2
-    rc = report(start_checks(spec, overlay=overlay, **probes), out)
+    # The document's provenance, as `run` gives it: a --spec document is never
+    # checked as though it were read from the anchored overlay.
+    rc = report(start_checks(spec, overlay=None if spec_path is not None else overlay, **probes), out)
     if rc != 0:
         out("hub-start-check: REFUSED. The hub-link router may not start; nothing to run.")
         return rc

@@ -485,7 +485,7 @@ class StartSweepTest(unittest.TestCase):
         self.assertTrue(fails)
         return found
 
-    def gate(self, exposure_found, secrets_checks=None, overlay=None):
+    def gate(self, exposure_found, secrets_checks=None, overlay=None, spec_path=None):
         good = [rh.check("x", rh.Fact("x", True, "a test"), True, "x")]
         built = spec()
 
@@ -500,7 +500,7 @@ class StartSweepTest(unittest.TestCase):
             self.addCleanup(setattr, mod, name, getattr(mod, name))
             setattr(mod, name, value)
         said = []
-        rc = hs.hub_start_check(None, overlay=overlay, out=said.append, state="active", keys={"containers": []},
+        rc = hs.hub_start_check(spec_path, overlay=overlay, out=said.append, state="active", keys={"containers": []},
                                 secret_lock=free_lock)
         return rc, "\n".join(said)
 
@@ -516,6 +516,23 @@ class StartSweepTest(unittest.TestCase):
         clean = [rh.check("y", rh.Fact("y", True, "a test"), True, "x")]
         rc, said = self.gate(clean, secrets_checks=secrets, overlay=ov)
         self.assertEqual(rc, 0, said)
+
+    def test_a_spec_document_is_never_checked_as_the_overlay(self):
+        """The CLI supplies the overlay path even with --spec: the document
+        actually read is the --spec copy, so the secrets checks must see no
+        overlay, and their provenance check FAILs."""
+        ov = Path("/srv/overlay/host.json")
+        seen = []
+
+        def secrets(spec_, **k):
+            seen.append(k.get("overlay"))
+            ok = k.get("overlay") == str(ov)
+            return [rh.check("the document was read from the overlay", rh.Fact("o", True, "a test"), ok, "x")]
+        clean = [rh.check("y", rh.Fact("y", True, "a test"), True, "x")]
+        rc, said = self.gate(clean, secrets_checks=secrets, overlay=ov, spec_path=Path("/tmp/copied-host.json"))
+        self.assertNotEqual(rc, 0, said)
+        self.assertEqual(seen, [None])
+        self.assertIn("REFUSED", said)
 
     def test_a_planted_overlap_refuses_the_start_step(self):
         rc, said = self.gate(self.planted_overlap())

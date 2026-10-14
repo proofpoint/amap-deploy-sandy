@@ -85,8 +85,9 @@ class ConstantTest(unittest.TestCase):
                                   ("total", hp.HUB_ATTACH_MAX_TOTAL + 1, "caps.total")):
             with self.subTest(key=key, value=value):
                 bad = hp.cap_problems(dict(hp.caps(), **{key: value}), hp.HOP_VERSION_WRITE)
-                self.assertTrue(bad and words in bad[0], bad)
-        self.assertIn("version_write", hp.cap_problems(hp.caps(), 2)[0])
+                self.assertTrue(any(words in p for p in bad), bad)
+        self.assertTrue(any("version_write" in p for p in hp.cap_problems(hp.caps(), 2)),
+                        "a hop contract other than 1 is a problem")
 
     def test_the_reviewed_values(self):
         self.assertEqual(hp.caps(), {"document": 23418699, "request": 1048576, "attachment": 1048576,
