@@ -24,6 +24,11 @@ anything the strictest reader would refuse:
   or a statement that is not the approved one, byte for byte;
 - a domain set that differs from the fleet hosts the local router is given.
 
+The source's own `host_domains` is the canonical record of each host's
+domain: this host's entry must be exactly the overlay's own domain, and the
+link's set must be exactly every other host's domains, so the overlay's own
+domain and fleet hosts cannot drift from the producer together.
+
 A source that does not attest, or holds no link for this host, renders
 NOTHING (`NotAttested`): no hub-link router starts without an attested set,
 and a file already deployed stays until the operator stops that router.
@@ -187,7 +192,11 @@ def source_link(raw: bytes, rules: Rules) -> Union[Dict[str, Any], NotAttested]:
         raise D7Error("shape", "host_domains must be an object and links a list")
     if doc["attested"] is not True:
         return NotAttested("the source is not attested")
-    mine = [ln for ln in doc["links"] if isinstance(ln, dict) and ln.get("host") == rules.host_label]
+    for i, ln in enumerate(doc["links"]):
+        if not isinstance(ln, dict) or not isinstance(ln.get("host"), str) or not ln["host"]:
+            raise D7Error("links", f"links[{i}] is not a link object naming its host")
+    others = _host_domains(doc["host_domains"], rules)
+    mine = [ln for ln in doc["links"] if ln["host"] == rules.host_label]
     if not mine:
         return NotAttested(f"the source has no link for {rules.host_label}")
     if len(mine) > 1:
@@ -198,12 +207,35 @@ def source_link(raw: bytes, rules: Rules) -> Union[Dict[str, Any], NotAttested]:
     domains = check_domains(link["delivered_domains"], rules)
     check_hash(link["delivered_domains_sha256"], domains, "delivered_domains_sha256")
     attestation = check_attestation(link["attestation"], rules)
+    if set(domains) != others:
+        raise D7Error("host_domains", "the link's domains are not exactly every other host's domains in "
+                                      "the source's host_domains")
     if set(domains) != set(rules.fleet_hosts):
         raise D7Error("fleet", f"{len(set(domains) - set(rules.fleet_hosts))} delivered domain(s) are not "
                                f"fleet hosts and {len(set(rules.fleet_hosts) - set(domains))} fleet host(s) "
                                f"are not delivered")
     return {"delivered_domains": domains, "sha256": link["delivered_domains_sha256"],
             "attestation": attestation}
+
+
+def _host_domains(hd: Any, rules: Rules) -> set:
+    """The canonical record of each host's domains: this host's must be
+    exactly the own domain; returns every other host's."""
+    if not isinstance(hd, dict) or not hd:
+        raise D7Error("host_domains", "host_domains must be a non-empty object")
+    others = set()
+    for host, ds in hd.items():
+        if not isinstance(ds, list) or not ds or any(not isinstance(d, str) or not _DOMAIN.fullmatch(d)
+                                                     for d in ds):
+            raise D7Error("host_domains", f"host_domains.{host} must list lower-case <label>.internal domains")
+        if host != rules.host_label:
+            others |= set(ds)
+    if hd.get(rules.host_label) != [rules.own_domain]:
+        raise D7Error("host_domains", f"host_domains.{rules.host_label} is not exactly [{rules.own_domain}], "
+                                      f"the overlay's own domain")
+    if rules.own_domain in others:
+        raise D7Error("host_domains", f"{rules.own_domain} is listed for another host too")
+    return others
 
 
 def render(raw: bytes, rules: Rules) -> Union[bytes, NotAttested]:
@@ -261,9 +293,52 @@ def read_file(path: str) -> bytes:
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise OSError(f"{path} is not a regular file")
-        return os.read(fd, MAX_BYTES + 1)
+        return read_bounded(fd, MAX_BYTES + 1)
     finally:
         os.close(fd)
+
+
+def read_bounded(fd: int, limit: int) -> bytes:
+    """Read to EOF or `limit` bytes, whichever comes first: a short read is
+    not the end."""
+    chunks, total = [], 0
+    while total < limit:
+        chunk = os.read(fd, limit - total)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+    return b"".join(chunks)
+
+
+def write_all(fd: int, data: bytes) -> None:
+    """Write every byte: a short write is continued, never taken as done."""
+    view = memoryview(data)
+    while view:
+        n = os.write(fd, view)
+        if n <= 0:
+            raise OSError("write made no progress")
+        view = view[n:]
+
+
+def write_atomically(path: str, data: bytes) -> None:
+    """`data` into `path` by a fresh temporary name and a rename; the
+    temporary file is removed if anything fails before the rename."""
+    tmp = f"{path}.{os.getpid()}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0), 0o600)
+    try:
+        try:
+            write_all(fd, data)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def verify(d7_dir: str, name: str, rules: Rules, source: Any, *, lstat: Callable = os.lstat,
@@ -359,9 +434,14 @@ def _content(path: str, deployed: Any, rules: Rules, source: Any) -> List[rh.Che
         out.append(rh.check(claim, want, f"the source refuses: {e}", "correct the source (its producer's step)"))
         return out
     if isinstance(fresh, NotAttested):
-        out.append(rh.check(claim, want, f"{fresh.reason}: the source no longer attests this link",
-                            "stop the hub-link router (the operator's step) until the source attests again",
-                            do_not="never keep it running on a set the source no longer attests"))
+        if deployed is None:
+            out.append(rh.check(claim, want, f"{fresh.reason}: not attested yet, so nothing is rendered",
+                                "the operator attests the link in the source; the hub-link router stays "
+                                "stopped until then"))
+        else:
+            out.append(rh.check(claim, want, f"{fresh.reason}: the source no longer attests this link",
+                                "stop the hub-link router (the operator's step) until the source attests again",
+                                do_not="never keep it running on a set the source no longer attests"))
         return out
     if isinstance(deployed, rh.Unresolved) or deployed is None:
         out.append(rh.unknown(claim, want, "the deployed file could not be read", remedy)
@@ -371,8 +451,9 @@ def _content(path: str, deployed: Any, rules: Rules, source: Any) -> List[rh.Che
     claim = f"the D7 file {path} carries the source link's domains, hash and attestation"
     want = _fact("D7 fields", True, "compared parsed, never by re-serialising the source")
     link = source_link(source, rules)
-    same = parsed is not None and not isinstance(link, NotAttested) and all(
-        parsed[k] == link[k] for k in ("delivered_domains", "sha256", "attestation"))
+    same = parsed is not None and not isinstance(link, NotAttested) and \
+        sorted(parsed["delivered_domains"]) == sorted(link["delivered_domains"]) and \
+        all(parsed[k] == link[k] for k in ("sha256", "attestation"))
     out.append(rh.check(claim, want, same, remedy))
     return out
 

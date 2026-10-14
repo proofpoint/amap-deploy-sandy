@@ -34,7 +34,7 @@ def link(host="alpha", domains=("beta.internal", "gamma.internal"), digest=None,
 
 def source(links=None, attested=True, version=1, hub="hub.example", **extra):
     doc = {"version": version, "hub": hub, "attested": attested,
-           "host_domains": {"alpha": ["alpha.internal"], "beta": ["beta.internal"]},
+           "host_domains": {"alpha": ["alpha.internal"], "beta": ["beta.internal"], "gamma": ["gamma.internal"]},
            "links": [link()] if links is None else links}
     doc.update(extra)
     return (json.dumps(doc, indent=2) + "\n").encode()
@@ -143,6 +143,34 @@ class RenderTest(unittest.TestCase):
     def test_an_extra_attestation_member_refuses(self):
         self.refuses(source(links=[link(att=dict(ATT, note="x"))]), "shape")
 
+    def test_a_link_entry_that_is_not_a_link_object_refuses(self):
+        self.refuses(source(links=[link(), "x"]), "links")
+
+    def test_a_link_entry_without_its_host_refuses(self):
+        bad = link()
+        del bad["host"]
+        self.refuses(source(links=[link(host="beta"), bad]), "links")
+
+    def test_a_host_domains_entry_for_this_host_that_is_not_the_own_domain_refuses(self):
+        raw = source(host_domains={"alpha": ["other.internal"], "beta": ["beta.internal"],
+                                   "gamma": ["gamma.internal"]})
+        self.refuses(raw, "host_domains")
+
+    def test_coordinated_drift_of_the_own_domain_and_fleet_is_refused_by_the_source(self):
+        """The overlay's own domain and fleet hosts changed together, so the
+        overlay agrees with itself: the source's host_domains still says
+        otherwise, and the render refuses."""
+        drifted = dd.Rules(host_label="alpha", own_domain="delta.internal", excluded=RULES.excluded,
+                           statement=STATEMENT, fleet_hosts=("beta.internal", "gamma.internal"))
+        with self.assertRaises(dd.D7Error) as e:
+            dd.render(source(), drifted)
+        self.assertEqual(e.exception.rule, "host_domains")
+
+    def test_a_link_set_that_is_not_every_other_host_s_domains_refuses(self):
+        raw = source(host_domains={"alpha": ["alpha.internal"], "beta": ["beta.internal"],
+                                   "gamma": ["gamma.internal"], "delta": ["delta.internal"]})
+        self.refuses(raw, "host_domains")
+
     def test_a_set_that_differs_from_the_fleet_hosts_refuses(self):
         rules = dd.Rules(**dict(RULES.__dict__, fleet_hosts=("beta.internal",)))
         with self.assertRaises(dd.D7Error) as e:
@@ -232,6 +260,17 @@ class VerifyTest(unittest.TestCase):
         self.assertEqual(self.by_claim(found, "byte-identical").result, rh.FAIL)
         self.assertEqual(self.by_claim(found, "carries the source").result, rh.FAIL)
 
+    def test_an_unsorted_valid_source_passes_the_parsed_compare(self):
+        src = source(links=[link(domains=("gamma.internal", "beta.internal"))])
+        found = self.run_verify(src=src)
+        self.assertEqual(self.by_claim(found, "carries the source").result, rh.PASS)
+
+    def test_nothing_deployed_and_not_attested_says_not_attested_yet(self):
+        del self.files["/opt/d7/d7.json"]
+        del self.bytes["/opt/d7/d7.json"]
+        c = self.by_claim(self.run_verify(src=source(attested=False, links=[])), "byte-identical")
+        self.assertIn("not attested yet", str(c.actual))
+
     def test_a_withdrawn_attestation_fails_and_says_so(self):
         found = self.run_verify(src=source(attested=False, links=[]))
         c = self.by_claim(found, "byte-identical")
@@ -246,6 +285,66 @@ class VerifyTest(unittest.TestCase):
         del self.files["/opt/d7/d7.json"]
         del self.bytes["/opt/d7/d7.json"]
         self.assertEqual(self.by_claim(self.run_verify(), "meets the hub-link").result, rh.FAIL)
+
+
+class ShortIoTest(unittest.TestCase):
+    def test_a_short_read_is_continued_to_eof(self):
+        import tempfile
+        data = dd.render(source(), RULES)
+        with tempfile.NamedTemporaryFile(delete=False) as f:
+            f.write(data)
+        self.addCleanup(os.unlink, f.name)
+        real = os.read
+        calls = []
+
+        def one_byte(fd, n):
+            calls.append(n)
+            return real(fd, min(n, 1))
+        os.read = one_byte
+        try:
+            got = dd.read_file(f.name)
+        finally:
+            os.read = real
+        self.assertEqual(got, data)
+        self.assertGreater(len(calls), 1)
+
+    def test_a_read_stops_one_byte_past_the_bound(self):
+        import tempfile
+        with tempfile.NamedTemporaryFile(delete=False) as f:
+            f.write(b"x" * (dd.MAX_BYTES + 100))
+        self.addCleanup(os.unlink, f.name)
+        self.assertEqual(len(dd.read_file(f.name)), dd.MAX_BYTES + 1)
+
+    def test_a_short_write_is_continued(self):
+        import tempfile
+        real = os.write
+
+        def three(fd, b):
+            return real(fd, bytes(b[:3]))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "f")
+            os.write = three
+            try:
+                dd.write_atomically(path, b"0123456789")
+            finally:
+                os.write = real
+            with open(path, "rb") as f:
+                self.assertEqual(f.read(), b"0123456789")
+
+    def test_a_failed_write_leaves_no_temp_file(self):
+        import tempfile
+        real = os.write
+
+        def fail(fd, b):
+            raise OSError(28, "No space left on device")
+        with tempfile.TemporaryDirectory() as tmp:
+            os.write = fail
+            try:
+                with self.assertRaises(OSError):
+                    dd.write_atomically(os.path.join(tmp, "f"), b"x")
+            finally:
+                os.write = real
+            self.assertEqual(os.listdir(tmp), [])
 
 
 if __name__ == "__main__":
