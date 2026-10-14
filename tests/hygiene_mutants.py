@@ -21,6 +21,12 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 #: (label, file, text, replacement)
 MUTANTS = [
+    ('replace objects honoured', 'hygiene_gate.py',
+     '               GIT_NO_REPLACE_OBJECTS="1", GIT_GRAFT_FILE=os.devnull)',
+     '               GIT_GRAFT_FILE=os.devnull)'),
+    ('grafts honoured', 'hygiene_gate.py',
+     '               GIT_NO_REPLACE_OBJECTS="1", GIT_GRAFT_FILE=os.devnull)',
+     '               GIT_NO_REPLACE_OBJECTS="1")'),
     ('identity exception ignores reachability', 'hygiene_gate.py',
      '                    and self._reachable(where.commit, ex.commit):',
      '                    and True:'),
@@ -151,7 +157,7 @@ MUTANTS = [
      '                if (a == 0 or not text[a - 1].isalnum()) and (b + 1 >= len(text) or not text[b + 1].isalnum()):',
      '                if True:'),
     ('unused exceptions not listed', 'hygiene_gate.py',
-     '        return [ex for ex in self.lists.exceptions if ex.kind in ("commit", "tree") and not ex.used]',
+     '        return [ex for ex in self.lists.exceptions if ex.kind in ("commit", "tree", "identity") and not ex.used]',
      '        return []'),
     ('long lines not split', 'hygiene_gate.py',
      '        if len(line) <= MAX_LINE:',

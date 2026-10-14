@@ -378,14 +378,15 @@ class Matcher:
         if key not in self._reach:
             if not self.git_dir:
                 raise CannotRun("an identity exception needs the history's git directory")
-            if subprocess.run(["git", "-C", self.git_dir, "cat-file", "-e", boundary + "^{commit}"],
-                              env=git_env(), capture_output=True).returncode:
+            try:
+                git(self.git_dir, "cat-file", "-e", boundary + "^{commit}")
+            except CannotRun:
                 raise CannotRun(f"identity exception: boundary {boundary[:12]} is not in {self.repo}")
-            r = subprocess.run(["git", "-C", self.git_dir, "merge-base", "--is-ancestor", commit, boundary],
-                               env=git_env(), capture_output=True)
-            if r.returncode not in (0, 1):
+            p = subprocess.run(["git", "-C", self.git_dir, *GIT_OPTS, "merge-base", "--is-ancestor", commit,
+                                boundary], capture_output=True, env=git_env())
+            if p.returncode not in (0, 1):
                 raise CannotRun(f"identity exception: reachability of {commit[:12]} could not be read")
-            self._reach[key] = r.returncode == 0
+            self._reach[key] = p.returncode == 0
         return self._reach[key]
 
     def _identity_excepted(self, where: Where, email: str) -> bool:
@@ -515,10 +516,16 @@ def is_binary(data: bytes) -> bool:
 
 
 def git_env() -> Dict[str, str]:
-    """git with no system or user configuration and no pager or prompt."""
+    """git with no system or user configuration and no pager or prompt,
+    reading only the PHYSICAL object graph: replace refs and grafts, which
+    let a repository's own refs or local files rewrite what a commit's
+    parents, identities or content appear to be, are ignored by every git
+    call the gate makes, so what is scanned and what reachability is
+    decided over are the same objects."""
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull, GIT_TERMINAL_PROMPT="0",
-               GIT_PAGER="cat", PAGER="cat", LC_ALL="C")
+               GIT_PAGER="cat", PAGER="cat", LC_ALL="C",
+               GIT_NO_REPLACE_OBJECTS="1", GIT_GRAFT_FILE=os.devnull)
     return env
 
 
