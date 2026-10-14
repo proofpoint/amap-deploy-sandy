@@ -155,9 +155,6 @@ def load(sec: Any, spec: Any) -> KeySpec:
         if _related(d, o):
             raise KeySpecError(f"keys.dir {d} overlaps {o}; the key stays outside every root a runtime "
                                f"or an agent reaches")
-    for m in hr.run_spec(spec, hs)["mounts"]:
-        if m["type"] == "bind" and m["source"] == "/":
-            raise KeySpecError("the email router binds /, which holds the key; no probe can tell it apart")
     p = spec.principals[local]
     return KeySpec(dir=d, file=sec["file"], evidence_dir=ev, local_config=cfg, principal=local, uid=p.uid,
                    gid=p.gids[0])

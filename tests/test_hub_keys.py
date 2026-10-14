@@ -79,9 +79,11 @@ class LoadTest(unittest.TestCase):
         self.refuses(d, "secret_roots")
 
     def test_an_email_router_that_binds_root_refuses(self):
+        """A template at / makes the router bind /, which holds the key: the
+        overlap check refuses it at load."""
         d = full_doc()
         d["hub"]["prefix_template"] = "/prefix.json"
-        self.refuses(d, "binds /")
+        self.refuses(d, "overlaps /;")
 
     def test_keys_without_a_hub_section_refuse(self):
         d = full_doc()
