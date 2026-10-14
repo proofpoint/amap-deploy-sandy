@@ -75,6 +75,15 @@ jobs:
           repository: proofpoint/amap-connector-codex
           path: amap-connector-codex
 
+      # The router's temporary second pin, for the hop renderer: checked out
+      # at the PINNED commit siblings.json names, not at a branch tip, so the
+      # pin-equality test reads the pin. It goes when that pin goes.
+      - name: the hop renderer's router, at its pin
+        run: |
+          sha=$(python3 -c 'import json; print(next(s["commit"] for s in json.load(open("amap-deploy-sandy/siblings.json"))["siblings"] if s.get("dir") == "amap-router-local-hop"))')
+          git clone --quiet https://github.com/proofpoint/amap-router-local amap-router-local-hop
+          git -C amap-router-local-hop checkout --quiet --detach "$sha"
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
