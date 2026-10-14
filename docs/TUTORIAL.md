@@ -366,7 +366,10 @@ runtimes; a deployment must not pre-create or chown them. Each level is
 checked by the runtime that makes it and never repaired, so one made or
 re-owned by anyone else stops that runtime's admission of the link.
 
-Run the printed steps as root, in order, **before any hop runtime starts**.
+Run the printed steps as root, in order, **before any hop runtime starts**,
+from a checkout that no sandbox mounts read-write: a fresh clone at the
+recorded deploy commit, never an agent's workspace checkout. The steps run
+that checkout's `host_steps.py` as root.
 Each step goes through `host_steps.py`, which reaches every path from `/`
 without following a symbolic link and stops at one. Every root is created
 with its owner, group and mode, then it and every ancestor are fsynced, so a

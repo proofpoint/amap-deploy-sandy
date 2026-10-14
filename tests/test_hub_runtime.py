@@ -196,6 +196,7 @@ class RenderingTest(unittest.TestCase):
 
     def test_private_dirs_are_given_by_their_container_path(self):
         self.assertEqual(self.env["MAILBOX_ROOT_DIR"], "/down/mail")
+        self.assertEqual(self.env["RELAY_LOG"], "/down/mail/relay-log.jsonl")
         self.assertEqual(self.env["RELAY_LOCK"], "/down/lock/relay.lock")
         self.assertEqual(self.env["HOP_ROOT"], "/data/root")
 
@@ -254,6 +255,20 @@ class RulesTest(unittest.TestCase):
     def test_the_role_twice_breaks_the_one_place_rule(self):
         bad = self.broken(env=self.env + [("RELAY_LINK_ROLE", "hub")])
         self.assertTrue(any("RELAY_LINK_ROLE" in b for b in bad), bad)
+
+    def test_the_send_log_is_exactly_the_mailbox_roots_file_once(self):
+        """Erratum 3(a): RELAY_LOG is rendered as <MAILBOX_ROOT>/relay-log.jsonl,
+        and the rule holds the rendering and the container to that exact
+        value: absent, another path, empty or twice each break it."""
+        env = dict(self.env)
+        self.assertEqual(env["RELAY_LOG"], env["MAILBOX_ROOT_DIR"] + "/relay-log.jsonl")
+        for label, e in (("absent", [(k, v) for k, v in self.env if k != "RELAY_LOG"]),
+                         ("elsewhere", [(k, "/app/.amp/relay-log.jsonl" if k == "RELAY_LOG" else v)
+                                        for k, v in self.env]),
+                         ("empty", [(k, "" if k == "RELAY_LOG" else v) for k, v in self.env]),
+                         ("twice", self.env + [("RELAY_LOG", env["RELAY_LOG"])])):
+            with self.subTest(label=label):
+                self.assertTrue(any("RELAY_LOG" in b for b in self.broken(env=e)), label)
 
     def test_another_role_breaks_it(self):
         env = [(k, "standalone" if k == "RELAY_LINK_ROLE" else v) for k, v in self.env]
