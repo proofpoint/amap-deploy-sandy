@@ -54,7 +54,9 @@ What it checks, through router_health's three outcomes:
 A document with a `secrets` section adds a runtime's secret file: its plan
 steps and its checks are secret_setup's. A document with a `hub` section adds
 the hub-link email router's D7 and environment files and its rendering:
-hub_runtime's.
+hub_runtime's. A `keys` section adds the local router's signing key, its
+partition from the email router, the key probe's evidence and the guard
+against a delegation block: hub_keys'.
 
 None of these can see whether the barrier ran: durability rests on the plan
 having run before any runtime started.
@@ -91,6 +93,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
+import hub_keys as hk      # the local router's key, kept from the email router; no delegation block
 import hub_runtime as hr   # the hub-link router's files and rendering
 import router_health as rh
 import secret_exposure as se   # who else could reach that secret: every container, every engine
@@ -174,6 +177,7 @@ class Spec:
     production: bool = False
     secrets: Optional[ss.SecretSpec] = None     # a runtime's secret file, when the document has one
     hub: Optional[hr.HubSpec] = None            # the hub-link router's rendering, when the document has one
+    keys: Optional[hk.KeySpec] = None           # the local router's signing key, when the document has one
 
     def runtime_of(self, principal: str) -> Dict[str, Any]:
         return next(r for r in self.runtimes if r["principal"] == principal)
@@ -206,7 +210,7 @@ def load_spec(doc: Any) -> Spec:
     if not isinstance(doc, dict) or doc.get("schema") != SPEC_SCHEMA:
         raise SpecError(f"the document is not a {SPEC_SCHEMA} host setup")
     known = {"schema", "principals", "groups", "hops", "roots", "overlay", "agent_paths", "openssl",
-             "mounts", "runtimes", "production", ss.SECTION, hr.SECTION}
+             "mounts", "runtimes", "production", ss.SECTION, hr.SECTION, hk.SECTION}
     if set(doc) - known:
         raise SpecError(f"unknown member(s): {', '.join(sorted(set(doc) - known))}")
     production = doc.get("production", False)
@@ -361,6 +365,11 @@ def load_spec(doc: Any) -> Spec:
             spec = dataclasses.replace(spec, hub=hr.load(doc[hr.SECTION], spec))
         except hr.HubSpecError as e:
             raise SpecError(str(e)) from None
+    if hk.SECTION in doc:
+        try:
+            spec = dataclasses.replace(spec, keys=hk.load(doc[hk.SECTION], spec))
+        except hk.KeySpecError as e:
+            raise SpecError(str(e)) from None
     return spec
 
 
@@ -449,6 +458,8 @@ def render_plan(spec: Spec, overlay_source: Optional[Path] = None,
         lines += ss.render(spec.secrets, q)
     if spec.hub is not None and hub is not None:
         lines += hr.plan(spec, spec.hub, hub, q, steps)
+    if spec.keys is not None:
+        lines += hk.plan(spec, spec.keys, q, steps)
     lines.append("# Start no runtime until every step above has run: each root exists and is synced "
                  "before a runtime opens it.")
     return lines
@@ -960,7 +971,8 @@ def checks(spec: Spec, *, production: bool, lstat: Callable = os.lstat,
            secrets: Optional[Dict[str, Any]] = None,
            exposure: Optional[Dict[str, Any]] = None, overlay: Optional[Path] = None,
            secret_lock: Optional[Callable[[Any], Any]] = None,
-           hub: Optional[Dict[str, Any]] = None) -> List[rh.Check]:
+           hub: Optional[Dict[str, Any]] = None,
+           keys: Optional[Dict[str, Any]] = None) -> List[rh.Check]:
     """Every check of the host against the plan. `production` is ORed with
     the document's own. `secrets` passes probes to the secret's checks;
     `overlay` is the file the document was read from (None for --spec). The
@@ -997,6 +1009,8 @@ def checks(spec: Spec, *, production: bool, lstat: Callable = os.lstat,
                 out += se.checks(spec, spec.secrets, lock=contextlib.nullcontext, **(exposure or {}))
     if spec.hub is not None:
         out += hr.checks(spec, spec.hub, lstat=lstat, **(hub or {}))
+    if spec.keys is not None:
+        out += hk.checks(spec, spec.keys, lstat=lstat, **(keys or {}))
     return out
 
 
@@ -1081,3 +1095,17 @@ def hub_render(spec_path: Optional[Path], *, apply: bool, overlay: Optional[Path
         return 2
     return hr.write_files(spec, spec.hub, hr.render_all(spec, spec.hub, hr.read_source(spec, spec.hub)),
                           apply=apply, out=out)
+
+
+def hub_keyprobe(spec_path: Optional[Path], *, apply: bool, overlay: Optional[Path] = None, out=print) -> int:
+    """The `hub-keyprobe` verb: show, or with `--apply` run, the key-read
+    probe, and write its record into the run directory for the plan to place."""
+    try:
+        spec = load_spec(read_spec(spec_path, overlay))
+    except ValueError as e:     # SpecError included
+        out(f"hub-keyprobe: {e}")
+        return 2
+    if spec.keys is None:
+        out("hub-keyprobe: the host-setup document has no keys section")
+        return 2
+    return hk.run_probe(spec, spec.keys, apply=apply, out=out)

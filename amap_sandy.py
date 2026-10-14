@@ -4796,6 +4796,15 @@ def build_parser() -> argparse.ArgumentParser:
                               "host_setup section)")
     hrender.add_argument("--apply", action="store_true", help="write the files (default: show)")
 
+    kprobe = sub.add_parser(
+        "hub-keyprobe", help="the key-read probe: the hub-link email router's rendered run spec, "
+                             "without its secret volume, lstat-ing the local router's key paths; "
+                             "PASS only when none exists inside it. Runs only with --apply")
+    kprobe.add_argument("--spec", type=Path, default=None,
+                        help="the host-setup document (default: the deployment overlay's "
+                             "host_setup section)")
+    kprobe.add_argument("--apply", action="store_true", help="run the probe (default: show it)")
+
     teardown = sub.add_parser(
         "teardown", help="the fleet back to its pre-install state for a clean rebuild: "
                          "remove the payload, the router's config and router-state/ (held "
@@ -4844,6 +4853,9 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         if args.command == "hub-render":
             return hsu.hub_render(args.spec, apply=args.apply, overlay=ha.overlay_path(args.overlay))
+
+        if args.command == "hub-keyprobe":
+            return hsu.hub_keyprobe(args.spec, apply=args.apply, overlay=ha.overlay_path(args.overlay))
 
         if args.command == "migrate-registry":
             return run_migrate_registry(args, home)

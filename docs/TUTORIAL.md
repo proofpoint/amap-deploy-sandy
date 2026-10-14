@@ -603,3 +603,39 @@ read-only, without copy, and the D7, overlay and registry directories
 read-only. A running container must also match the rendering: the same
 variables (beyond the image's own) and mounts. In the `pending_b5` and
 `retired` states the router must not exist at all.
+
+### The local router's signing key
+
+A `keys` section (it needs the `hub` section) places the local router's
+signing key and keeps it out of the email router's reach. The key is
+generated on the host by you, as the local router's uid, into its own 0700
+directory, mode 0400; nothing in this repository generates, reads or
+copies it. The directory must be listed in the `secrets` section's
+`exposure.secret_roots`, so the exposure sweep fails any container whose
+bind overlaps it, in either direction, the local router's included, and
+the probe's evidence directory in `exposure.integrity_roots`.
+
+The key-read probe runs the email router's own rendered run spec (its
+user, groups, capabilities, security options, read-only root and mounts)
+with only its name, labels, network (none), restart, entrypoint and
+command changed, and without the secret volume, which no other container
+may mount. It only `lstat`s the key's paths and passes only when every one
+is absent (ENOENT): a key that is there but unreadable (EACCES) is a key
+that is reachable.
+
+```sh
+python3 amap-sandy.py hub-keyprobe            # shows the probe
+python3 amap-sandy.py hub-keyprobe --apply    # runs it; writes keyprobe.json into the run directory
+```
+
+Then place the record with the plan's `place ... --sha256 <hex>` step. The
+record is bound to the email router's run-spec hash, the key's path, the
+candidate paths and the probe's image and command: change any of them and
+the record is stale, and the email router may not start until the probe
+passes again. The environment file's contents are not bound: a variable
+cannot add a mount, a capability or a user.
+
+`host-setup` and `verify` also check that the local router's config has no
+`delegation` block at all, in any form (no live peer signing until the
+full signed-case harness passes), and that each running router sees the
+D7 file the host holds.
