@@ -68,6 +68,21 @@ class LoadTest(unittest.TestCase):
         d[ss.SECTION]["exposure"]["secret_roots"] = ["/opt/ex"]
         self.refuses(d, "overlaps")
 
+    def test_a_key_dir_above_the_template_dir_refuses(self):
+        d = full_doc(dir="/opt/ex/tmpl")
+        d[ss.SECTION]["exposure"]["secret_roots"] = ["/opt/ex/tmpl"]
+        self.refuses(d, "overlaps")
+
+    def test_a_secrets_section_without_exposure_is_a_clean_refusal(self):
+        d = full_doc()
+        del d[ss.SECTION]["exposure"]
+        self.refuses(d, "secret_roots")
+
+    def test_an_email_router_that_binds_root_refuses(self):
+        d = full_doc()
+        d["hub"]["prefix_template"] = "/prefix.json"
+        self.refuses(d, "binds /")
+
     def test_keys_without_a_hub_section_refuse(self):
         d = full_doc()
         del d[hr.SECTION]
@@ -119,6 +134,11 @@ class ProbeSpecTest(unittest.TestCase):
         b = copy.deepcopy(self.base)
         b["mounts"].append({"type": "bind", "source": "/opt/ex", "target": "/mnt/ex", "readonly": True})
         self.assertEqual(hk.candidates(b, self.spec.keys)[2:], ["/mnt/ex/keys", "/mnt/ex/keys/signing.key"])
+
+    def test_a_bind_of_root_maps_the_key_s_paths_correctly(self):
+        b = copy.deepcopy(self.base)
+        b["mounts"].append({"type": "bind", "source": "/", "target": "/host", "readonly": True})
+        self.assertEqual(hk.candidates(b, self.spec.keys)[2:], ["/host/opt/ex/keys", "/host/opt/ex/keys/signing.key"])
 
     def test_a_mount_inside_the_key_dir_adds_its_target(self):
         b = copy.deepcopy(self.base)
@@ -234,6 +254,11 @@ class VerifyTest(unittest.TestCase):
         c = self.claim(self.run_checks(), "signing.key is upstream's")
         self.assertEqual(c.result, rh.FAIL)
         self.assertIn("generates it on this host", c.remedy)
+
+    def test_a_second_hard_link_to_the_key_fails(self):
+        """A second link is an alias a path-based probe cannot see."""
+        self.files[KEY_DIR + "/signing.key"] = st(stat.S_IFREG | 0o400, UP, nlink=2)
+        self.assertEqual(self.claim(self.run_checks(), "signing.key is upstream's").result, rh.FAIL)
 
     def test_a_key_dir_owned_by_the_email_router_fails(self):
         self.files[KEY_DIR] = st(stat.S_IFDIR | 0o700, 2102)

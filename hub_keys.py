@@ -149,11 +149,15 @@ def load(sec: Any, spec: Any) -> KeySpec:
                            "container may write it")
     others = [r.path for r in spec.roots] + list(spec.agent_paths) + [
         hs.hop_root, hs.registry_dir, hs.d7_dir, posixpath.dirname(hs.env_file), ev,
-        posixpath.dirname(spec.overlay_path), s.container_dir, s.run_dir]
+        posixpath.dirname(spec.overlay_path), posixpath.dirname(hs.prefix_template), s.container_dir,
+        s.run_dir]
     for o in others:
         if _related(d, o):
             raise KeySpecError(f"keys.dir {d} overlaps {o}; the key stays outside every root a runtime "
                                f"or an agent reaches")
+    for m in hr.run_spec(spec, hs)["mounts"]:
+        if m["type"] == "bind" and m["source"] == "/":
+            raise KeySpecError("the email router binds /, which holds the key; no probe can tell it apart")
     p = spec.principals[local]
     return KeySpec(dir=d, file=sec["file"], evidence_dir=ev, local_config=cfg, principal=local, uid=p.uid,
                    gid=p.gids[0])
@@ -174,8 +178,8 @@ def candidates(base: Dict[str, Any], ks: KeySpec) -> List[str]:
         src, dst = m["source"], m["target"]
         if _related(src, ks.dir):
             if ks.dir == src or ks.dir.startswith(src.rstrip("/") + "/"):
-                rel = ks.dir[len(src):]
-                out += [dst + rel, posixpath.join(dst + rel, ks.file)]
+                inside = posixpath.normpath(posixpath.join(dst, posixpath.relpath(ks.dir, src)))
+                out += [inside, posixpath.join(inside, ks.file)]
             else:
                 out.append(dst)
     return list(dict.fromkeys(out))
@@ -438,8 +442,8 @@ def verify_evidence(spec: Any, ks: KeySpec, lstat: Callable, read: Callable[[str
 
 
 def ask_d7_hash(spec: Any, container: str, path: str) -> Any:
-    """The D7 file's sha256 as `container` sees it: None when the container
-    is not running, or an Unresolved."""
+    """The D7 file's sha256 as `container` sees it, or an Unresolved naming
+    why it could not be asked (the container not running among them)."""
     try:
         p = rh.run(ss.docker(spec.secrets) + ["exec", container, "python3", "-I", "-S", "-c", D7_HASH_SCRIPT, path])
     except rh.CannotRun as e:
