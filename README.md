@@ -192,7 +192,7 @@ difference.
 | Verb | Does |
 |---|---|
 | `install [--apply]` | the whole install, once per host: the manifest, the payload, the roster directory and the router's config |
-| `verify [--only SLUG] [--match SUBSTR] [--host-facts PATH]` | read-only. It checks the install, every selected sandbox (lanes, relay, the mounts, what sandy applied at its last launch) and, last, the router process: its container, mount set and health. It exits 1 on any problem |
+| `verify [--only SLUG] [--match SUBSTR] [--host-facts PATH]` | read-only. It checks the install, the payload daemon's connector build against its siblings.json pin, every selected sandbox (lanes, relay, the mounts, what sandy applied at its last launch, whether the session lister can serve its sessions and, for named sessions, their posture as sandy reports it, and the peer notices its daemon has not handled) and, last, the router process: its container, mount set and health. It exits 1 on any problem |
 | `router-config [--apply]` | only the router's config. Without `--apply` it compares the file with the rendering and exits 1 on drift |
 | `list` | every sandbox sandy reports, with sandy's verdict for this feature: `selected`, `not selected` (with the reason) or `unknown` (not launched since the manifest changed) |
 | `fleet-domain [--base BASE] [--apply]` | this host's derived fleet domain, `sandy.<host>.<base>` (base: `internal`), beside the manifest's; `--apply` writes it into `feature.fleet_domain`. Every agent's address changes, so relaunch them after |
