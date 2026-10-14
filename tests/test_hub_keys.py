@@ -550,10 +550,10 @@ if __name__ == "__main__":
 
 
 class RecoveryBelowHorizonTest(unittest.TestCase):
-    """The hub-link router's inbound recovery window (its default, since the
-    deploy leaves HUB_INBOUND_RECOVERY_MAX_DAYS unrendered) must stay below
-    the local router's dedup horizon: its config's key, or the hop
-    checkout's own default when the key is absent."""
+    """The hub-link router's inbound recovery window, as its environment file
+    renders it (the value it validates at start), must stay below the local
+    router's dedup horizon: its config's key, or the hop checkout's own
+    default when the key is absent."""
 
     def run_it(self, cfg, default=(30, "the hop checkout's default")):
         files = {LOCAL: cfg} if cfg is not None else {}
@@ -570,7 +570,7 @@ class RecoveryBelowHorizonTest(unittest.TestCase):
         self.assertEqual(c.expected.value, 30)
 
     def test_a_horizon_at_or_below_the_window_fails(self):
-        for days in (hr.RECOVERY_DEFAULT_DAYS, 7):
+        for days in (hr.RECOVERY_DAYS, 7):
             with self.subTest(days=days):
                 [c] = self.run_it({"instances": {}, hp.HORIZON_KEY: days})
                 self.assertEqual(c.result, rh.FAIL)
@@ -596,7 +596,19 @@ class RecoveryBelowHorizonTest(unittest.TestCase):
         from _workspace import HOP_ROUTER_ROOT
         days, where = hp.horizon_default(str(HOP_ROUTER_ROOT))
         self.assertIsInstance(days, int, where)
-        self.assertGreater(days, hr.RECOVERY_DEFAULT_DAYS, "the defaults themselves keep the order")
+        self.assertGreater(days, hr.RECOVERY_DAYS, "the rendered window is below the router's default horizon")
+
+    def test_the_window_is_rendered_and_read_from_the_rendering(self):
+        s = spec()
+        self.assertEqual(dict(hr.environment(s, s.hub))[hr.RECOVERY_ENV], str(hr.RECOVERY_DAYS))
+        self.addCleanup(setattr, hr, "environment", hr.environment)
+        hr.environment = lambda sp, hub: [(hr.RECOVERY_ENV, "40")]
+        [c] = self.run_it({"instances": {}})
+        self.assertEqual(c.result, rh.FAIL, "the check reads the rendered value, never a constant of its own")
+        hr.environment = lambda sp, hub: []
+        [c] = self.run_it({"instances": {}})
+        self.assertEqual(c.result, rh.UNKNOWN)
+        self.assertIn("renders no", c.reason)
 
     def test_verify_runs_it_on_a_hub_host(self):
         class Ran(Exception):

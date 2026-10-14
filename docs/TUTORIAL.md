@@ -661,8 +661,8 @@ it there. On a hop host `install` refuses a `keys.local_config` other than
 the router.json it renders, so start the local router with `--config`
 naming that file. They also check that each running router sees the D7
 file the host holds, and that the email router's inbound recovery window
-(its default; this deploy leaves `HUB_INBOUND_RECOVERY_MAX_DAYS` unset)
-stays below the local router's `ingress_dedup_horizon_days`.
+(`HUB_INBOUND_RECOVERY_MAX_DAYS`, rendered into its environment file) stays
+below the local router's `ingress_dedup_horizon_days`.
 
 ### The local router's hop link
 

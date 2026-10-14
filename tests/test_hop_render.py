@@ -340,7 +340,11 @@ class OneLocalRouterTest(unittest.TestCase):
                   read_json_=lambda p: (_ for _ in ()).throw(FileNotFoundError(p)), d7_hash="a" * 64,
                   ask=lambda c, p: "a" * 64, containers=[], read_bytes_=lambda p: b"{}")
         self.assertEqual(asked, [s.router.container])
-        self.assertEqual(hk.local_container(s, s.keys), s.router.container)
+        # Past load_spec's refusal, the router section still decides: a decoy
+        # runtime is never the one asked.
+        import dataclasses
+        r = hp.RouterSpec(s.router.image_name, s.router.image_digest, s.router.image_commit, "actual-hop-router")
+        self.assertEqual(hk.local_container(dataclasses.replace(s, router=r), s.keys), "actual-hop-router")
 
 
 class InstallTest(unittest.TestCase):

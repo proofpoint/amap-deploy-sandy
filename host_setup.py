@@ -1056,20 +1056,21 @@ def verify_recovery_horizon(spec: Spec, read: Callable[[str], Any] = hk.read_jso
                             ) -> List[rh.Check]:
     """The hub-link router's inbound recovery window stays below the local
     router's dedup horizon: an item recovered after the local router forgot
-    it would be admitted twice. The window is [2]'s rendered variable, or its
-    default when unrendered; the horizon is [1]'s config (keys.local_config,
-    which install binds to the router.json it renders), or the hop
-    checkout's default when the key is absent."""
+    it would be admitted twice. The window is [2]'s rendered variable, the
+    value it validates at start; the horizon is [1]'s config
+    (keys.local_config, which install binds to the router.json it renders),
+    or the hop checkout's default when the key is absent."""
     claim = (f"the hub-link router's {hr.RECOVERY_ENV} is below the local router's "
              f"{hp.HORIZON_KEY}")
     remedy = (f"keep {hr.RECOVERY_ENV} unset, or set it below the local router's {hp.HORIZON_KEY}, "
               "then render both again")
     env = dict(hr.environment(spec, spec.hub))
-    if hr.RECOVERY_ENV in env:
-        window, why = int(env[hr.RECOVERY_ENV]), f"{hr.RECOVERY_ENV} as the environment file renders it"
-    else:
-        window, why = hr.RECOVERY_DEFAULT_DAYS, (f"the hub-link router's default with {hr.RECOVERY_ENV} unset "
-                                                 "(inbound_journal.RECOVERY_MAX_S), which this deploy leaves unset")
+    if not env.get(hr.RECOVERY_ENV, "").isdigit():
+        return [rh.unknown(claim, rh.Fact("horizon", None, "the local router's config"),
+                           f"the environment file renders no {hr.RECOVERY_ENV}",
+                           f"render {hr.RECOVERY_ENV}: unset, the hub-link router falls back to a default "
+                           "nothing here reads")]
+    window, why = int(env[hr.RECOVERY_ENV]), f"{hr.RECOVERY_ENV} as the environment file renders it"
     if spec.keys is None:
         return [rh.unknown(claim, rh.Fact("horizon", None, "the local router's config"),
                            "the document has no keys section, so the local router's config is not named",

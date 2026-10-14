@@ -88,12 +88,11 @@ ABSENT_PREFIXES = ("OAUTH2_",)
 BUDGET_S = ss.PROBE_BUDGET_S
 BUDGETS = ss.PROBE_BUDGETS
 SWITCHES_OFF = ("HUB_UNKNOWN_TARGET_DSN", "HUB_INTAKE_SWEEP")
-#: How long the hub-link router may recover an inbound item, in days. Not
-#: rendered, so the router's own default applies: RECOVERY_DEFAULT_DAYS,
-#: its inbound_journal.RECOVERY_MAX_S (29 days), which it reads when the
-#: variable is unset. It must stay below the local router's dedup horizon.
+#: How long the hub-link router may recover an inbound item, in days,
+#: rendered so the value the router validates at start (1..29) is the one
+#: verify compares. It must stay below the local router's dedup horizon.
 RECOVERY_ENV = "HUB_INBOUND_RECOVERY_MAX_DAYS"
-RECOVERY_DEFAULT_DAYS = 29
+RECOVERY_DAYS = 29
 DIR_KEYS = ("MAILBOX_ROOT_DIR", "RELAY_LEDGER_DIR", "HUB_INBOUND_STATE_DIR", "lock")
 _LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
 _OWN = re.compile(rf"({_LABEL})\.internal")
@@ -327,6 +326,7 @@ def environment(spec: Any, hs: HubSpec) -> List[Tuple[str, str]]:
         ("TRANSPORT_PLUGIN_SHA256", spec.overlay_pin["sha256"]),
     ]
     env += [(k, "off") for k in SWITCHES_OFF]
+    env.append((RECOVERY_ENV, str(RECOVERY_DAYS)))
     for k, v in env:
         if "\n" in v or "\r" in v or "\0" in v:
             raise HubSpecError(f"{k}'s value cannot be written to an environment file")
