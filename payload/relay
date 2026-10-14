@@ -217,7 +217,7 @@ if [ -n "${AMAP_DELIVERY_SESSION_SOURCE_OVERRIDE+x}" ]; then
 import json, os, stat, sys
 value, session = sys.argv[1], sys.argv[2]
 def no(why):
-    print("no " + why)
+    print("no %r: %s" % (value, why))
     sys.exit(0)
 try:
     with open(session, encoding="utf-8") as f:
@@ -241,13 +241,15 @@ if not stat.S_ISREG(st.st_mode):
 if os.path.realpath(value) != expected:
     no("its real path is not exactly " + expected)
 print("ok " + expected)
-' "$AMAP_DELIVERY_SESSION_SOURCE_OVERRIDE" "$SANDY_SESSION_FILE") || override_verdict="no the check could not run"
+' "$AMAP_DELIVERY_SESSION_SOURCE_OVERRIDE" "$SANDY_SESSION_FILE") || override_verdict="no (the value is not shown): the check could not run"
     case "$override_verdict" in
         "ok "*)
             AMAP_DELIVERY_SESSION_SOURCE=${override_verdict#ok }
-            echo "relay: MEASUREMENT session source in use: $AMAP_DELIVERY_SESSION_SOURCE" >&2 ;;
+            printf 'relay: MEASUREMENT session source in use: %s\n' "$AMAP_DELIVERY_SESSION_SOURCE" >&2 ;;
         *)
-            echo "relay: REFUSED AMAP_DELIVERY_SESSION_SOURCE_OVERRIDE=$AMAP_DELIVERY_SESSION_SOURCE_OVERRIDE: ${override_verdict#no }; using the shipped session lister" >&2 ;;
+            # The value is named by Python's repr, never echoed raw: a
+            # backslash or a newline in it cannot split or rewrite the line.
+            printf 'relay: REFUSED AMAP_DELIVERY_SESSION_SOURCE_OVERRIDE=%s; using the shipped session lister\n' "${override_verdict#no }" >&2 ;;
     esac
     unset AMAP_DELIVERY_SESSION_SOURCE_OVERRIDE
 fi

@@ -111,7 +111,7 @@ class RefusedTest(Relay):
         self.assertEqual(self.source_of(out), self.shipped())
         lines = [l for l in err.splitlines() if l.startswith("relay: REFUSED")]
         self.assertEqual(len(lines), 1, err)
-        self.assertIn(f"{OVERRIDE}={value}:", lines[0])
+        self.assertIn(f"{OVERRIDE}={value!r}:", lines[0])
         self.assertIn(why, lines[0])
         self.assertIn("using the shipped session lister", lines[0])
 
@@ -119,6 +119,26 @@ class RefusedTest(Relay):
         target = self.lister(self.root / "elsewhere")
         os.symlink(target, self.expected)
         self.refused(self.expected, "it is a symbolic link")
+
+    def test_a_symbolic_link_elsewhere_pointing_at_the_exact_file(self):
+        """Its real path IS the expected one, so only lstat refuses it: the
+        outcome (the shipped lister) is what is asserted, not just the words."""
+        self.lister()
+        link = self.root / "link-to-it"
+        os.symlink(self.expected, link)
+        rc, err, out = self.run_relay(str(link))
+        self.assertEqual(self.source_of(out), self.shipped())
+        self.assertNotIn("MEASUREMENT", err)
+
+    def test_a_value_with_a_backslash_or_a_newline_is_named_on_one_line(self):
+        for value in ("/x\\nrelay: MEASUREMENT session source in use: /evil", "/x\nsecond line"):
+            with self.subTest(value=value):
+                rc, err, out = self.run_relay(value)
+                self.assertEqual(self.source_of(out), self.shipped())
+                refusal = [l for l in err.splitlines() if l.startswith("relay: REFUSED")]
+                self.assertEqual(len(refusal), 1, err)
+                self.assertIn(repr(value), refusal[0])
+                self.assertFalse(any(l.startswith("relay: MEASUREMENT") for l in err.splitlines()), err)
 
     def test_another_file_under_dot_sandy(self):
         self.refused(self.lister(self.ws / ".sandy" / "config"), "its real path is not exactly")
