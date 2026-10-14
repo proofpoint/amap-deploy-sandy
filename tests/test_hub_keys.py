@@ -20,6 +20,7 @@ import hub_runtime as hr
 import router_health as rh
 import secret_setup as ss
 from test_hub_runtime import full_doc as hub_doc
+from test_hub_runtime import setUpModule, tearDownModule  # noqa: F401 -- the fixture's pins, restored
 
 UP, UPGRP = 2101, 2201
 KEY_DIR, EVIDENCE_DIR = "/opt/ex/keys", "/opt/ex/evidence"
