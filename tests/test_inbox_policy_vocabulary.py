@@ -170,8 +170,9 @@ def router_vocabulary(root: Path) -> dict:
 
 
 def _pinned_router_commit() -> str:
-    doc = json.loads((REPO / "siblings.json").read_text(encoding="utf-8"))
-    return next(s["commit"] for s in doc["siblings"] if s["name"] == "amap-router-local")
+    """The MAIN router pin: the primary entry, never a second (hop) pin."""
+    import siblings
+    return siblings.primary(siblings.load_pins(REPO / "siblings.json"), "amap-router-local")["commit"]
 
 
 class FixtureIsTheRoutersTest(unittest.TestCase):

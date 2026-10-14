@@ -35,7 +35,7 @@ AMAP_REPO_BASE="${AMAP_REPO_BASE:-https://github.com/proofpoint}"
 ROUTER_CONTAINER=amap-router-local
 # The checkouts are the ones under $AMAP_DIR: an override pointing elsewhere
 # would install and build from a tree this script did not put at its pin.
-unset AMAP_ROUTER_REPO AMAP_CONNECTOR_REPO AMAP_CODEX_CONNECTOR_REPO
+unset AMAP_ROUTER_REPO AMAP_HOP_ROUTER_REPO AMAP_CONNECTOR_REPO AMAP_CODEX_CONNECTOR_REPO
 
 say() { printf '[amap] %s\n' "$*"; }
 die() { printf '[amap] error: %s\n' "$*" >&2; exit 1; }
