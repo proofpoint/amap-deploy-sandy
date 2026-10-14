@@ -1024,7 +1024,11 @@ def checks(spec: Spec, *, production: bool, lstat: Callable = os.lstat,
     if spec.hub is not None:
         out += hr.checks(spec, spec.hub, lstat=lstat, **(hub or {}))
     if spec.keys is not None:
-        out += hk.checks(spec, spec.keys, lstat=lstat, **(keys or {}))
+        out += hk.checks(spec, spec.keys, lstat=lstat,
+                         **{k: v for k, v in (keys or {}).items() if k != "horizon_default"})
+    if spec.hub is not None:
+        out += verify_recovery_horizon(spec, (keys or {}).get("read_json_", hk.read_json),
+                                       (keys or {}).get("horizon_default"))
     if spec.supervision is not None:
         out += hv.checks(spec, lstat=lstat, **(supervision or {}))
         if hv.labels(spec):
@@ -1039,6 +1043,48 @@ def checks(spec: Spec, *, production: bool, lstat: Callable = os.lstat,
     if spec.router is not None:
         out += hp.checks(spec, **(router or {}))
     return out
+
+
+def verify_recovery_horizon(spec: Spec, read: Callable[[str], Any] = hk.read_json,
+                            horizon_default: Optional[Callable[[], Tuple[Optional[int], str]]] = None
+                            ) -> List[rh.Check]:
+    """The hub-link router's inbound recovery window stays below the local
+    router's dedup horizon: an item recovered after the local router forgot
+    it would be admitted twice. The window is [2]'s rendered variable, or its
+    default when unrendered; the horizon is [1]'s config (keys.local_config,
+    which install binds to the router.json it renders), or the hop
+    checkout's default when the key is absent."""
+    claim = (f"the hub-link router's {hr.RECOVERY_ENV} is below the local router's "
+             f"{hp.HORIZON_KEY}")
+    remedy = (f"keep {hr.RECOVERY_ENV} unset, or set it below the local router's {hp.HORIZON_KEY}, "
+              "then render both again")
+    env = dict(hr.environment(spec, spec.hub))
+    if hr.RECOVERY_ENV in env:
+        window, why = int(env[hr.RECOVERY_ENV]), f"{hr.RECOVERY_ENV} as the environment file renders it"
+    else:
+        window, why = hr.RECOVERY_DEFAULT_DAYS, (f"the hub-link router's default with {hr.RECOVERY_ENV} unset "
+                                                 "(inbound_journal.RECOVERY_MAX_S), which this deploy leaves unset")
+    if spec.keys is None:
+        return [rh.unknown(claim, rh.Fact("horizon", None, "the local router's config"),
+                           "the document has no keys section, so the local router's config is not named",
+                           "add the keys section with local_config")]
+    try:
+        doc = read(spec.keys.local_config)
+    except (OSError, ValueError) as e:
+        return [rh.unknown(claim, rh.Fact("horizon", None, spec.keys.local_config),
+                           f"cannot read {spec.keys.local_config}: {e}", "render and place the local router's config")]
+    if not isinstance(doc, dict):
+        return [rh.unknown(claim, rh.Fact("horizon", None, spec.keys.local_config),
+                           f"{spec.keys.local_config} is not a JSON object", "render it again")]
+    if hp.HORIZON_KEY in doc:
+        horizon, where = doc[hp.HORIZON_KEY], f"{hp.HORIZON_KEY} in {spec.keys.local_config}"
+    else:
+        horizon, where = (horizon_default or (lambda: hp.horizon_default(hp.hop_checkout())))()
+    want = rh.Fact("horizon", horizon, where)
+    if not isinstance(horizon, int) or isinstance(horizon, bool):
+        return [rh.unknown(claim, want, where, "make the hop checkout readable at its pin")]
+    return [rh.check(claim, want, window, f"{remedy} (the window read: {window} days, {why})",
+                     ok=lambda e, a: a < e)]
 
 
 def secret_checks(spec: Spec, *, lstat: Callable, digest: Callable[[str], Any], overlay: Optional[Path] = None,
@@ -1200,11 +1246,17 @@ def start_checks(spec: Spec, *, lstat: Callable = os.lstat, digest: Callable[[st
     else:
         k = keys or {}
         out += hk.verify_placement(spec.keys, lstat)
-        out += hk.verify_no_delegation(spec.keys, k.get("read_json_", hk.read_json))
+        live = k.get("live", hk.ASK)
+        if live is hk.ASK:
+            live = hk.ask_live_config(spec, spec.runtime_of(spec.keys.principal)["container"])
+        out += hk.verify_no_delegation(spec.keys, k.get("read_json_", hk.read_json), live,
+                                       k.get("read_bytes_", hk.read_bytes))
         out += hk.verify_evidence_dir(spec.keys, lstat)
         out += hk.verify_evidence_binds(spec.keys, hk.ask_containers(spec) if k.get("containers", hr.ASK)
                                         is hr.ASK else k["containers"])
         out += hk.verify_evidence(spec, spec.keys, lstat, k.get("read_json_", hk.read_json))
+    out += verify_recovery_horizon(spec, (keys or {}).get("read_json_", hk.read_json),
+                                   (keys or {}).get("horizon_default"))
     out += hv.checks(spec, lstat=lstat, **(supervision or {}))
     return out
 

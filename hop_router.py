@@ -290,11 +290,15 @@ def plugin_nesting_problems(doc: Dict[str, Any], roots: Any = ()) -> List[str]:
               ("intake_dir", doc.get("intake_dir")),
               ("hop.root", doc["hop"]["root"]), ("registry_dir", doc.get("registry_dir")),
               ("the D7 directory", posixpath.dirname(doc.get("delivered_domains_file") or "") or None)]
-    if not isinstance(roots, rh.Unresolved):
+    unknown = []
+    if isinstance(roots, rh.Unresolved):
+        unknown = [f"the agent-reachable roots cannot be derived ({roots.reason}), so the plugin's directory "
+                   f"{plugin_dir} cannot be shown to sit outside them"]
+    else:
         others += [("an agent-reachable root", r) for r in roots]
-    return [f"the plugin's directory {plugin_dir} is inside {what} {p}; the router's plugin checks walk "
-            "its ancestors, so it must sit outside every other mount" for what, p in others
-            if p and _within(plugin_dir, os.path.realpath(p))]
+    return unknown + [f"the plugin's directory {plugin_dir} is inside {what} {p}; the router's plugin checks "
+                      "walk its ancestors, so it must sit outside every other mount" for what, p in others
+                      if p and _within(plugin_dir, os.path.realpath(p))]
 
 
 def tunable_problems(doc: Dict[str, Any]) -> List[str]:
@@ -389,6 +393,29 @@ def validate_with_hop_router(doc: Dict[str, Any], checkout: str) -> Optional[str
         return None
     lines = [l for l in p.stderr.strip().splitlines() if l.strip()]
     return lines[-1] if lines else f"exit {p.returncode}"
+
+
+#: The local router's config key for how long it remembers an ingress item
+#: it has seen (its dedup horizon), in days; absent means the router's default.
+HORIZON_KEY = "ingress_dedup_horizon_days"
+
+
+def horizon_default(checkout: str) -> Tuple[Optional[int], str]:
+    """The hop checkout's own default for HORIZON_KEY, read in a separate
+    process as validate_with_hop_router reads its loader: (days, where), or
+    (None, why it could not be read)."""
+    code = ("import sys\nsys.path.insert(0, sys.argv[1])\n"
+            "from router.config import INGRESS_DEDUP_HORIZON_DAYS_DEFAULT as d\nprint(d)\n")
+    where = f"router.config.INGRESS_DEDUP_HORIZON_DAYS_DEFAULT in the hop checkout {checkout}"
+    try:
+        p = subprocess.run([sys.executable, "-I", "-c", code, checkout], capture_output=True, text=True,
+                           timeout=120)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return None, f"{where} could not be read: {e}"
+    out = p.stdout.strip()
+    if p.returncode != 0 or not out.isdigit():
+        return None, f"{where} could not be read: exit {p.returncode}"
+    return int(out), where
 
 
 def state_problems(state_dir: str, keys: Optional[Dict[str, Any]]) -> List[str]:
@@ -581,9 +608,13 @@ def live_problems(spec: Any, keys: Dict[str, Any], roots: Any, *, run: Callable 
     if not isinstance(options, list):
         bad.append("the engine's security options cannot be read, so a daemon-wide user-namespace remap "
                    "cannot be ruled out")
-    elif any("name=userns" in str(o) for o in options):
-        bad.append("the engine remaps user namespaces daemon-wide (userns-remap); the hop trees' owners "
-                   "would not be what they seem")
+    else:
+        # Each entry is `name=<option>[,key=value...]`, as `docker info` prints it.
+        names = {str(o).split(",")[0] for o in options}
+        for name, what in (("name=userns", "remaps user namespaces daemon-wide (userns-remap)"),
+                           ("name=rootless", "runs rootless, so every container's uids are mapped")):
+            if name in names:
+                bad.append(f"the engine {what}; the hop trees' owners would not be what they seem")
     if c.get("Image") != r.image_digest:
         bad.append(f"[1] runs image {c.get('Image')!r}, not the recorded {r.image_name} ({r.image_digest})")
     if isinstance(roots, rh.Unresolved):

@@ -654,10 +654,15 @@ read-only included.
 
 `host-setup` and `verify` also check the local router's config for a
 `delegation` block: one present, in any form, fails (no live peer signing
-until the full signed-case harness passes). One absent is reported UNKNOWN
-until the local router's rendering binds `keys.local_config` to the file
-the router actually reads. They also check that each running router sees
-the D7 file the host holds.
+until the full signed-case harness passes). Its absence passes only when
+the running local router reads `keys.local_config`, byte for byte: they
+ask the router's container which file its `ROUTER_CONFIG` names and hash
+it there. On a hop host `install` refuses a `keys.local_config` other than
+the router.json it renders, so start the local router with `--config`
+naming that file. They also check that each running router sees the D7
+file the host holds, and that the email router's inbound recovery window
+(its default; this deploy leaves `HUB_INBOUND_RECOVERY_MAX_DAYS` unset)
+stays below the local router's `ingress_dedup_horizon_days`.
 
 ### The local router's hop link
 
@@ -689,6 +694,10 @@ principal (the hub's hop's other end in the host-setup document): the
 router runs as the uid and gid of whoever runs `run.sh`, and `verify`
 checks they are that principal's. A change to the hop keys or the plugin
 needs that restart; the router refuses a reload that changes them.
+`verify` reports a refused reload from the router's own `status.json`: the
+router keeps running on its last good config and says so there, and only a
+recent document from a router with its hop transport loaded can show that
+no reload was refused.
 
 Three changes are refused rather than rendered:
 

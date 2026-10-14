@@ -88,6 +88,12 @@ ABSENT_PREFIXES = ("OAUTH2_",)
 BUDGET_S = ss.PROBE_BUDGET_S
 BUDGETS = ss.PROBE_BUDGETS
 SWITCHES_OFF = ("HUB_UNKNOWN_TARGET_DSN", "HUB_INTAKE_SWEEP")
+#: How long the hub-link router may recover an inbound item, in days. Not
+#: rendered, so the router's own default applies: RECOVERY_DEFAULT_DAYS,
+#: its inbound_journal.RECOVERY_MAX_S (29 days), which it reads when the
+#: variable is unset. It must stay below the local router's dedup horizon.
+RECOVERY_ENV = "HUB_INBOUND_RECOVERY_MAX_DAYS"
+RECOVERY_DEFAULT_DAYS = 29
 DIR_KEYS = ("MAILBOX_ROOT_DIR", "RELAY_LEDGER_DIR", "HUB_INBOUND_STATE_DIR", "lock")
 _LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
 _OWN = re.compile(rf"({_LABEL})\.internal")

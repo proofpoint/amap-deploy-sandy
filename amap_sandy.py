@@ -3537,13 +3537,15 @@ def sibling_diff(existing: Any, rendered: Dict[str, Any]) -> List[str]:
 
 
 def hop_router_keys(policy: Dict[str, Any], state_dir: Path, overlay: Optional[Path], *,
-                    decommission: bool = False, spec_out: Optional[List[Any]] = None
-                    ) -> Tuple[Optional[Dict[str, Any]], List[str]]:
+                    decommission: bool = False, spec_out: Optional[List[Any]] = None,
+                    rendered: Optional[Path] = None) -> Tuple[Optional[Dict[str, Any]], List[str]]:
     """The local router's hop keys and every problem that stops them, on a
     host whose policy has `hop_link` (hop_router). The trigger is the policy,
     never the host-setup document, which a hop host must then have in full.
     Without `hop_link`, the problems are any hop state left in state_dir,
-    unless the run is the explicit decommission."""
+    unless the run is the explicit decommission. With `rendered`, the
+    document's keys.local_config must name that file: the no-signing check
+    reads it as the config the local router runs on."""
     try:
         link = hp.parse_hop_link(policy)
     except hp.HopRenderError as e:
@@ -3560,6 +3562,11 @@ def hop_router_keys(policy: Dict[str, Any], state_dir: Path, overlay: Optional[P
     problems = hp.plugin_problems(keys["transport_plugin"]["path"], keys["transport_plugin"]["sha256"])
     problems += hp.checkout_problems(hp.hop_checkout(), hp.hop_pin())
     problems += hp.state_problems(str(state_dir), keys)
+    if rendered is not None and spec.keys is not None and not (
+            spec.keys.local_config == str(rendered)
+            or os.path.realpath(spec.keys.local_config) == os.path.realpath(rendered)):
+        problems.append(f"the host-setup document's keys.local_config is {spec.keys.local_config}, not {rendered}, "
+                        f"the router config this renders: the no-signing check would read another file")
     return keys, problems
 
 
@@ -3582,7 +3589,7 @@ def run_render_router(args: argparse.Namespace, home: Path, boxes: List[Dict[str
     for w in result["_warnings"]:
         print(f"router config warning: {w}", file=sys.stderr)
     keys, hop_problems = hop_router_keys(policy, state_dir, ha.overlay_path(getattr(args, "overlay", None)),
-                                         decommission=getattr(args, "decommission_hop", False))
+                                         decommission=getattr(args, "decommission_hop", False), rendered=path)
     for p in hop_problems:
         print(f"router config: cannot render — {p}", file=sys.stderr)
     if hop_problems:
@@ -3664,7 +3671,7 @@ def verify_router_sibling(home: Path, policy: Dict[str, Any], members: Dict[str,
     except ProvisionError as e:
         return [f"router config: cannot render: {e}"]
     spec_out: List[Any] = []
-    keys, hop_problems = hop_router_keys(policy, state_dir, overlay, spec_out=spec_out)
+    keys, hop_problems = hop_router_keys(policy, state_dir, overlay, spec_out=spec_out, rendered=path)
     if hop_problems:
         return [f"router config: {p}" for p in hop_problems]
     if keys is None:

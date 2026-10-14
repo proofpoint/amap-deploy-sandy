@@ -15,6 +15,7 @@ import tempfile
 import unittest
 
 import host_setup as hs
+import hop_router as hp
 import hub_keys as hk
 import hub_runtime as hr
 import router_health as rh
@@ -243,6 +244,9 @@ class RunProbeTest(unittest.TestCase):
         self.assertIn("would run", said[0])
 
 
+LOCAL = "/opt/ex/local/router.json"
+
+
 def st(mode, uid=0, gid=0, nlink=1):
     return os.stat_result((mode, 0, 0, nlink, uid, gid, 0, 0, 0, 0))
 
@@ -273,7 +277,17 @@ class VerifyTest(unittest.TestCase):
             raise FileNotFoundError(p)
         return self.json[p]
 
-    def run_checks(self, d7_hash="a" * 64, seen=None, containers=()):
+    def raw(self, p):
+        if p not in self.json:
+            raise FileNotFoundError(p)
+        return json.dumps(self.json[p]).encode()
+
+    def live_ok(self):
+        """What the running local router reports: the rendered path, and the
+        sha256 of the bytes the host holds there."""
+        return LOCAL, hk._sha(self.raw(LOCAL))
+
+    def run_checks(self, d7_hash="a" * 64, seen=None, containers=(), live=None):
         seen = seen or {}
         ids = {}
 
@@ -282,20 +296,20 @@ class VerifyTest(unittest.TestCase):
             return os.stat_result((stat.S_IFDIR | 0o755, ids[p], 1, 1, 0, 0, 0, 0, 0, 0))
         return hk.checks(self.spec, self.k, lstat=self.lstat, read_json_=self.read, d7_hash=d7_hash,
                          ask=lambda c, p: seen.get(c, "a" * 64), containers=list(containers),
-                         stat_=stat_, realpath=lambda p: p)
+                         stat_=stat_, realpath=lambda p: p,
+                         live=self.live_ok() if live is None else live, read_bytes_=self.raw)
 
     def claim(self, found, words):
         hits = [c for c in found if words in c.claim]
         self.assertEqual(len(hits), 1, [c.claim for c in found])
         return hits[0]
 
-    def test_a_good_host_passes_but_for_the_unbound_config(self):
-        """Every check passes, except that a config without a delegation
-        block is UNKNOWN until the local router's rendering binds its path."""
+    def test_a_good_host_passes_every_check(self):
+        """The local router reads the rendered config, byte for byte, and it
+        has no delegation block: nothing is left UNKNOWN."""
         found = self.run_checks()
-        self.assertEqual([c.claim for c in found if c.result != rh.PASS],
-                         ["the local router's config /opt/ex/local/router.json has no delegation block"])
-        self.assertEqual(self.claim(found, "no delegation block").result, rh.UNKNOWN)
+        self.assertEqual([(c.claim, c.result) for c in found if c.result != rh.PASS], [])
+        self.assertEqual(self.claim(found, "no delegation block").result, rh.PASS)
 
     def test_an_exact_read_only_bind_of_the_evidence_dir_fails(self):
         c = {"Name": "/ex-up", "Mounts": [{"Type": "bind", "Source": EVIDENCE_DIR, "Destination": "/e", "RW": False}]}
@@ -354,14 +368,35 @@ class VerifyTest(unittest.TestCase):
                 self.json["/opt/ex/local/router.json"] = {"instances": {}, "delegation": value}
                 self.assertEqual(self.claim(self.run_checks(), "no delegation block").result, rh.FAIL)
 
-    def test_a_config_without_delegation_is_unknown_until_bound(self):
-        c = self.claim(self.run_checks(), "no delegation block")
+    def test_a_delegation_block_fails_even_when_the_router_reads_another_file(self):
+        self.json[LOCAL] = {"instances": {}, "delegation": {}}
+        found = self.run_checks(live=("/elsewhere/router.json", "b" * 64))
+        self.assertEqual(self.claim(found, "no delegation block").result, rh.FAIL)
+
+    def test_a_router_reading_another_file_fails_the_binding_and_proves_nothing(self):
+        found = self.run_checks(live=("/elsewhere/router.json", self.live_ok()[1]))
+        self.assertEqual(self.claim(found, "byte for byte").result, rh.FAIL)
+        c = self.claim(found, "no delegation block")
         self.assertEqual(c.result, rh.UNKNOWN)
-        self.assertIn("binds it", c.reason)
+        self.assertIn("not shown to read it", c.reason)
+
+    def test_a_router_reading_other_bytes_at_the_path_fails_the_binding(self):
+        found = self.run_checks(live=(LOCAL, "b" * 64))
+        self.assertEqual(self.claim(found, "byte for byte").result, rh.FAIL)
+        self.assertEqual(self.claim(found, "no delegation block").result, rh.UNKNOWN)
+
+    def test_a_router_that_cannot_be_asked_leaves_both_unknown(self):
+        found = self.run_checks(live=rh.Unresolved("docker exec local exited 1"))
+        self.assertEqual(self.claim(found, "byte for byte").result, rh.UNKNOWN)
+        c = self.claim(found, "no delegation block")
+        self.assertEqual(c.result, rh.UNKNOWN)
+        self.assertIn("exited 1", c.reason)
 
     def test_an_absent_local_config_is_unknown(self):
         del self.json["/opt/ex/local/router.json"]
-        self.assertEqual(self.claim(self.run_checks(), "no delegation block").result, rh.UNKNOWN)
+        found = self.run_checks(live=(LOCAL, "b" * 64))
+        self.assertEqual(self.claim(found, "no delegation block").result, rh.UNKNOWN)
+        self.assertEqual(self.claim(found, "byte for byte").result, rh.UNKNOWN)
 
     def test_a_failed_probe_record_fails(self):
         self.json[EVIDENCE_DIR + "/keyprobe.json"] = dict(self.record, result="FAIL")
@@ -497,3 +532,71 @@ class NoRendererEmitsDelegationTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RecoveryBelowHorizonTest(unittest.TestCase):
+    """The hub-link router's inbound recovery window (its default, since the
+    deploy leaves HUB_INBOUND_RECOVERY_MAX_DAYS unrendered) must stay below
+    the local router's dedup horizon: its config's key, or the hop
+    checkout's own default when the key is absent."""
+
+    def run_it(self, cfg, default=(30, "the hop checkout's default")):
+        files = {LOCAL: cfg} if cfg is not None else {}
+
+        def read(p):
+            if p not in files:
+                raise FileNotFoundError(p)
+            return files[p]
+        return hs.verify_recovery_horizon(spec(), read, lambda: default)
+
+    def test_the_defaults_pass(self):
+        [c] = self.run_it({"instances": {}})
+        self.assertEqual(c.result, rh.PASS)
+        self.assertEqual(c.expected.value, 30)
+
+    def test_a_horizon_at_or_below_the_window_fails(self):
+        for days in (hr.RECOVERY_DEFAULT_DAYS, 7):
+            with self.subTest(days=days):
+                [c] = self.run_it({"instances": {}, hp.HORIZON_KEY: days})
+                self.assertEqual(c.result, rh.FAIL)
+                self.assertIn(hr.RECOVERY_ENV, c.remedy)
+
+    def test_a_longer_horizon_in_the_config_passes(self):
+        [c] = self.run_it({"instances": {}, hp.HORIZON_KEY: 90})
+        self.assertEqual(c.result, rh.PASS)
+
+    def test_an_unreadable_default_or_config_is_unknown(self):
+        [c] = self.run_it({"instances": {}}, default=(None, "the hop checkout could not be read"))
+        self.assertEqual(c.result, rh.UNKNOWN)
+        [c] = self.run_it(None)
+        self.assertEqual(c.result, rh.UNKNOWN)
+
+    def test_no_keys_section_is_unknown(self):
+        d = full_doc()
+        del d["keys"]
+        [c] = hs.verify_recovery_horizon(hs.load_spec(d), lambda p: {}, lambda: (30, "x"))
+        self.assertEqual(c.result, rh.UNKNOWN)
+
+    def test_the_hop_checkouts_own_default_is_read_from_its_code(self):
+        from _workspace import HOP_ROUTER_ROOT
+        days, where = hp.horizon_default(str(HOP_ROUTER_ROOT))
+        self.assertIsInstance(days, int, where)
+        self.assertGreater(days, hr.RECOVERY_DEFAULT_DAYS, "the defaults themselves keep the order")
+
+    def test_verify_runs_it_on_a_hub_host(self):
+        class Ran(Exception):
+            pass
+
+        def spy(*a, **k):
+            raise Ran()
+        self.addCleanup(setattr, hs, "verify_recovery_horizon", hs.verify_recovery_horizon)
+        hs.verify_recovery_horizon = spy
+        for name in ("verify_roots", "verify_overlay", "verify_containers", "verify_mounts", "verify_openssl",
+                     "verify_umasks", "verify_groups", "secret_checks"):
+            self.addCleanup(setattr, hs, name, getattr(hs, name))
+            setattr(hs, name, lambda *a, **k: [])
+        for mod in (hs.hr, hs.hk):
+            self.addCleanup(setattr, mod, "checks", mod.checks)
+            mod.checks = lambda *a, **k: []
+        with self.assertRaises(Ran):
+            hs.checks(spec(), production=False, containers=lambda c: None, openssl={})
