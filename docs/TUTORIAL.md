@@ -635,7 +635,13 @@ the record is stale, and the email router may not start until the probe
 passes again. The environment file's contents are not bound: a variable
 cannot add a mount, a capability or a user.
 
-`host-setup` and `verify` also check that the local router's config has no
-`delegation` block at all, in any form (no live peer signing until the
-full signed-case harness passes), and that each running router sees the
-D7 file the host holds.
+The evidence directory must be root-owned 0755 under root-owned
+directories, and no container may bind it, or anything above it, at all,
+read-only included.
+
+`host-setup` and `verify` also check the local router's config for a
+`delegation` block: one present, in any form, fails (no live peer signing
+until the full signed-case harness passes). One absent is reported UNKNOWN
+until the local router's rendering binds `keys.local_config` to the file
+the router actually reads. They also check that each running router sees
+the D7 file the host holds.

@@ -85,6 +85,11 @@ class LoadTest(unittest.TestCase):
         d["hub"]["prefix_template"] = "/prefix.json"
         self.refuses(d, "overlaps /;")
 
+    def test_an_evidence_dir_inside_the_d7_dir_refuses(self):
+        d = full_doc(evidence_dir="/opt/ex/d7/ev")
+        d[ss.SECTION]["exposure"]["integrity_roots"] = ["/opt/ex/d7/ev"]
+        self.refuses(d, "keys.evidence_dir /opt/ex/d7/ev overlaps")
+
     def test_keys_without_a_hub_section_refuse(self):
         d = full_doc()
         del d[hr.SECTION]
@@ -98,7 +103,7 @@ class ProbeSpecTest(unittest.TestCase):
         self.probe = hk.probe_spec(self.base, self.spec.keys, "r1")
 
     def test_the_probe_differs_only_where_allowed(self):
-        self.assertEqual(hk.probe_diff(self.base, self.probe), [])
+        self.assertEqual(hk.probe_diff(self.base, self.probe, self.spec.keys, "r1"), [])
 
     def test_the_secret_volume_is_absent_from_the_probe_and_present_in_the_router(self):
         self.assertTrue(any(m["type"] == "volume" for m in self.base["mounts"]))
@@ -108,17 +113,51 @@ class ProbeSpecTest(unittest.TestCase):
     def test_a_dropped_capability_set_is_refused(self):
         p = copy.deepcopy(self.probe)
         p["cap_drop"] = []
-        self.assertEqual(hk.probe_diff(self.base, p), ["cap_drop differs"])
+        self.assertEqual(hk.probe_diff(self.base, p, self.spec.keys, "r1"), ["cap_drop differs"])
+
+    def refused(self, mutate, words):
+        p = copy.deepcopy(self.probe)
+        mutate(p)
+        self.assertIn(words, hk.probe_diff(self.base, p, self.spec.keys, "r1"))
+
+    def test_a_host_network_is_refused(self):
+        self.refused(lambda p: p.__setitem__("network", "host"), "network is not the allowed value")
+
+    def test_wrong_or_empty_labels_are_refused(self):
+        self.refused(lambda p: p.__setitem__("labels", {}), "labels is not the allowed value")
+        self.refused(lambda p: p["labels"].__setitem__("org.amap.run", "r2"), "labels is not the allowed value")
+
+    def test_another_command_is_refused(self):
+        self.refused(lambda p: p.__setitem__("command", ["-c", "print(open('/x').read())"]),
+                     "command is not the allowed value")
+
+    def test_another_entrypoint_restart_or_name_is_refused(self):
+        self.refused(lambda p: p.__setitem__("entrypoint", "sh"), "entrypoint is not the allowed value")
+        self.refused(lambda p: p.__setitem__("restart", "always"), "restart is not the allowed value")
+        self.refused(lambda p: p.__setitem__("name", self.base["name"]), "name is not the allowed value")
+        self.refused(lambda p: p.__setitem__("remove", False), "remove is not the allowed value")
+
+    def test_only_the_named_secret_volume_is_dropped(self):
+        b = copy.deepcopy(self.base)
+        other = {"type": "volume", "source": "ex-cache", "target": "/cache", "readonly": True}
+        b["mounts"].append(other)
+        p = hk.probe_spec(b, self.spec.keys, "r1")
+        self.assertIn(other, p["mounts"])
+        self.assertEqual(hk.probe_diff(b, p, self.spec.keys, "r1"), [])
+        dropped = copy.deepcopy(p)
+        dropped["mounts"] = [m for m in dropped["mounts"] if m["type"] != "volume"]
+        self.assertIn("its mounts are not the email router's without the secret volume",
+                      hk.probe_diff(b, dropped, self.spec.keys, "r1"))
 
     def test_another_user_is_refused(self):
         p = copy.deepcopy(self.probe)
         p["user"] = "0:0"
-        self.assertEqual(hk.probe_diff(self.base, p), ["user differs"])
+        self.assertEqual(hk.probe_diff(self.base, p, self.spec.keys, "r1"), ["user differs"])
 
     def test_a_removed_bind_is_refused(self):
         p = copy.deepcopy(self.probe)
         p["mounts"] = p["mounts"][1:]
-        self.assertIn("its mounts are not the email router's without the secret volume", hk.probe_diff(self.base, p))
+        self.assertIn("its mounts are not the email router's without the secret volume", hk.probe_diff(self.base, p, self.spec.keys, "r1"))
 
     def test_the_probe_keeps_the_router_s_user_groups_and_read_only_root(self):
         a = hk.probe_argv(self.probe)
@@ -233,19 +272,61 @@ class VerifyTest(unittest.TestCase):
             raise FileNotFoundError(p)
         return self.json[p]
 
-    def run_checks(self, d7_hash="a" * 64, seen=None):
+    def run_checks(self, d7_hash="a" * 64, seen=None, containers=()):
         seen = seen or {}
+        ids = {}
+
+        def stat_(p):
+            ids.setdefault(p, len(ids) + 1)
+            return os.stat_result((stat.S_IFDIR | 0o755, ids[p], 1, 1, 0, 0, 0, 0, 0, 0))
         return hk.checks(self.spec, self.k, lstat=self.lstat, read_json_=self.read, d7_hash=d7_hash,
-                         ask=lambda c, p: seen.get(c, "a" * 64))
+                         ask=lambda c, p: seen.get(c, "a" * 64), containers=list(containers),
+                         stat_=stat_, realpath=lambda p: p)
 
     def claim(self, found, words):
         hits = [c for c in found if words in c.claim]
         self.assertEqual(len(hits), 1, [c.claim for c in found])
         return hits[0]
 
-    def test_a_good_host_passes(self):
+    def test_a_good_host_passes_but_for_the_unbound_config(self):
+        """Every check passes, except that a config without a delegation
+        block is UNKNOWN until the local router's rendering binds its path."""
         found = self.run_checks()
-        self.assertEqual([(c.claim, c.actual) for c in found if c.result != rh.PASS], [])
+        self.assertEqual([c.claim for c in found if c.result != rh.PASS],
+                         ["the local router's config /opt/ex/local/router.json has no delegation block"])
+        self.assertEqual(self.claim(found, "no delegation block").result, rh.UNKNOWN)
+
+    def test_an_exact_read_only_bind_of_the_evidence_dir_fails(self):
+        c = {"Name": "/ex-up", "Mounts": [{"Type": "bind", "Source": EVIDENCE_DIR, "Destination": "/e", "RW": False}]}
+        self.assertEqual(self.claim(self.run_checks(containers=[("default", c)]), "no container binds").result,
+                         rh.FAIL)
+
+    def test_a_read_only_bind_above_the_evidence_dir_fails(self):
+        c = {"Name": "/ex-up", "Mounts": [{"Type": "bind", "Source": "/opt", "Destination": "/o", "RW": False}]}
+        self.assertEqual(self.claim(self.run_checks(containers=[("default", c)]), "no container binds").result,
+                         rh.FAIL)
+
+    def test_an_unanswerable_engine_is_unknown_for_the_binds(self):
+        found = hk.verify_evidence_binds(self.k, rh.Unresolved("no engine"))
+        self.assertEqual(found[0].result, rh.UNKNOWN)
+
+    def test_a_group_writable_evidence_dir_fails(self):
+        self.files[EVIDENCE_DIR] = st(stat.S_IFDIR | 0o775)
+        self.assertEqual(self.claim(self.run_checks(), "evidence directory").result, rh.FAIL)
+
+    def test_a_writable_ancestor_of_the_evidence_dir_fails(self):
+        self.files["/opt/ex"] = st(stat.S_IFDIR | 0o777)
+        self.assertEqual(self.claim(self.run_checks(), f"every directory above {EVIDENCE_DIR}").result, rh.FAIL)
+
+    def test_a_numeric_run_id_is_a_malformed_record_not_a_crash(self):
+        self.json[EVIDENCE_DIR + "/keyprobe.json"] = dict(self.record, run_id=7)
+        c = self.claim(self.run_checks(), "CURRENT run spec")
+        self.assertEqual(c.result, rh.FAIL)
+        self.assertIn("malformed", str(c.actual))
+
+    def test_an_unknown_result_is_malformed(self):
+        self.json[EVIDENCE_DIR + "/keyprobe.json"] = dict(self.record, result="pass")
+        self.assertIn("malformed", str(self.claim(self.run_checks(), "CURRENT run spec").actual))
 
     def test_a_group_readable_key_fails(self):
         self.files[KEY_DIR + "/signing.key"] = st(stat.S_IFREG | 0o440, UP)
@@ -271,6 +352,11 @@ class VerifyTest(unittest.TestCase):
             with self.subTest(value=value):
                 self.json["/opt/ex/local/router.json"] = {"instances": {}, "delegation": value}
                 self.assertEqual(self.claim(self.run_checks(), "no delegation block").result, rh.FAIL)
+
+    def test_a_config_without_delegation_is_unknown_until_bound(self):
+        c = self.claim(self.run_checks(), "no delegation block")
+        self.assertEqual(c.result, rh.UNKNOWN)
+        self.assertIn("binds it", c.reason)
 
     def test_an_absent_local_config_is_unknown(self):
         del self.json["/opt/ex/local/router.json"]
@@ -345,6 +431,44 @@ class SweepTest(unittest.TestCase):
 
     def test_an_unrelated_bind_passes(self):
         self.assertEqual(self.overlap("/srv/example/a/b"), ([], []))
+
+
+class ReadJsonTest(unittest.TestCase):
+    def write(self, data):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        p = os.path.join(td.name, "f.json")
+        with open(p, "wb") as f:
+            f.write(data)
+        return p
+
+    def test_a_short_read_is_continued(self):
+        p = self.write(json.dumps({"a": "b" * 100}).encode())
+        real = os.read
+        os.read = lambda fd, n: real(fd, min(n, 3))
+        try:
+            self.assertEqual(hk.read_json(p), {"a": "b" * 100})
+        finally:
+            os.read = real
+
+    def test_an_oversized_file_is_refused(self):
+        p = self.write(b'{"a": "' + b"x" * hk.JSON_MAX_BYTES + b'"}')
+        with self.assertRaises(ValueError) as e:
+            hk.read_json(p)
+        self.assertIn("larger than", str(e.exception))
+
+    def test_a_duplicate_key_is_refused(self):
+        with self.assertRaises(ValueError):
+            hk.read_json(self.write(b'{"a": 1, "a": 2}'))
+
+    def test_the_record_writer_survives_short_writes(self):
+        real = os.write
+        os.write = lambda fd, b: real(fd, bytes(b[:5]))
+        try:
+            code, rec, _ = RunProbeTest.run_it(self, "0 ENOENT\n1 ENOENT\n")
+        finally:
+            os.write = real
+        self.assertEqual(rec["result"], "PASS")
 
 
 class PlanTest(unittest.TestCase):

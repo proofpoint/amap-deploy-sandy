@@ -13,10 +13,15 @@ The host-setup document's `keys` section (it needs a `hub` section) names:
   own) whose bind overlaps it, in either direction. It must sit outside
   every declared root, agent path, the hop root, the registry, the D7 and
   overlay directories and the environment file's directory.
-- `evidence_dir`: where the key probe's record is placed, root-owned. It
-  must be listed in `exposure.integrity_roots`, so no container may write
-  it or bind anything above it.
-- `local_config`: the file the local router reads its config from.
+- `evidence_dir`: where the key probe's record is placed, root-owned 0755
+  under root-owned directories. It must be listed in
+  `exposure.integrity_roots`, and verify fails any container that binds it
+  or anything above it, read-only or not.
+- `local_config`: the file the local router is expected to read its config
+  from. Until the local router's rendering binds that path, a config here
+  without a delegation block proves nothing about the one the router reads,
+  so that outcome is UNKNOWN; a delegation block found here is still a
+  failure.
 
 The key-read probe runs the email router's own rendered run spec with only
 these changes: removed after `run`, no network, its own name and labels, no
@@ -60,6 +65,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 import delivered_domains as dd
 import hub_runtime as hr
 import router_health as rh
+import secret_exposure as se
 import secret_setup as ss
 
 SECTION = "keys"
@@ -104,6 +110,7 @@ class KeySpec:
     principal: str            # the local router's
     uid: int
     gid: int
+    volume: str               # the secret volume, the one mount the probe drops
 
     @property
     def path(self) -> str:
@@ -155,9 +162,12 @@ def load(sec: Any, spec: Any) -> KeySpec:
         if _related(d, o):
             raise KeySpecError(f"keys.dir {d} overlaps {o}; the key stays outside every root a runtime "
                                f"or an agent reaches")
+    for o in [x for x in others if x != ev] + [d]:
+        if _related(ev, o):
+            raise KeySpecError(f"keys.evidence_dir {ev} overlaps {o}; no runtime may reach the evidence")
     p = spec.principals[local]
     return KeySpec(dir=d, file=sec["file"], evidence_dir=ev, local_config=cfg, principal=local, uid=p.uid,
-                   gid=p.gids[0])
+                   gid=p.gids[0], volume=s.volume)
 
 
 # --- The probe ------------------------------------------------------------------
@@ -194,24 +204,41 @@ def probe_spec(base: Dict[str, Any], ks: KeySpec, run_id: str) -> Dict[str, Any]
     p["entrypoint"] = "python3"
     p["command"] = ["-I", "-S", "-c", PROBE_SCRIPT] + candidates(base, ks)
     p["remove"] = True
-    p["mounts"] = [m for m in base["mounts"] if m["type"] != "volume"]
+    p["mounts"] = [m for m in base["mounts"] if not _is_secret_volume(m, ks)]
     return p
 
 
-def probe_diff(base: Dict[str, Any], probe: Dict[str, Any]) -> List[str]:
-    """Every difference between the two specs that PROBE_CHANGES does not
-    allow, plus any mount change other than the secret volume's removal."""
-    bad = []
-    for k in sorted(set(base) | set(probe)):
-        if k == "mounts" or k in PROBE_CHANGES:
-            continue
-        if base.get(k) != probe.get(k):
-            bad.append(f"{k} differs")
-    kept = [m for m in base["mounts"] if m["type"] != "volume"]
-    if probe.get("mounts") != kept:
+def _is_secret_volume(m: Dict[str, Any], ks: KeySpec) -> bool:
+    return m.get("type") == "volume" and m.get("source") == ks.volume
+
+
+def expected_probe(base: Dict[str, Any], ks: KeySpec, run_id: str) -> Dict[str, Any]:
+    """The exact probe spec, built field by field from the email router's
+    and independently of probe_spec, for probe_diff to hold it to."""
+    want: Dict[str, Any] = {k: copy.deepcopy(v) for k, v in base.items() if k != "mounts"}
+    want.update({
+        "name": base["name"] + "-" + PROBE_LABEL + "-" + run_id,
+        "network": "none",
+        "restart": "no",
+        "labels": {"org.amap.oneshot": PROBE_LABEL, "org.amap.run": run_id},
+        "entrypoint": "python3",
+        "command": ["-I", "-S", "-c", PROBE_SCRIPT] + candidates(base, ks),
+        "remove": True,
+        "mounts": [copy.deepcopy(m) for m in base["mounts"]
+                   if not (m["type"] == "volume" and m["source"] == ks.volume)],
+    })
+    return want
+
+
+def probe_diff(base: Dict[str, Any], probe: Dict[str, Any], ks: KeySpec, run_id: str) -> List[str]:
+    """Every field in which `probe` is not exactly the email router's spec
+    with PROBE_CHANGES set to their one allowed value each and the one named
+    secret volume removed: values are compared, not only which fields move."""
+    want = expected_probe(base, ks, run_id)
+    bad = [f"{k} is not the allowed value" if k in PROBE_CHANGES else f"{k} differs"
+           for k in sorted(set(want) | set(probe)) if k != "mounts" and want.get(k) != probe.get(k)]
+    if probe.get("mounts") != want["mounts"]:
         bad.append("its mounts are not the email router's without the secret volume")
-    if any(m["type"] == "volume" for m in probe.get("mounts", [])):
-        bad.append("it mounts a volume")
     return bad
 
 
@@ -269,7 +296,7 @@ def run_probe(spec: Any, ks: KeySpec, *, apply: bool, run_id: Optional[str] = No
     base = hr.run_spec(spec, hs)
     rid = run_id or time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(now()))
     probe = probe_spec(base, ks, rid)
-    bad = probe_diff(base, probe)
+    bad = probe_diff(base, probe, ks, rid)
     if bad:
         out(f"hub-keyprobe: refused: the probe would differ from the email router: {'; '.join(bad)}")
         return 2
@@ -287,14 +314,7 @@ def run_probe(spec: Any, ks: KeySpec, *, apply: bool, run_id: Optional[str] = No
         rh.Unresolved(f"the probe exited {p.rc}")
     data = record_bytes(base, ks, probe, rid, rows, now())
     path = posixpath.join(spec.secrets.run_dir, EVIDENCE_NAME)
-    tmp = f"{path}.{os.getpid()}.tmp"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0), 0o600)
-    try:
-        os.write(fd, data)
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-    os.replace(tmp, path)
+    dd.write_atomically(path, data)
     result = json.loads(data)["result"]
     for i, r in ([] if isinstance(rows, rh.Unresolved) else rows):
         out(f"  candidate {i}: {r}")
@@ -371,15 +391,53 @@ def verify_placement(ks: KeySpec, lstat: Callable) -> List[rh.Check]:
     return out
 
 
+JSON_MAX_BYTES = 1 << 20
+
+
+def _no_duplicates(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for k, v in pairs:
+        if k in out:
+            raise ValueError(f"the key {k!r} appears twice")
+        out[k] = v
+    return out
+
+
 def read_json(path: str) -> Any:
+    """A regular file's JSON, never through a symbolic link: read to EOF up
+    to the bound plus one, refused when larger, duplicate keys and NaN
+    refused."""
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise OSError(f"{path} is not a regular file")
-        raw = os.read(fd, (1 << 20) + 1)
+        raw = dd.read_bounded(fd, JSON_MAX_BYTES + 1)
     finally:
         os.close(fd)
-    return json.loads(raw.decode("utf-8"))
+    if len(raw) > JSON_MAX_BYTES:
+        raise ValueError(f"{path} is larger than {JSON_MAX_BYTES} bytes")
+
+    def no_constant(name: str) -> Any:
+        raise ValueError(f"{name} is not JSON")
+    return json.loads(raw.decode("utf-8"), object_pairs_hook=_no_duplicates, parse_constant=no_constant)
+
+
+_AT = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
+
+
+def parse_record(rec: Any) -> Optional[str]:
+    """Why `rec` is not a well-formed probe record, or None."""
+    if not isinstance(rec, dict) or set(rec) != RECORD_KEYS:
+        return "not exactly the record's members"
+    if any(not isinstance(v, str) for v in rec.values()):
+        return "a member is not a string"
+    if not _RUN_ID.fullmatch(rec["run_id"]) or not _AT.fullmatch(rec["at"]):
+        return "run_id or at is malformed"
+    if rec["result"] not in ("PASS", "FAIL"):
+        return "result is neither PASS nor FAIL"
+    if not all(_HEX64.fullmatch(rec[k]) for k in ("spec_sha256", "candidates_sha256", "probe_command_sha256")):
+        return "a hash is not 64 lower-case hex"
+    return None
 
 
 def verify_no_delegation(ks: KeySpec, read: Callable[[str], Any] = read_json) -> List[rh.Check]:
@@ -395,8 +453,68 @@ def verify_no_delegation(ks: KeySpec, read: Callable[[str], Any] = read_json) ->
         return [rh.unknown(claim, want, f"cannot read {ks.local_config}: {e}", "make it readable JSON")]
     if not isinstance(doc, dict):
         return [rh.unknown(claim, want, f"{ks.local_config} is not a JSON object", "render it again")]
-    return [rh.check(claim, want, DELEGATION_KEY in doc, remedy,
-                     do_not="never add the block by hand to test signing")]
+    if DELEGATION_KEY in doc:
+        return [rh.check(claim, want, True, remedy, do_not="never add the block by hand to test signing")]
+    return [rh.unknown(claim, want, f"{ks.local_config} has none, but nothing yet binds it to the file the "
+                                    f"local router reads; that binding comes with the router's rendering",
+                       "render the local router's config from this deployment")]
+
+
+def verify_evidence_dir(ks: KeySpec, lstat: Callable) -> List[rh.Check]:
+    why = "the probe's record is trusted only as root placed it"
+    st = _lst(ks.evidence_dir, lstat)
+    claim = f"the evidence directory {ks.evidence_dir} is a root-owned 0755 directory"
+    want = _fact("evidence dir", (0, 0, 0o755), why)
+    remedy = f"create it as the plan does: install -d -o 0 -g 0 -m 0755 {ks.evidence_dir}"
+    if isinstance(st, rh.Unresolved):
+        out = [rh.unknown(claim, want, st.reason, remedy)]
+    elif st is None or not stat.S_ISDIR(st.st_mode):
+        out = [rh.check(claim, want, "absent" if st is None else "not a directory", remedy)]
+    else:
+        out = [rh.check(claim, want, (st.st_uid, st.st_gid, stat.S_IMODE(st.st_mode)), remedy)]
+    out.append(ss._owned_chain(f"every directory above {ks.evidence_dir} is root-owned and not group- or "
+                               f"world-writable", ks.evidence_dir, (0,), why, lstat))
+    return out
+
+
+def ask_containers(spec: Any) -> Any:
+    """[(engine, inspect document)] for every container on this host's
+    engines, or an Unresolved."""
+    s = spec.secrets
+    ctx = se.contexts(s)
+    if isinstance(ctx, rh.Unresolved):
+        return ctx
+    found = []
+    for name, endpoint in ctx:
+        if not se.local(endpoint):
+            continue
+        cs = se.containers(s, name)
+        if isinstance(cs, rh.Unresolved):
+            return cs
+        found += [(name, c) for c in cs if isinstance(c, dict)]
+    return found
+
+
+def verify_evidence_binds(ks: KeySpec, containers: Any, stat_: Callable = os.stat,
+                          realpath: Callable[[str], str] = os.path.realpath) -> List[rh.Check]:
+    """No container binds the evidence directory, or anything above or
+    inside it, read-only or not."""
+    claim = f"no container binds {ks.evidence_dir} or anything above it"
+    want = _fact("binds", [], "a container that can see the evidence can be argued to have shaped it; "
+                              "none may mount it at all")
+    remedy = "remove the bind"
+    if isinstance(containers, rh.Unresolved):
+        return [rh.unknown(claim, want, containers.reason, "make every engine answer")]
+    bad, unk = [], []
+    for engine, c in containers:
+        b, u = se.rule_overlap(c, [ks.evidence_dir], [], stat_, realpath)
+        bad += [f"{engine}/{se._name(c)} {x}" for x in b]
+        unk += [f"{engine}/{se._name(c)} {x}" for x in u]
+    if bad:
+        return [rh.check(claim, want, bad, remedy)]
+    if unk:
+        return [rh.unknown(claim, want, "; ".join(unk), remedy)]
+    return [rh.check(claim, want, [], remedy)]
 
 
 def verify_evidence(spec: Any, ks: KeySpec, lstat: Callable, read: Callable[[str], Any] = read_json
@@ -423,10 +541,11 @@ def verify_evidence(spec: Any, ks: KeySpec, lstat: Callable, read: Callable[[str
     except (OSError, ValueError) as e:
         out.append(rh.unknown(claim, want, f"cannot read {ks.evidence}: {e}", remedy))
         return out
-    if not isinstance(rec, dict) or set(rec) != RECORD_KEYS:
-        out.append(rh.check(claim, want, "the record is malformed", remedy))
+    why = parse_record(rec)
+    if why is not None:
+        out.append(rh.check(claim, want, f"the record is malformed: {why}", remedy))
         return out
-    probe = probe_spec(base, ks, rec["run_id"] if _RUN_ID.fullmatch(str(rec["run_id"])) else "x")
+    probe = probe_spec(base, ks, rec["run_id"])
     stale = [k for k, v in bound(base, ks, probe).items() if rec.get(k) != v]
     if stale:
         out.append(rh.check(claim, want, f"stale: {', '.join(stale)} changed since the probe ran",
@@ -474,9 +593,12 @@ ASK = hr.ASK
 
 
 def checks(spec: Any, ks: KeySpec, *, lstat: Callable = os.lstat, read_json_: Callable[[str], Any] = read_json,
-           d7_hash: Any = ASK, ask: Any = ASK) -> List[rh.Check]:
+           d7_hash: Any = ASK, ask: Any = ASK, containers: Any = ASK, stat_: Callable = os.stat,
+           realpath: Callable[[str], str] = os.path.realpath) -> List[rh.Check]:
     out = verify_placement(ks, lstat)
     out += verify_no_delegation(ks, read_json_)
+    out += verify_evidence_dir(ks, lstat)
+    out += verify_evidence_binds(ks, ask_containers(spec) if containers is ASK else containers, stat_, realpath)
     out += verify_evidence(spec, ks, lstat, read_json_)
     if d7_hash is ASK:
         try:
