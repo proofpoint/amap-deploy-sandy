@@ -200,4 +200,57 @@ if [ -n "${AMAP_DELIVERY_SELF+x}" ]; then
     export AMAP_DELIVERY_SELF
 fi
 
+# BEGIN measurement session source
+# For one measurement only, removed after it: the operator may point the
+# daemon at a session lister of their own, for exactly one sandbox, through
+# AMAP_DELIVERY_SESSION_SOURCE_OVERRIDE. Sandy forwards that variable only
+# from an operator-approved workspace config (SANDY_EXTRA_ENV), but this
+# script cannot tell how a variable arrived, so the FILE is the guard: the
+# value must be a regular file, not a symbolic link, whose real path is
+# EXACTLY <workspace>/.sandy/m4/session-source, the workspace being the one
+# the read-only session file names. Sandy mounts the workspace's .sandy/
+# read-only, so the agent can write neither the config nor the script.
+# Anything else is refused, loudly, and the shipped lister is used. The
+# variable never reaches the daemon.
+if [ -n "${AMAP_DELIVERY_SESSION_SOURCE_OVERRIDE+x}" ]; then
+    override_verdict=$(python3 -I -c '
+import json, os, stat, sys
+value, session = sys.argv[1], sys.argv[2]
+def no(why):
+    print("no " + why)
+    sys.exit(0)
+try:
+    with open(session, encoding="utf-8") as f:
+        doc = json.load(f)
+except (OSError, ValueError):
+    no("the session file " + session + " cannot be read")
+ws = doc.get("workspace") if isinstance(doc, dict) else None
+if not isinstance(ws, str) or not ws.startswith("/"):
+    no("the session file names no absolute workspace")
+expected = ws.rstrip("/") + "/.sandy/m4/session-source"
+if not value.startswith("/"):
+    no("it is not an absolute path")
+try:
+    st = os.lstat(value)
+except OSError:
+    no("it does not exist")
+if stat.S_ISLNK(st.st_mode):
+    no("it is a symbolic link")
+if not stat.S_ISREG(st.st_mode):
+    no("it is not a regular file")
+if os.path.realpath(value) != expected:
+    no("its real path is not exactly " + expected)
+print("ok " + expected)
+' "$AMAP_DELIVERY_SESSION_SOURCE_OVERRIDE" "$SANDY_SESSION_FILE") || override_verdict="no the check could not run"
+    case "$override_verdict" in
+        "ok "*)
+            AMAP_DELIVERY_SESSION_SOURCE=${override_verdict#ok }
+            echo "relay: MEASUREMENT session source in use: $AMAP_DELIVERY_SESSION_SOURCE" >&2 ;;
+        *)
+            echo "relay: REFUSED AMAP_DELIVERY_SESSION_SOURCE_OVERRIDE=$AMAP_DELIVERY_SESSION_SOURCE_OVERRIDE: ${override_verdict#no }; using the shipped session lister" >&2 ;;
+    esac
+    unset AMAP_DELIVERY_SESSION_SOURCE_OVERRIDE
+fi
+# END measurement session source
+
 exec "$SELF_DIR/inbox-delivery" "$@"
