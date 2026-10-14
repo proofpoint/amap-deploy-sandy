@@ -721,6 +721,20 @@ class ARefusedReloadIsReadFromTheRoutersOwnStatusTest(HealthTestCase):
         self.assertIs(c.result, rh.UNKNOWN)
         self.assertIn("no interval_s", c.reason)
 
+    def test_a_flag_that_is_not_a_JSON_boolean_is_UNKNOWN_never_PASS(self):
+        self.hop_host()
+        for bad in ("true", 1, 0, {}, [], None):
+            with self.subTest(flag=bad):
+                _, cs = self._health(extra={"hop": self.HOP, "classification": {"config_reload_failed": bad}})
+                c = self.one(cs, rh.HEALTH_RELOAD)
+                self.assertIs(c.result, rh.UNKNOWN)
+                self.assertIn("not a JSON boolean", c.reason)
+
+    def test_a_false_flag_passes(self):
+        self.hop_host()
+        _, cs = self._health(extra={"hop": self.HOP, "classification": {"config_reload_failed": False}})
+        self.assertIs(self.one(cs, rh.HEALTH_RELOAD).result, rh.PASS)
+
     def test_a_classification_that_is_not_an_object_is_UNKNOWN(self):
         self.hop_host()
         _, cs = self._health(extra={"hop": self.HOP, "classification": ["config_reload_failed"]})

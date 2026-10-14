@@ -427,7 +427,11 @@ def read_bytes(path: str) -> bytes:
 def read_json(path: str) -> Any:
     """A regular file's JSON, read as `read_bytes` does, duplicate keys and
     NaN refused."""
-    raw = read_bytes(path)
+    return parse_json(read_bytes(path))
+
+
+def parse_json(raw: bytes) -> Any:
+    """`raw` as JSON, duplicate keys and NaN refused."""
 
     def no_constant(name: str) -> Any:
         raise ValueError(f"{name} is not JSON")
@@ -452,6 +456,14 @@ def parse_record(rec: Any) -> Optional[str]:
     return None
 
 
+def local_container(spec: Any, ks: KeySpec) -> str:
+    """The local router's container: the router section's on a hop host
+    (load_spec refuses a runtime that names another), else the keys
+    principal's runtime's."""
+    router = getattr(spec, "router", None)
+    return router.container if router is not None else spec.runtime_of(ks.principal)["container"]
+
+
 def ask_live_config(spec: Any, container: str) -> Any:
     """(path, sha256) of the config `container` reads, as its own environment
     names it, or an Unresolved naming why it could not be asked."""
@@ -467,18 +479,23 @@ def ask_live_config(spec: Any, container: str) -> Any:
     return parts[0], parts[1]
 
 
-def verify_no_delegation(ks: KeySpec, read: Callable[[str], Any] = read_json, live: Any = None,
+def verify_no_delegation(ks: KeySpec, live: Any = None,
                          read_bytes_: Callable[[str], bytes] = read_bytes) -> List[rh.Check]:
     """No live peer signing. A delegation block in `local_config` fails
     whatever else holds. Its absence passes only when the running local
     router is shown to read that file, byte for byte (`live`, from inside
-    its container): otherwise the file proves nothing about the router."""
+    its container): otherwise the file proves nothing about the router. One
+    read of the file is both hashed and parsed, so the decision is about the
+    bytes the binding compared."""
     out: List[rh.Check] = []
     bind_claim = f"the local router reads {ks.local_config}, byte for byte the host's copy"
     try:
-        host_sha: Any = _sha(read_bytes_(ks.local_config))
+        raw: Any = read_bytes_(ks.local_config)
+        host_sha: Any = _sha(raw)
+    except FileNotFoundError:
+        raw = host_sha = rh.Unresolved(f"{ks.local_config} is absent")
     except (OSError, ValueError) as e:
-        host_sha = rh.Unresolved(f"cannot read {ks.local_config}: {e}")
+        raw = host_sha = rh.Unresolved(f"cannot read {ks.local_config}: {e}")
     bind_want = _fact("live config", (ks.local_config, host_sha if isinstance(host_sha, str) else None),
                       "keys.local_config, which install binds to the router.json it renders, and its bytes "
                       "on the host")
@@ -497,12 +514,12 @@ def verify_no_delegation(ks: KeySpec, read: Callable[[str], Any] = read_json, li
     want = _fact("delegation", False, "the operator's decision: no live peer signing until the full "
                                       "signed-case harness passes; its absence is the whole of 'no signing'")
     remedy = f"remove the {DELEGATION_KEY} member and render the config again"
+    if isinstance(raw, rh.Unresolved):
+        return out + [rh.unknown(claim, want, raw.reason, "render and place the local router's config")]
     try:
-        doc = read(ks.local_config)
-    except FileNotFoundError:
-        return out + [rh.unknown(claim, want, f"{ks.local_config} is absent", "render and place the local router's config")]
-    except (OSError, ValueError) as e:
-        return out + [rh.unknown(claim, want, f"cannot read {ks.local_config}: {e}", "make it readable JSON")]
+        doc = parse_json(raw)
+    except ValueError as e:
+        return out + [rh.unknown(claim, want, f"{ks.local_config} is not readable JSON: {e}", "render it again")]
     if not isinstance(doc, dict):
         return out + [rh.unknown(claim, want, f"{ks.local_config} is not a JSON object", "render it again")]
     if DELEGATION_KEY in doc:
@@ -651,8 +668,8 @@ def checks(spec: Any, ks: KeySpec, *, lstat: Callable = os.lstat, read_json_: Ca
            realpath: Callable[[str], str] = os.path.realpath, live: Any = ASK,
            read_bytes_: Callable[[str], bytes] = read_bytes) -> List[rh.Check]:
     out = verify_placement(ks, lstat)
-    local = spec.runtime_of(ks.principal)["container"]
-    out += verify_no_delegation(ks, read_json_, ask_live_config(spec, local) if live is ASK else live, read_bytes_)
+    out += verify_no_delegation(ks, ask_live_config(spec, local_container(spec, ks)) if live is ASK else live,
+                                read_bytes_)
     out += verify_evidence_dir(ks, lstat)
     out += verify_evidence_binds(ks, ask_containers(spec) if containers is ASK else containers, stat_, realpath)
     out += verify_evidence(spec, ks, lstat, read_json_)

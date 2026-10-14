@@ -384,6 +384,12 @@ def load_spec(doc: Any) -> Spec:
             spec = dataclasses.replace(spec, router=hp.load(doc[hp.SECTION], spec))
         except hp.RouterSpecError as e:
             raise SpecError(str(e)) from None
+    if spec.keys is not None and spec.router is not None:
+        declared = spec.runtime_of(spec.keys.principal)["container"]
+        if declared != spec.router.container:
+            raise SpecError(f"the router section's container {spec.router.container} is not the local router's "
+                            f"runtime container {declared} ({spec.keys.principal}'s): the checks of the local "
+                            f"router would read two different containers")
     return spec
 
 
@@ -1248,9 +1254,8 @@ def start_checks(spec: Spec, *, lstat: Callable = os.lstat, digest: Callable[[st
         out += hk.verify_placement(spec.keys, lstat)
         live = k.get("live", hk.ASK)
         if live is hk.ASK:
-            live = hk.ask_live_config(spec, spec.runtime_of(spec.keys.principal)["container"])
-        out += hk.verify_no_delegation(spec.keys, k.get("read_json_", hk.read_json), live,
-                                       k.get("read_bytes_", hk.read_bytes))
+            live = hk.ask_live_config(spec, hk.local_container(spec, spec.keys))
+        out += hk.verify_no_delegation(spec.keys, live, k.get("read_bytes_", hk.read_bytes))
         out += hk.verify_evidence_dir(spec.keys, lstat)
         out += hk.verify_evidence_binds(spec.keys, hk.ask_containers(spec) if k.get("containers", hr.ASK)
                                         is hr.ASK else k["containers"])

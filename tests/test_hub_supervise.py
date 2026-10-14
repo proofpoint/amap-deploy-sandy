@@ -511,7 +511,7 @@ class StartSweepTest(unittest.TestCase):
         start check must pass what the router answered, never nothing."""
         seen = []
         answer = ("/opt/ex/local/router.json", "a" * 64)
-        self.gate([], no_delegation=lambda ks, read, live, rb: seen.append(live) or [],
+        self.gate([], no_delegation=lambda ks, live, rb: seen.append(live) or [],
                   keys={"containers": [], "live": answer})
         self.assertEqual(seen, [answer])
 

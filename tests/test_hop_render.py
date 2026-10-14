@@ -29,7 +29,7 @@ IMAGE = {"name": "example.org/hop-router", "digest": "sha256:" + "c" * 64, "comm
 
 def doc(**hub_over):
     d = keys_doc()
-    d[hp.SECTION] = {"image": dict(IMAGE), "container": "hop-router-1"}
+    d[hp.SECTION] = {"image": dict(IMAGE), "container": "ex-up"}  # the hub hop's upstream
     d["overlay"]["pin"]["sha256"] = hp.PLUGIN_SHA256
     d["hub"].update(hub_over)
     return d
@@ -317,6 +317,30 @@ class RestartTest(unittest.TestCase):
         self.assertIn("hop changed: RESTART", hp.restart_notice(router_doc(keys), router_doc(moved)))
         self.assertIn("RESTART", hp.restart_notice(router_doc(keys), {"state_dir": "/srv/x/state"}))
         self.assertIn("RESTART", hp.restart_notice(None, router_doc(keys)))
+
+
+class OneLocalRouterTest(unittest.TestCase):
+    """The router section and the keys' principal name ONE container: the
+    checks of the local router never read a decoy beside the real one."""
+
+    def test_a_router_container_other_than_the_local_runtime_is_refused(self):
+        d = doc()
+        d[hp.SECTION]["container"] = "actual-hop-router"
+        with self.assertRaises(hs.SpecError) as e:
+            hs.load_spec(d)
+        self.assertIn("is not the local router's runtime container ex-up", str(e.exception))
+
+    def test_the_live_config_is_asked_of_the_router_sections_container(self):
+        import hub_keys as hk
+        s = spec()
+        asked = []
+        self.addCleanup(setattr, hk, "ask_live_config", hk.ask_live_config)
+        hk.ask_live_config = lambda sp, c: asked.append(c) or hk.rh.Unresolved("not asked here")
+        hk.checks(s, s.keys, lstat=lambda p: (_ for _ in ()).throw(FileNotFoundError(p)),
+                  read_json_=lambda p: (_ for _ in ()).throw(FileNotFoundError(p)), d7_hash="a" * 64,
+                  ask=lambda c, p: "a" * 64, containers=[], read_bytes_=lambda p: b"{}")
+        self.assertEqual(asked, [s.router.container])
+        self.assertEqual(hk.local_container(s, s.keys), s.router.container)
 
 
 class InstallTest(unittest.TestCase):

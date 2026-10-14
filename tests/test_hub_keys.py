@@ -385,6 +385,21 @@ class VerifyTest(unittest.TestCase):
         self.assertEqual(self.claim(found, "byte for byte").result, rh.FAIL)
         self.assertEqual(self.claim(found, "no delegation block").result, rh.UNKNOWN)
 
+    def test_the_bytes_hashed_are_the_bytes_judged(self):
+        """A file replaced between two reads must not split the decision from
+        the binding: one read is both hashed and parsed."""
+        signing = json.dumps({"instances": {}, "delegation": {}}).encode()
+        clean = json.dumps({"instances": {}}).encode()
+        reads = []
+
+        def raw(p):
+            reads.append(p)
+            return signing if len(reads) == 1 else clean
+        found = hk.verify_no_delegation(self.k, (LOCAL, hk._sha(signing)), raw)
+        self.assertEqual(self.claim(found, "byte for byte").result, rh.PASS)
+        self.assertEqual(self.claim(found, "no delegation block").result, rh.FAIL)
+        self.assertEqual(reads, [LOCAL])
+
     def test_a_router_that_cannot_be_asked_leaves_both_unknown(self):
         found = self.run_checks(live=rh.Unresolved("docker exec local exited 1"))
         self.assertEqual(self.claim(found, "byte for byte").result, rh.UNKNOWN)

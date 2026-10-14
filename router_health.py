@@ -1100,7 +1100,13 @@ def _reload_checks(ctx, doc, age):
                       reason="status.json's classification section is not an object",
                       remedy=remedy)
         return
-    failing = (section or {}).get("config_reload_failed") is True
+    flag = (section or {}).get("config_reload_failed", False)
+    if not isinstance(flag, bool):
+        yield unknown(claim=claim, expected=expected,
+                      reason=f"status.json's config_reload_failed is {flag!r}, not a JSON boolean",
+                      remedy=remedy)
+        return
+    failing = flag
     yield check(claim=claim, expected=expected, actual=not failing, remedy=remedy,
                 do_not="do not restart the router to clear it: the flag clears on the next "
                        "reload that succeeds, and a restart re-reads the same config")

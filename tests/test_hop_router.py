@@ -27,7 +27,7 @@ IMAGE = {"name": "example.org/hop-router", "digest": "sha256:" + "c" * 64, "comm
 
 def spec(**image_over):
     d = keys_doc()
-    d[hp.SECTION] = {"image": dict(IMAGE, **image_over), "container": "hop-router-1"}
+    d[hp.SECTION] = {"image": dict(IMAGE, **image_over), "container": "ex-up"}  # the hub hop's upstream
     return hs.load_spec(d)
 
 
