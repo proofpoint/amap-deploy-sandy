@@ -110,13 +110,24 @@ class InstallShTest(unittest.TestCase):
             dest = self.remotes / name
             _git("clone", "--quiet", str(SOURCES[name]), str(dest))
             pins[name] = _git("rev-parse", "HEAD", cwd=dest)
+        # A second pin of a repository gets a commit of its own on another
+        # branch of that remote, so the test shows each checkout landing at
+        # ITS pin rather than both at one commit. Keyed by checkout directory.
+        import siblings
+        for s in siblings.load_pins():
+            if "dir" in s:
+                remote = self.remotes / s["name"]
+                _git("checkout", "--quiet", "-b", s["dir"], cwd=remote)
+                _git("commit", "--quiet", "--allow-empty", "-m", s["dir"], cwd=remote)
+                pins[s["dir"]] = _git("rev-parse", "HEAD", cwd=remote)
+                _git("checkout", "--quiet", "-", cwd=remote)
         # The installer clones "$AMAP_REPO_BASE/amap-deploy-sandy.git".
         mine = self.remotes / "amap-deploy-sandy.git"
         shutil.copytree(HERE, mine, ignore=shutil.ignore_patterns(
             ".git", "__pycache__", ".pytest_cache", "*.pyc"))
         doc = json.loads((mine / "siblings.json").read_text())
         for s in doc["siblings"]:
-            s["commit"] = pins[s["name"]]
+            s["commit"] = pins[s.get("dir", s["name"])]
         (mine / "siblings.json").write_text(json.dumps(doc, indent=2) + "\n")
         _git("init", "--quiet", "-b", "main", cwd=mine)
         _git("add", "-A", cwd=mine)
@@ -153,10 +164,11 @@ class InstallShTest(unittest.TestCase):
         self.assertIn(str(self.sandy_home / "features/amap/instances"), runs[0])
         self.assertIn(str(self.sandy_home / "router-state"), runs[0])
         self.assertIn("sandy --start", out)
+        self.assertNotEqual(len(set(self.pins.values())), 1)
         for name, commit in self.pins.items():
             if name == prov.CODEX_CONNECTOR_REPO_NAME:
                 continue
-            with self.subTest(sibling=name):
+            with self.subTest(checkout=name):
                 self.assertEqual(_git("rev-parse", "HEAD", cwd=self.amap_dir / name), commit)
         # The Codex connector is opt-in: a default install never clones it,
         # and says a Codex sandbox gets no supervisor.
