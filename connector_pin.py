@@ -60,7 +60,7 @@ def _git(args: List[str], cwd: Path) -> subprocess.CompletedProcess:
 
 
 def pinned_commit(pins_path: Path = siblings.PINS_FILE) -> str:
-    return next(s["commit"] for s in siblings.load_pins(pins_path) if s["name"] == CONNECTOR)
+    return siblings.primary(siblings.load_pins(pins_path), CONNECTOR)["commit"]
 
 
 def changed_files(checkout: Path, src: Path, files: Sequence[str],
