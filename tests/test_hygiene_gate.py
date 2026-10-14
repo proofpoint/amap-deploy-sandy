@@ -193,6 +193,33 @@ class NamesFoundEverywhereTest(GateTest):
         m2 = self.repo.git("rev-parse", "HEAD")
         self.assert_found([f"--range={m2}~1..{m2}"], f"commit {m2[:12]} k.txt:1")
 
+    def test_a_line_kept_from_one_side_of_a_conflict_is_that_sides(self):
+        """In a resolved conflict the combined diff shows a kept side line as
+        `+ ` or ` +` and only the merge's own new line as `++`: the kept line
+        is the side commit's finding, never the merge's."""
+        self.repo.commit({"c.txt": "base\n"}, "base")
+        self.repo.git("checkout", "-q", "-b", "side3")
+        side = self.repo.commit({"c.txt": "base\nside keeps zz-planted-host\n"}, "side")
+        self.repo.git("checkout", "-q", "main")
+        self.repo.commit({"c.txt": "base\nmain line\n"}, "main")
+        subprocess.run(["git", "-C", str(self.repo.root), "merge", "-q", "side3"], capture_output=True, env=ENV)
+        (self.repo.root / "c.txt").write_text("base\nside keeps zz-planted-host\nmain line\nresolved\n")
+        self.repo.git("add", "c.txt")
+        self.repo.git("commit", "-q", "--no-edit")
+        merge = self.repo.git("rev-parse", "HEAD")
+        out = self.assert_found([f"--range={self.base}..HEAD"], f"commit {side[:12]} c.txt:2")
+        self.assertNotIn(f"commit {merge[:12]} c.txt", out)
+
+    def test_a_long_line_is_cut_into_overlapping_pieces(self):
+        line = "".join(chr(97 + i % 26) for i in range(hg.MAX_LINE * 3))
+        pieces = list(hg._pieces(line))
+        self.assertTrue(all(len(p) <= hg.MAX_LINE for p in pieces))
+        self.assertGreater(len(pieces), 1)
+        step = hg.MAX_LINE - hg.LINE_OVERLAP
+        for i in range(len(pieces) - 1):
+            self.assertEqual(pieces[i][step:], pieces[i + 1][:len(pieces[i]) - step])
+        self.assertEqual(list(hg._pieces("short\nline")), ["short", "line"])
+
     def test_text_from_a_file(self):
         body = self.t / "body.md"
         body.write_text("Summary\n\nTested on zzplantedcorp's host.\n")
@@ -255,7 +282,10 @@ class UnicodeTest(GateTest):
         def boom(self, *a, **k):
             raise IndexError("x")
         hg.Matcher.text = boom
-        rc, out = self.scan("anything\n")
+        try:
+            rc, out = self.scan("anything\n")
+        except Exception as e:      # an escaped traceback is exit 1, which reads as a finding
+            self.fail(f"an internal error escaped main: {type(e).__name__}")
         self.assertEqual(rc, 2)
         self.assertIn("CANNOT RUN: internal error IndexError", out)
 

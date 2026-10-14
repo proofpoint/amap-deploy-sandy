@@ -998,7 +998,7 @@ def main(argv: Optional[Sequence[str]] = None, out=print) -> int:
     ci.add_argument("--token-env", help="the environment variable holding the public-read token")
     ci.add_argument("--private-token-env", help="the environment variable holding the metadata-only token")
     ci.add_argument("--verdicts", help="where to write the {repo, sha, state} hand-over")
-    ci.add_argument("--cache", help="the incremental cache, keyed by the lists' digest")
+    ci.add_argument("--cache", help="the incremental cache, keyed by the lists' digest and the gate's commit")
     ci.add_argument("--no-fingerprints", action="store_true", help="match names only")
     h = sub.add_parser("install-hook", help="install a pre-push hook that blocks on exit 1 and 2")
     h.add_argument("--lists", required=True)

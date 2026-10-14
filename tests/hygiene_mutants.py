@@ -8,7 +8,7 @@ root:
 Each mutant is applied to a copy of the tree in a temporary directory; the
 working tree is never touched. A mutant whose text is not found exactly once
 is reported BAD, and a mutant the tests do not catch SURVIVED; either makes
-the exit 1.
+the exit 1. The unmutated copy must pass first, or nothing is reported.
 """
 
 import os
@@ -213,9 +213,12 @@ MUTANTS = [
     ('exit with limits 0', 'hygiene_api.py',
      '    return 2 if limits else 0',
      '    return 0'),
-    ('cache never reset', 'hygiene_api.py',
-     '    if not isinstance(doc, dict) or doc.get("digest") != digest or not isinstance(doc.get("repos"), dict):',
-     '    if not isinstance(doc, dict) or not isinstance(doc.get("repos"), dict):'),
+    ('cache never reset on a list change', 'hygiene_api.py',
+     'or doc.get("digest") != digest \\\n',
+     '\\\n'),
+    ('cache reused across gate code', 'hygiene_api.py',
+     '            or doc.get("gate") != gate or not',
+     '            or not'),
     ('issue and pull request bodies not read', 'hygiene_api.py',
      '            text(kind, ident, it.get("title"), it.get("body"))\n            stamp = it.get("updated_at")',
      '            stamp = it.get("updated_at")'),
@@ -249,18 +252,44 @@ MUTANTS = [
     ('piece findings reported twice', 'hygiene_api.py',
      '            if (f.where.lineno, f.entry) not in self.piece_findings:',
      '            if True:'),
+    ('a surface that found something remembered as read', 'hygiene_api.py',
+     '        return len(limits) == before and len(m.findings) == found',
+     '        return len(limits) == before'),
+    ('a dirty commit skipped as cached', 'hygiene_api.py',
+     'skip={c for c, rec in cache.items() if rec.get("findings") == 0})',
+     'skip=set(cache))'),
+    ('a non-dict re-read crashes the run', 'hygiene_api.py',
+     '                if not isinstance(first, dict):\n                    raise Limit("unreadable object")\n',
+     ''),
+    ('a cache of another form used', 'hygiene_api.py',
+     '    if not isinstance(doc, dict) or doc.get("schema") != CACHE_SCHEMA or doc.get("digest") != digest \\\n',
+     '    if not isinstance(doc, dict) or doc.get("digest") != digest \\\n'),
 ]
 TESTS = {"hygiene_gate.py": "test_hygiene_gate", "hygiene_api.py": "test_hygiene_api"}
+
+
+def copy_tree(t):
+    """The tree, with its .git (the gate reads its own commit), never __pycache__."""
+    d = os.path.join(t, "r")
+    shutil.copytree(ROOT, d, ignore=shutil.ignore_patterns("__pycache__"))
+    return d
 
 
 def main(labels):
     chosen = [m for m in MUTANTS if not labels or m[0] in labels]
     env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", PYTHONPATH="tests:.")
+    with tempfile.TemporaryDirectory() as t:
+        d = copy_tree(t)
+        for mod in sorted(set(TESTS.values())):
+            r = subprocess.run([sys.executable, "-B", "-m", "unittest", mod], cwd=d, env=env,
+                               capture_output=True, timeout=900)
+            if r.returncode:
+                print(f"BASELINE FAILS: {mod} fails on the unmutated copy; no mutant result would mean anything")
+                return 1
     bad = []
     for label, path, old, new in chosen:
         with tempfile.TemporaryDirectory() as t:
-            d = os.path.join(t, "r")
-            shutil.copytree(ROOT, d, ignore=shutil.ignore_patterns(".git", "__pycache__"))
+            d = copy_tree(t)
             p = os.path.join(d, path)
             with open(p) as f:
                 src = f.read()
@@ -272,8 +301,12 @@ def main(labels):
                 f.write(src.replace(old, new))
             r = subprocess.run([sys.executable, "-B", "-m", "unittest", TESTS[path]], cwd=d, env=env,
                                capture_output=True, timeout=900)
-            print("killed  " if r.returncode else "SURVIVED", label, flush=True)
-            if not r.returncode:
+            # A kill is a test FAILURE. An error (an import or a syntax error the
+            # mutant caused) proves nothing about the guard, so it is not one.
+            tail = r.stderr.decode("utf-8", "replace")[-400:]
+            killed = r.returncode != 0 and "failures=" in tail
+            print("killed  " if killed else ("ERRORED " if r.returncode else "SURVIVED"), label, flush=True)
+            if not killed:
                 bad.append(label)
     print(f"{len(chosen) - len(bad)} of {len(chosen)} killed")
     return 1 if bad else 0

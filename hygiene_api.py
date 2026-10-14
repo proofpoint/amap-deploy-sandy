@@ -38,7 +38,9 @@ finished within them is a LIMIT, printed as `LIMIT: <repo> <surface> <id>:
 <reason>`; the run scans everything else, then exits 1 if there were
 findings, else 2 if there was a LIMIT, never 0.
 
-Credentials. Git clones carry none. API reads send the token named by
+Credentials. Git clones carry none. The body revisions are read through
+GraphQL, which answers only an authenticated request, so in practice the
+token is required. API reads send the token named by
 `--token-env` (the job's own token, a rate-limit identity for public data)
 only to the API host, never across a redirect to another host, and never in
 an argument, a log line or an output file. Listed PRIVATE repositories'
@@ -434,15 +436,17 @@ def heads(repo: str) -> List[Tuple[str, str]]:
 
 
 def scan_git(m: hg.Matcher, repo: str, cache: Dict[str, dict]) -> Dict[str, List[hg.Finding]]:
-    """Refs, every reachable commit (those not in the cache), and every
-    head's tree. Returns the immutable findings by commit and by head."""
+    """Refs, every reachable commit (those not cached as clean), and every
+    head's tree. Returns the immutable findings by commit and by head. A
+    commit with a finding is never cached as clean, so its finding is
+    reported again on every run while it is reachable."""
     hg.check_full_history(repo)
     blobs = hg.Blobs(repo)
     by_commit: Dict[str, List[hg.Finding]] = {}
     try:
         hg.scan_refs(m, repo, blobs)
         before = len(m.findings)
-        scanned = hg.scan_history(m, repo, ["--all"], blobs, skip=set(cache))
+        scanned = hg.scan_history(m, repo, ["--all"], blobs, skip={c for c, rec in cache.items() if rec.get("findings") == 0})
         for f in m.findings[before:]:
             by_commit.setdefault(f.where.commit, []).append(f)
         for c in scanned:
@@ -493,24 +497,27 @@ def scan_api(m: hg.Matcher, http: Http, owner: str, name: str, info: dict, limit
              seen_runs: Set[str], objects: Optional[Dict[str, str]] = None) -> None:
     """The mutable text surfaces. Each failure is a LIMIT for that surface.
 
-    `seen_runs` holds the Actions runs and artifacts already read whole: one
-    is added only after a complete read that hit no limit, so a failed or
-    partly unreadable one is read again next run. `objects` holds each issue
-    and pull request's `updated_at` as last read whole; one whose listing
-    shows a different value is read again by itself (and once more if that
-    read shows yet another value, after which it is a LIMIT), and its
-    retained body revisions are read."""
+    `seen_runs` holds the Actions runs and artifacts already read whole AND
+    clean: one is added only after a complete read that hit no limit and
+    found nothing, so a failed, partly unreadable or leaking one is read
+    (and reported) again on every run while it stays accessible. `objects`
+    holds each issue and pull request's `updated_at` as last read whole and
+    clean; one whose listing shows a different value, or that is not held,
+    is read again by itself (and once more if that read shows yet another
+    value, after which it is a LIMIT), and its retained body revisions are
+    read."""
     base = f"/repos/{owner}/{name}"
     objects = {} if objects is None else objects
 
     def guarded(surface: str, ident: str, fn: Callable[[], None]) -> bool:
-        """True when `fn` finished and added no LIMIT."""
-        before = len(limits)
+        """True when `fn` finished, added no LIMIT and found nothing: only
+        then may its surface be remembered as read."""
+        before, found = len(limits), len(m.findings)
         try:
             fn()
         except Limit as e:
             limits.append(f"LIMIT: {name} {surface} {ident}: {e}")
-        return len(limits) == before
+        return len(limits) == before and len(m.findings) == found
 
     def text(surface: str, ident: str, *parts: Optional[str]) -> None:
         body = "\n".join(p for p in parts if isinstance(p, str))
@@ -528,9 +535,13 @@ def scan_api(m: hg.Matcher, http: Http, owner: str, name: str, info: dict, limit
             if not isinstance(number, int) or (stamp is not None and objects.get(key) == stamp):
                 continue
 
-            def consistent(it=it, number=number, ident=ident, kind=kind, key=key, stamp=stamp):
+            read: List[Optional[str]] = []
+
+            def consistent(it=it, number=number, ident=ident, kind=kind, read=read, stamp=stamp):
                 first, _ = http.json(f"{http.api}{base}/issues/{number}")
-                now = first.get("updated_at") if isinstance(first, dict) else None
+                if not isinstance(first, dict):
+                    raise Limit("unreadable object")
+                now = first.get("updated_at")
                 if now != stamp:
                     text(kind, ident, first.get("title"), first.get("body"))
                     again, _ = http.json(f"{http.api}{base}/issues/{number}")
@@ -538,8 +549,9 @@ def scan_api(m: hg.Matcher, http: Http, owner: str, name: str, info: dict, limit
                         raise Limit("still changing")
                 for n, diff in enumerate(revisions(http, owner, name, number), 1):
                     text("revision", f"{ident}/{n}", diff)
-                objects[key] = now
-            guarded(kind, ident, consistent)
+                read.append(now)
+            if guarded(kind, ident, consistent) and read:
+                objects[key] = read[0]
 
     def comments(path: str, surface: str):
         def run():
@@ -704,16 +716,29 @@ def check_verdicts(doc: object, repos: Sequence[str]) -> List[dict]:
 # --- The run --------------------------------------------------------------------
 
 
-def load_cache(path: Optional[str], digest: str) -> dict:
+#: The cache's form. A cache of any other form (or none) is discarded whole:
+#: an older form could hold a leaking surface remembered as read.
+CACHE_SCHEMA = 2
+
+
+def load_cache(path: Optional[str], digest: str, gate: Optional[str] = None) -> dict:
+    """The incremental cache, used only when it was written for the same
+    lists (`digest`) by the same gate code (`gate`, the gate's commit), so a
+    bump of either rescans everything. With no gate commit known, nothing is
+    reused."""
+    fresh = {"schema": CACHE_SCHEMA, "digest": digest, "gate": gate, "repos": {}}
+    if gate is None:
+        return fresh
     if not path or not os.path.exists(path):
-        return {"digest": digest, "repos": {}}
+        return fresh
     try:
         with open(path, encoding="utf-8") as f:
             doc = json.load(f)
     except (OSError, ValueError):
-        return {"digest": digest, "repos": {}}
-    if not isinstance(doc, dict) or doc.get("digest") != digest or not isinstance(doc.get("repos"), dict):
-        return {"digest": digest, "repos": {}}
+        return fresh
+    if not isinstance(doc, dict) or doc.get("schema") != CACHE_SCHEMA or doc.get("digest") != digest \
+            or doc.get("gate") != gate or not isinstance(doc.get("repos"), dict):
+        return fresh
     return doc
 
 
@@ -725,7 +750,11 @@ def run_ci(lists_dir: str, owner: str, repos_path: str, rule_path: str, workdir:
     budget = Budget()
     http = Http(api.rstrip("/"), token, budget)
     view = resolve_fleet(http, owner, fleet, private_token)
-    cache = load_cache(cache_path, lists.digest)
+    try:
+        gate = hg.gate_commit()
+    except hg.CannotRun:
+        gate = None
+    cache = load_cache(cache_path, lists.digest, gate)
     full = not cache["repos"]
     findings: List[str] = list(view.findings)
     limits: List[str] = []

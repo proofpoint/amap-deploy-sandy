@@ -501,6 +501,83 @@ class RunTest(Base):
         self.assertEqual(rc, 1, out)
         self.assertIn("text log 5 s.txt:1", out)
 
+    def test_a_leak_found_on_a_mutable_surface_is_found_again_next_run(self):
+        """A retained revision, an Actions log and an artifact that FOUND a
+        name are never remembered as read: while the leak is accessible,
+        every run reports it."""
+        cache = str(self.t / "cache.json")
+        self.api.routes["/repos/o/zzfleet-a/issues?state=all&per_page=100"] = body(
+            [self.issue(4, "now clean", pull=False)])
+        self.api.routes["/repos/o/zzfleet-a/issues/4"] = body(self.issue(4, "now clean", pull=False))
+        self.api.posts["/graphql"] = edits("- was for zzplantedcorp")
+        self.api.routes["/repos/o/zzfleet-a/actions/runs?per_page=100"] = body(
+            {"workflow_runs": [{"id": 5, "status": "completed"}]})
+        self.api.routes["/repos/o/zzfleet-a/actions/runs/5/logs"] = body(zipped({"s.txt": b"zz-planted-host\n"}))
+        self.api.routes["/repos/o/zzfleet-a/actions/artifacts?per_page=100"] = body(
+            {"artifacts": [{"id": 9, "name": "out", "expired": False,
+                            "archive_download_url": f"{self.api.url}/repos/o/zzfleet-a/actions/artifacts/9/zip"}]})
+        self.api.routes["/repos/o/zzfleet-a/actions/artifacts/9/zip"] = body(zipped({"c.txt": b"zzplantedcorp\n"}))
+        for run in (1, 2):
+            with self.subTest(run=run):
+                rc, out, _ = self.run_ci(cache=cache)
+                self.assertEqual(rc, 1, out)
+                for where in ("text revision #4/1", "text log 5 s.txt:1", "text artifact 9 c.txt:1"):
+                    self.assertIn(where, out)
+        held = json.loads(Path(cache).read_text())["repos"]["zzfleet-a"]
+        self.assertEqual((held["runs"], held["objects"]), ([], {}))
+
+    def test_a_name_in_a_commit_is_found_again_on_an_unchanged_run(self):
+        """A dirty commit is never cached as clean: the unchanged second run
+        still names it and exits 1, and the verdict still fails."""
+        cache = str(self.t / "cache.json")
+        bad = self.src.commit({"n.txt": "zz-planted-host\n"}, "x")
+        self.publish()
+        for run in (1, 2):
+            with self.subTest(run=run):
+                rc, out, v = self.run_ci(cache=cache)
+                self.assertEqual(rc, 1, out)
+                self.assertIn(f"commit {bad[:12]} n.txt:1", out)
+                self.assertEqual([x["state"] for x in v], ["failure"])
+        self.assertIn("incremental", out, "the clean commit before it was still skipped")
+
+    def test_an_object_reread_that_is_not_an_object_is_a_limit(self):
+        """A changed stamp then a non-object answer: that object's LIMIT, not
+        an internal error ending the whole run."""
+        self.api.routes["/repos/o/zzfleet-a/issues?state=all&per_page=100"] = body(
+            [self.issue(7, "fine", pull=False)])
+        self.api.routes["/repos/o/zzfleet-a/issues/7"] = body(["not", "an", "object"])
+        rc, out, v = self.run_ci()
+        self.assertEqual(rc, 2, out)
+        self.assertIn("LIMIT: zzfleet-a issue #7: unreadable object", out)
+        self.assertEqual([x["state"] for x in v], ["success"])
+
+    def test_a_cache_from_other_gate_code_is_not_reused(self):
+        """Keyed by (list digest, gate commit): a gate.pin bump rescans."""
+        cache = str(self.t / "cache.json")
+        self.run_ci(cache=cache)
+        self.assertIn("incremental", self.run_ci(cache=cache)[1])
+        doc = json.loads(Path(cache).read_text())
+        doc["gate"] = "0" * 40
+        Path(cache).write_text(json.dumps(doc))
+        self.assertNotIn("incremental", self.run_ci(cache=cache)[1])
+        self.assertEqual(ha.load_cache(cache, doc["digest"], None)["repos"], {}, "no gate commit, no reuse")
+
+    def test_a_cache_of_another_form_is_discarded_whole(self):
+        """An older cache could hold a leaking surface as read: it is never used."""
+        cache = self.t / "cache.json"
+        lists = hg.load_lists(str(self.lists))
+        # Every key current but the form: only the schema can reject it.
+        cache.write_text(json.dumps({"schema": ha.CACHE_SCHEMA - 1, "digest": lists.digest,
+                                     "gate": hg.gate_commit(), "repos": {"zzfleet-a": {
+                                         "commits": {}, "runs": ["5"], "objects": {}}}}))
+        self.api.routes["/repos/o/zzfleet-a/actions/runs?per_page=100"] = body(
+            {"workflow_runs": [{"id": 5, "status": "completed"}]})
+        self.api.routes["/repos/o/zzfleet-a/actions/runs/5/logs"] = body(zipped({"s.txt": b"zz-planted-host\n"}))
+        rc, out, _ = self.run_ci(cache=str(cache))
+        self.assertEqual(rc, 1, out)
+        self.assertIn("text log 5 s.txt:1", out)
+        self.assertNotIn("incremental", out)
+
     def test_a_nested_archive_stays_a_limit_on_later_runs(self):
         cache = str(self.t / "cache.json")
         self.api.routes["/repos/o/zzfleet-a/actions/artifacts?per_page=100"] = body(
