@@ -4787,6 +4787,15 @@ def build_parser() -> argparse.ArgumentParser:
                         help="refuse the stub plugin's pin (default: plumbing, where the stub "
                              "is expected)")
 
+    hrender = sub.add_parser(
+        "hub-render", help="the hub-link router's D7 and environment files, rendered from the "
+                           "host-setup document into the operator's run directory for the plan "
+                           "to place. Writes only with --apply")
+    hrender.add_argument("--spec", type=Path, default=None,
+                         help="the host-setup document (default: the deployment overlay's "
+                              "host_setup section)")
+    hrender.add_argument("--apply", action="store_true", help="write the files (default: show)")
+
     teardown = sub.add_parser(
         "teardown", help="the fleet back to its pre-install state for a clean rebuild: "
                          "remove the payload, the router's config and router-state/ (held "
@@ -4832,6 +4841,9 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         if args.command == "host-setup":
             return hsu.run(args.spec, production=args.production, overlay=ha.overlay_path(args.overlay))
+
+        if args.command == "hub-render":
+            return hsu.hub_render(args.spec, apply=args.apply, overlay=ha.overlay_path(args.overlay))
 
         if args.command == "migrate-registry":
             return run_migrate_registry(args, home)

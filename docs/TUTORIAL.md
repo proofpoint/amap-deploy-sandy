@@ -552,3 +552,54 @@ only when the probe's exit is that class's own; a stopped engine is
 recorded as `engine_unavailable` without running anything, and a probe that
 outruns its time has its containers removed by the run's label and is
 recorded as `timeout`.
+
+### The hub-link router's files
+
+A document with a `hub` section (which needs the `secrets` section and its
+`probe` settings) renders two files for the email router on a hub link, and
+`host-setup` prints the steps that place them:
+
+- **The delivered-domain (D7) file**, from the network's generated D7
+  document in the `secrets` section's producer clone. Only this host's link
+  is taken, and only when the document says it is attested; otherwise
+  nothing is rendered, the plan says the router must not start, and a file
+  already placed stays until you stop the router. The render refuses
+  anything the stricter of the two routers would refuse (a domain not
+  already one lower-case `<label>.internal`, the host's own domain, an
+  excluded domain, a hash that is not the domains' own, a reworded
+  statement, a set that differs from `fleet_hosts`, duplicate JSON keys).
+  It never writes an attestation; it copies the source's.
+- **The environment file**, one `KEY=VALUE` per line, used by every mode
+  of the router. `own_domain` is the one source for the router's own
+  domain, its SMTP and IMAP logins and the D7 exclusion. Keys the router
+  refuses when present at all, even empty, are never written: the
+  passwords, the TLS key log, the raw archive, the optional templates, the
+  file log sink, the drop-box and every `OAUTH2_*`.
+
+Render them as the operator, into the `secrets` section's run directory:
+
+```sh
+python3 amap-sandy.py hub-render            # says what it would write
+python3 amap-sandy.py hub-render --apply    # writes hub-d7.json and hub.env
+```
+
+then run the plan's two `place ... --sha256 <hex>` steps as root. The D7
+file goes alone into its own root-owned 0755 directory, which both routers
+mount read-only as a directory: `place` replaces the file by rename, so a
+single-file mount would keep the old one.
+
+`host-setup` and `verify` then check: the D7 directory holds only the file
+(a `place` temp file there is a note: re-run the step), the file is
+root:root 0444 and byte-identical to a fresh render, and it carries the
+source link's domains, hash and attestation, compared field by field with
+the hash recomputed; a source that no longer attests the link fails. The
+environment file is root:root 0444 under root-owned directories and
+byte-identical to a fresh render. The rendering itself, and the running
+container when there is one, must meet the router's rules: the refused
+keys absent, `RELAY_LINK_ROLE=hub` once, password auth, the runtime's uid,
+gid and exactly its other groups, a read-only root, core 0:0, no new
+privileges, every capability dropped, restart `no`, the secret volume once,
+read-only, without copy, and the D7, overlay and registry directories
+read-only. A running container must also match the rendering: the same
+variables (beyond the image's own) and mounts. In the `pending_b5` and
+`retired` states the router must not exist at all.
