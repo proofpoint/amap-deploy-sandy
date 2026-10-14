@@ -52,7 +52,9 @@ What it checks, through router_health's three outcomes:
   `--group-add`) cannot reach the roots they say it can.
 
 A document with a `secrets` section adds a runtime's secret file: its plan
-steps and its checks are secret_setup's.
+steps and its checks are secret_setup's. A document with a `hub` section adds
+the hub-link email router's D7 and environment files and its rendering:
+hub_runtime's.
 
 None of these can see whether the barrier ran: durability rests on the plan
 having run before any runtime started.
@@ -77,6 +79,7 @@ which directory is a per-link one, so that rule is the operator's.
 """
 
 import contextlib
+import dataclasses
 import hashlib
 import json
 import os
@@ -88,6 +91,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
+import hub_runtime as hr   # the hub-link router's files and rendering
 import router_health as rh
 import secret_exposure as se   # who else could reach that secret: every container, every engine
 import secret_setup as ss   # a runtime's secret file: its section, plan steps and checks
@@ -169,6 +173,7 @@ class Spec:
     runtimes: Tuple[Dict[str, Any], ...] = ()   # {principal, container, image, umask, umasks}
     production: bool = False
     secrets: Optional[ss.SecretSpec] = None     # a runtime's secret file, when the document has one
+    hub: Optional[hr.HubSpec] = None            # the hub-link router's rendering, when the document has one
 
     def runtime_of(self, principal: str) -> Dict[str, Any]:
         return next(r for r in self.runtimes if r["principal"] == principal)
@@ -201,7 +206,7 @@ def load_spec(doc: Any) -> Spec:
     if not isinstance(doc, dict) or doc.get("schema") != SPEC_SCHEMA:
         raise SpecError(f"the document is not a {SPEC_SCHEMA} host setup")
     known = {"schema", "principals", "groups", "hops", "roots", "overlay", "agent_paths", "openssl",
-             "mounts", "runtimes", "production", ss.SECTION}
+             "mounts", "runtimes", "production", ss.SECTION, hr.SECTION}
     if set(doc) - known:
         raise SpecError(f"unknown member(s): {', '.join(sorted(set(doc) - known))}")
     production = doc.get("production", False)
@@ -349,8 +354,14 @@ def load_spec(doc: Any) -> Spec:
             secrets = ss.load(doc[ss.SECTION], principals, runtimes)
         except ss.SecretSpecError as e:
             raise SpecError(str(e)) from None
-    return Spec(principals, groups, tuple(hops), tuple(roots), ov_path, ov_pin, agent_paths, openssl,
+    spec = Spec(principals, groups, tuple(hops), tuple(roots), ov_path, ov_pin, agent_paths, openssl,
                 tuple(mounts), tuple(runtimes), production, secrets)
+    if hr.SECTION in doc:
+        try:
+            spec = dataclasses.replace(spec, hub=hr.load(doc[hr.SECTION], spec))
+        except hr.HubSpecError as e:
+            raise SpecError(str(e)) from None
+    return spec
 
 
 def parse_pin(pin: Any) -> Optional[Dict[str, str]]:
@@ -405,8 +416,10 @@ def _ancestors(path: str) -> List[str]:
     return ["/" + "/".join(parts[:i]) for i in range(len(parts))] if parts != [""] else []
 
 
-def render_plan(spec: Spec, overlay_source: Optional[Path] = None) -> List[str]:
-    """The root-run steps, in order, as shell lines. Printed, never run."""
+def render_plan(spec: Spec, overlay_source: Optional[Path] = None,
+                hub: Optional[hr.Rendered] = None) -> List[str]:
+    """The root-run steps, in order, as shell lines. Printed, never run.
+    `hub` is the hub-link router's rendering, when the document has one."""
     q = shlex.quote
     steps = f"python3 {q(str(HOST_STEPS))}"
     lines = ["# Run as root. Each line is one step; nothing here has run. No step follows a "
@@ -434,6 +447,8 @@ def render_plan(spec: Spec, overlay_source: Optional[Path] = None) -> List[str]:
                      f"launcher before it execs")
     if spec.secrets is not None:
         lines += ss.render(spec.secrets, q)
+    if spec.hub is not None and hub is not None:
+        lines += hr.plan(spec, spec.hub, hub, q, steps)
     lines.append("# Start no runtime until every step above has run: each root exists and is synced "
                  "before a runtime opens it.")
     return lines
@@ -944,7 +959,8 @@ def checks(spec: Spec, *, production: bool, lstat: Callable = os.lstat,
            groups: Optional[Callable[[str], Any]] = None,
            secrets: Optional[Dict[str, Any]] = None,
            exposure: Optional[Dict[str, Any]] = None, overlay: Optional[Path] = None,
-           secret_lock: Optional[Callable[[Any], Any]] = None) -> List[rh.Check]:
+           secret_lock: Optional[Callable[[Any], Any]] = None,
+           hub: Optional[Dict[str, Any]] = None) -> List[rh.Check]:
     """Every check of the host against the plan. `production` is ORed with
     the document's own. `secrets` passes probes to the secret's checks;
     `overlay` is the file the document was read from (None for --spec). The
@@ -979,6 +995,8 @@ def checks(spec: Spec, *, production: bool, lstat: Callable = os.lstat,
                 out += ss.checks(spec.secrets, lstat=lstat, digest=digest, held=True,
                                  overlay=None if overlay is None else str(overlay), **(secrets or {}))
                 out += se.checks(spec, spec.secrets, lock=contextlib.nullcontext, **(exposure or {}))
+    if spec.hub is not None:
+        out += hr.checks(spec, spec.hub, lstat=lstat, **(hub or {}))
     return out
 
 
@@ -986,6 +1004,9 @@ def print_notes(spec: Spec, out=print) -> None:
     """What the operator confirms by reading, never a pass or fail."""
     if spec.secrets is not None:
         for line in se.notes(spec.secrets):
+            out(f"  NOTE    {line}")
+    if spec.hub is not None:
+        for line in hr.dd.notes(spec.hub.d7_dir, spec.hub.d7_file):
             out(f"  NOTE    {line}")
 
 
@@ -1014,8 +1035,9 @@ def run(spec_path: Optional[Path], *, production: bool, overlay: Optional[Path] 
         out(f"host-setup: {e}")
         return 2
     out("host-setup (1/2): the plan. Nothing here has run; each step is the operator's, as root.")
+    hub = hr.render_all(spec, spec.hub, hr.read_source(spec, spec.hub)) if spec.hub is not None else None
     for line in render_plan(spec, STUB_PLUGIN if spec.overlay_pin and
-                            spec.overlay_pin["sha256"] == STUB_SHA256 else None):
+                            spec.overlay_pin["sha256"] == STUB_SHA256 else None, hub):
         out(f"  {line}")
     out("host-setup (2/2): the host against the plan.")
     rc = report(checks(spec, production=production, overlay=None if spec_path is not None else overlay,
@@ -1043,3 +1065,19 @@ def verify_section(overlay: Optional[Path], out=print, **probes: Any) -> int:
     rc = report(checks(spec, production=False, overlay=overlay, **probes), out)
     print_notes(spec, out)
     return rc
+
+
+def hub_render(spec_path: Optional[Path], *, apply: bool, overlay: Optional[Path] = None, out=print) -> int:
+    """The `hub-render` verb: render the hub-link router's D7 and environment
+    files into the operator's run directory (`--apply`), or say what would
+    be written. Placing them is the plan's root step."""
+    try:
+        spec = load_spec(read_spec(spec_path, overlay))
+    except ValueError as e:     # SpecError included
+        out(f"hub-render: {e}")
+        return 2
+    if spec.hub is None:
+        out("hub-render: the host-setup document has no hub section")
+        return 2
+    return hr.write_files(spec, spec.hub, hr.render_all(spec, spec.hub, hr.read_source(spec, spec.hub)),
+                          apply=apply, out=out)
