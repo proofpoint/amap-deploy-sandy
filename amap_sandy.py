@@ -76,6 +76,7 @@ import router_health as rh  # the router process: its container and its health, 
 import verify_report as vr  # how verify prints: one row per condition, its workspaces beside it
 import host_setup as hsu    # a hop deployment's host plan: rendered and checked, never applied
 import host_adapter as ha   # the host registry's CLI, run as a subprocess, never imported
+import connector_pin as cpin  # install refuses a connector checkout not at its siblings.json pin
 
 # `fleet_policy.py` sits beside this module. Guarded rather than bare: this
 # module is imported by its tests and by its sibling tools, where HERE is not
@@ -3942,6 +3943,14 @@ def run_sync(args: argparse.Namespace, home: Path, boxes_dir: Path) -> int:
       3. The router's config, a generated sibling of the manifest
          (`router_sibling_path`): written under --apply, compared otherwise.
     """
+    # Before anything is written: the connector checkout the payload is
+    # copied from must be at its siblings.json pin (connector_pin).
+    try:
+        cpin.guard(args.connector_src, override=getattr(args, "allow_unpinned_connector", None),
+                   apply=args.apply, log_dir=feature_root(home),
+                   files=(DELIVERY_DAEMON_NAME, DELIVERY_SUPPORT_NAME) + CONNECTOR_BINARIES)
+    except cpin.PinRefused as e:
+        raise ProvisionError(str(e)) from None
     policy_path = feature_manifest_path(home)
     policy = fp.load_policy(policy_path)
     base = getattr(args, "fleet_domain_base", None)
@@ -4675,6 +4684,10 @@ def build_parser() -> argparse.ArgumentParser:
                          f"(default: payload/{DEFAULT_SERVERS.name})")
     ap.add_argument("--connector-src", type=Path, default=DEFAULT_CONNECTOR_SRC,
                     help="directory holding the connector binaries")
+    ap.add_argument(cpin.OVERRIDE_FLAG, dest="allow_unpinned_connector", metavar="REASON", default=None,
+                    help="let install use a connector checkout that is not at its siblings.json pin, "
+                         "or is dirty; the use, both commits and REASON are recorded in the install "
+                         f"log ({cpin.LOG_NAME} beside the manifest) under --apply")
     ap.add_argument("--codex-connector-src", type=Path, default=DEFAULT_CODEX_CONNECTOR_SRC,
                     help=f"the {CODEX_CONNECTOR_REPO_NAME} checkout (optional: without it, "
                          f"a Codex sandbox gets no supervisor)")

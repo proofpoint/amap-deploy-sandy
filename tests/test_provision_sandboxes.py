@@ -775,7 +775,7 @@ class ProvisionOneThroughMainTest(unittest.TestCase):
         # No `--only`: `install` has no per-sandbox step to narrow, and the
         # parser refuses the flag on it (tested below).
         return ["--servers", str(self.servers_path),
-                "--connector-src", str(self.src),
+                "--connector-src", str(self.src), "--allow-unpinned-connector", "a stand-in connector source, not a checkout",
                 "--sandy-home", str(self.tmp), "install", "--apply"]
 
     def test_only_is_refused_because_install_has_no_per_sandbox_step(self):
@@ -983,7 +983,7 @@ class _ConnectorFixtureMixin:
     def _base_args(self):
         return [
             "--servers", str(self.servers_path),
-            "--connector-src", str(self.src),
+            "--connector-src", str(self.src), "--allow-unpinned-connector", "a stand-in connector source, not a checkout",
             "--sandy-home", str(self.tmp),
         ]
 

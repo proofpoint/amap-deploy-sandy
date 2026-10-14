@@ -431,7 +431,7 @@ class SyncRefusalTest(unittest.TestCase):
             manifest.write_text(prov.manifest_text(policy))
             out, err = io.StringIO(), io.StringIO()
             argv = ["--sandy-home", str(home), "--sandy", str(fake),
-                    "--connector-src", str(src), "install"]
+                    "--connector-src", str(src), "--allow-unpinned-connector", "a stand-in connector source, not a checkout", "install"]
             if apply:
                 argv.append("--apply")
             with redirect_stdout(out), redirect_stderr(err):
