@@ -407,7 +407,11 @@ def load_policy(path: Path) -> Dict[str, Any]:
     # it untouched and never reads it). Recognised by shape — a `feature`
     # object beside the mechanical blocks only a manifest has — and folded
     # into the one policy document every rule below validates. A bare policy
-    # document (no manifest blocks) loads by the same rules.
+    # document (no manifest blocks) loads by the same rules. Keys this module
+    # does not know are carried verbatim: `hop_link` is one, parsed by this
+    # deployment's hop_router, outside the shared core. Moving it into the
+    # core, or no longer carrying unknown keys, is announced to the
+    # repositories that import this module first.
     if is_manifest(raw):
         feature = raw["feature"]
         if not isinstance(feature, dict):

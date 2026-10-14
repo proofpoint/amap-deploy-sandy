@@ -658,3 +658,44 @@ until the full signed-case harness passes). One absent is reported UNKNOWN
 until the local router's rendering binds `keys.local_config` to the file
 the router actually reads. They also check that each running router sees
 the D7 file the host holds.
+
+### The local router's hop link
+
+On a host with a hop link, the local router carries the link's keys in the
+router.json `install` renders. Two inputs turn them on, and both are needed:
+
+- the policy names the link, in the manifest's `feature` section:
+  `"hop_link": {"link": "<the hub section's hop link name>",
+  "trusted_fleet_hosts": [...], "egress": true}`. Every member is required;
+  the trusted hosts are a subset of the hub section's `fleet_hosts`;
+- the host-setup document is complete: the `hub` section, the overlay pin,
+  and a `router` section naming the local router's image (`name`, `digest`,
+  `commit`) and its `container` name.
+
+Build the local router's image from the hop checkout (`siblings.json`'s
+`amap-router-local-hop` entry), under a name other than the factory
+default. Record its image ID as the `digest` (`docker image inspect
+--format '{{.Id}}' <name>`: a local build has no registry digest), and the
+commit it was built from. Then:
+
+```sh
+python3 amap-sandy.py install --apply
+```
+
+renders the hop keys and validates them with the hop checkout's own loader.
+Start, or restart, the router from the hop checkout's `docker/run.sh`, with
+`--name` the `router` section's container name, run by the local router's
+principal (the hub's hop's other end in the host-setup document): the
+router runs as the uid and gid of whoever runs `run.sh`, and `verify`
+checks they are that principal's. A change to the hop keys or the plugin
+needs that restart; the router refuses a reload that changes them.
+
+Three changes are refused rather than rendered:
+
+- `hop.root` against the generations recorded in `state_dir`: it is fixed
+  for the life of `state_dir`;
+- the link name: run `router generation new <name> --reason <text>` for
+  each hop identity first;
+- removing `hop_link` while `state_dir` holds hop state: run
+  `python3 amap-sandy.py install --decommission-hop --apply`, then restart
+  the router.

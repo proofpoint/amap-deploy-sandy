@@ -202,7 +202,7 @@ difference.
 
 | Verb | Does |
 |---|---|
-| `install [--apply]` | the whole install, once per host: the manifest, the payload, the roster directory and the router's config. First, the connector checkout the payload is copied from must be at its `siblings.json` pin and clean, or the install refuses; `--allow-unpinned-connector REASON` overrides it and is logged in `install.log` (one line per attempt) |
+| `install [--apply]` | the whole install, once per host: the manifest, the payload, the roster directory and the router's config. First, the connector checkout the payload is copied from must be at its `siblings.json` pin and clean, or the install refuses; `--allow-unpinned-connector REASON` overrides it and is logged in `install.log` (one line per attempt). On a host whose policy has `hop_link`, router.json also carries the local router's hop keys, from the host-setup document (which must then be complete, its `router` section included); they are validated by the hop pin's loader, a plugin nested in another mount or a hop path at the container's system paths refuses, and a change to `hop.root`, the link or the hop version against state_dir's records refuses. `--decommission-hop` renders router.json without the hop keys although state_dir holds hop state: the explicit removal of a link (then restart the router) |
 | `verify [--only SLUG] [--match SUBSTR] [--host-facts PATH]` | read-only. It checks the install, the payload daemon's connector build against its siblings.json pin, every selected sandbox (lanes, relay, the mounts, what sandy applied at its last launch, whether the session lister can serve its sessions and, for named sessions, their posture as sandy reports it, and the peer notices its daemon has not handled) and, last, the router process: its container, mount set and health. It exits 1 on any problem |
 | `router-config [--apply]` | only the router's config. Without `--apply` it compares the file with the rendering and exits 1 on drift |
 | `list` | every sandbox sandy reports, with sandy's verdict for this feature: `selected`, `not selected` (with the reason) or `unknown` (not launched since the manifest changed) |
@@ -234,6 +234,74 @@ from `selected.json` at that launch.
 
 **Who may task whom should change.** Edit the manifest's `feature` section,
 never `router.json`, then run `install --apply`.
+
+## The hygiene gate
+
+`amap-hygiene.py` finds private names and private fixture content in what a
+public repository holds or is about to publish. The code is here; the lists
+are private and are never in this repository. A writer's sandbox sees them
+read-only at `~/.amap-hygiene`; the gate prints their sha256, so a stale
+copy shows.
+
+Before every push, PR, PR edit or comment to a public repository:
+
+```sh
+python3 amap-hygiene.py --lists ~/.amap-hygiene --repo <repo> \
+    --range origin/<the PR's base>..HEAD --tree HEAD --refs --text <the PR body or comment>
+```
+
+`amap-hygiene.py install-hook --lists ~/.amap-hygiene --repo <repo>` installs
+a `pre-push` hook that runs the same scan and blocks on a finding (exit 1)
+and when the gate cannot run (exit 2), so a missing list never passes. A
+finding names the location and the list entry's line number, never the
+entry's text. Names are matched in text files only: a file with a NUL in
+its first 8000 bytes (git's own test, which also classes UTF-16 text as
+binary) is checked against the fixture file hashes but not read for names.
+
+`amap-hygiene.py ci` is the scheduled run, in the private repository's CI:
+every public fleet repository's refs, history and trees, and the text
+GitHub holds beside them (pull requests, issues, comments, releases and
+their assets, Actions logs and artifacts, the wiki), every read bounded. Its
+`--verdicts` hand-over gives `success` or `failure` for each default-branch
+and open pull-request head, decided ONLY by the git content that commit
+fixes: its tree and every commit reachable from it. Branch and tag names
+and everything GitHub holds as editable text can change without a new
+commit, so they turn the scheduled run red but never fail a commit's
+status.
+
+A surface with a finding is never remembered as read: while it stays
+public, every scheduled run reports it again. The incremental cache
+(`--cache`) is used only for the same lists and the same gate commit, so a
+change to either rescans everything. The token named by `--token-env` is
+required in practice: the retained body revisions of an edited issue or
+pull request are read through GraphQL, which answers no anonymous request,
+so without it each such object is a LIMIT on every run.
+
+What `ci` does not read, each a known limit:
+
+- pull request review summaries (the body of an approval or a change
+  request), as distinct from review comments;
+- the edit history of a comment (issue, review or commit comment), only its
+  current text;
+- discussions (a repository with them enabled is a named LIMIT).
+
+What it reads but cannot match:
+
+- a streamed line over 1 MiB, which is scanned for names in overlapping
+  pieces but never as a fixture line;
+- an `allow` entry's span cut by a piece boundary on such a line, so the
+  name it allows can be reported (a false positive, never a miss).
+
+`fingerprint` refuses a fixture line that a public repository already
+holds, but not a fixture file already public whole whose lines are all too
+short or too regular to fingerprint. Under `--no-fingerprints` no fixture
+content is matched at all, and every report says so.
+
+A squash merge, and the default merge-commit message, copy the pull
+request's title and body into a NEW commit on the default branch. A name in
+a PR body therefore passes the pull request's own check and then lands on
+main, where only the next scheduled run finds it. Set each public
+repository's merge-message defaults so the PR body is not included.
 
 ## Rules that do not change
 
