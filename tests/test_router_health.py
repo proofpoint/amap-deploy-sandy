@@ -662,6 +662,85 @@ class HealthAssertionsActuallyFireTest(HealthTestCase):
         self.assertIn("docker/run.sh", cs[0].remedy)
 
 
+class ARefusedReloadIsReadFromTheRoutersOwnStatusTest(HealthTestCase):
+    """On a host whose router serves a hop link, a refused reload is read
+    from status.json's classification section. The router omits that
+    section when there is nothing to report, so absence is a PASS only from
+    a router that reports it (its hop section, written every poll while the
+    hop transport is loaded) and only in a fresh document. The hop section
+    is `hoplink.status_doc`'s shape at the hop pin, measured in
+    router/hoplink.py there; classification is `service.classification_status`'s."""
+
+    HOP = {"instances": {}, "senders_open": 0, "marker_stores_open": 0}
+
+    def hop_host(self):
+        self.fleet.write_router_json(hop={"link": "uplink"})
+
+    def test_a_router_without_a_hop_link_makes_no_reload_claim(self):
+        _, cs = self._health(extra={"hop": self.HOP})
+        self.assertNotIn(rh.HEALTH_RELOAD, [c.claim for c in cs])
+
+    def test_a_fresh_document_from_a_hop_router_with_no_classification_passes(self):
+        self.hop_host()
+        _, cs = self._health(extra={"hop": self.HOP})
+        self.assertIs(self.one(cs, rh.HEALTH_RELOAD).result, rh.PASS)
+
+    def test_a_refused_reload_fails_by_name(self):
+        self.hop_host()
+        _, cs = self._health(extra={"hop": self.HOP, "classification": {"config_reload_failed": True}})
+        c = self.one(cs, rh.HEALTH_RELOAD)
+        self.assertIs(c.result, rh.FAIL)
+        self.assertIn("install --apply", c.remedy)
+        self.assertIn("restart", c.do_not)
+
+    def test_a_classification_without_the_flag_passes(self):
+        self.hop_host()
+        _, cs = self._health(extra={"hop": self.HOP, "classification": {"ingress_quarantine": {}}})
+        self.assertIs(self.one(cs, rh.HEALTH_RELOAD).result, rh.PASS)
+
+    def test_no_hop_section_is_UNKNOWN_never_PASS(self):
+        """A router with no hop transport loaded writes no classification
+        when its reload fails either; its silence proves nothing."""
+        self.hop_host()
+        _, cs = self._health()
+        c = self.one(cs, rh.HEALTH_RELOAD)
+        self.assertIs(c.result, rh.UNKNOWN)
+        self.assertIn("no hop section", c.reason)
+
+    def test_a_stale_document_is_UNKNOWN_never_PASS(self):
+        self.hop_host()
+        _, cs = self._health(age_s=100, extra={"hop": self.HOP})
+        c = self.one(cs, rh.HEALTH_RELOAD)
+        self.assertIs(c.result, rh.UNKNOWN)
+        self.assertIn("old, past", c.reason)
+
+    def test_no_interval_s_is_UNKNOWN_never_PASS(self):
+        self.hop_host()
+        _, cs = self._health(omit=("interval_s",), extra={"hop": self.HOP})
+        c = self.one(cs, rh.HEALTH_RELOAD)
+        self.assertIs(c.result, rh.UNKNOWN)
+        self.assertIn("no interval_s", c.reason)
+
+    def test_a_flag_that_is_not_a_JSON_boolean_is_UNKNOWN_never_PASS(self):
+        self.hop_host()
+        for bad in ("true", 1, 0, {}, [], None):
+            with self.subTest(flag=bad):
+                _, cs = self._health(extra={"hop": self.HOP, "classification": {"config_reload_failed": bad}})
+                c = self.one(cs, rh.HEALTH_RELOAD)
+                self.assertIs(c.result, rh.UNKNOWN)
+                self.assertIn("not a JSON boolean", c.reason)
+
+    def test_a_false_flag_passes(self):
+        self.hop_host()
+        _, cs = self._health(extra={"hop": self.HOP, "classification": {"config_reload_failed": False}})
+        self.assertIs(self.one(cs, rh.HEALTH_RELOAD).result, rh.PASS)
+
+    def test_a_classification_that_is_not_an_object_is_UNKNOWN(self):
+        self.hop_host()
+        _, cs = self._health(extra={"hop": self.HOP, "classification": ["config_reload_failed"]})
+        self.assertIs(self.one(cs, rh.HEALTH_RELOAD).result, rh.UNKNOWN)
+
+
 class StatusJsonCarriesTheAdmittedSetAndTheIntervalTest(HealthTestCase):
     """The router writes `admitted` — the loader's set at the end of the
     last poll, wholesale — and `interval_s`, the float the loop sleeps, both

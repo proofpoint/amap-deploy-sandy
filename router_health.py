@@ -138,6 +138,12 @@ WIRE_NAMES: Dict[str, str] = {
                 "the field: a list is read, and absence is UNKNOWN",
     "interval_s": "status.json field: the float the poll loop sleeps; "
                   "OMITTED on a tracker that is not a run loop, never defaulted",
+    "hop": "router.json top-level key naming the hop link, and status.json's section the "
+           "router writes on every poll while a hop transport is loaded",
+    "classification": "status.json section the router writes when it has cross-host state to "
+                      "report; OMITTED when there is none",
+    "config_reload_failed": "status.json classification field: present and true while the "
+                            "router refuses its config and runs on the last good one",
     "outbound_errored": "status.json totals field",
     "instance_errored": "status.json totals field",
     "discovery:": "the router's plain `status` heading for its discovery report",
@@ -1003,6 +1009,10 @@ HEALTH_MARKERS = ("each marker names its instance and carries a first_seen_ts (i
                   "declared_root is provenance, never compared)")
 HEALTH_DISCOVERY = "the router's discovery report flags nothing for a human"
 HEALTH_ERRORS = "nothing errored in this process lifetime"
+HEALTH_RELOAD = "the router runs on the config on disk: its last reload was not refused"
+HEALTH_RELOAD_REMEDY = ("read the router's log for the refused config, fix the rendering or the "
+                        "hand edit it names, and re-run install --apply; the router re-reads its "
+                        "config on every poll")
 
 
 def verify_health(ctx: Ctx) -> Iterator[Check]:
@@ -1034,6 +1044,7 @@ def verify_health(ctx: Ctx) -> Iterator[Check]:
                 remedy="the router is not polling; check it is still running — and if the "
                        "bound itself is UNKNOWN, status.json carries no interval_s, which is "
                        "where the interval is read from")
+    yield from _reload_checks(ctx, doc, age)
     yield check(claim=HEALTH_INSTANCES,
                 expected=ctx.fact("config_instances"),
                 actual=sorted(doc.get("instances") or {}), ok=same_set,
@@ -1051,6 +1062,54 @@ def verify_health(ctx: Ctx) -> Iterator[Check]:
                        "not a ledger",
                 do_not="do not assert absolute counter values: totals are PER-PROCESS-"
                        "LIFETIME and reset to zero on every container restart")
+
+
+def _reload_checks(ctx, doc, age):
+    """A refused reload, on a host whose router serves a hop link. The router
+    keeps its last good config and says so in status.json's classification
+    section, which it omits when there is nothing to report. Absence proves
+    something only from a router that reports it (one with its hop transport
+    loaded, shown by its hop section) and only in a document it wrote
+    recently: an old status.json outlives the container that wrote it."""
+    cfg = ctx.value("router_doc")
+    if not isinstance(cfg, Unresolved) and "hop" not in cfg:
+        return
+    claim, expected = HEALTH_RELOAD, ctx.fact("true")
+    remedy = HEALTH_RELOAD_REMEDY
+    if isinstance(cfg, Unresolved):
+        yield unknown(claim=claim, expected=expected, reason=cfg.reason, remedy=remedy)
+        return
+    if not isinstance(doc.get("hop"), dict):
+        yield unknown(claim=claim, expected=expected,
+                      reason="status.json carries no hop section: a router without its hop "
+                             "transport loaded does not report a refused reload",
+                      remedy="start the router from the hop checkout with the rendered config")
+        return
+    bound = ctx.fact("max_poll_age")
+    if not bound.known or isinstance(age, Unresolved) or age > bound.value:
+        yield unknown(claim=claim, expected=expected,
+                      reason=(bound.value.reason if not bound.known else age.reason
+                              if isinstance(age, Unresolved) else
+                              f"status.json is {age:.0f}s old, past {bound.value:.0f}s "
+                              f"({bound.provenance})"),
+                      remedy="start the router, or wait for its next poll")
+        return
+    section = doc.get("classification")
+    if section is not None and not isinstance(section, dict):
+        yield unknown(claim=claim, expected=expected,
+                      reason="status.json's classification section is not an object",
+                      remedy=remedy)
+        return
+    flag = (section or {}).get("config_reload_failed", False)
+    if not isinstance(flag, bool):
+        yield unknown(claim=claim, expected=expected,
+                      reason=f"status.json's config_reload_failed is {flag!r}, not a JSON boolean",
+                      remedy=remedy)
+        return
+    failing = flag
+    yield check(claim=claim, expected=expected, actual=not failing, remedy=remedy,
+                do_not="do not restart the router to clear it: the flag clears on the next "
+                       "reload that succeeds, and a restart re-reads the same config")
 
 
 def _graph_differences(expected: Dict[str, List[str]],

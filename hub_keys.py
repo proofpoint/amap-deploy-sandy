@@ -17,11 +17,12 @@ The host-setup document's `keys` section (it needs a `hub` section) names:
   under root-owned directories. It must be listed in
   `exposure.integrity_roots`, and verify fails any container that binds it
   or anything above it, read-only or not.
-- `local_config`: the file the local router is expected to read its config
-  from. Until the local router's rendering binds that path, a config here
-  without a delegation block proves nothing about the one the router reads,
-  so that outcome is UNKNOWN; a delegation block found here is still a
-  failure.
+- `local_config`: the file the local router reads its config from. On a hop
+  host, install refuses any path but the router.json it renders, and verify
+  asks the running local router, from inside its container, which file its
+  `ROUTER_CONFIG` names and that file's sha256. A delegation block here
+  fails; its absence passes only when the router reads this file, byte for
+  byte.
 
 The key-read probe runs the email router's own rendered run spec with only
 these changes: removed after `run`, no network, its own name and labels, no
@@ -90,6 +91,11 @@ PROBE_SCRIPT = (
     "    print(i, r)\n")
 D7_HASH_SCRIPT = ("import hashlib,sys\n"
                   "print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())\n")
+#: The config the local router reads, as its own process environment names
+#: it (`ROUTER_CONFIG`, set by its docker/run.sh), and that file's sha256.
+LIVE_CONFIG_SCRIPT = ("import hashlib,os,sys\n"
+                      "p=os.environ['ROUTER_CONFIG']\n"
+                      "sys.stdout.write(p+'\\t'+hashlib.sha256(open(p,'rb').read()).hexdigest()+'\\n')\n")
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 _RUN_ID = re.compile(r"[A-Za-z0-9._-]{1,64}")
 _HEX64 = re.compile(r"[0-9a-f]{64}")
@@ -403,10 +409,9 @@ def _no_duplicates(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
     return out
 
 
-def read_json(path: str) -> Any:
-    """A regular file's JSON, never through a symbolic link: read to EOF up
-    to the bound plus one, refused when larger, duplicate keys and NaN
-    refused."""
+def read_bytes(path: str) -> bytes:
+    """A regular file's bytes, never through a symbolic link: read to EOF up
+    to the bound plus one, refused when larger."""
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
@@ -416,6 +421,17 @@ def read_json(path: str) -> Any:
         os.close(fd)
     if len(raw) > JSON_MAX_BYTES:
         raise ValueError(f"{path} is larger than {JSON_MAX_BYTES} bytes")
+    return raw
+
+
+def read_json(path: str) -> Any:
+    """A regular file's JSON, read as `read_bytes` does, duplicate keys and
+    NaN refused."""
+    return parse_json(read_bytes(path))
+
+
+def parse_json(raw: bytes) -> Any:
+    """`raw` as JSON, duplicate keys and NaN refused."""
 
     def no_constant(name: str) -> Any:
         raise ValueError(f"{name} is not JSON")
@@ -440,24 +456,79 @@ def parse_record(rec: Any) -> Optional[str]:
     return None
 
 
-def verify_no_delegation(ks: KeySpec, read: Callable[[str], Any] = read_json) -> List[rh.Check]:
+def local_container(spec: Any, ks: KeySpec) -> str:
+    """The local router's container: the router section's on a hop host
+    (load_spec refuses a runtime that names another), else the keys
+    principal's runtime's."""
+    router = getattr(spec, "router", None)
+    return router.container if router is not None else spec.runtime_of(ks.principal)["container"]
+
+
+def ask_live_config(spec: Any, container: str) -> Any:
+    """(path, sha256) of the config `container` reads, as its own environment
+    names it, or an Unresolved naming why it could not be asked."""
+    try:
+        p = rh.run(ss.docker(spec.secrets) + ["exec", container, "python3", "-I", "-S", "-c", LIVE_CONFIG_SCRIPT])
+    except rh.CannotRun as e:
+        return rh.Unresolved(str(e))
+    if p.rc != 0:
+        return rh.Unresolved(f"docker exec {container} exited {p.rc}")
+    parts = p.out.rstrip("\n").split("\t")
+    if len(parts) != 2 or not _HEX64.fullmatch(parts[1]):
+        return rh.Unresolved(f"{container} printed no config path and hash")
+    return parts[0], parts[1]
+
+
+def verify_no_delegation(ks: KeySpec, live: Any = None,
+                         read_bytes_: Callable[[str], bytes] = read_bytes) -> List[rh.Check]:
+    """No live peer signing. A delegation block in `local_config` fails
+    whatever else holds. Its absence passes only when the running local
+    router is shown to read that file, byte for byte (`live`, from inside
+    its container): otherwise the file proves nothing about the router. One
+    read of the file is both hashed and parsed, so the decision is about the
+    bytes the binding compared."""
+    out: List[rh.Check] = []
+    bind_claim = f"the local router reads {ks.local_config}, byte for byte the host's copy"
+    try:
+        raw: Any = read_bytes_(ks.local_config)
+        host_sha: Any = _sha(raw)
+    except FileNotFoundError:
+        raw = host_sha = rh.Unresolved(f"{ks.local_config} is absent")
+    except (OSError, ValueError) as e:
+        raw = host_sha = rh.Unresolved(f"cannot read {ks.local_config}: {e}")
+    bind_want = _fact("live config", (ks.local_config, host_sha if isinstance(host_sha, str) else None),
+                      "keys.local_config, which install binds to the router.json it renders, and its bytes "
+                      "on the host")
+    bind_remedy = (f"start the local router with docker/run.sh --config {ks.local_config}, the file install "
+                   "renders, and never a copy")
+    if isinstance(host_sha, rh.Unresolved):
+        bind = rh.unknown(bind_claim, bind_want, host_sha.reason, "render and place the local router's config")
+    elif live is None or isinstance(live, rh.Unresolved):
+        bind = rh.unknown(bind_claim, bind_want, live.reason if live is not None else "the local router was "
+                          "not asked", "start the local router, or make the engine answer")
+    else:
+        bind = rh.check(bind_claim, bind_want, tuple(live), bind_remedy,
+                        do_not="never point keys.local_config at the file the router happens to read")
+    out.append(bind)
     claim = f"the local router's config {ks.local_config} has no {DELEGATION_KEY} block"
     want = _fact("delegation", False, "the operator's decision: no live peer signing until the full "
                                       "signed-case harness passes; its absence is the whole of 'no signing'")
     remedy = f"remove the {DELEGATION_KEY} member and render the config again"
+    if isinstance(raw, rh.Unresolved):
+        return out + [rh.unknown(claim, want, raw.reason, "render and place the local router's config")]
     try:
-        doc = read(ks.local_config)
-    except FileNotFoundError:
-        return [rh.unknown(claim, want, f"{ks.local_config} is absent", "render and place the local router's config")]
-    except (OSError, ValueError) as e:
-        return [rh.unknown(claim, want, f"cannot read {ks.local_config}: {e}", "make it readable JSON")]
+        doc = parse_json(raw)
+    except ValueError as e:
+        return out + [rh.unknown(claim, want, f"{ks.local_config} is not readable JSON: {e}", "render it again")]
     if not isinstance(doc, dict):
-        return [rh.unknown(claim, want, f"{ks.local_config} is not a JSON object", "render it again")]
+        return out + [rh.unknown(claim, want, f"{ks.local_config} is not a JSON object", "render it again")]
     if DELEGATION_KEY in doc:
-        return [rh.check(claim, want, True, remedy, do_not="never add the block by hand to test signing")]
-    return [rh.unknown(claim, want, f"{ks.local_config} has none, but nothing yet binds it to the file the "
-                                    f"local router reads; that binding comes with the router's rendering",
-                       "render the local router's config from this deployment")]
+        return out + [rh.check(claim, want, True, remedy, do_not="never add the block by hand to test signing")]
+    if bind.result is not rh.PASS:
+        return out + [rh.unknown(claim, want, f"{ks.local_config} has none, but the local router is not shown "
+                                              f"to read it: {bind.reason or 'it reads another file'}",
+                                 "make the binding above pass")]
+    return out + [rh.check(claim, want, False, remedy)]
 
 
 def verify_evidence_dir(ks: KeySpec, lstat: Callable) -> List[rh.Check]:
@@ -594,9 +665,11 @@ ASK = hr.ASK
 
 def checks(spec: Any, ks: KeySpec, *, lstat: Callable = os.lstat, read_json_: Callable[[str], Any] = read_json,
            d7_hash: Any = ASK, ask: Any = ASK, containers: Any = ASK, stat_: Callable = os.stat,
-           realpath: Callable[[str], str] = os.path.realpath) -> List[rh.Check]:
+           realpath: Callable[[str], str] = os.path.realpath, live: Any = ASK,
+           read_bytes_: Callable[[str], bytes] = read_bytes) -> List[rh.Check]:
     out = verify_placement(ks, lstat)
-    out += verify_no_delegation(ks, read_json_)
+    out += verify_no_delegation(ks, ask_live_config(spec, local_container(spec, ks)) if live is ASK else live,
+                                read_bytes_)
     out += verify_evidence_dir(ks, lstat)
     out += verify_evidence_binds(ks, ask_containers(spec) if containers is ASK else containers, stat_, realpath)
     out += verify_evidence(spec, ks, lstat, read_json_)

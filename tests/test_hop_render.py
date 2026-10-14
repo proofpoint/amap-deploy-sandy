@@ -29,7 +29,7 @@ IMAGE = {"name": "example.org/hop-router", "digest": "sha256:" + "c" * 64, "comm
 
 def doc(**hub_over):
     d = keys_doc()
-    d[hp.SECTION] = {"image": dict(IMAGE), "container": "hop-router-1"}
+    d[hp.SECTION] = {"image": dict(IMAGE), "container": "ex-up"}  # the hub hop's upstream
     d["overlay"]["pin"]["sha256"] = hp.PLUGIN_SHA256
     d["hub"].update(hub_over)
     return d
@@ -319,6 +319,34 @@ class RestartTest(unittest.TestCase):
         self.assertIn("RESTART", hp.restart_notice(None, router_doc(keys)))
 
 
+class OneLocalRouterTest(unittest.TestCase):
+    """The router section and the keys' principal name ONE container: the
+    checks of the local router never read a decoy beside the real one."""
+
+    def test_a_router_container_other_than_the_local_runtime_is_refused(self):
+        d = doc()
+        d[hp.SECTION]["container"] = "actual-hop-router"
+        with self.assertRaises(hs.SpecError) as e:
+            hs.load_spec(d)
+        self.assertIn("is not the local router's runtime container ex-up", str(e.exception))
+
+    def test_the_live_config_is_asked_of_the_router_sections_container(self):
+        import hub_keys as hk
+        s = spec()
+        asked = []
+        self.addCleanup(setattr, hk, "ask_live_config", hk.ask_live_config)
+        hk.ask_live_config = lambda sp, c: asked.append(c) or hk.rh.Unresolved("not asked here")
+        hk.checks(s, s.keys, lstat=lambda p: (_ for _ in ()).throw(FileNotFoundError(p)),
+                  read_json_=lambda p: (_ for _ in ()).throw(FileNotFoundError(p)), d7_hash="a" * 64,
+                  ask=lambda c, p: "a" * 64, containers=[], read_bytes_=lambda p: b"{}")
+        self.assertEqual(asked, [s.router.container])
+        # Past load_spec's refusal, the router section still decides: a decoy
+        # runtime is never the one asked.
+        import dataclasses
+        r = hp.RouterSpec(s.router.image_name, s.router.image_digest, s.router.image_commit, "actual-hop-router")
+        self.assertEqual(hk.local_container(dataclasses.replace(s, router=r), s.keys), "actual-hop-router")
+
+
 class InstallTest(unittest.TestCase):
     """amap_sandy.hop_router_keys: the policy triggers; the document must then
     be complete; without hop_link, hop state needs the decommission."""
@@ -353,6 +381,17 @@ class InstallTest(unittest.TestCase):
         keys, bad = prov.hop_router_keys(self.policy, self.t / "state", self.overlay)
         self.assertEqual(bad, [])
         self.assertEqual(set(keys), set(hp.HOP_KEYS))
+
+    def test_keys_local_config_must_name_the_rendered_router_config(self):
+        """The no-signing check reads keys.local_config as the config the local
+        router runs on, so a hop host refuses any other file."""
+        local = doc()["keys"]["local_config"]
+        keys, bad = prov.hop_router_keys(self.policy, self.t / "state", self.overlay, rendered=Path(local))
+        self.assertEqual(bad, [])
+        keys, bad = prov.hop_router_keys(self.policy, self.t / "state", self.overlay,
+                                         rendered=self.t / "router.json")
+        self.assertEqual(len(bad), 1, bad)
+        self.assertIn("keys.local_config is " + local, bad[0])
 
     def test_hop_state_without_hop_link_refuses_unless_decommissioned(self):
         p = self.t / "state" / "a" / "gen-1" / "transport" / "hop.json"
@@ -396,6 +435,12 @@ class NestingMoreTest(unittest.TestCase):
             d["transport_plugin"]["path"] = "/srv/x/in/plugin.py"
             d["intake_dir"] = "/srv/x/in"
             self.assertTrue(hp.plugin_nesting_problems(d), "inside intake_dir")
+
+    def test_roots_that_cannot_be_derived_are_named_never_skipped(self):
+        d = router_doc(hp.hop_keys(spec(), link(), FLEET_DOMAIN))
+        got = hp.plugin_nesting_problems(d, hp.rh.Unresolved("the hop router's loader refuses the rendering"))
+        self.assertEqual(len(got), 1, got)
+        self.assertIn("cannot be derived (the hop router's loader refuses the rendering)", got[0])
 
     def test_attachment_tunables_are_refused_on_a_hop_host(self):
         self.assertEqual(hp.tunable_problems({"state_dir": "/s"}), [])
@@ -492,6 +537,8 @@ class LiveTest(unittest.TestCase):
         self.preflight_rc = None
         self.security = ["name=userns"]
         self.assertTrue(any("daemon-wide" in p for p in self.probe()), "a daemon-wide remap leaves UsernsMode empty")
+        self.security = ["name=seccomp,profile=builtin", "name=rootless", "name=cgroupns"]
+        self.assertTrue(any("runs rootless" in p for p in self.probe()), "a rootless engine maps every uid")
         self.security = "not a list"
         self.assertTrue(any("cannot be ruled out" in p for p in self.probe()))
         self.security = ["name=seccomp,profile=builtin"]
@@ -563,6 +610,15 @@ class VerifyTest(unittest.TestCase):
         self.assertEqual(prov.verify_router_sibling(self.t, {}, {}, self.t / "s", {}, ov), [])
 
 
+    def test_verify_binds_keys_local_config_to_the_file_it_checks(self):
+        asked = []
+        self.addCleanup(setattr, prov, "hop_router_keys", prov.hop_router_keys)
+        prov.hop_router_keys = lambda *a, **k: asked.append(k.get("rendered")) or (None, ["bound elsewhere"])
+        got = prov.verify_router_sibling(self.t, {}, {}, self.t / "s", {}, None)
+        self.assertEqual(asked, [self.t / "router.json"])
+        self.assertEqual(got, ["router config: bound elsewhere"])
+
+
 class InstallRenderTest(unittest.TestCase):
     """install's real run_render_router on a hop host, its collaborators
     stubbed: the hop keys are written, the HOP loader validates (never the
@@ -573,7 +629,7 @@ class InstallRenderTest(unittest.TestCase):
         self.addCleanup(td.cleanup)
         self.t = Path(td.name)
         self.keys = hp.hop_keys(spec(), link(), FLEET_DOMAIN)
-        self.validated = []
+        self.validated, self.asked = [], []
         base = {"state_dir": str(self.t / "state"), "instances_dir": str(self.t / "inst"),
                 "selected_json": str(self.t / "sel" / "selected.json")}
         stubs = {
@@ -582,9 +638,11 @@ class InstallRenderTest(unittest.TestCase):
             (prov, "sibling_state_dir"): lambda home, explicit: self.t / "state",
             (prov, "render_router_sibling"): lambda *a, **k: {"_doc": dict(base), "_warnings": []},
             (prov, "install_router_state_dir"): lambda state_dir, dry_run: "ok",
-            (prov, "hop_router_keys"): lambda *a, **k: (json.loads(json.dumps(self.keys)), []),
+            (prov, "hop_router_keys"): lambda *a, **k: (self.asked.append(k.get("rendered")) or
+                                                        (json.loads(json.dumps(self.keys)), [])),
             (prov, "validate_with_router"): lambda doc: self.fail("the primary loader on a hop host"),
             (hp, "validate_with_hop_router"): lambda doc, checkout: self.validated.append(doc) or None,
+            (hp, "loader_roots"): lambda doc, checkout: [],
         }
         for (mod, name), value in stubs.items():
             self.addCleanup(setattr, mod, name, getattr(mod, name))
@@ -605,6 +663,7 @@ class InstallRenderTest(unittest.TestCase):
         for k in hp.HOP_KEYS:
             self.assertEqual(written[k], self.keys[k])
         self.assertEqual(len(self.validated), 1)
+        self.assertEqual(self.asked[0], self.t / "router.json", "the binding is checked against what is written")
         self.assertIn("RESTART", said, "a first hop render names the restart")
         rc, said = self.render()
         self.assertNotIn("RESTART", said, "an unchanged render does not")

@@ -485,7 +485,8 @@ class StartSweepTest(unittest.TestCase):
         self.assertTrue(fails)
         return found
 
-    def gate(self, exposure_found, secrets_checks=None, overlay=None, spec_path=None):
+    def gate(self, exposure_found, secrets_checks=None, overlay=None, spec_path=None, horizon=None,
+             no_delegation=None, keys=None):
         good = [rh.check("x", rh.Fact("x", True, "a test"), True, "x")]
         built = spec()
 
@@ -494,15 +495,32 @@ class StartSweepTest(unittest.TestCase):
         patches = [(hs, "read_spec", lambda *a, **k: None), (hs, "load_spec", lambda doc: built),
                    (hs.ss, "checks", secrets_checks or same), (hs.se, "checks", lambda *a, **k: exposure_found),
                    (hs.hr, "checks", same), (hs, "verify_overlay", same), (hs.hk, "verify_placement", same),
-                   (hs.hk, "verify_no_delegation", same), (hs.hk, "verify_evidence_dir", same),
-                   (hs.hk, "verify_evidence_binds", same), (hs.hk, "verify_evidence", same), (hs.hv, "checks", same)]
+                   (hs.hk, "verify_no_delegation", no_delegation or same), (hs.hk, "verify_evidence_dir", same),
+                   (hs.hk, "verify_evidence_binds", same), (hs.hk, "verify_evidence", same), (hs.hv, "checks", same),
+                   (hs, "verify_recovery_horizon", horizon or same)]
         for mod, name, value in patches:
             self.addCleanup(setattr, mod, name, getattr(mod, name))
             setattr(mod, name, value)
         said = []
-        rc = hs.hub_start_check(spec_path, overlay=overlay, out=said.append, state="active", keys={"containers": []},
-                                secret_lock=free_lock)
+        rc = hs.hub_start_check(spec_path, overlay=overlay, out=said.append, state="active",
+                                keys=keys or {"containers": []}, secret_lock=free_lock)
         return rc, "\n".join(said)
+
+    def test_the_start_check_hands_the_routers_own_answer_to_the_no_signing_check(self):
+        """Its absence passes only when the running router reads the file, so the
+        start check must pass what the router answered, never nothing."""
+        seen = []
+        answer = ("/opt/ex/local/router.json", "a" * 64)
+        self.gate([], no_delegation=lambda ks, live, rb: seen.append(live) or [],
+                  keys={"containers": [], "live": answer})
+        self.assertEqual(seen, [answer])
+
+    def test_the_recovery_window_is_part_of_the_start_check(self):
+        bad = [rh.check("the recovery window is below the horizon", rh.Fact("h", 30, "a test"), 30, "lower it",
+                        ok=lambda e, a: a < e)]
+        rc, said = self.gate([], horizon=lambda *a, **k: bad)
+        self.assertNotEqual(rc, 0, said)
+        self.assertIn("the recovery window is below the horizon", said)
 
     def test_a_start_check_from_the_overlay_hands_the_overlay_to_the_secrets_checks(self):
         """The secret's own checks FAIL a document read from --spec rather than
