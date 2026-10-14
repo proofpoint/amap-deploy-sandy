@@ -318,6 +318,121 @@ class FixtureTest(GateTest):
         self.assert_clean(["--tree", "HEAD"])
 
 
+class IdentityBoundaryTest(GateTest):
+    """An `identity` exception accepts one address in the identity fields of
+    commits reachable from a fixed boundary, and nowhere else."""
+
+    PERSON = "zz.person@example.org"
+
+    def setUp(self):
+        super().setUp()
+        self.old = self.repo.commit({"o.txt": "o\n"}, "old", env={"GIT_AUTHOR_EMAIL": self.PERSON})
+        self.digest = hashlib.sha256(self.PERSON.encode()).hexdigest()
+
+    def allow(self, boundary, digest=None):
+        self.write_lists(allow=f"identity public-repo {boundary} {digest or self.digest} accepted before the boundary\n")
+
+    def test_a_reachable_old_commit_is_accepted(self):
+        self.allow(self.old)
+        self.repo.commit({"n.txt": "n\n"}, "new and clean")
+        self.assert_clean(["--all-history"])
+
+    def test_a_new_commit_past_the_boundary_is_checked(self):
+        self.allow(self.old)
+        new = self.repo.commit({"n.txt": "n\n"}, "new", env={"GIT_AUTHOR_EMAIL": self.PERSON})
+        out = self.assert_found(["--all-history"], f"commit {new[:12]} author")
+        self.assertNotIn(f"commit {self.old[:12]}", out)
+
+    def test_a_backdated_new_commit_is_still_checked(self):
+        """Dates are the writer's to set; reachability is not."""
+        self.allow(self.old)
+        early = {"GIT_AUTHOR_EMAIL": self.PERSON, "GIT_AUTHOR_DATE": "2000-01-01T00:00:00Z",
+                 "GIT_COMMITTER_DATE": "2000-01-01T00:00:00Z"}
+        new = self.repo.commit({"n.txt": "n\n"}, "backdated", env=early)
+        self.assert_found(["--all-history"], f"commit {new[:12]} author")
+
+    def test_a_side_branch_off_the_boundary_is_checked(self):
+        self.allow(self.old)
+        self.repo.git("checkout", "-q", "-b", "side", self.base)
+        side = self.repo.commit({"s.txt": "s\n"}, "side", env={"GIT_AUTHOR_EMAIL": self.PERSON})
+        self.assert_found(["--all-history"], f"commit {side[:12]} author")
+
+    def test_the_address_in_text_is_still_found(self):
+        self.allow(self.old)
+        c = self.repo.commit({"t.txt": f"mail {self.PERSON}\n"}, "text")
+        self.assert_found(["--all-history"], f"commit {c[:12]} t.txt:1")
+
+    def test_another_address_is_not_accepted(self):
+        self.allow(self.old, digest=hashlib.sha256(b"zz.other@example.org").hexdigest())
+        self.assert_found(["--all-history"], f"commit {self.old[:12]} author")
+
+    def test_another_repository_is_not_accepted(self):
+        self.allow(self.old)
+        rc, out = self.run_gate("--all-history", repo="other-repo")
+        self.assertEqual(rc, 1, out)
+
+    def side_commit(self):
+        """A commit carrying the address on a branch forked BEFORE the boundary."""
+        self.repo.git("checkout", "-q", "-b", "side", self.base)
+        side = self.repo.commit({"s.txt": "s\n"}, "side", env={"GIT_AUTHOR_EMAIL": self.PERSON})
+        self.repo.git("checkout", "-q", "main")
+        return side
+
+    def test_a_replace_ref_cannot_splice_a_side_commit_under_the_boundary(self):
+        """A replacement for the boundary whose parent is the side commit
+        would make the side commit an 'ancestor'; only physical parents count."""
+        self.allow(self.old)
+        side = self.side_commit()
+        self.assert_found(["--all-history"], f"commit {side[:12]} author")
+        fake = self.repo.git("commit-tree", f"{side}^{{tree}}", "-p", side, "-m", "replacement",
+                             env={"GIT_AUTHOR_EMAIL": self.PERSON})
+        self.repo.git("replace", self.old, fake)
+        self.assert_found(["--all-history"], f"commit {side[:12]} author")
+
+    def test_a_graft_cannot_splice_a_side_commit_under_the_boundary(self):
+        self.allow(self.old)
+        side = self.side_commit()
+        grafts = Path(self.repo.git("rev-parse", "--absolute-git-dir")) / "info" / "grafts"
+        grafts.parent.mkdir(exist_ok=True)
+        grafts.write_text(f"{self.old} {side}\n")
+        self.assert_found(["--all-history"], f"commit {side[:12]} author")
+
+    def test_a_replace_ref_cannot_hide_a_historical_identity(self):
+        """Past the boundary, a replacement with a clean author must not
+        hide the real commit's address."""
+        self.allow(self.old)
+        new = self.repo.commit({"n.txt": "n\n"}, "new", env={"GIT_AUTHOR_EMAIL": self.PERSON})
+        clean = self.repo.git("commit-tree", f"{new}^{{tree}}", "-p", self.old, "-m", "new")
+        self.repo.git("replace", new, clean)
+        self.assert_found(["--all-history"], f"commit {new[:12]} author")
+
+    def test_a_replace_ref_cannot_hide_historical_content(self):
+        bad = self.repo.commit({"h.txt": "zz-planted-host\n"}, "bad")
+        self.repo.commit({"h.txt": "clean\n"}, "clean up")
+        fake = self.repo.git("commit-tree", f"{bad}^^{{tree}}", "-p", f"{bad}^", "-m", "bad")
+        self.repo.git("replace", bad, fake)
+        self.assert_found(["--all-history"], f"commit {bad[:12]} h.txt:1")
+
+    def test_a_tagger_is_never_accepted(self):
+        """Only commits are bounded by reachability; a tag's tagger is checked."""
+        self.allow(self.old)
+        self.repo.git("tag", "-a", "v1", "-m", "release", env={"GIT_COMMITTER_EMAIL": self.PERSON})
+        rc, out = self.run_gate("--refs")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("tagger", out)
+
+    def test_a_boundary_the_repository_does_not_hold_cannot_run(self):
+        self.allow("f" * 40)
+        rc, out = self.run_gate("--all-history")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("is not in public-repo", out)
+
+    def test_an_unused_identity_exception_is_listed(self):
+        self.allow(self.base)
+        rc, out = self.run_gate("--all-history")
+        self.assertIn("(identity) matched nothing", out)
+
+
 class ExceptionsTest(GateTest):
     def digest(self, line):
         return hashlib.sha256(line.encode()).hexdigest()
