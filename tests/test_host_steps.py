@@ -6,6 +6,7 @@ link or a non-directory planted where the plan expects a directory: the step
 must stop, and nothing beyond the link may change.
 """
 
+import hashlib
 import os
 import stat
 import tempfile
@@ -106,6 +107,21 @@ class PlaceTest(Tree):
         self.assertEqual(open(self.p("ov", "plugin.py")).read(), "x = 1\n")
         self.assertEqual(self.mode(self.p("ov", "plugin.py")), 0o444)
         self.assertEqual(os.listdir(self.p("ov")), ["plugin.py"])
+
+    def test_a_plist_mode_is_0644_and_no_other_mode_is_accepted(self):
+        src = self.p("src.plist")
+        with open(src, "w") as f:
+            f.write("<plist/>\n")
+        os.mkdir(self.p("ld"))
+        rc = st.main(["place", src, self.p("ld", "x.plist"), "--sha256",
+                      hashlib.sha256(b"<plist/>\n").hexdigest(), "--mode", "0644"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.mode(self.p("ld", "x.plist")), 0o644)
+        for bad in (0o666, 0o755, 0o600):
+            with self.subTest(mode=oct(bad)):
+                with self.assertRaises(st.StepError):
+                    st.place(src, self.p("ld", "y.plist"), mode=bad)
+                self.assertFalse(os.path.exists(self.p("ld", "y.plist")))
 
     def test_a_symlink_at_the_destination_is_replaced_not_written_through(self):
         src = self.p("src.py")

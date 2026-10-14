@@ -10,6 +10,9 @@ prints the calls; this module is what they run. Standard library only.
   python3 host_steps.py marker PATH               a random root marker, root-owned 0444
   python3 host_steps.py place SRC DEST --sha256 HEX
                                                   the same, refused unless SRC has that sha256
+  python3 host_steps.py place SRC DEST --sha256 HEX --mode 0644
+                                                  the same, root-owned 0644 (a LaunchDaemon's plist);
+                                                  the mode is 0444 or 0644, nothing else
 
 A runtime's secret file, in a directory that only that runtime's uid can open:
 
@@ -57,6 +60,8 @@ import time
 _DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
 MARKER_MODE = 0o444
 OVERLAY_MODE = 0o444
+#: The modes `place` may set: read-only, or root-writable and world-readable.
+PLACE_MODES = (0o444, 0o644)
 #: Who owns the overlay and the markers: root.
 OWNER_UID, OWNER_GID = 0, 0
 
@@ -136,12 +141,15 @@ def _split(path):
     return parent, name
 
 
-def place(src, dest, sha256=None):
-    """Copy `src` to `dest` as a root-owned 0444 file: written under a fresh
+def place(src, dest, sha256=None, mode=OVERLAY_MODE):
+    """Copy `src` to `dest` as a root-owned file, 0444 unless `mode` is the
+    one other mode allowed (0644): written under a fresh
     temporary name in dest's directory (O_EXCL, O_NOFOLLOW), then renamed
     over dest, so a link at dest is replaced, never written through. With
     `sha256`, the bytes read are checked against it before anything is
     written, so the route `src` arrived by does not have to be trusted."""
+    if mode not in PLACE_MODES:
+        raise StepError(f"mode {mode:04o} is not one of " + ", ".join(f"{m:04o}" for m in PLACE_MODES))
     parent, name = _split(dest)
     with open(src, "rb") as f:
         data = f.read()
@@ -154,7 +162,7 @@ def place(src, dest, sha256=None):
         try:
             os.write(fd, data)
             os.fchown(fd, OWNER_UID, OWNER_GID)
-            os.fchmod(fd, OVERLAY_MODE)
+            os.fchmod(fd, mode)
             os.fsync(fd)
         finally:
             os.close(fd)
@@ -678,6 +686,8 @@ def main(argv):
             place(argv[1], argv[2])
         elif len(argv) == 5 and argv[0] == "place" and argv[3] == "--sha256":
             place(argv[1], argv[2], sha256=argv[4])
+        elif len(argv) == 7 and argv[0] == "place" and argv[3] == "--sha256" and argv[5] == "--mode":
+            place(argv[1], argv[2], sha256=argv[4], mode=int(argv[6], 8))
         elif len(argv) == 2 and argv[0] == "marker":
             marker(argv[1])
         else:

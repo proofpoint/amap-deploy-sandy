@@ -4876,6 +4876,20 @@ def build_parser() -> argparse.ArgumentParser:
                              "host_setup section)")
     kprobe.add_argument("--apply", action="store_true", help="run the probe (default: show it)")
 
+    hsup = sub.add_parser(
+        "hub-supervise", help="the hub-link router's supervisor and the weekly login probe's job, "
+                              "rendered into the operator's run directory for the plan to place. "
+                              "Writes only with --apply; enables nothing")
+    hsup.add_argument("--spec", type=Path, default=None,
+                      help="the host-setup document (default: the deployment overlay's host_setup section)")
+    hsup.add_argument("--apply", action="store_true", help="write the files (default: show)")
+
+    hstart = sub.add_parser(
+        "hub-start-check", help="every check that must pass before the hub-link router starts; on a "
+                                "pass, and only then, prints the start step. Runs nothing")
+    hstart.add_argument("--spec", type=Path, default=None,
+                        help="the host-setup document (default: the deployment overlay's host_setup section)")
+
     teardown = sub.add_parser(
         "teardown", help="the fleet back to its pre-install state for a clean rebuild: "
                          "remove the payload, the router's config and router-state/ (held "
@@ -4927,6 +4941,12 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         if args.command == "hub-keyprobe":
             return hsu.hub_keyprobe(args.spec, apply=args.apply, overlay=ha.overlay_path(args.overlay))
+
+        if args.command == "hub-supervise":
+            return hsu.hub_supervise(args.spec, apply=args.apply, overlay=ha.overlay_path(args.overlay))
+
+        if args.command == "hub-start-check":
+            return hsu.hub_start_check(args.spec, overlay=ha.overlay_path(args.overlay))
 
         if args.command == "migrate-registry":
             return run_migrate_registry(args, home)

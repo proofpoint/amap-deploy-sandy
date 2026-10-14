@@ -95,6 +95,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import hub_keys as hk      # the local router's key, kept from the email router; no delegation block
 import hub_runtime as hr   # the hub-link router's files and rendering
+import hub_supervise as hv  # the hub-link router's supervision, weekly probe job and start check
 import router_health as rh
 import secret_exposure as se   # who else could reach that secret: every container, every engine
 import secret_setup as ss   # a runtime's secret file: its section, plan steps and checks
@@ -178,6 +179,7 @@ class Spec:
     secrets: Optional[ss.SecretSpec] = None     # a runtime's secret file, when the document has one
     hub: Optional[hr.HubSpec] = None            # the hub-link router's rendering, when the document has one
     keys: Optional[hk.KeySpec] = None           # the local router's signing key, when the document has one
+    supervision: Optional[hv.SupervisionSpec] = None   # the hub-link router's supervisor, when the document has one
 
     def runtime_of(self, principal: str) -> Dict[str, Any]:
         return next(r for r in self.runtimes if r["principal"] == principal)
@@ -210,7 +212,7 @@ def load_spec(doc: Any) -> Spec:
     if not isinstance(doc, dict) or doc.get("schema") != SPEC_SCHEMA:
         raise SpecError(f"the document is not a {SPEC_SCHEMA} host setup")
     known = {"schema", "principals", "groups", "hops", "roots", "overlay", "agent_paths", "openssl",
-             "mounts", "runtimes", "production", ss.SECTION, hr.SECTION, hk.SECTION}
+             "mounts", "runtimes", "production", ss.SECTION, hr.SECTION, hk.SECTION, hv.SECTION}
     if set(doc) - known:
         raise SpecError(f"unknown member(s): {', '.join(sorted(set(doc) - known))}")
     production = doc.get("production", False)
@@ -370,6 +372,11 @@ def load_spec(doc: Any) -> Spec:
             spec = dataclasses.replace(spec, keys=hk.load(doc[hk.SECTION], spec))
         except hk.KeySpecError as e:
             raise SpecError(str(e)) from None
+    if hv.SECTION in doc:
+        try:
+            spec = dataclasses.replace(spec, supervision=hv.load(doc[hv.SECTION], spec))
+        except hv.SupervisionSpecError as e:
+            raise SpecError(str(e)) from None
     return spec
 
 
@@ -460,6 +467,8 @@ def render_plan(spec: Spec, overlay_source: Optional[Path] = None,
         lines += hr.plan(spec, spec.hub, hub, q, steps)
     if spec.keys is not None:
         lines += hk.plan(spec, spec.keys, q, steps)
+    if spec.supervision is not None:
+        lines += hv.plan(spec, q, steps)
     lines.append("# Start no runtime until every step above has run: each root exists and is synced "
                  "before a runtime opens it.")
     return lines
@@ -972,7 +981,9 @@ def checks(spec: Spec, *, production: bool, lstat: Callable = os.lstat,
            exposure: Optional[Dict[str, Any]] = None, overlay: Optional[Path] = None,
            secret_lock: Optional[Callable[[Any], Any]] = None,
            hub: Optional[Dict[str, Any]] = None,
-           keys: Optional[Dict[str, Any]] = None) -> List[rh.Check]:
+           keys: Optional[Dict[str, Any]] = None,
+           supervision: Optional[Dict[str, Any]] = None,
+           enablement: Optional[Dict[str, Any]] = None) -> List[rh.Check]:
     """Every check of the host against the plan. `production` is ORed with
     the document's own. `secrets` passes probes to the secret's checks;
     `overlay` is the file the document was read from (None for --spec). The
@@ -1011,7 +1022,28 @@ def checks(spec: Spec, *, production: bool, lstat: Callable = os.lstat,
         out += hr.checks(spec, spec.hub, lstat=lstat, **(hub or {}))
     if spec.keys is not None:
         out += hk.checks(spec, spec.keys, lstat=lstat, **(keys or {}))
+    if spec.supervision is not None:
+        out += hv.checks(spec, lstat=lstat, **(supervision or {}))
+        if hv.labels(spec):
+            en = enablement or {}
+            out += hv.verify_enablement(
+                spec, en["disabled"] if "disabled" in en else hv.ask_disabled(spec),
+                en.get("gate") or (lambda: start_gate(spec, lstat=lstat, hub=hub, keys=keys,
+                                                      supervision=supervision)))
     return out
+
+
+def start_gate(spec: Spec, **probes: Any) -> Any:
+    """True when every start check passes now, False when one fails, an
+    Unresolved when none fails but one cannot be decided."""
+    if spec.hub is None:
+        return False
+    results = [c.result for c in start_checks(spec, **probes)]
+    if rh.FAIL in results:
+        return False
+    if rh.UNKNOWN in results:
+        return rh.Unresolved("a start check is UNKNOWN; run hub-start-check")
+    return True
 
 
 def print_notes(spec: Spec, out=print) -> None:
@@ -1109,3 +1141,74 @@ def hub_keyprobe(spec_path: Optional[Path], *, apply: bool, overlay: Optional[Pa
         out("hub-keyprobe: the host-setup document has no keys section")
         return 2
     return hk.run_probe(spec, spec.keys, apply=apply, out=out)
+
+
+def start_checks(spec: Spec, *, lstat: Callable = os.lstat, digest: Callable[[str], Any] = _sha256,
+                 hub: Optional[Dict[str, Any]] = None, keys: Optional[Dict[str, Any]] = None,
+                 supervision: Optional[Dict[str, Any]] = None, state: Any = hr.ASK) -> List[rh.Check]:
+    """Everything that must hold before the hub-link
+    router starts. The secret's state is active; the D7 file and the
+    environment file are placed and current and the rendering meets every
+    rule (hub_runtime); the production overlay pin; the key probe's CURRENT
+    evidence and the key's placement (hub_keys, without the in-container D7
+    read, which needs the router running); and the supervision's files and
+    the live-start ancestry check (hub_supervise)."""
+    out: List[rh.Check] = []
+    st = ss.state(spec.secrets) if state is hr.ASK else state
+    claim = "the secret's state is active"
+    want = rh.Fact("state", ss.STATES[1], "the router starts only after B5 has written and checked the secret")
+    remedy = "finish B5 and write the state as the runbook does"
+    out.append(rh.unknown(claim, want, st.reason, remedy) if isinstance(st, rh.Unresolved)
+               else rh.check(claim, want, st, remedy))
+    out += hr.checks(spec, spec.hub, lstat=lstat, state=st, **(hub or {}))
+    out += verify_overlay(spec, production=True, lstat=lstat, digest=digest)
+    if spec.keys is None:
+        out.append(rh.unknown("the key probe's evidence is current", rh.Fact("keys", True, "the router starts only on current key-probe evidence"),
+                              "the document has no keys section", "add the keys section and run the key probe"))
+    else:
+        k = keys or {}
+        out += hk.verify_placement(spec.keys, lstat)
+        out += hk.verify_no_delegation(spec.keys, k.get("read_json_", hk.read_json))
+        out += hk.verify_evidence_dir(spec.keys, lstat)
+        out += hk.verify_evidence_binds(spec.keys, hk.ask_containers(spec) if k.get("containers", hr.ASK)
+                                        is hr.ASK else k["containers"])
+        out += hk.verify_evidence(spec, spec.keys, lstat, k.get("read_json_", hk.read_json))
+    out += hv.checks(spec, lstat=lstat, **(supervision or {}))
+    return out
+
+
+def hub_supervise(spec_path: Optional[Path], *, apply: bool, overlay: Optional[Path] = None, out=print) -> int:
+    """The `hub-supervise` verb: render the supervision files into the run
+    directory (`--apply`), or say what would be written. Placing them is the
+    plan's root step; enabling them is the gated start step."""
+    try:
+        spec = load_spec(read_spec(spec_path, overlay))
+    except ValueError as e:     # SpecError included
+        out(f"hub-supervise: {e}")
+        return 2
+    if spec.supervision is None:
+        out("hub-supervise: the host-setup document has no supervision section")
+        return 2
+    return hv.write_files(spec, apply=apply, out=out)
+
+
+def hub_start_check(spec_path: Optional[Path], *, overlay: Optional[Path] = None, out=print,
+                    **probes: Any) -> int:
+    """The `hub-start-check` verb: every start check, printed; on a pass, and
+    only then, the start step for the operator to run."""
+    try:
+        spec = load_spec(read_spec(spec_path, overlay))
+    except ValueError as e:     # SpecError included
+        out(f"hub-start-check: {e}")
+        return 2
+    if spec.supervision is None or spec.hub is None:
+        out("hub-start-check: the host-setup document has no hub and supervision sections")
+        return 2
+    rc = report(start_checks(spec, **probes), out)
+    if rc != 0:
+        out("hub-start-check: REFUSED. The hub-link router may not start; nothing to run.")
+        return rc
+    out("hub-start-check: every check passed. The start step, as root:")
+    for line in hv.start_commands(spec):
+        out(f"  {line}")
+    return 0
