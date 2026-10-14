@@ -3668,8 +3668,8 @@ def verify_router_sibling(home: Path, policy: Dict[str, Any], members: Dict[str,
     if hop_problems:
         return [f"router config: {p}" for p in hop_problems]
     if keys is None:
-        # Codex C4: a document that configures the hub-link router while the
-        # policy names no hop link is a host half set up.
+        # A document that configures the hub-link router while the policy
+        # names no hop link is a host half set up.
         try:
             hub_doc = hsu.read_spec(None, overlay) if overlay is not None else None
         except ValueError:
