@@ -254,7 +254,9 @@ python3 amap-hygiene.py --lists ~/.amap-hygiene --repo <repo> \
 a `pre-push` hook that runs the same scan and blocks on a finding (exit 1)
 and when the gate cannot run (exit 2), so a missing list never passes. A
 finding names the location and the list entry's line number, never the
-entry's text.
+entry's text. Names are matched in text files only: a file with a NUL in
+its first 8000 bytes (git's own test, which also classes UTF-16 text as
+binary) is checked against the fixture file hashes but not read for names.
 
 `amap-hygiene.py ci` is the scheduled run, in the private repository's CI:
 every public fleet repository's refs, history and trees, and the text

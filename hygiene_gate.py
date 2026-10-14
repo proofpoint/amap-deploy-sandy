@@ -390,14 +390,17 @@ class Matcher:
         return text
 
     def _names_in(self, text: str) -> Iterator[int]:
-        """The names.txt lines of every entry matching `text` (masked)."""
+        """The names.txt lines of every entry matching `text` (masked).
+        `index` maps each normalised character back to its source character;
+        a character whose lower case is longer (U+0130 is two) maps every
+        one of its pieces to itself."""
         norm, index = [], []
         for i, ch in enumerate(text):
-            c = ch.lower()
-            if c in "-_. \t":
-                continue
-            norm.append(c)
-            index.append(i)
+            for c in ch.lower():
+                if c in "-_. \t":
+                    continue
+                norm.append(c)
+                index.append(i)
         flat = "".join(norm)
         for e in self.lists.of("token"):
             if e.norm in flat:
@@ -1041,4 +1044,7 @@ def main(argv: Optional[Sequence[str]] = None, out=print) -> int:
         return 2
     except CannotRun as e:
         out(f"CANNOT RUN: {e}")
+        return 2
+    except Exception as e:      # never a traceback's exit 1, which would read as a finding
+        out(f"CANNOT RUN: internal error {type(e).__name__}")
         return 2

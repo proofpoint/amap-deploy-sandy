@@ -222,6 +222,44 @@ class NegativeTest(GateTest):
         self.assert_clean(["--tree", "HEAD"])
 
 
+class UnicodeTest(GateTest):
+    """A character whose lower case is longer than itself (U+0130 becomes
+    two) must not shift later matches onto the wrong source characters."""
+
+    def scan(self, text):
+        p = self.t / "u.txt"
+        p.write_text(text, encoding="utf-8")
+        return self.run_gate("--text", str(p))
+
+    def test_a_word_after_a_two_character_lowercasing_letter_is_found(self):
+        for text in ("\u0130 see zzplantedcorp now", "\u0130\u0130\u0130\u0130 zzplantedcorp",
+                     "\u0130" * 40 + " (zzplantedcorp) " + "\u0130" * 40):
+            with self.subTest(text=text[:12]):
+                rc, out = self.scan(text + "\n")
+                self.assertEqual(rc, 1, out)
+                self.assertIn("names.txt line 3", out)
+
+    def test_a_word_directly_followed_by_such_a_letter_is_unbounded(self):
+        rc, out = self.scan("zzplantedcorp\u0130 and \u0130zzplantedcorp\n")
+        self.assertEqual(rc, 0, out)
+
+    def test_sharp_s_and_ligatures_keep_their_place(self):
+        rc, out = self.scan("stra\u00dfe \ufb03 \u1e9e zzplantedcorp\n")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("names.txt line 3", out)
+
+    def test_an_internal_error_is_cannot_run_never_a_traceback(self):
+        orig = hg.Matcher.text
+        self.addCleanup(setattr, hg.Matcher, "text", orig)
+
+        def boom(self, *a, **k):
+            raise IndexError("x")
+        hg.Matcher.text = boom
+        rc, out = self.scan("anything\n")
+        self.assertEqual(rc, 2)
+        self.assertIn("CANNOT RUN: internal error IndexError", out)
+
+
 class FixtureTest(GateTest):
     def test_a_whole_file_copy_under_another_name(self):
         self.repo.commit({"vendored/copy.json": FIX_FILE})
