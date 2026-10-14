@@ -674,7 +674,9 @@ router.json `install` renders. Two inputs turn them on, and both are needed:
 
 Build the local router's image from the hop checkout (`siblings.json`'s
 `amap-router-local-hop` entry), under a name other than the factory
-default, and record its digest and the commit it was built from. Then:
+default. Record its image ID as the `digest` (`docker image inspect
+--format '{{.Id}}' <name>`: a local build has no registry digest), and the
+commit it was built from. Then:
 
 ```sh
 python3 amap-sandy.py install --apply
@@ -682,10 +684,11 @@ python3 amap-sandy.py install --apply
 
 renders the hop keys and validates them with the hop checkout's own loader.
 Start, or restart, the router from the hop checkout's `docker/run.sh`, with
-`--name` the `router` section's container name, run by the SAME account
-that runs `install`: the router runs as that account's uid. A change to the
-hop keys or the plugin needs that restart; the router refuses a reload that
-changes them.
+`--name` the `router` section's container name, run by the local router's
+principal (the hub's hop's other end in the host-setup document): the
+router runs as the uid and gid of whoever runs `run.sh`, and `verify`
+checks they are that principal's. A change to the hop keys or the plugin
+needs that restart; the router refuses a reload that changes them.
 
 Three changes are refused rather than rendered:
 

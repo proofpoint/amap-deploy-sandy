@@ -19,8 +19,10 @@ router's, the hop plugin's and the email router's owners):
   process, so a change on either side shows.
 
 The host-setup document's `router` section names, all operator data:
-- `image`: `name`, `digest` (`sha256:<64 hex>`) and `commit`, the router
-  image the operator built and runs by digest. The name is never the
+- `image`: `name`, `digest` and `commit`, the router image the operator
+  built. `digest` is the image's ID (`docker image inspect --format
+  '{{.Id}}'`, `sha256:<64 hex>`): a local build has no registry digest, and
+  the running container's `.Image` is that ID. The name is never the
   factory router's own default tag, and the commit is the one the image was
   built from, which must be the deployment's hop pin (siblings.json's
   `amap-router-local-hop` entry): a recorded-commit check, not a label rule;
@@ -98,7 +100,8 @@ class RouterSpec:
 
     @property
     def image_ref(self) -> str:
-        return f"{self.image_name}@{self.image_digest}"
+        """The image by its ID: what the preflight runs, never pulled."""
+        return self.image_digest
 
 
 _CONTAINER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
@@ -204,9 +207,9 @@ class HopLink:
 def parse_hop_link(policy: Dict[str, Any]) -> Optional[HopLink]:
     """The policy's `hop_link`, or None when the host has no hop link. Every
     member is required and none is defaulted."""
-    raw = policy.get(HOP_LINK_KEY)
-    if raw is None:
+    if HOP_LINK_KEY not in policy:
         return None
+    raw = policy[HOP_LINK_KEY]          # present: null or anything else malformed is refused
     if not isinstance(raw, dict) or set(raw) != set(HOP_LINK_MEMBERS):
         raise HopRenderError(f"{HOP_LINK_KEY} must have exactly {', '.join(HOP_LINK_MEMBERS)}")
     link = raw["link"]
@@ -273,20 +276,42 @@ def hop_keys(spec: Any, link: HopLink, fleet_domain: Optional[str]) -> Dict[str,
     }
 
 
-def plugin_nesting_problems(doc: Dict[str, Any]) -> List[str]:
+def plugin_nesting_problems(doc: Dict[str, Any], roots: Any = ()) -> List[str]:
     """The plugin's directory may sit inside no other mount the router gets
     (RL's condition for the in-container preflight): there, startup would
     walk the HOST directory's owner and mode, while the preflight, which
     mounts only the plugin's directory, would see a docker-made root 0755
     parent, and could pass a plugin startup refuses."""
-    plugin_dir = posixpath.dirname(doc["transport_plugin"]["path"])
+    plugin_dir = os.path.realpath(posixpath.dirname(doc["transport_plugin"]["path"]))
+    sel = posixpath.dirname(doc.get("selected_json") or "") or None
     others = [("state_dir", doc.get("state_dir")), ("instances_dir", doc.get("instances_dir")),
-              ("selected_json's directory", posixpath.dirname(doc.get("selected_json") or "") or None),
+              ("selected_json's directory", sel),
+              ("the roster directory", posixpath.join(sel, "roster") if sel else None),
+              ("intake_dir", doc.get("intake_dir")),
               ("hop.root", doc["hop"]["root"]), ("registry_dir", doc.get("registry_dir")),
               ("the D7 directory", posixpath.dirname(doc.get("delivered_domains_file") or "") or None)]
+    if not isinstance(roots, rh.Unresolved):
+        others += [("an agent-reachable root", r) for r in roots]
     return [f"the plugin's directory {plugin_dir} is inside {what} {p}; the router's plugin checks walk "
             "its ancestors, so it must sit outside every other mount" for what, p in others
-            if p and _within(plugin_dir, p)]
+            if p and _within(plugin_dir, os.path.realpath(p))]
+
+
+def tunable_problems(doc: Dict[str, Any]) -> List[str]:
+    """No attachment tunable on a hop host: caps.document is the loader's
+    floor at the router's defaults for them, with no slack."""
+    return [f"{k} is set; on a hop host the attachment caps stay at the router's defaults, which "
+            "caps.document was computed for" for k in ATTACHMENT_TUNABLES if k in doc]
+
+
+def router_principal(spec: Any) -> Tuple[int, int]:
+    """[1]'s uid and primary gid: the other end of the hub's hop."""
+    for name, up, down, _env in spec.hops:
+        if name == spec.hub.hop:
+            other = up if down == spec.secrets.principal else down
+            p = spec.principals[other]
+            return p.uid, p.gids[0]
+    raise HopRenderError(f"the document has no hop named {spec.hub.hop}")
 
 
 def plugin_problems(path: str, sha256: str, *, lstat: Callable = os.lstat,
@@ -336,8 +361,7 @@ def checkout_problems(path: str, pin: Any) -> List[str]:
     git = ["git", "-C", path, "-c", "core.hooksPath=/dev/null"]
     try:
         head = subprocess.run(git + ["rev-parse", "HEAD"], capture_output=True, text=True, timeout=60)
-        dirty = subprocess.run(git + ["status", "--porcelain", "--untracked-files=no"], capture_output=True,
-                               text=True, timeout=60)
+        dirty = subprocess.run(git + ["status", "--porcelain"], capture_output=True, text=True, timeout=60)
     except (OSError, subprocess.TimeoutExpired) as e:
         return [f"the hop checkout {path} cannot be read: {e}"]
     if head.returncode:
@@ -500,11 +524,12 @@ def loader_roots(doc: Dict[str, Any], checkout: str) -> Any:
 
 
 def preflight_argv(r: RouterSpec, plugin: str, sha256: str, roots: List[str], uid: int, gid: int) -> List[str]:
-    """`docker run` of [1]'s recorded image with ONLY the plugin's directory
-    mounted read-only, no network, as [1]'s user (run.sh's: the account that
-    runs it, which runs install too)."""
+    """`docker run` of [1]'s recorded image, by its ID and never pulled,
+    with ONLY the plugin's directory mounted read-only, no network, no
+    capability and no new privileges, as [1]'s principal."""
     d = posixpath.dirname(plugin)
-    return ["docker", "run", "--rm", "--network", "none", "--read-only", "--user", f"{uid}:{gid}",
+    return ["docker", "run", "--rm", "--pull", "never", "--network", "none", "--read-only",
+            "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--user", f"{uid}:{gid}",
             "--mount", f"type=bind,src={d},dst={d},readonly", "--entrypoint", "python3", r.image_ref,
             "-I", "-c", PREFLIGHT, plugin, sha256, json.dumps(roots)]
 
@@ -516,8 +541,8 @@ def live_problems(spec: Any, keys: Dict[str, Any], roots: Any, *, run: Callable 
     user, and the plugin preflight in its image. Every unanswerable read is a
     problem by name, never a pass."""
     run = run or rh.run
-    uid = os.getuid() if uid is None else uid
-    gid = os.getgid() if gid is None else gid
+    if uid is None or gid is None:
+        uid, gid = router_principal(spec)
     r = spec.router
     bad: List[str] = []
     try:
@@ -542,8 +567,8 @@ def live_problems(spec: Any, keys: Dict[str, Any], roots: Any, *, run: Callable 
             bad.append(f"[1] does not mount {path} exactly once, by identity, {'read-write' if rw else 'read-only'}")
     cfg, host = c.get("Config") or {}, c.get("HostConfig") or {}
     if cfg.get("User") != f"{uid}:{gid}":
-        bad.append(f"[1] runs as {cfg.get('User')!r}, not {uid}:{gid}: install and run.sh must be run by "
-                   "the same account")
+        bad.append(f"[1] runs as {cfg.get('User')!r}, not its principal's {uid}:{gid}: run docker/run.sh "
+                   "as that account")
     if host.get("UsernsMode") not in ("", None, "host"):
         bad.append(f"[1] runs in a remapped user namespace ({host.get('UsernsMode')!r}); the hop trees' "
                    "owners would not be what they seem")
@@ -559,15 +584,8 @@ def live_problems(spec: Any, keys: Dict[str, Any], roots: Any, *, run: Callable 
     elif any("name=userns" in str(o) for o in options):
         bad.append("the engine remaps user namespaces daemon-wide (userns-remap); the hop trees' owners "
                    "would not be what they seem")
-    try:
-        q = run(["docker", "image", "inspect", "--format", "{{json .RepoDigests}}", str(c.get("Image"))])
-        digests = json.loads(q.out) if q.rc == 0 else None
-    except (rh.CannotRun, ValueError):
-        digests = None
-    if not isinstance(digests, list):
-        bad.append(f"[1]'s image digests cannot be read")
-    elif r.image_ref not in digests:
-        bad.append(f"[1] does not run the recorded image {r.image_ref}")
+    if c.get("Image") != r.image_digest:
+        bad.append(f"[1] runs image {c.get('Image')!r}, not the recorded {r.image_name} ({r.image_digest})")
     if isinstance(roots, rh.Unresolved):
         bad.append(f"the plugin preflight cannot run: {roots.reason}")
         return bad

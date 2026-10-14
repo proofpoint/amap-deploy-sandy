@@ -46,8 +46,10 @@ def link(**over):
 
 
 class PolicyKeyTest(unittest.TestCase):
-    def test_absent_is_no_hop_link(self):
+    def test_absent_is_no_hop_link_and_present_null_is_refused(self):
         self.assertIsNone(hp.parse_hop_link({}))
+        with self.assertRaises(hp.HopRenderError):
+            hp.parse_hop_link({hp.HOP_LINK_KEY: None})
 
     def test_every_member_is_required_and_checked(self):
         good = {"link": "link-a", "trusted_fleet_hosts": ["beta.internal"], "egress": True}
@@ -225,6 +227,9 @@ class CheckoutTest(unittest.TestCase):
             head = subprocess.run(["git", "-C", t, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
             self.assertEqual(hp.checkout_problems(t, head), [])
             self.assertTrue(any("not the hop pin" in p for p in hp.checkout_problems(t, "0" * 40)))
+            Path(t, "untracked.py").write_text("x\n")
+            self.assertTrue(any("uncommitted" in p for p in hp.checkout_problems(t, head)), "untracked counts")
+            os.unlink(Path(t, "untracked.py"))
             Path(t, "f").write_text("changed\n")
             self.assertTrue(any("uncommitted" in p for p in hp.checkout_problems(t, head)))
 
@@ -374,6 +379,38 @@ class NestingTest(unittest.TestCase):
                 self.assertTrue(hp.plugin_nesting_problems(moved), where)
 
 
+class NestingMoreTest(unittest.TestCase):
+    def test_roots_intake_and_roster_and_resolved_paths(self):
+        keys = hp.hop_keys(spec(), link(), FLEET_DOMAIN)
+        with tempfile.TemporaryDirectory() as t:
+            real = Path(os.path.realpath(t))
+            (real / "agent").mkdir()
+            os.symlink(real / "agent", real / "alias")
+            d = router_doc(keys)
+            d["transport_plugin"]["path"] = str(real / "alias" / "plug" / "plugin.py")
+            self.assertTrue(hp.plugin_nesting_problems(d, [str(real / "agent")]), "a resolved agent root")
+            d["transport_plugin"]["path"] = "/srv/x/sel/roster/p/plugin.py"
+            d["selected_json"] = "/srv/x/sel/selected.json"
+            self.assertTrue(hp.plugin_nesting_problems(d), "inside the roster directory")
+            d["transport_plugin"]["path"] = "/srv/x/in/plugin.py"
+            d["intake_dir"] = "/srv/x/in"
+            self.assertTrue(hp.plugin_nesting_problems(d), "inside intake_dir")
+
+    def test_attachment_tunables_are_refused_on_a_hop_host(self):
+        self.assertEqual(hp.tunable_problems({"state_dir": "/s"}), [])
+        for k in hp.ATTACHMENT_TUNABLES:
+            self.assertTrue(hp.tunable_problems({k: 1}), k)
+
+
+class DiffTest(unittest.TestCase):
+    def test_a_drifting_hop_key_is_named(self):
+        keys = hp.hop_keys(spec(), link(), FLEET_DOMAIN)
+        have = router_doc(keys)
+        want = json.loads(json.dumps(have))
+        want["egress"] = False
+        self.assertEqual(prov.sibling_diff(have, want), ["~ egress True -> False"])
+
+
 class Proc:
     def __init__(self, rc=0, out="", err=""):
         self.rc, self.out, self.err = rc, out, err
@@ -397,29 +434,35 @@ class LiveTest(unittest.TestCase):
             (os.path.dirname(k["delivered_domains_file"]), False),
             (os.path.dirname(k["transport_plugin"]["path"]), False))]
         c = {"Mounts": mounts, "Config": {"User": "501:20"}, "HostConfig": {"UsernsMode": ""},
-             "Image": "sha256:" + "e" * 64}
+             "Image": IMAGE["digest"]}
         c.update(over)
         return c
 
-    def probe(self, c=None, digests=None, preflight="ok\n", inspect_rc=0):
+    def probe(self, c=None, preflight="ok\n", inspect_rc=0, uid=501, gid=20):
         c = self.container() if c is None else c
-        digests = [self.s.router.image_ref] if digests is None else digests
 
         def fake(argv, **k):
             self.calls.append(list(argv))
             if argv[:2] == ["docker", "inspect"]:
                 return Proc(inspect_rc, json.dumps([c]) if inspect_rc == 0 else "")
-            if argv[:3] == ["docker", "image", "inspect"]:
-                return Proc(0, json.dumps(digests))
             if argv[:2] == ["docker", "run"]:
                 return Proc(0 if preflight.startswith("ok") else 1, preflight)
             if argv[:2] == ["docker", "info"]:
                 return Proc(0, json.dumps(self.security))
             raise AssertionError(argv)
-        return hp.live_problems(self.s, self.keys, ["/srv/x/instances/a"], run=fake, uid=501, gid=20)
+        return hp.live_problems(self.s, self.keys, ["/srv/x/instances/a"], run=fake, uid=uid, gid=gid)
 
     def test_a_good_router_passes(self):
         self.assertEqual(self.probe(), [])
+        self.assertFalse([a for a in self.calls if a[:3] == ["docker", "image", "inspect"]],
+                         "a local build has no repo digests: the container's image ID is what binds")
+
+    def test_the_user_is_the_routers_principal_not_the_caller(self):
+        """Run as root, verify still expects [1]'s principal (the hub hop's
+        other end), not its own uid."""
+        self.assertEqual(hp.router_principal(self.s), (2101, 2201))
+        self.assertEqual(self.probe(c=self.container(Config={"User": "2101:2201"}), uid=None, gid=None), [])
+        self.assertTrue(self.probe(c=self.container(Config={"User": "0:0"}), uid=None, gid=None))
 
     def test_each_fault_is_named(self):
         k = self.keys
@@ -438,7 +481,7 @@ class LiveTest(unittest.TestCase):
         for what, c in cases.items():
             with self.subTest(what=what):
                 self.assertTrue(self.probe(c=c), what)
-        self.assertTrue(any("recorded image" in p for p in self.probe(digests=["other@sha256:" + "0" * 64])))
+        self.assertTrue(any("not the recorded" in p for p in self.probe(c=self.container(Image="sha256:" + "0" * 64))))
         self.assertTrue(any("refuse: refused parent_owner" in p for p in self.probe(preflight="refused parent_owner x")))
         self.assertTrue(any("not running" in p for p in self.probe(inspect_rc=1)))
         self.security = ["name=userns"]
@@ -460,6 +503,10 @@ class LiveTest(unittest.TestCase):
                          [f"type=bind,src={plugin_dir},dst={plugin_dir},readonly"])
         self.assertIn("--network", argv)
         self.assertEqual(argv[argv.index("--network") + 1], "none")
+        self.assertEqual(argv[argv.index("--pull") + 1], "never", "a missing image is never pulled")
+        self.assertEqual(argv[argv.index("--cap-drop") + 1], "ALL")
+        self.assertEqual(argv[argv.index("--security-opt") + 1], "no-new-privileges")
+        self.assertEqual(argv[argv.index("--entrypoint") + 2], IMAGE["digest"], "run by the image ID")
         self.assertEqual(argv[argv.index("--user") + 1], "501:20")
         self.assertIn(self.s.router.image_ref, argv)
         self.assertEqual(json.loads(argv[-1]), ["/srv/x/instances/a"], "the roots are passed literally")

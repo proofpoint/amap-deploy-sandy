@@ -3513,7 +3513,7 @@ def sibling_diff(existing: Any, rendered: Dict[str, Any]) -> List[str]:
     out: List[str] = []
     for key in sorted(set(existing) - set(SIBLING_KEYS) - set(hp.HOP_KEYS)):
         out.append(f"- {key}: not a key the router reads — it refuses the file over it")
-    for key in SIBLING_KEYS:
+    for key in SIBLING_KEYS + hp.HOP_KEYS:
         have, want = existing.get(key), rendered.get(key)
         if key in (SIBLING_PEER_SENDERS, SIBLING_PEERS) and isinstance(have, dict) \
                 and isinstance(want, dict):
@@ -3591,7 +3591,8 @@ def run_render_router(args: argparse.Namespace, home: Path, boxes: List[Dict[str
         # A hop host: the rendering is validated by the HOP pin's loader, the
         # code its router runs; the primary pin's loader refuses these keys.
         doc = dict(doc, **keys)
-        nested = hp.plugin_nesting_problems(doc)
+        nested = hp.plugin_nesting_problems(doc, hp.loader_roots(doc, hp.hop_checkout()))
+        nested += hp.tunable_problems(doc)
         for p in nested:
             print(f"router config: cannot render — {p}", file=sys.stderr)
         if nested:
@@ -3678,10 +3679,11 @@ def verify_router_sibling(home: Path, policy: Dict[str, Any], members: Dict[str,
                     f"policy has no {hp.HOP_LINK_KEY}: add it, or remove the hub section"]
     else:
         doc = dict(doc, **keys)
-        nested = hp.plugin_nesting_problems(doc)
+        roots = hp.loader_roots(doc, hp.hop_checkout())
+        nested = hp.plugin_nesting_problems(doc, roots) + hp.tunable_problems(doc)
         if nested:
             return [f"router config: {p}" for p in nested]
-        live = hp.live_problems(spec_out[0], keys, hp.loader_roots(doc, hp.hop_checkout()))
+        live = hp.live_problems(spec_out[0], keys, roots)
         if live:
             return [f"router config: {p}" for p in live]
     try:
