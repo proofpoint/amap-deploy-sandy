@@ -35,6 +35,25 @@ PRIVATE = {"MAILBOX_ROOT_DIR": "/srv/example/down/mail", "RELAY_LEDGER_DIR": "/s
            "HUB_INBOUND_STATE_DIR": "/srv/example/down/inbound", "lock": "/srv/example/down/lock"}
 
 
+#: The fixture's invented login and probe names. hub_runtime pins the real,
+#: frozen ones by sha256; these tests point the pins at the fixture's values
+#: for the module and restore them afterwards.
+FIXTURE_PINS = {"LOGIN_LOCAL_SHA256": "rt", "LOGIN_DOMAIN_SHA256": "logins.internal",
+                "PROBE_DOMAIN_SHA256": "probe-x.internal"}
+_saved = {}
+
+
+def setUpModule():
+    for name, value in FIXTURE_PINS.items():
+        _saved[name] = getattr(hr, name)
+        setattr(hr, name, hashlib.sha256(value.encode()).hexdigest())
+
+
+def tearDownModule():
+    for name, value in _saved.items():
+        setattr(hr, name, value)
+
+
 def hub_sec():
     return {"host_label": "alpha", "own_domain": "alpha.internal",
             "login": {"local": "rt", "domain": "logins.internal"},
@@ -45,8 +64,7 @@ def hub_sec():
             "hop": {"name": "h1", "root": "/srv/example/a/b", "registry_dir": "/srv/example/registry",
                     "registry_uid": 2300, "link": "link-a"},
             "dirs": dict(PRIVATE, lock_file="relay.lock"),
-            "prefix_template": "/opt/ex/tmpl/prefix.json", "config_uid": 0,
-            "imap": {"port": 993, "mailbox": "INBOX"}}
+            "prefix_template": "/opt/ex/tmpl/prefix.json", "config_uid": 0}
 
 
 def full_doc(**hub_over):
@@ -89,6 +107,32 @@ class LoadTest(unittest.TestCase):
         d = full_doc()
         del d[hr.SECTION]["probe_domain"]
         self.refuses(d, "must have")
+
+    def test_coordinated_drift_of_the_login_and_the_probe_username_refuses(self):
+        """The login and the secrets probe username moved together, so they
+        agree with each other: the frozen pin still refuses."""
+        d = full_doc(login={"local": "other", "domain": "logins.internal"})
+        d[ss.SECTION]["probe"]["username"] = "other@alpha.logins.internal"
+        self.refuses(d, "not the frozen login")
+
+    def test_another_login_domain_refuses(self):
+        d = full_doc(login={"local": "rt", "domain": "elsewhere.internal"})
+        d[ss.SECTION]["probe"]["username"] = "rt@alpha.elsewhere.internal"
+        self.refuses(d, "not the frozen login")
+
+    def test_an_alternate_probe_domain_refuses(self):
+        self.refuses(full_doc(probe_domain="probe-y.internal"), "not the frozen probe domain")
+
+    def test_an_alternate_imap_port_or_mailbox_refuses(self):
+        self.refuses(full_doc(imap={"port": 143, "mailbox": "Other"}), "must have")
+
+    def test_the_imap_endpoint_is_the_constant(self):
+        env = dict(hr.environment(spec(), spec().hub))
+        self.assertEqual((env["IMAP_PORT"], env["IMAP_MAILBOX"]), (str(hr.IMAP_PORT), hr.IMAP_MAILBOX))
+
+    def test_the_pins_are_sha256_hex(self):
+        for name in _saved:
+            self.assertRegex(_saved[name], r"^[0-9a-f]{64}$")
 
     def test_an_own_domain_that_is_an_excluded_domain_refuses(self):
         d = full_doc(own_domain="probe-x.internal", host_label="probe-x")

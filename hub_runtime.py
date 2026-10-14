@@ -22,8 +22,13 @@ The host-setup document's `hub` section names, all operator data:
 - `dirs`: the roots the runtime's mailbox root, ledger, lock and inbound
   state live in, each a declared root owned by the runtime, mode 0700,
   and the lock file's name;
-- the prefix template and its owner; the IMAP port and mailbox; optionally
-  the log driver.
+- the prefix template and its owner; optionally the log driver.
+
+The login's local part and domain and the probe's domain are frozen by the
+hub design: the overlay names them, and each must hash to its pin here.
+Both logins are derived from own_domain's label and those parts, and must
+equal the secrets section's probe username. The IMAP port and mailbox are
+constants.
 The runtime's principal, image, secret volume and SMTP settings are the
 secrets section's; its container name is the document's runtimes entry; the
 plugin is the document's overlay.
@@ -86,6 +91,16 @@ _OWN = re.compile(rf"({_LABEL})\.internal")
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 _LINK = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
 _DOMAIN = re.compile(rf"{_LABEL}(?:\.{_LABEL})*")
+#: The frozen login and probe names (the hub design): the login's local
+#: part and domain, and the probe's domain, which the hub-link reader never
+#: delivers to. They are private identifiers, so this public code pins each
+#: by its sha256; the overlay supplies the value and must match.
+LOGIN_LOCAL_SHA256 = "74c95604043427f0bee1d0e16bfa53afd537f736ad0073c4cc4e1ccb3a82b5dc"
+LOGIN_DOMAIN_SHA256 = "4a28207acfde319b5b21e4bbf0cec138201f1242e9b966029ae6e9a8122e5889"
+PROBE_DOMAIN_SHA256 = "f40f36185588e8a6292c654f632086d5b204c5d763779ce632bd5138b805af56"
+#: The hub's IMAP endpoint for the catch-all: fixed, so not an overlay knob.
+IMAP_PORT = 993
+IMAP_MAILBOX = "INBOX"
 #: The names the rendered run spec gives the two rendered files in the run directory.
 D7_RENDERED = "hub-d7.json"
 ENV_RENDERED = "hub.env"
@@ -117,8 +132,6 @@ class HubSpec:
     lock_file: str
     prefix_template: str
     config_uid: int
-    imap_port: int
-    imap_mailbox: str
     log_driver: Optional[str]
 
     @property
@@ -148,6 +161,10 @@ def _exact(d: Any, keys: Sequence[str], what: str, optional: Sequence[str] = ())
     return d
 
 
+def _pin(v: Any) -> str:
+    return hashlib.sha256(v.encode("utf-8")).hexdigest() if isinstance(v, str) else ""
+
+
 def _uint(v: Any, what: str) -> int:
     if isinstance(v, bool) or not isinstance(v, int) or v < 0:
         raise HubSpecError(f"hub.{what} must be a non-negative integer")
@@ -162,7 +179,7 @@ def load(sec: Any, spec: Any) -> HubSpec:
     if s is None or s.probe is None:
         raise HubSpecError("the hub section needs a secrets section with its probe settings")
     keys = ("host_label", "own_domain", "login", "probe_domain", "statement", "fleet_hosts", "d7",
-            "env_file", "hop", "dirs", "prefix_template", "config_uid", "imap")
+            "env_file", "hop", "dirs", "prefix_template", "config_uid")
     sec = _exact(sec, keys, "(the section)", ("log_driver", "excluded_domains"))
     m = _OWN.fullmatch(sec["own_domain"]) if isinstance(sec["own_domain"], str) else None
     if m is None:
@@ -173,9 +190,11 @@ def load(sec: Any, spec: Any) -> HubSpec:
     if not isinstance(login["local"], str) or not _NAME.fullmatch(login["local"]) \
             or not isinstance(login["domain"], str) or not _DOMAIN.fullmatch(login["domain"]):
         raise HubSpecError("hub.login must give a local part and a domain")
+    if _pin(login["local"]) != LOGIN_LOCAL_SHA256 or _pin(login["domain"]) != LOGIN_DOMAIN_SHA256:
+        raise HubSpecError("hub.login is not the frozen login local part and domain")
     probe = sec["probe_domain"]
-    if not isinstance(probe, str) or not _OWN.fullmatch(probe):
-        raise HubSpecError("hub.probe_domain must be the probe's <label>.internal: it is never delivered")
+    if not isinstance(probe, str) or not _OWN.fullmatch(probe) or _pin(probe) != PROBE_DOMAIN_SHA256:
+        raise HubSpecError("hub.probe_domain is not the frozen probe domain: it is never delivered")
     excl = sec.get("excluded_domains", [])
     if not isinstance(excl, list) or any(not isinstance(d, str) or not _DOMAIN.fullmatch(d) for d in excl):
         raise HubSpecError("hub.excluded_domains must list domains")
@@ -215,9 +234,6 @@ def load(sec: Any, spec: Any) -> HubSpec:
         paths[k] = p
     if not isinstance(dirs["lock_file"], str) or not _NAME.fullmatch(dirs["lock_file"]):
         raise HubSpecError("hub.dirs.lock_file must be one file name")
-    imap = _exact(sec["imap"], ("port", "mailbox"), "imap")
-    if not isinstance(imap["mailbox"], str) or not _NAME.fullmatch(imap["mailbox"]):
-        raise HubSpecError("hub.imap.mailbox must be a mailbox name")
     log = sec.get("log_driver")
     if log is not None and (not isinstance(log, str) or not _NAME.fullmatch(log)):
         raise HubSpecError("hub.log_driver must be a driver name")
@@ -231,8 +247,7 @@ def load(sec: Any, spec: Any) -> HubSpec:
         registry_dir=_abs(hop["registry_dir"], "hop.registry_dir"),
         registry_uid=_uint(hop["registry_uid"], "hop.registry_uid"), link=hop["link"], dirs=paths,
         lock_file=dirs["lock_file"], prefix_template=_abs(sec["prefix_template"], "prefix_template"),
-        config_uid=_uint(sec["config_uid"], "config_uid"), imap_port=_uint(imap["port"], "imap.port"),
-        imap_mailbox=imap["mailbox"], log_driver=log)
+        config_uid=_uint(sec["config_uid"], "config_uid"), log_driver=log)
     if hs.username != s.probe["username"]:
         raise HubSpecError("the secrets section's probe username is not the login hub derives from own_domain")
     if posixpath.dirname(hs.env_file) == hs.d7_dir or hs.d7_dir in (posixpath.dirname(spec.overlay_path),):
@@ -275,9 +290,9 @@ def environment(spec: Any, hs: HubSpec) -> List[Tuple[str, str]]:
         ("SMTP_PORT", str(p["smtp_port"])),
         ("SMTP_USERNAME", hs.username),
         ("IMAP_HOST", p["smtp_host"]),
-        ("IMAP_PORT", str(hs.imap_port)),
+        ("IMAP_PORT", str(IMAP_PORT)),
         ("IMAP_USERNAME", hs.username),
-        ("IMAP_MAILBOX", hs.imap_mailbox),
+        ("IMAP_MAILBOX", IMAP_MAILBOX),
     ]
     env += [(b, str(BUDGET_S)) for b in BUDGETS]
     env += [
