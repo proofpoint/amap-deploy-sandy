@@ -387,8 +387,9 @@ class NestingMoreTest(unittest.TestCase):
             (real / "agent").mkdir()
             os.symlink(real / "agent", real / "alias")
             d = router_doc(keys)
-            d["transport_plugin"]["path"] = str(real / "alias" / "plug" / "plugin.py")
-            self.assertTrue(hp.plugin_nesting_problems(d, [str(real / "agent")]), "a resolved agent root")
+            d["transport_plugin"]["path"] = str(real / "agent" / "plug" / "plugin.py")
+            self.assertTrue(hp.plugin_nesting_problems(d, [str(real / "alias")]),
+                            "a root spelled through a symlink is compared resolved")
             d["transport_plugin"]["path"] = "/srv/x/sel/roster/p/plugin.py"
             d["selected_json"] = "/srv/x/sel/selected.json"
             self.assertTrue(hp.plugin_nesting_problems(d), "inside the roster directory")
@@ -503,9 +504,9 @@ class LiveTest(unittest.TestCase):
                          [f"type=bind,src={plugin_dir},dst={plugin_dir},readonly"])
         self.assertIn("--network", argv)
         self.assertEqual(argv[argv.index("--network") + 1], "none")
-        self.assertEqual(argv[argv.index("--pull") + 1], "never", "a missing image is never pulled")
-        self.assertEqual(argv[argv.index("--cap-drop") + 1], "ALL")
-        self.assertEqual(argv[argv.index("--security-opt") + 1], "no-new-privileges")
+        for flag, value in (("--pull", "never"), ("--cap-drop", "ALL"), ("--security-opt", "no-new-privileges")):
+            self.assertIn(flag, argv)
+            self.assertEqual(argv[argv.index(flag) + 1], value, flag)
         self.assertEqual(argv[argv.index("--entrypoint") + 2], IMAGE["digest"], "run by the image ID")
         self.assertEqual(argv[argv.index("--user") + 1], "501:20")
         self.assertIn(self.s.router.image_ref, argv)
