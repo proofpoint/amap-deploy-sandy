@@ -423,13 +423,37 @@ def start_commands(spec: Any) -> List[str]:
             f"{LAUNCHCTL} bootstrap system {sup.hub['plist']}"]
 
 
-def parse_disabled(text: str) -> Dict[str, bool]:
-    """`launchctl print-disabled system` as {label: disabled}. A line is
-    `"<label>" => disabled|enabled` (`true|false` on older macOS, true
-    meaning disabled). A label absent from the output has no override."""
-    out = {}
-    for m in re.finditer(r'^\s*"([^"]+)"\s*=>\s*(disabled|enabled|true|false)\s*$', text, re.M):
-        out[m.group(1)] = m.group(2) in ("disabled", "true")
+_BLOCK_OPEN = re.compile(r"[A-Za-z][A-Za-z ]* = \{")
+_ENTRY = re.compile(r'"([^"]+)"\s*=>\s*(disabled|enabled|true|false)')
+
+
+def parse_disabled(text: str) -> Any:
+    """`launchctl print-disabled system` as {label: disabled}, or an
+    Unresolved when the output is not in the documented form. The form is
+    `<name> = {` blocks of `"<label>" => disabled|enabled` lines
+    (`true|false` on older macOS, true meaning disabled), each closed by
+    `}`, with at least the `disabled services` block. Anything else makes
+    the whole answer unknown: a label merely missing from a misread output
+    would read as "no override", which launchd loads at boot. A label absent
+    from a well-formed output has no override."""
+    out: Dict[str, bool] = {}
+    inside, seen = False, False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if not inside and _BLOCK_OPEN.fullmatch(line):
+            inside = True
+            seen = seen or line.startswith("disabled services")
+        elif inside and line == "}":
+            inside = False
+        elif inside and _ENTRY.fullmatch(line):
+            m = _ENTRY.fullmatch(line)
+            out[m.group(1)] = m.group(2) in ("disabled", "true")
+        else:
+            return rh.Unresolved("launchctl print-disabled printed a line not in its documented form")
+    if inside or not seen:
+        return rh.Unresolved("launchctl print-disabled printed no complete `disabled services` block")
     return out
 
 
@@ -444,11 +468,30 @@ def ask_disabled(spec: Any) -> Any:
     return parse_disabled(p.out)
 
 
-def verify_enablement(spec: Any, disabled: Any, gate: Callable[[], Any]) -> List[rh.Check]:
-    """Each launchd label stays disabled until the gated start: a label that
-    is not disabled (enabled, or with no override, which launchd loads at
-    boot) is a FAIL unless every start check passes now. `gate` answers
-    that, True, False or an Unresolved, and is asked only when needed."""
+def ask_loaded(label: str) -> Any:
+    """True when the system domain has `label` loaded (`launchctl print
+    system/<label>` exits 0), False when launchctl reports it cannot find
+    the service, an Unresolved otherwise. The not-found wording is
+    launchctl's documented message; NOT measured on a host here."""
+    try:
+        p = rh.run([LAUNCHCTL, "print", f"system/{label}"])
+    except rh.CannotRun as e:
+        return rh.Unresolved(str(e))
+    if p.rc == 0:
+        return True
+    if "could not find service" in (p.out + p.err).lower():
+        return False
+    return rh.Unresolved(f"launchctl print system/{label} exited {p.rc}")
+
+
+def verify_enablement(spec: Any, disabled: Any, gate: Callable[[], Any],
+                      loaded: Callable[[str], Any] = ask_loaded) -> List[rh.Check]:
+    """Each launchd label stays disabled, and unloaded, until the gated
+    start: a label that is not disabled (enabled, or with no override, which
+    launchd loads at boot), or is disabled but already LOADED (bootstrapped
+    before the override, which the override does not unload), is a FAIL
+    unless every start check passes now. `gate` answers that, True, False or
+    an Unresolved, and is asked only when needed."""
     out = []
     asked: List[Any] = []
     for label in labels(spec):
@@ -462,8 +505,13 @@ def verify_enablement(spec: Any, disabled: Any, gate: Callable[[], Any]) -> List
             out.append(rh.unknown(claim, want, state.reason, remedy))
             continue
         if state is True:
-            out.append(rh.check(claim, want, True, remedy))
-            continue
+            up = loaded(label)
+            if isinstance(up, rh.Unresolved):
+                out.append(rh.unknown(claim, want, up.reason, remedy))
+                continue
+            if up is False:
+                out.append(rh.check(claim, want, True, remedy))
+                continue
         if not asked:
             asked.append(gate())
         g = asked[0]

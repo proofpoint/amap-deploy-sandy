@@ -39,6 +39,9 @@ The rules, the same for the rendering and for `docker inspect`:
   the optional templates, the file log sink, the drop-box, every OAUTH2_*;
 - RELAY_LINK_ROLE is exactly `hub`, in one place; SMTP_AUTH_METHOD is
   `password`; IMAP_AUTH_METHOD is absent or `password`;
+- RELAY_LOG, the send log, is exactly `<MAILBOX_ROOT_DIR>/relay-log.jsonl`
+  (the mailbox root's container path), once: inside the runtime's own 0700
+  root, and set even where a process starts without the image's entrypoint;
 - the user is the runtime's uid and gid, with exactly its other groups
   added; a read-only root; core 0:0; no new privileges; every capability
   dropped and none added; restart `no`;
@@ -101,6 +104,9 @@ PROBE_DOMAIN_SHA256 = "f40f36185588e8a6292c654f632086d5b204c5d763779ce632bd5138b
 #: The hub's IMAP endpoint for the catch-all: fixed, so not an overlay knob.
 IMAP_PORT = 993
 IMAP_MAILBOX = "INBOX"
+#: The send log's file name, inside the mailbox root (the router's own choice
+#: for a link role when RELAY_LOG is unset; rendered so it is reviewed).
+RELAY_LOG_FILE = "relay-log.jsonl"
 #: The names the rendered run spec gives the two rendered files in the run directory.
 D7_RENDERED = "hub-d7.json"
 ENV_RENDERED = "hub.env"
@@ -297,6 +303,7 @@ def environment(spec: Any, hs: HubSpec) -> List[Tuple[str, str]]:
     env += [(b, str(BUDGET_S)) for b in BUDGETS]
     env += [
         ("MAILBOX_ROOT_DIR", inside["MAILBOX_ROOT_DIR"]),
+        ("RELAY_LOG", relay_log(spec, hs)),
         ("RELAY_LEDGER_DIR", inside["RELAY_LEDGER_DIR"]),
         ("RELAY_LOCK", posixpath.join(inside["lock"], hs.lock_file)),
         ("HUB_INBOUND_STATE_DIR", inside["HUB_INBOUND_STATE_DIR"]),
@@ -318,6 +325,11 @@ def environment(spec: Any, hs: HubSpec) -> List[Tuple[str, str]]:
         if "\n" in v or "\r" in v or "\0" in v:
             raise HubSpecError(f"{k}'s value cannot be written to an environment file")
     return env
+
+
+def relay_log(spec: Any, hs: HubSpec) -> str:
+    """The send log's container path: the mailbox root's, plus RELAY_LOG_FILE."""
+    return posixpath.join(_in_container(spec, spec.secrets.principal, hs.dirs["MAILBOX_ROOT_DIR"]), RELAY_LOG_FILE)
 
 
 def _peer_uids(spec: Any) -> Dict[Tuple[str, str], int]:
@@ -448,6 +460,9 @@ def rules(c: Dict[str, Any], spec: Any, hs: HubSpec, *, lstat_: Callable = os.ls
         bad.append(f"RELAY_LINK_ROLE is {env.get('RELAY_LINK_ROLE')!r}, not exactly [{ROLE!r}] once")
     if env.get("SMTP_AUTH_METHOD") != [AUTH_METHOD]:
         bad.append(f"SMTP_AUTH_METHOD is {env.get('SMTP_AUTH_METHOD')!r}, not [{AUTH_METHOD!r}]")
+    want_log = relay_log(spec, hs)
+    if env.get("RELAY_LOG") != [want_log]:
+        bad.append(f"RELAY_LOG is {env.get('RELAY_LOG')!r}, not exactly [{want_log!r}] once")
     if "IMAP_AUTH_METHOD" in env and env["IMAP_AUTH_METHOD"] != [AUTH_METHOD]:
         bad.append(f"IMAP_AUTH_METHOD is {env['IMAP_AUTH_METHOD']!r}; absent or {AUTH_METHOD!r} only")
     cfg, h = c.get("Config") or {}, c.get("HostConfig") or {}

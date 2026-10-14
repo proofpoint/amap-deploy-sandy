@@ -9,6 +9,7 @@ from files, so the rows exercise what ships. No docker, systemd or launchd
 runs.
 """
 
+import contextlib
 import dataclasses
 import json
 import os
@@ -425,6 +426,11 @@ class StartGateTest(unittest.TestCase):
                 self.assertNotIn("systemctl", said)
 
 
+@contextlib.contextmanager
+def free_lock(_s=None):
+    yield None
+
+
 class StartChecksCompositionTest(unittest.TestCase):
     """The start check is the secret's state, the hub's
     files and rendering, the production overlay pin, the key probe's current
@@ -439,7 +445,10 @@ class StartChecksCompositionTest(unittest.TestCase):
                 marks[name] = marks.get(name, 0) + 1
                 return [rh.check(name, rh.Fact(name, True, "a test"), True, "x")]
             return f
-        patches = {(hs.hr, "checks"): "hub", (hs, "verify_overlay"): "overlay",
+        self.addCleanup(setattr, hs, "checks", hs.checks)
+        hs.checks = lambda *a, **k: self.fail("start_checks must never call checks (it calls start_gate back)")
+        patches = {(hs.ss, "checks"): "secret", (hs.se, "checks"): "exposure",
+                   (hs.hr, "checks"): "hub", (hs, "verify_overlay"): "overlay",
                    (hs.hk, "verify_placement"): "placement", (hs.hk, "verify_no_delegation"): "delegation",
                    (hs.hk, "verify_evidence_dir"): "evidence_dir", (hs.hk, "verify_evidence_binds"): "binds",
                    (hs.hk, "verify_evidence"): "evidence", (hs.hv, "checks"): "supervision",
@@ -447,13 +456,96 @@ class StartChecksCompositionTest(unittest.TestCase):
         for (mod, name), label in patches.items():
             self.addCleanup(setattr, mod, name, getattr(mod, name))
             setattr(mod, name, mark(label))
-        out = hs.start_checks(spec(), state="active", keys={"containers": []})
+        out = hs.start_checks(spec(), state="active", keys={"containers": []}, secret_lock=free_lock)
         self.assertEqual(out[0].claim, "the secret's state is active")
         self.assertEqual(out[0].result, rh.PASS)
-        self.assertEqual(set(marks), {"hub", "overlay", "placement", "delegation", "evidence_dir", "binds",
-                                      "evidence", "supervision"})
-        not_active = hs.start_checks(spec(), state="pending_b5", keys={"containers": []})
+        self.assertEqual(set(marks), {"secret", "exposure", "hub", "overlay", "placement", "delegation",
+                                      "evidence_dir", "binds", "evidence", "supervision"})
+        not_active = hs.start_checks(spec(), state="pending_b5", keys={"containers": []}, secret_lock=free_lock)
         self.assertEqual(not_active[0].result, rh.FAIL)
+
+
+class StartSweepTest(unittest.TestCase):
+    """The exposure sweep (§7d) is part of the start check: a container that
+    also mounts the secret volume refuses the start step. The overlap is the
+    REAL sweep's finding, from secret_exposure's own fixture (another
+    container mounting the volume read-only)."""
+
+    def planted_overlap(self):
+        import test_secret_exposure as tse
+        spec_x, sx = tse.specs()
+        orig = rh.run
+        rh.run = tse.engine(by_context={"default": [tse.runtime(), tse.container("other", [tse.vol("/x")])]})
+        try:
+            found = hs.se.checks(spec_x, sx, lstat_=lambda p: tse.Id(1, 1), stat_=tse.stat_of(),
+                                 realpath=lambda p: p, lock=tse.free_lock, platform="linux")
+        finally:
+            rh.run = orig
+        fails = [c for c in found if c.result == rh.FAIL and "only ex-down mounts the volume" in c.claim]
+        self.assertTrue(fails)
+        return found
+
+    def gate(self, exposure_found, secrets_checks=None, overlay=None, spec_path=None):
+        good = [rh.check("x", rh.Fact("x", True, "a test"), True, "x")]
+        built = spec()
+
+        def same(*a, **k):
+            return good
+        patches = [(hs, "read_spec", lambda *a, **k: None), (hs, "load_spec", lambda doc: built),
+                   (hs.ss, "checks", secrets_checks or same), (hs.se, "checks", lambda *a, **k: exposure_found),
+                   (hs.hr, "checks", same), (hs, "verify_overlay", same), (hs.hk, "verify_placement", same),
+                   (hs.hk, "verify_no_delegation", same), (hs.hk, "verify_evidence_dir", same),
+                   (hs.hk, "verify_evidence_binds", same), (hs.hk, "verify_evidence", same), (hs.hv, "checks", same)]
+        for mod, name, value in patches:
+            self.addCleanup(setattr, mod, name, getattr(mod, name))
+            setattr(mod, name, value)
+        said = []
+        rc = hs.hub_start_check(spec_path, overlay=overlay, out=said.append, state="active", keys={"containers": []},
+                                secret_lock=free_lock)
+        return rc, "\n".join(said)
+
+    def test_a_start_check_from_the_overlay_hands_the_overlay_to_the_secrets_checks(self):
+        """The secret's own checks FAIL a document read from --spec rather than
+        the overlay (`verify_overlay_source`): the overlay hub-start-check read
+        must reach them, or every overlay run is refused."""
+        ov = Path("/srv/overlay/host.json")
+
+        def secrets(spec_, **k):
+            ok = k.get("overlay") == str(ov)
+            return [rh.check("the document was read from the overlay", rh.Fact("o", True, "a test"), ok, "x")]
+        clean = [rh.check("y", rh.Fact("y", True, "a test"), True, "x")]
+        rc, said = self.gate(clean, secrets_checks=secrets, overlay=ov)
+        self.assertEqual(rc, 0, said)
+
+    def test_a_spec_document_is_never_checked_as_the_overlay(self):
+        """The CLI supplies the overlay path even with --spec: the document
+        actually read is the --spec copy, so the secrets checks must see no
+        overlay, and their provenance check FAILs."""
+        ov = Path("/srv/overlay/host.json")
+        seen = []
+
+        def secrets(spec_, **k):
+            seen.append(k.get("overlay"))
+            ok = k.get("overlay") == str(ov)
+            return [rh.check("the document was read from the overlay", rh.Fact("o", True, "a test"), ok, "x")]
+        clean = [rh.check("y", rh.Fact("y", True, "a test"), True, "x")]
+        rc, said = self.gate(clean, secrets_checks=secrets, overlay=ov, spec_path=Path("/tmp/copied-host.json"))
+        self.assertNotEqual(rc, 0, said)
+        self.assertEqual(seen, [None])
+        self.assertIn("REFUSED", said)
+
+    def test_a_planted_overlap_refuses_the_start_step(self):
+        rc, said = self.gate(self.planted_overlap())
+        self.assertNotEqual(rc, 0)
+        self.assertIn("REFUSED", said)
+        self.assertIn("only ex-down mounts the volume", said)
+        self.assertNotIn("systemctl", said)
+
+    def test_a_clean_sweep_passes_and_says_verify_must_also_pass(self):
+        rc, said = self.gate([rh.check("y", rh.Fact("y", True, "a test"), True, "x")])
+        self.assertEqual(rc, 0, said)
+        self.assertIn("`host-setup` (verify) must ALSO pass", said)
+        self.assertIn("systemctl enable --now hub-link.service", said)
 
 
 class LaunchdEnablementTest(unittest.TestCase):
@@ -492,13 +584,54 @@ class LaunchdEnablementTest(unittest.TestCase):
         self.assertEqual(hv.parse_disabled(text), {"org.example.hub": True, "org.example.hub-probe": False,
                                                    "com.other": True, "com.more": False})
 
-    def results(self, disabled, gate):
+    def results(self, disabled, gate, loaded=False):
         asked = []
 
         def g():
             asked.append(1)
             return gate
-        return [c.result for c in hv.verify_enablement(spec("launchd"), disabled, g)], asked
+        return [c.result for c in hv.verify_enablement(spec("launchd"), disabled, g, lambda label: loaded)], asked
+
+    def test_a_disabled_label_already_loaded_still_faces_the_gate(self):
+        """Disabling does not unload: a label bootstrapped before its override
+        is running, so it passes only when the start checks pass now."""
+        both = {"org.example.hub": True, "org.example.hub-probe": True}
+        r, asked = self.results(both, False, loaded=True)
+        self.assertEqual(r, [rh.FAIL, rh.FAIL])
+        self.assertEqual(len(asked), 1)
+        self.assertEqual(self.results(both, True, loaded=True)[0], [rh.PASS, rh.PASS])
+        self.assertEqual(self.results(both, False, loaded=rh.Unresolved("no answer"))[0], [rh.UNKNOWN, rh.UNKNOWN])
+
+    def test_print_disabled_output_not_in_its_form_is_unknown(self):
+        good = 'disabled services = {\n\t"org.example.hub" => disabled\n}\n'
+        self.assertEqual(hv.parse_disabled(good), {"org.example.hub": True})
+        self.assertEqual(hv.parse_disabled("disabled services = {\n}\n"), {})
+        for bad in ("", "garbage\n", 'disabled services = {\n\t"org.example.hub" => maybe\n}\n',
+                    'disabled services = {\n\t"org.example.hub" => disabled\n',
+                    'other = {\n}\n', '"org.example.hub" => disabled\n'):
+            with self.subTest(bad=bad):
+                self.assertIsInstance(hv.parse_disabled(bad), rh.Unresolved)
+        r, _ = self.results(hv.parse_disabled("garbage\n"), True)
+        self.assertEqual(r, [rh.UNKNOWN, rh.UNKNOWN])
+
+    def test_loaded_is_read_from_launchctl_print(self):
+        """`launchctl print system/<label>`: exit 0 is loaded; its documented
+        not-found message is not loaded; anything else is unknown."""
+        calls = []
+
+        def fake(rc, out="", err=""):
+            def run(argv, **k):
+                calls.append(list(argv))
+                return rh.Proc(tuple(argv), rc, out, err)
+            return run
+        self.addCleanup(setattr, hv.rh, "run", hv.rh.run)
+        hv.rh.run = fake(0)
+        self.assertIs(hv.ask_loaded("org.example.hub"), True)
+        self.assertEqual(calls[-1], [hv.LAUNCHCTL, "print", "system/org.example.hub"])
+        hv.rh.run = fake(113, err='Could not find service "org.example.hub" in domain for system')
+        self.assertIs(hv.ask_loaded("org.example.hub"), False)
+        hv.rh.run = fake(5, err="Operation not permitted")
+        self.assertIsInstance(hv.ask_loaded("org.example.hub"), rh.Unresolved)
 
     def test_disabled_labels_pass_without_asking_the_gate(self):
         r, asked = self.results({"org.example.hub": True, "org.example.hub-probe": True}, False)
@@ -524,7 +657,7 @@ class LaunchdEnablementTest(unittest.TestCase):
         calls = []
         orig = hs.hv.verify_enablement
         self.addCleanup(setattr, hs.hv, "verify_enablement", orig)
-        hs.hv.verify_enablement = lambda s, d, g: calls.append((d, g())) or []
+        hs.hv.verify_enablement = lambda s, d, g, loaded: calls.append((d, g())) or []
         self.addCleanup(setattr, hs.hv, "checks", hs.hv.checks)
         hs.hv.checks = lambda *a, **k: []
         for name in ("verify_roots", "verify_overlay", "verify_containers", "verify_mounts", "verify_openssl",
@@ -538,6 +671,28 @@ class LaunchdEnablementTest(unittest.TestCase):
                 s = dataclasses.replace(spec(kind_), runtimes=[], secrets=None, hub=None, keys=None)
                 hs.checks(s, production=False, enablement=en)
                 self.assertEqual(calls, want)
+
+    def test_verify_from_the_overlay_hands_the_overlay_to_the_start_gate(self):
+        """HOST's probe: with every start check passing, an enabled label PASSes
+        only if verify's overlay reaches the start checks the gate runs."""
+        ov = Path("/srv/overlay/host.json")
+        seen = []
+
+        def start(s, **k):
+            seen.append(k.get("overlay"))
+            return [rh.check("x", rh.Fact("x", True, "a test"), k.get("overlay") == ov, "x")]
+        for mod, name in ((hs, "start_checks"), (hs, "secret_checks"), (hs.hv, "checks"), (hs.hr, "checks"),
+                          (hs.hk, "checks"), (hs, "verify_roots"), (hs, "verify_overlay"),
+                          (hs, "verify_containers"), (hs, "verify_mounts"), (hs, "verify_openssl"),
+                          (hs, "verify_umasks"), (hs, "verify_groups")):
+            self.addCleanup(setattr, mod, name, getattr(mod, name))
+            setattr(mod, name, lambda *a, **k: [])
+        hs.start_checks = start
+        s = dataclasses.replace(spec("launchd"), runtimes=[])
+        out = hs.checks(s, production=False, overlay=ov, enablement={"disabled": {}, "loaded": lambda l: False})
+        results = [c.result for c in out if "is disabled, or every start check passes" in c.claim]
+        self.assertEqual(results, [rh.PASS, rh.PASS])
+        self.assertEqual(seen, [ov])
 
     def test_the_gate_is_false_on_a_fail_and_unresolved_on_an_unknown(self):
         orig = hs.start_checks
