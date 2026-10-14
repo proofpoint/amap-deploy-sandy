@@ -1,0 +1,88 @@
+{
+  "_note": "The router-authored notice vocabulary payload/INBOX-POLICY.md presents, as amap-router-local emits it. Read from its source at the commit below; test_inbox_policy_vocabulary holds the text to it, and holds it to the pinned router checkout once that checkout carries these modules.",
+  "control_failure_text": [
+    [
+      "demoted",
+      "attachment_count"
+    ],
+    [
+      "demoted",
+      "attachment_digest"
+    ],
+    [
+      "demoted",
+      "body_charset"
+    ],
+    [
+      "demoted",
+      "body_digest"
+    ],
+    [
+      "demoted",
+      "exposure_signer"
+    ],
+    [
+      "demoted",
+      "key_domain"
+    ],
+    [
+      "demoted",
+      "message_id"
+    ],
+    [
+      "demoted",
+      "statement_value"
+    ],
+    [
+      "demoted",
+      "ts_window"
+    ],
+    [
+      "dropped",
+      "duplicate"
+    ],
+    [
+      "dropped",
+      "misrouted"
+    ],
+    [
+      "refused",
+      "no_edge"
+    ],
+    [
+      "refused",
+      "policy"
+    ],
+    [
+      "refused",
+      "unresolved_reply"
+    ]
+  ],
+  "control_subject": "Delivery report for peer message ",
+  "hub_failure_subjects": {
+    "delayed": "Delayed: ",
+    "failed": "Not delivered: ",
+    "mixed": "Delivery report: "
+  },
+  "local_dsn_outcomes": [
+    "denied",
+    "refused"
+  ],
+  "local_dsn_prefix": "Not delivered: ",
+  "provenance": [
+    "internal",
+    "fleet-remote",
+    "unverified",
+    "external"
+  ],
+  "provenance_emitted": [
+    "internal",
+    "fleet-remote",
+    "unverified"
+  ],
+  "source": {
+    "commit": "80a7798fd8690d0fc5611ef0515df40412f0b261",
+    "pre_hop_pin": "972cb7096bf4110811cbafc20a6a8019d7408576",
+    "repo": "amap-router-local"
+  }
+}
