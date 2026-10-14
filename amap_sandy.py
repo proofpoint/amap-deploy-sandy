@@ -76,6 +76,7 @@ import router_health as rh  # the router process: its container and its health, 
 import verify_report as vr  # how verify prints: one row per condition, its workspaces beside it
 import host_setup as hsu    # a hop deployment's host plan: rendered and checked, never applied
 import host_adapter as ha   # the host registry's CLI, run as a subprocess, never imported
+import hop_router as hp     # the local router's hop keys, on a host with a hop link
 import delivery_checks as dc  # delivery itself: lister mode, session posture, daemon build, backlog
 import connector_pin as cpin  # install refuses a connector checkout not at its siblings.json pin
 
@@ -3510,9 +3511,9 @@ def sibling_diff(existing: Any, rendered: Dict[str, Any]) -> List[str]:
     if not isinstance(existing, dict):
         return ["the file on disk is not a JSON object"]
     out: List[str] = []
-    for key in sorted(set(existing) - set(SIBLING_KEYS)):
+    for key in sorted(set(existing) - set(SIBLING_KEYS) - set(hp.HOP_KEYS)):
         out.append(f"- {key}: not a key the router reads — it refuses the file over it")
-    for key in SIBLING_KEYS:
+    for key in SIBLING_KEYS + hp.HOP_KEYS:
         have, want = existing.get(key), rendered.get(key)
         if key in (SIBLING_PEER_SENDERS, SIBLING_PEERS) and isinstance(have, dict) \
                 and isinstance(want, dict):
@@ -3535,6 +3536,33 @@ def sibling_diff(existing: Any, rendered: Dict[str, Any]) -> List[str]:
     return out
 
 
+def hop_router_keys(policy: Dict[str, Any], state_dir: Path, overlay: Optional[Path], *,
+                    decommission: bool = False, spec_out: Optional[List[Any]] = None
+                    ) -> Tuple[Optional[Dict[str, Any]], List[str]]:
+    """The local router's hop keys and every problem that stops them, on a
+    host whose policy has `hop_link` (hop_router). The trigger is the policy,
+    never the host-setup document, which a hop host must then have in full.
+    Without `hop_link`, the problems are any hop state left in state_dir,
+    unless the run is the explicit decommission."""
+    try:
+        link = hp.parse_hop_link(policy)
+    except hp.HopRenderError as e:
+        return None, [str(e)]
+    if link is None:
+        return None, [] if decommission else hp.state_problems(str(state_dir), None)
+    try:
+        spec = hsu.load_spec(hsu.read_spec(None, overlay))
+        keys = hp.hop_keys(spec, link, policy.get(fp.FLEET_DOMAIN_KEY))
+    except ValueError as e:     # SpecError and HopRenderError
+        return None, [f"a hop host (the policy has {hp.HOP_LINK_KEY}): {e}"]
+    if spec_out is not None:
+        spec_out.append(spec)
+    problems = hp.plugin_problems(keys["transport_plugin"]["path"], keys["transport_plugin"]["sha256"])
+    problems += hp.checkout_problems(hp.hop_checkout(), hp.hop_pin())
+    problems += hp.state_problems(str(state_dir), keys)
+    return keys, problems
+
+
 def run_render_router(args: argparse.Namespace, home: Path, boxes: List[Dict[str, Any]],
                       policy: Dict[str, Any], *, apply: bool) -> int:
     """Render the sibling and write it (`apply`) or compare it (dry). Exit 0
@@ -3553,7 +3581,25 @@ def run_render_router(args: argparse.Namespace, home: Path, boxes: List[Dict[str
     doc = result["_doc"]
     for w in result["_warnings"]:
         print(f"router config warning: {w}", file=sys.stderr)
-    refused = validate_with_router(doc)
+    keys, hop_problems = hop_router_keys(policy, state_dir, ha.overlay_path(getattr(args, "overlay", None)),
+                                         decommission=getattr(args, "decommission_hop", False))
+    for p in hop_problems:
+        print(f"router config: cannot render — {p}", file=sys.stderr)
+    if hop_problems:
+        return 2
+    if keys is not None:
+        # A hop host: the rendering is validated by the HOP pin's loader, the
+        # code its router runs; the primary pin's loader refuses these keys.
+        doc = dict(doc, **keys)
+        nested = hp.plugin_nesting_problems(doc, hp.loader_roots(doc, hp.hop_checkout()))
+        nested += hp.tunable_problems(doc)
+        for p in nested:
+            print(f"router config: cannot render — {p}", file=sys.stderr)
+        if nested:
+            return 2
+        refused = hp.validate_with_hop_router(doc, hp.hop_checkout())
+    else:
+        refused = validate_with_router(doc)
     if refused:
         print(f"router config: cannot render — the router's own loader refuses the "
               f"rendering: {refused}", file=sys.stderr)
@@ -3576,12 +3622,15 @@ def run_render_router(args: argparse.Namespace, home: Path, boxes: List[Dict[str
     except OSError as e:
         print(f"router config: cannot read {path}: {e}", file=sys.stderr)
         return 2
+    notice = hp.restart_notice(_read_json(path) if have is not None else None, doc)
     if apply:
         if have == want:
             print(f"router config current: {path} — {len(members)} instance(s): {names}")
             return 0
         _write_file(path, want, dry_run=False, label=ROUTER_SIBLING_NAME)
         print(f"wrote {path} — {len(members)} instance(s): {names}")
+        if notice:
+            print(f"router config: {notice}")
         return 0
     if have is None:
         print(f"router config absent: would write {path} — {len(members)} instance(s): "
@@ -3602,15 +3651,41 @@ def run_render_router(args: argparse.Namespace, home: Path, boxes: List[Dict[str
 
 
 def verify_router_sibling(home: Path, policy: Dict[str, Any], members: Dict[str, dict],
-                          state_dir: Path, sandbox_paths: Dict[str, Path]) -> List[str]:
+                          state_dir: Path, sandbox_paths: Dict[str, Path],
+                          overlay: Optional[Path] = None) -> List[str]:
     """`verify`'s half: the file on disk is byte for byte the rendering.
     Absent is a problem (the router has nothing to start from), a hand edit
-    is drift with the re-sync as remedy."""
+    is drift with the re-sync as remedy. On a hop host the rendering carries
+    the hop keys, and their problems (the document, the plugin, the hop
+    checkout, state_dir's pins) are problems here too."""
     path = router_sibling_path(home)
     try:
         doc = render_router_sibling(policy, members, home, state_dir, sandbox_paths)["_doc"]
     except ProvisionError as e:
         return [f"router config: cannot render: {e}"]
+    spec_out: List[Any] = []
+    keys, hop_problems = hop_router_keys(policy, state_dir, overlay, spec_out=spec_out)
+    if hop_problems:
+        return [f"router config: {p}" for p in hop_problems]
+    if keys is None:
+        # A document that configures the hub-link router while the policy
+        # names no hop link is a host half set up.
+        try:
+            hub_doc = hsu.read_spec(None, overlay) if overlay is not None else None
+        except ValueError:
+            hub_doc = None
+        if isinstance(hub_doc, dict) and hub_doc.get(hsu.hr.SECTION) is not None:
+            return [f"router config: the host-setup document configures the hub-link router, and the "
+                    f"policy has no {hp.HOP_LINK_KEY}: add it, or remove the hub section"]
+    else:
+        doc = dict(doc, **keys)
+        roots = hp.loader_roots(doc, hp.hop_checkout())
+        nested = hp.plugin_nesting_problems(doc, roots) + hp.tunable_problems(doc)
+        if nested:
+            return [f"router config: {p}" for p in nested]
+        live = hp.live_problems(spec_out[0], keys, roots)
+        if live:
+            return [f"router config: {p}" for p in live]
     try:
         have = path.read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -3844,7 +3919,8 @@ def run_verify(args: argparse.Namespace, servers: Dict[str, dict], home: Path,
     # The router's config, once for the fleet: the sibling on disk is the
     # rendering, byte for byte.
     state_dir = sibling_state_dir(home, args.state_dir)
-    problems += verify_router_sibling(home, policy, enrolled, state_dir, boxes)
+    problems += verify_router_sibling(home, policy, enrolled, state_dir, boxes,
+                                      ha.overlay_path(getattr(args, "overlay", None)))
 
     # THE ROUTER PROCESS, last: its container and its health, three-valued
     # (router_health). Nothing here starts it — the remedy names the
@@ -4765,6 +4841,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "router's config beside the manifest — the whole install, once per "
                         "host; sandy applies it to each sandbox at its launch")
     install.add_argument("--apply", action="store_true", help="write (default: report only)")
+    install.add_argument("--decommission-hop", action="store_true",
+                         help="render router.json WITHOUT the hop keys although state_dir holds hop "
+                              "state: the explicit removal of a hop link (then restart the router)")
     install.add_argument("--fleet-domain-base", metavar="BASE",
                          help="a fresh host's template gets fleet_domain sandy.<host>.BASE "
                               "(default: internal, non-routable); a domain you control is "
