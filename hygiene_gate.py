@@ -47,6 +47,13 @@ allow.txt, one exception per line, each ending in a reason:
   tree <repo> <full commit sha> <path> <line-sha256> <reason>
       that line, at that path, only while scanning exactly that commit's
       tree.
+  identity <repo> <boundary commit sha> <address-sha256> <reason>
+      an author or committer address whose lower-cased sha256 is the given
+      one, accepted only in a commit that IS the boundary or is reachable
+      from it (an ancestor). Any other commit carrying it, whatever its
+      dates say, is checked: reachability is fixed by history, a date is
+      whatever the writer's clock said. A boundary the repository does not
+      hold is "cannot run".
 
 A line's sha256 is over its bytes without the trailing "\\n". Every run
 lists the commit and tree exceptions that matched nothing.
@@ -263,8 +270,10 @@ def parse_allow(text: str) -> List[Exception_]:
             out.append(Exception_(n, "commit", f[1], commit=f[2]))
         elif f[0] == "tree" and len(f) >= 6 and _HEX40.fullmatch(f[2]) and _HEX64.fullmatch(f[4]):
             out.append(Exception_(n, "tree", f[1], commit=f[2], path=f[3], digest=f[4]))
+        elif f[0] == "identity" and len(f) >= 5 and _HEX40.fullmatch(f[2]) and _HEX64.fullmatch(f[3]):
+            out.append(Exception_(n, "identity", f[1], commit=f[2], digest=f[3]))
         else:
-            raise CannotRun(f"{where}: not a path, commit or tree exception with its reason")
+            raise CannotRun(f"{where}: not a path, commit, tree or identity exception with its reason")
     return out
 
 
@@ -358,6 +367,37 @@ class Matcher:
         self.lists = lists
         self.repo = repo
         self.findings: List[Finding] = []
+        #: The git directory history is read from, for `identity` exceptions'
+        #: reachability; set by scan_history.
+        self.git_dir: Optional[str] = None
+        self._reach: Dict[Tuple[str, str], bool] = {}
+
+    def _reachable(self, commit: str, boundary: str) -> bool:
+        """`commit` is `boundary` or one of its ancestors."""
+        key = (commit, boundary)
+        if key not in self._reach:
+            if not self.git_dir:
+                raise CannotRun("an identity exception needs the history's git directory")
+            if subprocess.run(["git", "-C", self.git_dir, "cat-file", "-e", boundary + "^{commit}"],
+                              env=git_env(), capture_output=True).returncode:
+                raise CannotRun(f"identity exception: boundary {boundary[:12]} is not in {self.repo}")
+            r = subprocess.run(["git", "-C", self.git_dir, "merge-base", "--is-ancestor", commit, boundary],
+                               env=git_env(), capture_output=True)
+            if r.returncode not in (0, 1):
+                raise CannotRun(f"identity exception: reachability of {commit[:12]} could not be read")
+            self._reach[key] = r.returncode == 0
+        return self._reach[key]
+
+    def _identity_excepted(self, where: Where, email: str) -> bool:
+        if where.surface != "commit" or not where.commit:
+            return False
+        d = hashlib.sha256(email.strip().lower().encode("utf-8", "surrogateescape")).hexdigest()
+        for ex in self.lists.exceptions:
+            if ex.kind == "identity" and ex.repo == self.repo and ex.digest == d \
+                    and self._reachable(where.commit, ex.commit):
+                ex.used += 1
+                return True
+        return False
 
     # Exceptions.
     def _excepted(self, where: Where, line: Optional[str]) -> bool:
@@ -433,7 +473,8 @@ class Matcher:
         """An identity: the name as text; the email as text, which runs the
         email entries on it once allow entries have masked it."""
         self.text(where, name)
-        self.text(where, email)
+        if not self._identity_excepted(where, email):
+            self.text(where, email)
 
     def lines(self, where: Where, data: bytes, fingerprints: bool = True) -> None:
         """A file's text, line by line, for names and fixture lines."""
@@ -453,7 +494,7 @@ class Matcher:
             self.findings.append(Finding(where, "fixture file"))
 
     def unused(self) -> List[Exception_]:
-        return [ex for ex in self.lists.exceptions if ex.kind in ("commit", "tree") and not ex.used]
+        return [ex for ex in self.lists.exceptions if ex.kind in ("commit", "tree", "identity") and not ex.used]
 
 
 def _pieces(text: str) -> Iterator[str]:
@@ -568,6 +609,7 @@ def scan_history(m: Matcher, repo: str, revs: Sequence[str], blobs: Blobs,
     """Every commit in `revs`: message, identities, added lines and paths,
     and each new blob's fingerprint. Returns the commits scanned."""
     skip = skip or set()
+    m.git_dir = repo
     todo = [(c, ps) for c, ps in _commits(repo, revs) if c not in skip]
     if not todo:
         return []
