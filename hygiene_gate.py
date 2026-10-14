@@ -974,6 +974,18 @@ def main(argv: Optional[Sequence[str]] = None, out=print) -> int:
     f.add_argument("--public", action="append", default=[], help="a public clone to check fixture lines against")
     f.add_argument("--allow", help="the private fingerprint-allow file")
     f.add_argument("--out", required=True)
+    ci = sub.add_parser("ci", help="the scheduled run over every public fleet repository (hygiene_api)")
+    ci.add_argument("--lists", required=True)
+    ci.add_argument("--owner", required=True)
+    ci.add_argument("--repos", required=True, help="repos.txt: <name> public|private")
+    ci.add_argument("--fleet-rule", required=True, help="fleet-rule.txt: prefix <p> / topic <t>")
+    ci.add_argument("--workdir", required=True, help="where the public mirrors are kept")
+    ci.add_argument("--api", default="https://api.github.com")
+    ci.add_argument("--git-base", default="https://github.com")
+    ci.add_argument("--token-env", help="the environment variable holding the public-read token")
+    ci.add_argument("--private-token-env", help="the environment variable holding the metadata-only token")
+    ci.add_argument("--verdicts", help="where to write the {repo, sha, state} hand-over")
+    ci.add_argument("--cache", help="the incremental cache, keyed by the lists' digest")
     h = sub.add_parser("install-hook", help="install a pre-push hook that blocks on exit 1 and 2")
     h.add_argument("--lists", required=True)
     h.add_argument("--repo", required=True)
@@ -1003,6 +1015,13 @@ def main(argv: Optional[Sequence[str]] = None, out=print) -> int:
             out(f"fingerprint: wrote {args.out}: {len(doc['files'])} files, {len(doc['lines'])} lines, "
                 f"{len(doc['no_eligible_line'])} with no eligible line")
             return 0
+        if args.command == "ci":
+            import hygiene_api
+            return hygiene_api.run_ci(
+                args.lists, args.owner, args.repos, args.fleet_rule, args.workdir, api=args.api,
+                git_base=args.git_base, token=os.environ.get(args.token_env) if args.token_env else None,
+                private_token=os.environ.get(args.private_token_env) if args.private_token_env else None,
+                verdicts_out=args.verdicts, cache_path=args.cache, out=out)
         if args.command == "install-hook":
             out(f"install-hook: wrote {install_hook(args.git, args.lists, args.repo)}")
             return 0
