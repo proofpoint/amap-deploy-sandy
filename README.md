@@ -235,6 +235,74 @@ from `selected.json` at that launch.
 **Who may task whom should change.** Edit the manifest's `feature` section,
 never `router.json`, then run `install --apply`.
 
+## The hygiene gate
+
+`amap-hygiene.py` finds private names and private fixture content in what a
+public repository holds or is about to publish. The code is here; the lists
+are private and are never in this repository. A writer's sandbox sees them
+read-only at `~/.amap-hygiene`; the gate prints their sha256, so a stale
+copy shows.
+
+Before every push, PR, PR edit or comment to a public repository:
+
+```sh
+python3 amap-hygiene.py --lists ~/.amap-hygiene --repo <repo> \
+    --range origin/<the PR's base>..HEAD --tree HEAD --refs --text <the PR body or comment>
+```
+
+`amap-hygiene.py install-hook --lists ~/.amap-hygiene --repo <repo>` installs
+a `pre-push` hook that runs the same scan and blocks on a finding (exit 1)
+and when the gate cannot run (exit 2), so a missing list never passes. A
+finding names the location and the list entry's line number, never the
+entry's text. Names are matched in text files only: a file with a NUL in
+its first 8000 bytes (git's own test, which also classes UTF-16 text as
+binary) is checked against the fixture file hashes but not read for names.
+
+`amap-hygiene.py ci` is the scheduled run, in the private repository's CI:
+every public fleet repository's refs, history and trees, and the text
+GitHub holds beside them (pull requests, issues, comments, releases and
+their assets, Actions logs and artifacts, the wiki), every read bounded. Its
+`--verdicts` hand-over gives `success` or `failure` for each default-branch
+and open pull-request head, decided ONLY by the git content that commit
+fixes: its tree and every commit reachable from it. Branch and tag names
+and everything GitHub holds as editable text can change without a new
+commit, so they turn the scheduled run red but never fail a commit's
+status.
+
+A surface with a finding is never remembered as read: while it stays
+public, every scheduled run reports it again. The incremental cache
+(`--cache`) is used only for the same lists and the same gate commit, so a
+change to either rescans everything. The token named by `--token-env` is
+required in practice: the retained body revisions of an edited issue or
+pull request are read through GraphQL, which answers no anonymous request,
+so without it each such object is a LIMIT on every run.
+
+What `ci` does not read, each a known limit:
+
+- pull request review summaries (the body of an approval or a change
+  request), as distinct from review comments;
+- the edit history of a comment (issue, review or commit comment), only its
+  current text;
+- discussions (a repository with them enabled is a named LIMIT).
+
+What it reads but cannot match:
+
+- a streamed line over 1 MiB, which is scanned for names in overlapping
+  pieces but never as a fixture line;
+- an `allow` entry's span cut by a piece boundary on such a line, so the
+  name it allows can be reported (a false positive, never a miss).
+
+`fingerprint` refuses a fixture line that a public repository already
+holds, but not a fixture file already public whole whose lines are all too
+short or too regular to fingerprint. Under `--no-fingerprints` no fixture
+content is matched at all, and every report says so.
+
+A squash merge, and the default merge-commit message, copy the pull
+request's title and body into a NEW commit on the default branch. A name in
+a PR body therefore passes the pull request's own check and then lands on
+main, where only the next scheduled run finds it. Set each public
+repository's merge-message defaults so the PR body is not included.
+
 ## Rules that do not change
 
 - **Selection is sandy's.** The include and exclude globs go into the
