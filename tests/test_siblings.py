@@ -133,6 +133,19 @@ class SiblingsTest(unittest.TestCase):
         self.assertEqual(self._put(), "clone")
         self.assertEqual(self._head(), self.old)
 
+    def test_a_second_pin_of_a_repository_is_checked_out_into_its_own_dir(self):
+        """The main pin at the older commit, the second at the newer one,
+        each in its own directory, neither moving the other."""
+        hop = dict(self.sib, commit=self.new, override="AMAP_TEST_DEMO_HOP_REPO",
+                   dir="demo-hop", temporary="removed when the branch merges")
+        for s in (self.sib, hop):
+            action, _ = siblings.plan(s, self.base)
+            siblings.apply(s, self.base, action)
+        self.assertEqual(self._head(), self.old)
+        self.assertEqual(git("rev-parse", "HEAD", cwd=self.base / "demo-hop"), self.new)
+        self.assertEqual(siblings.plan(hop, self.base)[0], "present")
+        self.assertEqual(siblings.plan(self.sib, self.base)[0], "present")
+
     def test_a_dry_run_writes_nothing(self):
         out = io.StringIO()
         with mock.patch.object(siblings, "load_pins", return_value=[self.sib]), \
@@ -145,8 +158,47 @@ class SiblingsTest(unittest.TestCase):
 
 class ShippedPinsTest(unittest.TestCase):
 
+    def test_the_hop_pin_is_a_temporary_second_router_pin_and_lookups_read_the_main_one(self):
+        loaded = siblings.load_pins()
+        routers = [p for p in loaded if p["name"] == "amap-router-local"]
+        self.assertEqual(len(routers), 2)
+        hop = next(p for p in routers if "dir" in p)
+        self.assertEqual((hop["dir"], hop["override"]), ("amap-router-local-hop", "AMAP_HOP_ROUTER_REPO"))
+        self.assertIn("removed in the same PR that moves the main amap-router-local pin",
+                      hop["temporary"])
+        main = siblings.primary(loaded, "amap-router-local")
+        self.assertNotIn("dir", main)
+        self.assertEqual(main["override"], "AMAP_ROUTER_REPO")
+        self.assertNotEqual(main["commit"], hop["commit"])
+
+    def test_a_second_pin_must_name_its_dir_and_why_and_keep_its_repository_primary(self):
+        main = {"name": "x", "url": "u", "commit": "a" * 40, "override": "V"}
+        second = {"name": "x", "url": "u", "commit": "b" * 40, "override": "W", "dir": "x-2",
+                  "temporary": "until the merge"}
+        bad = {
+            "a dir without a reason": [main, {k: v for k, v in second.items() if k != "temporary"}],
+            "a reason without a dir": [main, {k: v for k, v in second.items() if k != "dir"}],
+            "a blank reason": [main, dict(second, temporary="  ")],
+            "two primaries (one checkout directory)": [main, dict(main, override="W")],
+            "no primary": [second],
+            "a shared directory": [main, dict(second, dir="x")],
+            "a shared override": [main, dict(second, override="V")],
+            "a bad dir name": [main, dict(second, dir="../x")],
+        }
+        with TemporaryDirectory() as d:
+            p = Path(d) / "pins.json"
+            p.write_text(json.dumps({"schema": 1, "siblings": [second, main]}))
+            loaded = siblings.load_pins(p)
+            self.assertEqual(siblings.primary(loaded, "x")["commit"], main["commit"],
+                             "the primary is the entry without a dir, wherever it is listed")
+            for why, entries in bad.items():
+                with self.subTest(why=why):
+                    p.write_text(json.dumps({"schema": 1, "siblings": entries}))
+                    with self.assertRaises(siblings.SiblingError):
+                        siblings.load_pins(p)
+
     def test_the_shipped_pins_load_and_name_both_siblings_with_their_overrides(self):
-        pins = {p["name"]: p for p in siblings.load_pins()}
+        pins = {p["name"]: p for p in siblings.load_pins() if "dir" not in p}
         self.assertEqual(set(pins), {"amap-router-local", "amap-connector-claude",
                                      "amap-connector-codex"})
         self.assertEqual(pins["amap-router-local"]["override"], "AMAP_ROUTER_REPO")

@@ -43,7 +43,9 @@ python3 amap-deploy-sandy/amap-siblings.py --apply
 ```
 
 `amap-siblings.py` clones `amap-router-local` and `amap-connector-claude`
-into `~/amap` and checks out the commits pinned in `siblings.json`. Run it
+into `~/amap` and checks out the commits pinned in `siblings.json`. It also
+checks out the router a second time, as `amap-router-local-hop`, at the
+temporary pin the hop deployment's renderer is tested against. Run it
 without `--apply` to see what it would do. It refuses a checkout with
 uncommitted changes. `amap-deploy-sandy` finds the other two by looking
 beside itself; `$AMAP_ROUTER_REPO` and `$AMAP_CONNECTOR_REPO` override that,

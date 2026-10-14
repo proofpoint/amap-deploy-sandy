@@ -78,3 +78,25 @@ def codex_connector_root() -> Path:
 
 
 CODEX_CONNECTOR_ROOT = codex_connector_root()
+
+
+# The hop renderer's router: the second, temporary amap-router-local pin in
+# siblings.json, checked out beside the main one. Keep in step with that
+# entry's `dir` and `override`.
+_HOP_ROUTER_DIR = "amap-router-local-hop"
+
+
+def hop_router_root() -> Path:
+    env = os.environ.get("AMAP_HOP_ROUTER_REPO")
+    if env:
+        return Path(env).resolve()
+    ws = os.environ.get("AMAP_WORKSPACE")
+    roots = [Path(ws).resolve()] if ws else list(_HERE.parents)
+    for cand in roots:
+        if (cand / _HOP_ROUTER_DIR).is_dir():
+            return cand / _HOP_ROUTER_DIR
+    base = roots[-1] if roots else _HERE.parent
+    return base / _HOP_ROUTER_DIR
+
+
+HOP_ROUTER_ROOT = hop_router_root()
