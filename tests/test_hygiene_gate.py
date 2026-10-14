@@ -433,6 +433,72 @@ class IdentityBoundaryTest(GateTest):
         self.assertIn("(identity) matched nothing", out)
 
 
+class TagExceptionTest(GateTest):
+    """A `tag` exception accepts one annotated tag OBJECT's tagger and
+    message, and nothing else."""
+
+    PERSON = "zz.person@example.org"
+
+    def tag(self, name, message="release", email=None, annotated=True):
+        if annotated:
+            self.repo.git("tag", "-f", "-a", name, "-m", message,
+                          env={"GIT_COMMITTER_EMAIL": email or self.PERSON})
+        else:
+            self.repo.git("tag", "-f", name)
+        return self.repo.git("rev-parse", f"refs/tags/{name}")
+
+    def allow(self, obj, repo="public-repo"):
+        self.write_lists(allow=f"tag {repo} {obj} accepted as it stands\n")
+
+    def test_the_exact_tag_object_is_accepted(self):
+        obj = self.tag("v1", "release for zz-planted-host")
+        self.assert_found(["--refs"], "tag refs/tags/v1 tagger", "tag refs/tags/v1 message:1")
+        self.allow(obj)
+        self.assert_clean(["--refs"])
+
+    def test_a_tag_recreated_under_the_same_name_is_checked(self):
+        obj = self.tag("v1")
+        self.allow(obj)
+        self.assert_clean(["--refs"])
+        again = self.tag("v1", "release, again")
+        self.assertNotEqual(again, obj)
+        self.assert_found(["--refs"], "tag refs/tags/v1 tagger")
+
+    def test_another_tag_is_checked(self):
+        obj = self.tag("v1")
+        self.tag("v2", "second")
+        self.allow(obj)
+        out = self.assert_found(["--refs"], "tag refs/tags/v2 tagger")
+        self.assertNotIn("refs/tags/v1 tagger", out)
+
+    def test_another_repository_is_checked(self):
+        obj = self.tag("v1")
+        self.allow(obj, repo="other-repo")
+        self.assert_found(["--refs"], "tag refs/tags/v1 tagger")
+
+    def test_the_ref_name_is_always_checked(self):
+        obj = self.tag("zz-planted-host-v1", email="clean@example.org")
+        self.allow(obj)
+        self.assert_found(["--refs"], "ref refs/tags/zz-planted-host-v1 ref name")
+
+    def test_a_lightweight_tag_is_never_accepted(self):
+        """No tag object, so nothing a `tag` row can name: its ref name is checked."""
+        self.tag("zz-planted-host-light", annotated=False)
+        commit = self.repo.git("rev-parse", "HEAD")
+        self.allow(commit)
+        self.assert_found(["--refs"], "ref refs/tags/zz-planted-host-light ref name")
+
+    def test_a_commit_row_for_the_tag_object_does_not_accept_it(self):
+        obj = self.tag("v1")
+        self.write_lists(allow=f"commit public-repo {obj} not a tag row\n")
+        self.assert_found(["--refs"], "tag refs/tags/v1 tagger")
+
+    def test_an_unused_tag_exception_is_listed(self):
+        self.allow("e" * 40)
+        rc, out = self.run_gate("--refs")
+        self.assertIn("(tag) matched nothing", out)
+
+
 class ExceptionsTest(GateTest):
     def digest(self, line):
         return hashlib.sha256(line.encode()).hexdigest()
