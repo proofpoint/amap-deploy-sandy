@@ -51,6 +51,10 @@ runs inside a sandbox, and nothing here can send or receive a message.
   `siblings.json` names the commit of each that this repo is tested against,
   and `python3 amap-siblings.py --apply` clones or checks out exactly those
   (a dry run without `--apply`; an overridden checkout is left alone). The
+  router is pinned twice for now: a second, temporary pin at a commit of its
+  `hop-integration` branch is checked out as `amap-router-local-hop`
+  (`$AMAP_HOP_ROUTER_REPO`) for the hop deployment's renderer, and is removed
+  when that branch merges to the router's main. The
   one-command installer does this for you. `install` refuses, before it
   writes anything, a connector checkout whose HEAD is not that pin or that
   has changes to tracked files (compared byte for byte with HEAD, so an index

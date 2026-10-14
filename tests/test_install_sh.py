@@ -194,7 +194,12 @@ class InstallShTest(unittest.TestCase):
         calls = self._calls()
         self.assertEqual(len([c for c in calls if c.startswith("docker run")]), 1, calls)
         self.assertIn("updating", out)
-        self.assertEqual(out.count(": present "), 2, out)
+        # Every sibling the installer puts at its pin (all but the opt-in
+        # ones) is already there on the second run.
+        import siblings
+        at_pin = [siblings.checkout_dir(p) for p in siblings.load_pins() if "opt_in" not in p]
+        self.assertEqual(sorted(line.split(":")[0].strip() for line in out.splitlines()
+                                if ": present " in line), sorted(at_pin), out)
         self.assertIn("is running; it was left running", out)
         self.assertNotIn("docker start", "\n".join(calls))
         self.assertNotIn("not the one it would derive", out,

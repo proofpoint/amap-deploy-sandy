@@ -19,6 +19,13 @@ the Codex connector) is put at its pin only when that variable is `1`, and
 skipped otherwise. $AMAP_REPO_BASE replaces the base of every clone URL,
 for a mirror.
 
+A repository may be pinned twice. The second entry names its own checkout
+directory (`dir`) and override, and says why it exists and when it goes
+(`temporary`): the hop renderer's router pin, at a commit of the router's
+integration branch, sits beside the main router pin until that branch
+merges. Every lookup by repository name (`primary`) reads the entry
+without a `dir`.
+
 Exit 0 when every sibling is at its pin or would be put there; 1 when any
 was refused or failed.
 """
@@ -38,6 +45,7 @@ PINS_FILE = HERE / "siblings.json"
 PINS_SCHEMA = 1
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+KEYS = ("name", "url", "commit", "override", "opt_in", "dir", "temporary")
 REPO_BASE_ENV = "AMAP_REPO_BASE"
 
 
@@ -67,15 +75,41 @@ def load_pins(path: Path = PINS_FILE) -> List[Dict[str, str]]:
             raise SiblingError(f"{where}: name {s['name']!r} is not a directory name")
         if not COMMIT_RE.match(s["commit"]):
             raise SiblingError(f"{where}: commit {s['commit']!r} is not a full 40-character sha")
-        unknown = sorted(set(s) - {"name", "url", "commit", "override", "opt_in"})
+        unknown = sorted(set(s) - set(KEYS))
         if unknown:
             raise SiblingError(f"{where} has unknown key(s) {unknown}")
         if "opt_in" in s and (not isinstance(s["opt_in"], str) or not s["opt_in"]):
             raise SiblingError(f"{where}: opt_in must name a variable")
-        out.append({k: s[k] for k in ("name", "url", "commit", "override", "opt_in") if k in s})
+        if ("dir" in s) != ("temporary" in s):
+            raise SiblingError(f"{where}: dir and temporary go together: a second pin of a "
+                               f"repository says where it is checked out and when it goes")
+        if "dir" in s and (not isinstance(s["dir"], str) or not NAME_RE.match(s["dir"])):
+            raise SiblingError(f"{where}: dir {s['dir']!r} is not a directory name")
+        if "temporary" in s and (not isinstance(s["temporary"], str) or not s["temporary"].strip()):
+            raise SiblingError(f"{where}: temporary must say when the pin is removed")
+        out.append({k: s[k] for k in KEYS if k in s})
     if not out:
         raise SiblingError(f"{path}: no siblings listed")
+    dirs = [checkout_dir(s) for s in out]
+    if len(set(dirs)) != len(dirs):
+        raise SiblingError(f"{path}: two siblings share a checkout directory")
+    names = [s["name"] for s in out if "dir" not in s]
+    if any(s["name"] not in names for s in out if "dir" in s):
+        raise SiblingError(f"{path}: a second pin needs its repository's primary pin")
+    overrides = [s["override"] for s in out]
+    if len(set(overrides)) != len(overrides):
+        raise SiblingError(f"{path}: two siblings share an override variable")
     return out
+
+
+def checkout_dir(sibling: Dict[str, str]) -> str:
+    """The directory the sibling is checked out into, beside the others."""
+    return sibling.get("dir", sibling["name"])
+
+
+def primary(pins: List[Dict[str, str]], name: str) -> Dict[str, str]:
+    """The repository's main pin: the entry with no `dir`."""
+    return next(s for s in pins if s["name"] == name and "dir" not in s)
 
 
 def clone_url(sibling: Dict[str, str]) -> str:
@@ -104,7 +138,7 @@ def plan(sibling: Dict[str, str], base: Path) -> Tuple[str, str]:
     if os.environ.get(var):
         return "skip", (f"${var} names {os.environ[var]}; that checkout is the operator's "
                         f"and is left alone")
-    dest = base / sibling["name"]
+    dest = base / checkout_dir(sibling)
     if not dest.exists():
         return "clone", f"{clone_url(sibling)} into {dest} at {sibling['commit'][:12]}"
     if not (dest / ".git").exists():
@@ -123,7 +157,7 @@ def plan(sibling: Dict[str, str], base: Path) -> Tuple[str, str]:
 def apply(sibling: Dict[str, str], base: Path, action: str) -> None:
     """Carry out `plan`'s action. Raises SiblingError if git fails or the pin
     is not on the remote."""
-    dest = base / sibling["name"]
+    dest = base / checkout_dir(sibling)
     commit = sibling["commit"]
     if action == "clone":
         r = _git(["clone", "--quiet", clone_url(sibling), str(dest)])
@@ -161,13 +195,13 @@ def main(argv: Optional[List[str]] = None) -> int:
             action, detail = plan(s, base)
             if args.apply and action in ("clone", "checkout"):
                 apply(s, base, action)
-                print(f"  {s['name']}: {action}d {detail}" if action == "clone"
-                      else f"  {s['name']}: checked out {detail}")
+                print(f"  {checkout_dir(s)}: {action}d {detail}" if action == "clone"
+                      else f"  {checkout_dir(s)}: checked out {detail}")
             else:
                 verb = {"skip": "skipped", "present": "present",
                         "clone": "would clone", "checkout": "would check out"}[action]
-                print(f"  {s['name']}: {verb} {detail}")
+                print(f"  {checkout_dir(s)}: {verb} {detail}")
         except SiblingError as e:
-            print(f"  {s['name']}: REFUSED — {e}", file=sys.stderr)
+            print(f"  {checkout_dir(s)}: REFUSED — {e}", file=sys.stderr)
             rc = 1
     return rc
