@@ -55,11 +55,13 @@ allow.txt, one exception per line, each ending in a reason:
       whatever the writer's clock said. A boundary the repository does not
       hold is "cannot run".
   tag <repo> <tag object sha> <reason>
-      an annotated tag's tagger and message, only while that tag ref
-      resolves to exactly that tag OBJECT, whose sha covers its tagger,
-      message and target: a tag re-created or moved under the same name is a
-      different object and is checked. The ref's name is always checked, and
-      a lightweight tag has no tag object, so it is never accepted.
+      the tagger and message of exactly that annotated tag OBJECT, under
+      whichever ref resolves to it, and wherever it sits in a chain of tags:
+      the object's sha covers its tagger, message and target, so every ref
+      naming it carries the same content, and a tag re-created or moved under
+      the same name is a different object and is checked. Each ref's name is
+      always checked, and a lightweight tag has no tag object, so it is never
+      accepted.
 
 A line's sha256 is over its bytes without the trailing "\\n". Every run
 lists the commit and tree exceptions that matched nothing.
@@ -117,6 +119,9 @@ MAX_LINE = 4096
 #: Where a long line is cut for regex scanning, each piece overlaps the next
 #: by this much, so a match no longer than MAX_REGEX's worth is not split.
 LINE_OVERLAP = 512
+#: The deepest chain of tags pointing at tags that scan_refs follows; a
+#: deeper one is "cannot run", never a partial scan.
+MAX_TAG_CHAIN = 8
 #: git's own test for binary content: a NUL in the first 8000 bytes.
 BINARY_SNIFF = 8000
 
@@ -187,6 +192,8 @@ class Exception_:
     commit: str = ""
     path: str = ""
     digest: str = ""
+    #: A `tag` exception's annotated tag object sha.
+    obj: str = ""
     used: int = 0
 
 
@@ -279,7 +286,7 @@ def parse_allow(text: str) -> List[Exception_]:
         elif f[0] == "identity" and len(f) >= 5 and _HEX40.fullmatch(f[2]) and _HEX64.fullmatch(f[3]):
             out.append(Exception_(n, "identity", f[1], commit=f[2], digest=f[3]))
         elif f[0] == "tag" and len(f) >= 4 and _HEX40.fullmatch(f[2]):
-            out.append(Exception_(n, "tag", f[1], commit=f[2]))
+            out.append(Exception_(n, "tag", f[1], obj=f[2]))
         else:
             raise CannotRun(f"{where}: not a path, commit, tree, identity or tag exception with its reason")
     return out
@@ -425,7 +432,7 @@ class Matcher:
             elif ex.kind == "path":
                 hit = where.surface in ("tree", "commit") and where.path == ex.path and d == ex.digest
             elif ex.kind == "tag":
-                hit = where.obj == ex.commit       # only an annotated tag's surfaces carry obj
+                hit = where.obj == ex.obj          # only an annotated tag's surfaces carry obj
             if hit:
                 ex.used += 1
                 return True
@@ -719,24 +726,41 @@ def _added(m: Matcher, commit: str, out: bytes, parents: int) -> None:
 
 
 def scan_refs(m: Matcher, repo: str, blobs: Blobs) -> None:
+    """Every ref's name, and every annotated tag object reachable from a ref,
+    following a tag whose target is itself a tag (a chain) down to the first
+    non-tag object. Each tag object is scanned once, however many refs or
+    chains reach it; a nested one is labelled `<ref> (nested <depth>)`. A
+    chain deeper than MAX_TAG_CHAIN is "cannot run", never a silent stop."""
     out = git(repo, "for-each-ref", "--format=%(refname)%00%(objecttype)%00%(objectname)%1e")
+    seen: Set[str] = set()
     for rec in out.decode("utf-8", "surrogateescape").split("\x1e"):
         rec = rec.strip("\n")
         if not rec:
             continue
         name, kind, oid = rec.split("\x00")
         m.text(Where("ref", m.repo, path=name, field="ref name"), name)
-        if kind == "tag":
+        depth = 0
+        while kind == "tag" and oid not in seen:
+            if depth > MAX_TAG_CHAIN:
+                raise CannotRun(f"{name}: a chain of more than {MAX_TAG_CHAIN} nested tags")
+            seen.add(oid)
+            label = name if not depth else f"{name} (nested {depth})"
             body = blobs.read(oid).decode("utf-8", "surrogateescape")
             head, _, message = body.partition("\n\n")
+            target, kind = "", ""
             for hl in head.split("\n"):
-                if hl.startswith("tagger "):
+                if hl.startswith("object "):
+                    target = hl[len("object "):].strip()
+                elif hl.startswith("type "):
+                    kind = hl[len("type "):].strip()
+                elif hl.startswith("tagger "):
                     who = hl[len("tagger "):]
                     nm, _, rest = who.partition(" <")
-                    m.identity(Where("tag", m.repo, path=name, field="tagger", obj=oid), nm,
+                    m.identity(Where("tag", m.repo, path=label, field="tagger", obj=oid), nm,
                                rest.partition(">")[0])
             for n, line in enumerate(message.split("\n"), 1):
-                m.text(Where("tag", m.repo, path=name, field=f"message:{n}", obj=oid), line)
+                m.text(Where("tag", m.repo, path=label, field=f"message:{n}", obj=oid), line)
+            oid, depth = target, depth + 1
 
 
 def scan_text(m: Matcher, label: str, data: bytes) -> None:
