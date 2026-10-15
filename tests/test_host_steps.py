@@ -134,6 +134,35 @@ class PlaceTest(Tree):
                     st.place(src, self.p("ld", "y.plist"), mode=bad)
                 self.assertFalse(os.path.exists(self.p("ld", "y.plist")))
 
+    def test_a_source_that_is_not_one_regular_file_is_refused_and_nothing_is_placed(self):
+        """A link, a FIFO (opened without blocking, so this cannot hang), a
+        second hard link, and a file larger than the bound."""
+        os.mkdir(self.p("ov"))
+        real = self.p("real.py")
+        with open(real, "w") as f:
+            f.write("x = 1\n")
+        with open(self.p("target.py"), "w") as f:
+            f.write("y = 2\n")
+        os.symlink(self.p("target.py"), self.p("link.py"))   # a target with one link: only no-follow refuses it
+        os.mkfifo(self.p("fifo.py"))
+        os.link(real, self.p("second.py"))
+        with open(self.p("big.py"), "wb") as f:
+            f.write(b"#" * (st.DOC_MAX + 1))
+        for name, words in (("link.py", "symbolic link"), ("fifo.py", "not a regular file"),
+                            ("second.py", "one link"), ("big.py", "larger than")):
+            with self.subTest(source=name):
+                with self.assertRaises(st.StepError) as e:
+                    st.place(self.p(name), self.p("ov", "plugin.py"))
+                self.assertIn(words, str(e.exception))
+                self.assertEqual(os.listdir(self.p("ov")), [])
+
+    def test_a_source_at_the_bound_is_placed_whole(self):
+        os.mkdir(self.p("ov"))
+        with open(self.p("max.py"), "wb") as f:
+            f.write(b"#" * st.DOC_MAX)
+        st.place(self.p("max.py"), self.p("ov", "plugin.py"))
+        self.assertEqual(os.path.getsize(self.p("ov", "plugin.py")), st.DOC_MAX)
+
     def test_a_symlink_at_the_destination_is_replaced_not_written_through(self):
         src = self.p("src.py")
         with open(src, "w") as f:

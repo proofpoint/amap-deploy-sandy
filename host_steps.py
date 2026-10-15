@@ -150,6 +150,33 @@ def _split(path):
     return parent, name
 
 
+def _read_source(src):
+    """A place source's bytes: the file itself, never through a link, never
+    a FIFO or device (opened without blocking, then held to a regular file
+    with one link), and at most DOC_MAX bytes, read to one more so a larger
+    file is seen and refused rather than truncated."""
+    try:
+        fd = os.open(src, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))
+    except OSError as e:
+        raise StepError(f"{src}: {e.strerror}; nothing placed") from None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+            raise StepError(f"{src} is not a regular file with one link; nothing placed")
+        chunks, total = [], 0
+        while total <= DOC_MAX:
+            chunk = os.read(fd, DOC_MAX + 1 - total)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+    finally:
+        os.close(fd)
+    if total > DOC_MAX:
+        raise StepError(f"{src} is larger than {DOC_MAX} bytes; nothing placed")
+    return b"".join(chunks)
+
+
 def place(src, dest, sha256=None, mode=OVERLAY_MODE):
     """Copy `src` to `dest` as a root-owned file, 0444 unless `mode` is the
     one other mode allowed (0644): written under a fresh
@@ -160,8 +187,7 @@ def place(src, dest, sha256=None, mode=OVERLAY_MODE):
     if mode not in PLACE_MODES:
         raise StepError(f"mode {mode:04o} is not one of " + ", ".join(f"{m:04o}" for m in PLACE_MODES))
     parent, name = _split(dest)
-    with open(src, "rb") as f:
-        data = f.read()
+    data = _read_source(src)
     if sha256 is not None and hashlib.sha256(data).hexdigest() != sha256.lower():
         raise StepError(f"{src}: sha256 is not the pinned {sha256}; nothing placed")
     dfd = open_dir(parent)
