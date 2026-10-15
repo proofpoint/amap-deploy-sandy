@@ -1,0 +1,343 @@
+"""verify's "runtime builds" phase (build_identity): what each running
+runtime was built from, against what the deployment recorded.
+
+The container and image documents are shaped from `docker inspect` and
+`docker image inspect --format '{{json .Config.Labels}}'` output: an image
+id `sha256:<64 hex>`, `Mounts` entries with Source, Destination and RW, and
+`State.StartedAt` as RFC 3339 UTC with nanoseconds. Nothing here runs
+docker."""
+
+import hashlib
+import json
+import os
+import tempfile
+import time
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+
+import _workspace  # noqa: F401
+import build_identity as bi
+import router_health as rh
+
+DIGEST = "sha256:" + "a" * 64
+OTHER = "sha256:" + "b" * 64
+PIN = "1" * 40
+COMMIT = "2" * 40
+LABEL = bi.LABEL
+
+
+def container(image=DIGEST, mounts=(), started="2026-10-15T10:00:00.123456789Z", labels=None):
+    return {"Image": image, "Mounts": list(mounts), "State": {"StartedAt": started},
+            "Config": {"Labels": labels}}
+
+
+def router(digest=DIGEST, commit=PIN):
+    return SimpleNamespace(image_name="zz-hop", image_digest=digest, image_commit=commit, container="zz-r1")
+
+
+def observed(claim):
+    return {k: v for k, v in claim.extras().items() if k.startswith("observed_")}
+
+
+class HopRouterTest(unittest.TestCase):
+    def test_the_recorded_image_from_the_pin_passes(self):
+        c = bi.hop_router(router(), PIN, container())
+        self.assertEqual(c.check.result, rh.PASS)
+        self.assertEqual(observed(c), {"observed_image_digest": DIGEST, "observed_commit": PIN})
+
+    def test_another_running_image_fails_and_attests_no_commit(self):
+        c = bi.hop_router(router(), PIN, container(image=OTHER))
+        self.assertEqual(c.check.result, rh.FAIL)
+        self.assertEqual(observed(c), {"observed_image_digest": OTHER})
+
+    def test_a_record_off_the_pin_fails(self):
+        c = bi.hop_router(router(commit=COMMIT), PIN, container())
+        self.assertEqual(c.check.result, rh.FAIL)
+
+    def test_absent_unreadable_or_unpinned_is_unknown(self):
+        for live, pin in ((None, PIN), (rh.Unresolved("no docker"), PIN), (container(image="x"), PIN),
+                          (container(), rh.Unresolved("siblings.json unreadable"))):
+            with self.subTest(live=live, pin=pin):
+                c = bi.hop_router(router(), pin, live)
+                self.assertEqual(c.check.result, rh.UNKNOWN)
+        self.assertEqual(observed(bi.hop_router(router(), PIN, None)), {})
+
+
+class HubRouterTest(unittest.TestCase):
+    def claim(self, commit=COMMIT, live="default", labels="default"):
+        live = container() if live == "default" else live
+        labels = {LABEL: COMMIT} if labels == "default" else labels
+        return bi.hub_router("zz-hub", commit, live, labels)
+
+    def test_the_image_label_matching_the_record_passes(self):
+        c = self.claim()
+        self.assertEqual(c.check.result, rh.PASS)
+        self.assertEqual(observed(c), {"observed_commit": COMMIT})
+
+    def test_a_label_that_differs_fails(self):
+        c = self.claim(labels={LABEL: PIN})
+        self.assertEqual(c.check.result, rh.FAIL)
+        self.assertEqual(observed(c), {"observed_commit": PIN})
+
+    def test_a_run_time_label_override_fails_even_when_it_matches_the_record(self):
+        c = self.claim(live=container(labels={LABEL: COMMIT}), labels={LABEL: PIN})
+        self.assertEqual(c.check.result, rh.FAIL)
+        self.assertIn("--label", c.check.remedy)
+
+    def test_the_containers_own_label_is_never_read_as_the_build(self):
+        c = self.claim(live=container(labels={LABEL: COMMIT}), labels={})
+        self.assertEqual(c.check.result, rh.UNKNOWN)
+
+    def test_absent_or_malformed_is_unknown_and_reports_nothing_observed(self):
+        cases = {
+            "no record": dict(commit=None),
+            "no label": dict(labels={}),
+            "null labels": dict(labels=None),
+            "short label": dict(labels={LABEL: COMMIT[:12]}),
+            "dirty label": dict(labels={LABEL: COMMIT + "-dirty"}),
+            "labels unreadable": dict(labels=rh.Unresolved("image inspect failed")),
+            "not running": dict(live=None),
+            "inspect failed": dict(live=rh.Unresolved("no docker")),
+        }
+        for label, kw in cases.items():
+            with self.subTest(label):
+                c = self.claim(**kw)
+                self.assertEqual(c.check.result, rh.UNKNOWN)
+                if label != "no record":
+                    self.assertEqual(observed(c), {})
+
+
+class ConnectorTest(unittest.TestCase):
+    def setUp(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        self.payload = Path(td.name)
+
+    def stamp(self, text):
+        (self.payload / bi.STAMP_NAME).write_text(text)
+        return bi.read_stamp(self.payload)
+
+    def test_a_clean_install_at_the_pin_passes(self):
+        c = bi.connector(self.stamp(bi.stamp_text(PIN, False, PIN)), PIN)
+        self.assertEqual(c.check.result, rh.PASS)
+        self.assertEqual(observed(c), {"observed_commit": PIN})
+
+    def test_an_install_off_the_pin_fails(self):
+        c = bi.connector(self.stamp(bi.stamp_text(COMMIT, False, PIN)), PIN)
+        self.assertEqual(c.check.result, rh.FAIL)
+        self.assertEqual(observed(c), {"observed_commit": COMMIT})
+
+    def test_a_dirty_install_at_the_pin_fails_and_attests_no_commit(self):
+        c = bi.connector(self.stamp(bi.stamp_text(PIN, True, PIN)), PIN)
+        self.assertEqual(c.check.result, rh.FAIL)
+        self.assertEqual(observed(c), {})
+
+    def test_no_stamp_or_a_malformed_one_is_unknown(self):
+        self.assertIsInstance(bi.read_stamp(self.payload), rh.Unresolved)
+        for text in ("not json", json.dumps({"schema": 1, "commit": PIN[:12], "dirty": False}),
+                     json.dumps({"schema": 2, "commit": PIN, "dirty": False}),
+                     json.dumps({"schema": 1, "commit": PIN, "dirty": "no"}),
+                     bi.stamp_text(None, False, PIN)):
+            with self.subTest(text=text):
+                c = bi.connector(self.stamp(text), PIN)
+                self.assertEqual(c.check.result, rh.UNKNOWN)
+
+    def test_an_unreadable_pin_is_unknown(self):
+        c = bi.connector(self.stamp(bi.stamp_text(PIN, False, PIN)), rh.Unresolved("no siblings.json"))
+        self.assertEqual(c.check.result, rh.UNKNOWN)
+
+
+class HopPluginTest(unittest.TestCase):
+    def setUp(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        self.dir = os.path.realpath(td.name)
+        self.path = os.path.join(self.dir, "plugin.py")
+        Path(self.path).write_bytes(b"the plugin\n")
+        self.sha = hashlib.sha256(b"the plugin\n").hexdigest()
+        self.later = time.strftime("%Y-%m-%dT%H:%M:%S.5Z", time.gmtime(time.time() + 3600))
+        self.earlier = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 3600))
+
+    def mount(self, source=None, dest=None, rw=False):
+        return {"Type": "bind", "Source": source or self.dir, "Destination": dest or self.dir, "RW": rw}
+
+    def claim(self, live=None, pin=None):
+        live = container(mounts=[self.mount()], started=self.later) if live is None else live
+        return bi.hop_plugin(bi.ROLE_HOP, "zz-r1", live, self.path, pin or self.sha)
+
+    def test_the_pinned_plugin_mounted_by_identity_passes(self):
+        c = self.claim()
+        self.assertEqual(c.check.result, rh.PASS)
+        self.assertEqual(c.extras(), {"id": bi.ID_PLUGIN, "observed_sha256": self.sha,
+                                      "host_role": bi.ROLE_HOP})
+
+    def test_other_bytes_fail(self):
+        c = self.claim(pin="0" * 64)
+        self.assertEqual(c.check.result, rh.FAIL)
+        self.assertEqual(c.extras()["observed_sha256"], self.sha)
+
+    def test_the_directory_replaced_after_the_container_started_is_unknown(self):
+        c = self.claim(live=container(mounts=[self.mount()], started=self.earlier))
+        self.assertEqual(c.check.result, rh.UNKNOWN)
+        self.assertEqual(c.check.reason, "the overlay directory changed after the container started")
+        self.assertNotIn("observed_sha256", c.extras())
+
+    def test_a_mount_not_read_only_and_by_identity_is_unknown(self):
+        cases = {
+            "read-write": [self.mount(rw=True)],
+            "another source": [self.mount(source="/elsewhere")],
+            "absent": [],
+            "twice": [self.mount(), self.mount()],
+        }
+        for label, mounts in cases.items():
+            with self.subTest(label):
+                c = self.claim(live=container(mounts=mounts, started=self.later))
+                self.assertEqual(c.check.result, rh.UNKNOWN)
+                self.assertNotIn("observed_sha256", c.extras())
+
+    def test_an_unreadable_start_time_file_or_container_is_unknown(self):
+        os.chmod(self.path, 0)
+        self.addCleanup(os.chmod, self.path, 0o644)
+        for live in (container(mounts=[self.mount()], started="yesterday"),
+                     container(mounts=[self.mount()], started=self.later), None, rh.Unresolved("no docker")):
+            with self.subTest(live=live):
+                self.assertEqual(self.claim(live=live).check.result, rh.UNKNOWN)
+
+    def test_started_at_keeps_the_fraction(self):
+        self.assertEqual(bi.started_at(container(started="1970-01-01T00:00:01.5Z")), 1.5)
+        self.assertEqual(bi.started_at(container(started="1970-01-01T00:00:01Z")), 1.0)
+
+
+class CollectTest(unittest.TestCase):
+    def setUp(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        self.payload = Path(td.name) / "payload"
+        self.payload.mkdir()
+        (self.payload / bi.STAMP_NAME).write_text(bi.stamp_text(PIN, False, PIN))
+        self.asked = []
+
+    def inspect(self, role, name):
+        self.asked.append((role, name))
+        return container()
+
+    def run_collect(self, spec):
+        return bi.collect(spec, self.payload, hop_pin=PIN, connector_pin=PIN, inspect=self.inspect,
+                          labels=lambda image: {LABEL: COMMIT})
+
+    def spec(self, router_=True, hub=True, overlay=True):
+        secrets = SimpleNamespace(principal="zz-hub", image_commit=COMMIT)
+        return SimpleNamespace(router=router() if router_ else None, hub=object() if hub else None,
+                               secrets=secrets if hub else None,
+                               runtime_of=lambda p: {"container": "zz-r2"},
+                               overlay_path="/zz/overlay/plugin.py" if overlay else None,
+                               overlay_pin={"sha256": "0" * 64} if overlay else None)
+
+    def test_a_full_host_has_every_claim_once_and_names_its_roles(self):
+        p = self.run_collect(self.spec())
+        self.assertEqual([c.id for c in p.claims],
+                         [bi.ID_HOP, bi.ID_PLUGIN, bi.ID_HUB, bi.ID_PLUGIN, bi.ID_CONNECTOR])
+        self.assertEqual([c.host_role for c in p.claims if c.id == bi.ID_PLUGIN], [bi.ROLE_HOP, bi.ROLE_HUB])
+        self.assertEqual(sorted(p.deployed_roles), sorted([bi.ROLE_CONNECTOR, bi.ROLE_HUB, bi.ROLE_HOP]))
+        self.assertEqual(self.asked, [(bi.ROLE_HOP, "zz-r1"), (bi.ROLE_HUB, "zz-r2")])
+
+    def test_an_id_is_present_exactly_when_its_role_is_deployed(self):
+        for router_, hub in ((True, False), (False, True), (False, False)):
+            with self.subTest(router=router_, hub=hub):
+                p = self.run_collect(self.spec(router_, hub))
+                ids = {c.id for c in p.claims}
+                self.assertEqual(bi.ID_HOP in ids, bi.ROLE_HOP in p.deployed_roles)
+                self.assertEqual(bi.ID_HUB in ids, bi.ROLE_HUB in p.deployed_roles)
+
+    def test_no_host_setup_document_leaves_only_the_connector(self):
+        p = self.run_collect(None)
+        self.assertEqual(([c.id for c in p.claims], p.deployed_roles), ([bi.ID_CONNECTOR], [bi.ROLE_CONNECTOR]))
+
+    def test_an_unreadable_document_refuses_rather_than_reading_as_not_deployed(self):
+        p = self.run_collect(rh.Unresolved("the host-setup document cannot be read: bad"))
+        self.assertIn(bi.ROLE_HOP, p.deployed_roles)
+        self.assertIn(bi.ROLE_HUB, p.deployed_roles)
+        hop, hub = [c for c in p.claims if c.id in (bi.ID_HOP, bi.ID_HUB)]
+        self.assertEqual((hop.check.result, hub.check.result), (rh.UNKNOWN, rh.UNKNOWN))
+        self.assertEqual(self.asked, [])
+
+    def test_no_payload_means_no_connector_role(self):
+        (self.payload / bi.STAMP_NAME).unlink()
+        self.payload.rmdir()
+        p = self.run_collect(None)
+        self.assertEqual((p.claims, p.deployed_roles), ([], []))
+
+
+class HostFactsDocumentTest(unittest.TestCase):
+    """The document exactly as the conformance harness reads it."""
+
+    def doc(self):
+        claims = [bi.hop_router(router(), PIN, container()),
+                  bi.hub_router("zz-hub", COMMIT, container(), {}),
+                  bi.Claim(bi.ID_PLUGIN, bi.hop_router(router(), PIN, container()).check,
+                           {"observed_sha256": "c" * 64}, bi.ROLE_HUB)]
+        phase = bi.Phase(claims, [bi.ROLE_HUB, bi.ROLE_HOP])
+        return rh.host_facts_doc([phase.outcome()], rh.EXIT_FAILED)
+
+    def test_schema_three_with_the_phase_and_its_deployed_roles(self):
+        doc = self.doc()
+        self.assertEqual(doc["schema"], 3)
+        [p] = doc["phases"]
+        self.assertEqual((p["id"], p["title"]), ("runtime-builds", "runtime builds"))
+        self.assertEqual(p["deployed_roles"], ["hop_router", "hub_router"])
+
+    def test_each_check_has_exactly_the_members_the_harness_reads(self):
+        a, b, c = self.doc()["phases"][0]["checks"]
+        self.assertEqual(set(a), {"id", "claim", "result", "remedy", "observed_image_digest", "observed_commit"})
+        self.assertEqual(set(b), {"id", "claim", "result", "remedy", "reason"})
+        self.assertEqual(set(c), {"id", "claim", "result", "remedy", "observed_sha256", "host_role"})
+        self.assertEqual((a["id"], b["id"], c["id"]), ("build.hop_router", "build.hub_router", "build.hop_plugin"))
+
+    def test_an_unread_value_is_absent_never_null(self):
+        checks = self.doc()["phases"][0]["checks"]
+        self.assertFalse(any(v is None for c in checks for v in c.values()))
+
+    def test_no_expected_or_actual_value_is_carried(self):
+        for c in self.doc()["phases"][0]["checks"]:
+            self.assertFalse({"expected", "actual"} & set(c))
+
+
+class DockerReadersTest(unittest.TestCase):
+    def runner(self, *procs):
+        calls, it = [], iter(procs)
+
+        def run(argv, **k):
+            calls.append(list(argv))
+            p = next(it)
+            if isinstance(p, Exception):
+                raise p
+            return rh.Proc(tuple(argv), *p)
+        return run, calls
+
+    def test_a_container_no_listing_names_is_absent(self):
+        run, calls = self.runner((1, "", "No such container"), (0, "", ""))
+        self.assertIsNone(bi.inspect_container(["docker"], "zz-r1", run))
+        self.assertIn("ps", calls[1])
+
+    def test_a_failed_inspect_of_a_listed_container_is_unknown(self):
+        run, _ = self.runner((1, "", "error"), (0, "abc\n", ""))
+        self.assertIsInstance(bi.inspect_container(["docker"], "zz-r1", run), rh.Unresolved)
+
+    def test_docker_that_cannot_run_is_unknown(self):
+        run, _ = self.runner(rh.CannotRun("no docker"))
+        self.assertIsInstance(bi.inspect_container(["docker"], "zz-r1", run), rh.Unresolved)
+
+    def test_labels_are_asked_of_the_image_by_its_id(self):
+        run, calls = self.runner((0, json.dumps({LABEL: COMMIT}), ""))
+        self.assertEqual(bi.image_labels(["docker"], DIGEST, run), {LABEL: COMMIT})
+        self.assertEqual(calls[0][:3], ["docker", "image", "inspect"])
+        self.assertEqual(calls[0][-1], DIGEST)
+
+    def test_an_image_without_labels_has_none(self):
+        run, _ = self.runner((0, "null", ""))
+        self.assertEqual(bi.image_labels(["docker"], DIGEST, run), {})
+
+
+if __name__ == "__main__":
+    unittest.main()

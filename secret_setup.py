@@ -138,6 +138,7 @@ class SecretSpec:
     pipeline_locks: Tuple[str, ...] = ()    # further operator lock files in run_dir
     probe: Optional[Dict[str, Any]] = None  # network, smtp_host, smtp_port, username
     zsh: Optional[Dict[str, str]] = None    # version, module_path: the recorded zsh
+    image_commit: Optional[str] = None      # the commit `image` was built from, when recorded
 
     @property
     def writer(self) -> str:
@@ -165,7 +166,7 @@ def load(sec: Any, principals: Dict[str, Any], runtimes: Sequence[Dict[str, Any]
     keys = ("volume", "label", "principal", "file", "container_dir", "image", "writer", "anchor",
             "state_file", "clones", "tools", "uv", "status_dir", "run_dir", "ssh", "operator_uid")
     sec = _exact(sec, keys, "(the section)", ("docker_via_sudo", "caps_allow", "attestations", "exposure",
-                                                "pipeline_locks", "probe", "zsh"))
+                                                "pipeline_locks", "probe", "zsh", "image_commit"))
     if not isinstance(sec["volume"], str) or not _NAME.fullmatch(sec["volume"]):
         raise SecretSpecError("secrets.volume must be a volume name")
     if not isinstance(sec["label"], str) or not _LABEL.fullmatch(sec["label"]):
@@ -179,6 +180,9 @@ def load(sec: Any, principals: Dict[str, Any], runtimes: Sequence[Dict[str, Any]
         raise SecretSpecError("secrets.file must be one file name")
     if not isinstance(sec["image"], str) or not _IMAGE.fullmatch(sec["image"]):
         raise SecretSpecError("secrets.image must be the runtime image by digest (name@sha256:...)")
+    image_commit = sec.get("image_commit")
+    if image_commit is not None and (not isinstance(image_commit, str) or not _HEX40.fullmatch(image_commit)):
+        raise SecretSpecError("secrets.image_commit must be a full commit sha")
     w = _exact(sec["writer"], ("dir", "sha256", "commit"), "writer")
     if not isinstance(w["sha256"], str) or not _HEX64.fullmatch(w["sha256"]):
         raise SecretSpecError("secrets.writer.sha256 must be 64 lower-case hex digits")
@@ -260,7 +264,7 @@ def load(sec: Any, principals: Dict[str, Any], runtimes: Sequence[Dict[str, Any]
         ssh={"config": _abs(ssh["config"], "ssh.config"),
              "known_hosts": _abs(ssh["known_hosts"], "ssh.known_hosts"), "alias": ssh["alias"]},
         operator_uid=op, docker_via_sudo=via_sudo, principal=sec["principal"],
-        pipeline_locks=tuple(locks), probe=probe, zsh=zsh,
+        pipeline_locks=tuple(locks), probe=probe, zsh=zsh, image_commit=image_commit,
         extra={"caps_allow": dict(caps), "attestations": dict(att), "exposure": exposure})
 
 
