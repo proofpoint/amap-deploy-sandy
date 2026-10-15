@@ -385,6 +385,6 @@ def validation_steps(p: ps.PartitionSpec, kind: str, q: Callable[[str], str] = s
         f"printf '%s  %s\\n' {dj} \"$R/judge.sh\" {dd} \"$R/discover.sh\" "
         "| sudo sh -c 'umask 077; cat > \"$1\"' sh \"$R/judge.sha256\"",
         f"sudo sh -c '{step3(kind, identity=identity, path=path)}' sh \"$R\"",
-        f"# Go on only when that printed exactly {SENTINEL} and exited 0: nothing before this line runs the vetted",
-        "# interpreter as root, and nothing after it may until it passes.",
+        f"# Go on only when that printed exactly {SENTINEL} and exited 0. The plan prints this check first, so every",
+        "# later step that runs an interpreter as root comes after it.",
     ]

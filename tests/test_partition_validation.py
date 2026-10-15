@@ -565,12 +565,23 @@ class PrivilegedTest(Rig):
         os.chmod(self.pub, 0o755)
         self.addCleanup(subprocess.run, ["sudo", "-n", "rm", "-rf", "--", self.pub])
 
-    def real(self, py_text):
+    def real(self, py_text, operator=""):
         py = write(os.path.join(self.pub, "python3"), "#!/bin/sh\n" + py_text)
         spec = dataclasses.replace(P, tools={"python3": py, "docker": self.tools[1]})
         lines = pj.validation_steps(spec, "systemd", template=os.path.join(self.pub, "judge.XXXXXXXX"))
-        return subprocess.run(["/bin/sh", "-c", "\n".join(lines) + '\necho "R=$R" >&2'], capture_output=True,
-                              text=True, timeout=300)
+        return subprocess.run(["/bin/sh", "-c", operator + "\n".join(lines) + '\necho "R=$R" >&2'],
+                              capture_output=True, text=True, timeout=300, stdin=subprocess.DEVNULL)
+
+    def test_discovery_holds_only_fds_0_1_and_2_under_real_sudo(self):
+        """The operator's shell holds fd 7; real sudo's closefrom, not the
+        detachment, keeps it from discovery, which runs as nobody."""
+        rec = os.path.join(self.pub, "rec")
+        os.mkdir(rec)
+        os.chmod(rec, 0o777)
+        self.real(f"ls -l /proc/$$/fd > {rec}/fds\necho /nonexistent\n", operator="exec 7</dev/null\n")
+        with open(os.path.join(rec, "fds")) as f:
+            held = {l.split(" -> ")[0].split()[-1] for l in f if " -> " in l}
+        self.assertEqual({n for n in held if int(n) < 10}, {"0", "1", "2"})
 
     def test_discovery_cannot_use_the_operators_sudo_ticket(self):
         m1 = os.path.join(self.pub, "m1")

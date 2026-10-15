@@ -712,8 +712,8 @@ Three changes are refused rather than rendered:
 ### The weekly partition job's tools
 
 The weekly partition job runs the host's interpreter and docker as root, so
-before it is placed the plan's partition section checks them and everything
-they load at startup. Run these steps at install AND again after any
+when the document has a partition section, the plan's first steps check them
+and everything they load at startup. Run these steps at install AND again after any
 operating-system, interpreter or docker update, before the next weekly run.
 Those updates change the startup closure the per-run tripwire holds to the
 install-time state.
@@ -744,8 +744,9 @@ On macOS:
 sudo sh -c 'shasum -a 256 --status -c "$1/judge.sha256" || { echo "discovery failed: the judging scripts do not match their digests; nothing is run"; exit 1; }; ( cd / && /usr/bin/perl -MPOSIX -e "POSIX::setsid() >= 0 or exit 1; exec @ARGV" /usr/bin/sudo -u nobody -g nobody /usr/bin/env -i PATH=/usr/bin:/bin HOME=/var/empty LC_ALL=C /bin/sh -c "$(cat "$1/discover.sh")" </dev/null 2>/dev/null ) | head -c 1048577 > "$1/closure.env"; chmod 0400 "$1/closure.env" && sh "$1/judge.sh" "$1/closure.env"' sh "$R"
 ```
 
-Go on only when it printed exactly `END-OF-BLOCK` and exited 0: nothing
-before it runs the interpreter as root, and the bundle's provisioning
+Go on only when it printed exactly `END-OF-BLOCK` and exited 0. The plan
+prints this check first, before every step that runs an interpreter as root,
+and the bundle's provisioning
 (`partition-provision`, under the job's lock) comes after it. `nobody` must
 hold no sudoers rule and own nothing in the closure, and sudo's default
 `closefrom` must hold. The check trusts, as given, the completeness of the

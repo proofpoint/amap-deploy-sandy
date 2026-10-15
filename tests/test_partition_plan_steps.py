@@ -43,17 +43,48 @@ class PlanTest(unittest.TestCase):
                 self.assertIn("# after any operating-system, interpreter or docker update, before the next weekly "
                               "run. Those updates", lines)
 
-    def test_nothing_in_the_whole_plan_runs_the_vetted_interpreter_as_root_before_step_3(self):
+    @staticmethod
+    def executed(lines):
+        """The lines the shell runs, in order: comments and the heredocs'
+        bodies (the scripts written as data) left out."""
+        out, end = [], None
+        for l in lines:
+            if end is not None:
+                end = None if l == end else end
+                continue
+            if l.lstrip().startswith("#"):
+                continue
+            m = re.search(r"<<'([A-Z-]+)'$", l)
+            if m:
+                end = m.group(1)
+            out.append(l)
+        return out
+
+    def test_nothing_in_the_whole_plan_runs_an_interpreter_before_step_3(self):
+        """Any interpreter, however spelled (bare python3 or python, the
+        approved spelling, its realpath), anywhere in the plan, with or
+        without sudo: none runs before step 3, and the plan's own root steps
+        do run one after it."""
         for kind in ("systemd", "launchd"):
             with self.subTest(kind):
                 spec, lines = plan(kind)
                 py = spec.partition.tools["python3"]
-                names = {py, os.path.realpath(py)}
-                three = [i for i, l in enumerate(lines) if l.startswith("sudo sh -c '") and "closure.env" in l][0]
-                early = [l for l in lines[:three] if l.lstrip().startswith("sudo") and any(n in l for n in names)]
-                self.assertEqual(early, [])
-                later = [l for l in lines[three:] if l.startswith("sudo") and any(n in l for n in names)]
-                self.assertTrue(later, "the provisioning runs it, after")
+                run = self.executed(lines)
+                three = [i for i, l in enumerate(run) if l.startswith("sudo sh -c '") and "closure.env" in l]
+                self.assertEqual(len(three), 1)
+                names = re.compile(r"(^|[\s/])python[0-9.]*(\s|$)|" + "|".join(
+                    re.escape(n) for n in {py, os.path.realpath(py)}))
+                self.assertEqual([l for l in run[:three[0]] if names.search(l)], [])
+                later = [l for l in run[three[0]:] if names.search(l)]
+                self.assertTrue([l for l in later if l.startswith("python3 ")], "the plan's own root steps, after")
+                self.assertTrue([l for l in later if "partition-provision" in l], "the provisioning, after")
+
+    def test_the_validation_is_the_plans_first_step(self):
+        for kind in ("systemd", "launchd"):
+            with self.subTest(kind):
+                spec, lines = plan(kind)
+                run = self.executed(lines)
+                self.assertTrue(run[0].startswith("R=$(sudo mktemp -d "), run[0])
 
     def test_every_root_step_of_the_validation_touches_only_its_root_directory(self):
         for kind in ("systemd", "launchd"):

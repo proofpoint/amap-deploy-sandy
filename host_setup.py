@@ -466,6 +466,12 @@ def render_plan(spec: Spec, overlay_source: Optional[Path] = None,
              "symbolic link, and each is safe to run again.",
              f"# Run them from a checkout no sandbox mounts read-write (a fresh clone at the recorded "
              f"deploy commit), never from an agent's workspace: these steps run {HOST_STEPS.name} as root."]
+    if spec.partition is not None and spec.supervision is not None and spec.secrets is not None:
+        # Imported here: host_setup is in the weekly job's bundle, and the job's own installation is not.
+        import partition_job as pj
+        # Printed first: every later step that runs an interpreter as root comes after this check of what
+        # root will run, and goes on only when it passes.
+        lines += pj.validation_steps(spec.partition, spec.supervision.kind, q)
     for r in sorted(spec.roots, key=lambda r: (r.path.count("/"), r.path)):
         p = spec.principals[r.owner]
         lines.append(f"{steps} root {q(r.path)} {p.uid} {spec.groups[r.group]} {r.mode:04o}  # {r.purpose}")
@@ -501,10 +507,7 @@ def render_plan(spec: Spec, overlay_source: Optional[Path] = None,
             lines.append("# The weekly job's validation and bundle steps need the supervision and secrets sections "
                          "(the host's kind, the deploy pin and the pinned writer).")
         else:
-            # Imported here: host_setup is in the weekly job's bundle, and the job's own installation is not.
-            import partition_job as pj
-            # The validation first: nothing below runs the vetted interpreter as root until it passes.
-            lines += pj.validation_steps(spec.partition, spec.supervision.kind, q)
+            # The validation of what root will run was printed first, above every other step.
             lines += pj.provision_steps(spec.partition, spec.secrets.clones["deploy"]["sha"], spec.secrets.writer, q)
     lines.append("# Start no runtime until every step above has run: each root exists and is synced "
                  "before a runtime opens it.")
