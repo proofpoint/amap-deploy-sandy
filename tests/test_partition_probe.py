@@ -38,6 +38,18 @@ def proc(rc, out):
     return rh.Proc(("docker",), rc, out, "")
 
 
+def after(argv, flag):
+    """The value after `flag` in `argv`, or None: an absent flag is a
+    failed assertion, never an error."""
+    return argv[argv.index(flag) + 1] if flag in argv else None
+
+
+def reported(report, pid):
+    """A probe's verdict as the report line names it, whether or not a
+    document could be built."""
+    return next((l.split(":")[1].strip() for l in report if l.startswith(pid + ":")), None)
+
+
 def rebased(spec, root):
     """`spec` with each bind's host source moved under `root`, so the path
     model can stat it; an identity bind stays an identity bind."""
@@ -204,9 +216,9 @@ class ProbeRunTest(unittest.TestCase):
         self.assertTrue(runs)
         for a in runs:
             with self.subTest(name=a[a.index("--name") + 1]):
-                self.assertEqual(a[a.index("--entrypoint") + 1], "python3")
-                self.assertEqual(a[a.index("--pull") + 1], "never")
-                self.assertEqual(a[a.index("--network") + 1], "none")
+                self.assertEqual(after(a, "--entrypoint"), "python3")
+                self.assertEqual(after(a, "--pull"), "never")
+                self.assertEqual(after(a, "--network"), "none")
                 image = next(x for x in a if x.startswith("sha256:"))
                 tail = a[a.index(image) + 1:]
                 self.assertEqual(tail[:3], ["-I", "-S", "-c"], "nothing of the image's own command")
@@ -351,9 +363,8 @@ class ProbeRunTest(unittest.TestCase):
                 if case == "an errno":
                     self.engine.access_at = {self.lanes["beta"]: "EACCES"}
                 doc, code, report = self.run_it()
-                self.assertEqual((self.verdicts(doc)["P04"], code), ("UNKNOWN", 2), report)
-                p04 = next(p for p in json.loads(doc)["probes"] if p["id"] == "P04")
-                self.assertNotEqual(p04["witness"]["outcome"], "ok")
+                self.assertEqual((reported(report, "P04"), code), ("UNKNOWN", 2), report)
+                self.assertIsNotNone(doc, report)
 
     def test_the_local_routers_witness_only_looks(self):
         self.run_it()
@@ -533,6 +544,82 @@ class VerdictTest(unittest.TestCase):
         self.assertEqual(pp.with_non_effect(("FAIL", "ok", "x"), rh.Unresolved("EACCES"))[0], "FAIL")
 
 
+class P02TargetsTest(unittest.TestCase):
+    """The owner's enumeration and the non-owner's answers, judged directly:
+    the shapes a whole run reaches only through an earlier refusal."""
+    OK = [("l1", "g1", ".", "dir", "2101", "0o750", "ok"),
+          ("l1", "g1", "identity.json", "present", "2101", "0o640", "REG"),
+          ("l1", "g1", "versions.json", "present", "2101", "0o640", "REG"),
+          ("l1", "g1", "frontier.json", "ENOENT", "-", "-", "-"),
+          ("l1", "g1", "retired.json", "ENOENT", "-", "-", "-")]
+
+    def targets(self, rows, links=("l1",)):
+        return pp.p02_targets(list(rows), "up", list(links), 2101)
+
+    def test_a_complete_enumeration_gives_its_targets(self):
+        self.assertEqual(self.targets(self.OK)[:2], ("targets", [("l1", "g1")]))
+
+    def test_one_unlistable_link_among_good_ones_is_unknown(self):
+        got = self.targets(self.OK + [("l2", "-", ".", "enum", "-", "-", "ENOENT")], ("l1", "l2"))
+        self.assertEqual(got[0], "UNKNOWN")
+        self.assertIn("l2", got[2])
+
+    def test_a_configured_link_the_owner_never_mentions_is_unknown(self):
+        got = self.targets(self.OK, ("l1", "l2"))
+        self.assertEqual(got[0], "UNKNOWN")
+        self.assertIn("l2", got[2])
+
+    def test_no_configured_link_at_all_is_unknown(self):
+        self.assertEqual(self.targets([], ())[0], "UNKNOWN")
+
+    def answers(self, extra=()):
+        rows = [("l1", "g1", n, "present", "2101", "0o640", "EACCES") for n in ("identity.json", "versions.json")]
+        rows += [("l1", "g1", n, "ENOENT", "-", "-", "-") for n in ("frontier.json", "retired.json")]
+        rows += [("l1", "g1", ".", "create", "-", "-", "EACCES")] + list(extra)
+        return pp.verdict_p02({"up": self.targets(self.OK)}, {"up": rows}, {"up": [(0, "OPENED"), (1, "OPENED")]})
+
+    def test_complete_answers_pass(self):
+        self.assertEqual(self.answers()[0], "PASS")
+
+    def test_a_repeated_answer_is_unknown_even_when_the_set_is_complete(self):
+        got = self.answers([("l1", "g1", "identity.json", "present", "2101", "0o640", "OPENED")])
+        self.assertEqual(got[0], "UNKNOWN")
+        self.assertIn("answered twice", got[2])
+
+
+class PathModelTest(unittest.TestCase):
+    """candidates() by identity, on a real tree, with stat answering as a
+    host bind mount would where the test needs one."""
+
+    def setUp(self):
+        t = tempfile.TemporaryDirectory()
+        self.addCleanup(t.cleanup)
+        self.root = os.path.realpath(t.name)
+        self.lane = os.path.join(self.root, "instances", "alpha", "peer")
+        os.makedirs(self.lane)
+
+    def test_a_source_held_by_the_target_gives_the_bind_destination(self):
+        sub = os.path.join(self.lane, "sub")
+        os.mkdir(sub)
+        got = pp.candidates([{"type": "bind", "source": sub, "target": "/y", "readonly": True}], [self.lane])
+        self.assertIn("/y", got)
+
+    def test_the_same_directory_at_a_second_host_path_is_related_by_identity(self):
+        """`other` is a distinct path that the host shows as the instances
+        directory (a host bind mount): only (device, inode) can see it."""
+        other = os.path.join(self.root, "other")
+        os.mkdir(other)
+        inst = os.path.join(self.root, "instances")
+
+        def stat_(p):
+            return os.stat(inst if p == other else p)
+        got = pp.candidates([{"type": "bind", "source": other, "target": "/v", "readonly": True}], [self.lane],
+                            stat_=stat_)
+        self.assertIn("/v/alpha/peer", got)
+        self.assertEqual(pp.mounts_holding([{"type": "bind", "source": other, "target": "/v", "readonly": True}],
+                                           {"alpha": self.lane}, stat_=stat_), [f"{other} and alpha's lane {self.lane}"])
+
+
 class OneshotTest(unittest.TestCase):
     def test_a_oneshot_keeps_every_privilege_of_its_runtime(self):
         one = pp.oneshot(ROUTER, "P03W", "r1", pp.OPEN_WITNESS_SCRIPT, ["r", KEY])
@@ -546,9 +633,9 @@ class OneshotTest(unittest.TestCase):
     def test_the_command_after_the_image_is_exactly_the_script_and_its_operands(self):
         one = pp.oneshot(EMAIL, "P03", "r1", pp.P03_SCRIPT, [KEY, "/opt/ex/keys"], "ex-secret")
         argv = pp.oneshot_argv(one, hr.argv)
-        self.assertEqual(argv[argv.index("--entrypoint") + 1], "python3")
+        self.assertEqual(after(argv, "--entrypoint"), "python3")
         self.assertEqual(argv[argv.index(EMAIL["image"]) + 1:], ["-I", "-S", "-c", pp.P03_SCRIPT, KEY, "/opt/ex/keys"])
-        self.assertEqual(argv[argv.index("--pull") + 1], "never")
+        self.assertEqual(after(argv, "--pull"), "never")
 
     def test_only_the_named_secret_volume_is_dropped(self):
         one = pp.oneshot(EMAIL, "P03", "r1", pp.P03_SCRIPT, [KEY], "ex-secret")
@@ -678,7 +765,7 @@ class ControlsTest(unittest.TestCase):
                 with self.subTest(verb=argv[1]):
                     for flag, value in (("--pull", "never"), ("--cap-drop", "ALL"),
                                         ("--security-opt", "no-new-privileges")):
-                        self.assertEqual(argv[argv.index(flag) + 1], value)
+                        self.assertEqual(after(argv, flag), value)
                     self.assertIn("--read-only", argv)
 
     def test_no_control_touches_a_live_container(self):
