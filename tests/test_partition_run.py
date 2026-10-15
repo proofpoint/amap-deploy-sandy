@@ -143,7 +143,13 @@ class RunEngine(Engine):
         if argv[1:3] == ["inspect", "--type"]:
             self.seen.append(argv)
             doc = self.find(argv[-1])
-            return proc(1, "") if doc is None else proc(0, json.dumps([doc]))
+            if doc is None:
+                return proc(1, "")
+            return proc(0, json.dumps(doc["State"]) if "--format" in argv else json.dumps([doc]))
+        if argv[1] == "ps" and "--no-trunc" in argv:
+            self.seen.append(argv)
+            doc = self.find(argv[-1].split("=", 1)[1])
+            return proc(0, "" if doc is None else doc.get("Id", "") + "\n")
         if argv[1:3] == ["image", "inspect"]:
             self.seen.append(argv)
             return proc(0, json.dumps(self.image_env))
@@ -182,9 +188,10 @@ class ChildTest(unittest.TestCase):
         with open(f"{r}/sel/selected.json", "w") as f:
             json.dump({"schema": 2, "selected": [{"slug": "alpha", "at": "x"}], "not_selected": []}, f)
         self.run_dir = f"{r}/exec/run-r1"
-        self.context = {"schema": pr.SCHEMA, "run_id": "r1", "host": "alpha", "started_at": "2026-10-15T03:00:00Z",
-                        "evidence_dir": f"{r}/evidence", "live_config_path": self.live,
-                        "router_container_id": self.TARGET, "engine": "unix:///var/run/docker.sock"}
+        self.context = {"schema": pr.CONTEXT_SCHEMA, "run_id": "r1", "host": "alpha",
+                        "started_at": "2026-10-15T03:00:00Z", "evidence_dir": f"{r}/evidence",
+                        "live_config_path": self.live, "router_container_id": self.TARGET,
+                        "engine": "unix:///var/run/docker.sock", "docker": "/usr/bin/docker"}
         self.document = b'{"host_setup": {"schema": 1}}'
         self.email = rebased(EMAIL, r)
         self.email["mounts"][1]["source"] = f"{r}/srv/hop"
@@ -280,7 +287,8 @@ class ChildTest(unittest.TestCase):
 
     def test_an_unusable_context_or_lock_starts_nothing(self):
         for raw in (b'{"run_id": "r1"', pr.canonical(dict(self.context, extra=1)),
-                    pr.canonical(dict(self.context, schema="other/1"))):
+                    pr.canonical(dict(self.context, schema="other/1")), pr.canonical(dict(self.context, docker=None)),
+                    pr.canonical(dict(self.context, router_container_id=1))):
             with self.subTest(raw=raw[:30]):
                 self.place(context=raw)
                 with self.assertRaises(pr.ChildError):
@@ -296,6 +304,30 @@ class ChildTest(unittest.TestCase):
         self.assertEqual(self.run_it(), pr.INCOMPLETE)
         self.assertFalse([a for a in self.engine.seen if a[1] == "run"])
         self.assertFalse(os.path.exists(f"{self.run_dir}/expect.json"))
+
+
+class AffirmativeInspectTest(unittest.TestCase):
+    """The child's inspect for the incident's stop: only the engine's own
+    statement counts. A failed inspect is "no such container" only when the
+    engine then lists no container of that id."""
+
+    CID = "c" * 64
+
+    def running(self, *answers):
+        replies = list(answers)
+        return pr.Docker(pp.Runner(["docker"], lambda argv: replies.pop(0))).running(self.CID)
+
+    def test_only_a_stated_running_state_or_a_listed_absence_is_an_answer(self):
+        self.assertEqual(self.running(proc(0, '{"Running": true}')), {"running": True})
+        self.assertEqual(self.running(proc(0, '{"Running": false}')), {"running": False})
+        self.assertEqual(self.running(proc(0, '{"Running": false, "Paused": true}')), {"running": True})
+        self.assertEqual(self.running(proc(0, '{"Running": false, "Restarting": true}')), {"running": True})
+        self.assertIsNone(self.running(proc(1, ""), proc(0, "")), "absence the engine affirms")
+        for answers in ((proc(0, "{}"),), (proc(0, '{"Running": "yes"}'),), (proc(0, "not json"),),
+                        (proc(0, "[]"),), (proc(1, ""), proc(1, "")), (proc(1, ""), proc(0, self.CID + "\n")),
+                        (rh.Unresolved("transport"),), (proc(1, ""), rh.Unresolved("transport"))):
+            with self.subTest(answers=answers):
+                self.assertIsInstance(self.running(*answers), rh.Unresolved)
 
 
 if __name__ == "__main__":

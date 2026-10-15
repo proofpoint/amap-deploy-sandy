@@ -3,8 +3,13 @@ it. The argv is the job's trusted input; the units start it weekly and once
 after boot; the steps provision from the public repository, never a local
 clone, and check the tools with the operating system's own."""
 
+import dataclasses
 import hashlib
+import os
 import plistlib
+import subprocess
+import sys
+import tempfile
 import unittest
 
 import partition_job as pj
@@ -52,8 +57,32 @@ class JobTest(unittest.TestCase):
     def test_validation_uses_the_systems_own_tools_and_an_empty_environment(self):
         text = "\n".join(pj.validation_steps(P))
         for words in ("env -i /usr/bin/python3 -I -S -B", "find ", "ldd ", "otool -L", "xcode-select -p",
-                      "! -user root -o -perm -g+w -o -perm -o+w"):
+                      "! -user root -o -perm -g+w -o -perm -o+w", "DESTSHARED", "/*.so", ".zip",
+                      "-maxdepth 0"):
             self.assertIn(words, text)
+
+    def test_the_parent_chain_check_prints_a_directory_others_can_write_above_a_tool(self):
+        with tempfile.TemporaryDirectory() as t:
+            w = os.path.join(os.path.realpath(t), "w")
+            os.mkdir(w)
+            os.chmod(w, 0o777)
+            tool = os.path.join(w, "python3")
+            with open(tool, "w") as f:
+                f.write("#!/bin/sh\nexit 1\n")
+            os.chmod(tool, 0o755)
+            spec = dataclasses.replace(P, tools={"python3": tool, "docker": os.path.realpath(sys.executable)})
+            line = pj.validation_steps(spec)[-1]
+            out = subprocess.run(["/bin/sh", "-c", line], capture_output=True, text=True, timeout=60).stdout
+            self.assertIn(w + "\n", out)
+
+    def test_the_linux_library_check_reaches_the_extension_modules_links(self):
+        if not os.path.exists("/usr/bin/ldd"):
+            self.skipTest("no ldd here")
+        spec = dataclasses.replace(P, tools={"python3": os.path.realpath(sys.executable), "docker": "/bin/sh"})
+        line = next(l for l in pj.validation_steps(spec) if l.startswith("ldd "))
+        listing = line.split(" | awk")[0].replace(" 2>/dev/null", "")
+        out = subprocess.run(["/bin/sh", "-c", listing], capture_output=True, text=True, timeout=120).stdout
+        self.assertIn("lib-dynload", out, "each extension module is listed")
 
 
 if __name__ == "__main__":

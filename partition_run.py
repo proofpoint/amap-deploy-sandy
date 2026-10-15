@@ -39,14 +39,20 @@ import partition_probe as pp
 import partition_store as pst
 import router_health as rh
 
-SCHEMA = "amap-deploy.partition-run/1"
+#: Each record's schema, and its members with their types, exactly: the
+#: pinned writer reads them by the same grammar (a test holds the two equal).
+CONTEXT_SCHEMA = "amap-deploy.partition-context/1"
+EXPECT_SCHEMA = "amap-deploy.partition-expect/1"
+OUTCOME_SCHEMA = "amap-deploy.partition-outcome/1"
+_OPT_STR = (str, type(None))
+CONTEXT_MEMBERS = {"schema": str, "run_id": str, "host": str, "started_at": str, "evidence_dir": str,
+                   "live_config_path": str, "router_container_id": _OPT_STR, "engine": str, "docker": str}
+EXPECT_MEMBERS = {"schema": str, "run_id": str, "host": str, "bindings": dict}
+OUTCOME_MEMBERS = {"schema": str, "run_id": str, "code": int, "incident": bool, "router_seen": _OPT_STR, "why": str}
 CONTEXT, DOCUMENT, EXPECT, OUTCOME = "context.json", "document.json", "expect.json", "outcome.json"
 LOCK = "lock"
 #: The child's own exit codes, as outcome.json records them.
 PASSED, FAILED, INCOMPLETE = 0, 1, 2
-#: The members each record carries, and nothing else.
-CONTEXT_MEMBERS = frozenset({"schema", "run_id", "host", "started_at", "evidence_dir", "live_config_path",
-                             "router_container_id", "engine"})
 
 
 class ChildError(Exception):
@@ -54,7 +60,21 @@ class ChildError(Exception):
 
 
 def canonical(doc: Dict[str, Any]) -> bytes:
-    return json.dumps(doc, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return pe.canonical(doc)
+
+
+def typed(doc: Any, members: Dict[str, Any], schema: str) -> bool:
+    """`doc` exactly `members`, each of its type (a bool is never an int,
+    nor a str), with the given schema."""
+    if not isinstance(doc, dict) or set(doc) != set(members) or doc.get("schema") != schema:
+        return False
+    for k, t in members.items():
+        v = doc[k]
+        if isinstance(v, bool) and t is not bool:
+            return False
+        if not isinstance(v, t):
+            return False
+    return True
 
 
 def read_record(store: pst.RootedStore, path: str) -> Any:
@@ -137,12 +157,25 @@ class Docker:
         return env if isinstance(env, list) else []
 
     def running(self, cid: str) -> Any:
-        """partition_incident's inspect: {"running": bool}, None, or an
-        Unresolved."""
-        live = self.inspect(cid)
-        if live is None or isinstance(live, rh.Unresolved):
-            return live
-        return {"running": bool((live.get("State") or {}).get("Running"))}
+        """partition_incident's inspect, affirmative only: {"running": bool}
+        when the engine states it (paused or restarting count as running),
+        None only when the engine affirms no such container exists, and an
+        Unresolved whenever it cannot say."""
+        p = self.runner(["inspect", "--type", "container", "--format", "{{json .State}}", cid])
+        if isinstance(p, rh.Unresolved):
+            return p
+        if p.rc == 0:
+            try:
+                state = json.loads(p.out)
+            except ValueError:
+                return rh.Unresolved(f"docker inspect {cid} printed no JSON")
+            if not isinstance(state, dict) or not isinstance(state.get("Running"), bool):
+                return rh.Unresolved(f"docker inspect {cid} states no running state")
+            return {"running": state["Running"] or state.get("Paused") is True or state.get("Restarting") is True}
+        q = self.runner(["ps", "--all", "--quiet", "--no-trunc", "--filter", f"id={cid}"])
+        if not isinstance(q, rh.Unresolved) and q.rc == 0 and not q.out.strip():
+            return None
+        return rh.Unresolved(f"docker cannot say whether {cid} exists")
 
 
 def selected_lanes(router_doc: Dict[str, Any], read: Callable[[str], bytes] = pst.read_bounded) -> Any:
@@ -170,14 +203,14 @@ def run_child(run_dir: str, lock_fd: int, *, runner: pp.Runner, stat_: Callable 
     check_lock(lock_fd, exec_root, stat_)
     boot = pst.RootedStore(evidence_dir=run_dir, run_dir=run_dir, live_config=posixpath.join(run_dir, CONTEXT))
     context = read_record(boot, posixpath.join(run_dir, CONTEXT))
-    if isinstance(context, rh.Unresolved) or set(context) != CONTEXT_MEMBERS or context.get("schema") != SCHEMA:
-        raise ChildError(f"the run's context is not usable: {getattr(context, 'reason', 'its members')}")
+    if isinstance(context, rh.Unresolved) or not typed(context, CONTEXT_MEMBERS, CONTEXT_SCHEMA):
+        raise ChildError(f"the run's context is not usable: {getattr(context, 'reason', 'its grammar')}")
     store = pst.RootedStore(evidence_dir=context["evidence_dir"], run_dir=run_dir,
                             live_config=context["live_config_path"])
     rid, at = context["run_id"], context["started_at"]
 
     def finish(code: int, incident: bool, seen: Optional[str], why: str) -> int:
-        out = {"schema": SCHEMA, "run_id": rid, "code": code, "incident": incident, "router_seen": seen,
+        out = {"schema": OUTCOME_SCHEMA, "run_id": rid, "code": code, "incident": incident, "router_seen": seen,
                "why": why}
         failed = pi._try(store.new_file, posixpath.join(run_dir, OUTCOME), canonical(out))
         emit(f"partition-weekly {rid}: code {code}: {why}" + (f" (outcome NOT recorded: {failed})" if failed else ""))
@@ -212,7 +245,7 @@ def run_child(run_dir: str, lock_fd: int, *, runner: pp.Runner, stat_: Callable 
     if isinstance(bound, rh.Unresolved):
         return finish(INCOMPLETE, False, seen, bound.reason)
     failed = pi._try(store.new_file, posixpath.join(run_dir, EXPECT),
-                     canonical({"schema": SCHEMA, "run_id": rid, "host": context["host"], "bindings": bound}))
+                     canonical({"schema": EXPECT_SCHEMA, "run_id": rid, "host": context["host"], "bindings": bound}))
     if failed:
         return finish(INCOMPLETE, False, seen, f"the expectation cannot be recorded, so nothing is probed: {failed}")
     try:

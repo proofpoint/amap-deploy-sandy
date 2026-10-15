@@ -104,20 +104,29 @@ def provision_steps(p: ps.PartitionSpec, pin: str, writer: str, q: Callable[[str
 def validation_steps(p: ps.PartitionSpec, q: Callable[[str], str] = shlex.quote) -> List[str]:
     """The operator's install-time check of what root will run, with the
     operating system's own tools only, never the interpreter under test (its
-    paths are only discovered with it, under an empty environment). Every
-    path printed must be root-owned and writable by no one else."""
+    paths are only discovered with it, under an empty environment): the
+    tools, the interpreter's library, its extension modules and any zip on
+    its path, the libraries the tools and every extension module link, the
+    developer directory on macOS, and every directory above each of them.
+    Every path printed must be root-owned and writable by no one else. The
+    pinned writer applies the same rule before every run."""
     py, docker = q(p.tools["python3"]), q(p.tools["docker"])
-    paths = (f"$(env -i {py} -I -S -B -c 'import sys,sysconfig; "
-             f"print(sys.base_prefix, sysconfig.get_paths()[\"stdlib\"], sysconfig.get_paths()[\"platstdlib\"])')")
+    bad = "\\( ! -user root -o -perm -g+w -o -perm -o+w \\) -print"
+    paths = (f"$(env -i {py} -I -S -B -c 'import os,sys,sysconfig; g=sysconfig.get_paths(); "
+             "print(g[\"stdlib\"], g[\"platstdlib\"], sysconfig.get_config_var(\"DESTSHARED\") or "
+             "os.path.join(g[\"platstdlib\"], \"lib-dynload\"), *[x for x in sys.path if x.endswith(\".zip\")])')")
+    dynload = (f"$(env -i {py} -I -S -B -c 'import os,sysconfig; print(sysconfig.get_config_var(\"DESTSHARED\") or "
+               "os.path.join(sysconfig.get_paths()[\"platstdlib\"], \"lib-dynload\"))')")
+    tools = f"$(realpath {py}) $(realpath {docker}) {dynload}/*.so"
     return [
         "# The tools the weekly job runs as root: each must be the operating system's or its vendor's,",
         "# and nothing in their startup closure may be writable by anyone but root (each command prints nothing):",
-        f"find {py} {docker} $(realpath {py} {docker}) \\( ! -user root -o -perm -g+w -o -perm -o+w \\) -print",
-        f"find {paths} \\( ! -user root -o -perm -g+w -o -perm -o+w \\) -print",
-        f"ldd $(realpath {py}) $(realpath {docker}) 2>/dev/null | awk '/=>/ {{print $3}}' | xargs -r find "
-        "\\( ! -user root -o -perm -g+w -o -perm -o+w \\) -print   # Linux",
-        f"otool -L $(realpath {py}) $(realpath {docker}) | awk 'NR>1 {{print $1}}' | xargs find "
-        "\\( ! -user root -o -perm -g+w -o -perm -o+w \\) -print 2>/dev/null   # macOS",
-        "find \"$(xcode-select -p)\" -maxdepth 2 \\( ! -user root -o -perm -g+w -o -perm -o+w \\) -print   # macOS: "
-        "the developer directory /usr/bin/python3 runs",
+        f"find {py} {docker} $(realpath {py} {docker}) {bad}",
+        f"find {paths} {bad}",
+        f"ldd {tools} 2>/dev/null | awk '/=>/ {{print $3}}' | sort -u | xargs -r find {bad}   # Linux",
+        f"otool -L {tools} | awk '/^\\t/ {{print $1}}' | sort -u | xargs find {bad} 2>/dev/null   # macOS",
+        f"find \"$(xcode-select -p)\" {bad}   # macOS: the developer directory /usr/bin/python3 runs",
+        "# Every directory above each of those paths (each prints nothing):",
+        f"for p in $(realpath {py} {docker}) {paths} \"$(xcode-select -p 2>/dev/null)\"; do "
+        f"while [ -n \"$p\" ] && [ \"$p\" != / ]; do p=$(dirname \"$p\"); find \"$p\" -maxdepth 0 {bad}; done; done",
     ]
