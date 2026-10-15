@@ -9,7 +9,8 @@ directory, never deleted:
   actions pending; written FIRST;
 - `incident-<run_id>/events.jsonl`: append-only, each line fsynced, one
   event per effect (`rewrite_ok`/`rewrite_failed`, `stop_ok`/`stop_failed`/
-  `stop_not_attempted`) and the one lifecycle event, `resolved`.
+  `stop_not_attempted`/`stop_not_required`) and the one lifecycle event,
+  `resolved`.
 An incident is OPEN from `detected.json` until a `resolved` event. A history
 that cannot be read, or that is incomplete, is OPEN.
 
@@ -21,6 +22,16 @@ running, and nothing is ever stopped by name. When the record itself cannot
 be written, the run says so exactly (`incident NOT recorded: <why>; rewrite
 <outcome>; stop <outcome>`), still acts, and a later run writes the
 incident late, marked so, from what is durable and what it can observe.
+
+A PROSPECTIVE run (A2, before activation, with the local router stopped)
+records `mode: "prospective"` in detected.json. Its rewrite observes first:
+a live config without `delegation` is left byte for byte as it is, and
+recorded as observed. Its stop is `stop_not_required` only when EVERY
+rewrite in the incident's history observed no delegation, this act observed
+none, the certified target does not run, and the engine affirms that no
+container under the local router's name runs; otherwise it is the weekly
+stop. `stop_not_required` closes the stop action for a prospective incident
+only, never for a weekly one.
 
 Closing: only `resolve`, with the operator's reason and fresh passing
 evidence later than the incident, after checking CURRENT facts. A scheduled
@@ -39,7 +50,12 @@ PREFIX = "incident-"
 DETECTED = "detected.json"
 EVENTS = "events.jsonl"
 _RUN_ID = re.compile(r"[A-Za-z0-9._-]{1,64}")
-EFFECT_EVENTS = frozenset({"rewrite_ok", "rewrite_failed", "stop_ok", "stop_failed", "stop_not_attempted"})
+EFFECT_EVENTS = frozenset({"rewrite_ok", "rewrite_failed", "stop_ok", "stop_failed", "stop_not_attempted",
+                           "stop_not_required"})
+#: The run modes an incident can record; a detected.json without `mode` is a
+#: weekly run's.
+MODES = ("weekly", "prospective")
+NO_DELEGATION = "the live config carries no delegation"
 LIFECYCLE_EVENTS = frozenset({"resolved"})
 
 
@@ -119,7 +135,10 @@ class Effects:
     - `live_has_delegation()`: whether the live config file carries
       `delegation` now (bool or Unresolved);
     - `squatter_signing()`: whether any running container holding the local
-      router's NAME runs with `delegation` (bool or Unresolved).
+      router's NAME runs with `delegation` (bool or Unresolved);
+    - `router_running()`: whether a container under the plan's local router
+      NAME runs (bool or Unresolved), read only by a prospective run, never
+      a stop target.
     Any of them may raise anything; nothing they raise ever prevents the next
     action."""
 
@@ -175,7 +194,7 @@ def _strict(raw: bytes) -> Any:
 #: detected.json's members: required, and those a record may also carry.
 DETECTED_REQUIRED = {"run_id": str, "at": str, "failing": list, "pending": list}
 DETECTED_OPTIONAL = {"token": (str, type(None)), "identity": (str, type(None)), "failing_evidence_persisted": bool,
-                     "recorded_late": bool, "taken_without_record": bool, "recorded_by": str}
+                     "recorded_late": bool, "taken_without_record": bool, "recorded_by": str, "mode": str}
 
 
 def detected_problem(doc: Any, run_id: str) -> Optional[str]:
@@ -190,6 +209,8 @@ def detected_problem(doc: Any, run_id: str) -> Optional[str]:
             return f"{k} has the wrong type"
     if doc["run_id"] != run_id:
         return "its run_id is not its directory's"
+    if "mode" in doc and doc["mode"] != MODES[1]:
+        return "its mode is not prospective (a weekly run records none)"
     if not doc["failing"] or not all(isinstance(f, str) and f for f in doc["failing"]):
         return "it names no failing probe"
     pending = doc["pending"]
@@ -211,6 +232,7 @@ EVENT_GRAMMAR = {
     "stop_ok": ({"id": "text"}, {"observed": "text"}),
     "stop_failed": ({"reason": "text"}, {"id": "text"}),
     "stop_not_attempted": ({"reason": "text"}, {}),
+    "stop_not_required": ({"reason": "text"}, {}),
     "resolved": ({"evidence": "text", "reason": "text"}, {}),
 }
 _COMMON = ({"at": "text"}, {"completion": "bool", "by": "text"})
@@ -266,7 +288,7 @@ def _publish_detected(store: Store, d: str, run_id: str, detected: Dict[str, Any
 
 def act(store: Store, fx: Effects, *, evidence_dir: str, run_id: str, at: str, failing: Sequence[str],
         token: Optional[str], identity: Any, evidence_persisted: bool,
-        emit: Callable[[str], None] = print) -> Tuple[int, str]:
+        emit: Callable[[str], None] = print, mode: str = "weekly") -> Tuple[int, str]:
     """The weekly job's FAIL-STOP action, decided by the run's IN-MEMORY
     fail-stop failure (`failing`). `identity` is the local router's verified
     container id from what is already durable (the activation document's
@@ -280,6 +302,8 @@ def act(store: Store, fx: Effects, *, evidence_dir: str, run_id: str, at: str, f
     detected = {"run_id": run_id, "at": at, "failing": sorted(failing), "token": token,
                 "identity": identity if isinstance(identity, str) else None,
                 "pending": ["rewrite", "stop"], "failing_evidence_persisted": evidence_persisted}
+    if mode == MODES[1]:
+        detected["mode"] = mode
     made = _try(store.mkdir, d)
     kept = None
     if made is not None and _try(store.listdir, d) is not None:
@@ -297,15 +321,47 @@ def act(store: Store, fx: Effects, *, evidence_dir: str, run_id: str, at: str, f
             if failed:
                 _say(emit, f"partition-incident: could not record {event['event']}: {failed}")
 
-    rewrite_failed = _try(fx.rewrite)
-    rewrite = "ok" if rewrite_failed is None else f"failed ({rewrite_failed})"
-    record({"event": "rewrite_ok"} if rewrite_failed is None else {"event": "rewrite_failed", "reason": rewrite_failed})
-    stop = _stop(fx, identity)
+    live = _observe(fx.live_has_delegation) if mode == MODES[1] else None
+    try:
+        prior: Any = parse_events(store.read(events)) if mode == MODES[1] else None
+    except FileNotFoundError:
+        prior = []
+    except (OSError, ValueError, UnicodeDecodeError) as e:
+        prior = rh.Unresolved(f"the incident's history cannot be read: {e}")
+    if live is False:
+        rewrite = "ok (observed: no delegation)"
+        record({"event": "rewrite_ok", "observed": NO_DELEGATION})
+    else:
+        rewrite_failed = _try(fx.rewrite)
+        rewrite = "ok" if rewrite_failed is None else f"failed ({rewrite_failed})"
+        record({"event": "rewrite_ok"} if rewrite_failed is None
+               else {"event": "rewrite_failed", "reason": rewrite_failed})
+    eligible = live is False and isinstance(prior, list) and only_observed(prior)
+    stop = _prospective_stop(fx, identity) if eligible else _stop(fx, identity)
     record(stop)
     status = (f"incident {('recorded (' + kept + ')') if kept else 'recorded' if recorded else 'NOT recorded: ' + str(why)}; "
               f"rewrite {rewrite}; stop {_stop_words(stop)}")
     _say(emit, status)
     return 1, status
+
+
+def _prospective_stop(fx: Effects, identity: Any) -> Dict[str, Any]:
+    """A prospective run's stop, once the live config showed no delegation:
+    the certified router (the recovery-verified identity) is stopped only if
+    it runs; when none runs, nothing signs and no stop is required."""
+    if isinstance(identity, str):
+        seen = _observe(fx.inspect, identity)
+        if isinstance(seen, rh.Unresolved) or (seen is not None and seen.get("running") is not False):
+            return _stop(fx, identity)
+    named = _observe(fx.router_running)
+    if named is not False:
+        why = named.reason if isinstance(named, rh.Unresolved) else "a container under the local router's name runs"
+        return {"event": "stop_not_attempted",
+                "reason": f"a router may be signing that no record names ({why}): stop it and run the ordinary "
+                          "partition-weekly, or record resolved after checking it"}
+    return {"event": "stop_not_required",
+            "reason": f"prospective: {NO_DELEGATION} throughout, no certified router runs, and the local router "
+                      "is stopped"}
 
 
 def _stop(fx: Effects, identity: Any) -> Dict[str, Any]:
@@ -330,7 +386,27 @@ def _stop(fx: Effects, identity: Any) -> Dict[str, Any]:
 
 
 def _stop_words(stop: Dict[str, Any]) -> str:
-    return {"stop_ok": "ok"}.get(stop["event"], f"{stop['event'].replace('stop_', '')} ({stop.get('reason', '')})")
+    return {"stop_ok": "ok", "stop_not_required": "not required"}.get(stop["event"], f"{stop['event'].replace('stop_', '')} ({stop.get('reason', '')})")
+
+
+def parse_events(raw: bytes) -> List[Dict[str, Any]]:
+    """An events.jsonl history, strictly: every line an event of its kind's
+    grammar and the last line complete; ValueError otherwise."""
+    events = [_strict(l.encode("utf-8")) for l in raw.decode("utf-8").splitlines() if l.strip()]
+    if raw and not raw.endswith(b"\n"):
+        raise ValueError("a truncated last line")
+    bad = next((p for p in (event_problem(e) for e in events) if p), None)
+    if bad:
+        raise ValueError(bad)
+    return events
+
+
+def only_observed(events: Sequence[Dict[str, Any]]) -> bool:
+    """Every rewrite in the history found no delegation to remove: none was
+    live while the incident was handled. A bare rewrite_ok (a removal) or a
+    rewrite_failed means it was, or may have been."""
+    return all(e["event"] == "rewrite_ok" and e.get("observed") == NO_DELEGATION
+               for e in events if e["event"] in ("rewrite_ok", "rewrite_failed"))
 
 
 # --- Reading the record ----------------------------------------------------------------
@@ -354,7 +430,9 @@ class Incident:
         out = []
         if "rewrite_ok" not in kinds:
             out.append("rewrite")
-        if "stop_ok" not in kinds:
+        prospective = isinstance(self.detected, dict) and self.detected.get("mode") == MODES[1]
+        if "stop_ok" not in kinds and not (prospective and "stop_not_required" in kinds
+                                          and only_observed(self.events)):
             out.append("stop")
         return out
 
@@ -387,12 +465,7 @@ def read_all(store: Store, evidence_dir: str) -> Any:
         events: Any = raw
         if not isinstance(raw, rh.Unresolved):
             try:
-                events = [_strict(l.encode("utf-8")) for l in raw.decode("utf-8").splitlines() if l.strip()]
-                if not raw.endswith(b"\n") and raw:
-                    raise ValueError("a truncated last line")
-                bad = next((p for p in (event_problem(e) for e in events) if p), None)
-                if bad:
-                    raise ValueError(bad)
+                events = parse_events(raw)
             except (UnicodeDecodeError, ValueError) as e:
                 events = rh.Unresolved(f"{n}/{EVENTS}: {e}")
         out.append(Incident(rid, detected, events))
