@@ -157,14 +157,17 @@ class ValidationMirrorTest(unittest.TestCase):
         os.chmod(py, 0o755)
         return py
 
-    def run_block(self, py, env=None, as_owner=False):
+    def run_block(self, py, env=None, as_owner=False, bound=180):
         spec = dataclasses.replace(P, tools={"python3": py, "docker": os.path.realpath("/bin/sh")})
         script = "\n".join(pj.validation_steps(spec))
         if as_owner:
             import getpass
             script = script.replace("-user root", f"-user {getpass.getuser()}")
-        return subprocess.run(["/bin/sh", "-c", script], capture_output=True, text=True, timeout=180,
-                              env=dict(os.environ, **(env or {}))).stdout
+        try:
+            return subprocess.run(["/bin/sh", "-c", script], capture_output=True, text=True, timeout=bound,
+                                  env=dict(os.environ, **(env or {}))).stdout
+        except subprocess.TimeoutExpired:
+            self.fail(f"the block did not finish within {bound} s")
 
     def test_on_macos_a_missing_required_path_is_named_though_it_is_under_a_system_prefix(self):
         stub = os.path.join(self.d, "stub")
@@ -212,6 +215,79 @@ class ValidationMirrorTest(unittest.TestCase):
         py = self.interpreter([stdlib, stdlib, stdlib])
         out = self.run_block(py, as_owner=True)
         self.assertIn(outside + "\n", out.replace(outside + "/", "\0"), "the target's own directory")
+
+    def test_a_path_holding_whitespace_is_named_never_split(self):
+        """stdlib/link.py -> "out side"/linked.py, and stdlib/"a b.py": each is
+        named as a discovery failure rather than split into fragments that
+        would be judged in its place."""
+        stdlib, spaced = os.path.join(self.d, "stdlib"), os.path.join(self.d, "out side")
+        os.mkdir(stdlib)
+        os.mkdir(spaced)
+        with open(os.path.join(spaced, "linked.py"), "w") as f:
+            f.write("x = 1\n")
+        os.symlink(os.path.join(spaced, "linked.py"), os.path.join(stdlib, "link.py"))
+        with open(os.path.join(stdlib, "a b.py"), "w") as f:
+            f.write("y = 2\n")
+        py = self.interpreter([stdlib, stdlib, stdlib])
+        out = self.run_block(py, as_owner=True)
+        self.assertIn(f"discovery failed: whitespace in {spaced}/linked.py\n", out)
+        self.assertIn(f"discovery failed: whitespace in {stdlib}/a b.py\n", out)
+
+    def tree(self, links, writable=()):
+        """Directories and links under the test's root: `links` maps a link's
+        path to its target (as written); `writable` names directories made 0777."""
+        for name in sorted({os.path.dirname(l) for l in links} | set(writable) | {"stdlib"}):
+            os.makedirs(os.path.join(self.d, name), exist_ok=True)
+        for name in writable:
+            os.chmod(os.path.join(self.d, name), 0o777)
+        for link, target in links.items():
+            os.symlink(target, os.path.join(self.d, link))
+
+    def test_a_chain_visit_never_stands_in_for_a_later_tree_visit(self):
+        """The first root reaches shared/ only as a parent link's target (a
+        chain visit); the second reaches it as a closure link (a tree visit),
+        under which a link leads to a writable directory. In either order the
+        writable directory is printed."""
+        for first, second in (("stdlib", "dynload"), ("dynload", "stdlib")):
+            with self.subTest(order=(first, second)):
+                d = self.d = os.path.join(os.path.realpath(self.d), f"{first}-first")
+                os.makedirs(d)
+                os.makedirs(os.path.join(d, "shared"))
+                with open(os.path.join(d, "shared", "file"), "w") as f:
+                    f.write("x")
+                os.makedirs(os.path.join(d, "outside"))
+                with open(os.path.join(d, "outside", "linked.py"), "w") as f:
+                    f.write("y")
+                os.chmod(os.path.join(d, "outside"), 0o777)
+                self.tree({"parent": os.path.join(d, "shared"),
+                           "stdlib/first.py": os.path.join(d, "parent", "file"),
+                           "shared/inner.py": os.path.join(d, "outside", "linked.py"),
+                           "dynload/second": os.path.join(d, "shared")})
+                py = self.interpreter([os.path.join(d, first), os.path.join(d, first), os.path.join(d, second)])
+                out = self.run_block(py, as_owner=True, bound=60)
+                self.assertIn(os.path.join(d, "outside") + "\n", out)
+                self.d = os.path.dirname(d)
+
+    def test_every_relative_cycle_ends_and_what_lies_beyond_is_still_judged(self):
+        shapes = {"d/l -> ../d/l": {"stdlib/d/l": "../d/l"},
+                  "bin/X11 -> .": {"stdlib/bin/X11": "."},
+                  "bin/up -> ../bin": {"stdlib/bin/up": "../bin"},
+                  "A/sub -> ../B, B/back -> ../A": {"stdlib/A/sub": "../B", "stdlib/B/back": "../A"},
+                  "d/x -> loop/x through d/loop -> .": {"stdlib/d/loop": ".", "stdlib/d/x": "loop/x"}}
+        for what, links in shapes.items():
+            with self.subTest(what):
+                d = self.d = os.path.join(os.path.realpath(self.d), what.split()[0].replace("/", "_"))
+                os.makedirs(d)
+                beyond = os.path.join(d, "beyond")
+                first = sorted(links)[0]
+                self.tree(dict(links, **{os.path.join(os.path.dirname(first), "w"): beyond}), writable=["beyond"])
+                py = self.interpreter([os.path.join(d, "stdlib")] * 3)
+                out = self.run_block(py, as_owner=True, bound=60)
+                self.assertIn(beyond + "\n", out, "the walk ends, and judges past the cycle")
+                unmapped = self.run_block(py, bound=60)
+                self.assertFalse([l for l in unmapped.splitlines() if "loop/loop" in l or "../B/../A/../B" in l],
+                                 "each target is visited once by what it is, never again by a longer spelling")
+                self.d = os.path.dirname(d)
 
     def test_nested_directory_links_and_a_cycle_are_followed_once(self):
         """stdlib/sub -> outside (a directory link); outside/deeper -> elsewhere/,

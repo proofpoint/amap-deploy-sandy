@@ -143,8 +143,10 @@ def validation_steps(p: ps.PartitionSpec, q: Callable[[str], str] = shlex.quote)
            "-print")
     query = "env -i " + py + " -I -S -B -c 'import os,sys,sysconfig; g=sysconfig.get_paths(); "
     return [
-        "# The tools the weekly job runs as root, and their startup closure. Run these lines in order, as one",
-        "# block: each prints nothing on a host whose closure is root's alone.",
+        "# The tools the weekly job runs as root, and their startup closure. Paste these lines as one block into",
+        "# one shell (bash or dash; the functions below are defined on earlier lines and used on later ones).",
+        "# Each prints nothing on a host whose closure is root's alone. A path holding whitespace is named, never",
+        "# split, since the lists below are split on it.",
         f"P=$({query}print(g[\"stdlib\"], g[\"platstdlib\"], sysconfig.get_config_var(\"DESTSHARED\") or "
         "os.path.join(g[\"platstdlib\"], \"lib-dynload\"))')",
         f"Z=$({query}print(*[x for x in sys.path if x.endswith(\".zip\")])')",
@@ -166,18 +168,33 @@ def validation_steps(p: ps.PartitionSpec, q: Callable[[str], str] = shlex.quote)
         "[ \"$(uname)\" = Darwin ] && { D=$(xcode-select -p); find \"$D\" " + own + "; find -L \"$D\" " + bad + "; }",
         # Every link met in the closure, followed one hop at a time, as the writer's own check does: a
         # link inside the closure has its target, everything under a target directory and every
-        # directory above it judged; a link among those directories has only its target and the
-        # directories above it judged. Each target and directory is judged once, so a cycle ends.
+        # directory above it judged (a tree visit); a link among those directories has only its target
+        # and the directories above it judged (a chain visit). A target is known by what it is on disk
+        # (its realpath), so every cycle ends, relative or not; a chain visit never stands in for a
+        # later tree visit of the same target. A directory is known by its spelling and what it is, so
+        # no link among them goes unjudged.
         f"chk() {{ find \"$1\" -maxdepth 0 {own}; }}",
-        "up() { local x=$1; while [ \"$x\" != / ] && [ \"$x\" != . ]; do x=$(dirname \"$x\"); "
-        "case \" $ups \" in *\" $x \"*) return;; esac; ups=\"$ups $x\"; chk \"$x\"; "
-        "[ -L \"$x\" ] && hop \"$x\" chain; done; }",
-        "hop() { local r t l; r=$(readlink \"$1\"); case \"$r\" in /*) t=$r;; *) t=\"$(dirname \"$1\")/$r\";; esac; "
-        "case \" $seen \" in *\" $t \"*) return;; esac; seen=\"$seen $t\"; "
-        f"if [ \"$2\" = tree ]; then find \"$t\" {own} 2>/dev/null; "
+        "norm() { local c o IFS=/; o=; set -f; for c in $1; do case $c in ''|.) ;; ..) o=${o%/*};; "
+        "*) o=\"$o/$c\";; esac; done; set +f; echo \"${o:-/}\"; }",
+        # What a path is on disk: its realpath, or, when it cannot be resolved (a link that loops onto
+        # itself), the directory entry it names: its parent's realpath and its own name.
+        "real() { realpath \"$1\" 2>/dev/null || { local p; p=$(realpath \"$(dirname \"$1\")\" 2>/dev/null) "
+        "&& echo \"$p/$(basename \"$1\")\"; } || echo \"?$(norm \"$1\")\"; }",
+        "up() { local x=$1 k; while [ \"$x\" != / ] && [ \"$x\" != . ]; do x=$(dirname \"$x\"); "
+        "k=\"$(norm \"$x\")|$(real \"$x\")\"; case \" $ups \" in *\" $k \"*) return;; esac; ups=\"$ups $k\"; "
+        "chk \"$x\"; [ -L \"$x\" ] && hop \"$x\" chain; done; }",
+        "hop() { local r t l k; r=$(readlink \"$1\"); case \"$r\" in /*) t=$r;; *) t=\"$(dirname \"$1\")/$r\";; esac; "
+        "case \"$t\" in *[[:space:]]*) echo \"discovery failed: whitespace in $t\"; return;; esac; k=$(real \"$t\"); "
+        "if [ \"$2\" = tree ]; then case \" $trees \" in *\" $k \"*) return;; esac; trees=\"$trees $k\"; "
+        f"find \"$t\" {own} 2>/dev/null; "
+        "find \"$t\" -name '*[[:space:]]*' -print 2>/dev/null | sed 's/^/discovery failed: whitespace in /'; "
         "for l in $(find \"$t\" -type l 2>/dev/null); do hop \"$l\" tree; done; "
-        "else chk \"$t\"; [ -L \"$t\" ] && hop \"$t\" chain; fi; up \"$t\"; }",
-        f"seen=; ups=; for l in $(find {py} {docker} $P $L $(for z in $Z; do [ -e \"$z\" ] && echo \"$z\"; done) "
+        "else case \" $trees $chains \" in *\" $k \"*) return;; esac; chains=\"$chains $k\"; "
+        "chk \"$t\"; [ -L \"$t\" ] && hop \"$t\" chain; fi; up \"$t\"; }",
+        f"find {py} {docker} $(realpath {py} {docker}) $P $L $(for z in $Z; do [ -e \"$z\" ] && echo \"$z\"; done) "
+        "$( [ \"$(uname)\" = Darwin ] && xcode-select -p) -name '*[[:space:]]*' -print 2>/dev/null "
+        "| sed 's/^/discovery failed: whitespace in /'   # a path the lists would split",
+        f"trees=; chains=; ups=; for l in $(find {py} {docker} $P $L $(for z in $Z; do [ -e \"$z\" ] && echo \"$z\"; done) "
         "$( [ \"$(uname)\" = Darwin ] && xcode-select -p) -type l 2>/dev/null); do hop \"$l\" tree; done"
         "   # every link's target, its tree and its directories",
         f"for p in {py} {docker} $P $Z $L \"$( [ \"$(uname)\" = Darwin ] && xcode-select -p)\"; do for x in \"$p\" "
