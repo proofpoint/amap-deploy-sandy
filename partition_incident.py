@@ -338,11 +338,24 @@ def act(store: Store, fx: Effects, *, evidence_dir: str, run_id: str, at: str, f
                else {"event": "rewrite_failed", "reason": rewrite_failed})
     eligible = live is False and isinstance(prior, list) and only_observed(prior)
     stop = _prospective_stop(fx, identity) if eligible else _stop(fx, identity)
+    if mode == MODES[1] and stop["event"] == "stop_not_attempted":
+        stop = dict(stop, reason=stop["reason"] + "; " + remedy(eligible))
     record(stop)
     status = (f"incident {('recorded (' + kept + ')') if kept else 'recorded' if recorded else 'NOT recorded: ' + str(why)}; "
               f"rewrite {rewrite}; stop {_stop_words(stop)}")
     _say(emit, status)
     return 1, status
+
+
+def remedy(all_observed: bool) -> str:
+    """What closes a prospective incident whose stop was not attempted, by
+    its history: one in which a live delegation was removed (or a rewrite
+    failed) is closed only by the operator's `resolved`; an all-observed one
+    by stopping the local router and running the ordinary weekly job."""
+    if all_observed:
+        return "remedy: stop the local router, then run the ordinary partition-weekly"
+    return ("remedy: stop the local router, check it, and record resolved; a delegation was live during this "
+            "incident, so no ordinary run can close it")
 
 
 def _prospective_stop(fx: Effects, identity: Any) -> Dict[str, Any]:
@@ -356,9 +369,7 @@ def _prospective_stop(fx: Effects, identity: Any) -> Dict[str, Any]:
     named = _observe(fx.router_running)
     if named is not False:
         why = named.reason if isinstance(named, rh.Unresolved) else "a container under the local router's name runs"
-        return {"event": "stop_not_attempted",
-                "reason": f"a router may be signing that no record names ({why}): stop it and run the ordinary "
-                          "partition-weekly, or record resolved after checking it"}
+        return {"event": "stop_not_attempted", "reason": f"a router may be signing that no record names ({why})"}
     return {"event": "stop_not_required",
             "reason": f"prospective: {NO_DELEGATION} throughout, no certified router runs, and the local router "
                       "is stopped"}

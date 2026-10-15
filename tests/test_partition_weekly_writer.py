@@ -1749,6 +1749,30 @@ class ProspectiveWriterTest(unittest.TestCase):
         self.assertEqual(kinds[-1], "stop_not_attempted")
         self.assertEqual(len(self.h.runs()), 1, "kept: the stop is not shown done")
 
+    def test_a2_that_does_not_pass_prints_the_back_out(self):
+        """Opus B2 (c): A2 exit 3 after the stop names the command that brings
+        the stopped router back on its unchanged live config."""
+        self.h.plan([["expect", B], ["evidence", B, PASS], ["outcome", 2, None]])
+        p = self.run_a2()
+        self.assertEqual(p.returncode, hs.EXIT_HANDOFF, p.stdout + p.stderr)
+        self.assertIn(f"back-out: the local router was stopped for A2 and its live config is unchanged: "
+                      f"docker start {self.NAME}", p.stdout + p.stderr)
+
+    def test_a_refusal_with_the_router_running_prints_no_start(self):
+        self.h.containers({self.NAME: True})
+        p = self.run_a2()
+        self.assertNotIn("docker start", p.stdout + p.stderr)
+
+    def test_a_live_removal_s_remedy_is_resolved_only(self):
+        """Opus N1: after a live removal no ordinary run can close it."""
+        self.h.plan([["expect", B], ["evidence", B, FAIL3], ["detected", ["P03"]],
+                     ["events", '{"at":"x","event":"rewrite_ok"}\n'
+                                '{"at":"x","event":"stop_not_attempted","reason":"no target"}\n'],
+                     ["outcome", 1, None]])
+        p = self.run_a2()
+        self.assertIn("record resolved; a delegation was live during this incident", p.stdout + p.stderr)
+        self.assertIn("then docker start", p.stdout + p.stderr)          # the kept run's remedy comes first
+
     def test_a_local_router_started_during_the_run_is_never_stop_not_required(self):
         """(viii-c): delegation placed, [1] restarted on it, removed again
         without a restart: the file says none, a router under the name runs."""

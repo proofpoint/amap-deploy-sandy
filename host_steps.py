@@ -1877,8 +1877,7 @@ def _act(evidence_dir, live_config, target, rid, at, failing, engine, said, mode
         event({"event": "stop_not_attempted",
                "reason": "a router may be signing that no record names (" + (
                    "a container under the local router's name runs" if named else
-                   "the engine cannot say whether the local router runs") + "): stop it and run the ordinary "
-               "partition-weekly, or record resolved after checking it"})
+                   "the engine cannot say whether the local router runs") + "); " + _remedy(True)})
         return False
     if not isinstance(target, str) or not _HEX64.fullmatch(target):
         if eligible:
@@ -1904,6 +1903,8 @@ def _act(evidence_dir, live_config, target, rid, at, failing, engine, said, mode
             else:
                 event({"event": "stop_failed", "id": target,
                        "reason": "still running" if after else "the engine cannot say whether it stopped"})
+    if mode == MODES[1] and not stopped and not eligible:
+        say(_remedy(False))
     if ifd is not None:
         os.close(ifd)
     return rewritten and stopped
@@ -1917,6 +1918,14 @@ def _context(rfd):
         return doc if doc["mode"] in MODES else None
     doc = _record(rfd, "context.json", CONTEXT_MEMBERS_V1, CONTEXT_SCHEMA_V1)
     return dict(doc, mode=MODES[0]) if doc is not None else None
+
+
+def _remedy(all_observed):
+    """partition_incident.remedy, exactly."""
+    if all_observed:
+        return "remedy: stop the local router, then run the ordinary partition-weekly"
+    return ("remedy: stop the local router, check it, and record resolved; a delegation was live during this "
+            "incident, so no ordinary run can close it")
 
 
 def _only_observed(events):
@@ -2178,6 +2187,26 @@ def _status(code):
     return EXIT_HANDOFF if code == EXIT_PASS else code
 
 
+def _approved_name_of(raw):
+    """The local router's container name in A1's record's bytes, or None."""
+    try:
+        name = _strict_json(raw)["spec"]["name"]
+    except (ValueError, KeyError, TypeError, UnicodeDecodeError):
+        return None
+    return name if isinstance(name, str) and _NAME.fullmatch(name) else None
+
+
+def _back_out(name, kept):
+    """What brings the local router back after a prospective run that did
+    not pass: it was stopped for A2, and its live config is the unchanged
+    pre-activation one. A kept run's remedy comes first."""
+    start = f"docker start {name}" if name else "docker start <the local router's container>"
+    if kept:
+        return (f"back-out: first follow the remedy printed for {', '.join(kept)} (kept: an effect is not shown "
+                f"done), then {start}")
+    return f"back-out: the local router was stopped for A2 and its live config is unchanged: {start}"
+
+
 def _prospective_refusal(efd, host, values, approved, recovery, docker, exec_root):
     """Why a prospective run (A2) may not start, or "": every read here is a
     guard, made before W2 and any effect. G1: the live config carries no
@@ -2186,14 +2215,16 @@ def _prospective_refusal(efd, host, values, approved, recovery, docker, exec_roo
     decision; that is the ordinary run's to complete. G4': no container
     under the approved record's local router name runs: A2 runs with it
     stopped, since nothing the writer can read shows which config a running
-    one adopted. Also A1's record must be this host's, for this config."""
+    one adopted. Also A1's record must be this host's, for this config.
+    Returns (why, whether the local router was found running or could not
+    be said not to run): its back-out is then not to start it."""
     try:
         record = _strict_json(approved)
         name, rec_host, final = record["spec"]["name"], record["host"], record["final_config_path"]
     except (ValueError, KeyError, TypeError, UnicodeDecodeError):
-        return "A1's record cannot be read"
+        return "A1's record cannot be read", False
     if rec_host != host or final != values["live_config"]:
-        return "A1's record is another host's or another config path's"
+        return "A1's record is another host's or another config path's", False
     try:
         cfd, cname = _config_dir(values["live_config"])
         try:
@@ -2201,9 +2232,9 @@ def _prospective_refusal(efd, host, values, approved, recovery, docker, exec_roo
         finally:
             os.close(cfd)
     except (OSError, ValueError, UnicodeDecodeError, Tooling) as e:
-        return f"the live config cannot be read: {e}"
+        return f"the live config cannot be read: {e}", False
     if not isinstance(doc, dict) or "delegation" in doc:
-        return "A2 is pre-activation: the live config already carries delegation"
+        return "A2 is pre-activation: the live config already carries delegation", False
     engine = _Engine(docker, values["engine"], exec_root)
     if recovery and recovery["host"] == host and recovery["live_config_path"] == values["live_config"] \
             and recovery["engine"] == values["engine"] and recovery["evidence_dir"] == values["evidence_dir"]:
@@ -2211,18 +2242,18 @@ def _prospective_refusal(efd, host, values, approved, recovery, docker, exec_roo
         if up is not False:
             return (f"a router the weekly job certified ({recovery['router_container_id']}) is running: de-activate "
                     "it (A4 recreates it) or run the ordinary partition-weekly" if up else
-                    "the engine cannot say whether the certified router runs")
+                    "the engine cannot say whether the certified router runs"), True
     pending = [n for n in os.listdir(efd) if RUN_NAME.fullmatch(n)]
     if pending:
-        return f"{', '.join(sorted(pending))} awaits a decision: run the ordinary partition-weekly, which completes it"
+        return f"{', '.join(sorted(pending))} awaits a decision: run the ordinary partition-weekly, which completes it", False
     if not isinstance(name, str) or not _NAME.fullmatch(name):
-        return "A1's record names no local router container"
+        return "A1's record names no local router container", False
     up = engine.running_by_name(name)
     if up is not False:
         return (f"A2 runs with the local router stopped: stop {name} (docker stop {name}), then run A2; A3 and A4 "
                 "start it on the activated config" if up else
-                f"the engine cannot say whether {name} runs")
-    return ""
+                f"the engine cannot say whether {name} runs"), True
+    return "", False
 
 
 def partition_weekly(exec_root, host, document, sha256, activation, activation_sha256, now=None, child_timeout=None,
@@ -2283,7 +2314,9 @@ def partition_weekly(exec_root, host, document, sha256, activation, activation_s
             recovery = _recovery(efd)
             mode = MODES[1] if prospective else MODES[0]
             if prospective:
-                refused = _prospective_refusal(efd, host, values, approved, recovery, docker, exec_root)
+                rec["router_name"] = _approved_name_of(approved)
+                refused, rec["router_up"] = _prospective_refusal(efd, host, values, approved, recovery, docker,
+                                                                 exec_root)
                 if refused:
                     said.append(f"refused, nothing written: {refused}")
                     return EXIT_HANDOFF
@@ -2448,7 +2481,10 @@ def partition_weekly(exec_root, host, document, sha256, activation, activation_s
             code = body()
         finally:
             publish()
-        return _status(code) if rec["status"] else code
+        final = _status(code) if rec["status"] else code
+        if prospective and final != EXIT_PASS and not rec.get("router_up"):
+            said.append(_back_out(rec.get("router_name"), sorted(rec["kept"])))
+        return final
     finally:
         for s in said:
             try:

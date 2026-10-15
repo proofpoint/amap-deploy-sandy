@@ -527,6 +527,17 @@ class ProspectiveActTest(unittest.TestCase):
         self.assertEqual(self.kinds(), ["rewrite_ok", "stop_not_attempted"])
         self.assertEqual(self.incident().pending(), ["stop"])
 
+    def test_the_remedy_follows_the_history(self):
+        self.named_running = True
+        self.act()
+        self.assertIn("then run the ordinary partition-weekly", self.incident().events[-1]["reason"])
+        self.router.delegation = True
+        t = tempfile.TemporaryDirectory()
+        self.addCleanup(t.cleanup)
+        self.dir = t.name
+        self.act()
+        self.assertIn("record resolved", self.incident().events[-1]["reason"])
+
     def test_an_engine_that_cannot_say_is_never_stop_not_required(self):
         self.named_running = rh.Unresolved("no engine")
         self.act()
