@@ -322,10 +322,29 @@ class LifecycleTest(unittest.TestCase):
         self.assertEqual(self.router.stops, [ID])
         said = self.complete()
         self.assertEqual(self.router.stops, [ID], "a stopped router is not stopped again")
-        self.assertEqual(said, ["r1: rewrite_ok", "r1: stop_ok"])
-        self.assertEqual(pi.read_all(self.store, self.dir)[0].pending(), [], "nothing left to repeat")
+        self.assertEqual(said, ["r1: rewrite_ok", "r1: stop_not_attempted"],
+                         "a stop whose record was lost is not certified from an id not running")
+        self.assertEqual(pi.read_all(self.store, self.dir)[0].pending(), ["stop"], "left to the operator's --resolve")
         events = pi.read_all(self.store, self.dir)[0].events
         self.assertTrue(all(e["completion"] for e in events))
+        self.assertEqual(self.router.stops, [ID])
+
+    def test_completion_never_certifies_a_stale_id_stopped(self):
+        """[1] recreated under a new id after the incident: the recorded id
+        is gone or not running, the replacement runs. Nothing is stopped,
+        and the stop stays pending."""
+        for running in ({}, {ID: False}):
+            with self.subTest(running=running):
+                self.setUp()
+                self.act(store=Failing("append", times=2))
+                self.router.running = dict(running, **{"d" * 64: True})
+                self.router.stops = []
+                said = self.complete()
+                self.assertEqual(self.router.stops, [])
+                self.assertEqual(said[-1], "r1: stop_not_attempted")
+                last = pi.read_all(self.store, self.dir)[0].events[-1]
+                self.assertIn("may be stale", last["reason"])
+                self.assertEqual(pi.read_all(self.store, self.dir)[0].pending(), ["stop"])
 
     def test_an_unrecorded_incident_is_written_late_and_vetoes(self):
         pi.act(Failing("mkdir"), self.router.effects(), evidence_dir=self.dir, run_id="r1", at=AT, failing=["P04"],

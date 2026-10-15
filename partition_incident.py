@@ -316,7 +316,8 @@ def _stop(fx: Effects, identity: Any) -> Dict[str, Any]:
     if isinstance(seen, rh.Unresolved):
         return {"event": "stop_not_attempted", "reason": f"cannot inspect {identity}: {seen.reason}"}
     if seen is None or seen.get("running") is not True:
-        return {"event": "stop_not_attempted", "reason": f"{identity} is not shown running"}
+        return {"event": "stop_not_attempted",
+                "reason": f"{identity} is not shown running: the target may be stale"}
     failed = _try(fx.stop, identity)
     after = _observe(fx.inspect, identity)
     if isinstance(after, rh.Unresolved):
@@ -442,11 +443,10 @@ def complete(store: Store, fx: Effects, *, evidence_dir: str, at: str, identity:
             _try(store.append, events, _line(dict(ev, at=at, completion=True)))
             said.append(f"{inc.run_id}: {ev['event']}")
         if "stop" in inc.pending():
-            seen = _observe(fx.inspect, identity) if isinstance(identity, str) else None
-            if isinstance(identity, str) and isinstance(seen, dict) and seen.get("running") is False:
-                ev = {"event": "stop_ok", "id": identity, "observed": "not running"}
-            else:
-                ev = _stop(fx, identity)
+            # Only a stop of our own that the engine then shows taken is
+            # stop_ok: an id already not running may be stale (its router
+            # recreated under a new id), so the stop stays pending.
+            ev = _stop(fx, identity)
             _try(store.append, events, _line(dict(ev, at=at, completion=True)))
             said.append(f"{inc.run_id}: {ev['event']}")
     for s in said:

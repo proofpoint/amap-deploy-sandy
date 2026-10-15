@@ -164,10 +164,35 @@ def running_differences(live: Dict[str, Any], spec: Dict[str, Any], image: Dict[
 
 def activation_binding(spec: Dict[str, Any], staged: bytes) -> str:
     """The binding the evidence carries for the local router: its activation
-    config (canonical, without `partition_verified`) and its prospective
-    spec, never its container id."""
+    config (canonical, without `partition_verified`) and its run spec, never
+    its container id. The mounts are bound as a set, so the spec derive-mounts
+    builds and the one read back from the running router (spec_from_running)
+    bind the same when A5's comparison holds."""
     import partition_evidence as pe
-    return pe.sha_json({"config": pe.config_binding(json.loads(staged)), "spec": spec})
+    mounts = sorted(spec["mounts"], key=lambda m: (m["source"], m["target"], m["readonly"]))
+    return pe.sha_json({"config": pe.config_binding(json.loads(staged)), "spec": dict(spec, mounts=mounts)})
+
+
+def spec_from_running(live: Dict[str, Any]) -> Any:
+    """The local router's run spec as `docker inspect` shows it running: the
+    form prospective_spec builds, read back. The weekly job uses it because
+    it runs as root and never executes the hop checkout, which the operator
+    owns; A5's comparison (running_differences empty) is what makes it the
+    activation spec. An Unresolved when the container is not one run.sh
+    could have started: a non-bind mount, or no ROUTER_CONFIG."""
+    cfg, host = live.get("Config") or {}, live.get("HostConfig") or {}
+    env = dict(e.partition("=")[::2] for e in cfg.get("Env") or [])
+    mounts = []
+    for m in live.get("Mounts") or []:
+        if m.get("Type") != "bind":
+            return rh.Unresolved(f"it has a {m.get('Type')} mount at {m.get('Destination')}, which run.sh never makes")
+        mounts.append({"type": "bind", "source": m.get("Source"), "target": m.get("Destination"),
+                       "readonly": not m.get("RW")})
+    if "ROUTER_CONFIG" not in env:
+        return rh.Unresolved("it has no ROUTER_CONFIG")
+    return {"name": (live.get("Name") or "").lstrip("/"), "image": live.get("Image"), "user": cfg.get("User"),
+            "network": host.get("NetworkMode"), "restart": (host.get("RestartPolicy") or {}).get("Name"),
+            "env": {k: env[k] for k in ("ROUTER_CONFIG", "ROUTER_INTERVAL") if k in env}, "mounts": mounts}
 
 
 #: What A1's loader check puts where A3 will put the token: the loader
@@ -209,6 +234,86 @@ def final_bytes(staged: bytes, token: str) -> bytes:
     # so the token is the delegation block's last member, as the renderer
     # places it.
     return (json.dumps(doc, indent=2) + "\n").encode("utf-8")
+
+
+#: A1's approved expectation: the record install's activation step writes,
+#: which the weekly job's root half trusts only by the digest its unit carries.
+ACTIVATION_SCHEMA = "amap-deploy.partition-activation/1"
+ACTIVATION_MEMBERS = frozenset({"schema", "host", "spec", "staged", "staged_sha256", "final_config_path"})
+SPEC_MEMBERS = frozenset({"name", "image", "user", "network", "restart", "env", "mounts"})
+
+
+def activation_record(*, host: str, spec: Dict[str, Any], staged: bytes, final_config_path: str) -> bytes:
+    """A1's record: the prospective spec for the final config path and the
+    staged bytes, canonical. Checked by `parse_activation` before it is
+    returned."""
+    import partition_evidence as pe
+    raw = pe.canonical({"schema": ACTIVATION_SCHEMA, "host": host, "spec": spec, "staged": staged.decode("utf-8"),
+                        "staged_sha256": pe.sha_bytes(staged), "final_config_path": final_config_path})
+    parse_activation(raw)
+    return raw
+
+
+def parse_activation(raw: bytes) -> Dict[str, Any]:
+    """`raw` as A1's record, or ActivationError: canonical bytes, exactly its
+    members, the spec's exact members, and staged bytes that hash to the
+    recorded digest."""
+    import partition_evidence as pe
+    try:
+        doc = json.loads(raw.decode("utf-8"), object_pairs_hook=pe._no_duplicates, parse_constant=pe._no_constant)
+    except (UnicodeDecodeError, ValueError) as e:
+        raise ActivationError(f"the activation record is not JSON: {e}") from None
+    if not isinstance(doc, dict) or set(doc) != ACTIVATION_MEMBERS or doc["schema"] != ACTIVATION_SCHEMA:
+        raise ActivationError("the activation record is not exactly its members and schema")
+    if pe.canonical(doc) != raw:
+        raise ActivationError("the activation record is not in canonical form")
+    spec = doc["spec"]
+    if not isinstance(spec, dict) or set(spec) != SPEC_MEMBERS or not isinstance(spec["mounts"], list) \
+            or not isinstance(spec["env"], dict):
+        raise ActivationError("the activation record's spec is not a run spec")
+    for k in ("host", "staged", "staged_sha256", "final_config_path"):
+        if not isinstance(doc[k], str) or not doc[k]:
+            raise ActivationError(f"the activation record's {k} is not a string")
+    if pe.sha_bytes(doc["staged"].encode("utf-8")) != doc["staged_sha256"]:
+        raise ActivationError("the activation record's staged bytes are not its digest's")
+    return doc
+
+
+def inspect_projection(live: Dict[str, Any]) -> Dict[str, Any]:
+    """What of `docker inspect` the stop target's record binds: the id, its
+    creation, its image, user, environment, network, restart policy and
+    mounts. The pinned writer computes the same projection (a test holds
+    the two equal)."""
+    cfg, host = live.get("Config") or {}, live.get("HostConfig") or {}
+    return {"Id": live.get("Id"), "Created": live.get("Created"), "Image": live.get("Image"),
+            "User": cfg.get("User"), "Env": sorted(str(e) for e in cfg.get("Env") or []),
+            "NetworkMode": host.get("NetworkMode"), "RestartPolicy": (host.get("RestartPolicy") or {}).get("Name"),
+            "Mounts": sorted([str(m.get("Type")), str(m.get("Source")), str(m.get("Destination")), bool(m.get("RW"))]
+                             for m in live.get("Mounts") or [] if isinstance(m, dict))}
+
+
+def a5_differences(live: Any, image: Any, approved: Dict[str, Any], live_raw: bytes) -> List[str]:
+    """A5's comparison against A1's APPROVED record: the router affirmed
+    running with a full id, exactly the approved spec, and its live config
+    exactly the approved staged bytes plus the token it carries. Empty when
+    it holds. The token's currency is the caller's to judge."""
+    if not isinstance(live, dict) or is_running(live) is not True:
+        return ["the local router is not affirmed running"]
+    cid = live.get("Id")
+    if not isinstance(cid, str) or len(cid) != 64 or any(c not in "0123456789abcdef" for c in cid):
+        return ["the local router's id is not a full id"]
+    if not isinstance(image, dict):
+        return ["the local router's image cannot be inspected"]
+    bad = running_differences(live, approved["spec"], image)
+    try:
+        token = json.loads(live_raw)["delegation"]["partition_verified"]
+        if not isinstance(token, str):
+            raise TypeError
+        if final_bytes(approved["staged"].encode("utf-8"), token) != live_raw:
+            bad.append("the live config is not the approved staged bytes plus its token")
+    except (ValueError, KeyError, TypeError, ActivationError):
+        bad.append("the live config carries no token over the approved staged bytes")
+    return bad
 
 
 #: Where a supervisor would live that could restart the local router: every

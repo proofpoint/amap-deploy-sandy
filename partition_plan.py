@@ -22,6 +22,10 @@ import router_health as rh
 #: The hop's two ends, as P01 names them: the local router upstream, the
 #: email router downstream.
 UPSTREAM, DOWNSTREAM = "upstream", "downstream"
+#: The export through which sandy tells an agent where its peer lane is
+#: mounted: the manifest's (amap_sandy.EXPORT_LANE_DIR["peer"], pinned by a
+#: test), read from each agent container's own environment.
+PEER_EXPORT = "AMAP_PEER_DIR"
 
 
 class PlanError(ValueError):
@@ -53,14 +57,19 @@ def email_drift(live: Any, rendered: Dict[str, Any], image_env: Any) -> Any:
     return hr.compare(live, rendered, image_env)
 
 
-def agent_source(inspect: Any, destination: str) -> Any:
-    """The host source of the bind an agent's container mounts at
-    `destination` (its peer lane), or an Unresolved."""
+def agent_source(inspect: Any) -> Any:
+    """The host source of the bind at the path the agent's container itself
+    names for its peer lane (PEER_EXPORT in its environment), or an
+    Unresolved."""
     if isinstance(inspect, rh.Unresolved):
         return inspect
     if inspect is None or pa.is_running(inspect) is not True:
         return rh.Unresolved("its container is not running" if inspect is None or pa.is_running(inspect) is False
                              else "the engine does not say whether its container runs")
+    env = dict(str(e).partition("=")[::2] for e in (inspect.get("Config") or {}).get("Env") or [])
+    destination = env.get(PEER_EXPORT)
+    if not destination:
+        return rh.Unresolved(f"its container exports no {PEER_EXPORT}")
     found = [m for m in inspect.get("Mounts") or [] if m.get("Destination") == destination]
     if len(found) != 1 or found[0].get("Type") != "bind" or not found[0].get("Source"):
         return rh.Unresolved(f"its container has no single bind at {destination}")
@@ -82,14 +91,14 @@ def _uid_gid(spec: Dict[str, Any]) -> tuple:
 
 def gather(*, host: str, run_id: str, at: str, email: Dict[str, Any], email_view: Dict[str, Any],
            email_live: Any, email_image_env: Any, email_volume: str, router: Dict[str, Any],
-           router_doc: Dict[str, Any], lanes: Dict[str, str], agent_inspects: Dict[str, Any], peer_destination: str,
+           router_doc: Dict[str, Any], lanes: Dict[str, str], agent_inspects: Dict[str, Any],
            bindings: Dict[str, str]) -> pp.Plan:
     """The Plan for one run. `email` is the email router's rendered run spec
     (hub_runtime.run_spec) and `email_view` its inspect-shaped view;
     `router` is the local router's activation spec and `router_doc` the
     activation config it reads; `lanes` each enrolled agent's peer lane on
     the host; `agent_inspects` each agent container's inspect (None when
-    not running); `peer_destination` where an agent mounts its lane."""
+    not running)."""
     if email["image"] == router["image"]:
         raise PlanError("the two routers run the same image, so their one-shots cannot be told apart")
     hop, delegation = router_doc.get("hop"), router_doc.get("delegation")
@@ -105,7 +114,7 @@ def gather(*, host: str, run_id: str, at: str, email: Dict[str, Any], email_view
         host=host, run_id=run_id, at=at, email=email,
         email_drift=email_drift(email_live, email_view, email_image_env), email_volume=email_volume,
         router=router, key_path=key, key_dir=posixpath.dirname(key),
-        lanes=dict(lanes), agent_sources={s: agent_source(agent_inspects.get(s), peer_destination) for s in lanes},
+        lanes=dict(lanes), agent_sources={s: agent_source(agent_inspects.get(s)) for s in lanes},
         links=[hop["link"]], hop_root=root,
         runtimes={UPSTREAM: (router["name"], up_uid, up_gid), DOWNSTREAM: (email["name"], down_uid, down_gid)},
         vantages={UPSTREAM: pp.spec_vantage(router), DOWNSTREAM: pp.spec_vantage(email)},

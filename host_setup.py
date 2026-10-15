@@ -706,6 +706,33 @@ def ask_container(container: str) -> Any:
     return {"image": image, "binds": binds}
 
 
+def ask_identity(ref: str, *, docker: str, engine: str) -> Any:
+    """`docker inspect` of the container `ref` names (an id, or a name only
+    to compare), asked of the APPROVED engine with the APPROVED docker,
+    whatever the operator's PATH, DOCKER_HOST or DOCKER_CONTEXT select: its
+    whole document; None when that engine affirms there is no such
+    container (a failed inspect, then listings by id and by name that
+    succeed and are empty); an Unresolved otherwise. Read-only."""
+    env = {"DOCKER_HOST": engine, "DOCKER_CONTEXT": "default"}
+
+    def ask(*args: str) -> Any:
+        return rh.run([docker, "--host", engine, *args], extra_env=env)
+    try:
+        p = ask("inspect", "--type", "container", "--format", "{{json .}}", ref)
+        if p.rc == 0:
+            doc = json.loads(p.out)
+            return doc if isinstance(doc, dict) else rh.Unresolved(f"`docker inspect {ref}` printed no object")
+        q = ask("ps", "--all", "--quiet", "--no-trunc", "--filter", f"id={ref}")
+        r = ask("ps", "--all", "--quiet", "--no-trunc", "--filter", f"name=^/{ref}$")
+    except rh.CannotRun as e:
+        return rh.Unresolved(str(e))
+    except ValueError:
+        return rh.Unresolved(f"`docker inspect {ref}` printed no JSON")
+    if q.rc == 0 and r.rc == 0 and not q.out.strip() and not r.out.strip():
+        return None
+    return rh.Unresolved(f"`docker inspect {ref}` exited {p.rc}, and the engine does not affirm it is absent")
+
+
 def ask_mount(container: str, path: str, marker: Optional[str] = None) -> Any:
     """`(identity, marker content or None)` of `path` as the RUNNING container
     `container` sees it, or an Unresolved. Read-only: stat and cat."""
@@ -1068,7 +1095,32 @@ def checks(spec: Spec, *, production: bool, lstat: Callable = os.lstat,
                          rl_sha=p["rl_sha"] if "rl_sha" in p else hp.hop_pin(),
                          hop_sha=(spec.overlay_pin or {}).get("commit", rh.Unresolved("the overlay has no plugin pin")),
                          plugin_sha256=hp.PLUGIN_SHA256, read=p.get("read", ps.read_record))
+        out += verify_stop_target(spec, p)
     return out
+
+
+def verify_stop_target(spec: Spec, p: Dict[str, Any]) -> List[rh.Check]:
+    """The weekly job's stop target, against this document's approved values:
+    the local router's live config, the engine, the docker it runs (its
+    realpath) and the local router's container name, which is inspected only
+    to compare. `p` may supply `inspect`, `read_placed`, `read` and
+    `realpath`."""
+    if spec.partition is None and spec.gate is None:
+        return []
+    missing = [what for what, absent in (("partition", spec.partition is None), ("keys", spec.keys is None),
+                                         ("supervision", spec.supervision is None), ("hops", not spec.hops)) if absent]
+    if missing:
+        return [rh.check(ps.TARGET_CLAIM, rh.Fact("stop target", True, "the weekly job's record of the local router"),
+                         f"cannot be judged: the document has no {', '.join(missing)} section",
+                         "add the missing sections: the stop target is judged against the local router's live "
+                         "config (keys), its engine (supervision) and its container (hops)",
+                         ok=lambda e, a: a is True)]
+    docker = p.get("realpath", os.path.realpath)(spec.partition.tools["docker"])
+    engine = spec.supervision.engine
+    return ps.verify_target(spec.partition, spec.gate, live_config=spec.keys.local_config, engine=engine,
+                            docker=docker, router_name=spec.runtime_of(spec.hops[0][1])["container"],
+                            inspect=p.get("inspect", lambda ref: ask_identity(ref, docker=docker, engine=engine)),
+                            read=p.get("read_placed", ps.read_placed), read_live=p.get("read", ps.read_record))
 
 
 def verify_recovery_horizon(spec: Spec, read: Callable[[str], Any] = hk.read_json,

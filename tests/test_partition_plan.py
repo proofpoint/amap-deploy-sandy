@@ -42,7 +42,8 @@ class Fixture(unittest.TestCase):
         self.doc = {"hop": {"root": f"{r}/hop", "link": "l1"},
                     "delegation": {"signing_key": {"path": f"{r}/keys/signing.key", "key_id": "k1"}}}
         self.lanes = {"alpha": f"{r}/instances/alpha/peer"}
-        self.inspects = {"alpha": {"State": {"Running": True}, "Mounts": [{"Type": "bind", "Source": f"{r}/instances/alpha/peer",
+        self.inspects = {"alpha": {"State": {"Running": True}, "Config": {"Env": ["AMAP_PEER_DIR=/agent/peer"]},
+                                   "Mounts": [{"Type": "bind", "Source": f"{r}/instances/alpha/peer",
                                                "Destination": "/agent/peer"}]}}
         self.live = {"State": {"Running": True}}
 
@@ -50,7 +51,7 @@ class Fixture(unittest.TestCase):
         kw = dict(host="alpha", run_id="r1", at="2026-10-15T03:00:00Z", email=self.email, email_view={},
                   email_live=self.live, email_image_env=[], email_volume="ex-secret", router=self.router,
                   router_doc=self.doc, lanes=self.lanes, agent_inspects=self.inspects,
-                  peer_destination="/agent/peer", bindings={"host_setup": "c" * 64})
+                  bindings={"host_setup": "c" * 64})
         kw.update(over)
         try:
             return ppl.gather(**kw)
@@ -115,12 +116,24 @@ class PlanTest(Fixture):
                 self.assertIsInstance(d, rh.Unresolved)
                 self.assertIn(words, d.reason)
 
+    def test_the_lane_is_found_where_the_agents_own_export_names_it(self):
+        self.assertEqual(self.gather().agent_sources["alpha"], f"{self.root}/instances/alpha/peer")
+        moved = {"State": {"Running": True}, "Config": {"Env": ["AMAP_PEER_DIR=/elsewhere"]},
+                 "Mounts": self.inspects["alpha"]["Mounts"]}
+        self.assertIsInstance(self.gather(agent_inspects={"alpha": moved}).agent_sources["alpha"], rh.Unresolved)
+
+    def test_the_export_is_the_manifests(self):
+        import amap_sandy
+        self.assertEqual(ppl.PEER_EXPORT, amap_sandy.EXPORT_LANE_DIR["peer"])
+
     def test_an_agent_without_its_lane_bind_is_unresolved(self):
+        env = {"Env": ["AMAP_PEER_DIR=/agent/peer"]}
         mounts = self.inspects["alpha"]["Mounts"]
-        for inspect in (None, {"State": {"Running": True}, "Mounts": []},
-                        {"State": {"Running": True}, "Mounts": [{"Type": "volume", "Source": "v",
-                                                                  "Destination": "/agent/peer"}]},
-                        {"State": {"Running": False}, "Mounts": mounts}, {"Mounts": mounts}):
+        up = {"Running": True}
+        for inspect in (None, {"State": up, "Config": {}, "Mounts": mounts}, {"State": up, "Config": env, "Mounts": []},
+                        {"State": up, "Config": env,
+                         "Mounts": [{"Type": "volume", "Source": "v", "Destination": "/agent/peer"}]},
+                        {"State": {"Running": False}, "Config": env, "Mounts": mounts}, {"Config": env, "Mounts": mounts}):
             with self.subTest(inspect=inspect):
                 src = self.gather(agent_inspects={"alpha": inspect}).agent_sources["alpha"]
                 self.assertIsInstance(src, rh.Unresolved)
