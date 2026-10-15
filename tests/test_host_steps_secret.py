@@ -169,7 +169,9 @@ class NoDumpsTest(Secret):
 
     def test_the_writer_keeps_no_core_and_is_not_dumpable_while_it_reads(self):
         """While the writer waits on stdin (after no_dumps, before any byte of
-        the value), its own /proc entry shows both settings."""
+        the value), its own /proc entry shows both settings. no_dumps sets the
+        core limit and then the dumpable flag, so the test waits for BOTH
+        before it judges either: a read between the two is not a failure."""
         feeder = subprocess.Popen([sys.executable, "-c", "import time;time.sleep(3)"],
                                   stdout=subprocess.PIPE)
         writer = subprocess.Popen([sys.executable, "-I", "-S", HOST_STEPS, "secret", self.path,
@@ -177,17 +179,17 @@ class NoDumpsTest(Secret):
                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         feeder.stdout.close()
         try:
-            limits = ""
+            limits, owner = "", None
             for _ in range(100):
                 with open(f"/proc/{writer.pid}/limits") as f:
                     limits = f.read()
-                if "Max core file size        0                    0" in limits:
+                owner = os.stat(f"/proc/{writer.pid}/status").st_uid
+                if "Max core file size        0                    0" in limits and (os.getuid() == 0 or owner == 0):
                     break
                 time.sleep(0.05)
             self.assertIn("Max core file size        0                    0", limits)
             if os.getuid() != 0:
-                self.assertEqual(os.stat(f"/proc/{writer.pid}/status").st_uid, 0,
-                                 "a non-dumpable process's /proc entries belong to root")
+                self.assertEqual(owner, 0, "a non-dumpable process's /proc entries belong to root")
         finally:
             writer.kill()
             writer.communicate(timeout=10)
