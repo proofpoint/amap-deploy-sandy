@@ -709,6 +709,55 @@ Three changes are refused rather than rendered:
   `python3 amap-sandy.py install --decommission-hop --apply`, then restart
   the router.
 
+### The local router's delegation: fleet keys and activation
+
+Signed delegation between hosts needs three inputs, and it stays off until
+all three hold and the activation steps have run:
+
+- the policy turns it on for this host: `hop_link` gains
+  `"delegation": {"inbound": false}` (or `true` to verify inbound signed
+  delegations too). Without the member, no `delegation` block is rendered;
+- the host-setup document pins the fleet's public keys:
+  `"fleet_keys": {"path": "<the inventory file>", "sha256": "<its sha256>"}`.
+  The inventory is one canonical JSON file listing every host's `name`,
+  `domains`, `runtime` (`amap.router@<one of its domains>`), `public_key`
+  (the raw 32-byte key, 64 hex) and `key_id` (the sha256 of that key, as the
+  key step printed it). This host is the entry listing its fleet domain;
+  every other entry must lie within `hop_link.trusted_fleet_hosts`;
+- the harness gate holds (`delegation_gate`).
+
+Nothing here reads the signing key. Each rendering is held to the hop
+checkout's loader and its plugin's key gate in a separate process that
+refuses to open the key; the key pair itself is proved only by the router,
+when it starts.
+
+Activation is A1 to A5. A2 runs as root with the local router STOPPED, since
+nothing on the host shows which config a running one adopted:
+
+```sh
+docker stop <the local router's container>
+sudo <python3> -I -S -B <writer> partition-weekly ... --prospective
+```
+
+It exits 0 only when both fail-stop probes pass, the evidence is placed and
+P02 passes; its output names the run whose token A3 takes. A3 then writes the
+activation config into the run directory and prints root's place step:
+
+```sh
+python3 amap-sandy.py install --apply --activate <A2's run id> --activation-sha256 <A1's printed digest>
+```
+
+It refuses, writing nothing, unless the gate holds, the placed A1 record
+hashes to the digest given, A2's evidence is this host's, passing, current
+and bound to this A1, today's rendering is A1's staged bytes, and the live
+config is the pre-activation rendering or already the activation. A4 starts
+the router on the activated config with `docker/run.sh --config <the live
+config> --detach`. `verify` passes the signing check only when the router
+signs exactly as the policy and the gate allow, under the token of current
+evidence, and has adopted the host's config: it watches two of the router's
+polls while the file it reads stays unchanged.
+
+
 ### The weekly partition job's tools
 
 The weekly partition job runs the host's interpreter and docker as root, so
