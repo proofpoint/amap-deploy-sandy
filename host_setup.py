@@ -89,6 +89,7 @@ import posixpath
 import re
 import shlex
 import stat
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -1134,33 +1135,15 @@ def partition_host(spec: Spec) -> Any:
     return spec.hub.host_label if spec.hub is not None else rh.Unresolved("the document has no hub section")
 
 
-def witness_capability(spec: Spec, p: Dict[str, Any], container_dev: Any, interval_s: Any) -> Tuple[str, Any]:
-    """("", the record) when this host's placed capability record qualifies
-    the adoption witness for the live config's share, else (why, None).
-    `p` may supply `read_placed`."""
-    if spec.partition is None or spec.supervision is None:
-        return "the document has no partition or supervision section to name the record's place and engine", None
-    path = posixpath.join(spec.partition.evidence_dir, hk.CAPABILITY_NAME)
+def host_view(spec: Spec) -> Any:
+    """The host's platform, and the live config's device, inode and ctime
+    with the host's clock, read together: the host stamps that ctime."""
     try:
-        cap: Any = hk.parse_json(p.get("read_placed", ps.read_placed)(path))
-    except (OSError, ValueError) as e:
-        cap = rh.Unresolved(f"{path}: {e}")
-    try:
-        host_dev: Any = os.stat(posixpath.dirname(spec.keys.local_config)).st_dev
-    except OSError as e:
-        host_dev = rh.Unresolved(str(e))
-    why = hk.capability_problem(cap, host=partition_host(spec), engine=spec.supervision.engine, host_dev=host_dev,
-                                container_dev=container_dev, interval_s=interval_s)
-    return (why, None) if why else ("", cap)
-
-
-def host_settle(spec: Spec) -> Any:
-    """The host's ctime of the live config and the host's clock, read
-    together: the host's writers stamp that ctime."""
-    try:
-        return os.stat(spec.keys.local_config).st_ctime_ns, time.time()
+        st = os.stat(spec.keys.local_config)
     except OSError as e:
         return rh.Unresolved(f"cannot inspect {spec.keys.local_config}: {e}")
+    return {"platform": sys.platform, "dev": st.st_dev, "ino": st.st_ino, "ctime_ns": st.st_ctime_ns,
+            "now": time.time()}
 
 
 def signing_inputs(spec: Spec, policy_on: Any, p: Dict[str, Any], k: Dict[str, Any]) -> hk.Signing:
@@ -1207,9 +1190,7 @@ def signing_inputs(spec: Spec, policy_on: Any, p: Dict[str, Any], k: Dict[str, A
     if witness is hk.ASK:
         witness = (lambda host_sha: hk.adoption(lambda: hk.ask_config_tuple(spec, container),
                                                 lambda: hk.ask_status(spec, container), host_sha,
-                                                capability=lambda dev, interval: witness_capability(
-                                                    spec, p, dev, interval),
-                                                host_settle=lambda: host_settle(spec))) if container \
+                                                host_view=lambda: host_view(spec))) if container \
             else (lambda host_sha: (rh.UNKNOWN, missing.reason))
     return hk.Signing(policy_on=policy_on, gate_ok=not bad, approved=approved, approved_why=why, named=named,
                       status=status, witness=witness, now=k.get("now", time.time()))

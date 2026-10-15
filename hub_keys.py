@@ -604,45 +604,12 @@ CONFIG_TUPLE_SCRIPT = ("import hashlib,json,os,time\n"
                        "print(json.dumps({'dev':st.st_dev,'ino':st.st_ino,'ctime_ns':st.st_ctime_ns,'size':st.st_size,"
                        "'sha256':hashlib.sha256(b).hexdigest(),'now':time.time()}))\n")
 TUPLE_KEYS = ("dev", "ino", "ctime_ns", "size", "sha256")
-#: How long the config must have been quiet before the window opens: at
-#: least twice the largest ctime tick a capability record may declare
-#: (TICK_BOUND_MAX_NS), so no qualifying share can hide an edit inside it.
+#: How long the config must have been quiet before the window opens, on the
+#: host's clock: far beyond the kernel's ctime tick (its coarse clock, 1/HZ
+#: with HZ >= 100, at most 10 ms), the only tick the supported platform has.
 CTIME_SETTLE_S = 2
-#: The host's recorded qualification of this witness: placed by root beside
-#: the partition evidence, from the probe run on a throwaway container.
-CAPABILITY_NAME = "config-witness.json"
-CAPABILITY_SCHEMA = "amap-deploy.config-witness/1"
-CAPABILITY_MEMBERS = frozenset({"schema", "host", "engine", "at", "share", "tick_bound_ns", "visible_within_s",
-                                "rename", "writes"})
-#: The largest ctime tick the witness accepts, and the write paths it covers.
-TICK_BOUND_MAX_NS = 1_000_000_000
-WRITE_PATHS = ["write", "rename"]
-
-
-def capability_problem(cap: Any, *, host: Any, engine: Any, host_dev: Any, container_dev: Any,
-                       interval_s: Any) -> str:
-    """Why the host's recorded capability does not qualify the witness here,
-    or "" when it does. An absent or unreadable record never qualifies."""
-    if isinstance(cap, rh.Unresolved):
-        return f"no qualifying capability record: {cap.reason}"
-    if not isinstance(cap, dict) or set(cap) != CAPABILITY_MEMBERS or cap["schema"] != CAPABILITY_SCHEMA:
-        return "the capability record is not exactly its members and schema"
-    if cap["host"] != host or cap["engine"] != engine:
-        return "the capability record is another host's or another engine's"
-    if cap["share"] != {"host_dev": host_dev, "container_dev": container_dev}:
-        return "the capability record was measured on another share than the live config's"
-    tick, visible, rename = cap["tick_bound_ns"], cap["visible_within_s"], cap["rename"]
-    if not isinstance(tick, int) or isinstance(tick, bool) or not 0 < tick <= TICK_BOUND_MAX_NS:
-        return "the share's ctime tick is unbounded or longer than one second"
-    if not isinstance(visible, (int, float)) or isinstance(visible, bool) or not isinstance(interval_s, (int, float)) \
-            or not 0 <= visible < interval_s:
-        return "a host write is not shown in the container within one poll interval"
-    if not isinstance(rename, dict) or not (rename.get("bytes_changed") is True
-                                            or rename.get("ino_or_ctime_changed") is True):
-        return "a host rename-replace is invisible in the container"
-    if cap["writes"] != WRITE_PATHS:
-        return "the capability record does not cover every supported write path"
-    return ""
+UNSUPPORTED = ("the signing PASS needs a native-Linux single-file bind (the same inode on the host and in the "
+               "container)")
 
 
 def ask_config_tuple(spec: Any, container: str) -> Any:
@@ -664,26 +631,33 @@ def ask_config_tuple(spec: Any, container: str) -> Any:
 
 
 def adoption(read_tuple: Callable[[], Any], read_status: Callable[[], Any], host_sha: str, *,
-             capability: Callable[[Any, Any], Tuple[str, Any]], host_settle: Callable[[], Any],
-             sleep: Callable[[float], None] = time.sleep) -> Tuple[str, str]:
+             host_view: Callable[[], Any], sleep: Callable[[float], None] = time.sleep) -> Tuple[str, str]:
     """(PASS | FAIL | UNKNOWN, why): the running local router runs the
-    config the host holds now, by order and by a change generation, never by
-    a clock compared with a file. 1: the file the router reads, from inside
-    its container, is the host's bytes, quiet for CTIME_SETTLE_S on the
-    container's own clock. 2-4: its status shows two more polls by the same
-    process (the second poll's reload began after step 1), the last with no
-    refused reload. 5: the file it reads has the same device, inode, change
-    time, size and bytes: any write to it moved its ctime, which restoring
-    the bytes cannot undo, so every reload in the window read those bytes.
-    `capability(container_dev, interval_s)` gives ("", the record) when the
-    host's recorded capability qualifies the witness here, else (why, None);
-    `host_settle()` gives the host's ctime of the live config and the host's
-    clock, in one host step, since the host stamps ctime."""
+    config the host holds now. Supported only where the bounds are the
+    kernel's documented behaviour: a Linux host whose router reads its
+    config through a single-file bind of the SAME inode (same device and
+    inode, same ctime, on the host and in the container), so one inode cache
+    serves both, the ctime tick is the kernel's coarse clock and one clock
+    stamps it. Anywhere else (a VM file share) UNKNOWN by design.
+    1: the file the router reads is the host's bytes and that inode, quiet
+    for CTIME_SETTLE_S on the host's clock. 2-4: two more polls by the same
+    process (the second's reload began after step 1), the last with no
+    refused reload. 5: the same inode, change time, size and bytes: a write
+    moved its ctime, which restoring the bytes cannot undo.
+    `host_view()` gives the host's {platform, dev, ino, ctime_ns, now} for
+    the live config, read in one host step."""
     t1 = read_tuple()
     if isinstance(t1, rh.Unresolved):
         return rh.UNKNOWN, f"the config the router reads cannot be identified: {t1.reason}"
     if t1["sha256"] != host_sha:
         return rh.UNKNOWN, "the router reads other bytes than the host's file (an old bind, or a replacement)"
+    h1 = host_view()
+    if isinstance(h1, rh.Unresolved):
+        return rh.UNKNOWN, f"the host's view of the live config cannot be read: {h1.reason}"
+    if h1["platform"] != "linux" or (h1["dev"], h1["ino"], h1["ctime_ns"]) != (t1["dev"], t1["ino"], t1["ctime_ns"]):
+        return rh.UNKNOWN, UNSUPPORTED + "; this host is not one"
+    if h1["now"] - h1["ctime_ns"] / 1e9 < CTIME_SETTLE_S:
+        return rh.UNKNOWN, "the config changed moments ago; run verify again"
     s0 = read_status()
     if isinstance(s0, rh.Unresolved):
         return rh.UNKNOWN, f"the router's status.json cannot be read: {s0.reason}"
@@ -691,15 +665,6 @@ def adoption(read_tuple: Callable[[], Any], read_status: Callable[[], Any], host
     if not isinstance(polls, int) or isinstance(polls, bool) or not isinstance(started, str) \
             or not isinstance(interval, (int, float)) or isinstance(interval, bool) or interval <= 0:
         return rh.UNKNOWN, "status.json carries no polls, started_ts or interval_s"
-    why, cap = capability(t1["dev"], interval)
-    if why:
-        return rh.UNKNOWN, why
-    settled = host_settle()
-    if isinstance(settled, rh.Unresolved):
-        return rh.UNKNOWN, f"the host's view of the live config cannot be read: {settled.reason}"
-    host_ctime_ns, host_now = settled
-    if host_now - host_ctime_ns / 1e9 < CTIME_SETTLE_S:
-        return rh.UNKNOWN, "the config changed moments ago; run verify again"
     waited, bound = 0.0, (2 + rh.FRESHNESS_MULTIPLE) * interval
     while True:
         sleep(interval / 2)
@@ -716,7 +681,6 @@ def adoption(read_tuple: Callable[[], Any], read_status: Callable[[], Any], host
     section = s.get("classification")
     if isinstance(section, dict) and section.get("config_reload_failed") is True:
         return rh.FAIL, "the running router refused its config file and runs an older one"
-    sleep(cap["visible_within_s"])      # a write inside the window is visible to step 5
     t5 = read_tuple()
     if isinstance(t5, rh.Unresolved):
         return rh.UNKNOWN, f"the config the router reads cannot be identified again: {t5.reason}"

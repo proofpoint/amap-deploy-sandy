@@ -168,95 +168,75 @@ class StatusWitness(Base):
 
 
 class AdoptionTest(unittest.TestCase):
-    """hub_keys.adoption over a scripted container and status: what the
-    router reads (its identity, change time, size and bytes) and its polls."""
+    """hub_keys.adoption over a scripted container, host and status: what the
+    router reads (its device, inode, change time, size and bytes), the
+    host's view of the same file with the host's clock, and its polls."""
 
     HOST = "a" * 64
+    C = 1_000_000_000_000_000_000
 
-    def record(self, **over):
-        cap = {"schema": hk.CAPABILITY_SCHEMA, "host": "alpha", "engine": "unix:///e.sock", "at": "x",
-               "share": {"host_dev": 9, "container_dev": 1}, "tick_bound_ns": 1_000_000, "visible_within_s": 0.5,
-               "rename": {"seen_by_path": False, "ino_or_ctime_changed": False, "bytes_changed": True},
-               "writes": ["write", "rename"]}
-        cap.update(over)
-        return cap
-
-    def run_it(self, tuples, statuses, cap=None, host=None, slept=None):
+    def run_it(self, tuples, statuses, host=None):
         t, s = iter(tuples), iter(statuses)
-        cap = self.record() if cap is None else cap
+        view = host if host is not None else (lambda: self.view())
+        return hk.adoption(lambda: next(t), lambda: next(s), self.HOST, host_view=view, sleep=lambda x: None)
 
-        def capability(dev, interval):
-            why = hk.capability_problem(cap, host="alpha", engine="unix:///e.sock", host_dev=9, container_dev=dev,
-                                        interval_s=interval)
-            return (why, None) if why else ("", cap)
-        settle = host if host is not None else (lambda: (1_000_000_000_000_000_000, 1_000_000_060.0))
-        return hk.adoption(lambda: next(t), lambda: next(s), self.HOST, capability=capability, host_settle=settle,
-                           sleep=(slept.append if slept is not None else (lambda x: None)))
+    def a(self, ctime=None, sha=None, ino=7, dev=1):
+        return {"dev": dev, "ino": ino, "ctime_ns": ctime or self.C, "size": 10, "sha256": sha or self.HOST,
+                "now": 0.0}
 
-    def a(self, ctime=1_000_000_000_000_000_000, sha=None, ino=7):
-        return {"dev": 1, "ino": ino, "ctime_ns": ctime, "size": 10, "sha256": sha or self.HOST,
-                "now": ctime / 1e9 + 60}
+    def view(self, **over):
+        v = {"platform": "linux", "dev": 1, "ino": 7, "ctime_ns": self.C, "now": self.C / 1e9 + 60}
+        v.update(over)
+        return v
 
-    def polls(self, *ns, started="s", failed=False):
-        out = [{"polls": n, "started_ts": started, "interval_s": 5.0} for n in ns]
+    def polls(self, *ns, started="s", failed=False, interval=5.0):
+        out = [{"polls": n, "started_ts": started, "interval_s": interval} for n in ns]
         if failed:
             out[-1]["classification"] = {"config_reload_failed": True}
         return out
 
-    def test_a_stable_config_and_two_more_polls_pass(self):
+    def test_native_same_inode_stable_config_and_two_polls_pass(self):
         self.assertEqual(self.run_it([self.a(), self.a()], self.polls(10, 11, 12))[0], rh.PASS)
 
     def test_an_edit_and_restore_between_the_reads_is_never_a_pass(self):
-        """A, then a valid B in place, then A again: the bytes match at both
-        ends; the change time does not, and the restore cannot reset it."""
-        restored = self.a(ctime=1_000_000_000_000_000_000 + 5_000_000_000)
-        result, why = self.run_it([self.a(), restored], self.polls(10, 11, 12))
+        result, why = self.run_it([self.a(), self.a(ctime=self.C + 5_000_000_000)], self.polls(10, 11, 12))
         self.assertEqual(result, rh.UNKNOWN)
         self.assertIn("changed while verify watched", why)
 
-    def test_a_host_replacement_the_container_does_not_see_is_unknown(self):
+    def test_a_host_rename_the_pinned_bind_does_not_see_is_unknown(self):
         self.assertEqual(self.run_it([self.a(sha="b" * 64)], [])[0], rh.UNKNOWN)
 
+    def test_a_vm_share_is_unsupported_by_design(self):
+        """Another device or inode in the container than on the host: not one
+        inode in one kernel, so no documented bound holds; UNKNOWN before any
+        poll is waited for."""
+        for name, view in (("other device", self.view(dev=99)), ("other inode", self.view(ino=8)),
+                           ("other ctime", self.view(ctime_ns=self.C + 1)), ("not linux", self.view(platform="darwin"))):
+            with self.subTest(case=name):
+                result, why = self.run_it([self.a()], [], host=lambda v=view: v)
+                self.assertEqual(result, rh.UNKNOWN)
+                self.assertIn("native-Linux single-file bind", why)
+
     def test_a_config_changed_moments_ago_on_the_host_s_clock_is_unknown(self):
-        """The host stamps ctime, so the settle is judged on the host's clock,
-        whatever the container's clock says."""
-        young = lambda: (1_000_000_000_000_000_000, 1_000_000_001.0)
+        young = lambda: self.view(now=self.C / 1e9 + 1)
         self.assertIn("moments ago", self.run_it([self.a(), self.a()], self.polls(10, 11, 12), host=young)[1])
 
-    def test_the_settle_covers_twice_the_largest_tick_a_record_may_declare(self):
-        self.assertGreaterEqual(hk.CTIME_SETTLE_S * 1_000_000_000, 2 * hk.TICK_BOUND_MAX_NS)
-        self.assertIn("tick", self.run_it([self.a()], self.polls(10),
-                                          cap=self.record(tick_bound_ns=hk.TICK_BOUND_MAX_NS + 1))[1])
-
-    def test_no_qualifying_capability_record_is_unknown_before_the_witness(self):
-        cases = {"none": rh.Unresolved("absent"), "host": self.record(host="beta"),
-                 "engine": self.record(engine="unix:///other"),
-                 "share": self.record(share={"host_dev": 8, "container_dev": 1}),
-                 "tick": self.record(tick_bound_ns=2_000_000_000), "visible": self.record(visible_within_s=5.0),
-                 "rename": self.record(rename={"seen_by_path": True, "ino_or_ctime_changed": False,
-                                               "bytes_changed": False}),
-                 "writes": self.record(writes=["write"])}
-        for name, cap in cases.items():
-            with self.subTest(case=name):
-                result, why = self.run_it([self.a(), self.a()], self.polls(10, 11, 12), cap=cap)
-                self.assertEqual(result, rh.UNKNOWN, why)
-
-    def test_step_five_waits_the_visibility_bound(self):
-        slept = []
-        self.assertEqual(self.run_it([self.a(), self.a()], self.polls(10, 11, 12), slept=slept)[0], rh.PASS)
-        self.assertEqual(slept[-1], 0.5)
+    def test_a_missing_interval_is_unknown(self):
+        self.assertEqual(self.run_it([self.a()], [{"polls": 10, "started_ts": "s"}])[0], rh.UNKNOWN)
 
     def test_one_poll_is_not_enough(self):
-        result, why = self.run_it([self.a(), self.a()], self.polls(10, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11))
+        result, why = self.run_it([self.a(), self.a()], self.polls(10, *([11] * 10)))
         self.assertEqual(result, rh.UNKNOWN)
         self.assertIn("did not poll twice", why)
 
     def test_a_restart_while_watching_is_unknown(self):
-        statuses = self.polls(10) + self.polls(1, started="t")
-        self.assertIn("restarted", self.run_it([self.a()], statuses)[1])
+        self.assertIn("restarted", self.run_it([self.a()], self.polls(10) + self.polls(1, started="t"))[1])
 
     def test_a_refused_reload_in_the_last_document_fails(self):
         self.assertEqual(self.run_it([self.a(), self.a()], self.polls(10, 11, 12, failed=True))[0], rh.FAIL)
+
+    def test_the_settle_far_exceeds_the_kernel_tick(self):
+        self.assertGreaterEqual(hk.CTIME_SETTLE_S, 2 * 0.010)
 
 
 class PolicyTest(unittest.TestCase):
