@@ -241,14 +241,22 @@ class StalenessTest(unittest.TestCase):
 
     def test_roles_that_are_not_todays_targets_void_it(self):
         doc = pe.parse(build(), host=HOST)
-        self.assertEqual(pe.staleness(doc, now=NOW, bindings=BINDINGS, roles={"P04": ["peer:alpha", "peer:beta"]}), [])
-        why = pe.staleness(doc, now=NOW, bindings=BINDINGS, roles={"P04": ["peer:alpha", "peer:beta", "peer:gamma"]})
+        self.assertEqual(pe.staleness(doc, now=NOW, bindings=BINDINGS, roles=TODAY), [])
+        why = pe.staleness(doc, now=NOW, bindings=BINDINGS, roles=dict(TODAY, P04=["peer:alpha", "peer:beta", "peer:gamma"]))
         self.assertEqual(len(why), 1, why)
         self.assertIn("P04 targeted", why[0])
+
+    def test_a_missing_fail_stop_role_set_is_stale_never_unchecked(self):
+        doc = pe.parse(build(), host=HOST)
+        why = pe.staleness(doc, now=NOW, bindings=BINDINGS, roles={"P04": ["peer:alpha", "peer:beta"]})
+        self.assertEqual(why, ["today's roles for P03 were not given, so the document cannot be held to them"])
 
     def test_a_document_without_a_token_never_counts(self):
         doc = pe.parse(build(verdicts={"P04": "FAIL"}), host=HOST)
         self.assertIn("its fail-stop probes did not both pass", pe.staleness(doc, now=NOW, bindings=BINDINGS))
+
+
+TODAY = {"P03": ROLES["P03"], "P04": ROLES["P04"]}
 
 
 def st(mode, uid=0, gid=0, nlink=1):
@@ -271,7 +279,7 @@ class VerifyDocumentTest(unittest.TestCase):
     def run_it(self, live="token", now=NOW, bindings=BINDINGS):
         token = json.loads(self.raw)[pe.TOKEN_MEMBER]
         return pe.verify_document(self.PATH, host=HOST, now=now, bindings=bindings,
-                                  live_token=token if live == "token" else live, lstat=self.lstat,
+                                  live_token=token if live == "token" else live, roles=TODAY, lstat=self.lstat,
                                   read=lambda p: self.raw)
 
     def claim(self, found, words):
@@ -324,7 +332,7 @@ class VerifyDocumentTest(unittest.TestCase):
         def gone(p):
             raise FileNotFoundError(p)
         found = pe.verify_document(self.PATH, host=HOST, now=NOW, bindings=BINDINGS, live_token=None,
-                                   lstat=self.lstat, read=gone)
+                                   roles=TODAY, lstat=self.lstat, read=gone)
         self.assertEqual(self.claim(found, "current and passing").result, rh.UNKNOWN)
 
     def test_an_unhashable_role_is_a_malformed_fail_never_an_exception(self):
@@ -354,12 +362,12 @@ class VerifyDocumentTest(unittest.TestCase):
         for name, read in reads.items():
             with self.subTest(path=name):
                 found = pe.verify_document(self.PATH, host=HOST, now=NOW, bindings=BINDINGS,
-                                           live_token="run1:" + "a" * 64, lstat=self.lstat, read=read)
+                                           live_token="run1:" + "a" * 64, roles=TODAY, lstat=self.lstat, read=read)
                 c = self.claim(found, "signs with")
                 self.assertEqual(c.result, rh.FAIL)
                 self.assertIn("without delegation", c.remedy)
                 found = pe.verify_document(self.PATH, host=HOST, now=NOW, bindings=BINDINGS, live_token=None,
-                                           lstat=self.lstat, read=read)
+                                           roles=TODAY, lstat=self.lstat, read=read)
                 self.assertEqual(self.claim(found, "signs with").result, rh.PASS)
 
 

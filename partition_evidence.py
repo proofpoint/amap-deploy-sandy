@@ -251,6 +251,10 @@ def staleness(doc: Dict[str, Any], *, now: float, bindings: Dict[str, str],
     lane); empty when it counts. A document whose fail-stop probes did not
     both pass never counts."""
     why = []
+    if roles is not None:
+        missing = [pid for pid in FAIL_STOP if pid not in roles]
+        if missing:
+            why.append(f"today's roles for {', '.join(missing)} were not given, so the document cannot be held to them")
     for p in doc["probes"]:
         want = (roles or {}).get(p["id"])
         if want is not None and set(p["target_role"]) != set(want):
@@ -314,7 +318,7 @@ UNSIGN_REMEDY = ("render the local router's config without delegation (install -
 
 
 def verify_document(path: str, *, host: str, now: float, bindings: Dict[str, str], live_token: Any,
-                    roles: Optional[Dict[str, List[str]]] = None, lstat: Callable = os.lstat,
+                    roles: Dict[str, List[str]], lstat: Callable = os.lstat,
                     read: Callable[[str], bytes] = read_placed) -> List[rh.Check]:
     """The evidence document at `path`: placed as only root could place it,
     well-formed for `host`, current against `bindings`; and, on EVERY path,

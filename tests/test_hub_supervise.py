@@ -726,3 +726,46 @@ class LaunchdEnablementTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StopBudgetTest(unittest.TestCase):
+    """The stop timeout against the router's own join bound, derived from the
+    rendered budgets; and the start probe's window, named."""
+
+    def test_the_rendered_budgets_give_91_and_185_and_100_covers_the_join(self):
+        env = dict(hs.hr.environment(spec(), spec().hub))
+        self.assertEqual(hv.stop_budget(env), (91, 185))
+        [c] = hv.verify_stop_budget(spec())
+        self.assertEqual(c.result, rh.PASS)
+        self.assertIn("does not cover the start probe's login window (185 s)", c.claim)
+
+    def test_a_dot_budget_past_the_stop_timeout_fails(self):
+        self.addCleanup(setattr, hs.hr, "environment", hs.hr.environment)
+        real = hs.hr.environment
+        hs.hr.environment = lambda sp, hub: [(k, "60" if k == "RELAY_SMTP_DOT_TIMEOUT" else v) for k, v in real(sp, hub)]
+        [c] = hv.verify_stop_budget(spec())
+        self.assertEqual((c.result, c.expected.value), (rh.FAIL, 121))
+
+    def test_budgets_are_read_as_the_email_router_reads_them(self):
+        """Unset is its default; a fraction rounds up; a value it would refuse
+        is a FAIL by name, never a crash."""
+        self.assertEqual(hv.stop_budget({}), (600 + hv.JOIN_SLACK_S + hv.DONE_POLL_S, 300 + 5 * 300 + hv.QUIT_S))
+        env = {"RELAY_SMTP_DOT_TIMEOUT": "29.2", "RELAY_SMTP_CONNECT_TIMEOUT": "7.5", "RELAY_SMTP_COMMAND_TIMEOUT": "3"}
+        self.assertEqual(hv.stop_budget(env), (30 + hv.JOIN_SLACK_S + hv.DONE_POLL_S, 23 + hv.QUIT_S))
+        self.assertEqual(hv.RE_BUDGET_MAX, 3600)
+        self.assertEqual(hv.stop_budget({"RELAY_SMTP_DOT_TIMEOUT": "3600"})[0], 3600 + hv.JOIN_SLACK_S + hv.DONE_POLL_S)
+        for bad in ("0", "-5", "3601", "nan", "inf", "thirty"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError) as e:
+                    hv.stop_budget({"RELAY_SMTP_DOT_TIMEOUT": bad})
+                self.assertIn("RELAY_SMTP_DOT_TIMEOUT", str(e.exception))
+        self.addCleanup(setattr, hs.hr, "environment", hs.hr.environment)
+        real = hs.hr.environment
+        hs.hr.environment = lambda sp, hub: [(k, "nan" if k == "RELAY_SMTP_DOT_TIMEOUT" else v) for k, v in real(sp, hub)]
+        [c] = hv.verify_stop_budget(spec())
+        self.assertEqual(c.result, rh.FAIL)
+        self.assertIn("RELAY_SMTP_DOT_TIMEOUT", str(c.actual))
+
+    def test_each_term_of_the_bound_counts(self):
+        env = {"RELAY_SMTP_DOT_TIMEOUT": "10", "RELAY_SMTP_CONNECT_TIMEOUT": "7", "RELAY_SMTP_COMMAND_TIMEOUT": "3"}
+        self.assertEqual(hv.stop_budget(env), (10 + hv.JOIN_SLACK_S + hv.DONE_POLL_S, 7 + 5 * 3 + hv.QUIT_S))
