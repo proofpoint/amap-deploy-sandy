@@ -371,6 +371,59 @@ class LifecycleTest(unittest.TestCase):
                     f.write(tail)
                 self.assertEqual(self.opened(), ["r1"])
 
+    def test_the_records_grammar_is_whole_or_the_incident_stays_open(self):
+        """Codex's two cases, and the rest of the emitted grammar: a pending
+        list outside the actions, an event lacking a required member, one
+        with a member outside its kind's grammar, or one of the wrong type."""
+        self.act()
+        detected = os.path.join(self.dir, "incident-r1", "detected.json")
+        os.chmod(detected, 0o644)
+        good = json.load(open(detected))
+        path = os.path.join(self.dir, "incident-r1", "events.jsonl")
+        resolved = '{"event":"resolved","at":"x","evidence":"r2","reason":"fixed"}\n'
+        with open(path, "a") as f:
+            f.write(resolved)
+        self.assertEqual(self.opened(), [], "a whole history with a resolution closes")
+        for pending in (["rewrite", 17], ["rewrite", "rewrite"], ["reboot"]):
+            with self.subTest(pending=pending):
+                with open(detected, "w") as f:
+                    json.dump(dict(good, pending=pending), f)
+                self.assertEqual(self.opened(), ["r1"], "a resolution never closes a malformed record")
+        with open(detected, "w") as f:
+            json.dump(good, f)
+        for line in ('{"event":"stop_ok","at":"x"}', '{"event":"stop_ok","at":"x","id":""}',
+                     '{"event":"stop_failed","at":"x"}', '{"event":"rewrite_failed","at":"x"}',
+                     '{"event":"stop_not_attempted","at":"x","reason":"r","seen":{}}',
+                     '{"event":"rewrite_ok","at":"x","completion":"yes"}', '{"event":"rewrite_ok"}'):
+            with self.subTest(line=line):
+                with open(path, "w") as f:
+                    f.write(line + "\n" + resolved)
+                self.assertEqual(self.opened(), ["r1"])
+        with open(path, "w") as f:
+            f.write('{"event":"rewrite_ok","at":"x"}\n{"event":"stop_ok","at":"x","id":"c"}\n' + resolved)
+        self.assertEqual(self.opened(), [], "a whole, well-formed history closes")
+
+    def test_every_event_this_module_writes_is_in_its_grammar(self):
+        self.router.stop_works = False
+        self.act()
+        self.router.stop_works = True
+        self.complete()
+        self.complete(late={"run_id": "r1", "at": AT, "failing": ["P03"], "token": None,
+                            "failing_evidence_persisted": False})
+        inc = called(self, pi.read_all, self.store, self.dir)[0]
+        self.assertNotIsInstance(inc.events, rh.Unresolved, inc.events)
+        self.assertNotIsInstance(inc.detected, rh.Unresolved, inc.detected)
+
+    def test_a_repeated_act_on_a_recorded_incident_still_records_its_effects(self):
+        self.act()
+        self.router.running[ID] = True
+        self.router.delegation = True
+        called(self, pi.act, self.store, self.router.effects(), evidence_dir=self.dir, run_id="r1", at=AT,
+               failing=["P04"], token=None, identity=ID, evidence_persisted=True, emit=lambda s: None)
+        events = [json.loads(l)["event"] for l in open(os.path.join(self.dir, "incident-r1", "events.jsonl"))]
+        self.assertEqual(events, ["rewrite_ok", "stop_ok", "rewrite_ok", "stop_ok"])
+        self.assertEqual(json.load(open(os.path.join(self.dir, "incident-r1", "detected.json")))["failing"], ["P03"])
+
     def test_a_malformed_or_truncated_history_is_open(self):
         self.act()
         path = os.path.join(self.dir, "incident-r1", "events.jsonl")

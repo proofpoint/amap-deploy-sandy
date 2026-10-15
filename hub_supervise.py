@@ -634,10 +634,12 @@ ASK = hr.ASK
 
 
 #: The email router's own defaults for a budget left unset, and its bound on
-#: each: it reads them as seconds, a float in (0, RE_BUDGET_MAX].
+#: each (its smtp_send.DEADLINE_MAX): it reads them as seconds, a float in
+#: (0, RE_BUDGET_MAX]. The email router is not a sibling of this repository,
+#: so these are cited from its source, not imported from it.
 RE_BUDGET_DEFAULTS = {"RELAY_SMTP_CONNECT_TIMEOUT": 300, "RELAY_SMTP_COMMAND_TIMEOUT": 300,
                       "RELAY_SMTP_DOT_TIMEOUT": 600}
-RE_BUDGET_MAX = 900
+RE_BUDGET_MAX = 3600
 
 
 def _budget(env: Dict[str, str], key: str) -> float:
@@ -673,7 +675,8 @@ def verify_stop_budget(spec: Any) -> List[rh.Check]:
         bound, window = stop_budget(dict(hr.environment(spec, spec.hub)))
     except ValueError as e:
         claim = "the rendered SMTP budgets are ones the email router accepts"
-        want = rh.Fact("budgets", True, "the email router reads each as seconds in (0, 900], its default when unset")
+        want = rh.Fact("budgets", True, f"the email router reads each as seconds in (0, {RE_BUDGET_MAX}], its default "
+                                        "when unset")
         return [rh.check(claim, want, str(e), "render each budget as a number of seconds the router accepts",
                          ok=lambda e_, a: a is True)]
     covered = "covers" if STOP_TIMEOUT_S >= window else "does not cover"

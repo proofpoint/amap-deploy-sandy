@@ -752,7 +752,9 @@ class StopBudgetTest(unittest.TestCase):
         self.assertEqual(hv.stop_budget({}), (600 + hv.JOIN_SLACK_S + hv.DONE_POLL_S, 300 + 5 * 300 + hv.QUIT_S))
         env = {"RELAY_SMTP_DOT_TIMEOUT": "29.2", "RELAY_SMTP_CONNECT_TIMEOUT": "7.5", "RELAY_SMTP_COMMAND_TIMEOUT": "3"}
         self.assertEqual(hv.stop_budget(env), (30 + hv.JOIN_SLACK_S + hv.DONE_POLL_S, 23 + hv.QUIT_S))
-        for bad in ("0", "-5", "901", "nan", "inf", "thirty"):
+        self.assertEqual(hv.RE_BUDGET_MAX, 3600)
+        self.assertEqual(hv.stop_budget({"RELAY_SMTP_DOT_TIMEOUT": "3600"})[0], 3600 + hv.JOIN_SLACK_S + hv.DONE_POLL_S)
+        for bad in ("0", "-5", "3601", "nan", "inf", "thirty"):
             with self.subTest(bad=bad):
                 with self.assertRaises(ValueError) as e:
                     hv.stop_budget({"RELAY_SMTP_DOT_TIMEOUT": bad})

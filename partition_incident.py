@@ -192,24 +192,54 @@ def detected_problem(doc: Any, run_id: str) -> Optional[str]:
         return "its run_id is not its directory's"
     if not doc["failing"] or not all(isinstance(f, str) and f for f in doc["failing"]):
         return "it names no failing probe"
+    pending = doc["pending"]
+    if not all(isinstance(a, str) and a in ACTIONS for a in pending) or len(set(pending)) != len(pending):
+        return f"its pending actions are not distinct ones of {', '.join(ACTIONS)}"
     return None
 
 
+#: The actions an incident may have pending.
+ACTIONS = ("rewrite", "stop")
+#: Each event kind's grammar, as this module and the weekly job's writer
+#: emit it: (required members, optional members), each a name and whether it
+#: must be a non-empty string ("text"), any string ("str") or a bool. Every
+#: event also carries `at` (text), and may carry `completion` (bool) and `by`
+#: (text). A member outside its kind's grammar is malformed.
+EVENT_GRAMMAR = {
+    "rewrite_ok": ({}, {"observed": "text"}),
+    "rewrite_failed": ({"reason": "text"}, {}),
+    "stop_ok": ({"id": "text"}, {"observed": "text"}),
+    "stop_failed": ({"reason": "text"}, {"id": "text"}),
+    "stop_not_attempted": ({"reason": "text"}, {}),
+    "resolved": ({"evidence": "text", "reason": "text"}, {}),
+}
+_COMMON = ({"at": "text"}, {"completion": "bool", "by": "text"})
+
+
+def _typed(v: Any, kind: str) -> bool:
+    if kind == "bool":
+        return isinstance(v, bool)
+    return isinstance(v, str) and (kind == "str" or bool(v.strip()))
+
+
 def event_problem(e: Any) -> Optional[str]:
-    """Why `e` is not a well-formed event, or None."""
+    """Why `e` is not a well-formed event of its kind, or None."""
     if not isinstance(e, dict) or not isinstance(e.get("event"), str):
         return "not an event"
     kind = e["event"]
-    if kind not in EFFECT_EVENTS | LIFECYCLE_EVENTS:
+    if kind not in EVENT_GRAMMAR:
         return f"{kind!r} is outside the vocabulary"
-    if not isinstance(e.get("at"), str):
-        return f"{kind} has no time"
-    if kind == "resolved" and not (isinstance(e.get("evidence"), str) and e["evidence"]
-                                   and isinstance(e.get("reason"), str) and e["reason"].strip()):
-        return "a resolution without its evidence and reason"
-    for k in ("reason", "id", "observed"):
-        if k in e and not isinstance(e[k], str):
-            return f"{kind}'s {k} is not a string"
+    required = dict(EVENT_GRAMMAR[kind][0], **_COMMON[0])
+    allowed = dict(required, **EVENT_GRAMMAR[kind][1], **_COMMON[1])
+    missing = sorted(k for k in required if k not in e)
+    if missing:
+        return f"{kind} lacks {', '.join(missing)}"
+    extra = sorted(set(e) - set(allowed) - {"event"})
+    if extra:
+        return f"{kind} carries {', '.join(extra)}, outside its grammar"
+    bad = sorted(k for k in allowed if k in e and not _typed(e[k], allowed[k]))
+    if bad:
+        return f"{kind}'s {', '.join(bad)} has the wrong type or is empty"
     return None
 
 
@@ -251,10 +281,13 @@ def act(store: Store, fx: Effects, *, evidence_dir: str, run_id: str, at: str, f
                 "identity": identity if isinstance(identity, str) else None,
                 "pending": ["rewrite", "stop"], "failing_evidence_persisted": evidence_persisted}
     made = _try(store.mkdir, d)
+    kept = None
     if made is not None and _try(store.listdir, d) is not None:
         why: Optional[str] = made
     else:
-        why, _ = _publish_detected(store, d, run_id, detected)
+        why, in_force = _publish_detected(store, d, run_id, detected)
+        if why is not None and isinstance(in_force, dict):
+            kept, why = why, None
     recorded = why is None
     events = posixpath.join(d, EVENTS)
 
@@ -269,7 +302,7 @@ def act(store: Store, fx: Effects, *, evidence_dir: str, run_id: str, at: str, f
     record({"event": "rewrite_ok"} if rewrite_failed is None else {"event": "rewrite_failed", "reason": rewrite_failed})
     stop = _stop(fx, identity)
     record(stop)
-    status = (f"incident {'recorded' if recorded else 'NOT recorded: ' + str(why)}; "
+    status = (f"incident {('recorded (' + kept + ')') if kept else 'recorded' if recorded else 'NOT recorded: ' + str(why)}; "
               f"rewrite {rewrite}; stop {_stop_words(stop)}")
     _say(emit, status)
     return 1, status
@@ -431,9 +464,12 @@ def _exists(store: Store, path: str) -> bool:
 def resolve(store: Store, fx: Effects, *, evidence_dir: str, run_id: str, reason: str, at: str,
             fresh: Any, identity: Any) -> List[str]:
     """Close incident `run_id`: every prerequisite is checked against CURRENT
-    facts, and the one `resolved` event is appended. `fresh`: the newer
-    evidence document (parsed) with its staleness reasons, as (doc, reasons),
-    or an Unresolved. Returns why it refuses; empty when it resolved."""
+    facts, and the one `resolved` event is appended. The local router's
+    recorded id must be confirmed not running, whatever the history says
+    about its stop: a recorded `stop_ok` is never trusted alone. `fresh`: the
+    newer evidence document (parsed) with its staleness reasons, as (doc,
+    reasons), or an Unresolved. Returns why it refuses; empty when it
+    resolved."""
     got = read_all(store, evidence_dir)
     if isinstance(got, rh.Unresolved):
         return [got.reason]

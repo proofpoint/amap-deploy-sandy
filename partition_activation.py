@@ -97,7 +97,9 @@ def router_argv(spec: Dict[str, Any]) -> List[str]:
 
 
 #: The namespace modes run.sh leaves at the engine's default; anything else
-#: (the host's, or another container's) is named.
+#: (the host's, or another container's) is named. CgroupnsMode admits "host"
+#: because that IS the engine's default on a cgroup v1 host ("private" on
+#: v2), and run.sh sets no cgroup namespace either way.
 DEFAULT_NAMESPACES = {"PidMode": ("",), "IpcMode": ("", "private", "shareable"), "UTSMode": ("",),
                       "UsernsMode": ("",), "CgroupnsMode": ("", "private", "host")}
 
