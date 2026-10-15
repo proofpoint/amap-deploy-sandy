@@ -339,5 +339,50 @@ class DockerReadersTest(unittest.TestCase):
         self.assertEqual(bi.image_labels(["docker"], DIGEST, run), {})
 
 
+class InstallAndVerifyTest(unittest.TestCase):
+    """install writes the stamp from its pin check; verify reads it back."""
+
+    def setUp(self):
+        import amap_sandy as prov
+        import connector_pin as cpin
+        self.prov, self.cpin = prov, cpin
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        self.home = Path(td.name)
+
+    def install(self, pin):
+        self.prov.install_feature_payload(self.home, self.prov.DEFAULT_CONNECTOR_SRC, dry_run=False, pin=pin)
+        return self.prov.feature_payload_dir(self.home)
+
+    def test_install_stamps_the_commit_it_copied_from(self):
+        pin = self.cpin.PinCheck(PIN, COMMIT, True, self.home, "off the pin")
+        payload = self.install(pin)
+        self.assertEqual(bi.read_stamp(payload), (COMMIT, True))
+        self.assertEqual(json.loads((payload / bi.STAMP_NAME).read_text())["pinned"], PIN)
+
+    def test_a_dry_run_writes_no_stamp(self):
+        pin = self.cpin.PinCheck(PIN, PIN, False, self.home, "")
+        self.prov.install_feature_payload(self.home, self.prov.DEFAULT_CONNECTOR_SRC, dry_run=True, pin=pin)
+        self.assertFalse((self.prov.feature_payload_dir(self.home) / bi.STAMP_NAME).exists())
+
+    def test_verify_reads_the_stamp_and_names_the_connector_role(self):
+        self.install(self.cpin.PinCheck(PIN, PIN, False, self.home, ""))
+        args = SimpleNamespace(overlay=None)
+        real = self.cpin.pinned_commit
+        self.cpin.pinned_commit = lambda *a, **k: PIN
+        self.addCleanup(setattr, self.cpin, "pinned_commit", real)
+        out = self.prov.build_identity_outcome(args, self.home)
+        self.assertEqual(out.phase_extras, {"deployed_roles": [bi.ROLE_CONNECTOR]})
+        self.assertEqual([(e["id"], c.result) for e, c in zip(out.extras, out.checks)],
+                         [(bi.ID_CONNECTOR, rh.PASS)])
+
+    def test_an_unreadable_overlay_lists_both_routers_as_unknown(self):
+        bad = self.home / "overlay.json"
+        bad.write_text("not json")
+        out = self.prov.build_identity_outcome(SimpleNamespace(overlay=bad), self.home)
+        self.assertEqual(out.phase_extras["deployed_roles"], [bi.ROLE_HOP, bi.ROLE_HUB])
+        self.assertEqual([c.result for c in out.checks], [rh.UNKNOWN, rh.UNKNOWN])
+
+
 if __name__ == "__main__":
     unittest.main()
