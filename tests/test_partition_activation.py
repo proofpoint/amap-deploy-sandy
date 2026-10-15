@@ -165,3 +165,32 @@ class ArgvTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SupervisorTest(unittest.TestCase):
+    def setUp(self):
+        t = tempfile.TemporaryDirectory()
+        self.addCleanup(t.cleanup)
+        self.dirs = [os.path.join(t.name, "systemd"), os.path.join(t.name, "LaunchDaemons")]
+        for d in self.dirs:
+            os.makedirs(d)
+        with open(os.path.join(self.dirs[0], "example-email.service"), "w") as f:
+            f.write("ExecStart=/usr/bin/docker start -a ex-down\n")
+
+    def test_no_unit_naming_the_local_router_passes(self):
+        self.assertEqual(pa.supervisor_problems("ex-up", dirs=self.dirs), [])
+
+    def test_a_unit_or_daemon_naming_it_is_named(self):
+        p = os.path.join(self.dirs[1], "org.example.router.plist")
+        with open(p, "w") as f:
+            f.write("<string>ex-up</string>")
+        self.assertEqual(pa.supervisor_problems("ex-up", dirs=self.dirs), [p])
+
+    def test_an_unreadable_unit_is_unknown(self):
+        def read(p):
+            raise PermissionError(p)
+        got = pa.supervisor_problems("ex-up", dirs=self.dirs, read=read)
+        self.assertIn("cannot read", got.reason)
+
+    def test_a_missing_supervisor_directory_is_not_a_problem(self):
+        self.assertEqual(pa.supervisor_problems("ex-up", dirs=[self.dirs[0] + "-absent"]), [])

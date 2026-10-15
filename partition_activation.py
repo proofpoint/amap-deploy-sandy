@@ -145,3 +145,37 @@ def final_bytes(staged: bytes, token: str) -> bytes:
     # so the token is the delegation block's last member, as the renderer
     # places it.
     return (json.dumps(doc, indent=2) + "\n").encode("utf-8")
+
+
+#: Where a supervisor would live that could restart the local router: the
+#: places systemd and launchd load units from (hub_supervise's).
+SUPERVISOR_DIRS = ("/etc/systemd/system", "/Library/LaunchDaemons")
+
+
+def supervisor_problems(container: str, *, dirs: Sequence[str] = SUPERVISOR_DIRS,
+                        listdir=os.listdir, read=None) -> Any:
+    """Every unit or LaunchDaemon file that names the local router's
+    container: one would start it again after a fail-stop stop. The local
+    router runs `--detach` under `unless-stopped` and nothing else restarts
+    it. An Unresolved when a file that exists cannot be read."""
+    read = read or (lambda p: open(p, "rb").read())
+    needle = container.encode("utf-8")
+    bad = []
+    for d in dirs:
+        try:
+            names = sorted(listdir(d))
+        except FileNotFoundError:
+            continue
+        except OSError as e:
+            return rh.Unresolved(f"cannot list {d}: {e}")
+        for n in names:
+            p = os.path.join(d, n)
+            try:
+                data = read(p)
+            except IsADirectoryError:
+                continue
+            except OSError as e:
+                return rh.Unresolved(f"cannot read {p}: {e}")
+            if needle in data:
+                bad.append(p)
+    return bad
