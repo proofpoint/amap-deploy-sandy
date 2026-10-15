@@ -18,6 +18,7 @@ import re
 import types
 import os
 import signal
+import shutil
 import socket
 import stat
 import subprocess
@@ -99,6 +100,16 @@ for step in plan:
     elif kind == "evidence":
         place(os.path.join(ev, "partition-%s.json" % rid),
               evidence(step[1], step[2], step[4] if len(step) > 4 else None), step[3] if len(step) > 3 else 0o444)
+    elif kind == "containers":
+        # The engine's world changing during the run (a router started).
+        with open(STATE) as f:
+            state = json.load(f)
+        state.update(step[1])
+        with open(STATE, "w") as f:
+            json.dump(state, f)
+    elif kind == "liveconf":
+        # The live config replaced during the run, as a placement would.
+        place(ctx["live_config_path"], (json.dumps(step[1], indent=2) + "\n").encode(), 0o644)
     elif kind == "events":
         d = os.path.join(ev, "incident-" + rid)
         os.makedirs(d, exist_ok=True)
@@ -406,7 +417,7 @@ class Host:
         records = {"context.json": {"schema": pr.CONTEXT_SCHEMA, "run_id": rid, "host": "alpha", "started_at": at,
                                     "evidence_dir": self.ev, "live_config_path": self.conf,
                                     "router_container_id": target, "engine": engine or "unix://" + self.sock_path,
-                                    "docker": docker or self.docker}}
+                                    "docker": docker or self.docker, "mode": "weekly"}}
         if expect:
             records["expect.json"] = {"schema": pr.EXPECT_SCHEMA, "run_id": rid, "host": "alpha", "bindings": B}
         for n, doc in records.items():
@@ -1503,6 +1514,7 @@ class GrammarDriftTest(unittest.TestCase):
                          (pi.EVENT_GRAMMAR, pi._COMMON, pi.ACTIONS, pi.DETECTED_REQUIRED, pi.DETECTED_OPTIONAL))
         good = {"rewrite_ok": {}, "rewrite_failed": {"reason": "r"}, "stop_ok": {"id": "i", "observed": "o"},
                 "stop_failed": {"reason": "r"}, "stop_not_attempted": {"reason": "r"},
+                "stop_not_required": {"reason": "r"},
                 "resolved": {"evidence": "e", "reason": "r"}}
         corpus = [dict(event=k, at="x", **v) for k, v in good.items()]
         corpus += [dict(e, at="") for e in corpus] + [dict(e, by=1) for e in corpus] + \
@@ -1621,3 +1633,155 @@ class ToolTrustTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ProspectiveWriterTest(unittest.TestCase):
+    """A2: partition-weekly --prospective, with the local router stopped.
+    The refusals come before W2 and write nothing; a pass records no stop
+    target; a fail-stop's stop is not required only when nothing in the
+    incident's history, and nothing running, could be signing."""
+
+    NAME = "ex-up"
+
+    def setUp(self):
+        t = tempfile.mkdtemp(dir="/tmp", prefix="pw")
+        self.addCleanup(WriterTest._rm, t)
+        self.h = Host(os.path.realpath(t))
+        self.addCleanup(self.h.sock.close)
+        with open(self.h.conf, "w") as f:
+            f.write(json.dumps({"state_dir": "/s"}, indent=2) + "\n")       # pre-activation: no delegation
+        self.h.activation(pe.canonical({"spec": {"name": self.NAME}, "host": "alpha",
+                                        "final_config_path": self.h.conf}))
+        self.h.containers({})                                             # nothing runs: [1] is stopped
+
+    def run_a2(self):
+        argv = self.h.argv() + ["--prospective"]
+        return subprocess.run(argv, capture_output=True, text=True, timeout=120)
+
+    def snapshot(self):
+        """Every persistent thing a refusal must leave as it was. The empty
+        lock file is the lock itself, made when it is first taken, before any
+        guard can run, and is not compared."""
+        out = {}
+        for d in (self.h.exec, self.h.ev, os.path.dirname(self.h.conf)):
+            for root, dirs, files in os.walk(d):
+                for n in files:
+                    p = os.path.join(root, n)
+                    if p == os.path.join(self.h.exec, "lock"):
+                        continue
+                    with open(p, "rb") as f:
+                        out[p] = f.read()
+                for n in dirs:
+                    out[os.path.join(root, n)] = None
+        return out
+
+    def refused(self, words):
+        before = self.snapshot()
+        p = self.run_a2()
+        self.assertEqual(p.returncode, hs.EXIT_HANDOFF, p.stdout + p.stderr)
+        self.assertIn("refused, nothing written", p.stdout + p.stderr)
+        self.assertIn(words, p.stdout + p.stderr)
+        self.assertEqual(self.snapshot(), before)
+        self.assertIsNone(self.h.side_read("child-started.json"))
+        self.assertEqual(self.h.stops(), [])
+
+    def kinds(self):
+        return [e["event"] for e in WriterTest.event_records(self)]
+
+    def test_a_passing_a2_exits_zero_and_records_no_stop_target(self):
+        self.h.recovery()                         # an earlier certification, its router no longer running
+        rec = open(f"{self.h.exec}/recovery.json", "rb").read()
+        self.h.plan([["expect", B], ["evidence", B, PASS], ["outcome", 0, None]])
+        p = self.run_a2()
+        self.assertEqual(p.returncode, hs.EXIT_PASS, p.stdout + p.stderr)
+        self.assertIn("A2 passed", p.stdout + p.stderr)
+        self.assertEqual(open(f"{self.h.exec}/recovery.json", "rb").read(), rec)
+        self.assertFalse(os.path.exists(f"{self.h.ev}/stop-target.json"))
+        self.assertEqual((self.h.runs(), self.h.stops()), ([], []))
+        ctx = self.h.side_read("context.json") or {}
+        self.assertIn(ctx.get("mode", "prospective"), ("prospective",))
+
+    def test_a_live_delegation_refuses_before_anything(self):
+        with open(self.h.conf, "w") as f:
+            f.write(json.dumps({"state_dir": "/s", "delegation": {}}, indent=2) + "\n")
+        self.refused("already carries delegation")
+
+    def test_a_running_local_router_refuses_before_anything(self):
+        """G4': no timestamp can show which config a running one adopted."""
+        self.h.containers({self.NAME: True})
+        self.refused("A2 runs with the local router stopped")
+
+    def test_a_running_certified_router_refuses_before_anything(self):
+        self.h.recovery()
+        self.h.containers({TARGET: True})
+        self.refused("the weekly job certified")
+
+    def test_an_engine_that_cannot_say_refuses(self):
+        self.h.containers({"_inspect_fail": True, "_ps_fail": True})
+        self.refused("cannot say")
+
+    def test_a_run_awaiting_a_decision_refuses_and_is_left_to_the_ordinary_run(self):
+        self.h.abandoned("old", verdicts=FAIL3)
+        self.refused("awaits a decision")
+
+    def test_a_fail_stop_with_nothing_live_needs_no_stop(self):
+        """(vii): the history holds only observed rewrites, nothing runs."""
+        self.h.plan([["expect", B], ["evidence", B, FAIL3], ["outcome", 1, None]])
+        conf = open(self.h.conf, "rb").read()
+        p = self.run_a2()
+        self.assertEqual(p.returncode, hs.EXIT_INCIDENT, p.stdout + p.stderr)
+        self.assertEqual(self.kinds(), ["rewrite_ok", "stop_not_required"])
+        self.assertEqual(open(self.h.conf, "rb").read(), conf)
+        self.assertEqual(self.h.runs(), [])
+
+    def test_a_live_removal_in_the_child_keeps_the_stop_pending(self):
+        """(viii-b), across the child's act and the writer's own decision on
+        the same invocation: the child removed a live delegation; the writer
+        then observes none, and the stop is still not 'not required'."""
+        self.h.plan([["expect", B], ["evidence", B, FAIL3], ["detected", ["P03"]],
+                     ["events", '{"at":"x","event":"rewrite_ok"}\n'
+                                '{"at":"x","event":"stop_not_attempted","reason":"no target"}\n'],
+                     ["outcome", 1, None]])
+        p = self.run_a2()
+        self.assertEqual(p.returncode, hs.EXIT_INCIDENT, p.stdout + p.stderr)
+        kinds = self.kinds()
+        self.assertNotIn("stop_not_required", kinds)
+        self.assertEqual(kinds[-1], "stop_not_attempted")
+        self.assertEqual(len(self.h.runs()), 1, "kept: the stop is not shown done")
+
+    def test_a_local_router_started_during_the_run_is_never_stop_not_required(self):
+        """(viii-c): delegation placed, [1] restarted on it, removed again
+        without a restart: the file says none, a router under the name runs."""
+        self.h.plan([["expect", B], ["evidence", B, FAIL3], ["containers", {self.NAME: True}],
+                     ["outcome", 1, None]])
+        p = self.run_a2()
+        self.assertEqual(p.returncode, hs.EXIT_INCIDENT, p.stdout + p.stderr)
+        self.assertEqual(self.kinds(), ["rewrite_ok", "stop_not_attempted"])
+        self.assertEqual(len(self.h.runs()), 1)
+        self.assertEqual(self.h.stops(), [], "never stopped by name")
+
+
+class ContextModeTest(unittest.TestCase):
+    """The run's mode is read from its context only: a /1 context (before
+    the mode was recorded) is a weekly run's; a /2 context names its mode,
+    and any other value is no context at all."""
+
+    def read(self, doc):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d)
+        with open(os.path.join(d, "context.json"), "wb") as f:
+            f.write(pe.canonical(doc))
+        fd = os.open(d, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            return hs._context(fd)
+        finally:
+            os.close(fd)
+
+    def test_v1_is_weekly_v2_names_its_mode_and_nothing_else_is_a_context(self):
+        base = {"run_id": "r1", "host": "alpha", "started_at": "x", "evidence_dir": "/e", "live_config_path": "/c",
+                "router_container_id": None, "engine": "unix:///s", "docker": "/d"}
+        self.assertEqual(self.read(dict(base, schema=hs.CONTEXT_SCHEMA_V1))["mode"], "weekly")
+        self.assertEqual(self.read(dict(base, schema=hs.CONTEXT_SCHEMA, mode="prospective"))["mode"], "prospective")
+        self.assertIsNone(self.read(dict(base, schema=hs.CONTEXT_SCHEMA, mode="other")))
+        self.assertIsNone(self.read(dict(base, schema=hs.CONTEXT_SCHEMA)))
+        self.assertIsNone(self.read(dict(base, schema=hs.CONTEXT_SCHEMA_V1, mode="prospective")))

@@ -694,7 +694,9 @@ def _probe_weekly_main(argv):
 # being copies of partition_evidence's and partition_incident's that a test
 # holds equal to them.
 
-CONTEXT_SCHEMA = "amap-deploy.partition-context/1"
+CONTEXT_SCHEMA = "amap-deploy.partition-context/2"
+#: The context before the run mode was recorded: read as a weekly run's.
+CONTEXT_SCHEMA_V1 = "amap-deploy.partition-context/1"
 EXPECT_SCHEMA = "amap-deploy.partition-expect/1"
 OUTCOME_SCHEMA = "amap-deploy.partition-outcome/1"
 RECOVERY_SCHEMA = "amap-deploy.partition-recovery/1"
@@ -769,17 +771,21 @@ EVENT_GRAMMAR = {
     "stop_ok": ({"id": "text"}, {"observed": "text"}),
     "stop_failed": ({"reason": "text"}, {"id": "text"}),
     "stop_not_attempted": ({"reason": "text"}, {}),
+    "stop_not_required": ({"reason": "text"}, {}),
     "resolved": ({"evidence": "text", "reason": "text"}, {}),
 }
 _COMMON = ({"at": "text"}, {"completion": "bool", "by": "text"})
 DETECTED_REQUIRED = {"run_id": str, "at": str, "failing": list, "pending": list}
 DETECTED_OPTIONAL = {"token": (str, type(None)), "identity": (str, type(None)), "failing_evidence_persisted": bool,
-                     "recorded_late": bool, "taken_without_record": bool, "recorded_by": str}
+                     "recorded_late": bool, "taken_without_record": bool, "recorded_by": str, "mode": str}
+MODES = ("weekly", "prospective")
+NO_DELEGATION = "the live config carries no delegation"
 
 # Each run record's members and types, exactly.
 _OPT_STR = (str, type(None))
-CONTEXT_MEMBERS = {"schema": str, "run_id": str, "host": str, "started_at": str, "evidence_dir": str,
-                   "live_config_path": str, "router_container_id": _OPT_STR, "engine": str, "docker": str}
+CONTEXT_MEMBERS_V1 = {"schema": str, "run_id": str, "host": str, "started_at": str, "evidence_dir": str,
+                      "live_config_path": str, "router_container_id": _OPT_STR, "engine": str, "docker": str}
+CONTEXT_MEMBERS = dict(CONTEXT_MEMBERS_V1, mode=str)
 EXPECT_MEMBERS = {"schema": str, "run_id": str, "host": str, "bindings": dict}
 OUTCOME_MEMBERS = {"schema": str, "run_id": str, "code": int, "incident": bool, "router_seen": _OPT_STR, "why": str,
                    "config_sha256": _OPT_STR, "evidence_run_id": _OPT_STR, "evidence_sha256": _OPT_STR,
@@ -1551,6 +1557,26 @@ class _Engine:
             return False
         return None
 
+    def running_by_name(self, name):
+        """As `running`, for the container holding `name`: a guard read only,
+        never a stop target. Absence is a successful listing by exact name
+        that lists nothing."""
+        p = self.run(["inspect", "--type", "container", "--format", "{{json .State}}", name])
+        if p is None:
+            return None
+        if p.returncode == 0:
+            try:
+                state = json.loads(p.stdout)
+            except ValueError:
+                return None
+            if not isinstance(state, dict) or not isinstance(state.get("Running"), bool):
+                return None
+            return state["Running"] or state.get("Paused") is True or state.get("Restarting") is True
+        q = self.run(["ps", "--all", "--quiet", "--no-trunc", "--filter", f"name=^/{name}$"])
+        if q is not None and q.returncode == 0 and not q.stdout.strip():
+            return False
+        return None
+
     def identity(self, cid):
         """The container `cid` names, inspected BY ID: its document, or None
         whenever the engine does not answer with one."""
@@ -1715,6 +1741,8 @@ def detected_problem(doc, rid):
             return f"{k} has the wrong type"
     if doc["run_id"] != rid or not doc["failing"] or not all(isinstance(f, str) and f for f in doc["failing"]):
         return "not this run's, or names no failing probe"
+    if "mode" in doc and doc["mode"] != MODES[1]:
+        return "its mode is not prospective (a weekly run records none)"
     pending = doc["pending"]
     if not all(isinstance(a, str) and a in ACTIONS for a in pending) or len(set(pending)) != len(pending):
         return "its pending actions are malformed"
@@ -1757,7 +1785,7 @@ def _incident(evfd, rid):
         os.close(ifd)
 
 
-def _act(evidence_dir, live_config, target, rid, at, failing, engine, said):
+def _act(evidence_dir, live_config, target, rid, at, failing, engine, said, mode=MODES[0], router_running=None):
     """The fail-stop actions, in order, each attempted whatever the earlier
     did: the incident record if absent (an existing well-formed one keeps its
     cause), the live config without delegation if it still carries it, and
@@ -1765,8 +1793,11 @@ def _act(evidence_dir, live_config, target, rid, at, failing, engine, said):
     done only when the engine affirms it no longer does. Nothing is ever
     stopped by name. A well-formed resolved incident is left alone; a
     malformed history is completed, never trusted to say it is done. No
-    record, history or diagnostic failure can block the stop. Returns
-    whether every effect is done."""
+    record, history or diagnostic failure can block the stop. A PROSPECTIVE
+    run's stop is not required only when every rewrite in the incident's
+    history and this one observed no delegation, the target does not run,
+    and `router_running()` affirms the local router's name runs nothing.
+    Returns whether every effect is done."""
     def say(text):
         try:
             said.append(text)
@@ -1777,6 +1808,7 @@ def _act(evidence_dir, live_config, target, rid, at, failing, engine, said):
         evfd = _evidence_dir(evidence_dir)
         try:
             det, events = _incident(evfd, rid) or (None, [])
+            prior = events
             if events and any(e["event"] == "resolved" for e in events):
                 say(f"incident {rid} is resolved; nothing to complete")
                 return True
@@ -1787,9 +1819,10 @@ def _act(evidence_dir, live_config, target, rid, at, failing, engine, said):
             ifd = os.open(INCIDENT_PREFIX + rid, _DIR, dir_fd=evfd)
             if det is None:
                 try:
-                    _write_at(ifd, "detected.json", _canonical(
+                    _write_at(ifd, "detected.json", _canonical(dict(
                         {"run_id": rid, "at": at, "failing": failing, "identity": target,
-                         "pending": list(ACTIONS), "recorded_by": "writer"}), 0o444, exclusive=True)
+                         "pending": list(ACTIONS), "recorded_by": "writer"},
+                        **({"mode": mode} if mode == MODES[1] else {}))), 0o444, exclusive=True)
                 except FileExistsError:
                     say(f"incident {rid}: an existing record is kept as it is")
         finally:
@@ -1797,6 +1830,7 @@ def _act(evidence_dir, live_config, target, rid, at, failing, engine, said):
     except (OSError, ValueError, StepError, Tooling) as e:
         say(f"incident NOT recorded: {e}")
         ifd = None
+        prior = None
 
     def event(ev):
         if ifd is not None:
@@ -1812,7 +1846,7 @@ def _act(evidence_dir, live_config, target, rid, at, failing, engine, said):
             except OSError as e:
                 say(f"could not record {ev['event']}: {e.strerror}")
         say(ev["event"])
-    rewritten = False
+    rewritten = observed = False
     try:
         cfd, cname = _config_dir(live_config)
         try:
@@ -1824,18 +1858,38 @@ def _act(evidence_dir, live_config, target, rid, at, failing, engine, said):
                 _write_at(cfd, cname, (json.dumps(doc, indent=2) + "\n").encode("utf-8"), 0o644, keep=True)
                 event({"event": "rewrite_ok"})
             else:
-                event({"event": "rewrite_ok", "observed": "the live config carries no delegation"})
+                event({"event": "rewrite_ok", "observed": NO_DELEGATION})
+                observed = True
             rewritten = True
         finally:
             os.close(cfd)
     except (OSError, ValueError, UnicodeDecodeError, StepError, Tooling) as e:
         event({"event": "rewrite_failed", "reason": str(e) or type(e).__name__})
     stopped = False
+    eligible = mode == MODES[1] and observed and isinstance(prior, list) and _only_observed(prior)
+
+    def not_needed(why):
+        named = router_running() if router_running is not None else None
+        if named is False:
+            event({"event": "stop_not_required", "reason": f"prospective: {NO_DELEGATION} throughout, {why}, "
+                                                           "and the local router is stopped"})
+            return True
+        event({"event": "stop_not_attempted",
+               "reason": "a router may be signing that no record names (" + (
+                   "a container under the local router's name runs" if named else
+                   "the engine cannot say whether the local router runs") + "): stop it and run the ordinary "
+               "partition-weekly, or record resolved after checking it"})
+        return False
     if not isinstance(target, str) or not _HEX64.fullmatch(target):
-        event({"event": "stop_not_attempted", "reason": "no verified full container id to stop"})
+        if eligible:
+            stopped = not_needed("no certified target")
+        else:
+            event({"event": "stop_not_attempted", "reason": "no verified full container id to stop"})
     else:
         up = engine.running(target)
-        if up is False:
+        if up is False and eligible:
+            stopped = not_needed(f"the certified {target} does not run")
+        elif up is False:
             # Not [1]'s running container: never certified stopped, since a
             # stale id leaves the router that replaced it running.
             event({"event": "stop_not_attempted", "reason": f"{target} is not running: the target may be stale"})
@@ -1855,6 +1909,35 @@ def _act(evidence_dir, live_config, target, rid, at, failing, engine, said):
     return rewritten and stopped
 
 
+def _context(rfd):
+    """A run's context with its mode: a /2 record whose mode is one of
+    MODES, or a /1 record read as a weekly run's; None otherwise."""
+    doc = _record(rfd, "context.json", CONTEXT_MEMBERS, CONTEXT_SCHEMA)
+    if doc is not None:
+        return doc if doc["mode"] in MODES else None
+    doc = _record(rfd, "context.json", CONTEXT_MEMBERS_V1, CONTEXT_SCHEMA_V1)
+    return dict(doc, mode=MODES[0]) if doc is not None else None
+
+
+def _only_observed(events):
+    """partition_incident.only_observed, exactly: every rewrite in the
+    history found no delegation to remove."""
+    return all(e["event"] == "rewrite_ok" and e.get("observed") == NO_DELEGATION
+               for e in events if e["event"] in ("rewrite_ok", "rewrite_failed"))
+
+
+def _approved_name(rfd):
+    """The local router's container name in the run's copy of A1's record
+    (spec.name), or None when it cannot be read: a guard's name, never a
+    stop target."""
+    try:
+        doc = _strict_json(_read_at(rfd, ACTIVATION, DOC_MAX)[0])
+        name = doc["spec"]["name"]
+    except (OSError, ValueError, UnicodeDecodeError, KeyError, TypeError):
+        return None
+    return name if isinstance(name, str) and _NAME.fullmatch(name) else None
+
+
 def _decide(efd, run_name, current, said):
     """The parent's decision for one run, from its own records, with ITS
     context's engine and docker, re-verified, and never an old id on another
@@ -1865,9 +1948,10 @@ def _decide(efd, run_name, current, said):
     rid = RUN_NAME.fullmatch(run_name).group(1)
     rfd = os.open(run_name, _DIR, dir_fd=efd)
     try:
-        context = _record(rfd, "context.json", CONTEXT_MEMBERS, CONTEXT_SCHEMA)
+        context = _context(rfd)
         expect = _record(rfd, "expect.json", EXPECT_MEMBERS, EXPECT_SCHEMA)
         outcome = _record(rfd, "outcome.json", OUTCOME_MEMBERS, OUTCOME_SCHEMA)
+        router_name = _approved_name(rfd)
     finally:
         os.close(rfd)
     if context is None or context["run_id"] != rid:
@@ -1889,20 +1973,28 @@ def _decide(efd, run_name, current, said):
         incident = _incident(evfd, rid)
     finally:
         os.close(evfd)
-    done = set()
+    prospective = context["mode"] == MODES[1]
+    done, events = set(), None
     if incident is not None:
         det, events = incident
         done = {e["event"] for e in events} if events is not None else set()
-        if not failing and "resolved" not in done and not {"rewrite_ok", "stop_ok"} <= done:
+
+    def effects_done():
+        return "resolved" in done or {"rewrite_ok", "stop_ok"} <= done or (
+            prospective and events is not None and {"rewrite_ok", "stop_not_required"} <= done
+            and _only_observed(events))
+    if incident is not None:
+        if not failing and not effects_done():
             # Its own open incident, completed with its ORIGINAL cause; a
             # record that cannot be read is completed too, never trusted done.
             failing, why = (list(det["failing"]) if det else ["cause_unrecorded"]), ""
     if failing:
-        if "resolved" in done or {"rewrite_ok", "stop_ok"} <= done:
+        if effects_done():
             said.append(f"{rid}: its incident's history already shows every effect done; none is repeated")
             return EXIT_INCIDENT, None, False
         complete = _act(context["evidence_dir"], context["live_config_path"], context["router_container_id"], rid,
-                        context["started_at"], failing, engine, said)
+                        context["started_at"], failing, engine, said, mode=context["mode"],
+                        router_running=(lambda: engine.running_by_name(router_name)) if router_name else None)
         return EXIT_INCIDENT, None, not complete
     if outcome is not None and outcome["run_id"] == rid and outcome["code"] == 0 and not why:
         return EXIT_PASS, outcome, False
@@ -2086,8 +2178,55 @@ def _status(code):
     return EXIT_HANDOFF if code == EXIT_PASS else code
 
 
+def _prospective_refusal(efd, host, values, approved, recovery, docker, exec_root):
+    """Why a prospective run (A2) may not start, or "": every read here is a
+    guard, made before W2 and any effect. G1: the live config carries no
+    delegation. G2: no router a weekly pass certified (recovery.json's, for
+    this host, config, engine and evidence) runs. G3: no run awaits a
+    decision; that is the ordinary run's to complete. G4': no container
+    under the approved record's local router name runs: A2 runs with it
+    stopped, since nothing the writer can read shows which config a running
+    one adopted. Also A1's record must be this host's, for this config."""
+    try:
+        record = _strict_json(approved)
+        name, rec_host, final = record["spec"]["name"], record["host"], record["final_config_path"]
+    except (ValueError, KeyError, TypeError, UnicodeDecodeError):
+        return "A1's record cannot be read"
+    if rec_host != host or final != values["live_config"]:
+        return "A1's record is another host's or another config path's"
+    try:
+        cfd, cname = _config_dir(values["live_config"])
+        try:
+            doc = _strict_json(_read_at(cfd, cname, DOC_MAX)[0])
+        finally:
+            os.close(cfd)
+    except (OSError, ValueError, UnicodeDecodeError, Tooling) as e:
+        return f"the live config cannot be read: {e}"
+    if not isinstance(doc, dict) or "delegation" in doc:
+        return "A2 is pre-activation: the live config already carries delegation"
+    engine = _Engine(docker, values["engine"], exec_root)
+    if recovery and recovery["host"] == host and recovery["live_config_path"] == values["live_config"] \
+            and recovery["engine"] == values["engine"] and recovery["evidence_dir"] == values["evidence_dir"]:
+        up = engine.running(recovery["router_container_id"])
+        if up is not False:
+            return (f"a router the weekly job certified ({recovery['router_container_id']}) is running: de-activate "
+                    "it (A4 recreates it) or run the ordinary partition-weekly" if up else
+                    "the engine cannot say whether the certified router runs")
+    pending = [n for n in os.listdir(efd) if RUN_NAME.fullmatch(n)]
+    if pending:
+        return f"{', '.join(sorted(pending))} awaits a decision: run the ordinary partition-weekly, which completes it"
+    if not isinstance(name, str) or not _NAME.fullmatch(name):
+        return "A1's record names no local router container"
+    up = engine.running_by_name(name)
+    if up is not False:
+        return (f"A2 runs with the local router stopped: stop {name} (docker stop {name}), then run A2; A3 and A4 "
+                "start it on the activated config" if up else
+                f"the engine cannot say whether {name} runs")
+    return ""
+
+
 def partition_weekly(exec_root, host, document, sha256, activation, activation_sha256, now=None, child_timeout=None,
-                     emit=print):
+                     emit=print, prospective=False):
     """One weekly partition run (see the section comment). Returns its exit.
 
     Its run record, under the lock: W2 removes the old one, durably, before
@@ -2142,6 +2281,12 @@ def partition_weekly(exec_root, host, document, sha256, activation, activation_s
             os.close(cfd)
             approved = _activation(values["evidence_dir"], activation, activation_sha256)
             recovery = _recovery(efd)
+            mode = MODES[1] if prospective else MODES[0]
+            if prospective:
+                refused = _prospective_refusal(efd, host, values, approved, recovery, docker, exec_root)
+                if refused:
+                    said.append(f"refused, nothing written: {refused}")
+                    return EXIT_HANDOFF
             current = {"engine": values["engine"], "docker": docker, "exec_root": exec_root}
             # W2: no run directory is made unless the old record is durably gone.
             evfd = _evidence_dir(values["evidence_dir"])
@@ -2184,7 +2329,7 @@ def partition_weekly(exec_root, host, document, sha256, activation, activation_s
                 _write_at(rfd, "context.json", _canonical(
                     {"schema": CONTEXT_SCHEMA, "run_id": rid, "host": host, "started_at": at,
                      "evidence_dir": values["evidence_dir"], "live_config_path": values["live_config"],
-                     "router_container_id": target, "engine": values["engine"], "docker": docker}), 0o400,
+                     "router_container_id": target, "engine": values["engine"], "docker": docker, "mode": mode}), 0o400,
                     exclusive=True)
             finally:
                 os.close(rfd)
@@ -2218,7 +2363,10 @@ def partition_weekly(exec_root, host, document, sha256, activation, activation_s
                 child.wait()
             code, passed, keep = _decide(efd, run_name, current, said)
             rec["code"] = code
-            if code == EXIT_PASS:
+            if code == EXIT_PASS and prospective:
+                said.append(f"{rid}: A2 passed; its evidence carries the token for A3 "
+                            f"({passed['why']}); no stop target is recorded before activation")
+            elif code == EXIT_PASS:
                 why = _verified_target(_Engine(docker, values["engine"], run_dir), passed, values)
                 if why:
                     said.append(f"{rid}: passed; no stop target recorded: {why}")
@@ -2410,14 +2558,14 @@ def main(argv):
             place(argv[1], argv[2], sha256=argv[4], mode=int(argv[6], 8))
         elif len(argv) == 2 and argv[0] == "marker":
             marker(argv[1])
-        elif len(argv) == 13 and argv[0] == "partition-weekly":
-            opts = dict(zip(argv[1::2], argv[2::2]))
+        elif len(argv) in (13, 14) and argv[0] == "partition-weekly" and (len(argv) == 13 or argv[13] == "--prospective"):
+            opts = dict(zip(argv[1:13:2], argv[2:13:2]))
             if set(opts) != {"--exec-root", "--host", "--document", "--document-sha256", "--activation",
                              "--activation-sha256"}:
                 raise StepError("partition-weekly --exec-root DIR --host NAME --document PATH --document-sha256 HEX "
-                                "--activation PATH --activation-sha256 HEX")
+                                "--activation PATH --activation-sha256 HEX [--prospective]")
             return partition_weekly(opts["--exec-root"], opts["--host"], opts["--document"], opts["--document-sha256"],
-                                    opts["--activation"], opts["--activation-sha256"])
+                                    opts["--activation"], opts["--activation-sha256"], prospective=len(argv) == 14)
         elif len(argv) == 2 and argv[0] == "partition-provision":
             return partition_provision(argv[1])
         else:

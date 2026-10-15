@@ -193,7 +193,7 @@ class ChildTest(unittest.TestCase):
         self.context = {"schema": pr.CONTEXT_SCHEMA, "run_id": "r1", "host": "alpha",
                         "started_at": "2026-10-15T03:00:00Z", "evidence_dir": f"{r}/evidence",
                         "live_config_path": self.live, "router_container_id": self.TARGET,
-                        "engine": "unix:///var/run/docker.sock", "docker": "/usr/bin/docker"}
+                        "engine": "unix:///var/run/docker.sock", "docker": "/usr/bin/docker", "mode": "weekly"}
         self.document = b'{"host_setup": {"schema": 1}}'
         self.email = rebased(EMAIL, r)
         self.email["mounts"][1]["source"] = f"{r}/srv/hop"
@@ -477,3 +477,43 @@ class AffirmativeInspectTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class A2OutcomeTest(unittest.TestCase):
+    """partition_run.a2_outcome: A2 passes only with the token, the evidence
+    placed, P02 PASS, and P01 PASS or UNKNOWN for exactly the stopped router.
+    The documents are partition_evidence.build's."""
+
+    UNMEASURED = {"upstream": pr.P01_STOPPED}
+
+    def doc(self, **verdicts):
+        from test_partition_evidence import build
+        return build(verdicts=verdicts)
+
+    def outcome(self, doc, placed=True, p01=None):
+        p01 = [("UNKNOWN", "unresolved", pp.unmeasured_detail(self.UNMEASURED))] if p01 is None else p01
+        return pr.a2_outcome(doc, placed, p01, self.UNMEASURED)
+
+    def test_the_stopped_router_s_unknown_passes(self):
+        code, incident, why = self.outcome(self.doc(P01="UNKNOWN"))
+        self.assertEqual((code, incident), (pr.PASSED, False))
+        self.assertIn("is placed", why)
+
+    def test_each_shortfall_is_a_handoff_never_a_silent_pass(self):
+        for name, args in (("no token", dict(doc=self.doc(P03="FAIL"))),
+                           ("not placed", dict(doc=self.doc(P01="UNKNOWN"), placed=False)),
+                           ("P02", dict(doc=self.doc(P01="UNKNOWN", P02="FAIL"))),
+                           ("P01 FAIL", dict(doc=self.doc(P01="FAIL"), p01=[("FAIL", "ok", "x")])),
+                           ("P01 other UNKNOWN", dict(doc=self.doc(P01="UNKNOWN"),
+                                                      p01=[("UNKNOWN", "unresolved", "downstream: exec failed")]))):
+            with self.subTest(name=name):
+                self.assertEqual(self.outcome(**args)[0], pr.INCOMPLETE)
+
+    def test_the_unmeasured_router_never_hides_a_failure(self):
+        walks = {"downstream": [(1, 2102, 2102), (2, 0, 0)]}
+        self.assertEqual(pp.verdict_p01(walks, {"upstream": 2101, "downstream": 2102}, [("upstream", "downstream")],
+                                        self.UNMEASURED)[0], "FAIL")
+        ok = {"downstream": [(1, 2102, 2102)]}
+        verdict, _, detail = pp.verdict_p01(ok, {"upstream": 2101, "downstream": 2102},
+                                            [("upstream", "downstream")], self.UNMEASURED)
+        self.assertEqual((verdict, detail), ("UNKNOWN", pp.unmeasured_detail(self.UNMEASURED)))

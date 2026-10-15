@@ -28,7 +28,7 @@ import posixpath
 import re
 import stat
 import time
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import host_setup as hs
 import hub_runtime as hr
@@ -43,12 +43,18 @@ import router_health as rh
 
 #: Each record's schema, and its members with their types, exactly: the
 #: pinned writer reads them by the same grammar (a test holds the two equal).
-CONTEXT_SCHEMA = "amap-deploy.partition-context/1"
+CONTEXT_SCHEMA = "amap-deploy.partition-context/2"
+CONTEXT_SCHEMA_V1 = "amap-deploy.partition-context/1"
+#: The run modes the context records; a /1 context is a weekly run's.
+MODES = ("weekly", "prospective")
+#: Why A2 does not read the local router's processes: it runs stopped.
+P01_STOPPED = "the local router is stopped for A2; A5's post-activation P01 measures it"
 EXPECT_SCHEMA = "amap-deploy.partition-expect/1"
 OUTCOME_SCHEMA = "amap-deploy.partition-outcome/1"
 _OPT_STR = (str, type(None))
-CONTEXT_MEMBERS = {"schema": str, "run_id": str, "host": str, "started_at": str, "evidence_dir": str,
-                   "live_config_path": str, "router_container_id": _OPT_STR, "engine": str, "docker": str}
+CONTEXT_MEMBERS_V1 = {"schema": str, "run_id": str, "host": str, "started_at": str, "evidence_dir": str,
+                      "live_config_path": str, "router_container_id": _OPT_STR, "engine": str, "docker": str}
+CONTEXT_MEMBERS = dict(CONTEXT_MEMBERS_V1, mode=str)
 EXPECT_MEMBERS = {"schema": str, "run_id": str, "host": str, "bindings": dict}
 OUTCOME_MEMBERS = {"schema": str, "run_id": str, "code": int, "incident": bool, "router_seen": _OPT_STR, "why": str,
                    "config_sha256": _OPT_STR, "evidence_run_id": _OPT_STR, "evidence_sha256": _OPT_STR,
@@ -196,6 +202,26 @@ class Docker:
             return rh.Unresolved(f"docker image inspect {image} printed no JSON")
         return env if isinstance(env, list) else []
 
+    def running_by_name(self, name: str) -> Any:
+        """Whether a container under `name` runs: True or False only when the
+        engine affirms it (absence is a listing by exact name that lists
+        nothing), else an Unresolved. A guard read, never a stop target."""
+        p = self.runner(["inspect", "--type", "container", "--format", "{{json .State}}", name])
+        if isinstance(p, rh.Unresolved):
+            return p
+        if p.rc == 0:
+            try:
+                state = json.loads(p.out)
+            except ValueError:
+                return rh.Unresolved(f"docker inspect {name} printed no JSON")
+            if not isinstance(state, dict) or not isinstance(state.get("Running"), bool):
+                return rh.Unresolved(f"docker inspect {name} states no running state")
+            return state["Running"] or state.get("Paused") is True or state.get("Restarting") is True
+        q = self.runner(["ps", "--all", "--quiet", "--no-trunc", "--filter", f"name=^/{name}$"])
+        if not isinstance(q, rh.Unresolved) and q.rc == 0 and not q.out.strip():
+            return False
+        return rh.Unresolved(f"docker cannot say whether {name} runs")
+
     def running(self, cid: str) -> Any:
         """partition_incident's inspect, affirmative only: {"running": bool}
         when the engine states it (paused or restarting count as running),
@@ -269,6 +295,28 @@ def a5_snapshot(*, store: pst.RootedStore, run_dir: str, context: Dict[str, Any]
             "evidence_sha256": pe.sha_bytes(raw), "inspect_digest": pe.sha_json(pa.inspect_projection(live))}
 
 
+def a2_outcome(doc: Optional[bytes], placed: bool, p01: List[Any], unmeasured: Dict[str, str]) -> Tuple[int, bool, str]:
+    """A2's outcome when no fail-stop probe failed: PASSED only with the
+    token in the document, the document placed, P02 PASS and P01 PASS or
+    UNKNOWN for exactly the deliberately unmeasured stopped router; any
+    other shortfall is INCOMPLETE (a handoff), and T, when placed, is named."""
+    parsed = json.loads(doc) if doc else None
+    token = parsed[pe.TOKEN_MEMBER] if parsed else None
+    verdicts = {p["id"]: p["verdict"] for p in parsed["probes"]} if parsed else {}
+    named = f" (its token {token} is placed)" if token and placed else ""
+    if not token:
+        return INCOMPLETE, False, "A2 produced no token"
+    if not placed:
+        return INCOMPLETE, False, "A2's evidence was not placed, so it is not A2's evidence"
+    p01_ok = verdicts.get("P01") == "PASS" or (
+        verdicts.get("P01") == "UNKNOWN" and len(p01) == 1 and p01[0][2] == pp.unmeasured_detail(unmeasured))
+    if not p01_ok:
+        return INCOMPLETE, False, f"A2's P01 is {verdicts.get('P01')}, not PASS or the stopped router's UNKNOWN{named}"
+    if verdicts.get("P02") != "PASS":
+        return INCOMPLETE, False, f"A2's P02 is {verdicts.get('P02')}, not PASS{named}"
+    return PASSED, False, f"A2 passed{named}"
+
+
 def run_child(run_dir: str, lock_fd: int, *, runner: pp.Runner, stat_: Callable = os.stat,
               realpath_: Callable = os.path.realpath, lstat_: Callable = os.lstat,
               emit: Callable[[str], None] = print, now_: Callable[[], float] = time.time,
@@ -278,8 +326,12 @@ def run_child(run_dir: str, lock_fd: int, *, runner: pp.Runner, stat_: Callable 
     check_lock(lock_fd, exec_root, stat_)
     boot = pst.RootedStore(evidence_dir=run_dir, run_dir=run_dir, live_config=posixpath.join(run_dir, CONTEXT))
     context = read_record(boot, posixpath.join(run_dir, CONTEXT))
-    if isinstance(context, rh.Unresolved) or not typed(context, CONTEXT_MEMBERS, CONTEXT_SCHEMA):
+    if not isinstance(context, rh.Unresolved) and typed(context, CONTEXT_MEMBERS_V1, CONTEXT_SCHEMA_V1):
+        context = dict(context, mode=MODES[0])
+    elif isinstance(context, rh.Unresolved) or not typed(context, CONTEXT_MEMBERS, CONTEXT_SCHEMA) \
+            or context["mode"] not in MODES:
         raise ChildError(f"the run's context is not usable: {getattr(context, 'reason', 'its grammar')}")
+    prospective = context["mode"] == MODES[1]
     store = pst.RootedStore(evidence_dir=context["evidence_dir"], run_dir=run_dir,
                             live_config=context["live_config_path"])
     rid, at = context["run_id"], context["started_at"]
@@ -297,15 +349,28 @@ def run_child(run_dir: str, lock_fd: int, *, runner: pp.Runner, stat_: Callable 
         spec = hs.load_spec(sec)
         live_raw = store.read(context["live_config_path"])
         router_doc = pst.strict_object(live_raw)
+        if prospective:
+            # A2: [1]'s inputs are A1's placed record, never the running router
+            # (it is stopped) or the live config, which is checked only as G1.
+            if "delegation" in router_doc:
+                return finish(INCOMPLETE, False, "A2 is pre-activation: the live config now carries delegation")
+            approved = pa.parse_activation(store.read(posixpath.join(run_dir, ACTIVATION)))
+            if approved["host"] != context["host"] or approved["final_config_path"] != context["live_config_path"]:
+                return finish(INCOMPLETE, False, "A1's record is another host's or another config path's")
+            live_raw = approved["staged"].encode("utf-8")
+            router_doc = pst.strict_object(live_raw)
     except (OSError, ValueError, UnicodeDecodeError) as e:
         return finish(INCOMPLETE, False, f"the run's inputs cannot be read: {e}")
     docker = Docker(runner)
     email = hr.run_spec(spec, spec.hub)
     email_view = hr.view(email, hr.environment(spec, spec.hub))
     up = spec.hops[0][1]
-    router_live = docker.inspect(spec.runtime_of(up)["container"])
-    router = pa.spec_from_running(router_live) if isinstance(router_live, dict) else (
-        router_live if isinstance(router_live, rh.Unresolved) else rh.Unresolved("the local router is not running"))
+    if prospective:
+        router_live, router = None, approved["spec"]
+    else:
+        router_live = docker.inspect(spec.runtime_of(up)["container"])
+        router = pa.spec_from_running(router_live) if isinstance(router_live, dict) else (
+            router_live if isinstance(router_live, rh.Unresolved) else rh.Unresolved("the local router is not running"))
     if isinstance(router, rh.Unresolved):
         return finish(INCOMPLETE, False, f"the local router's spec cannot be read: {router.reason}")
     lanes = selected_lanes(router_doc)
@@ -329,14 +394,18 @@ def run_child(run_dir: str, lock_fd: int, *, runner: pp.Runner, stat_: Callable 
                           agent_inspects={s: docker.inspect(s) for s in lanes}, bindings=bound)
     except ppl.PlanError as e:
         return finish(INCOMPLETE, False, f"no plan: {e}")
+    p01: List[Any] = []
+    unmeasured = {up: P01_STOPPED} if prospective else None
     doc, code, report = pp.run(plan, runner, ppl.run_argv_for(router), stat_=stat_, realpath_=realpath_,
-                               lstat_=lstat_)
+                               lstat_=lstat_, p01_unmeasured=unmeasured, p01_out=p01)
     for line in report:
         emit(line)
     placed = doc is not None and pi._try(store.new_file, posixpath.join(context["evidence_dir"],
                                                                         f"partition-{rid}.json"), doc) is None
     failing = sorted(p["id"] for p in (json.loads(doc)["probes"] if doc else [])
                      if p["id"] in pe.FAIL_STOP and p["verdict"] == "FAIL")
+    if not failing and prospective:
+        return finish(*a2_outcome(doc, placed, p01, unmeasured))
     if not failing:
         if code != 0:
             return finish(INCOMPLETE, False, "no fail-stop failure, but the run did not pass")
@@ -352,9 +421,11 @@ def run_child(run_dir: str, lock_fd: int, *, runner: pp.Runner, stat_: Callable 
                     stop=lambda cid: runner(["stop", "-t", str(hv.STOP_TIMEOUT_S), cid]),
                     live_has_delegation=lambda: "delegation" in pst.strict_object(store.read(store.live_config)),
                     squatter_signing=lambda: rh.Unresolved("not asked by a weekly run"))
+    if prospective:
+        fx.router_running = lambda: docker.running_by_name(router["name"])
     pi.act(store, fx, evidence_dir=context["evidence_dir"], run_id=rid, at=at, failing=failing,
            token=(router_doc.get("delegation") or {}).get("partition_verified"),
            identity=target if isinstance(target, str) else rh.Unresolved("the run's context names no target"),
-           evidence_persisted=placed, emit=emit)
+           evidence_persisted=placed, emit=emit, mode=context["mode"])
     return finish(FAILED, True, f"fail-stop: {', '.join(failing)}")
 

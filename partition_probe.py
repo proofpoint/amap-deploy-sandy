@@ -221,10 +221,14 @@ def parse_markers(out: str) -> Any:
 # --- Verdicts ----------------------------------------------------------------------
 
 
-def verdict_p01(walks: Dict[str, Any], uids: Dict[str, int], hops: Sequence[Tuple[str, str]]) -> Tuple[str, str, str]:
+def verdict_p01(walks: Dict[str, Any], uids: Dict[str, int], hops: Sequence[Tuple[str, str]],
+                unmeasured: Optional[Dict[str, str]] = None) -> Tuple[str, str, str]:
     """`walks`: each runtime's principal → parse_proc's result. Every process
     runs under its principal's uid, real and effective, and no hop's two ends
-    share a uid, as the processes show it."""
+    share a uid, as the processes show it. `unmeasured`: principals whose
+    processes were deliberately not read, each with why; the verdict is then
+    UNKNOWN with exactly those reasons, and only once everything measured
+    passed, so a FAIL is never hidden behind it."""
     for principal in sorted(walks):
         w = walks[principal]
         if isinstance(w, rh.Unresolved):
@@ -235,7 +239,13 @@ def verdict_p01(walks: Dict[str, Any], uids: Dict[str, int], hops: Sequence[Tupl
     for up, down in hops:
         if up in walks and down in walks and uids[up] == uids[down]:
             return "FAIL", "ok", f"{up} and {down} share uid {uids[up]}"
+    if unmeasured:
+        return "UNKNOWN", "unresolved", unmeasured_detail(unmeasured)
     return "PASS", "ok", "every process under its principal's uid; no hop's ends share one"
+
+
+def unmeasured_detail(unmeasured: Dict[str, str]) -> str:
+    return "; ".join(f"{p}: not measured: {why}" for p, why in sorted(unmeasured.items()))
 
 
 def p02_targets(enum: Any, side: str, links: Sequence[str], owner_uid: int) -> Any:
@@ -729,7 +739,9 @@ def _run_spec(runner: Runner, base: Dict[str, Any], probe: str, run_id: str, scr
 
 
 def run(plan: Plan, runner: Runner, run_argv: Callable, stat_: Callable = os.stat,
-        realpath_: Callable = os.path.realpath, lstat_: Callable = os.lstat) -> Tuple[Optional[bytes], int, List[str]]:
+        realpath_: Callable = os.path.realpath, lstat_: Callable = os.lstat,
+        p01_unmeasured: Optional[Dict[str, str]] = None,
+        p01_out: Optional[List[Tuple[str, str, str]]] = None) -> Tuple[Optional[bytes], int, List[str]]:
     """(the evidence document's bytes or None, the exit code, the report).
     0 only when every probe passed; 1 when any failed; 2 when one could not
     establish its facts. A running email router that differs from its
@@ -757,10 +769,14 @@ def run(plan: Plan, runner: Runner, run_argv: Callable, stat_: Callable = os.sta
     # P01: each hop runtime's processes, read as its own principal.
     walks = {}
     for principal, (container, uid, gid) in sorted(plan.runtimes.items()):
+        if principal in (p01_unmeasured or {}):
+            continue      # never exec'd: its processes are not the ones this run is about
         out = _out(runner(["exec", "-u", f"{uid}:{gid}", container, "python3", "-I", "-S", "-c", P01_SCRIPT]))
         walks[principal] = out if isinstance(out, rh.Unresolved) else parse_proc(out)
     uids = {p: u for p, (_, u, _) in plan.runtimes.items()}
-    p01 = verdict_p01(walks, uids, plan.hops)
+    p01 = verdict_p01(walks, uids, plan.hops, p01_unmeasured)
+    if p01_out is not None:
+        p01_out.append(p01)
 
     # P02: per side, the owner's enumeration, the non-owner's answers, the owner's witness.
     sides, nonowner, witness, marker_dirs = {}, {}, {}, []
