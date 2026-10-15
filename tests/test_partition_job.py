@@ -157,14 +157,14 @@ class ValidationMirrorTest(unittest.TestCase):
         os.chmod(py, 0o755)
         return py
 
-    def run_block(self, py, env=None, as_owner=False, bound=180):
+    def run_block(self, py, env=None, as_owner=False, bound=180, shell="/bin/sh"):
         spec = dataclasses.replace(P, tools={"python3": py, "docker": os.path.realpath("/bin/sh")})
         script = "\n".join(pj.validation_steps(spec))
         if as_owner:
             import getpass
             script = script.replace("-user root", f"-user {getpass.getuser()}")
         try:
-            return subprocess.run(["/bin/sh", "-c", script], capture_output=True, text=True, timeout=bound,
+            return subprocess.run([shell, "-c", script], capture_output=True, text=True, timeout=bound,
                                   env=dict(os.environ, **(env or {}))).stdout
         except subprocess.TimeoutExpired:
             self.fail(f"the block did not finish within {bound} s")
@@ -285,9 +285,74 @@ class ValidationMirrorTest(unittest.TestCase):
                 out = self.run_block(py, as_owner=True, bound=60)
                 self.assertIn(beyond + "\n", out, "the walk ends, and judges past the cycle")
                 unmapped = self.run_block(py, bound=60)
-                self.assertFalse([l for l in unmapped.splitlines() if "loop/loop" in l or "../B/../A/../B" in l],
-                                 "each target is visited once by what it is, never again by a longer spelling")
+                self.assertFalse([l for l in unmapped.splitlines()
+                                  if "loop/loop/loop" in l or "../B/../A/../B/../A" in l],
+                                 "each entry is visited once; a longer spelling has only its directories judged")
                 self.d = os.path.dirname(d)
+
+    def shells(self):
+        """dash and bash, each once, as installed here."""
+        found = {}
+        for sh in ("/bin/dash", "/usr/bin/dash", "/bin/bash", "/usr/bin/bash"):
+            if os.path.exists(sh):
+                found.setdefault(os.path.basename(sh), os.path.realpath(sh))
+        return sorted(found.values())
+
+    def test_every_link_along_a_chain_is_followed_in_both_shells(self):
+        """a -> ../mid/b, mid/b -> <W>/c: c's tree is walked (it holds a writable
+        directory); and a parent chain dirlink -> ../mid2/p, p -> <W>/marked/real2:
+        the final target's writable parent is judged. Each link is its own visit."""
+        root = self.d
+        for shell in self.shells():
+            with self.subTest(shell=shell):
+                d = self.d = os.path.join(root, os.path.basename(shell))
+                os.makedirs(d)
+                os.makedirs(os.path.join(d, "c", "w"))
+                os.chmod(os.path.join(d, "c", "w"), 0o777)
+                os.makedirs(os.path.join(d, "marked", "real2", "x"))
+                os.chmod(os.path.join(d, "marked"), 0o777)
+                self.tree({"stdlib/a": "../mid/b", "mid/b": os.path.join(d, "c"),
+                           "stdlib/c2root/dirlink": "../../mid2/p",
+                           "mid2/p": os.path.join(d, "marked", "real2")})
+                os.symlink(os.path.join(d, "marked", "real2", "x"), os.path.join(d, "stdlib", "lx"))
+                with open(os.path.join(d, "marked", "real2", "x", "f"), "w") as f:
+                    f.write("x")
+                os.symlink(os.path.join(d, "stdlib", "c2root", "dirlink", "x", "f"), os.path.join(d, "stdlib", "via"))
+                py = self.interpreter([os.path.join(d, "stdlib")] * 3)
+                out = self.run_block(py, as_owner=True, bound=60, shell=shell)
+                self.assertIn(os.path.join(d, "c", "w") + "\n", out, "the second hop's tree")
+                self.assertIn(os.path.join(d, "marked") + "\n", out, "the second hop's directories")
+                self.d = root
+
+    def test_a_path_reaching_a_visited_target_still_has_its_own_directories_judged(self):
+        """first.py -> safe/linked.py; second.py -> outside/alias/linked.py,
+        outside/ 0777, outside/alias -> safe/. Both reach the same file; the
+        second path's writable directory is judged in either order. With
+        outside/ not writable, nothing about it is printed."""
+        root = self.d
+        for order, writable in ((("first", "second"), True), (("second", "first"), True), (("first", "second"), False)):
+            with self.subTest(order=order, writable=writable):
+                d = self.d = os.path.join(root, "-".join(order) + ("-w" if writable else "-safe"))
+                os.makedirs(os.path.join(d, "safe"))
+                with open(os.path.join(d, "safe", "linked.py"), "w") as f:
+                    f.write("x")
+                os.chmod(os.path.join(d, "safe", "linked.py"), 0o444)
+                os.makedirs(os.path.join(d, "outside"))
+                os.chmod(os.path.join(d, "outside"), 0o777 if writable else 0o755)
+                self.tree({"outside/alias": os.path.join(d, "safe"),
+                           "first-root/first.py": os.path.join(d, "safe", "linked.py"),
+                           "second-root/second.py": os.path.join(d, "outside", "alias", "linked.py")})
+                roots = [os.path.join(d, f"{o}-root") for o in order]
+                py = self.interpreter([roots[0], roots[0], roots[1]])
+                out = self.run_block(py, as_owner=True, bound=60)
+                self.assertEqual(os.path.join(d, "outside") + "\n" in out, writable, out)
+                self.d = root
+
+    def test_on_macos_a_library_path_holding_whitespace_is_named(self):
+        py = self.interpreter([self.d, self.d, self.d])
+        self.stub("uname", "echo Darwin\n")
+        env = self.stub("otool", "echo \"$1:\"; printf '\\t/usr/lib/a b.dylib (compatibility version 1.0.0)\\n'\n")
+        self.assertIn("discovery failed: whitespace in /usr/lib/a b.dylib\n", self.run_block(py, env=env))
 
     def test_nested_directory_links_and_a_cycle_are_followed_once(self):
         """stdlib/sub -> outside (a directory link); outside/deeper -> elsewhere/,
