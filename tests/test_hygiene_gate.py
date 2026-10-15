@@ -433,6 +433,29 @@ class IdentityBoundaryTest(GateTest):
         self.assertIn("(identity) matched nothing", out)
 
 
+class ReasonsRequiredTest(GateTest):
+    """Every located exception kind is refused without its reason."""
+
+    def test_each_kind_without_a_reason_cannot_run(self):
+        c, d = "c" * 40, "d" * 64
+        rows = {
+            "path": f"path public-repo a.txt {d}",
+            "commit": f"commit public-repo {c}",
+            "tree": f"tree public-repo {c} a.txt {d}",
+            "identity": f"identity public-repo {c} {d}",
+            "tag": f"tag public-repo {c}",
+        }
+        for kind, row in rows.items():
+            with self.subTest(kind):
+                self.write_lists(allow=row + "\n")
+                rc, out = self.run_gate("--tree", "HEAD")
+                self.assertEqual(rc, 2, out)
+                self.assertIn("allow.txt line 1", out)
+                self.write_lists(allow=row + " with its reason\n")
+                rc, out = self.run_gate("--tree", "HEAD")
+                self.assertNotEqual(rc, 2, out)
+
+
 class TagExceptionTest(GateTest):
     """A `tag` exception accepts one annotated tag OBJECT's tagger and
     message, and nothing else."""
@@ -492,6 +515,88 @@ class TagExceptionTest(GateTest):
         obj = self.tag("v1")
         self.write_lists(allow=f"commit public-repo {obj} not a tag row\n")
         self.assert_found(["--refs"], "tag refs/tags/v1 tagger")
+
+    def test_a_tag_row_never_accepts_a_commit_it_names(self):
+        """A lightweight tag has no tag object; a `tag` row naming the commit
+        it points at accepts nothing on that commit."""
+        c = self.repo.commit({"l.txt": "l\n"}, "reach zz-planted-host")
+        self.tag("light", annotated=False)
+        self.allow(c)
+        self.assert_found(["--all-history", "--refs"], f"commit {c[:12]} message:1")
+
+    def nest(self, inner, outer, message="wrapped"):
+        """An annotated tag `outer` whose target is the tag object `inner`."""
+        self.repo.git("tag", "-a", outer, f"refs/tags/{inner}", "-m", message,
+                      env={"GIT_COMMITTER_EMAIL": "clean@example.org"})
+        return self.repo.git("rev-parse", f"refs/tags/{outer}")
+
+    def test_a_nested_tag_is_scanned(self):
+        """A tag object reached only through another tag is still read."""
+        inner = self.tag("inner", "inner release for zz-planted-host")
+        self.nest("inner", "outer")
+        self.repo.git("tag", "-d", "inner")
+        out = self.assert_found(["--refs"], "tag refs/tags/outer (nested 1) tagger",
+                                "tag refs/tags/outer (nested 1) message:1")
+        self.assertNotIn("tag refs/tags/outer tagger", out)
+        self.assertTrue(inner)
+
+    def test_outer_and_inner_rows_are_independent(self):
+        inner = self.tag("inner")
+        self.repo.git("tag", "-a", "outer", "refs/tags/inner", "-m", "wrapped",
+                      env={"GIT_COMMITTER_EMAIL": self.PERSON})
+        outer = self.repo.git("rev-parse", "refs/tags/outer")
+        self.repo.git("tag", "-d", "inner")
+        self.allow(outer)
+        self.assert_found(["--refs"], "tag refs/tags/outer (nested 1) tagger")
+        self.allow(inner)
+        self.assert_found(["--refs"], "tag refs/tags/outer tagger")
+        self.write_lists(allow=f"tag public-repo {outer} a\ntag public-repo {inner} b\n")
+        self.assert_clean(["--refs"])
+
+    def test_one_inner_object_reached_twice_is_reported_once(self):
+        self.tag("inner")
+        self.nest("inner", "a-outer")
+        self.nest("inner", "b-outer")
+        self.repo.git("tag", "-d", "inner")
+        rc, out = self.run_gate("--refs")
+        self.assertEqual(rc, 1, out)
+        self.assertEqual(len([l for l in self.findings(out) if "(nested 1) tagger" in l]), 1)
+
+    def chain(self, depth, keep_inner=False):
+        """t0 <- t1 <- ... <- t<depth>; the inner refs deleted unless kept."""
+        self.tag("t0", email="clean@example.org")
+        for i in range(1, depth + 1):
+            self.nest(f"t{i - 1}", f"t{i}")
+        if not keep_inner:
+            for i in range(depth):
+                self.repo.git("tag", "-d", f"t{i}")
+        return f"t{depth}"
+
+    def test_a_chain_at_the_bound_is_scanned(self):
+        top = self.chain(hg.MAX_TAG_CHAIN)
+        self.assert_clean(["--refs"])
+        self.assertTrue(top)
+
+    def test_a_chain_past_the_bound_cannot_run(self):
+        self.chain(hg.MAX_TAG_CHAIN + 1)
+        rc, out = self.run_gate("--refs")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("nested tags", out)
+
+    def test_inner_refs_cannot_hide_a_chain_past_the_bound(self):
+        """Refs naming the inner tags get them scanned first; the outer
+        chain's depth must still be measured to its end."""
+        self.chain(hg.MAX_TAG_CHAIN + 1, keep_inner=True)
+        rc, out = self.run_gate("--refs")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("nested tags", out)
+
+    def test_a_chain_at_the_bound_with_inner_refs_is_scanned(self):
+        self.chain(hg.MAX_TAG_CHAIN, keep_inner=True)
+        self.assert_clean(["--refs"])
+
+    def test_the_chain_bound_is_the_reviewed_value(self):
+        self.assertEqual(hg.MAX_TAG_CHAIN, 8)
 
     def test_an_unused_tag_exception_is_listed(self):
         self.allow("e" * 40)
