@@ -41,6 +41,7 @@ import sys
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+import delegation_render as dr
 import router_health as rh
 import siblings
 
@@ -200,18 +201,24 @@ class HopRenderError(ValueError):
 
 
 class HopLink:
-    def __init__(self, link: str, trusted: Tuple[str, ...], egress: bool):
+    def __init__(self, link: str, trusted: Tuple[str, ...], egress: bool, inbound: Optional[bool] = None):
         self.link, self.trusted, self.egress = link, trusted, egress
+        #: The `delegation` member: None when absent (the host renders no
+        #: delegation block), else whether inbound verification is on.
+        self.inbound = inbound
 
 
 def parse_hop_link(policy: Dict[str, Any]) -> Optional[HopLink]:
     """The policy's `hop_link`, or None when the host has no hop link. Every
-    member is required and none is defaulted."""
+    member is required and none is defaulted, except `delegation`, whose
+    absence means no delegation block (delegation_render.parse_policy)."""
     if HOP_LINK_KEY not in policy:
         return None
     raw = policy[HOP_LINK_KEY]          # present: null or anything else malformed is refused
-    if not isinstance(raw, dict) or set(raw) != set(HOP_LINK_MEMBERS):
-        raise HopRenderError(f"{HOP_LINK_KEY} must have exactly {', '.join(HOP_LINK_MEMBERS)}")
+    if not isinstance(raw, dict) or not set(HOP_LINK_MEMBERS) <= set(raw) \
+            or set(raw) - set(HOP_LINK_MEMBERS) - {dr.POLICY_MEMBER}:
+        raise HopRenderError(f"{HOP_LINK_KEY} must have exactly {', '.join(HOP_LINK_MEMBERS)}, "
+                             f"and may have {dr.POLICY_MEMBER}")
     link = raw["link"]
     if not isinstance(link, str) or not LINK_RE.fullmatch(link):
         raise HopRenderError(f"{HOP_LINK_KEY}.link must match [a-z0-9][a-z0-9-]{{0,62}}")
@@ -221,7 +228,13 @@ def parse_hop_link(policy: Dict[str, Any]) -> Optional[HopLink]:
         raise HopRenderError(f"{HOP_LINK_KEY}.trusted_fleet_hosts must list canonical host domains, once each")
     if not isinstance(raw["egress"], bool):
         raise HopRenderError(f"{HOP_LINK_KEY}.egress must be true or false; it has no default")
-    return HopLink(link, tuple(sorted(trusted)), raw["egress"])
+    inbound = None
+    if dr.POLICY_MEMBER in raw:
+        try:
+            inbound = dr.parse_policy(raw[dr.POLICY_MEMBER])
+        except dr.DelegationRenderError as e:
+            raise HopRenderError(str(e)) from None
+    return HopLink(link, tuple(sorted(trusted)), raw["egress"], inbound)
 
 
 def _within(a: str, b: str) -> bool:

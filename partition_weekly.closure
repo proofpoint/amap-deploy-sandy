@@ -1,4 +1,5 @@
 partition_weekly.py
+delegation_render.py
 delivered_domains.py
 fleet_keys.py
 fleet_policy.py
