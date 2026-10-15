@@ -206,3 +206,39 @@ def verify(ps: Optional[PartitionSpec], gs: Optional[GateSpec], *, delegation_en
                             "(the design's §11.2 steps); until then delegation stays off",
                             do_not="never edit the record or the section to make it hold"))
     return out
+
+
+def plan(p: PartitionSpec, gs: Optional[GateSpec], q: Callable[[str], str], *, anchor: Optional[str],
+         read: Callable[[str], bytes] = read_record) -> List[str]:
+    """The operator's steps for the two sections: the directories, and, for the
+    gate, the design's six steps with this host's paths. When a record is
+    already placed, its own harness_sha is printed for the overlay change."""
+    record = posixpath.join(p.evidence_dir, GATE_RECORD)
+    lines = [
+        "# The partition evidence: root-owned, under root-owned directories; the controls' scratch space:",
+        f"install -d -o 0 -g 0 -m 0755 {q(p.evidence_dir)}",
+        f"install -d -o 0 -g 0 -m 0700 {q(p.scratch_dir)}",
+        "# The delegation gate, the operator's alone, when the conformance harness reports its full run passed,",
+        "# given the relayed record and its sha256:",
+        "#   1. shasum -a 256 <the relayed file>   (or sha256sum): it must print the relayed sha256",
+        f"#   2. install -o 0 -g 0 -m 0444 <the relayed file> {q(record)}",
+        "#   3. in the private overlay, a PR setting delegation_gate: harness_sha COPIED from the record's own",
+        "#      harness_sha member (the commit the gate ran at, reachable from the harness PR's head ref; squash",
+        f"#      merges leave it off main), record_sha256 the relayed sha256, record_path {record}",
+    ]
+    try:
+        own = hg.parse(read(record))["harness_sha"]
+        lines.append(f"#      the placed record's harness_sha is {own}: confirm it is reachable from the harness PR's "
+                     f"head ref in the harness repository")
+    except (OSError, hg.RecordError) as e:
+        lines.append(f"#      (no placed record to read the harness_sha from: {e})")
+    lines += [
+        "#   4. after the PR merges, write its commit to the anchor: install -o 0 -g 0 -m 0444 <a file holding the "
+        f"merged commit sha> {q(anchor) if anchor else '<secrets.anchor>'}",
+        "#   5. make the fresh overlay clone at that commit, as the runbook does for an overlay change",
+        "#   6. amap-sandy.py install (a dry run first), then the activation sequence; it refuses unless the gate "
+        "holds",
+    ]
+    if gs is not None:
+        lines.append(f"# delegation_gate is set: harness_sha {gs.harness_sha}, record_sha256 {gs.record_sha256}")
+    return lines

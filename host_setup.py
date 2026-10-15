@@ -495,6 +495,8 @@ def render_plan(spec: Spec, overlay_source: Optional[Path] = None,
         lines += hk.plan(spec, spec.keys, q, steps)
     if spec.supervision is not None:
         lines += hv.plan(spec, q, steps)
+    if spec.partition is not None:
+        lines += ps.plan(spec.partition, spec.gate, q, anchor=spec.secrets.anchor if spec.secrets else None)
     lines.append("# Start no runtime until every step above has run: each root exists and is synced "
                  "before a runtime opens it.")
     return lines

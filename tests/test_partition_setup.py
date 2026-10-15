@@ -196,3 +196,29 @@ class ReadRecordTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PlanTest(unittest.TestCase):
+    def setUp(self):
+        for name, value in (("MUTANT_IDS_SHA256", hg.set_sha256(IDS)), ("MUTANT_COUNT", len(IDS)),
+                            ("SCHEMA_SHA256", hashlib.sha256(SCHEMA.encode()).hexdigest()),
+                            ("UNIT_SHA256", hashlib.sha256(UNIT.encode()).hexdigest())):
+            self.addCleanup(setattr, hg, name, getattr(hg, name))
+            setattr(hg, name, value)
+        self.part = ps.PartitionSpec(evidence_dir=EV, scratch_dir=SCRATCH, weekday=0, hour=3)
+
+    def test_the_plan_prints_the_six_steps_with_this_hosts_paths(self):
+        def gone(p):
+            raise FileNotFoundError(p)
+        text = "\n".join(ps.plan(self.part, None, lambda s: s, anchor="/opt/amap/etc/overlay.sha", read=gone))
+        for words in (f"install -d -o 0 -g 0 -m 0755 {EV}", f"install -d -o 0 -g 0 -m 0700 {SCRATCH}",
+                      f"{EV}/gate-record.json", "COPIED from the record's own", "squash",
+                      "/opt/amap/etc/overlay.sha", "no placed record"):
+            self.assertIn(words, text)
+
+    def test_a_placed_record_has_its_harness_sha_printed_with_no_url(self):
+        raw = hg.canonical(healthy())
+        text = "\n".join(ps.plan(self.part, None, lambda s: s, anchor=None, read=lambda p: raw))
+        self.assertIn("the placed record's harness_sha is " + "4" * 40, text)
+        self.assertIn("reachable from the harness PR's head ref in the harness repository", text)
+        self.assertNotIn("://", text, "no URL: the harness repository is not named in public code")
