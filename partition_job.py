@@ -142,16 +142,21 @@ def validation_steps(p: ps.PartitionSpec, q: Callable[[str], str] = shlex.quote)
         f"find -L {py} {docker} $(realpath {py} {docker}) $P $L {bad} 2>/dev/null   # every link's target",
         f"for z in $Z; do [ -e \"$z\" ] && {{ find \"$z\" {own}; find -L \"$z\" {bad}; }}; done   # a zip present",
         "[ \"$(uname)\" = Darwin ] && { D=$(xcode-select -p); find \"$D\" " + own + "; find -L \"$D\" " + bad + "; }",
-        # Every link met anywhere in the closure, followed one hop at a time: its target, everything
-        # under a target directory, and every directory above the target, each target once (a cycle ends).
-        f"seen=; todo=$(find {py} {docker} $P $L $(for z in $Z; do [ -e \"$z\" ] && echo \"$z\"; done) "
-        "$( [ \"$(uname)\" = Darwin ] && xcode-select -p) -type l 2>/dev/null); "
-        "while [ -n \"$todo\" ]; do next=; for l in $todo; do r=$(readlink \"$l\"); "
-        "case \"$r\" in /*) t=$r;; *) t=\"$(dirname \"$l\")/$r\";; esac; "
-        "case \" $seen \" in *\" $t \"*) continue;; esac; seen=\"$seen $t\"; "
-        f"find \"$t\" {own} 2>/dev/null; next=\"$next $(find \"$t\" -type l 2>/dev/null)\"; x=$t; "
-        "while [ \"$x\" != / ] && [ \"$x\" != . ]; do x=$(dirname \"$x\"); "
-        f"find \"$x\" -maxdepth 0 {own}; [ -L \"$x\" ] && next=\"$next $x\"; done; done; todo=$next; done"
+        # Every link met in the closure, followed one hop at a time, as the writer's own check does: a
+        # link inside the closure has its target, everything under a target directory and every
+        # directory above it judged; a link among those directories has only its target and the
+        # directories above it judged. Each target and directory is judged once, so a cycle ends.
+        f"chk() {{ find \"$1\" -maxdepth 0 {own}; }}",
+        "up() { local x=$1; while [ \"$x\" != / ] && [ \"$x\" != . ]; do x=$(dirname \"$x\"); "
+        "case \" $ups \" in *\" $x \"*) return;; esac; ups=\"$ups $x\"; chk \"$x\"; "
+        "[ -L \"$x\" ] && hop \"$x\" chain; done; }",
+        "hop() { local r t l; r=$(readlink \"$1\"); case \"$r\" in /*) t=$r;; *) t=\"$(dirname \"$1\")/$r\";; esac; "
+        "case \" $seen \" in *\" $t \"*) return;; esac; seen=\"$seen $t\"; "
+        f"if [ \"$2\" = tree ]; then find \"$t\" {own} 2>/dev/null; "
+        "for l in $(find \"$t\" -type l 2>/dev/null); do hop \"$l\" tree; done; "
+        "else chk \"$t\"; [ -L \"$t\" ] && hop \"$t\" chain; fi; up \"$t\"; }",
+        f"seen=; ups=; for l in $(find {py} {docker} $P $L $(for z in $Z; do [ -e \"$z\" ] && echo \"$z\"; done) "
+        "$( [ \"$(uname)\" = Darwin ] && xcode-select -p) -type l 2>/dev/null); do hop \"$l\" tree; done"
         "   # every link's target, its tree and its directories",
         f"for p in {py} {docker} $P $Z $L \"$( [ \"$(uname)\" = Darwin ] && xcode-select -p)\"; do for x in \"$p\" "
         "\"$(realpath \"$p\" 2>/dev/null)\"; do while [ -n \"$x\" ] && [ \"$x\" != / ]; do x=$(dirname \"$x\"); "
