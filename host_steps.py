@@ -24,6 +24,13 @@ A runtime's secret file, in a directory that only that runtime's uid can open:
   python3 -I -S host_steps.py probe-weekly STATUS RUN_ID [--engine unix:///SOCK] [--docker ABS] -- ARGV...
                                                   ARGV's one-line result kept in STATUS
 
+The weekly partition job's root half (see its section below):
+
+  python3 -I -S -B host_steps.py partition-weekly --exec-root DIR --host NAME --document PATH --document-sha256 HEX
+                                                  one run of the provisioned bundle, under the job's lock
+  python3 -I -S -B host_steps.py partition-provision DIR
+                                                  DIR/bundle.new swapped in as the bundle, under the lock
+
 Every path is walked from `/` one component at a time, each opened with
 O_NOFOLLOW | O_DIRECTORY, so a symbolic link anywhere on the way, or a
 non-directory where a directory belongs, stops the step with an error and
@@ -636,6 +643,641 @@ def _probe_weekly_main(argv):
     return probe_weekly(argv[1], argv[2], rest, engine=engine, docker=docker)
 
 
+# --- The weekly partition job: its root half -------------------------------------------
+#
+# `partition-weekly` runs the partition probes from the provisioned bundle as
+# root, and `partition-provision` swaps a newly provisioned bundle in. Both hold
+# `<exec_root>/lock`. The job's lock descriptor is passed to its child, so the
+# lock is held until every process of the run is gone, even when this process
+# dies first. What the job trusts: this file, the unit's argv (the exec root,
+# the host, the approved document's path and sha256), the document's exact
+# bytes once they match that sha256, the bundle only root provisioned, and the
+# root-owned tools. It never runs git, and never reads the operator's clones.
+
+PARTITION_SCHEMA = "amap-deploy.partition-run/1"
+RECOVERY_SCHEMA = "amap-deploy.partition-recovery/1"
+#: The job's exits: passed; a fail-stop incident handled; refused (usage);
+#: a handoff (could not complete, nothing stopped); tooling not verified.
+EXIT_PASS, EXIT_INCIDENT, EXIT_HANDOFF, EXIT_TOOLING = 0, 1, 3, 4
+#: How long the child may run before its group is killed: the probes' own
+#: budgets keep it well inside.
+CHILD_TIMEOUT_S = 3600
+#: The bundle's bounds, checked before anything is read.
+BUNDLE_MAX_FILES, BUNDLE_FILE_MAX, BUNDLE_MAX_BYTES = 64, 1 << 20, 8 << 20
+BUNDLE, CLOSURE, PIN, LAUNCHER = "bundle", "partition_weekly.closure", "PIN", "partition_weekly.py"
+RUN_PREFIX = "run-"
+RUN_NAME = re.compile(r"run-([A-Za-z0-9._-]{1,64})")
+DOC_MAX = 1 << 20
+#: `docker stop -t` for the local router, as its supervision renders it.
+STOP_TIMEOUT_S = 100
+INCIDENT_PREFIX = "incident-"
+#: Who must own what the job trusts: root.
+ROOT_UID = 0
+
+
+def _ancestor_ok(st):
+    """A directory above a trusted path: root's, and no one else can write it."""
+    return st.st_uid == ROOT_UID and not st.st_mode & 0o022
+
+
+class Handoff(Exception):
+    """The run cannot proceed, and nothing is stopped: the reason is reported."""
+
+
+class Tooling(Exception):
+    """What root would run is not as provisioned: tamper or misconfiguration."""
+
+
+def _strict_json(raw):
+    def pairs(items):
+        out = {}
+        for k, v in items:
+            if k in out:
+                raise ValueError(f"duplicate key {k!r}")
+            out[k] = v
+        return out
+
+    def no_constant(name):
+        raise ValueError(f"non-finite number {name}")
+    doc = json.loads(raw.decode("utf-8"), object_pairs_hook=pairs, parse_constant=no_constant)
+    if not isinstance(doc, dict):
+        raise ValueError("not a JSON object")
+    return doc
+
+
+def _canonical(doc):
+    return json.dumps(doc, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def _read_at(dfd, name, limit, want=None):
+    """A regular file in `dfd`, opened without following a link, checked on
+    the descriptor it is read from (`want`: (uid, mode, nlink) it must have),
+    and read up to `limit` bytes."""
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dfd)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise ValueError(f"{name} is not a regular file")
+        if want is not None and (st.st_uid, stat.S_IMODE(st.st_mode), st.st_nlink) != want:
+            raise ValueError(f"{name} is not {want[0]}:{oct(want[1])} with {want[2]} link(s)")
+        if st.st_size > limit:
+            raise ValueError(f"{name} is over {limit} bytes")
+        chunks, total = [], 0
+        while total <= limit:
+            b = os.read(fd, limit + 1 - total)
+            if not b:
+                break
+            chunks.append(b)
+            total += len(b)
+        if total > limit:
+            raise ValueError(f"{name} is over {limit} bytes")
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def _record(dfd, name):
+    """A run record as one strict object, or None: absent, truncated and
+    malformed are all "not there", never repaired."""
+    try:
+        return _strict_json(_read_at(dfd, name, DOC_MAX))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+
+
+def _write_at(dfd, name, data, mode, exclusive=False, keep=False):
+    """`name` in `dfd`: written under a fresh temporary name (O_EXCL), then
+    linked into place when `exclusive` (it must not exist) or renamed over it;
+    with `keep`, the existing file's owner and mode are kept."""
+    owner = None
+    if keep:
+        old = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+        if not stat.S_ISREG(old.st_mode):
+            raise ValueError(f"{name} is not a regular file")
+        owner, mode = (old.st_uid, old.st_gid), stat.S_IMODE(old.st_mode)
+    tmp = f".{name}.{os.getpid()}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=dfd)
+    try:
+        try:
+            os.write(fd, data)
+            if owner is not None:
+                os.fchown(fd, *owner)
+            os.fchmod(fd, mode)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        if exclusive:
+            os.link(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)
+            os.unlink(tmp, dir_fd=dfd)
+        else:
+            os.rename(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)
+    except BaseException:
+        try:
+            os.unlink(tmp, dir_fd=dfd)
+        except OSError:
+            pass
+        raise
+    os.fsync(dfd)
+
+
+def _remove_tree(dfd, name):
+    """`name` under `dfd` and everything in it, never following a link."""
+    st = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+    if not stat.S_ISDIR(st.st_mode):
+        os.unlink(name, dir_fd=dfd)
+        return
+    sub = os.open(name, _DIR, dir_fd=dfd)
+    try:
+        os.fchmod(sub, 0o700)  # a read-only tree (a bundle) is being removed whole
+        for n in os.listdir(sub):
+            _remove_tree(sub, n)
+    finally:
+        os.close(sub)
+    os.rmdir(name, dir_fd=dfd)
+
+
+def _root_dir(path, mode):
+    """A descriptor for `path`, reached without following a link, which must
+    be root-owned with exactly `mode`, under root-owned parents that no one
+    else can write."""
+    parts = _parts(path)
+    fd = os.open("/", _DIR)
+    try:
+        for i, name in enumerate(parts):
+            if not _ancestor_ok(os.fstat(fd)):
+                raise Tooling(f"{'/' + '/'.join(parts[:i])}: not root-owned, or writable by others")
+            nxt = os.open(name, _DIR, dir_fd=fd)
+            os.close(fd)
+            fd = nxt
+        st = os.fstat(fd)
+        if (st.st_uid, stat.S_IMODE(st.st_mode)) != (ROOT_UID, mode):
+            raise Tooling(f"{path}: not root-owned {oct(mode)}")
+        return fd
+    except OSError as e:
+        os.close(fd)
+        raise Tooling(f"{path}: not a real directory ({e.strerror})") from None
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _take_partition_lock(efd):
+    fd = os.open("lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=efd)
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != ROOT_UID:
+        os.close(fd)
+        raise Tooling("the lock is not a root-owned regular file")
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        raise Handoff("another run holds the lock") from None
+    return fd
+
+
+def _document(path, sha256):
+    """The approved document's exact bytes and its host-setup section. A
+    document that is not the one the unit approved is a handoff."""
+    parent, name = _split(path)
+    try:
+        dfd = open_dir(parent)
+        try:
+            raw = _read_at(dfd, name, DOC_MAX)
+        finally:
+            os.close(dfd)
+    except (OSError, ValueError, StepError) as e:
+        raise Handoff(f"the approved document cannot be read: {e}") from None
+    if hashlib.sha256(raw).hexdigest() != sha256:
+        raise Handoff("the document is not the one the unit approved: re-render the unit after an overlay change")
+    try:
+        doc = _strict_json(raw)
+    except (ValueError, UnicodeDecodeError) as e:
+        raise Handoff(f"the approved document does not parse: {e}") from None
+    sec = doc.get("host_setup", doc)
+    if not isinstance(sec, dict):
+        raise Handoff("the approved document has no host_setup object")
+    return raw, sec
+
+
+def _authority(sec, exec_root):
+    """What the approved document selects, held to the unit's exec root."""
+    try:
+        part = sec["partition"]
+        values = {"evidence_dir": part["evidence_dir"], "exec_root": part["exec_root"],
+                  "python3": part["tools"]["python3"], "docker": part["tools"]["docker"],
+                  "engine": sec["supervision"]["engine"], "live_config": sec["keys"]["local_config"],
+                  "pin": sec["secrets"]["clones"]["deploy"]["sha"]}
+    except (KeyError, TypeError):
+        raise Handoff("the approved document lacks what the weekly job needs") from None
+    if values["exec_root"] != exec_root:
+        raise Handoff("the approved document's exec_root is not the unit's")
+    for k in ("evidence_dir", "python3", "docker", "live_config"):
+        _parts(values[k])
+    if not isinstance(values["pin"], str) or not re.fullmatch(r"[0-9a-f]{40}", values["pin"]):
+        raise Handoff("the approved document's deploy pin is not a commit sha")
+    return values
+
+
+def _verify_bundle(efd, pin):
+    """The provisioned bundle: root's, flat, only regular files no one else
+    can write, exactly the closure list plus the list and PIN, each valid
+    UTF-8 holding no NUL, within the bounds; PIN equal to the deploy pin."""
+    try:
+        bfd = os.open(BUNDLE, _DIR, dir_fd=efd)
+    except OSError as e:
+        raise Tooling(f"no bundle: {e.strerror}") from None
+    try:
+        st = os.fstat(bfd)
+        if st.st_uid != ROOT_UID or st.st_mode & 0o222:
+            raise Tooling("the bundle directory is not root's and read-only")
+        names = os.listdir(bfd)
+        if len(names) > BUNDLE_MAX_FILES:
+            raise Tooling("the bundle holds too many files")
+        total, contents = 0, {}
+        for n in names:
+            try:
+                data = _read_at(bfd, n, BUNDLE_FILE_MAX)
+                fst = os.stat(n, dir_fd=bfd, follow_symlinks=False)
+            except (OSError, ValueError) as e:
+                raise Tooling(f"bundle file {n!r}: {e}") from None
+            if fst.st_uid != ROOT_UID or fst.st_mode & 0o222:
+                raise Tooling(f"bundle file {n!r} is not root's and read-only")
+            total += len(data)
+            if total > BUNDLE_MAX_BYTES:
+                raise Tooling("the bundle is over its size bound")
+            if b"\0" in data:
+                raise Tooling(f"bundle file {n!r} holds a NUL")
+            try:
+                contents[n] = data.decode("utf-8")
+            except UnicodeDecodeError:
+                raise Tooling(f"bundle file {n!r} is not UTF-8") from None
+        if CLOSURE not in contents or PIN not in contents:
+            raise Tooling("the bundle has no closure list or no PIN")
+        closure = [l for l in contents[CLOSURE].splitlines() if l]
+        if LAUNCHER not in closure or set(names) != set(closure) | {CLOSURE, PIN} or len(set(closure)) != len(closure):
+            raise Tooling("the bundle's files are not exactly its closure list")
+        if contents[PIN].strip() != pin:
+            raise Handoff("the bundle is not the deploy pin: provision it again after the pin move")
+    finally:
+        os.close(bfd)
+
+
+def _trusted_tool(path):
+    """`path`'s realpath, a root-owned executable no one else can write,
+    under root-owned directories no one else can write."""
+    real = os.path.realpath(path)
+    try:
+        st = os.lstat(real)
+    except OSError as e:
+        raise Tooling(f"{path}: {e.strerror}") from None
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != ROOT_UID or st.st_mode & 0o022 or not st.st_mode & 0o111:
+        raise Tooling(f"{path} resolves to {real}, which is not a root-owned executable no one else can write")
+    d = os.path.dirname(real)
+    while True:
+        if not _ancestor_ok(os.lstat(d)):
+            raise Tooling(f"{d}, above {real}, is not root-owned, or is writable by others")
+        if d == "/":
+            return real
+        d = os.path.dirname(d)
+
+
+def _engine_socket(endpoint):
+    if not isinstance(endpoint, str) or not endpoint.startswith("unix:///"):
+        raise Tooling("the engine is not a unix socket")
+    try:
+        st = os.lstat(endpoint[len("unix://"):])
+    except OSError as e:
+        raise Tooling(f"the engine socket: {e.strerror}") from None
+    if not stat.S_ISSOCK(st.st_mode):
+        raise Tooling("the engine socket is not a socket")
+    return st.st_uid
+
+
+class _Engine:
+    """docker, as root: the given CLI against the given engine, with an empty
+    configuration and home of the run's own, so no context, helper or plugin
+    is read."""
+
+    def __init__(self, docker, engine, run_dir):
+        self.docker, self.env = docker, {"DOCKER_HOST": engine, "DOCKER_CONFIG": os.path.join(run_dir, "docker"),
+                                         "HOME": os.path.join(run_dir, "home"), "LC_ALL": "C"}
+
+    def run(self, args, timeout=STOP_TIMEOUT_S + 60):
+        try:
+            return subprocess.run([self.docker] + args, shell=False, close_fds=True, stdin=subprocess.DEVNULL,
+                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=self.env, timeout=timeout)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+
+    def running(self, cid):
+        """True, False, or None when the engine cannot say."""
+        p = self.run(["inspect", "--type", "container", "--format", "{{.State.Running}}", cid])
+        if p is None:
+            return None
+        if p.returncode != 0:
+            return False
+        return {b"true": True, b"false": False}.get(p.stdout.strip())
+
+    def remove_run(self, run_id):
+        p = self.run(["ps", "--all", "--quiet", "--filter", f"label={RUN_LABEL}={run_id}"])
+        ids = p.stdout.decode("ascii", "replace").split() if p is not None and p.returncode == 0 else []
+        if ids:
+            self.run(["rm", "--force"] + ids)
+
+
+def _evidence_failing(evfd, rid, context, expect):
+    """This run's fail-stop failures, read from its own evidence document
+    only when it is trustworthy: root:root 0444 with one link, canonical,
+    this run's and this host's, with the bindings the child recorded before
+    its first one-shot. Otherwise none, and why: a FAIL is never invented."""
+    if expect is None:
+        return [], "no expectation recorded, so no evidence of this run is used"
+    try:
+        raw = _read_at(evfd, f"partition-{rid}.json", DOC_MAX, want=(ROOT_UID, 0o444, 1))
+        doc = _strict_json(raw)
+    except FileNotFoundError:
+        return [], "no evidence placed"
+    except (OSError, ValueError, UnicodeDecodeError) as e:
+        return [], f"the evidence is not trustworthy: {e}"
+    if _canonical(doc) != raw or doc.get("run_id") != rid or doc.get("host") != context.get("host") \
+            or doc.get("bindings") != expect.get("bindings") or expect.get("run_id") != rid:
+        return [], "the evidence is not this run's, or not under its expected bindings"
+    return sorted(p.get("id") for p in doc.get("probes") or []
+                  if isinstance(p, dict) and p.get("id") in ("P03", "P04") and p.get("verdict") == "FAIL"), ""
+
+
+def _append_event(ifd, event):
+    fd = os.open("events.jsonl", os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | os.O_CLOEXEC, 0o644,
+                 dir_fd=ifd)
+    try:
+        os.write(fd, (json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8"))
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _act(evidence_dir, live_config, target, rid, at, failing, engine, said):
+    """The fail-stop actions, in order, each attempted whatever the earlier
+    did: the incident record if absent, the live config without delegation
+    if it still carries it, and the stop of `target`, only if it runs, judged
+    by an inspect after it. Nothing is ever stopped by name. Each effect is
+    appended as an event; a resolved incident is left alone."""
+    name = INCIDENT_PREFIX + rid
+    try:
+        evfd = open_dir(evidence_dir)
+    except StepError as e:
+        said.append(f"incident NOT recorded: {e}")
+        evfd = None
+    ifd = None
+    if evfd is not None:
+        try:
+            try:
+                os.mkdir(name, 0o755, dir_fd=evfd)
+            except FileExistsError:
+                pass
+            ifd = os.open(name, _DIR, dir_fd=evfd)
+            try:
+                existing = _read_at(ifd, "events.jsonl", DOC_MAX)
+                if any(json.loads(l).get("event") == "resolved" for l in existing.decode("utf-8").splitlines() if l):
+                    said.append(f"incident {rid} is resolved; nothing to complete")
+                    return
+            except FileNotFoundError:
+                pass
+            except (ValueError, UnicodeDecodeError):
+                pass
+            try:
+                _write_at(ifd, "detected.json", _canonical(
+                    {"run_id": rid, "at": at, "failing": failing, "identity": target,
+                     "pending": ["rewrite", "stop"], "recorded_by": "writer"}), 0o444, exclusive=True)
+            except FileExistsError:
+                pass
+        except OSError as e:
+            said.append(f"incident NOT recorded: {e.strerror}")
+            ifd = None
+        finally:
+            os.close(evfd)
+
+    def event(ev):
+        if ifd is not None:
+            try:
+                _append_event(ifd, dict(ev, at=at, by="writer"))
+            except OSError as e:
+                said.append(f"could not record {ev['event']}: {e.strerror}")
+        said.append(ev["event"])
+    try:
+        parent, cname = _split(live_config)
+        cfd = open_dir(parent)
+        try:
+            doc = _strict_json(_read_at(cfd, cname, DOC_MAX))
+            if "delegation" in doc:
+                doc.pop("delegation")
+                _write_at(cfd, cname, (json.dumps(doc, indent=2) + "\n").encode("utf-8"), 0o644, keep=True)
+                event({"event": "rewrite_ok"})
+        finally:
+            os.close(cfd)
+    except (OSError, ValueError, UnicodeDecodeError, StepError) as e:
+        event({"event": "rewrite_failed", "reason": str(e)})
+    if not isinstance(target, str):
+        event({"event": "stop_not_attempted", "reason": "the run's context names no target"})
+    else:
+        up = engine.running(target)
+        if up is not True:
+            event({"event": "stop_not_attempted", "reason": "not running" if up is False else "cannot inspect"})
+        else:
+            engine.run(["stop", "-t", str(STOP_TIMEOUT_S), target])
+            after = engine.running(target)
+            event({"event": "stop_ok", "id": target} if after is False else
+                  {"event": "stop_failed", "reason": "still running" if after else "cannot inspect", "id": target})
+    if ifd is not None:
+        os.close(ifd)
+
+
+def _decide(efd, run_name, engine_for, said):
+    """The parent's decision for one run, from its own records: a fail-stop
+    failure in this run's trustworthy evidence is completed whatever the
+    child did, with the ORIGINAL cause and the context's target only.
+    Returns (exit, the run's passing outcome or None)."""
+    rid = RUN_NAME.fullmatch(run_name).group(1)
+    rfd = os.open(run_name, _DIR, dir_fd=efd)
+    try:
+        context = _record(rfd, "context.json")
+        expect = _record(rfd, "expect.json")
+        outcome = _record(rfd, "outcome.json")
+    finally:
+        os.close(rfd)
+    if context is None or context.get("run_id") != rid:
+        said.append(f"{rid}: no usable context; nothing is decided or stopped")
+        return EXIT_HANDOFF, None
+    engine = engine_for(context)
+    engine.remove_run(rid)
+    try:
+        evfd = open_dir(context["evidence_dir"])
+    except (StepError, KeyError, TypeError) as e:
+        said.append(f"{rid}: the evidence directory cannot be opened: {e}")
+        return EXIT_HANDOFF, None
+    try:
+        failing, why = _evidence_failing(evfd, rid, context, expect)
+    finally:
+        os.close(evfd)
+    if failing:
+        _act(context["evidence_dir"], context["live_config_path"], context.get("router_container_id"), rid,
+             context.get("started_at"), failing, engine, said)
+        return EXIT_INCIDENT, None
+    if outcome is not None and outcome.get("run_id") == rid and outcome.get("code") == 0 and not why:
+        return EXIT_PASS, outcome
+    said.append(f"{rid}: could not complete: {why or (outcome or {}).get('why') or 'the child did not finish'}")
+    return EXIT_HANDOFF, None
+
+
+def _recovery(efd):
+    """The recovery description, root's alone, or None."""
+    try:
+        doc = _strict_json(_read_at(efd, "recovery.json", DOC_MAX, want=(ROOT_UID, 0o444, 1)))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+    return doc if doc.get("schema") == RECOVERY_SCHEMA else None
+
+
+def partition_weekly(exec_root, host, document, sha256, now=None, child_timeout=None, emit=print):
+    """One weekly partition run (see the section comment). Returns its exit."""
+    child_timeout = CHILD_TIMEOUT_S if child_timeout is None else child_timeout
+    if not RUN_ID.fullmatch(host) or not re.fullmatch(r"[0-9a-f]{64}", sha256):
+        raise Refused("usage")
+    at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now if now is not None else time.time()))
+    rid = time.strftime("w%Y%m%dT%H%M%SZ", time.gmtime(now if now is not None else time.time()))
+    said = []
+    try:
+        efd = _root_dir(exec_root, 0o700)
+    except Tooling as e:
+        emit(f"partition-weekly: tooling_unverified: {e}; no recovery context can be trusted without the exec root")
+        return EXIT_TOOLING
+    lock_fd = None
+    try:
+        lock_fd = _take_partition_lock(efd)
+        _, sec = raw_sec = _document(document, sha256)
+        values = _authority(sec, exec_root)
+        engine_for = lambda ctx, v=values: _Engine(v["docker"], v["engine"],
+                                                   os.path.join(exec_root, RUN_PREFIX + ctx["run_id"]))
+        for n in sorted(os.listdir(efd)):
+            if RUN_NAME.fullmatch(n):
+                said.append(f"{n}: abandoned; completing its decision before removing it")
+                _decide(efd, n, engine_for, said)
+                _remove_tree(efd, n)
+        _verify_bundle(efd, values["pin"])
+        python = _trusted_tool(values["python3"])
+        docker = _trusted_tool(values["docker"])
+        _engine_socket(values["engine"])
+        recovery = _recovery(efd)
+        target = recovery.get("router_container_id") if recovery and recovery.get("host") == host \
+            and recovery.get("live_config_path") == values["live_config"] else None
+        run_name = RUN_PREFIX + rid
+        os.mkdir(run_name, 0o700, dir_fd=efd)
+        rfd = os.open(run_name, _DIR, dir_fd=efd)
+        try:
+            for d in ("docker", "home"):
+                os.mkdir(d, 0o700, dir_fd=rfd)
+            _write_at(rfd, "document.json", raw_sec[0], 0o400, exclusive=True)
+            _write_at(rfd, "context.json", _canonical(
+                {"schema": PARTITION_SCHEMA, "run_id": rid, "host": host, "started_at": at,
+                 "evidence_dir": values["evidence_dir"], "live_config_path": values["live_config"],
+                 "router_container_id": target if isinstance(target, str) else None,
+                 "engine": values["engine"]}), 0o400, exclusive=True)
+        finally:
+            os.close(rfd)
+        run_dir = os.path.join(exec_root, run_name)
+        child_fd = os.dup(lock_fd)
+        try:
+            child = subprocess.Popen(
+                [python, "-I", "-S", "-B", os.path.join(exec_root, BUNDLE, LAUNCHER), "--run-dir", run_dir,
+                 "--lock-fd", str(child_fd), "--docker", docker],
+                shell=False, close_fds=True, pass_fds=(child_fd,), stdin=subprocess.DEVNULL, cwd=run_dir,
+                env={"DOCKER_HOST": values["engine"], "DOCKER_CONFIG": os.path.join(run_dir, "docker"),
+                     "HOME": os.path.join(run_dir, "home"), "LC_ALL": "C"}, start_new_session=True)
+        finally:
+            os.close(child_fd)
+        try:
+            child.wait(timeout=child_timeout)
+        except subprocess.TimeoutExpired:
+            said.append(f"{rid}: the child outran {child_timeout} s; its group is killed")
+            try:
+                os.killpg(child.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            child.wait()
+        code, passed = _decide(efd, run_name, engine_for, said)
+        if passed and isinstance(passed.get("router_seen"), str):
+            _write_at(efd, "recovery.json", _canonical(
+                {"schema": RECOVERY_SCHEMA, "host": host, "at": at, "evidence_dir": values["evidence_dir"],
+                 "live_config_path": values["live_config"], "router_container_id": passed["router_seen"],
+                 "engine": values["engine"], "docker": docker}), 0o444)
+        _remove_tree(efd, run_name)
+        return code
+    except Handoff as e:
+        said.append(f"handoff: {e}")
+        return EXIT_HANDOFF
+    except Tooling as e:
+        said.append(f"tooling_unverified: {e}")
+        recovery = _recovery(efd)
+        if recovery is None:
+            said.append("no recovery description: no target, nothing stopped")
+            return EXIT_TOOLING
+        try:
+            docker = _trusted_tool(recovery["docker"])
+            _engine_socket(recovery["engine"])
+        except (Tooling, KeyError, TypeError) as e2:
+            said.append(f"the recovery description's tools are not trusted either ({e2}): nothing stopped")
+            return EXIT_TOOLING
+        _act(recovery["evidence_dir"], recovery["live_config_path"], recovery.get("router_container_id"),
+             "tooling-" + rid, at, ["tooling_unverified"], _Engine(docker, recovery["engine"], exec_root), said)
+        return EXIT_TOOLING
+    finally:
+        for s in said:
+            emit(f"partition-weekly: {s}")
+        if lock_fd is not None:
+            os.close(lock_fd)
+        os.close(efd)
+
+
+def partition_provision(exec_root):
+    """Swap `<exec_root>/bundle.new` in as the bundle, under the job's lock,
+    once it verifies (its own PIN is the one it carries). Dan runs this after
+    the printed provisioning commands fill bundle.new."""
+    efd = _root_dir(exec_root, 0o700)
+    lock_fd = None
+    try:
+        lock_fd = _take_partition_lock(efd)
+        nfd = os.open("bundle.new", _DIR, dir_fd=efd)
+        try:
+            pin = _read_at(nfd, PIN, 64).decode("ascii").strip()
+        finally:
+            os.close(nfd)
+        os.rename("bundle.new", "bundle.check", src_dir_fd=efd, dst_dir_fd=efd)
+        try:
+            os.rename("bundle", "bundle.old", src_dir_fd=efd, dst_dir_fd=efd)
+        except FileNotFoundError:
+            pass
+        os.rename("bundle.check", BUNDLE, src_dir_fd=efd, dst_dir_fd=efd)
+        try:
+            _verify_bundle(efd, pin)
+        except (Tooling, Handoff):
+            os.rename(BUNDLE, "bundle.new", src_dir_fd=efd, dst_dir_fd=efd)
+            try:
+                os.rename("bundle.old", BUNDLE, src_dir_fd=efd, dst_dir_fd=efd)
+            except FileNotFoundError:
+                pass
+            raise
+        try:
+            _remove_tree(efd, "bundle.old")
+        except FileNotFoundError:
+            pass
+        os.fsync(efd)
+        return 0
+    finally:
+        if lock_fd is not None:
+            os.close(lock_fd)
+        os.close(efd)
+
+
 def _secret_main(argv):
     """The secret steps' dispatch. Any exception at all becomes one fixed
     line and exit 2 through os._exit, so no traceback, repr or message can
@@ -692,9 +1334,22 @@ def main(argv):
             place(argv[1], argv[2], sha256=argv[4], mode=int(argv[6], 8))
         elif len(argv) == 2 and argv[0] == "marker":
             marker(argv[1])
+        elif len(argv) == 9 and argv[0] == "partition-weekly":
+            opts = dict(zip(argv[1::2], argv[2::2]))
+            if set(opts) != {"--exec-root", "--host", "--document", "--document-sha256"}:
+                raise StepError("partition-weekly --exec-root DIR --host NAME --document PATH --document-sha256 HEX")
+            return partition_weekly(opts["--exec-root"], opts["--host"], opts["--document"], opts["--document-sha256"])
+        elif len(argv) == 2 and argv[0] == "partition-provision":
+            return partition_provision(argv[1])
         else:
             print(__doc__.split("\n\n")[1], file=sys.stderr)
             return 2
+    except (Tooling, Handoff) as e:
+        print(f"host_steps: {e}", file=sys.stderr)
+        return EXIT_TOOLING if isinstance(e, Tooling) else EXIT_HANDOFF
+    except Refused:
+        print("host_steps: refused: usage", file=sys.stderr)
+        return REFUSED
     except (StepError, OSError, ValueError) as e:
         print(f"host_steps: {e}", file=sys.stderr)
         return 1

@@ -51,6 +51,29 @@ class ClosureTest(unittest.TestCase):
             self.assertEqual(mine, set(CLOSURE), "the bundle's imports are exactly the closure list")
             self.assertFalse(any(d == "__pycache__" for _, ds, _ in os.walk(bundle) for d in ds), "no bytecode written")
 
+    def test_nothing_the_child_runs_unlocks_the_runs_lock(self):
+        """The child holds its writer's lock descriptor for its whole life.
+        Its own modules never call flock or lockf, nor name the unlock; the
+        one flock anywhere in the closure is secret_setup.Lock's, which locks
+        a descriptor of its own on another file (an flock only ever releases
+        its own open file description), and the child never uses it."""
+        import ast
+        sites = []
+        for f in CLOSURE:
+            tree = ast.parse((REPO / f).read_text(encoding="utf-8"))
+            for fn in ast.walk(tree):
+                if isinstance(fn, (ast.FunctionDef, ast.ClassDef)):
+                    for node in ast.walk(fn):
+                        if isinstance(node, ast.Attribute) and node.attr in ("flock", "lockf", "LOCK_UN"):
+                            sites.append((f, fn.name, node.attr))
+        own = {"partition_weekly.py", "partition_run.py", "partition_store.py"}
+        self.assertEqual([x for x in sites if x[0] in own], [])
+        self.assertEqual(sorted({(f, a) for f, _, a in sites}), [("secret_setup.py", "flock")])
+        for f in own:
+            src = (REPO / f).read_text(encoding="utf-8")
+            self.assertNotIn("ss.Lock", src, f)
+            self.assertNotIn("secret_setup", src, f)
+
     def test_the_closure_names_only_files_of_this_repository(self):
         for f in CLOSURE:
             self.assertTrue((REPO / f).is_file(), f)
