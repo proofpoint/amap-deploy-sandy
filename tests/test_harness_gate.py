@@ -165,10 +165,19 @@ class GateTest(unittest.TestCase):
         why = self.check()
         self.assertEqual(why, [("G6", "no mutant list is pinned yet: the harness's design has not frozen it")])
 
+    def test_a_mutant_pin_of_zero_refuses(self):
+        hg.MUTANT_IDS_SHA256, hg.MUTANT_COUNT = hg.set_sha256([]), 0
+        def edit(r):
+            r["mutants_expected"] = {"count": 0, "ids": []}
+            r["mutants"] = []
+        why = self.check(self.broken(edit))
+        self.assertEqual(why, [("G6", "no mutant list is pinned yet: the harness's design has not frozen it")])
+
     def test_the_module_ships_with_no_mutant_list_pinned(self):
         """Read from the source, since this class pins a list for its own tests."""
         import ast
-        tree = ast.parse(open(hg.__file__, encoding="utf-8").read())
+        with open(hg.__file__, encoding="utf-8") as f:
+            tree = ast.parse(f.read())
         pinned = {n.target.id: n.value for n in tree.body if isinstance(n, ast.AnnAssign)}
         for name in ("MUTANT_IDS_SHA256", "MUTANT_COUNT"):
             self.assertIsInstance(pinned[name], ast.Constant)

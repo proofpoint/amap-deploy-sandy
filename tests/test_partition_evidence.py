@@ -18,9 +18,19 @@ BINDINGS = {"host_setup": "a" * 64, "router_activation": "b" * 64}
 SCRIPTS = {"P01": "c" * 64, "P02": "d" * 64, "P03": "e" * 64, "P04": "f" * 64, "verb": "0" * 64}
 
 
+ROLES = {"P01": ["runtime:upstream", "runtime:downstream"], "P02": ["marker:up/identity.json"],
+         "P03": ["key:signing", "key:dir", "mount:hop"], "P04": ["peer:alpha", "peer:beta"]}
+
+
 def probe(pid, verdict="PASS"):
-    return {"id": pid, "vantage": {"container": "ex-down", "uid": 2102}, "operation": "lstat",
-            "target_role": f"role:{pid}", "outcome": "ENOENT", "witness": {"ok": True}, "verdict": verdict}
+    """An entry as partition_probe writes one: a fail-stop PASS has outcome
+    ENOENT and its witness ok; anything else names what it saw."""
+    passing = verdict == "PASS"
+    return {"id": pid, "vantage": [{"container": "ex-down", "image": "sha256:" + "a" * 64, "uid": 2102,
+                                    "gids": [2102, 2200]}],
+            "operation": "lstat", "target_role": list(ROLES[pid]),
+            "outcome": "ENOENT" if passing else ("unresolved" if verdict == "UNKNOWN" else "ok"),
+            "witness": {"operation": "open", "outcome": "ok"}, "verdict": verdict}
 
 
 def build(**over):
@@ -141,6 +151,56 @@ class ParseTest(unittest.TestCase):
             build(bindings={"host_setup": "A" * 64})
 
 
+class ProbeShapeTest(unittest.TestCase):
+    """Every probe member has its declared type and shape, and a fail-stop
+    PASS is only one its entry supports. Each row breaks one thing in an
+    otherwise healthy document, re-signed so only that thing is wrong."""
+
+    def refuses(self, edit, words):
+        doc = json.loads(build())
+        edit(doc)
+        with self.assertRaises(pe.EvidenceError) as e:
+            pe.parse(resign(doc), host=HOST)
+        self.assertIn(words, str(e.exception))
+
+    def p(self, doc, pid):
+        return next(x for x in doc["probes"] if x["id"] == pid)
+
+    def test_the_healthy_document_parses(self):
+        self.assertEqual([x["id"] for x in pe.parse(build(), host=HOST)["probes"]], list(pe.PROBE_IDS))
+
+    def test_wrong_types_refuse(self):
+        rows = [("operation", 42, "operation"), ("operation", "", "operation"), ("vantage", None, "vantage"),
+                ("vantage", [], "vantage"), ("vantage", [{"container": "x"}], "vantage"),
+                ("outcome", [], "outcome"), ("outcome", "maybe", "outcome"), ("witness", "not-a-witness", "witness"),
+                ("witness", {"operation": "open"}, "witness"), ("target_role", "key:signing", "target_role"),
+                ("target_role", ["/opt/ex/keys"], "target_role"), ("target_role", ["key:dir", "key:dir"], "target_role")]
+        for member, value, words in rows:
+            with self.subTest(member=member, value=value):
+                self.refuses(lambda d, m=member, v=value: self.p(d, "P03").__setitem__(m, v), words)
+
+    def test_a_vantage_uid_that_is_not_an_integer_refuses(self):
+        self.refuses(lambda d: self.p(d, "P01")["vantage"][0].__setitem__("uid", True), "vantage")
+
+    def test_a_fail_stop_pass_with_outcome_ok_refuses(self):
+        self.refuses(lambda d: self.p(d, "P03").__setitem__("outcome", "ok"), "outcome ENOENT")
+        self.refuses(lambda d: self.p(d, "P04").__setitem__("outcome", "ok"), "outcome ENOENT")
+
+    def test_a_fail_stop_pass_without_its_witness_refuses(self):
+        self.refuses(lambda d: self.p(d, "P03")["witness"].__setitem__("outcome", "ENOENT"), "witness ok")
+
+    def test_p03_must_cover_the_key_and_its_directory(self):
+        self.refuses(lambda d: self.p(d, "P03").__setitem__("target_role", ["key:signing"]), "do not cover")
+
+    def test_p04_roles_are_lanes_only(self):
+        self.refuses(lambda d: self.p(d, "P04").__setitem__("target_role", ["peer:alpha", "key:dir"]), "lanes")
+
+    def test_an_impossible_timestamp_refuses(self):
+        for at in ("2026-99-99T25:61:61Z", "2026-02-30T00:00:00Z"):
+            with self.subTest(at=at):
+                self.refuses(lambda d, at=at: d.__setitem__("at", at), "not a real UTC time")
+
+
 class StalenessTest(unittest.TestCase):
     def test_a_fresh_passing_document_with_current_bindings_counts(self):
         self.assertEqual(pe.staleness(pe.parse(build(), host=HOST), now=NOW, bindings=BINDINGS), [])
@@ -168,6 +228,13 @@ class StalenessTest(unittest.TestCase):
         why = pe.staleness(doc, now=NOW, bindings=dict(BINDINGS, extra="1" * 64))
         self.assertEqual(len(why), 1, why)
         self.assertIn("it binds", why[0])
+
+    def test_roles_that_are_not_todays_targets_void_it(self):
+        doc = pe.parse(build(), host=HOST)
+        self.assertEqual(pe.staleness(doc, now=NOW, bindings=BINDINGS, roles={"P04": ["peer:alpha", "peer:beta"]}), [])
+        why = pe.staleness(doc, now=NOW, bindings=BINDINGS, roles={"P04": ["peer:alpha", "peer:beta", "peer:gamma"]})
+        self.assertEqual(len(why), 1, why)
+        self.assertIn("P04 targeted", why[0])
 
     def test_a_document_without_a_token_never_counts(self):
         doc = pe.parse(build(verdicts={"P04": "FAIL"}), host=HOST)
@@ -234,6 +301,14 @@ class VerifyDocumentTest(unittest.TestCase):
         c = self.claim(self.run_it(live=None), "current and passing")
         self.assertEqual(c.result, rh.FAIL)
         self.assertIn("never edit", c.do_not)
+
+    def test_an_impossible_timestamp_is_a_malformed_fail_never_a_crash(self):
+        doc = json.loads(self.raw)
+        doc["at"] = "2026-99-99T25:61:61Z"
+        self.raw = resign(doc)
+        c = self.claim(self.run_it(live=None), "current and passing")
+        self.assertEqual(c.result, rh.FAIL)
+        self.assertIn("not a real UTC time", str(c.actual))
 
     def test_an_absent_document_is_unknown(self):
         def gone(p):

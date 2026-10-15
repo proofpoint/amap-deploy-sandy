@@ -11,9 +11,19 @@ no trailing newline) with exactly these members:
   the RAW bytes of each file;
 - `bindings`: each input the run was bound to, by the sha256 of its
   canonical JSON (structures) or of its raw bytes (files);
-- `probes`: one entry per probe, P01 to P04, each with its vantage, the
-  operation, the target by role, the outcome, the could-fail witness and a
-  verdict;
+- `probes`: one entry per probe, P01 to P04 (the design's M1-P01 to
+  M1-P04), each with:
+  - `vantage`: the runtimes it was measured from, each {container, image,
+    uid, gids};
+  - `operation`: what it did;
+  - `target_role`: the roles it targeted (`key:signing`, `key:dir`,
+    `mount:<name>`, `peer:<slug>`, `marker:<side>/<name>`,
+    `runtime:<principal>`), never a path;
+  - `outcome`: the decisive observation's errno name, `ok` when the
+    operation succeeded, or `unresolved` when it could not be made;
+  - `witness`: {operation, outcome}, the could-fail witness;
+  - `verdict`: PASS, FAIL or UNKNOWN. A fail-stop probe passes only with
+    outcome ENOENT, its witness `ok`, and its roles covering its targets;
 - `fail_stop`: the verdicts of the two fail-stop probes, P03 and P04;
 - `delegation_partition_verified`: the token, or null.
 
@@ -59,6 +69,13 @@ _HEX64 = re.compile(r"[0-9a-f]{64}")
 _RUN_ID = re.compile(r"[A-Za-z0-9._-]{1,64}")
 _AT = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
+_ROLE = re.compile(r"(key:(signing|dir)|mount:[A-Za-z0-9._/-]{1,128}|peer:[A-Za-z0-9._-]{1,64}"
+                   r"|marker:(up|down)/[A-Za-z0-9._-]{1,64}|runtime:[A-Za-z0-9._-]{1,64})")
+_OUTCOME = re.compile(r"E[A-Z0-9]{1,15}|ok|unresolved")
+VANTAGE_MEMBERS = frozenset({"container", "image", "uid", "gids"})
+WITNESS_MEMBERS = frozenset({"operation", "outcome"})
+#: The roles each fail-stop probe must cover whatever else it targets.
+REQUIRED_ROLES = {"P03": frozenset({"key:signing", "key:dir"})}
 
 
 class EvidenceError(ValueError):
@@ -152,6 +169,10 @@ def parse(raw: bytes, *, host: str) -> Dict[str, Any]:
         raise EvidenceError("run_id is malformed")
     if not isinstance(doc["at"], str) or not _AT.fullmatch(doc["at"]):
         raise EvidenceError("at is not YYYY-MM-DDTHH:MM:SSZ")
+    try:
+        at_seconds(doc["at"])
+    except ValueError:
+        raise EvidenceError(f"at {doc['at']!r} is not a real UTC time") from None
     _hexmap(doc["script_sha256"], "script_sha256")
     _hexmap(doc["bindings"], "bindings")
     probes = doc["probes"]
@@ -159,12 +180,7 @@ def parse(raw: bytes, *, host: str) -> Dict[str, Any]:
             != list(PROBE_IDS):
         raise EvidenceError(f"probes must be exactly {', '.join(PROBE_IDS)}, in order")
     for p in probes:
-        if set(p) != PROBE_MEMBERS:
-            raise EvidenceError(f"{p['id']} is not exactly the probe's members")
-        if p["verdict"] not in VERDICTS:
-            raise EvidenceError(f"{p['id']}'s verdict is not one of {', '.join(VERDICTS)}")
-        if not isinstance(p["target_role"], str) or not p["target_role"]:
-            raise EvidenceError(f"{p['id']}'s target_role must be a role")
+        _probe_problem(p)
     verdicts = {p["id"]: p["verdict"] for p in probes}
     if doc["fail_stop"] != {i: verdicts.get(i) for i in FAIL_STOP}:
         raise EvidenceError("fail_stop does not repeat the fail-stop probes' verdicts")
@@ -177,16 +193,62 @@ def parse(raw: bytes, *, host: str) -> Dict[str, Any]:
     return doc
 
 
+def _probe_problem(p: Dict[str, Any]) -> None:
+    """Refuse a probe entry whose members, types or payload shapes are not the
+    document's, or a fail-stop PASS that the entry does not support."""
+    pid = p["id"]
+    if set(p) != PROBE_MEMBERS:
+        raise EvidenceError(f"{pid} is not exactly the probe's members")
+    if p["verdict"] not in VERDICTS:
+        raise EvidenceError(f"{pid}'s verdict is not one of {', '.join(VERDICTS)}")
+    v = p["vantage"]
+    if not isinstance(v, list) or not v or not all(
+            isinstance(x, dict) and set(x) == VANTAGE_MEMBERS and isinstance(x["container"], str) and x["container"]
+            and isinstance(x["image"], str) and x["image"] and _int(x["uid"])
+            and isinstance(x["gids"], list) and all(_int(g) for g in x["gids"]) for x in v):
+        raise EvidenceError(f"{pid}'s vantage is not a list of {{container, image, uid, gids}}")
+    if not isinstance(p["operation"], str) or not p["operation"]:
+        raise EvidenceError(f"{pid}'s operation must be a non-empty string")
+    roles = p["target_role"]
+    if not isinstance(roles, list) or not roles or len(set(roles)) != len(roles) or not all(
+            isinstance(r, str) and _ROLE.fullmatch(r) for r in roles):
+        raise EvidenceError(f"{pid}'s target_role must be a list of distinct roles")
+    if not isinstance(p["outcome"], str) or not _OUTCOME.fullmatch(p["outcome"]):
+        raise EvidenceError(f"{pid}'s outcome must be an errno name, ok or unresolved")
+    w = p["witness"]
+    if not isinstance(w, dict) or set(w) != WITNESS_MEMBERS or not isinstance(w["operation"], str) \
+            or not w["operation"] or not isinstance(w["outcome"], str) or not _OUTCOME.fullmatch(w["outcome"]):
+        raise EvidenceError(f"{pid}'s witness must be {{operation, outcome}}")
+    if pid in FAIL_STOP:
+        if not REQUIRED_ROLES.get(pid, frozenset()) <= set(roles):
+            raise EvidenceError(f"{pid}'s roles do not cover {', '.join(sorted(REQUIRED_ROLES[pid]))}")
+        if pid == "P04" and not all(r.startswith("peer:") for r in roles):
+            raise EvidenceError("P04's roles must be the agents' lanes")
+        if p["verdict"] == "PASS" and (p["outcome"] != "ENOENT" or w["outcome"] != "ok"):
+            raise EvidenceError(f"{pid} passes only with outcome ENOENT and its witness ok")
+
+
+def _int(v: Any) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
 def at_seconds(at: str) -> float:
     return datetime.datetime.strptime(at, "%Y-%m-%dT%H:%M:%SZ").replace(
         tzinfo=datetime.timezone.utc).timestamp()
 
 
-def staleness(doc: Dict[str, Any], *, now: float, bindings: Dict[str, str]) -> List[str]:
-    """Why `doc` does not count now, against the current `bindings`; empty when
-    it counts. A document whose fail-stop probes did not both pass never
-    counts."""
+def staleness(doc: Dict[str, Any], *, now: float, bindings: Dict[str, str],
+              roles: Optional[Dict[str, List[str]]] = None) -> List[str]:
+    """Why `doc` does not count now, against the current `bindings` and, per
+    fail-stop probe, the roles it must have targeted now (`roles`: P03 → the
+    key's roles and every mount reaching it, P04 → every enrolled agent's
+    lane); empty when it counts. A document whose fail-stop probes did not
+    both pass never counts."""
     why = []
+    for p in doc["probes"]:
+        want = (roles or {}).get(p["id"])
+        if want is not None and set(p["target_role"]) != set(want):
+            why.append(f"{p['id']} targeted {sorted(p['target_role'])}, not {sorted(want)}")
     if doc[TOKEN_MEMBER] is None:
         why.append("its fail-stop probes did not both pass")
     age = now - at_seconds(doc["at"])
@@ -220,7 +282,8 @@ def read_protected(path: str) -> bytes:
 
 
 def verify_document(path: str, *, host: str, now: float, bindings: Dict[str, str], live_token: Any,
-                    lstat: Callable = os.lstat, read: Callable[[str], bytes] = read_protected) -> List[rh.Check]:
+                    roles: Optional[Dict[str, List[str]]] = None, lstat: Callable = os.lstat,
+                    read: Callable[[str], bytes] = read_protected) -> List[rh.Check]:
     """The evidence document at `path`: placed as only root could place it,
     well-formed for `host`, current against `bindings`, and the one whose
     token the running local router carries (`live_token`; None when it
@@ -243,7 +306,7 @@ def verify_document(path: str, *, host: str, now: float, bindings: Dict[str, str
         doc = parse(raw, host=host)
     except EvidenceError as e:
         return out + [rh.check(claim, want, f"malformed: {e}", remedy, do_not="never edit the document")]
-    stale = staleness(doc, now=now, bindings=bindings)
+    stale = staleness(doc, now=now, bindings=bindings, roles=roles)
     out.append(rh.check(claim, want, "; ".join(stale) if stale else True, remedy,
                         do_not="never move the clock or a binding to make a document current"))
     claim = "the local router signs with this document's token, or not at all"

@@ -227,7 +227,7 @@ def _case_problems(r: Dict[str, Any]) -> List[str]:
 
 
 def _mutant_problems(r: Dict[str, Any]) -> List[str]:
-    if MUTANT_IDS_SHA256 is None or MUTANT_COUNT is None:
+    if MUTANT_IDS_SHA256 is None or MUTANT_COUNT is None or MUTANT_COUNT <= 0:
         return ["no mutant list is pinned yet: the harness's design has not frozen it"]
     expected = r["mutants_expected"]
     if expected["count"] != MUTANT_COUNT or len(expected["ids"]) != MUTANT_COUNT \
