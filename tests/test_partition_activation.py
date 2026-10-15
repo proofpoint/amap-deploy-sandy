@@ -92,11 +92,20 @@ class ProspectiveSpecTest(unittest.TestCase):
                                         image="i", container="c", uid=1, gid=1)
 
 
+IMAGE_ENV = ["PATH=/usr/bin", "ROUTER_INTERVAL=60"]
+
+
 def inspect_of(spec, **over):
-    """`docker inspect` as the running router started from `spec` shows it."""
-    live = {"Image": spec["image"], "Config": {"User": spec["user"],
-                                               "Env": [f"{k}={v}" for k, v in spec["env"].items()] + ["PATH=/usr/bin"]},
-            "HostConfig": {"NetworkMode": spec["network"], "RestartPolicy": {"Name": spec["restart"]}},
+    """`docker inspect` as the running router started from `spec` by run.sh
+    shows it: the image's environment under the spec's, binds only, and the
+    privilege fields at the engine's defaults (null, false, empty)."""
+    env = [e for e in IMAGE_ENV if e.partition("=")[0] not in spec["env"]] + [
+        f"{k}={v}" for k, v in sorted(spec["env"].items())]
+    live = {"Image": spec["image"], "Config": {"User": spec["user"], "Env": env},
+            "HostConfig": {"NetworkMode": spec["network"], "RestartPolicy": {"Name": spec["restart"]},
+                           "CapAdd": None, "CapDrop": None, "SecurityOpt": None, "GroupAdd": None, "Devices": [],
+                           "Privileged": False, "ReadonlyRootfs": False, "PidMode": "", "IpcMode": "private",
+                           "UTSMode": "", "UsernsMode": ""},
             "Mounts": [{"Type": "bind", "Source": m["source"], "Destination": m["target"], "RW": not m["readonly"]}
                        for m in spec["mounts"]]}
     live.update(over)
@@ -111,30 +120,50 @@ SPEC = {"name": "ex-up", "image": "sha256:" + "b" * 64, "user": "2101:2101", "ne
 
 
 class RunningTest(unittest.TestCase):
+    def diff(self, live):
+        return pa.running_differences(live, SPEC, IMAGE_ENV)
+
     def test_a_router_started_from_the_spec_matches_it(self):
-        self.assertEqual(pa.running_differences(inspect_of(SPEC), SPEC), [])
+        self.assertEqual(self.diff(inspect_of(SPEC)), [])
 
     def test_each_difference_is_named_and_none_is_masked(self):
         cases = {
             "image": (dict(Image="sha256:" + "0" * 64), "image"),
-            "user": (dict(Config={"User": "0:0", "Env": ["ROUTER_CONFIG=/c/router.json", "ROUTER_INTERVAL=5"]}), "runs as"),
-            "network": (dict(HostConfig={"NetworkMode": "bridge", "RestartPolicy": {"Name": "unless-stopped"}}), "network"),
-            "restart": (dict(HostConfig={"NetworkMode": "none", "RestartPolicy": {"Name": "always"}}), "restart"),
-            "staged path": (dict(Config={"User": "2101:2101", "Env": ["ROUTER_CONFIG=/run/staged.json",
+            "user": (dict(Config={"User": "0:0", "Env": inspect_of(SPEC)["Config"]["Env"]}), "runs as"),
+            "network": ({"NetworkMode": "bridge"}, "network"),
+            "restart": ({"RestartPolicy": {"Name": "always"}}, "restart"),
+            "staged path": (dict(Config={"User": "2101:2101", "Env": ["PATH=/usr/bin", "ROUTER_CONFIG=/run/staged.json",
                                                                       "ROUTER_INTERVAL=5"]}), "ROUTER_CONFIG"),
+            "an extra variable": (dict(Config={"User": "2101:2101", "Env": inspect_of(SPEC)["Config"]["Env"] +
+                                               ["PYTHONPATH=/x"]}), "PYTHONPATH"),
+            "a capability": ({"CapAdd": ["SYS_ADMIN"]}, "CapAdd"),
+            "a security option": ({"SecurityOpt": ["seccomp=unconfined"]}, "SecurityOpt"),
+            "a group": ({"GroupAdd": ["2200"]}, "GroupAdd"),
+            "a device": ({"Devices": [{"PathOnHost": "/dev/fuse"}]}, "Devices"),
+            "privileged": ({"Privileged": True}, "Privileged"),
+            "the host's pid namespace": ({"PidMode": "host"}, "PidMode"),
         }
         for name, (over, words) in cases.items():
             with self.subTest(name=name):
-                why = pa.running_differences(inspect_of(SPEC, **over), SPEC)
+                live = inspect_of(SPEC)
+                if "Image" in over or "Config" in over:
+                    live.update(over)
+                else:
+                    live["HostConfig"] = dict(live["HostConfig"], **over)
+                why = self.diff(live)
                 self.assertTrue(any(words in w for w in why), why)
 
-    def test_a_key_bound_read_write_or_an_extra_bind_is_named(self):
+    def test_a_key_bound_read_write_an_extra_bind_or_a_volume_is_named(self):
         live = inspect_of(SPEC)
         live["Mounts"][1]["RW"] = True
-        self.assertTrue(any("+/k:/k:rw" in w for w in pa.running_differences(live, SPEC)))
+        self.assertTrue(any("+bind:/k:/k:rw" in w for w in self.diff(live)))
         live = inspect_of(SPEC)
         live["Mounts"].append({"Type": "bind", "Source": "/peer", "Destination": "/peer", "RW": True})
-        self.assertTrue(any("+/peer:/peer:rw" in w for w in pa.running_differences(live, SPEC)))
+        self.assertTrue(any("+bind:/peer:/peer:rw" in w for w in self.diff(live)))
+        live = inspect_of(SPEC)
+        live["Mounts"].append({"Type": "volume", "Source": "/var/lib/docker/volumes/v/_data", "Destination": "/v",
+                               "RW": True})
+        self.assertTrue(any("+volume:" in w for w in self.diff(live)))
 
 
 class FinalBytesTest(unittest.TestCase):

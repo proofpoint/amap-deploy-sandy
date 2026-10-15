@@ -23,6 +23,7 @@ import json
 import os
 import subprocess
 import sys
+from collections import Counter
 from typing import Any, Dict, List, Optional, Sequence
 
 import router_health as rh
@@ -95,10 +96,12 @@ def router_argv(spec: Dict[str, Any]) -> List[str]:
     return out + [spec["image"]]
 
 
-def running_differences(live: Dict[str, Any], spec: Dict[str, Any]) -> List[str]:
+def running_differences(live: Dict[str, Any], spec: Dict[str, Any], image_env: Sequence[str]) -> List[str]:
     """The running local router (`docker inspect`) against its spec, field by
-    field: image, user, network, restart policy, the two environment
-    variables, and the exact set of binds with their modes. Nothing is masked."""
+    field: image, user, network, restart policy, the whole environment (the
+    image's entries the spec does not set, then the spec's), every mount of
+    any type with its mode, and every privilege run.sh never grants, which
+    must be absent. Nothing is masked."""
     bad = []
     cfg, host = live.get("Config") or {}, live.get("HostConfig") or {}
     if live.get("Image") != spec["image"]:
@@ -109,18 +112,30 @@ def running_differences(live: Dict[str, Any], spec: Dict[str, Any]) -> List[str]
         bad.append(f"its network is {host.get('NetworkMode')!r}, not {spec['network']!r}")
     if (host.get("RestartPolicy") or {}).get("Name") != spec["restart"]:
         bad.append(f"its restart policy is not {spec['restart']}")
-    env = dict(e.partition("=")[::2] for e in cfg.get("Env") or [])
-    for k, v in sorted(spec["env"].items()):
-        if env.get(k) != v:
-            bad.append(f"its {k} is {env.get(k)!r}, not {v!r}")
-    got = sorted((m.get("Source"), m.get("Destination"), bool(m.get("RW"))) for m in live.get("Mounts") or []
-                 if m.get("Type") == "bind")
-    want = sorted((m["source"], m["target"], not m["readonly"]) for m in spec["mounts"])
+    want_env = [e for e in image_env if e.partition("=")[0] not in spec["env"]] + [
+        f"{k}={v}" for k, v in sorted(spec["env"].items())]
+    got_env = Counter(str(e) for e in cfg.get("Env") or [])
+    for e in sorted((got_env - Counter(want_env)) + (Counter(want_env) - got_env)):
+        k = e.partition("=")[0]
+        if f"its environment differs at {k}" not in bad:
+            bad.append(f"its environment differs at {k}")
+    for key in ("CapAdd", "CapDrop", "SecurityOpt", "GroupAdd", "Devices"):
+        if host.get(key):
+            bad.append(f"it has {key} {host[key]!r}, which run.sh never sets")
+    for key in ("Privileged", "ReadonlyRootfs"):
+        if host.get(key):
+            bad.append(f"it runs with {key}, which run.sh never sets")
+    for key in ("PidMode", "IpcMode", "UTSMode", "UsernsMode"):
+        if host.get(key) == "host":
+            bad.append(f"it shares the host's namespace by {key}")
+    got = sorted((str(m.get("Type")), m.get("Source"), m.get("Destination"), bool(m.get("RW")))
+                 for m in live.get("Mounts") or [])
+    want = sorted(("bind", m["source"], m["target"], not m["readonly"]) for m in spec["mounts"])
     if got != want:
         extra, missing = sorted(set(got) - set(want)), sorted(set(want) - set(got))
-        bad.append("its binds differ from the spec: " + "; ".join(
-            [f"+{s}:{d}:{'rw' if w else 'ro'}" for s, d, w in extra] +
-            [f"-{s}:{d}:{'rw' if w else 'ro'}" for s, d, w in missing]))
+        bad.append("its mounts differ from the spec: " + "; ".join(
+            [f"+{t}:{s}:{d}:{'rw' if w else 'ro'}" for t, s, d, w in extra] +
+            [f"-{t}:{s}:{d}:{'rw' if w else 'ro'}" for t, s, d, w in missing]))
     return bad
 
 
@@ -152,13 +167,18 @@ def final_bytes(staged: bytes, token: str) -> bytes:
 SUPERVISOR_DIRS = ("/etc/systemd/system", "/Library/LaunchDaemons")
 
 
+def _read_bytes(path: str) -> bytes:
+    with open(path, "rb") as f:
+        return f.read()
+
+
 def supervisor_problems(container: str, *, dirs: Sequence[str] = SUPERVISOR_DIRS,
                         listdir=os.listdir, read=None) -> Any:
     """Every unit or LaunchDaemon file that names the local router's
     container: one would start it again after a fail-stop stop. The local
     router runs `--detach` under `unless-stopped` and nothing else restarts
     it. An Unresolved when a file that exists cannot be read."""
-    read = read or (lambda p: open(p, "rb").read())
+    read = read or _read_bytes
     needle = container.encode("utf-8")
     bad = []
     for d in dirs:
