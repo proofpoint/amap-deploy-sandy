@@ -54,6 +54,12 @@ allow.txt, one exception per line, each ending in a reason:
       dates say, is checked: reachability is fixed by history, a date is
       whatever the writer's clock said. A boundary the repository does not
       hold is "cannot run".
+  tag <repo> <tag object sha> <reason>
+      an annotated tag's tagger and message, only while that tag ref
+      resolves to exactly that tag OBJECT, whose sha covers its tagger,
+      message and target: a tag re-created or moved under the same name is a
+      different object and is checked. The ref's name is always checked, and
+      a lightweight tag has no tag object, so it is never accepted.
 
 A line's sha256 is over its bytes without the trailing "\\n". Every run
 lists the commit and tree exceptions that matched nothing.
@@ -272,8 +278,10 @@ def parse_allow(text: str) -> List[Exception_]:
             out.append(Exception_(n, "tree", f[1], commit=f[2], path=f[3], digest=f[4]))
         elif f[0] == "identity" and len(f) >= 5 and _HEX40.fullmatch(f[2]) and _HEX64.fullmatch(f[3]):
             out.append(Exception_(n, "identity", f[1], commit=f[2], digest=f[3]))
+        elif f[0] == "tag" and len(f) >= 4 and _HEX40.fullmatch(f[2]):
+            out.append(Exception_(n, "tag", f[1], commit=f[2]))
         else:
-            raise CannotRun(f"{where}: not a path, commit, tree or identity exception with its reason")
+            raise CannotRun(f"{where}: not a path, commit, tree, identity or tag exception with its reason")
     return out
 
 
@@ -329,6 +337,8 @@ class Where:
     path: str = ""
     lineno: int = 0
     field: str = ""
+    #: An annotated tag's object sha, for `tag` exceptions; not printed.
+    obj: str = ""
 
     def __str__(self) -> str:
         bits = [self.surface]
@@ -414,6 +424,8 @@ class Matcher:
                        and d == ex.digest)
             elif ex.kind == "path":
                 hit = where.surface in ("tree", "commit") and where.path == ex.path and d == ex.digest
+            elif ex.kind == "tag":
+                hit = where.obj == ex.commit       # only an annotated tag's surfaces carry obj
             if hit:
                 ex.used += 1
                 return True
@@ -495,7 +507,7 @@ class Matcher:
             self.findings.append(Finding(where, "fixture file"))
 
     def unused(self) -> List[Exception_]:
-        return [ex for ex in self.lists.exceptions if ex.kind in ("commit", "tree", "identity") and not ex.used]
+        return [ex for ex in self.lists.exceptions if ex.kind in ("commit", "tree", "identity", "tag") and not ex.used]
 
 
 def _pieces(text: str) -> Iterator[str]:
@@ -721,9 +733,10 @@ def scan_refs(m: Matcher, repo: str, blobs: Blobs) -> None:
                 if hl.startswith("tagger "):
                     who = hl[len("tagger "):]
                     nm, _, rest = who.partition(" <")
-                    m.identity(Where("tag", m.repo, path=name, field="tagger"), nm, rest.partition(">")[0])
+                    m.identity(Where("tag", m.repo, path=name, field="tagger", obj=oid), nm,
+                               rest.partition(">")[0])
             for n, line in enumerate(message.split("\n"), 1):
-                m.text(Where("tag", m.repo, path=name, field=f"message:{n}"), line)
+                m.text(Where("tag", m.repo, path=name, field=f"message:{n}", obj=oid), line)
 
 
 def scan_text(m: Matcher, label: str, data: bytes) -> None:
