@@ -46,8 +46,10 @@ def email_drift(live: Any, rendered: Dict[str, Any], image_env: Any) -> Any:
     for v in (live, image_env):
         if isinstance(v, rh.Unresolved):
             return v
-    if live is None:
-        return rh.Unresolved("the email router is not running")
+    running = None if live is None else pa.is_running(live)
+    if running is not True:
+        return rh.Unresolved("the email router is not running" if live is None or running is False
+                             else "the engine does not say whether the email router runs")
     return hr.compare(live, rendered, image_env)
 
 
@@ -56,8 +58,9 @@ def agent_source(inspect: Any, destination: str) -> Any:
     `destination` (its peer lane), or an Unresolved."""
     if isinstance(inspect, rh.Unresolved):
         return inspect
-    if inspect is None:
-        return rh.Unresolved("its container is not running")
+    if inspect is None or pa.is_running(inspect) is not True:
+        return rh.Unresolved("its container is not running" if inspect is None or pa.is_running(inspect) is False
+                             else "the engine does not say whether its container runs")
     found = [m for m in inspect.get("Mounts") or [] if m.get("Destination") == destination]
     if len(found) != 1 or found[0].get("Type") != "bind" or not found[0].get("Source"):
         return rh.Unresolved(f"its container has no single bind at {destination}")

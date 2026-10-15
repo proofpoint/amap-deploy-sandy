@@ -108,6 +108,8 @@ class ProspectiveSpecTest(unittest.TestCase):
 
 
 IMAGE_ENV = ["PATH=/usr/bin", "ROUTER_INTERVAL=60"]
+#: The image's own config, as `docker image inspect` shows it.
+IMAGE = {"Env": IMAGE_ENV, "Entrypoint": ["/usr/bin/tini", "--"], "Cmd": ["python3", "-m", "router"]}
 
 
 def inspect_of(spec, **over):
@@ -116,7 +118,8 @@ def inspect_of(spec, **over):
     privilege fields at the engine's defaults (null, false, empty)."""
     env = [e for e in IMAGE_ENV if e.partition("=")[0] not in spec["env"]] + [
         f"{k}={v}" for k, v in sorted(spec["env"].items())]
-    live = {"Image": spec["image"], "Config": {"User": spec["user"], "Env": env},
+    live = {"Image": spec["image"], "State": {"Running": True, "Paused": False, "Restarting": False},
+            "Config": {"User": spec["user"], "Env": env, "Entrypoint": IMAGE["Entrypoint"], "Cmd": IMAGE["Cmd"]},
             "HostConfig": {"NetworkMode": spec["network"], "RestartPolicy": {"Name": spec["restart"]},
                            "CapAdd": None, "CapDrop": None, "SecurityOpt": None, "GroupAdd": None, "Devices": [],
                            "Privileged": False, "ReadonlyRootfs": False, "PidMode": "", "IpcMode": "private",
@@ -136,7 +139,7 @@ SPEC = {"name": "ex-up", "image": "sha256:" + "b" * 64, "user": "2101:2101", "ne
 
 class RunningTest(unittest.TestCase):
     def diff(self, live):
-        return pa.running_differences(live, SPEC, IMAGE_ENV)
+        return pa.running_differences(live, SPEC, IMAGE)
 
     def test_a_router_started_from_the_spec_matches_it(self):
         self.assertEqual(self.diff(inspect_of(SPEC)), [])
@@ -157,6 +160,13 @@ class RunningTest(unittest.TestCase):
             "a device": ({"Devices": [{"PathOnHost": "/dev/fuse"}]}, "Devices"),
             "privileged": ({"Privileged": True}, "Privileged"),
             "the host's pid namespace": ({"PidMode": "host"}, "PidMode"),
+            "another container's pid namespace": ({"PidMode": "container:x"}, "PidMode"),
+            "another container's ipc namespace": ({"IpcMode": "container:x"}, "IpcMode"),
+            "the host's uts namespace": ({"UTSMode": "host"}, "UTSMode"),
+            "the host's user namespace": ({"UsernsMode": "host"}, "UsernsMode"),
+            "an entrypoint of its own": (dict(Config=dict(inspect_of(SPEC)["Config"], Entrypoint=["/bin/sh"])),
+                                         "Entrypoint"),
+            "a command of its own": (dict(Config=dict(inspect_of(SPEC)["Config"], Cmd=["sleep", "1"])), "Cmd"),
         }
         for name, (over, words) in cases.items():
             with self.subTest(name=name):
@@ -246,6 +256,11 @@ class SupervisorTest(unittest.TestCase):
         self.assertIsInstance(got, rh.Unresolved, got)
         self.assertIn("cannot read", got.reason)
 
+    def test_every_system_unit_and_launchd_directory_is_scanned(self):
+        for d in ("/etc/systemd/system", "/run/systemd/system", "/usr/lib/systemd/system", "/lib/systemd/system",
+                  "/Library/LaunchDaemons", "/Library/LaunchAgents"):
+            self.assertIn(d, pa.SUPERVISOR_DIRS)
+
     def test_a_missing_supervisor_directory_is_not_a_problem(self):
         self.assertEqual(pa.supervisor_problems("ex-up", dirs=[self.dirs[0] + "-absent"]), [])
 
@@ -266,7 +281,7 @@ class VerifyActivationTest(unittest.TestCase):
                                         image="sha256:" + "b" * 64, container="ex-up", uid=2101, gid=2101)
 
     def results(self, **over):
-        kw = dict(live=inspect_of(self.spec), image_env=IMAGE_ENV, spec=self.spec, staged=self.staged,
+        kw = dict(live=inspect_of(self.spec), image=IMAGE, spec=self.spec, staged=self.staged,
                   final_raw=pa.final_bytes(self.staged, self.T), token=self.T)
         kw.update(over)
         return [(c.claim.split(" is ")[0], c.result) for c in pa.verify_activation(**kw)]
@@ -288,7 +303,14 @@ class VerifyActivationTest(unittest.TestCase):
 
     def test_what_cannot_be_read_or_expected_is_unknown(self):
         self.assertEqual([r for _, r in self.results(live=rh.Unresolved("not running"))], [rh.UNKNOWN, rh.PASS])
-        self.assertEqual([r for _, r in self.results(image_env=rh.Unresolved("no image"))], [rh.UNKNOWN, rh.PASS])
+        self.assertEqual([r for _, r in self.results(image=rh.Unresolved("no image"))], [rh.UNKNOWN, rh.PASS])
+        for state in ({"Running": False}, {"Running": True, "Paused": True}, {"Running": True, "Restarting": True},
+                      None):
+            with self.subTest(state=state):
+                live = dict(inspect_of(self.spec), State=state) if state else \
+                    {k: v for k, v in inspect_of(self.spec).items() if k != "State"}
+                self.assertEqual([r for _, r in self.results(live=live)], [rh.UNKNOWN, rh.PASS],
+                                 "a router not affirmed running is never judged its spec")
         self.assertEqual([r for _, r in self.results(token=None)], [rh.PASS, rh.UNKNOWN])
         self.assertEqual([r for _, r in self.results(final_raw=rh.Unresolved("EACCES"))], [rh.PASS, rh.UNKNOWN])
         staged_with_token = pa.final_bytes(self.staged, self.T)

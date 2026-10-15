@@ -48,6 +48,7 @@ foreground command runs.
 """
 
 import json
+import math
 import plistlib
 import posixpath
 import re
@@ -632,16 +633,49 @@ def verify_ancestry(spec: Any, ancestor: Callable[[str, str], Any], label: Any) 
 ASK = hr.ASK
 
 
+#: The email router's own defaults for a budget left unset, and its bound on
+#: each: it reads them as seconds, a float in (0, RE_BUDGET_MAX].
+RE_BUDGET_DEFAULTS = {"RELAY_SMTP_CONNECT_TIMEOUT": 300, "RELAY_SMTP_COMMAND_TIMEOUT": 300,
+                      "RELAY_SMTP_DOT_TIMEOUT": 600}
+RE_BUDGET_MAX = 900
+
+
+def _budget(env: Dict[str, str], key: str) -> float:
+    """One budget as the email router reads it: its default when unset, else
+    a float in (0, RE_BUDGET_MAX]; ValueError naming it otherwise."""
+    raw = env.get(key)
+    if raw is None or raw == "":
+        return float(RE_BUDGET_DEFAULTS[key])
+    try:
+        v = float(raw)
+    except ValueError:
+        raise ValueError(f"{key}={raw!r} is not a number of seconds") from None
+    if not 0 < v <= RE_BUDGET_MAX:
+        raise ValueError(f"{key}={raw!r} is not in (0, {RE_BUDGET_MAX}]")
+    return v
+
+
 def stop_budget(env: Dict[str, str]) -> Tuple[int, int]:
     """(the join bound the stop timeout must cover, the start probe's window),
-    from the rendered budgets."""
-    dot = int(env["RELAY_SMTP_DOT_TIMEOUT"])
-    window = int(env["RELAY_SMTP_CONNECT_TIMEOUT"]) + START_PROBE_COMMANDS * int(env["RELAY_SMTP_COMMAND_TIMEOUT"])
-    return dot + JOIN_SLACK_S + DONE_POLL_S, window + QUIT_S
+    from the rendered budgets, read as the email router reads them and
+    rounded up to whole seconds; ValueError when one is not a budget it
+    accepts."""
+    dot = _budget(env, "RELAY_SMTP_DOT_TIMEOUT")
+    window = _budget(env, "RELAY_SMTP_CONNECT_TIMEOUT") + START_PROBE_COMMANDS * _budget(env, "RELAY_SMTP_COMMAND_TIMEOUT")
+    return math.ceil(dot) + JOIN_SLACK_S + DONE_POLL_S, math.ceil(window) + QUIT_S
 
 
 def verify_stop_budget(spec: Any) -> List[rh.Check]:
-    bound, window = stop_budget(dict(hr.environment(spec, spec.hub)))
+    """The stop timeout held to the join bound DERIVED FROM THE RENDERING, not
+    read from the placed environment file: that is sound only because
+    verify_files FAILs a placed file that differs from the rendering."""
+    try:
+        bound, window = stop_budget(dict(hr.environment(spec, spec.hub)))
+    except ValueError as e:
+        claim = "the rendered SMTP budgets are ones the email router accepts"
+        want = rh.Fact("budgets", True, "the email router reads each as seconds in (0, 900], its default when unset")
+        return [rh.check(claim, want, str(e), "render each budget as a number of seconds the router accepts",
+                         ok=lambda e_, a: a is True)]
     covered = "covers" if STOP_TIMEOUT_S >= window else "does not cover"
     claim = (f"the stop timeout ({STOP_TIMEOUT_S} s) covers the router's own join (the rendered dot budget + "
              f"{JOIN_SLACK_S} s + {DONE_POLL_S} s); it {covered} the start probe's login window ({window} s), where "

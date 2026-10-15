@@ -75,9 +75,9 @@ class Failing(pi.Store):
         self._maybe("mkdir")
         super().mkdir(path)
 
-    def new_file(self, path, data):
+    def new_file(self, path, data, exclusive=False):
         self._maybe("new_file")
-        super().new_file(path, data)
+        super().new_file(path, data, exclusive=exclusive)
 
     def append(self, path, line):
         self._maybe("append")
@@ -183,6 +183,50 @@ class ActTest(unittest.TestCase):
         self.assertEqual(code, 1)
 
 
+class NothingStopsTheStopTest(unittest.TestCase):
+    """Whatever an effect, a record or a diagnostic sink raises, the verified
+    stop is still attempted, and act still returns its status."""
+
+    def setUp(self):
+        t = tempfile.TemporaryDirectory()
+        self.addCleanup(t.cleanup)
+        self.dir = t.name
+        self.router = Router()
+
+    def act(self, store=None, emit=lambda s: None):
+        return called(self, pi.act, store or pi.Store(), self.router.effects(), evidence_dir=self.dir, run_id="r1",
+                      at=AT, failing=["P04"], token=None, identity=ID, evidence_persisted=True, emit=emit)
+
+    def test_a_failed_append_and_a_broken_diagnostic_sink_never_prevent_the_stop(self):
+        for error in (BrokenPipeError(32, "Broken pipe"), ValueError("I/O operation on closed file")):
+            with self.subTest(error=error):
+                self.setUp()
+
+                def broken(text, error=error):
+                    raise error
+                code, status = self.act(store=Failing("append", times=2), emit=broken)
+                self.assertEqual((self.router.stops, code), ([ID], 1))
+                self.assertTrue(status.endswith("stop ok"), status)
+
+    def test_a_rewrite_or_a_stop_that_raises_anything_is_recorded_and_the_stop_still_tried(self):
+        def cannot(*a):
+            raise rh.CannotRun("the engine is gone")
+        fx = self.router.effects()
+        fx.rewrite = cannot
+        code, status = called(self, pi.act, pi.Store(), fx, evidence_dir=self.dir, run_id="r1", at=AT,
+                              failing=["P04"], token=None, identity=ID, evidence_persisted=True, emit=lambda s: None)
+        self.assertEqual(self.router.stops, [ID])
+        self.assertIn("rewrite failed (CannotRun", status)
+        self.setUp()
+        fx = self.router.effects()
+        fx.stop = cannot
+        code, status = called(self, pi.act, pi.Store(), fx, evidence_dir=self.dir, run_id="r1", at=AT,
+                              failing=["P04"], token=None, identity=ID, evidence_persisted=True, emit=lambda s: None)
+        self.assertIn("stop failed", status)
+        with open(os.path.join(self.dir, "incident-r1", "events.jsonl")) as f:
+            self.assertEqual([json.loads(l)["event"] for l in f], ["rewrite_ok", "stop_failed"])
+
+
 class LifecycleTest(unittest.TestCase):
     def setUp(self):
         t = tempfile.TemporaryDirectory()
@@ -243,6 +287,18 @@ class LifecycleTest(unittest.TestCase):
         self.assertTrue(any("its rewrite is not complete" in w for w in self.resolve()))
         self.assertEqual(self.opened(), ["r1"])
 
+    def test_resolve_refuses_while_the_stop_is_not_shown_done(self):
+        self.router.stop_works = False
+        self.act()
+        self.router.delegation = False
+        self.assertTrue(any("still running" in w for w in self.resolve()), "stop_failed and running")
+        self.router.running[ID] = False
+        self.router.inspect_error = "engine down"
+        self.assertTrue(any("cannot inspect" in w for w in self.resolve()))
+        self.router.inspect_error = None
+        self.assertTrue(any("identity is unreadable" in w for w in self.resolve(identity=rh.Unresolved("gone"))))
+        self.assertEqual(self.resolve(), [], "confirmed not running resolves")
+
     def test_resolve_checks_current_facts_not_history(self):
         self.act()
         self.router.delegation = True
@@ -283,15 +339,49 @@ class LifecycleTest(unittest.TestCase):
             self.assertIs(inc.detected.get(k), True, k)
         self.assertIs(inc.detected["failing_evidence_persisted"], False)
 
+    def test_an_existing_record_keeps_its_original_cause(self):
+        self.act()
+        for failing in (["P04"], ["P04"]):
+            self.complete(late={"run_id": "r1", "at": AT, "failing": failing, "token": None,
+                                "failing_evidence_persisted": False})
+        with open(os.path.join(self.dir, "incident-r1", "detected.json")) as f:
+            self.assertEqual(json.load(f)["failing"], ["P03"], "a late record never replaces the original cause")
+
+    def test_a_malformed_detected_record_or_event_leaves_the_incident_open(self):
+        self.act()
+        self.assertEqual(self.resolve(), [])
+        detected = os.path.join(self.dir, "incident-r1", "detected.json")
+        os.chmod(detected, 0o644)
+        good = open(detected).read()
+        for raw in ("{}", '{"run_id": "r9", "at": "x", "failing": ["P03"], "pending": []}',
+                    '{"run_id": "r1", "at": "x", "failing": [], "pending": []}',
+                    '{"run_id": "r1", "run_id": "r1", "at": "x", "failing": ["P03"], "pending": []}',
+                    '{"run_id": "r1", "at": NaN, "failing": ["P03"], "pending": []}'):
+            with self.subTest(raw=raw):
+                with open(detected, "w") as f:
+                    f.write(raw)
+                self.assertEqual(self.opened(), ["r1"])
+        with open(detected, "w") as f:
+            f.write(good)
+        path = os.path.join(self.dir, "incident-r1", "events.jsonl")
+        for tail in ('{"event":"resolved","at":"x"}\n', '{"event":"resolved","at":"x","evidence":"r2","reason":" "}\n',
+                     '{"event":"resolved","evidence":"r2","reason":"r"}\n'):
+            with self.subTest(tail=tail):
+                with open(path, "w") as f:
+                    f.write(tail)
+                self.assertEqual(self.opened(), ["r1"])
+
     def test_a_malformed_or_truncated_history_is_open(self):
         self.act()
         path = os.path.join(self.dir, "incident-r1", "events.jsonl")
         for name, tail in (("a broken last line", '{"event":"resolved"'),
-                           ("a whole last line with no newline", '{"event":"resolved","at":"x"}'),
-                           ("an event outside the vocabulary", '{"event":"closed_by_hand"}\n{"event":"resolved"}\n')):
+                           ("a whole last line with no newline", '{"event":"resolved","at":"x","evidence":"r2","reason":"r"}'),
+                           ("an event outside the vocabulary",
+                            '{"event":"closed_by_hand","at":"x"}\n'
+                            '{"event":"resolved","at":"x","evidence":"r2","reason":"by hand"}\n')):
             with self.subTest(name=name):
                 with open(path, "w") as f:
-                    f.write('{"event":"rewrite_ok"}\n' + tail)
+                    f.write('{"event":"rewrite_ok","at":"x"}\n' + tail)
                 self.assertEqual(self.opened(), ["r1"])
         detected = os.path.join(self.dir, "incident-r1", "detected.json")
         os.chmod(detected, 0o644)

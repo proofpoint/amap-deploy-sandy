@@ -187,6 +187,25 @@ class GateTest(unittest.TestCase):
         self.assertTrue(any("/usr/local/libexec/amap/docker" in c.claim
                             for c in self.verify(files) if c.result == rh.FAIL))
 
+    def test_a_tool_reached_through_a_link_in_a_writable_directory_fails(self):
+        """The link's own directory is held too: whoever can write it can
+        point the configured path at another tool."""
+        files = self.host()
+        files["/opt/brew"] = st(stat.S_IFDIR | 0o775, uid=501)
+        files["/opt/brew/python3"] = st(stat.S_IFLNK | 0o777, uid=501)
+        part = ps.PartitionSpec(evidence_dir=EV, scratch_dir=SCRATCH, weekday=0, hour=3, exec_root=EXEC,
+                                tools=dict(TOOLS, python3="/opt/brew/python3"))
+
+        def lstat(p):
+            if p not in files:
+                raise FileNotFoundError(p)
+            return files[p]
+        found = ps.verify(part, self.gs, delegation_enabled=True, lstat=lstat, owned_chain=ss._owned_chain,
+                          rl_sha=self.RL, hop_sha=self.HOP, plugin_sha256=self.PLUGIN, read=lambda p: self.raw,
+                          realpath=lambda p: "/usr/bin/python3" if p == "/opt/brew/python3" else p)
+        self.assertTrue(any("/opt/brew/python3" in c.claim for c in found if c.result == rh.FAIL),
+                        [(c.claim, c.result) for c in found if c.result != rh.PASS])
+
     def test_a_tool_that_cannot_be_inspected_is_unknown(self):
         files = self.host()
         del files[TOOLS["python3"]]

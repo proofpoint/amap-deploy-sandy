@@ -258,6 +258,9 @@ def verify_tools(ps: PartitionSpec, lstat: Callable, owned_chain: Callable,
                             do_not="never record a tool the operator's account can replace"))
         out.append(owned_chain(f"every directory above {real} is root-owned and not group- or world-writable",
                                real, (0,), why, lstat))
+        if real != path:
+            out.append(owned_chain(f"every directory above the configured {path} is root-owned and not group- or "
+                                   "world-writable, so no one else can point it elsewhere", path, (0,), why, lstat))
     return out
 
 

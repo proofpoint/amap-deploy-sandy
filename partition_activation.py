@@ -96,12 +96,30 @@ def router_argv(spec: Dict[str, Any]) -> List[str]:
     return out + [spec["image"]]
 
 
-def running_differences(live: Dict[str, Any], spec: Dict[str, Any], image_env: Sequence[str]) -> List[str]:
+#: The namespace modes run.sh leaves at the engine's default; anything else
+#: (the host's, or another container's) is named.
+DEFAULT_NAMESPACES = {"PidMode": ("",), "IpcMode": ("", "private", "shareable"), "UTSMode": ("",),
+                      "UsernsMode": ("",), "CgroupnsMode": ("", "private", "host")}
+
+
+def is_running(live: Any) -> Optional[bool]:
+    """True only when `docker inspect` affirms it: running, not paused, not
+    restarting. False when it affirms otherwise; None when it cannot tell."""
+    state = live.get("State") if isinstance(live, dict) else None
+    if not isinstance(state, dict) or not isinstance(state.get("Running"), bool):
+        return None
+    return state["Running"] and not state.get("Paused") and not state.get("Restarting")
+
+
+def running_differences(live: Dict[str, Any], spec: Dict[str, Any], image: Dict[str, Any]) -> List[str]:
     """The running local router (`docker inspect`) against its spec, field by
     field: image, user, network, restart policy, the whole environment (the
-    image's entries the spec does not set, then the spec's), every mount of
-    any type with its mode, and every privilege run.sh never grants, which
-    must be absent. Nothing is masked."""
+    image's entries the spec does not set, then the spec's), the program (the
+    image's own entrypoint and command, which run.sh never overrides), every
+    mount of any type with its mode, every privilege run.sh never grants, and
+    every namespace run.sh leaves at its default. `image` is the image's
+    inspected config: {Env, Entrypoint, Cmd}. Nothing is masked."""
+    image_env = list(image.get("Env") or [])
     bad = []
     cfg, host = live.get("Config") or {}, live.get("HostConfig") or {}
     if live.get("Image") != spec["image"]:
@@ -125,9 +143,12 @@ def running_differences(live: Dict[str, Any], spec: Dict[str, Any], image_env: S
     for key in ("Privileged", "ReadonlyRootfs"):
         if host.get(key):
             bad.append(f"it runs with {key}, which run.sh never sets")
-    for key in ("PidMode", "IpcMode", "UTSMode", "UsernsMode"):
-        if host.get(key) == "host":
-            bad.append(f"it shares the host's namespace by {key}")
+    for key in ("Entrypoint", "Cmd"):
+        if (cfg.get(key) or None) != (image.get(key) or None):
+            bad.append(f"its {key} is {cfg.get(key)!r}, not the image's {image.get(key)!r}")
+    for key, allowed in sorted(DEFAULT_NAMESPACES.items()):
+        if (host.get(key) or "") not in allowed:
+            bad.append(f"its {key} is {host.get(key)!r}, which run.sh never sets")
     got = sorted((str(m.get("Type")), m.get("Source"), m.get("Destination"), bool(m.get("RW")))
                  for m in live.get("Mounts") or [])
     want = sorted(("bind", m["source"], m["target"], not m["readonly"]) for m in spec["mounts"])
@@ -188,9 +209,11 @@ def final_bytes(staged: bytes, token: str) -> bytes:
     return (json.dumps(doc, indent=2) + "\n").encode("utf-8")
 
 
-#: Where a supervisor would live that could restart the local router: the
-#: places systemd and launchd load units from (hub_supervise's).
-SUPERVISOR_DIRS = ("/etc/systemd/system", "/Library/LaunchDaemons")
+#: Where a supervisor would live that could restart the local router: every
+#: directory systemd loads system units from, and launchd's system-wide
+#: daemons and agents.
+SUPERVISOR_DIRS = ("/etc/systemd/system", "/run/systemd/system", "/usr/local/lib/systemd/system",
+                   "/usr/lib/systemd/system", "/lib/systemd/system", "/Library/LaunchDaemons", "/Library/LaunchAgents")
 
 
 def _read_bytes(path: str) -> bytes:
@@ -232,22 +255,28 @@ A5_REMEDY = ("render the local router's config without delegation (install --app
              "fresh partition-probe --apply and the activation again")
 
 
-def verify_activation(*, live: Any, image_env: Any, spec: Dict[str, Any], staged: bytes, final_raw: Any,
+def verify_activation(*, live: Any, image: Any, spec: Dict[str, Any], staged: bytes, final_raw: Any,
                       token: Optional[str]) -> List[rh.Check]:
     """A5: the running local router is exactly A1's activation spec, its live
     config is A1's staged bytes plus the token and nothing else, and that
     token is the current passing evidence's (`token`: None when there is no
-    current passing document). `live`, `image_env` and `final_raw` are
-    Unresolved when they could not be read."""
+    current passing document). `live`, `image` (the image's inspected
+    config) and `final_raw` are Unresolved when they could not be read. A
+    router not affirmed running is never judged its spec."""
     import partition_evidence as pe
     out = []
     claim = "the running local router is exactly its activation spec"
     want = rh.Fact("activation spec", True, "A1's prospective spec for the final config path, as run.sh builds it")
-    blocked = next((v for v in (live, image_env) if isinstance(v, rh.Unresolved)), None)
+    blocked = next((v for v in (live, image) if isinstance(v, rh.Unresolved)), None)
+    running = None if blocked is not None or live is None else is_running(live)
     if blocked is not None:
         out.append(rh.unknown(claim, want, blocked.reason, "start the local router, or make the engine answer"))
+    elif running is not True:
+        out.append(rh.unknown(claim, want, "the local router is not running" if running is False or live is None
+                              else "the engine does not say whether the local router runs",
+                              "start the local router, or make the engine answer"))
     else:
-        bad = running_differences(live, spec, image_env)
+        bad = running_differences(live, spec, image)
         out.append(rh.check(claim, want, "; ".join(bad) if bad else True, A5_REMEDY,
                             do_not="never edit the spec to match what is running"))
 

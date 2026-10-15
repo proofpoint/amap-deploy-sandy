@@ -42,9 +42,9 @@ class Fixture(unittest.TestCase):
         self.doc = {"hop": {"root": f"{r}/hop", "link": "l1"},
                     "delegation": {"signing_key": {"path": f"{r}/keys/signing.key", "key_id": "k1"}}}
         self.lanes = {"alpha": f"{r}/instances/alpha/peer"}
-        self.inspects = {"alpha": {"Mounts": [{"Type": "bind", "Source": f"{r}/instances/alpha/peer",
+        self.inspects = {"alpha": {"State": {"Running": True}, "Mounts": [{"Type": "bind", "Source": f"{r}/instances/alpha/peer",
                                                "Destination": "/agent/peer"}]}}
-        self.live = {"running": True}
+        self.live = {"State": {"Running": True}}
 
     def gather(self, **over):
         kw = dict(host="alpha", run_id="r1", at="2026-10-15T03:00:00Z", email=self.email, email_view={},
@@ -106,15 +106,21 @@ class PlanTest(Fixture):
                                                                      f"{self.root}/keys", ["l1"]))
 
     def test_a_router_not_running_or_unanswered_is_drift_never_a_pass(self):
-        for live, words in ((None, "not running"), (rh.Unresolved("the engine did not answer"), "did not answer")):
+        for live, words in ((None, "not running"), (rh.Unresolved("the engine did not answer"), "did not answer"),
+                            ({"State": {"Running": False}}, "not running"),
+                            ({"State": {"Running": True, "Paused": True}}, "not running"),
+                            ({"Id": "x"}, "does not say")):
             with self.subTest(words=words):
                 d = self.gather(email_live=live).email_drift
                 self.assertIsInstance(d, rh.Unresolved)
                 self.assertIn(words, d.reason)
 
     def test_an_agent_without_its_lane_bind_is_unresolved(self):
-        for inspect in (None, {"Mounts": []}, {"Mounts": [{"Type": "volume", "Source": "v",
-                                                            "Destination": "/agent/peer"}]}):
+        mounts = self.inspects["alpha"]["Mounts"]
+        for inspect in (None, {"State": {"Running": True}, "Mounts": []},
+                        {"State": {"Running": True}, "Mounts": [{"Type": "volume", "Source": "v",
+                                                                  "Destination": "/agent/peer"}]},
+                        {"State": {"Running": False}, "Mounts": mounts}, {"Mounts": mounts}):
             with self.subTest(inspect=inspect):
                 src = self.gather(agent_inspects={"alpha": inspect}).agent_sources["alpha"]
                 self.assertIsInstance(src, rh.Unresolved)

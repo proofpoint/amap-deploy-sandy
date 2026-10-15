@@ -45,22 +45,35 @@ LIFECYCLE_EVENTS = frozenset({"resolved"})
 
 class Store:
     """The incident directory's durable writes: a new file by temporary name,
-    fsync, rename and directory fsync; an appended line, fsynced. Each is one
-    method so a test can make exactly one of them fail."""
+    fsync, then rename (or, with `exclusive`, a link that fails if the name
+    exists, so a record is never replaced) and directory fsync; an appended
+    line, fsynced. Each is one method so a test can make exactly one of them
+    fail."""
 
     def mkdir(self, path: str) -> None:
         os.mkdir(path, 0o755)
         self._fsync_dir(posixpath.dirname(path))
 
-    def new_file(self, path: str, data: bytes) -> None:
+    def new_file(self, path: str, data: bytes, exclusive: bool = False) -> None:
         tmp = f"{path}.{os.getpid()}.tmp"
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o444)
         try:
-            os.write(fd, data)
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-        os.rename(tmp, path)
+            try:
+                os.write(fd, data)
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            if exclusive:
+                os.link(tmp, path)
+                os.unlink(tmp)
+            else:
+                os.rename(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
         self._fsync_dir(posixpath.dirname(path))
 
     def append(self, path: str, line: bytes) -> None:
@@ -106,7 +119,9 @@ class Effects:
     - `live_has_delegation()`: whether the live config file carries
       `delegation` now (bool or Unresolved);
     - `squatter_signing()`: whether any running container holding the local
-      router's NAME runs with `delegation` (bool or Unresolved)."""
+      router's NAME runs with `delegation` (bool or Unresolved).
+    Any of them may raise anything; nothing they raise ever prevents the next
+    action."""
 
     def __init__(self, **kw: Callable):
         self.__dict__.update(kw)
@@ -116,13 +131,107 @@ def _line(event: Dict[str, Any]) -> bytes:
     return (json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
 
 
-def _try(fn: Callable, *a: Any) -> Optional[str]:
-    """None when `fn` succeeded, else why it did not."""
+def _try(fn: Callable, *a: Any, **k: Any) -> Optional[str]:
+    """None when `fn` succeeded, else why it did not: an effect or a write
+    that raises anything at all is a failed step, never an escape."""
     try:
-        fn(*a)
+        fn(*a, **k)
         return None
-    except (OSError, ValueError) as e:
+    except Exception as e:  # every failure of an effect is recorded, never raised
         return f"{type(e).__name__}: {e}"
+
+
+def _say(emit: Callable[[str], None], text: str) -> None:
+    """A diagnostic, best-effort: a sink that fails (a closed pipe, a full
+    disk) is ignored, so it can never stand between two actions."""
+    try:
+        emit(text)
+    except Exception:  # a diagnostic is never an action
+        pass
+
+
+def _observe(fn: Callable, *a: Any) -> Any:
+    """An observation, or an Unresolved when asking raised."""
+    try:
+        return fn(*a)
+    except Exception as e:  # an observation that raised is unknown
+        return rh.Unresolved(f"{type(e).__name__}: {e}")
+
+
+def _strict(raw: bytes) -> Any:
+    def pairs(items: List[Any]) -> Dict[str, Any]:
+        out: Dict[str, Any] = {}
+        for k, v in items:
+            if k in out:
+                raise ValueError(f"duplicate key {k!r}")
+            out[k] = v
+        return out
+
+    def no_constant(name: str) -> Any:
+        raise ValueError(f"non-finite number {name}")
+    return json.loads(raw.decode("utf-8"), object_pairs_hook=pairs, parse_constant=no_constant)
+
+
+#: detected.json's members: required, and those a record may also carry.
+DETECTED_REQUIRED = {"run_id": str, "at": str, "failing": list, "pending": list}
+DETECTED_OPTIONAL = {"token": (str, type(None)), "identity": (str, type(None)), "failing_evidence_persisted": bool,
+                     "recorded_late": bool, "taken_without_record": bool, "recorded_by": str}
+
+
+def detected_problem(doc: Any, run_id: str) -> Optional[str]:
+    """Why `doc` is not a well-formed detected.json for incident `run_id`,
+    or None."""
+    if not isinstance(doc, dict):
+        return "not an object"
+    if set(DETECTED_REQUIRED) - set(doc) or set(doc) - set(DETECTED_REQUIRED) - set(DETECTED_OPTIONAL):
+        return "not exactly its members"
+    for k, t in list(DETECTED_REQUIRED.items()) + list(DETECTED_OPTIONAL.items()):
+        if k in doc and (isinstance(doc[k], bool) and t is not bool or not isinstance(doc[k], t)):
+            return f"{k} has the wrong type"
+    if doc["run_id"] != run_id:
+        return "its run_id is not its directory's"
+    if not doc["failing"] or not all(isinstance(f, str) and f for f in doc["failing"]):
+        return "it names no failing probe"
+    return None
+
+
+def event_problem(e: Any) -> Optional[str]:
+    """Why `e` is not a well-formed event, or None."""
+    if not isinstance(e, dict) or not isinstance(e.get("event"), str):
+        return "not an event"
+    kind = e["event"]
+    if kind not in EFFECT_EVENTS | LIFECYCLE_EVENTS:
+        return f"{kind!r} is outside the vocabulary"
+    if not isinstance(e.get("at"), str):
+        return f"{kind} has no time"
+    if kind == "resolved" and not (isinstance(e.get("evidence"), str) and e["evidence"]
+                                   and isinstance(e.get("reason"), str) and e["reason"].strip()):
+        return "a resolution without its evidence and reason"
+    for k in ("reason", "id", "observed"):
+        if k in e and not isinstance(e[k], str):
+            return f"{kind}'s {k} is not a string"
+    return None
+
+
+def _publish_detected(store: Store, d: str, run_id: str, detected: Dict[str, Any]) -> Tuple[Optional[str], Any]:
+    """detected.json created exclusively. An existing well-formed record is
+    kept, with its original cause; an existing malformed one is left as it
+    is (the incident stays open). Returns (why it is not this run's record,
+    the record in force or an Unresolved)."""
+    path = posixpath.join(d, DETECTED)
+    why = _try(store.new_file, path, json.dumps(detected, sort_keys=True).encode("utf-8"), exclusive=True)
+    if why is None:
+        return None, detected
+    try:
+        existing = _strict(store.read(path))
+    except FileNotFoundError:
+        return why, rh.Unresolved(why)
+    except Exception as e:  # an unreadable record stays open
+        return why, rh.Unresolved(f"the existing record cannot be read: {e}")
+    bad = detected_problem(existing, run_id)
+    if bad:
+        return f"an existing record is malformed ({bad}); it is kept, and the incident stays open", rh.Unresolved(bad)
+    return "an existing record is kept, with its original cause", existing
 
 
 def act(store: Store, fx: Effects, *, evidence_dir: str, run_id: str, at: str, failing: Sequence[str],
@@ -133,15 +242,19 @@ def act(store: Store, fx: Effects, *, evidence_dir: str, run_id: str, at: str, f
     container id from what is already durable (the activation document's
     vantage, or the last run record), or an Unresolved. Returns (exit code,
     status line); the exit is always nonzero, since an incident is never a
-    success. Every diagnostic is also emitted, best-effort."""
+    success. Every diagnostic is also emitted, best-effort: nothing a
+    diagnostic sink does can prevent the next action."""
     if not _RUN_ID.fullmatch(run_id):
         raise ValueError("the run id must be 1-64 of [A-Za-z0-9._-]")
     d = posixpath.join(evidence_dir, PREFIX + run_id)
     detected = {"run_id": run_id, "at": at, "failing": sorted(failing), "token": token,
                 "identity": identity if isinstance(identity, str) else None,
                 "pending": ["rewrite", "stop"], "failing_evidence_persisted": evidence_persisted}
-    why = _try(store.mkdir, d) or _try(store.new_file, posixpath.join(d, DETECTED),
-                                        json.dumps(detected, sort_keys=True).encode("utf-8"))
+    made = _try(store.mkdir, d)
+    if made is not None and _try(store.listdir, d) is not None:
+        why: Optional[str] = made
+    else:
+        why, _ = _publish_detected(store, d, run_id, detected)
     recorded = why is None
     events = posixpath.join(d, EVENTS)
 
@@ -149,7 +262,7 @@ def act(store: Store, fx: Effects, *, evidence_dir: str, run_id: str, at: str, f
         if recorded:
             failed = _try(store.append, events, _line(dict(event, at=at)))
             if failed:
-                emit(f"partition-incident: could not record {event['event']}: {failed}")
+                _say(emit, f"partition-incident: could not record {event['event']}: {failed}")
 
     rewrite_failed = _try(fx.rewrite)
     rewrite = "ok" if rewrite_failed is None else f"failed ({rewrite_failed})"
@@ -158,7 +271,7 @@ def act(store: Store, fx: Effects, *, evidence_dir: str, run_id: str, at: str, f
     record(stop)
     status = (f"incident {'recorded' if recorded else 'NOT recorded: ' + str(why)}; "
               f"rewrite {rewrite}; stop {_stop_words(stop)}")
-    emit(status)
+    _say(emit, status)
     return 1, status
 
 
@@ -166,18 +279,20 @@ def _stop(fx: Effects, identity: Any) -> Dict[str, Any]:
     if not isinstance(identity, str):
         reason = identity.reason if isinstance(identity, rh.Unresolved) else "no identity"
         return {"event": "stop_not_attempted", "reason": f"the local router's identity is unreadable: {reason}"}
-    seen = fx.inspect(identity)
+    seen = _observe(fx.inspect, identity)
     if isinstance(seen, rh.Unresolved):
         return {"event": "stop_not_attempted", "reason": f"cannot inspect {identity}: {seen.reason}"}
-    if seen is None or not seen.get("running"):
-        return {"event": "stop_not_attempted", "reason": f"{identity} is not running", "seen": seen}
-    fx.stop(identity)
-    after = fx.inspect(identity)
+    if seen is None or seen.get("running") is not True:
+        return {"event": "stop_not_attempted", "reason": f"{identity} is not shown running"}
+    failed = _try(fx.stop, identity)
+    after = _observe(fx.inspect, identity)
     if isinstance(after, rh.Unresolved):
-        return {"event": "stop_failed", "reason": f"cannot inspect {identity} after the stop: {after.reason}"}
-    if after is None or not after.get("running"):
+        return {"event": "stop_failed", "reason": f"cannot inspect {identity} after the stop: {after.reason}"
+                + (f" (the stop: {failed})" if failed else ""), "id": identity}
+    if after is None or after.get("running") is False:
         return {"event": "stop_ok", "id": identity}
-    return {"event": "stop_failed", "reason": f"{identity} is still running", "id": identity}
+    return {"event": "stop_failed", "reason": f"{identity} is still running" + (f" ({failed})" if failed else ""),
+            "id": identity}
 
 
 def _stop_words(stop: Dict[str, Any]) -> str:
@@ -212,19 +327,22 @@ class Incident:
 
 def read_all(store: Store, evidence_dir: str) -> Any:
     """Every incident under `evidence_dir`, or an Unresolved when the
-    directory cannot be listed (which vetoes as an open incident would)."""
+    directory cannot be listed (which vetoes as an open incident would).
+    Both records are read strictly: a malformed detected.json or event leaves
+    the incident open."""
     try:
         names = sorted(n for n in store.listdir(evidence_dir) if n.startswith(PREFIX))
     except OSError as e:
         return rh.Unresolved(f"cannot list {evidence_dir}: {e}")
     out = []
     for n in names:
-        d = posixpath.join(evidence_dir, n)
+        d, rid = posixpath.join(evidence_dir, n), n[len(PREFIX):]
         try:
-            detected: Any = json.loads(store.read(posixpath.join(d, DETECTED)))
-            if not isinstance(detected, dict):
-                raise ValueError("not an object")
-        except (OSError, ValueError) as e:
+            detected: Any = _strict(store.read(posixpath.join(d, DETECTED)))
+            bad = detected_problem(detected, rid)
+            if bad:
+                raise ValueError(bad)
+        except (OSError, ValueError, UnicodeDecodeError) as e:
             detected = rh.Unresolved(f"{n}/{DETECTED}: {e}")
         try:
             raw = store.read(posixpath.join(d, EVENTS))
@@ -235,14 +353,15 @@ def read_all(store: Store, evidence_dir: str) -> Any:
         events: Any = raw
         if not isinstance(raw, rh.Unresolved):
             try:
-                events = [json.loads(l) for l in raw.decode("utf-8").splitlines() if l.strip()]
+                events = [_strict(l.encode("utf-8")) for l in raw.decode("utf-8").splitlines() if l.strip()]
                 if not raw.endswith(b"\n") and raw:
                     raise ValueError("a truncated last line")
-                if not all(isinstance(e, dict) and e.get("event") in EFFECT_EVENTS | LIFECYCLE_EVENTS for e in events):
-                    raise ValueError("an event outside the vocabulary")
+                bad = next((p for p in (event_problem(e) for e in events) if p), None)
+                if bad:
+                    raise ValueError(bad)
             except (UnicodeDecodeError, ValueError) as e:
                 events = rh.Unresolved(f"{n}/{EVENTS}: {e}")
-        out.append(Incident(n[len(PREFIX):], detected, events))
+        out.append(Incident(rid, detected, events))
     return out
 
 
@@ -258,17 +377,19 @@ def complete(store: Store, fx: Effects, *, evidence_dir: str, at: str, identity:
              late: Optional[Dict[str, Any]] = None, emit: Callable[[str], None] = print) -> List[str]:
     """Finish what crashed or could not be recorded, idempotently, from
     CURRENT facts. `late`: an incident a run acted on but could not record
-    ({run_id, failing, token, failing_evidence_persisted}), written now,
-    marked `recorded_late` and `taken_without_record`, so the veto applies.
-    Each completion is appended as an event."""
+    ({run_id, at, failing, token, failing_evidence_persisted}), written now,
+    exclusively, marked `recorded_late` and `taken_without_record`, so the
+    veto applies; an existing record is kept with its original cause. Each
+    completion is appended as an event."""
     said = []
     if late is not None:
-        d = posixpath.join(evidence_dir, PREFIX + late["run_id"])
+        rid = late["run_id"]
+        d = posixpath.join(evidence_dir, PREFIX + rid)
         detected = dict(late, identity=identity if isinstance(identity, str) else None,
                         pending=["rewrite", "stop"], recorded_late=True, taken_without_record=True)
-        why = None if _exists(store, d) else _try(store.mkdir, d)
-        why = why or _try(store.new_file, posixpath.join(d, DETECTED), json.dumps(detected, sort_keys=True).encode())
-        said.append(f"late incident {late['run_id']}: " + ("recorded" if why is None else f"NOT recorded: {why}"))
+        made = None if _exists(store, d) else _try(store.mkdir, d)
+        why = made if made is not None else _publish_detected(store, d, rid, detected)[0]
+        said.append(f"late incident {rid}: " + ("recorded" if why is None else f"NOT recorded: {why}"))
     got = read_all(store, evidence_dir)
     if isinstance(got, rh.Unresolved):
         return said + [got.reason]
@@ -277,7 +398,7 @@ def complete(store: Store, fx: Effects, *, evidence_dir: str, at: str, identity:
             continue
         events = posixpath.join(evidence_dir, PREFIX + inc.run_id, EVENTS)
         if "rewrite" in inc.pending():
-            has = fx.live_has_delegation()
+            has = _observe(fx.live_has_delegation)
             if has is True:
                 failed = _try(fx.rewrite)
                 ev = {"event": "rewrite_ok"} if failed is None else {"event": "rewrite_failed", "reason": failed}
@@ -288,24 +409,20 @@ def complete(store: Store, fx: Effects, *, evidence_dir: str, at: str, identity:
             _try(store.append, events, _line(dict(ev, at=at, completion=True)))
             said.append(f"{inc.run_id}: {ev['event']}")
         if "stop" in inc.pending():
-            seen = fx.inspect(identity) if isinstance(identity, str) else None
-            if isinstance(identity, str) and isinstance(seen, dict) and not seen.get("running"):
+            seen = _observe(fx.inspect, identity) if isinstance(identity, str) else None
+            if isinstance(identity, str) and isinstance(seen, dict) and seen.get("running") is False:
                 ev = {"event": "stop_ok", "id": identity, "observed": "not running"}
             else:
                 ev = _stop(fx, identity)
             _try(store.append, events, _line(dict(ev, at=at, completion=True)))
             said.append(f"{inc.run_id}: {ev['event']}")
     for s in said:
-        emit(s)
+        _say(emit, s)
     return said
 
 
 def _exists(store: Store, path: str) -> bool:
-    try:
-        store.listdir(path)
-        return True
-    except OSError:
-        return False
+    return _try(store.listdir, path) is None
 
 
 # --- Resolution ---------------------------------------------------------------------------
@@ -332,16 +449,22 @@ def resolve(store: Store, fx: Effects, *, evidence_dir: str, run_id: str, reason
         bad.append("its rewrite is not complete")
     if not reason.strip():
         bad.append("an operator reason is required")
-    has = fx.live_has_delegation()
+    has = _observe(fx.live_has_delegation)
     if has is not False:
         bad.append("the live config still carries delegation" if has is True else f"cannot observe the live config: {has.reason}")
-    squat = fx.squatter_signing()
+    squat = _observe(fx.squatter_signing)
     if squat is not False:
         bad.append("a container holding the local router's name runs with delegation" if squat is True
                    else f"cannot observe the containers: {squat.reason}")
-    running = fx.inspect(identity) if isinstance(identity, str) else None
-    if isinstance(running, rh.Unresolved):
-        bad.append(f"cannot inspect the local router: {running.reason}")
+    if not isinstance(identity, str):
+        bad.append("the local router's identity is unreadable, so it cannot be shown stopped")
+    else:
+        running = _observe(fx.inspect, identity)
+        if isinstance(running, rh.Unresolved):
+            bad.append(f"cannot inspect the local router: {running.reason}")
+        elif isinstance(running, dict) and running.get("running") is not False:
+            bad.append("the local router is still running" if running.get("running") is True
+                       else "the local router's state cannot be told")
     if isinstance(fresh, rh.Unresolved):
         bad.append(f"no fresh evidence: {fresh.reason}")
     else:
