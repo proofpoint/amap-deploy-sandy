@@ -93,6 +93,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
+import fleet_keys as fk    # the fleet's public signing keys: the pinned inventory
 import hub_keys as hk      # the local router's key, kept from the email router; no delegation block
 import hub_runtime as hr   # the hub-link router's files and rendering
 import hub_supervise as hv  # the hub-link router's supervision, weekly probe job and start check
@@ -185,6 +186,7 @@ class Spec:
     router: Optional[hp.RouterSpec] = None      # the local router's recorded image, when the document has one
     partition: Optional[ps.PartitionSpec] = None   # the partition evidence's directories and weekly job
     gate: Optional[ps.GateSpec] = None          # the harness's passing record, the operator's alone
+    fleet_keys: Optional[fk.FleetKeysPin] = None   # the fleet inventory's path and pin, when the document has one
 
     def runtime_of(self, principal: str) -> Dict[str, Any]:
         return next(r for r in self.runtimes if r["principal"] == principal)
@@ -218,7 +220,7 @@ def load_spec(doc: Any) -> Spec:
         raise SpecError(f"the document is not a {SPEC_SCHEMA} host setup")
     known = {"schema", "principals", "groups", "hops", "roots", "overlay", "agent_paths", "openssl",
              "mounts", "runtimes", "production", ss.SECTION, hr.SECTION, hk.SECTION, hv.SECTION, hp.SECTION,
-             ps.SECTION, ps.GATE_SECTION}
+             ps.SECTION, ps.GATE_SECTION, fk.SECTION}
     if set(doc) - known:
         raise SpecError(f"unknown member(s): {', '.join(sorted(set(doc) - known))}")
     production = doc.get("production", False)
@@ -395,6 +397,14 @@ def load_spec(doc: Any) -> Spec:
             spec = dataclasses.replace(spec, gate=ps.load_gate(doc[ps.GATE_SECTION], spec.partition))
     except ps.PartitionSpecError as e:
         raise SpecError(str(e)) from None
+    if fk.SECTION in doc:
+        if spec.keys is None:
+            raise SpecError(f"the {fk.SECTION} section needs a keys section: the inventory names this host's "
+                            "signing key, which the keys section places")
+        try:
+            spec = dataclasses.replace(spec, fleet_keys=fk.load(doc[fk.SECTION]))
+        except fk.FleetKeysError as e:
+            raise SpecError(str(e)) from None
     if spec.keys is not None and spec.router is not None:
         declared = spec.runtime_of(spec.keys.principal)["container"]
         if declared != spec.router.container:
