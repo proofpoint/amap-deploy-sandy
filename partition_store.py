@@ -207,9 +207,10 @@ class RootedStore(pi.Store):
             os.close(dfd)
 
 
-def without_delegation(raw: bytes) -> bytes:
-    """The live config without its `delegation` member, in install's own
-    serialisation; ValueError when it is not one strict JSON object."""
+def strict_object(raw: bytes) -> Dict[str, Any]:
+    """`raw` as one JSON object: UTF-8, no duplicate key, no non-finite
+    number; ValueError otherwise. A truncated record fails here and is never
+    repaired."""
     def pairs(items: List[Any]) -> Dict[str, Any]:
         out: Dict[str, Any] = {}
         for k, v in items:
@@ -222,6 +223,30 @@ def without_delegation(raw: bytes) -> bytes:
         raise ValueError(f"non-finite number {name}")
     doc = json.loads(raw.decode("utf-8"), object_pairs_hook=pairs, parse_constant=no_constant)
     if not isinstance(doc, dict):
-        raise ValueError("the live config is not a JSON object")
+        raise ValueError("not a JSON object")
+    return doc
+
+
+def read_bounded(path: str) -> bytes:
+    """A regular file's bytes, reached from / without following any link and
+    read from the descriptor it was checked on: for inputs outside the write
+    roots, which are read and never written."""
+    dfd = open_dir(posixpath.dirname(_abs(path)))
+    try:
+        fd = os.open(posixpath.basename(path), _READ, dir_fd=dfd)
+    finally:
+        os.close(dfd)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError(f"{path} is not a regular file")
+        return _read_fd(fd)
+    finally:
+        os.close(fd)
+
+
+def without_delegation(raw: bytes) -> bytes:
+    """The live config without its `delegation` member, in install's own
+    serialisation; ValueError when it is not one strict JSON object."""
+    doc = strict_object(raw)
     doc.pop("delegation", None)
     return (json.dumps(doc, indent=2) + "\n").encode("utf-8")
