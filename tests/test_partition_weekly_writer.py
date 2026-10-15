@@ -28,6 +28,7 @@ import unittest
 from pathlib import Path
 
 import host_steps as hs
+from _fakefs import FakeFS
 import partition_evidence as pe
 import partition_incident as pi
 import partition_run as pr
@@ -53,6 +54,10 @@ def note(name, value):
         json.dump(value, f)
 a, b = os.fstat(fd), os.stat(os.path.join(os.path.dirname(run_dir), "lock"))
 note("child-lock.json", [a.st_dev == b.st_dev and a.st_ino == b.st_ino])
+try:
+    note("record-at-start.json", json.load(open(os.path.join(ev, "weekly-runs.json"))))
+except OSError:
+    note("record-at-start.json", None)
 note("child-started.json", True)
 canonical = pe.canonical
 def probe(pid, verdict, name):
@@ -201,11 +206,70 @@ import json
 sys.path.insert(0, %r)
 import host_steps as hs
 hs.ROOT_UID, hs.ROOT_GID = os.getuid(), os.getgid()
-hs.startup_closure = lambda python, docker: json.loads(os.environ.get("PW_CLOSURE", "[]"))
-hs._docker_closure = lambda docker: json.loads(os.environ.get("PW_DOCKER_CLOSURE", "[]"))
+hs.startup_closure = lambda python, docker, spelled=(): json.loads(os.environ.get("PW_CLOSURE", "[]"))
+hs._docker_closure = lambda docker, spelled=None: json.loads(os.environ.get("PW_DOCKER_CLOSURE", "[]"))
 hs._ancestor_ok = lambda st: True
 hs._trusted_tool = lambda p: os.path.realpath(p)
 hs.CHILD_TIMEOUT_S = float(os.environ.get("PW_CHILD_TIMEOUT", hs.CHILD_TIMEOUT_S))
+# PW_RUNS_FAULT=<phase>:<call>[#<n>] fails the n-th such call of the run
+# record's filesystem in that phase (W2, W5 or W7); PW_REMOVE_FAIL names run
+# directories whose removal fails.
+if os.environ.get("PW_RUNS_FAULT"):
+    phase, call = os.environ["PW_RUNS_FAULT"].split(":")
+    call, nth = (call.split("#") + ["1"])[:2]
+    class Faulty:
+        def __init__(self):
+            self.seen = 0
+        def __getattr__(self, name):
+            real = getattr(os, name)
+            if name != call:
+                return real
+            def maybe(*a, **k):
+                self.seen += 1
+                if self.seen == int(nth):
+                    raise OSError(5, "injected " + call)
+                return real(*a, **k)
+            return maybe
+    real_fs = hs._runs_fs
+    hs._runs_fs = lambda p: Faulty() if p == phase else real_fs(p)
+# PW_SETUP_FAULT names one step between W2 and the child that fails with an
+# OSError: mkdir of the run directory or of its docker directory, the
+# context record, W5's listing, or the child's launch.
+_fault = os.environ.get("PW_SETUP_FAULT")
+if _fault in ("mkdir-run", "mkdir-docker"):
+    _real_mkdir = os.mkdir
+    def _mkdir(path, *a, **k):
+        if (path.startswith("run-") if _fault == "mkdir-run" else path == "docker"):
+            raise OSError(28, "No space left on device", path)
+        return _real_mkdir(path, *a, **k)
+    os.mkdir = _mkdir
+elif _fault == "context":
+    _real_write_at = hs._write_at
+    def _write_at(dfd, name, *a, **k):
+        if name == "context.json":
+            raise OSError(28, "No space left on device", name)
+        return _real_write_at(dfd, name, *a, **k)
+    hs._write_at = _write_at
+elif _fault == "listing":
+    _real_record, _calls = hs._runs_record, []
+    def _runs_record(*a, **k):
+        _calls.append(1)
+        if len(_calls) == 1:
+            raise OSError(5, "Input/output error", "exec_root")
+        return _real_record(*a, **k)
+    hs._runs_record = _runs_record
+elif _fault == "launch":
+    def _launch(*a, **k):
+        raise OSError(8, "Exec format error", a[0][0])
+    hs._launch = _launch
+if os.environ.get("PW_REMOVE_FAIL"):
+    import re as _re
+    real_rm = hs._remove_tree
+    def failing(dfd, name):
+        if _re.fullmatch(os.environ["PW_REMOVE_FAIL"], name):
+            raise OSError(5, "injected removal")
+        return real_rm(dfd, name)
+    hs._remove_tree = failing
 sys.exit(hs.main(sys.argv[1:]))
 '''
 
@@ -651,6 +715,41 @@ class WriterTest(unittest.TestCase):
         self.assertEqual(p.returncode, hs.EXIT_TOOLING, p.stdout + p.stderr)
         self.assertEqual(sorted(os.listdir(f"{self.h.exec}/bundle")), before, "the verified bundle stays")
         self.assertIn("stray.py", os.listdir(new), "the refused one is left where it was, for a look")
+
+    def test_provisioning_with_the_lock_held_hands_off_and_touches_nothing(self):
+        """The plan's swap step on both systems is this subcommand, never
+        flock(1): with the lock held by another, it is a handoff, and the
+        bundle, bundle.new and the lock are byte- and inode-unchanged."""
+        import fcntl
+        new = f"{self.h.exec}/bundle.new"
+        os.mkdir(new)
+        for n in ("partition_weekly.py", "partition_weekly.closure", "PIN"):
+            with open(f"{self.h.exec}/bundle/{n}", "rb") as f, open(f"{new}/{n}", "wb") as g:
+                g.write(f.read())
+            os.chmod(f"{new}/{n}", 0o444)
+        os.chmod(new, 0o555)
+        lock = f"{self.h.exec}/lock"
+        fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+        def state():
+            out = {}
+            for top in (f"{self.h.exec}/bundle", new):
+                for n in sorted(os.listdir(top)):
+                    st = os.lstat(f"{top}/{n}")
+                    with open(f"{top}/{n}", "rb") as f:
+                        out[f"{top}/{n}"] = (st.st_ino, f.read())
+                out[top] = os.lstat(top).st_ino
+            st = os.lstat(lock)
+            with open(lock, "rb") as f:
+                out[lock] = (st.st_ino, f.read())
+            return out
+        before = state()
+        provision = [sys.executable, "-I", "-S", "-B", self.h.wrapper, "partition-provision", self.h.exec]
+        p = subprocess.run(provision, capture_output=True, text=True, timeout=60)
+        self.assertEqual(p.returncode, hs.EXIT_HANDOFF, p.stdout + p.stderr)
+        self.assertEqual(state(), before)
 
     # B1: everything root runs is verified before any engine call
     def test_nothing_reaches_the_engine_before_the_startup_closure_is_verified(self):
@@ -1177,24 +1276,11 @@ class ClosureTest(unittest.TestCase):
     and judged path by path, up every parent and down every tree."""
 
     def fs(self, entries, links=None):
-        """A fake tree: path -> (uid, mode); lstat, walk and realpath over
-        it, with `links` mapping each link to its target."""
-        def lstat(p):
-            if p not in entries:
-                raise FileNotFoundError(2, "No such file or directory")
-            uid, mode = entries[p]
-            return types.SimpleNamespace(st_uid=uid, st_mode=mode)
-
-        def walk(top):
-            if not stat.S_ISDIR(entries.get(top, (0, 0))[1]):
-                return
-            kids = [p for p in entries if os.path.dirname(p) == top and p != top]
-            yield top, [os.path.basename(k) for k in kids if stat.S_ISDIR(entries[k][1])], \
-                [os.path.basename(k) for k in kids if not stat.S_ISDIR(entries[k][1])]
-            for k in kids:
-                if stat.S_ISDIR(entries[k][1]):
-                    yield from walk(k)
-        return lstat, walk, lambda p: (links or {}).get(p, p)
+        """A fake tree: path -> (uid, mode), with `links` mapping each link to
+        its textual target (the tree's own link.py points at os.py beside it)."""
+        if "/usr/lib/python3/link.py" in entries:
+            links = dict({"/usr/lib/python3/link.py": "os.py"}, **(links or {}))
+        return FakeFS(entries, links)
 
     D, F, L = stat.S_IFDIR | 0o755, stat.S_IFREG | 0o644, stat.S_IFLNK | 0o777
 
@@ -1212,8 +1298,8 @@ class ClosureTest(unittest.TestCase):
     PATHS = ["/usr/lib/python3", "/usr/lib/libssl.so.3", "/Library/Developer/CommandLineTools"]
 
     def test_a_closure_root_alone_has_no_problems(self):
-        lstat, walk, _ = self.fs(self.tree())
-        self.assertEqual(hs.closure_problems(self.PATHS, lstat, walk), [])
+        fx = self.fs(self.tree())
+        self.assertEqual(hs.closure_problems(self.PATHS, **fx.kw()), [])
 
     def test_every_writable_or_foreign_startup_dependency_is_a_problem(self):
         rows = {"a module others can write": {"/usr/lib/python3/os.py": (0, stat.S_IFREG | 0o666)},
@@ -1227,11 +1313,11 @@ class ClosureTest(unittest.TestCase):
                     "/Library/Developer": (0, stat.S_IFDIR | 0o775)}}
         for what, over in rows.items():
             with self.subTest(what):
-                lstat, walk, _ = self.fs(self.tree(**over))
-                bad = hs.closure_problems(self.PATHS, lstat, walk)
+                fx = self.fs(self.tree(**over))
+                bad = hs.closure_problems(self.PATHS, **fx.kw())
                 self.assertEqual([b.split(" ")[0] for b in bad], list(over), bad)
-        lstat, walk, _ = self.fs({k: v for k, v in self.tree().items() if k != "/usr/lib/libssl.so.3"})
-        self.assertTrue(hs.closure_problems(self.PATHS, lstat, walk), "a missing dependency is a problem")
+        fx = self.fs({k: v for k, v in self.tree().items() if k != "/usr/lib/libssl.so.3"})
+        self.assertTrue(hs.closure_problems(self.PATHS, **fx.kw()), "a missing dependency is a problem")
 
     def test_a_link_is_judged_by_its_target_and_the_targets_directories_too(self):
         out = {"/opt": (0, self.D), "/opt/w": (501, stat.S_IFDIR | 0o777), "/opt/w/libssl.so.3": (501, self.F)}
@@ -1248,42 +1334,42 @@ class ClosureTest(unittest.TestCase):
         for what, (over, links) in rows.items():
             with self.subTest(what):
                 tree = dict(self.tree(**over), **out)
-                lstat, walk, realpath = self.fs(tree, links)
-                bad = hs.closure_problems(self.PATHS, lstat, walk, realpath)
+                fx = self.fs(tree, links)
+                bad = hs.closure_problems(self.PATHS, **fx.kw())
                 self.assertTrue(any(b.startswith(("/opt/w", "/opt/clt")) for b in bad), bad)
 
     def test_a_link_cycle_ends(self):
         tree = dict(self.tree(**{"/usr/lib/python3/a": (0, self.L), "/usr/lib/python3/b": (0, self.L)}))
-        lstat, walk, realpath = self.fs(tree, {"/usr/lib/python3/a": "/usr/lib/python3/b",
+        fx = self.fs(tree, {"/usr/lib/python3/a": "/usr/lib/python3/b",
                                                "/usr/lib/python3/b": "/usr/lib/python3/a"})
-        self.assertEqual(hs.closure_problems(self.PATHS, lstat, walk, realpath), [])
+        self.assertEqual(hs.closure_problems(self.PATHS, **fx.kw()), [])
 
     def test_on_macos_only_a_discovered_system_library_may_be_in_the_shared_cache(self):
         tree = {k: v for k, v in self.tree().items() if k != "/usr/lib/libssl.so.3"}
-        lstat, walk, realpath = self.fs(tree)
+        fx = self.fs(tree)
         closure = {hs.REQUIRED: ["/usr/lib/python3"], hs.LIBRARIES: ["/usr/lib/libssl.so.3"], hs.OPTIONAL: []}
-        self.assertEqual(hs.closure_problems(closure, lstat, walk, realpath, platform="darwin"), [])
-        self.assertEqual(hs.closure_problems(closure, lstat, walk, realpath, platform="linux"),
+        self.assertEqual(hs.closure_problems(closure, **fx.kw(), platform="darwin"), [])
+        self.assertEqual(hs.closure_problems(closure, **fx.kw(), platform="linux"),
                          ["/usr/lib/libssl.so.3: absent"])
         for absent in ("/usr/lib/absent-python-tree", "/usr/lib/absent-python.zip", "/System/Library/absent"):
             with self.subTest(absent=absent):
                 required = dict(closure, **{hs.REQUIRED: ["/usr/lib/python3", absent]})
-                self.assertIn(f"{absent}: absent", hs.closure_problems(required, lstat, walk, realpath,
+                self.assertIn(f"{absent}: absent", hs.closure_problems(required, **fx.kw(),
                                                                          platform="darwin"),
                               "a required path is never excused as cached")
 
     def test_an_absent_optional_zip_is_judged_by_its_would_be_place(self):
         zipped = "/usr/lib/python313.zip"
         closure = {hs.REQUIRED: ["/usr/lib/python3"], hs.LIBRARIES: [], hs.OPTIONAL: [zipped]}
-        lstat, walk, realpath = self.fs(self.tree())
-        self.assertEqual(hs.closure_problems(closure, lstat, walk, realpath), [], "absent, under root's directories")
+        fx = self.fs(self.tree())
+        self.assertEqual(hs.closure_problems(closure, **fx.kw()), [], "absent, under root's directories")
         own = {hs.REQUIRED: ["/usr/lib/python3"], hs.LIBRARIES: [], hs.OPTIONAL: ["/opt/pyzip/python313.zip"]}
-        lstat, walk, realpath = self.fs(self.tree(**{"/opt": (0, self.D), "/opt/pyzip": (501, self.D)}))
-        self.assertEqual(hs.closure_problems(own, lstat, walk, realpath),
+        fx = self.fs(self.tree(**{"/opt": (0, self.D), "/opt/pyzip": (501, self.D)}))
+        self.assertEqual(hs.closure_problems(own, **fx.kw()),
                          ["/opt/pyzip is not root-owned, or is writable by others"],
                          "whoever owns the would-be place could plant it, though no required path is there")
-        lstat, walk, realpath = self.fs(self.tree(**{zipped: (0, stat.S_IFREG | 0o666)}))
-        self.assertEqual(hs.closure_problems(closure, lstat, walk, realpath),
+        fx = self.fs(self.tree(**{zipped: (0, stat.S_IFREG | 0o666)}))
+        self.assertEqual(hs.closure_problems(closure, **fx.kw()),
                          [f"{zipped} is not root-owned, or is writable by others"], "present, it is judged whole")
 
     def test_this_hosts_own_interpreter_has_no_closure_problem(self):
