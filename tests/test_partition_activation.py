@@ -66,6 +66,18 @@ class ProspectiveSpecTest(unittest.TestCase):
             self.spec(final=f"{self.tree.root}/hop/router.json")
         self.assertIn("the config file", str(e.exception))
 
+    def test_the_mounts_follow_the_staged_bytes_even_with_other_bytes_at_the_final_path(self):
+        """The final path holds a DIFFERENT config (another state_dir); the
+        mounts must still be the staged bytes'. A read that bypassed the
+        wrapper's open() would show up here as the final file's mounts."""
+        other = os.path.join(self.tree.root, "other-state")
+        os.makedirs(other)
+        with open(self.final, "wb") as f:
+            f.write(self.tree.config(state_dir=other))
+        sources = {m["source"] for m in self.spec()["mounts"]}
+        self.assertIn(f"{self.tree.root}/state", sources)
+        self.assertNotIn(other, sources)
+
     def test_a_refusal_from_derive_mounts_is_named(self):
         staged = self.tree.config(registry_dir=f"{self.tree.root}/missing")
         with self.assertRaises(pa.ActivationError) as e:
