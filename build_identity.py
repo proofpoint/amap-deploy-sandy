@@ -182,8 +182,12 @@ def hub_router(container: str, image_commit: Optional[str], live: Any, image_lab
         return Claim(ID_HUB, rh.check(claim, want, image_labels, remedy))
     label = (image_labels or {}).get(LABEL) if isinstance(image_labels, dict) else None
     if not isinstance(label, str) or not _HEX40.fullmatch(label):
-        why = (f"[2]'s image carries no {LABEL} label (an image not built by build.sh, or built "
-               "from a dirty tree)" if label is None else f"[2]'s image's {LABEL} label is not a full commit")
+        if label is None:
+            why = f"[2]'s image carries no {LABEL} label (an image not built by the router's build.sh)"
+        elif label == "":
+            why = f"[2]'s image's {LABEL} label is empty (built from an unknown tree: dirty, or not its own checkout)"
+        else:
+            why = f"[2]'s image's {LABEL} label is not a full commit"
         return Claim(ID_HUB, rh.check(claim, want, rh.Unresolved(why), remedy))
     observed = {"observed_commit": label}
     own = ((live.get("Config") or {}).get("Labels") or {}).get(LABEL)

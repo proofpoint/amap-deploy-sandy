@@ -75,6 +75,14 @@ class HubRouterTest(unittest.TestCase):
         self.assertEqual(c.check.result, rh.PASS)
         self.assertEqual(observed(c), {"observed_commit": COMMIT})
 
+    def test_an_empty_label_is_unknown_and_says_why(self):
+        """build.sh sets the label EMPTY for a tree it cannot attest (so no
+        base image's value is inherited): unknown, never a commit of \"\"."""
+        c = self.claim(labels={LABEL: ""})
+        self.assertEqual(c.check.result, rh.UNKNOWN)
+        self.assertIn("is empty", c.check.reason)
+        self.assertNotIn("observed_commit", c.extras())
+
     def test_a_label_that_differs_fails(self):
         c = self.claim(labels={LABEL: PIN})
         self.assertEqual(c.check.result, rh.FAIL)
@@ -94,6 +102,7 @@ class HubRouterTest(unittest.TestCase):
             "no record": dict(commit=None),
             "no label": dict(labels={}),
             "null labels": dict(labels=None),
+            "empty label": dict(labels={LABEL: ""}),
             "short label": dict(labels={LABEL: COMMIT[:12]}),
             "dirty label": dict(labels={LABEL: COMMIT + "-dirty"}),
             "labels unreadable": dict(labels=rh.Unresolved("image inspect failed")),
