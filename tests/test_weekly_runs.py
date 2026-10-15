@@ -20,7 +20,8 @@ import partition_runs as pr
 import partition_setup as ps
 import partition_store as pst
 import router_health as rh
-from test_partition_setup import EV, EXEC, SCRATCH, TOOLS, StopTargetTest
+import test_partition_setup as tps
+from test_partition_setup import EV, EXEC, SCRATCH, TOOLS
 from test_partition_weekly_writer import B, FAIL3, PASS, TARGET, Host, InProcess
 
 LIVE = "/opt/ex/router.json"
@@ -33,7 +34,7 @@ def at(t):
 
 def activation(host="alpha"):
     staged = (json.dumps({"state_dir": "/s"}, indent=2) + "\n").encode()
-    return pa.activation_record(host=host, spec=StopTargetTest.SPEC, staged=staged, final_config_path=LIVE)
+    return pa.activation_record(host=host, spec=tps.StopTargetTest.SPEC, staged=staged, final_config_path=LIVE)
 
 
 def record(runs, host="alpha", when=NOW):

@@ -60,7 +60,7 @@ class Rig(unittest.TestCase):
     def stub(self, name, text):
         return write(os.path.join(self.stubs, name), "#!/bin/sh\n" + text)
 
-    def steps(self, kind, spec=P, *, between="", sudo=SUDO, owner="root", pass_fds=(), tty=None, bound=120):
+    def steps(self, kind, spec=P, *, between="", sudo=SUDO, owner="root", tty=None, bound=120):
         """The plan's validation steps run as one script, from a working
         directory that is not $R, with discovery's PATH led by the stubs.
         `between` runs after step 2 and before step 3. (stdout, rc, $R)."""
@@ -73,12 +73,14 @@ class Rig(unittest.TestCase):
             ['echo "R=$R" >&2', 'exit $rc']
         here = os.path.join(self.d, "elsewhere")
         os.makedirs(here, exist_ok=True)
-        kw = dict(cwd=here, pass_fds=pass_fds, timeout=bound, stdin=subprocess.DEVNULL)
+        kw = dict(cwd=here, timeout=bound, stdin=subprocess.DEVNULL)
         if tty is not None:
             kw.update(stdin=tty, start_new_session=True,
                       preexec_fn=lambda: __import__("fcntl").ioctl(tty, __import__("termios").TIOCSCTTY, 0))
         try:
-            p = subprocess.run(["/bin/sh", "-c", sudo + "\n" + "\n".join(lines)], stdout=subprocess.PIPE,
+            # The operator's shell holds an extra fd, 7, as a terminal session may.
+            p = subprocess.run(["/bin/sh", "-c", "exec 7</dev/null\n" + sudo + "\n" + "\n".join(lines)],
+                               stdout=subprocess.PIPE,
                                stderr=subprocess.PIPE, text=True, **kw)
         except subprocess.TimeoutExpired:
             self.fail(f"the steps did not finish within {bound} s")
@@ -96,13 +98,15 @@ class WholeStepTest(Rig):
 
     def darwin_stubs(self):
         """otool naming this host's libc for every binary, xcode-select naming
-        the interpreter's own library: a clean macOS rendering on Linux."""
-        import sysconfig
+        the spelled interpreter's own library: a clean macOS rendering on Linux."""
         libc = os.path.realpath([p for p in ("/lib/aarch64-linux-gnu/libc.so.6", "/lib/x86_64-linux-gnu/libc.so.6",
                                              "/usr/lib/libc.so.6") if os.path.exists(p)][0])
         self.stub("otool", f'for b in "$@"; do [ "$b" = -L ] && continue; echo "$b:"; '
                            f'printf "\\t{libc} (compatibility version 1.0.0)\\n"; done\n')
-        self.stub("xcode-select", f'echo {sysconfig.get_paths()["stdlib"]}\n')
+        stdlib = subprocess.run(["/usr/bin/python3", "-I", "-S", "-B", "-c",
+                                 "import sysconfig; print(sysconfig.get_paths()['stdlib'])"],
+                                capture_output=True, text=True, env={}).stdout.strip()
+        self.stub("xcode-select", f"echo {stdlib}\n")
 
     def test_a_clean_run_prints_only_the_sentinel_on_each_system(self):
         tools = healthy()
@@ -194,7 +198,8 @@ class WholeStepTest(Rig):
                     self.assertFalse(os.path.exists(marker + ".sti"), "no terminal on fds 0-2 to type into")
 
     def test_discovery_holds_only_fds_0_1_and_2(self):
-        """The shell's own fds, listed by ls from /proc/$$/fd (an ls of
+        """The operator's shell holds fd 7. Discovery's own fds, listed by ls
+        from /proc/$$/fd (an ls of
         /proc/self/fd would count its own directory fd), below 10, where dash
         keeps its script and the fds it saves for a redirection: with sudo's
         closefrom, fd 7 the caller holds never reaches discovery; without it
@@ -207,13 +212,7 @@ class WholeStepTest(Rig):
                 rec = os.path.join(self.d, "fds")
                 py = self.stub("python3", f"ls -l /proc/$$/fd > {rec}\necho /nonexistent\n")   # not last: never exec'd
                 spec = dataclasses.replace(P, tools={"python3": py, "docker": "/bin/sh"})
-                fd = os.open("/dev/null", os.O_RDONLY)
-                try:
-                    os.dup2(fd, 7)
-                    self.steps("systemd", spec, sudo=sudo, pass_fds=(7,))
-                finally:
-                    os.close(7)
-                    os.close(fd)
+                self.steps("systemd", spec, sudo=sudo)
                 with open(rec) as f:
                     held = {l.split(" -> ")[0].split()[-1] for l in f if " -> " in l}
                 held = {n for n in held if int(n) < 10}   # dash keeps its script and saved fds at 10 and above
