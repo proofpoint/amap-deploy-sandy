@@ -77,6 +77,9 @@ import verify_report as vr  # how verify prints: one row per condition, its work
 import host_setup as hsu    # a hop deployment's host plan: rendered and checked, never applied
 import host_adapter as ha   # the host registry's CLI, run as a subprocess, never imported
 import hop_router as hp     # the local router's hop keys, on a host with a hop link
+import activation_install as ai   # A3: the activation config, checked before anything is written
+import delegation_render as dr    # the delegation block's no-seed check
+import partition_setup as ps      # the harness gate A3 requires
 import delivery_checks as dc  # delivery itself: lister mode, session posture, daemon build, backlog
 import connector_pin as cpin  # install refuses a connector checkout not at its siblings.json pin
 
@@ -3570,6 +3573,41 @@ def hop_router_keys(policy: Dict[str, Any], state_dir: Path, overlay: Optional[P
     return keys, problems
 
 
+def run_activation(args: argparse.Namespace, policy: Dict[str, Any], doc: Dict[str, Any], path: Path, *,
+                   apply: bool, spec: Any) -> int:
+    """A3 (activation_install): the activation config into the operator's
+    run directory under --apply, and root's place step printed. Exit 2 on any
+    refusal, which writes nothing; the live config is never written here."""
+    if not args.activate or not args.activation_sha256:
+        print("router config: --activate and --activation-sha256 go together: A3 names A2's run and A1's "
+              "printed digest, and neither is ever defaulted", file=sys.stderr)
+        return 2
+    link = hp.parse_hop_link(policy)
+    if spec is None or link is None or link.inbound is None:
+        print("router config: cannot activate — the policy's hop_link has no delegation member", file=sys.stderr)
+        return 2
+    checkout = hp.hop_checkout()
+    gate = ps.gate_problems(spec.gate, rl_sha=hp.hop_pin(),
+                            hop_sha=(spec.overlay_pin or {}).get("commit", rh.Unresolved("no plugin pin")),
+                            plugin_sha256=hp.PLUGIN_SHA256)
+    final, refused = ai.activate(
+        spec=spec, host=hsu.partition_host(spec), doc=doc, pre_activation=sibling_text(doc).encode("utf-8"),
+        fleet_domain=policy.get(fp.FLEET_DOMAIN_KEY), trusted=link.trusted, inbound=link.inbound,
+        run_id=args.activate, activation_sha256=args.activation_sha256, gate=gate,
+        validate=lambda d: dr.no_seed_problem(d, checkout),
+        validate_bytes=lambda b: dr.no_seed_problem_bytes(b, checkout))
+    for r in refused:
+        print(f"router config: cannot activate — {r}", file=sys.stderr)
+    if final is None:
+        return 2
+    source = Path(spec.secrets.run_dir) / ai.ACTIVATED_NAME
+    print(f"router config: activation {_write_file(source, final.decode('utf-8'), dry_run=not apply, label=ai.ACTIVATED_NAME)}")
+    print("  then, as root:")
+    print(f"    {ai.place_step(spec, str(source), final)}")
+    print(f"  then restart the local router (A4): docker/run.sh --config {path} --detach, from the hop checkout")
+    return 0
+
+
 def run_render_router(args: argparse.Namespace, home: Path, boxes: List[Dict[str, Any]],
                       policy: Dict[str, Any], *, apply: bool) -> int:
     """Render the sibling and write it (`apply`) or compare it (dry). Exit 0
@@ -3588,8 +3626,10 @@ def run_render_router(args: argparse.Namespace, home: Path, boxes: List[Dict[str
     doc = result["_doc"]
     for w in result["_warnings"]:
         print(f"router config warning: {w}", file=sys.stderr)
+    hop_spec: List[Any] = []
     keys, hop_problems = hop_router_keys(policy, state_dir, ha.overlay_path(getattr(args, "overlay", None)),
-                                         decommission=getattr(args, "decommission_hop", False), rendered=path)
+                                         decommission=getattr(args, "decommission_hop", False), rendered=path,
+                                         spec_out=hop_spec)
     for p in hop_problems:
         print(f"router config: cannot render — {p}", file=sys.stderr)
     if hop_problems:
@@ -3612,6 +3652,8 @@ def run_render_router(args: argparse.Namespace, home: Path, boxes: List[Dict[str
               f"rendering: {refused}", file=sys.stderr)
         return 2
     names = ", ".join(sorted(members))
+    if getattr(args, "activate", None) is not None or getattr(args, "activation_sha256", None) is not None:
+        return run_activation(args, policy, doc, path, apply=apply, spec=(hop_spec or [None])[0])
     # The router cannot start without its state_dir, so it is created here —
     # only after the rendering (state_dir included) has passed the router's
     # own loader, so a placement the router refuses is never created.
@@ -4139,7 +4181,9 @@ def run_sync(args: argparse.Namespace, home: Path, boxes_dir: Path) -> int:
     # a dry install answers "what would change", and an absent sibling is one
     # of the answers.
     print()
-    run_render_router(args, home, boxes, policy, apply=apply)
+    router_rc = run_render_router(args, home, boxes, policy, apply=apply)
+    if getattr(args, "activate", None) and router_rc:
+        return router_rc
 
     # Step 4: the registry's names, only when the policy turns them on.
     if identity_mode(policy) is not None:
@@ -4848,6 +4892,13 @@ def build_parser() -> argparse.ArgumentParser:
                         "router's config beside the manifest — the whole install, once per "
                         "host; sandy applies it to each sandbox at its launch")
     install.add_argument("--apply", action="store_true", help="write (default: report only)")
+    install.add_argument("--activate", metavar="RUN_ID",
+                         help="A3: write the local router's activation config (A1's staged bytes with the token "
+                              "of A2's run RUN_ID) into the run directory and print root's place step; never "
+                              "the live config itself. Needs --activation-sha256")
+    install.add_argument("--activation-sha256", metavar="HEX",
+                         help="the sha256 A1 printed for its record; compared with the PLACED record, never "
+                              "taken from it")
     install.add_argument("--decommission-hop", action="store_true",
                          help="render router.json WITHOUT the hop keys although state_dir holds hop "
                               "state: the explicit removal of a hop link (then restart the router)")
