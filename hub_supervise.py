@@ -48,6 +48,7 @@ foreground command runs.
 """
 
 import json
+import math
 import plistlib
 import posixpath
 import re
@@ -68,10 +69,21 @@ STOP_CODE = 143
 RESTART_SEC = 30
 START_LIMIT_INTERVAL_S = 600
 START_LIMIT_BURST = 5
-#: `docker stop -t`: at least the rendered dot budget + 60 s, the router's own
-#: join bound, so a stop during a slow dot ends in the router's join, never in
-#: the engine's kill.
+#: `docker stop -t`: at least the router's own join bound (the rendered dot
+#: budget + JOIN_SLACK_S + DONE_POLL_S), so a planned stop ends in the
+#: router's exit, 0 or 4, never in the engine's kill. verify derives the bound
+#: from the rendering and holds this to it.
 STOP_TIMEOUT_S = 100
+#: The router's join slack beyond the dot budget (the router's frozen
+#: constant, with no knob), and its main thread's poll for the stop.
+JOIN_SLACK_S = 60
+DONE_POLL_S = 1
+#: The start probe's login runs before the join exists: connect, then five
+#: command phases (EHLO, STARTTLS, the TLS handshake, EHLO, AUTH), then at most
+#: this long for QUIT. A stop in that window can end in the engine's kill,
+#: with nothing committed.
+START_PROBE_COMMANDS = 5
+QUIT_S = 5
 #: The supervisors' own bounds sit above the stop: systemd's default
 #: TimeoutStopSec (90 s) and launchd's default ExitTimeOut (20 s) are below it.
 SUPERVISOR_STOP_S = 120
@@ -621,9 +633,65 @@ def verify_ancestry(spec: Any, ancestor: Callable[[str, str], Any], label: Any) 
 ASK = hr.ASK
 
 
+#: The email router's own defaults for a budget left unset, and its bound on
+#: each (its smtp_send.DEADLINE_MAX): it reads them as seconds, a float in
+#: (0, RE_BUDGET_MAX]. The email router is not a sibling of this repository,
+#: so these are cited from its source, not imported from it.
+RE_BUDGET_DEFAULTS = {"RELAY_SMTP_CONNECT_TIMEOUT": 300, "RELAY_SMTP_COMMAND_TIMEOUT": 300,
+                      "RELAY_SMTP_DOT_TIMEOUT": 600}
+RE_BUDGET_MAX = 3600
+
+
+def _budget(env: Dict[str, str], key: str) -> float:
+    """One budget as the email router reads it: its default when unset, else
+    a float in (0, RE_BUDGET_MAX]; ValueError naming it otherwise."""
+    raw = env.get(key)
+    if raw is None or raw == "":
+        return float(RE_BUDGET_DEFAULTS[key])
+    try:
+        v = float(raw)
+    except ValueError:
+        raise ValueError(f"{key}={raw!r} is not a number of seconds") from None
+    if not 0 < v <= RE_BUDGET_MAX:
+        raise ValueError(f"{key}={raw!r} is not in (0, {RE_BUDGET_MAX}]")
+    return v
+
+
+def stop_budget(env: Dict[str, str]) -> Tuple[int, int]:
+    """(the join bound the stop timeout must cover, the start probe's window),
+    from the rendered budgets, read as the email router reads them and
+    rounded up to whole seconds; ValueError when one is not a budget it
+    accepts."""
+    dot = _budget(env, "RELAY_SMTP_DOT_TIMEOUT")
+    window = _budget(env, "RELAY_SMTP_CONNECT_TIMEOUT") + START_PROBE_COMMANDS * _budget(env, "RELAY_SMTP_COMMAND_TIMEOUT")
+    return math.ceil(dot) + JOIN_SLACK_S + DONE_POLL_S, math.ceil(window) + QUIT_S
+
+
+def verify_stop_budget(spec: Any) -> List[rh.Check]:
+    """The stop timeout held to the join bound DERIVED FROM THE RENDERING, not
+    read from the placed environment file: that is sound only because
+    verify_files FAILs a placed file that differs from the rendering."""
+    try:
+        bound, window = stop_budget(dict(hr.environment(spec, spec.hub)))
+    except ValueError as e:
+        claim = "the rendered SMTP budgets are ones the email router accepts"
+        want = rh.Fact("budgets", True, f"the email router reads each as seconds in (0, {RE_BUDGET_MAX}], its default "
+                                        "when unset")
+        return [rh.check(claim, want, str(e), "render each budget as a number of seconds the router accepts",
+                         ok=lambda e_, a: a is True)]
+    covered = "covers" if STOP_TIMEOUT_S >= window else "does not cover"
+    claim = (f"the stop timeout ({STOP_TIMEOUT_S} s) covers the router's own join (the rendered dot budget + "
+             f"{JOIN_SLACK_S} s + {DONE_POLL_S} s); it {covered} the start probe's login window ({window} s), where "
+             f"a stop can end in the engine's kill with nothing committed")
+    want = rh.Fact("join bound", bound, "the rendered RELAY_SMTP_DOT_TIMEOUT + the router's join slack + its poll")
+    return [rh.check(claim, want, STOP_TIMEOUT_S, f"raise STOP_TIMEOUT_S to at least {bound}, or lower the rendered "
+                     "dot budget", ok=lambda e, a: a >= e)]
+
+
 def checks(spec: Any, *, lstat: Callable, read: Callable[[str], bytes] = hr.dd.read_file,
            ancestor: Any = ASK, label: Any = ASK) -> List[rh.Check]:
     out = verify_files(spec, lstat, read)
+    out += verify_stop_budget(spec)
     out += verify_ancestry(spec, (lambda c, o: ask_ancestor(spec, c, o)) if ancestor is ASK else ancestor,
                            ask_label(spec) if label is ASK else label)
     return out

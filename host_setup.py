@@ -97,6 +97,7 @@ import hub_keys as hk      # the local router's key, kept from the email router;
 import hub_runtime as hr   # the hub-link router's files and rendering
 import hub_supervise as hv  # the hub-link router's supervision, weekly probe job and start check
 import hop_router as hp     # the local router's hop constant and recorded image (the router section)
+import partition_setup as ps   # the partition evidence's directories and the harness gate (two sections)
 import router_health as rh
 import secret_exposure as se   # who else could reach that secret: every container, every engine
 import secret_setup as ss   # a runtime's secret file: its section, plan steps and checks
@@ -182,6 +183,8 @@ class Spec:
     keys: Optional[hk.KeySpec] = None           # the local router's signing key, when the document has one
     supervision: Optional[hv.SupervisionSpec] = None   # the hub-link router's supervisor, when the document has one
     router: Optional[hp.RouterSpec] = None      # the local router's recorded image, when the document has one
+    partition: Optional[ps.PartitionSpec] = None   # the partition evidence's directories and weekly job
+    gate: Optional[ps.GateSpec] = None          # the harness's passing record, the operator's alone
 
     def runtime_of(self, principal: str) -> Dict[str, Any]:
         return next(r for r in self.runtimes if r["principal"] == principal)
@@ -214,7 +217,8 @@ def load_spec(doc: Any) -> Spec:
     if not isinstance(doc, dict) or doc.get("schema") != SPEC_SCHEMA:
         raise SpecError(f"the document is not a {SPEC_SCHEMA} host setup")
     known = {"schema", "principals", "groups", "hops", "roots", "overlay", "agent_paths", "openssl",
-             "mounts", "runtimes", "production", ss.SECTION, hr.SECTION, hk.SECTION, hv.SECTION, hp.SECTION}
+             "mounts", "runtimes", "production", ss.SECTION, hr.SECTION, hk.SECTION, hv.SECTION, hp.SECTION,
+             ps.SECTION, ps.GATE_SECTION}
     if set(doc) - known:
         raise SpecError(f"unknown member(s): {', '.join(sorted(set(doc) - known))}")
     production = doc.get("production", False)
@@ -384,6 +388,13 @@ def load_spec(doc: Any) -> Spec:
             spec = dataclasses.replace(spec, router=hp.load(doc[hp.SECTION], spec))
         except hp.RouterSpecError as e:
             raise SpecError(str(e)) from None
+    try:
+        if ps.SECTION in doc:
+            spec = dataclasses.replace(spec, partition=ps.load(doc[ps.SECTION], spec))
+        if ps.GATE_SECTION in doc:
+            spec = dataclasses.replace(spec, gate=ps.load_gate(doc[ps.GATE_SECTION], spec.partition))
+    except ps.PartitionSpecError as e:
+        raise SpecError(str(e)) from None
     if spec.keys is not None and spec.router is not None:
         declared = spec.runtime_of(spec.keys.principal)["container"]
         if declared != spec.router.container:
@@ -484,6 +495,8 @@ def render_plan(spec: Spec, overlay_source: Optional[Path] = None,
         lines += hk.plan(spec, spec.keys, q, steps)
     if spec.supervision is not None:
         lines += hv.plan(spec, q, steps)
+    if spec.partition is not None:
+        lines += ps.plan(spec.partition, spec.gate, q, anchor=spec.secrets.anchor if spec.secrets else None)
     lines.append("# Start no runtime until every step above has run: each root exists and is synced "
                  "before a runtime opens it.")
     return lines
@@ -999,7 +1012,8 @@ def checks(spec: Spec, *, production: bool, lstat: Callable = os.lstat,
            keys: Optional[Dict[str, Any]] = None,
            supervision: Optional[Dict[str, Any]] = None,
            enablement: Optional[Dict[str, Any]] = None,
-           router: Optional[Dict[str, Any]] = None) -> List[rh.Check]:
+           router: Optional[Dict[str, Any]] = None,
+           partition: Optional[Dict[str, Any]] = None) -> List[rh.Check]:
     """Every check of the host against the plan. `production` is ORed with
     the document's own. `secrets` passes probes to the secret's checks;
     `overlay` is the file the document was read from (None for --spec). The
@@ -1048,6 +1062,12 @@ def checks(spec: Spec, *, production: bool, lstat: Callable = os.lstat,
                 en.get("loaded") or hv.ask_loaded)
     if spec.router is not None:
         out += hp.checks(spec, **(router or {}))
+    if spec.partition is not None or spec.gate is not None:
+        p = partition or {}
+        out += ps.verify(spec.partition, spec.gate, delegation_enabled=False, lstat=lstat, owned_chain=ss._owned_chain,
+                         rl_sha=p["rl_sha"] if "rl_sha" in p else hp.hop_pin(),
+                         hop_sha=(spec.overlay_pin or {}).get("commit", rh.Unresolved("the overlay has no plugin pin")),
+                         plugin_sha256=hp.PLUGIN_SHA256, read=p.get("read", ps.read_record))
     return out
 
 
