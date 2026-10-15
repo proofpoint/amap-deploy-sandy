@@ -159,8 +159,8 @@ class ChildTest(unittest.TestCase):
                             "Config": {"User": "2101:2101", "Env": [f"ROUTER_CONFIG={self.live}", "ROUTER_INTERVAL=5"]},
                             "HostConfig": {"NetworkMode": "none", "RestartPolicy": {"Name": "unless-stopped"}},
                             "Mounts": [{"Type": "bind", "Source": s, "Destination": s, "RW": not ro} for s, ro in mounts]}
-        self.inspects = {"ex-up": self.router_live, "ex-down": {"Id": "e" * 64},
-                         "alpha": {"Config": {"Env": ["AMAP_PEER_DIR=/agent/peer"]},
+        self.inspects = {"ex-up": self.router_live, "ex-down": {"Id": "e" * 64, "State": {"Running": True}},
+                         "alpha": {"State": {"Running": True}, "Config": {"Env": ["AMAP_PEER_DIR=/agent/peer"]},
                                    "Mounts": [{"Type": "bind", "Source": f"{r}/instances/alpha/peer",
                                                "Destination": "/agent/peer"}]}}
         self.engine = RunEngine(self.inspects, [])

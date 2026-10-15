@@ -55,7 +55,8 @@ class StoreTest(unittest.TestCase):
     def test_a_runs_records_are_created_once(self):
         self.store.new_file(f"{self.run}/context.json", b"{}")
         self.assertEqual(stat.S_IMODE(os.stat(f"{self.run}/context.json").st_mode), 0o400)
-        self.refused(self.store.new_file, f"{self.run}/context.json", b"{}")
+        with self.assertRaises(FileExistsError):
+            self.store.new_file(f"{self.run}/context.json", b"{}")
 
     def test_the_live_config_is_replaced_keeping_its_owner_and_mode_never_created(self):
         before = os.stat(self.conf)

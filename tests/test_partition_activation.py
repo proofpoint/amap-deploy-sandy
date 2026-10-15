@@ -367,7 +367,7 @@ class SpecFromRunningTest(unittest.TestCase):
         live = dict(inspect_of(SPEC), Name="/" + SPEC["name"])
         live["Mounts"] = list(reversed(live["Mounts"]))
         back = pa.spec_from_running(live)
-        self.assertEqual(pa.running_differences(live, back, IMAGE_ENV), [])
+        self.assertEqual(pa.running_differences(live, back, IMAGE), [])
         staged = FinalBytesTest.STAGED
         self.assertEqual(pa.activation_binding(back, staged), pa.activation_binding(SPEC, staged),
                          "the mount order a running container reports does not move the binding")

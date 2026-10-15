@@ -114,10 +114,10 @@ class RootedStore(pi.Store):
         finally:
             os.close(dfd)
 
-    def new_file(self, path: str, data: bytes) -> None:
+    def new_file(self, path: str, data: bytes, exclusive: bool = False) -> None:
         self._may_write(path)
         record = posixpath.dirname(path) == self.run_dir
-        self._replace(path, data, keep=False, exclusive=record, mode=0o400 if record else 0o444)
+        self._replace(path, data, keep=False, exclusive=exclusive or record, mode=0o400 if record else 0o444)
 
     def append(self, path: str, line: bytes) -> None:
         self._may_write(path)
@@ -172,7 +172,7 @@ class RootedStore(pi.Store):
             try:
                 old = os.stat(name, dir_fd=dfd, follow_symlinks=False)
                 if exclusive:
-                    raise Refused(f"{path} exists; a run's record is created once")
+                    raise FileExistsError(17, f"{path} exists; it is created once", path)
                 if not stat.S_ISREG(old.st_mode):
                     raise Refused(f"{path} is not a regular file")
                 if keep:
