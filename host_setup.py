@@ -1099,7 +1099,7 @@ def checks(spec: Spec, *, production: bool, lstat: Callable = os.lstat,
     if spec.keys is not None:
         k = keys or {}
         out += hk.checks(spec, spec.keys, lstat=lstat, signing=signing_inputs(spec, policy_on, partition or {}, k),
-                         **{n: v for n, v in k.items() if n not in ("horizon_default", "status", "config_mtime", "now")})
+                         **{n: v for n, v in k.items() if n not in ("horizon_default", "status", "witness", "now")})
     if spec.hub is not None:
         out += verify_recovery_horizon(spec, (keys or {}).get("read_json_", hk.read_json),
                                        (keys or {}).get("horizon_default"))
@@ -1138,7 +1138,7 @@ def signing_inputs(spec: Spec, policy_on: Any, p: Dict[str, Any], k: Dict[str, A
     """Everything the signing check reads, as read now. `policy_on` is the
     fleet policy's answer (its hop_link has `delegation`), None when this run
     read no policy. `p` may supply `rl_sha`, `read`, `read_placed` and
-    `read_evidence`; `k` may supply `status` and `config_mtime`."""
+    `read_evidence`; `k` may supply `status` and `witness`."""
     if policy_on is None:
         policy_on = rh.Unresolved("this run read no fleet policy (verify reads it from the manifest)")
     bad = ps.gate_problems(spec.gate, rl_sha=p["rl_sha"] if "rl_sha" in p else hp.hop_pin(),
@@ -1166,22 +1166,21 @@ def signing_inputs(spec: Spec, policy_on: Any, p: Dict[str, Any], k: Dict[str, A
             return None, pe.NAMED_MISSING, "the document has no partition or hub section"
         return pe.named_document(token, evidence_dir=spec.partition.evidence_dir, host=host,
                                  read=p.get("read_evidence", pe.read_placed))
+    try:
+        container = hk.local_container(spec, spec.keys)
+    except StopIteration:
+        container = None
+    missing = rh.Unresolved(f"the document declares no runtime for {spec.keys.principal}, the local router")
     status = k.get("status", hk.ASK)
     if status is hk.ASK:
-        try:
-            container = hk.local_container(spec, spec.keys)
-        except StopIteration:
-            container = None
-        status = hk.ask_status(spec, container) if container else \
-            rh.Unresolved(f"the document declares no runtime for {spec.keys.principal}, the local router")
-    mtime = k.get("config_mtime", hk.ASK)
-    if mtime is hk.ASK:
-        try:
-            mtime = os.stat(spec.keys.local_config).st_mtime
-        except OSError as e:
-            mtime = rh.Unresolved(f"cannot inspect {spec.keys.local_config}: {e}")
+        status = hk.ask_status(spec, container) if container else missing
+    witness = k.get("witness", hk.ASK)
+    if witness is hk.ASK:
+        witness = (lambda host_sha: hk.adoption(lambda: hk.ask_config_tuple(spec, container),
+                                                lambda: hk.ask_status(spec, container), host_sha)) if container \
+            else (lambda host_sha: (rh.UNKNOWN, missing.reason))
     return hk.Signing(policy_on=policy_on, gate_ok=not bad, approved=approved, approved_why=why, named=named,
-                      status=status, config_mtime=mtime, now=k.get("now", time.time()))
+                      status=status, witness=witness, now=k.get("now", time.time()))
 
 
 def verify_weekly_runs(spec: Spec, p: Dict[str, Any]) -> List[rh.Check]:

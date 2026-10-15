@@ -296,7 +296,7 @@ class VerifyTest(unittest.TestCase):
         fields = dict(policy_on=False, gate_ok=False, approved=None, approved_why="no record",
                       named=lambda t: (None, "missing", "no document"),
                       status={"interval_s": 5.0, "last_poll_ts": ts, "started_ts": ts},
-                      config_mtime=now - 60, now=now)
+                      witness=lambda host_sha: (rh.PASS, "adopted"), now=now)
         fields.update(over)
         return hk.Signing(**fields)
 

@@ -72,7 +72,7 @@ class Base(unittest.TestCase):
 
     def verdict(self, raw, **over):
         fields = dict(policy_on=True, gate_ok=True, approved=approved(), approved_why="", named=named(),
-                      status=fresh_status(), config_mtime=NOW - 60, now=NOW)
+                      status=fresh_status(), witness=lambda host_sha: (rh.PASS, "adopted"), now=NOW)
         fields.update(over)
         c = hk.verify_signing(self.k, raw, self.bind, hk.Signing(**fields))
         self.assertEqual(c.claim, hk.SIGNING_CLAIM)
@@ -149,31 +149,73 @@ class StatusWitness(Base):
         self.assertEqual(c.result, rh.FAIL)
         self.assertIn("refused its config file", str(c.actual))
 
-    def test_no_classification_or_no_member_is_healthy(self):
-        self.assertEqual(self.verdict(live(SIGNED), status=fresh_status()).result, rh.PASS)
-        self.assertEqual(self.verdict(live(SIGNED), status=fresh_status(classification={})).result, rh.PASS)
-
-    def test_a_stale_or_absent_poll_or_interval_is_unknown(self):
-        for status in (fresh_status(last_poll_ts=ts(NOW - 60)), fresh_status(last_poll_ts=None),
-                       {k: v for k, v in fresh_status().items() if k != "interval_s"}, rh.Unresolved("no exec")):
-            with self.subTest(status=status):
-                self.assertEqual(self.verdict(live(SIGNED), status=status).result, rh.UNKNOWN)
-
-    def test_a_router_started_before_its_config_was_placed_is_unknown(self):
-        c = self.verdict(live(SIGNED), status=fresh_status(started_ts=ts(NOW - 61)), config_mtime=NOW - 60)
+    def test_a_pass_needs_the_adoption_witness(self):
+        self.assertEqual(self.verdict(live(SIGNED)).result, rh.PASS)
+        c = self.verdict(live(SIGNED), witness=lambda h: (rh.UNKNOWN, "the router did not poll twice"))
         self.assertEqual(c.result, rh.UNKNOWN)
-        self.assertIn("started before its config was placed", c.reason)
+        self.assertIn("did not poll twice", c.reason)
 
-    def test_a_restart_in_the_same_second_as_the_place_passes(self):
-        """started_ts has second precision; the mtime is floored to it."""
-        c = self.verdict(live(SIGNED), status=fresh_status(started_ts=ts(NOW - 60)), config_mtime=NOW - 60 + 0.9)
-        self.assertEqual(c.result, rh.PASS)
+    def test_the_witness_is_handed_the_host_file_s_sha256(self):
+        seen = []
+        self.verdict(live(SIGNED), witness=lambda h: (seen.append(h), (rh.PASS, ""))[1])
+        self.assertEqual(seen, [hk._sha(live(SIGNED))])
 
     def test_a_pass_needs_the_binding(self):
         self.bind = rh.unknown("bind", rh.Fact("live config", 1, "test"), "not asked", "r")
         c = self.verdict(live(SIGNED))
         self.assertEqual(c.result, rh.UNKNOWN)
         self.assertIn("not shown to read", c.reason)
+
+
+class AdoptionTest(unittest.TestCase):
+    """hub_keys.adoption over a scripted container and status: what the
+    router reads (its identity, change time, size and bytes) and its polls."""
+
+    HOST = "a" * 64
+
+    def run_it(self, tuples, statuses):
+        t, s = iter(tuples), iter(statuses)
+        return hk.adoption(lambda: next(t), lambda: next(s), self.HOST, sleep=lambda x: None)
+
+    def a(self, ctime=1_000_000_000_000_000_000, sha=None, ino=7):
+        return {"dev": 1, "ino": ino, "ctime_ns": ctime, "size": 10, "sha256": sha or self.HOST,
+                "now": ctime / 1e9 + 60}
+
+    def polls(self, *ns, started="s", failed=False):
+        out = [{"polls": n, "started_ts": started, "interval_s": 5.0} for n in ns]
+        if failed:
+            out[-1]["classification"] = {"config_reload_failed": True}
+        return out
+
+    def test_a_stable_config_and_two_more_polls_pass(self):
+        self.assertEqual(self.run_it([self.a(), self.a()], self.polls(10, 11, 12))[0], rh.PASS)
+
+    def test_an_edit_and_restore_between_the_reads_is_never_a_pass(self):
+        """A, then a valid B in place, then A again: the bytes match at both
+        ends; the change time does not, and the restore cannot reset it."""
+        restored = self.a(ctime=1_000_000_000_000_000_000 + 5_000_000_000)
+        result, why = self.run_it([self.a(), restored], self.polls(10, 11, 12))
+        self.assertEqual(result, rh.UNKNOWN)
+        self.assertIn("changed while verify watched", why)
+
+    def test_a_host_replacement_the_container_does_not_see_is_unknown(self):
+        self.assertEqual(self.run_it([self.a(sha="b" * 64)], [])[0], rh.UNKNOWN)
+
+    def test_a_config_changed_moments_ago_is_unknown(self):
+        young = dict(self.a(), now=1_000_000_000 + 1)
+        self.assertIn("moments ago", self.run_it([young], [])[1])
+
+    def test_one_poll_is_not_enough(self):
+        result, why = self.run_it([self.a(), self.a()], self.polls(10, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11))
+        self.assertEqual(result, rh.UNKNOWN)
+        self.assertIn("did not poll twice", why)
+
+    def test_a_restart_while_watching_is_unknown(self):
+        statuses = self.polls(10) + self.polls(1, started="t")
+        self.assertIn("restarted", self.run_it([self.a()], statuses)[1])
+
+    def test_a_refused_reload_in_the_last_document_fails(self):
+        self.assertEqual(self.run_it([self.a(), self.a()], self.polls(10, 11, 12, failed=True))[0], rh.FAIL)
 
 
 class PolicyTest(unittest.TestCase):

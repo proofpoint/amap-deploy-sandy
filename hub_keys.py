@@ -491,26 +491,16 @@ class Signing:
     or invalid (`approved_why` says which); Unresolved when it cannot be read.
     `named(token)`: partition_evidence.named_document for this host.
     `status`: the local router's status.json document, or Unresolved.
-    `config_mtime`: the live config's mtime, or Unresolved. `now`: epoch s."""
+    `witness(host_sha)`: `adoption` over the router's container, its result.
+    `now`: epoch s."""
     policy_on: Any
     gate_ok: Any
     approved: Any
     approved_why: str
     named: Callable[[str], Tuple[Any, Any, str]]
     status: Any
-    config_mtime: Any
+    witness: Callable[[str], Tuple[str, str]]
     now: float
-
-
-def _ts(text: Any) -> Any:
-    """The router's UTC timestamp as epoch seconds, or Unresolved."""
-    import calendar
-    if not isinstance(text, str):
-        return rh.Unresolved(f"{text!r} is not a timestamp")
-    try:
-        return calendar.timegm(time.strptime(text, "%Y-%m-%dT%H:%M:%SZ"))
-    except ValueError:
-        return rh.Unresolved(f"{text!r} is not a YYYY-MM-DDTHH:MM:SSZ timestamp")
 
 
 def _member(doc: Dict[str, Any]) -> bytes:
@@ -596,30 +586,106 @@ def verify_signing(ks: KeySpec, raw: Any, bind: rh.Check, sg: Signing) -> rh.Che
     if bind.result is not rh.PASS:
         return rh.unknown(claim, want, f"{why}, but the local router is not shown to read {ks.local_config}: "
                                        f"{bind.reason or 'it reads another file'}", "make the binding above pass")
-    return _status_witness(claim, want, why, ks, sg, remedy)
+    return _status_witness(claim, want, why, ks, sg, remedy, _sha(raw))
 
 
-def _status_witness(claim: str, want: rh.Fact, why: str, ks: KeySpec, sg: Signing, remedy: str) -> rh.Check:
-    """A PASS needs the router's own status.json: written within
-    FRESHNESS_MULTIPLE x its interval, by a process started no earlier than
-    the second its config was placed."""
-    status = sg.status
-    if isinstance(status, rh.Unresolved):
-        return rh.unknown(claim, want, f"{why}; the router's status.json cannot be read: {status.reason}",
-                          "start the local router, or make the engine answer")
-    interval, polled, started = status.get("interval_s"), _ts(status.get("last_poll_ts")), _ts(status.get("started_ts"))
-    if not isinstance(interval, (int, float)) or isinstance(interval, bool) or interval <= 0:
-        return rh.unknown(claim, want, f"{why}; status.json carries no interval_s, so its age has no bound",
-                          "start the local router from the hop checkout")
-    if isinstance(polled, rh.Unresolved) or sg.now - polled > rh.FRESHNESS_MULTIPLE * interval:
-        return rh.unknown(claim, want, f"{why}; status.json is not fresh: "
-                                       f"{polled.reason if isinstance(polled, rh.Unresolved) else 'its last poll is old'}",
-                          "start the local router, or wait for its next poll")
-    if isinstance(started, rh.Unresolved) or isinstance(sg.config_mtime, rh.Unresolved) \
-            or started < int(sg.config_mtime):
-        return rh.unknown(claim, want, f"{why}; the running router started before its config was placed",
-                          f"restart the local router with docker/run.sh --config {ks.local_config} --detach (A4)")
-    return rh.check(claim, want, True, remedy)
+#: The config the local router reads, read from inside its container in one
+#: exec: its identity, its change time, its size, its bytes' sha256, and the
+#: container's own clock.
+CONFIG_TUPLE_SCRIPT = ("import hashlib,json,os,time\n"
+                       "p=os.environ['ROUTER_CONFIG']\n"
+                       "fd=os.open(p,os.O_RDONLY)\n"
+                       "st=os.fstat(fd)\n"
+                       "b=b''\n"
+                       "while True:\n"
+                       "    c=os.read(fd,65536)\n"
+                       "    if not c: break\n"
+                       "    b+=c\n"
+                       "print(json.dumps({'dev':st.st_dev,'ino':st.st_ino,'ctime_ns':st.st_ctime_ns,'size':st.st_size,"
+                       "'sha256':hashlib.sha256(b).hexdigest(),'now':time.time()}))\n")
+TUPLE_KEYS = ("dev", "ino", "ctime_ns", "size", "sha256")
+#: How long the config must have been quiet before the window opens, beyond
+#: any filesystem's ctime tick.
+CTIME_SETTLE_S = 2
+
+
+def ask_config_tuple(spec: Any, container: str) -> Any:
+    try:
+        p = rh.run(ss.docker(spec.secrets) + ["exec", container, "python3", "-I", "-S", "-c", CONFIG_TUPLE_SCRIPT])
+    except rh.CannotRun as e:
+        return rh.Unresolved(str(e))
+    if p.rc != 0:
+        return rh.Unresolved(f"docker exec {container} could not read its config (exit {p.rc})")
+    try:
+        doc = json.loads(p.out)
+    except ValueError:
+        return rh.Unresolved(f"{container} printed no config identity")
+    ok = isinstance(doc, dict) and all(isinstance(doc.get(k), int) and not isinstance(doc.get(k), bool)
+                                       for k in ("dev", "ino", "ctime_ns", "size")) \
+        and isinstance(doc.get("sha256"), str) and _HEX64.fullmatch(doc["sha256"]) \
+        and isinstance(doc.get("now"), (int, float))
+    return doc if ok else rh.Unresolved(f"{container} printed a malformed config identity")
+
+
+def adoption(read_tuple: Callable[[], Any], read_status: Callable[[], Any], host_sha: str, *,
+             sleep: Callable[[float], None] = time.sleep) -> Tuple[str, str]:
+    """(PASS | FAIL | UNKNOWN, why): the running local router runs the
+    config the host holds now, by order and by a change generation, never by
+    a clock compared with a file. 1: the file the router reads, from inside
+    its container, is the host's bytes, quiet for CTIME_SETTLE_S on the
+    container's own clock. 2-4: its status shows two more polls by the same
+    process (the second poll's reload began after step 1), the last with no
+    refused reload. 5: the file it reads has the same device, inode, change
+    time, size and bytes: any write to it moved its ctime, which restoring
+    the bytes cannot undo, so every reload in the window read those bytes."""
+    t1 = read_tuple()
+    if isinstance(t1, rh.Unresolved):
+        return rh.UNKNOWN, f"the config the router reads cannot be identified: {t1.reason}"
+    if t1["sha256"] != host_sha:
+        return rh.UNKNOWN, "the router reads other bytes than the host's file (an old bind, or a replacement)"
+    if t1["now"] - t1["ctime_ns"] / 1e9 < CTIME_SETTLE_S:
+        return rh.UNKNOWN, "the config changed moments ago; run verify again"
+    s0 = read_status()
+    if isinstance(s0, rh.Unresolved):
+        return rh.UNKNOWN, f"the router's status.json cannot be read: {s0.reason}"
+    polls, started, interval = s0.get("polls"), s0.get("started_ts"), s0.get("interval_s")
+    if not isinstance(polls, int) or isinstance(polls, bool) or not isinstance(started, str) \
+            or not isinstance(interval, (int, float)) or isinstance(interval, bool) or interval <= 0:
+        return rh.UNKNOWN, "status.json carries no polls, started_ts or interval_s"
+    waited, bound = 0.0, (2 + rh.FRESHNESS_MULTIPLE) * interval
+    while True:
+        sleep(interval / 2)
+        waited += interval / 2
+        s = read_status()
+        if isinstance(s, rh.Unresolved):
+            return rh.UNKNOWN, f"the router's status.json cannot be read: {s.reason}"
+        if s.get("started_ts") != started:
+            return rh.UNKNOWN, "the router restarted while verify watched it; run verify again"
+        if isinstance(s.get("polls"), int) and s["polls"] >= polls + 2:
+            break
+        if waited >= bound:
+            return rh.UNKNOWN, f"the router did not poll twice within {bound:.0f}s"
+    section = s.get("classification")
+    if isinstance(section, dict) and section.get("config_reload_failed") is True:
+        return rh.FAIL, "the running router refused its config file and runs an older one"
+    t5 = read_tuple()
+    if isinstance(t5, rh.Unresolved):
+        return rh.UNKNOWN, f"the config the router reads cannot be identified again: {t5.reason}"
+    if any(t5[k] != t1[k] for k in TUPLE_KEYS) or t5["sha256"] != host_sha:
+        return rh.UNKNOWN, "the config the router reads changed while verify watched it; run verify again"
+    return rh.PASS, "the router adopted the host's config: two polls on unchanged bytes"
+
+
+def _status_witness(claim: str, want: rh.Fact, why: str, ks: KeySpec, sg: Signing, remedy: str,
+                    host_sha: str) -> rh.Check:
+    """A PASS needs the adoption witness (`adoption`)."""
+    result, reason = sg.witness(host_sha)
+    if result == rh.PASS:
+        return rh.check(claim, want, True, remedy)
+    if result == rh.FAIL:
+        return rh.check(claim, want, reason, f"correct {ks.local_config}, then restart the local router with "
+                                             "docker/run.sh --detach (A4)")
+    return rh.unknown(claim, want, f"{why}; {reason}", "start the local router, or let it run, then run verify again")
 
 
 #: The local router's own status document, read from inside its container:
@@ -679,7 +745,7 @@ def verify_no_delegation(ks: KeySpec, live: Any = None,
                             approved=rh.Unresolved("A1's record was not read"), approved_why="",
                             named=lambda t: (None, None, "the evidence was not read"),
                             status=rh.Unresolved("the local router's status.json was not read"),
-                            config_mtime=rh.Unresolved("the live config was not inspected"), now=time.time())
+                            witness=lambda h: (rh.UNKNOWN, "the local router was not watched"), now=time.time())
     return out + [verify_signing(ks, raw, bind, sg)]
 
 
