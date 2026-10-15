@@ -18,8 +18,9 @@ import partition_setup as ps
 P = ps.PartitionSpec(evidence_dir="/opt/ex/ev", scratch_dir="/opt/ex/scratch", weekday=2, hour=4,
                      exec_root="/opt/ex/exec", tools={"python3": "/usr/bin/python3", "docker": "/usr/bin/docker"})
 DOC = b'{"host_setup": {}}'
+ACT = b'{"approved": "A1"}'
 ARGV = pj.job_argv(P, writer="/opt/amap/host_steps.py", host="alpha", document="/opt/ov/overlay.json",
-                   document_bytes=DOC)
+                   document_bytes=DOC, activation_bytes=ACT)
 
 
 class JobTest(unittest.TestCase):
@@ -27,7 +28,16 @@ class JobTest(unittest.TestCase):
         self.assertEqual(ARGV[:5], ["/usr/bin/python3", "-I", "-S", "-B", "/opt/amap/host_steps.py"])
         opts = dict(zip(ARGV[6::2], ARGV[7::2]))
         self.assertEqual(opts, {"--exec-root": "/opt/ex/exec", "--host": "alpha", "--document": "/opt/ov/overlay.json",
-                                "--document-sha256": hashlib.sha256(DOC).hexdigest()})
+                                "--document-sha256": hashlib.sha256(DOC).hexdigest(),
+                                "--activation": "/opt/ex/ev/activation.json",
+                                "--activation-sha256": hashlib.sha256(ACT).hexdigest()})
+
+    def test_a1s_record_is_placed_at_its_one_place_checked_against_its_digest(self):
+        steps = pj.activation_steps(P, writer="/opt/amap/host_steps.py", source="/home/op/run/activation.json",
+                                    activation_bytes=ACT)
+        self.assertIn(f"place /home/op/run/activation.json /opt/ex/ev/activation.json --sha256 "
+                      f"{hashlib.sha256(ACT).hexdigest()}", steps[-1])
+        self.assertTrue(steps[-1].startswith("sudo /usr/bin/python3 -I -S -B /opt/amap/host_steps.py place "))
 
     def test_systemd_runs_it_weekly_and_once_after_boot(self):
         files = dict(pj.rendered("systemd", P, ARGV))

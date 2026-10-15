@@ -36,11 +36,33 @@ PUBLIC_REPO = "https://github.com/proofpoint/amap-deploy-sandy"
 HEADER = "# Rendered by amap-deploy-sandy from the anchored overlay. Place it; never edit it.\n"
 
 
-def job_argv(p: ps.PartitionSpec, *, writer: str, host: str, document: str, document_bytes: bytes) -> List[str]:
+#: A1's approved record's one place, under the evidence directory.
+ACTIVATION = "activation.json"
+
+
+def activation_path(p: ps.PartitionSpec) -> str:
+    return posixpath.join(p.evidence_dir, ACTIVATION)
+
+
+def job_argv(p: ps.PartitionSpec, *, writer: str, host: str, document: str, document_bytes: bytes,
+             activation_bytes: bytes) -> List[str]:
     """The job's command: the pinned writer, under the root-trusted
-    interpreter, with the document's sha256 computed from its exact bytes."""
+    interpreter, with the document's and A1's approved record's sha256s
+    computed from their exact bytes. The unit is rendered again after every
+    overlay change and after every A1."""
     return [p.tools["python3"], "-I", "-S", "-B", writer, "partition-weekly", "--exec-root", p.exec_root,
-            "--host", host, "--document", document, "--document-sha256", hashlib.sha256(document_bytes).hexdigest()]
+            "--host", host, "--document", document, "--document-sha256", hashlib.sha256(document_bytes).hexdigest(),
+            "--activation", activation_path(p), "--activation-sha256", hashlib.sha256(activation_bytes).hexdigest()]
+
+
+def activation_steps(p: ps.PartitionSpec, *, writer: str, source: str, activation_bytes: bytes,
+                     q: Callable[[str], str] = shlex.quote) -> List[str]:
+    """The operator's root step after A1: place A1's record, checked against
+    the sha256 of the bytes A1 wrote, at its one place (root:root 0444). The
+    unit carrying the same sha256 is then rendered and placed again."""
+    return ["# A1's approved record, where the weekly job and verify read it (after every A1):",
+            f"sudo {q(p.tools['python3'])} -I -S -B {q(writer)} place {q(source)} {q(activation_path(p))} "
+            f"--sha256 {hashlib.sha256(activation_bytes).hexdigest()}"]
 
 
 def _sd(arg: str) -> str:

@@ -14,6 +14,7 @@ records every call with the path it was run as."""
 
 import hashlib
 import json
+import re
 import types
 import os
 import signal
@@ -39,6 +40,8 @@ TARGET = "c" * 64
 CHILD = r'''
 import fcntl, json, os, sys, time
 sys.path.insert(0, REPO)
+import hashlib, subprocess
+import partition_activation as pa
 import partition_evidence as pe
 args = dict(zip(sys.argv[1::2], sys.argv[2::2]))
 run_dir, fd = args["--run-dir"], int(args["--lock-fd"])
@@ -106,10 +109,41 @@ for step in plan:
                                                            "identity": None, "pending": ["rewrite", "stop"]})
               if step[1] else b"{not json", 0o444)
     elif kind == "outcome":
-        schema = step[3] if len(step) > 3 else "amap-deploy.partition-outcome/1"
-        place(os.path.join(run_dir, "outcome.json"), canonical({"schema": schema, "run_id": rid, "code": step[1],
-                                                               "incident": step[1] == 1, "router_seen": step[2],
-                                                               "why": "test"}), 0o400)
+        schema = step[3] if len(step) > 3 and step[3] else "amap-deploy.partition-outcome/1"
+        mode = step[4] if len(step) > 4 else None
+        snap = dict.fromkeys(("router_seen", "config_sha256", "evidence_run_id", "evidence_sha256", "inspect_digest"))
+        if step[1] == 0 and step[2] and mode != "noshot":
+            # The snapshot as partition_run records it: the container inspected
+            # by id, the live config and the evidence read, each hashed.
+            live = json.loads(subprocess.run([ctx["docker"], "inspect", "--type", "container", "--format",
+                                              "{{json .}}", step[2]], capture_output=True).stdout)
+            with open(ctx["live_config_path"], "rb") as f:
+                cfg = f.read()
+            # The token's evidence is A2's document, not this run's.
+            with open(os.path.join(ev, "partition-a2.json"), "rb") as f:
+                evidence = f.read()
+            snap = {"router_seen": "ex-up" if mode == "nameonly" else step[2],
+                    "config_sha256": hashlib.sha256(cfg).hexdigest(),
+                    "evidence_run_id": "../a2" if mode == "badrun" else "a2",
+                    "evidence_sha256": hashlib.sha256(evidence).hexdigest(),
+                    "inspect_digest": pe.sha_json(pa.inspect_projection(live))}
+            if mode == "touchconf":
+                with open(ctx["live_config_path"], "ab") as f:
+                    f.write(b" ")
+            if mode in ("touchevidence", "evidence0644"):
+                p = os.path.join(ev, "partition-a2.json")
+                if mode == "touchevidence":
+                    place(p, evidence + b" ", 0o444)
+                else:
+                    os.chmod(p, 0o644)
+            if mode == "mutate":
+                with open(STATE) as f:
+                    state = json.load(f)
+                state["_doc"] = {"Image": "another-image"}
+                with open(STATE, "w") as f:
+                    json.dump(state, f)
+        place(os.path.join(run_dir, "outcome.json"), canonical(dict(snap, schema=schema, run_id=rid, code=step[1],
+                                                                    incident=step[1] == 1, why="test")), 0o400)
     elif kind == "exit":
         note("child-fd-open-at-end.json", fcntl.fcntl(fd, fcntl.F_GETFD) >= 0)
         os._exit(step[1])
@@ -124,12 +158,24 @@ note("child-fd-open-at-end.json", fcntl.fcntl(fd, fcntl.F_GETFD) >= 0)
 #: recorded, last with the path docker was run as.
 DOCKER = r'''#!PYTHON
 import json, sys
-STATE, LOG = %r, %r
+STATE, LOG, CONF = %r, %r, %r
 with open(LOG, "a") as f:
     f.write(json.dumps(sys.argv[1:] + [sys.argv[0]]) + "\n")
 state = json.load(open(STATE))
 a = sys.argv[1:]
-if a[:2] == ["inspect", "--type"]:
+if a[:2] == ["inspect", "--type"] and "{{json .}}" in a:
+    cid = a[-1]
+    if cid not in state or state.get("_inspect_fail"):
+        sys.exit(1)
+    v = state[cid]
+    doc = {"Id": cid, "Created": state.get("_created", "2026-01-01T00:00:00.123456789Z"), "Image": "img",
+           "State": {"Running": v is True or v == "paused", "Paused": v == "paused", "Restarting": False},
+           "Config": {"User": "2101:2101", "Env": ["ROUTER_CONFIG=" + CONF]},
+           "HostConfig": {"NetworkMode": "none", "RestartPolicy": {"Name": "unless-stopped"}},
+           "Mounts": [{"Type": "bind", "Source": CONF, "Destination": CONF, "RW": False}]}
+    doc.update(state.get("_doc", {}))
+    print(json.dumps(doc))
+elif a[:2] == ["inspect", "--type"]:
     cid = a[-1]
     if cid not in state or state.get("_inspect_fail"):
         sys.exit(1)
@@ -189,7 +235,7 @@ class Host:
         self.containers({TARGET: True})
         self.docker = f"{r}/bin/docker"
         with open(self.docker, "w") as f:
-            f.write((DOCKER % (self.state, self.log)).replace("#!PYTHON", "#!" + sys.executable))
+            f.write((DOCKER % (self.state, self.log, self.conf)).replace("#!PYTHON", "#!" + sys.executable))
         os.chmod(self.docker, 0o755)
         self.docker_link = f"{r}/bin/docker-link"
         os.symlink(self.docker, self.docker_link)
@@ -199,6 +245,17 @@ class Host:
         self.plan([])
         self.bundle()
         self.document()
+        self.activation()
+        self.a2()
+
+    def a2(self):
+        """A2's evidence document, whose token the live config carries."""
+        p = f"{self.ev}/partition-a2.json"
+        if os.path.exists(p):
+            os.unlink(p)
+        with open(p, "wb") as f:
+            f.write(b'{"a2": "the token\'s evidence, placed by A2"}')
+        os.chmod(p, 0o444)
 
     def containers(self, running):
         with open(self.state, "w") as f:
@@ -231,8 +288,8 @@ class Host:
                 os.unlink(f"{b}/{n}")
             os.rmdir(b)
         os.mkdir(b)
-        files = {"partition_weekly.py": f"PLAN, SIDE, REPO = {self.root + '/plan.json'!r}, {self.side!r}, "
-                                        f"{str(REPO)!r}\n" + CHILD,
+        files = {"partition_weekly.py": f"PLAN, SIDE, REPO, STATE = {self.root + '/plan.json'!r}, {self.side!r}, "
+                                        f"{str(REPO)!r}, {self.state!r}\n" + CHILD,
                  "partition_weekly.closure": "".join(c + "\n" for c in closure), "PIN": pin + "\n"}
         files.update(extra or {})
         for n, data in files.items():
@@ -252,11 +309,23 @@ class Host:
             json.dump({"host_setup": sec}, f)
         self.digest = hashlib.sha256(open(self.doc, "rb").read()).hexdigest()
 
+    def activation(self, data=b'{"approved": "A1"}'):
+        """A1's approved record at its one place; the writer judges only its
+        digest and hands its bytes over."""
+        p = f"{self.ev}/activation.json"
+        if os.path.exists(p):
+            os.unlink(p)
+        with open(p, "wb") as f:
+            f.write(data)
+        os.chmod(p, 0o444)
+        self.act_path, self.act_digest = p, hashlib.sha256(data).hexdigest()
+
     def recovery(self, target=TARGET):
-        data = json.dumps({"schema": hs.RECOVERY_SCHEMA, "host": "alpha", "at": "x", "evidence_dir": self.ev,
-                           "live_config_path": self.conf, "router_container_id": target,
-                           "engine": "unix://" + self.sock_path, "docker": self.docker}, sort_keys=True,
-                          separators=(",", ":"))
+        data = json.dumps({"schema": hs.RECOVERY_SCHEMA, "host": "alpha", "run_id": "r0", "at": "x",
+                           "evidence_dir": self.ev, "live_config_path": self.conf, "router_container_id": target,
+                           "engine": "unix://" + self.sock_path, "docker": self.docker, "config_sha256": "1" * 64,
+                           "evidence_run_id": "r0", "evidence_sha256": "2" * 64, "inspect_digest": "3" * 64,
+                           "activation_sha256": "4" * 64}, sort_keys=True, separators=(",", ":"))
         p = f"{self.exec}/recovery.json"
         if os.path.exists(p):
             os.unlink(p)
@@ -287,9 +356,10 @@ class Host:
                 f.write(raw)
             os.chmod(f"{self.ev}/partition-{rid}.json", 0o444)
 
-    def argv(self, digest=None):
+    def argv(self, digest=None, activation=None, activation_digest=None):
         return [sys.executable, "-I", "-S", "-B", self.wrapper, "partition-weekly", "--exec-root", self.exec,
-                "--host", "alpha", "--document", self.doc, "--document-sha256", digest or self.digest]
+                "--host", "alpha", "--document", self.doc, "--document-sha256", digest or self.digest,
+                "--activation", activation or self.act_path, "--activation-sha256", activation_digest or self.act_digest]
 
     def run(self, env=None, **kw):
         return subprocess.run(self.argv(**kw), capture_output=True, text=True, timeout=120,
@@ -413,7 +483,7 @@ class WriterTest(unittest.TestCase):
                 self.assertIn("may be stale", last["reason"])
                 self.assertNotIn("stop_ok", self.events())
                 self.assertEqual(len(self.h.runs()), 1, "kept: the stop is pending")
-                subprocess.run(["rm", "-rf"] + [f"{self.h.ev}/{n}" for n in os.listdir(self.h.ev)]
+                subprocess.run(["rm", "-rf"] + [f"{self.h.ev}/{n}" for n in os.listdir(self.h.ev) if n not in ("activation.json", "partition-a2.json")]
                                + [f"{self.h.exec}/{n}" for n in self.h.runs()])
                 time.sleep(1.1)  # the next run's id is the next second
 
@@ -675,7 +745,7 @@ class WriterTest(unittest.TestCase):
                 self.h.plan(steps + [["exit", 9]])
                 self.assertEqual(self.h.run().returncode, hs.EXIT_INCIDENT)
                 self.assertEqual(self.h.stops(), [TARGET])
-                subprocess.run(["rm", "-rf"] + [f"{self.h.ev}/{n}" for n in os.listdir(self.h.ev)])
+                subprocess.run(["rm", "-rf"] + [f"{self.h.ev}/{n}" for n in os.listdir(self.h.ev) if n not in ("activation.json", "partition-a2.json")])
                 time.sleep(1.1)
 
     def test_a_well_formed_resolved_incident_is_left_alone(self):
@@ -687,8 +757,19 @@ class WriterTest(unittest.TestCase):
                 self.h.run()
                 self.assertEqual(self.h.stops(), [])
                 self.assertTrue(self.delegation())
-                subprocess.run(["rm", "-rf"] + [f"{self.h.ev}/{n}" for n in os.listdir(self.h.ev)])
+                subprocess.run(["rm", "-rf"] + [f"{self.h.ev}/{n}" for n in os.listdir(self.h.ev) if n not in ("activation.json", "partition-a2.json")])
                 time.sleep(1.1)
+
+    def test_an_abandoned_run_that_cannot_be_opened_is_kept_and_the_job_goes_on(self):
+        self.h.abandoned("wold", FAIL3)
+        os.chmod(f"{self.h.exec}/run-wold", 0)
+        self.h.plan([["expect", B], ["evidence", B, PASS], ["outcome", 0, TARGET]])
+        p = self.h.run()
+        os.chmod(f"{self.h.exec}/run-wold", 0o700)
+        self.assertEqual(p.returncode, hs.EXIT_PASS, p.stdout + p.stderr)
+        self.assertIn("run-wold: cannot be read", p.stdout)
+        self.assertEqual(self.h.runs(), ["run-wold"])
+        self.assertEqual(self.h.stops(), [])
 
     def test_tooling_without_the_lock_acts_on_nothing(self):
         self.h.recovery()
@@ -710,7 +791,7 @@ class WriterTest(unittest.TestCase):
                 self.assertEqual(self.h.stops(), [])
                 self.assertNotIn("stop_ok", self.events())
                 self.assertEqual(len(self.h.runs()), 1, "kept: the stop is not shown done")
-                subprocess.run(["rm", "-rf"] + [f"{self.h.ev}/{n}" for n in os.listdir(self.h.ev)]
+                subprocess.run(["rm", "-rf"] + [f"{self.h.ev}/{n}" for n in os.listdir(self.h.ev) if n not in ("activation.json", "partition-a2.json")]
                                + [f"{self.h.exec}/{n}" for n in self.h.runs()])
                 time.sleep(1.1)
 
@@ -766,6 +847,185 @@ class WriterTest(unittest.TestCase):
                 self.assertEqual(p.returncode, hs.EXIT_HANDOFF, p.stdout + p.stderr)
                 self.assertIn("overlap", p.stdout)
                 self.assertIsNone(self.h.side_read("child-started.json"))
+
+    # The stop target (the first one comes from A5's last step)
+    def published(self):
+        out = {}
+        for where, name in ((self.h.exec, "recovery.json"), (self.h.ev, "stop-target.json")):
+            p = f"{where}/{name}"
+            out[name] = open(p, "rb").read() if os.path.exists(p) else None
+        return out
+
+    def test_a_passing_run_publishes_the_same_record_twice_and_exits_zero(self):
+        self.h.plan([["expect", B], ["evidence", B, PASS], ["outcome", 0, TARGET]])
+        p = self.h.run()
+        self.assertEqual(p.returncode, hs.EXIT_PASS, p.stdout + p.stderr)
+        got = self.published()
+        self.assertIsNotNone(got["recovery.json"])
+        self.assertEqual(got["recovery.json"], got["stop-target.json"], "byte-identical")
+        rec = json.loads(got["recovery.json"])
+        self.assertEqual(set(rec), set(hs.RECOVERY_MEMBERS))
+        self.assertEqual((rec["router_container_id"], rec["activation_sha256"], rec["docker"]),
+                         (TARGET, self.h.act_digest, self.h.docker))
+        st = os.stat(f"{self.h.ev}/stop-target.json")
+        self.assertEqual(stat.S_IMODE(st.st_mode), 0o444)
+
+    def test_every_refused_acquisition_exits_three_and_publishes_nothing(self):
+        rows = {"no snapshot": ({}, "noshot"), "a name, not an id": ({}, "nameonly"),
+                "the live config changed after the run judged it": ({}, "touchconf"),
+                "the container changed after the run judged it": ({}, "mutate"),
+                "a decoy config mount": ({"_doc": {"Mounts": [{"Type": "bind", "Source": "/decoy",
+                                                                "Destination": "/c", "RW": False}]}}, None),
+                "the config bound read-write": ({"_doc": {"Mounts": [{"Type": "bind", "Source": "CONF",
+                                                                       "Destination": "CONF", "RW": True}]}}, None),
+                "no ROUTER_CONFIG": ({"_doc": {"Config": {"User": "2101:2101", "Env": []}}}, None),
+                "another id answers": ({"_doc": {"Id": "d" * 64}}, None),
+                "the container is paused": ({"_doc": {"State": {"Running": True, "Paused": True,
+                                                                 "Restarting": False}}}, None),
+                "the evidence changed after the run judged it": ({}, "touchevidence"),
+                "the evidence no longer placed as root places it": ({}, "evidence0644"),
+                "an evidence run id that is not a run id": ({}, "badrun")}
+        for what, (extra, mode) in rows.items():
+            with self.subTest(what):
+                self.h.a2()
+                state = dict({TARGET: True}, **json.loads(json.dumps(extra).replace("CONF", self.h.conf)))
+                self.h.containers(state)
+                self.h.plan([["expect", B], ["evidence", B, PASS], ["outcome", 0, TARGET, None, mode]])
+                p = self.h.run()
+                self.assertEqual(p.returncode, hs.EXIT_HANDOFF, what + p.stdout + p.stderr)
+                self.assertIn("no stop target recorded", p.stdout)
+                if mode in ("noshot", "nameonly", "badrun"):
+                    self.assertIn("no whole snapshot", p.stdout, "refused as a snapshot, before any read")
+                self.assertEqual(self.published(), {"recovery.json": None, "stop-target.json": None})
+                with open(self.h.conf, "rb") as f:
+                    raw = f.read().rstrip(b" ")
+                with open(self.h.conf, "wb") as f:
+                    f.write(raw)
+                time.sleep(1.1)
+
+    def test_a_publication_that_fails_exits_three_with_its_state(self):
+        os.mkdir(f"{self.h.ev}/stop-target.json")
+        self.h.plan([["expect", B], ["evidence", B, PASS], ["outcome", 0, TARGET]])
+        p = self.h.run()
+        self.assertEqual(p.returncode, hs.EXIT_HANDOFF, p.stdout + p.stderr)
+        self.assertIn("the old copy could not be invalidated", p.stdout)
+        self.assertFalse(os.path.exists(f"{self.h.exec}/recovery.json"))
+
+    def test_an_activation_record_not_the_units_runs_nothing(self):
+        for kw in ({"activation_digest": "0" * 64}, {"activation": f"{self.h.root}/activation.json"}):
+            with self.subTest(kw=list(kw)):
+                p = self.h.run(**kw)
+                self.assertEqual(p.returncode, hs.EXIT_HANDOFF, p.stdout + p.stderr)
+                self.assertIn("activation", p.stdout)
+                self.assertIsNone(self.h.side_read("child-started.json"))
+                self.assertEqual(self.h.logged(), [])
+
+    def test_the_child_is_handed_the_approved_records_exact_bytes(self):
+        self.h.activation(b'{"approved": "A1, exactly"}')
+        self.h.plan([["sleep", 2]])
+        first = subprocess.Popen(self.h.argv(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        deadline = time.monotonic() + 30
+        while self.h.side_read("child-started.json") is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        run = f"{self.h.exec}/{self.h.runs()[0]}"
+        self.assertTrue(os.path.exists(f"{run}/activation.json"), "the child is handed the approved record")
+        with open(f"{run}/activation.json", "rb") as f:
+            self.assertEqual(f.read(), b'{"approved": "A1, exactly"}')
+        self.assertEqual(stat.S_IMODE(os.stat(f"{run}/activation.json").st_mode), 0o400)
+        first.wait()
+
+
+class PublishTest(unittest.TestCase):
+    """_publish_target's three steps, each failure injected: the exact state
+    and message, and never success."""
+
+    def setUp(self):
+        for name, value in (("ROOT_UID", os.getuid()), ("ROOT_GID", os.getgid()), ("_ancestor_ok", lambda st: True)):
+            self.addCleanup(setattr, hs, name, getattr(hs, name))
+            setattr(hs, name, value)
+        t = tempfile.TemporaryDirectory()
+        self.addCleanup(t.cleanup)
+        d = os.path.realpath(t.name)
+        self.exec, self.ev = f"{d}/exec", f"{d}/ev"
+        os.mkdir(self.exec, 0o700)
+        os.mkdir(self.ev, 0o755)
+        os.chmod(self.ev, 0o755)
+        self.efd = os.open(self.exec, os.O_RDONLY | os.O_DIRECTORY)
+        self.addCleanup(os.close, self.efd)
+        self.old, self.new = b'{"old": 1}', b'{"new": 2}'
+        for where in (self.exec + "/recovery.json", self.ev + "/stop-target.json"):
+            with open(where, "wb") as f:
+                f.write(self.old)
+
+    def files(self):
+        out = []
+        for p in (self.exec + "/recovery.json", self.ev + "/stop-target.json"):
+            out.append(open(p, "rb").read() if os.path.exists(p) else None)
+        return out
+
+    class FS:
+        """os, with one call failing: `fail` = (name, the n-th call of it, 1-based)."""
+
+        def __init__(self, fail):
+            self.fail, self.seen = fail, {}
+
+        def __getattr__(self, name):
+            real = getattr(os, name)
+
+            def call(*a, **k):
+                self.seen[name] = self.seen.get(name, 0) + 1
+                if self.fail == (name, self.seen[name]):
+                    raise OSError(5, f"injected {name}")
+                return real(*a, **k)
+            return call
+
+    def publish(self, fail=None):
+        try:
+            return hs._publish_target(self.efd, self.ev, self.new, fs=self.FS(fail))
+        except Exception as e:  # a crash is not an outcome
+            self.fail(f"_publish_target raised {e!r}")
+
+    def test_success_writes_both_byte_identical(self):
+        self.assertEqual(self.publish(), "")
+        self.assertEqual(self.files(), [self.new, self.new])
+
+    def test_each_failure_is_its_own_state_and_never_success(self):
+        # fsync calls in order: 1 the evidence dir after the unlink; 2 recovery.json; 3 exec_root;
+        # 4 the copy; 5 the evidence dir after the copy's rename.
+        rows = [(("unlink", 1), "the old copy could not be invalidated", [self.old, self.old]),
+                (("fsync", 1), "the old copy could not be invalidated", [self.old, None]),
+                (("open", 1), "recovery.json not written", [self.old, None]),
+                (("write", 1), "recovery.json not written", [self.old, None]),
+                (("fsync", 2), "recovery.json not written", [self.old, None]),
+                (("rename", 1), "recovery.json not written", [self.old, None]),
+                (("fsync", 3), "recovery.json written, its durability uncertain", [self.new, None]),
+                (("open", 2), "stop target not published", [self.new, None]),
+                (("write", 2), "stop target not published", [self.new, None]),
+                (("fsync", 4), "stop target not published", [self.new, None]),
+                (("rename", 2), "stop target not published", [self.new, None]),
+                (("fsync", 5), "stop target published, its durability uncertain", [self.new, self.new])]
+        for fail, words, after in rows:
+            with self.subTest(fail=fail):
+                for where in (self.exec + "/recovery.json", self.ev + "/stop-target.json"):
+                    if os.path.exists(where):
+                        os.unlink(where)
+                    with open(where, "wb") as f:
+                        f.write(self.old)
+                why = self.publish(fail)
+                self.assertIn(words, why)
+                self.assertEqual(self.files(), after)
+                self.assertEqual([n for n in os.listdir(self.exec) + os.listdir(self.ev) if n.endswith(".tmp")], [],
+                                 "no temporary file is left")
+
+    def test_a_rerun_after_any_crash_invalidates_then_republishes(self):
+        """A crash leaves one of the states above; the rerun (under the lock)
+        starts again from step one and ends with both new and identical."""
+        for fail in (("fsync", 1), ("fsync", 3), ("fsync", 5)):
+            with self.subTest(fail=fail):
+                self.publish(fail)
+                self.new = self.new + b" "
+                self.assertEqual(self.publish(), "")
+                self.assertEqual(self.files(), [self.new, self.new])
 
 
 class InProcess(unittest.TestCase):
@@ -891,7 +1151,7 @@ class EngineTest(unittest.TestCase):
         d = os.path.realpath(t.name)
         self.state, log, self.docker = f"{d}/s.json", f"{d}/l", f"{d}/docker"
         with open(self.docker, "w") as f:
-            f.write((DOCKER % (self.state, log)).replace("#!PYTHON", "#!" + sys.executable))
+            f.write((DOCKER % (self.state, log, "/c")).replace("#!PYTHON", "#!" + sys.executable))
         os.chmod(self.docker, 0o755)
         self.engine = hs._Engine(self.docker, "unix:///nowhere.sock", d)
 
@@ -1177,6 +1437,35 @@ class GrammarDriftTest(unittest.TestCase):
                          (pr.CONTEXT_SCHEMA, pr.EXPECT_SCHEMA, pr.OUTCOME_SCHEMA))
         self.assertEqual((hs.CONTEXT_MEMBERS, hs.EXPECT_MEMBERS, hs.OUTCOME_MEMBERS),
                          (pr.CONTEXT_MEMBERS, pr.EXPECT_MEMBERS, pr.OUTCOME_MEMBERS))
+
+    def test_the_stop_targets_grammar_and_names_are_verifys_and_the_jobs(self):
+        import partition_activation as pa
+        import partition_job as pj
+        import partition_setup as ps
+        self.assertEqual((hs.RECOVERY_SCHEMA, hs.RECOVERY_MEMBERS), (ps.TARGET_SCHEMA, ps.TARGET_MEMBERS))
+        self.assertEqual((hs.STOP_TARGET, hs.ACTIVATION), (ps.STOP_TARGET, ps.ACTIVATION))
+        self.assertEqual(hs.ACTIVATION, pj.ACTIVATION)
+        live = {"Id": "c" * 64, "Created": "2026-01-01T00:00:00Z", "Image": "i", "Config": {"User": "u",
+                "Env": ["B=2", "A=1"]}, "HostConfig": {"NetworkMode": "none", "RestartPolicy": {"Name": "no"}},
+                "Mounts": [{"Type": "bind", "Source": "/b", "Destination": "/b", "RW": False},
+                           {"Type": "bind", "Source": "/a", "Destination": "/x", "RW": True}], "State": {}}
+        self.assertEqual(hs.inspect_projection(live), pa.inspect_projection(live))
+        self.assertEqual(hs._canonical(hs.inspect_projection(live)), pe.canonical(pa.inspect_projection(live)))
+
+    def test_the_writer_only_names_are_outside_the_stores_reach(self):
+        import partition_setup as ps
+        import partition_store as pst
+        for name in (hs.STOP_TARGET, hs.ACTIVATION):
+            with self.subTest(name=name):
+                self.assertFalse(ps.evidence_name_ok(name))
+                self.assertIsNone(re.fullmatch(r"partition-[A-Za-z0-9._-]{1,64}\.json", name),
+                                  "no run id can make a document of that name")
+                with tempfile.TemporaryDirectory() as t:
+                    d = os.path.realpath(t)
+                    store = pst.RootedStore(evidence_dir=d, run_dir=f"{d}/run-r1", live_config=f"{d}/c.json")
+                    with self.assertRaises(pst.Refused):
+                        store.new_file(f"{d}/{name}", b"{}")
+                    self.assertEqual(os.listdir(d), [])
 
     def test_the_evidence_grammar_is_partition_evidences(self):
         def built(verdicts=PASS, name="router"):

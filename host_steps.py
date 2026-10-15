@@ -743,9 +743,18 @@ _OPT_STR = (str, type(None))
 CONTEXT_MEMBERS = {"schema": str, "run_id": str, "host": str, "started_at": str, "evidence_dir": str,
                    "live_config_path": str, "router_container_id": _OPT_STR, "engine": str, "docker": str}
 EXPECT_MEMBERS = {"schema": str, "run_id": str, "host": str, "bindings": dict}
-OUTCOME_MEMBERS = {"schema": str, "run_id": str, "code": int, "incident": bool, "router_seen": _OPT_STR, "why": str}
-RECOVERY_MEMBERS = {"schema": str, "host": str, "at": str, "evidence_dir": str, "live_config_path": str,
-                    "router_container_id": str, "engine": str, "docker": str}
+OUTCOME_MEMBERS = {"schema": str, "run_id": str, "code": int, "incident": bool, "router_seen": _OPT_STR, "why": str,
+                   "config_sha256": _OPT_STR, "evidence_run_id": _OPT_STR, "evidence_sha256": _OPT_STR,
+                   "inspect_digest": _OPT_STR}
+RECOVERY_MEMBERS = {"schema": str, "host": str, "run_id": str, "at": str, "evidence_dir": str, "live_config_path": str,
+                    "engine": str, "docker": str, "router_container_id": str, "config_sha256": str,
+                    "evidence_run_id": str, "evidence_sha256": str, "inspect_digest": str, "activation_sha256": str}
+#: The stop target's copy in the evidence directory, for verify only: the job
+#: never reads it, and the library's store cannot write it (it is outside
+#: partition_setup.EVIDENCE_NAME).
+STOP_TARGET = "stop-target.json"
+#: A1's approved record, placed by the operator, read only under the unit's digest.
+ACTIVATION = "activation.json"
 
 
 def _ancestor_ok(st):
@@ -994,6 +1003,24 @@ def _document(path, sha256):
     if not isinstance(sec, dict):
         raise Handoff("the approved document has no host_setup object")
     return raw, sec
+
+
+def _activation(evidence_dir, path, sha256):
+    """A1's approved record's exact bytes, at its one place, only when they
+    hash to the unit's digest; a handoff otherwise."""
+    if path != os.path.join(evidence_dir, ACTIVATION):
+        raise Handoff(f"the unit's activation record is not {os.path.join(evidence_dir, ACTIVATION)}")
+    try:
+        evfd = _evidence_dir(evidence_dir)
+        try:
+            raw = _read_at(evfd, ACTIVATION, DOC_MAX, want=(ROOT_UID, ROOT_GID, 0o444, 1))[0]
+        finally:
+            os.close(evfd)
+    except (OSError, ValueError) as e:
+        raise Handoff(f"the approved activation record cannot be read: {e}") from None
+    if hashlib.sha256(raw).hexdigest() != sha256:
+        raise Handoff("the activation record is not the one the unit approved: re-render the unit after A1")
+    return raw
 
 
 def _authority(sec, exec_root):
@@ -1389,6 +1416,18 @@ class _Engine:
             return False
         return None
 
+    def identity(self, cid):
+        """The container `cid` names, inspected BY ID: its document, or None
+        whenever the engine does not answer with one."""
+        p = self.run(["inspect", "--type", "container", "--format", "{{json .}}", cid])
+        if p is None or p.returncode != 0:
+            return None
+        try:
+            doc = json.loads(p.stdout)
+        except ValueError:
+            return None
+        return doc if isinstance(doc, dict) else None
+
     def remove_run(self, run_id):
         p = self.run(["ps", "--all", "--quiet", "--filter", f"label={RUN_LABEL}={run_id}"])
         ids = p.stdout.decode("ascii", "replace").split() if p is not None and p.returncode == 0 else []
@@ -1736,6 +1775,128 @@ def _decide(efd, run_name, current, said):
     return EXIT_HANDOFF, None, False
 
 
+def inspect_projection(live):
+    """partition_activation.inspect_projection, exactly (a test holds the
+    two equal): what of `docker inspect` the stop target's record binds."""
+    cfg, hc = live.get("Config") or {}, live.get("HostConfig") or {}
+    return {"Id": live.get("Id"), "Created": live.get("Created"), "Image": live.get("Image"),
+            "User": cfg.get("User"), "Env": sorted(str(e) for e in cfg.get("Env") or []),
+            "NetworkMode": hc.get("NetworkMode"), "RestartPolicy": (hc.get("RestartPolicy") or {}).get("Name"),
+            "Mounts": sorted([str(m.get("Type")), str(m.get("Source")), str(m.get("Destination")), bool(m.get("RW"))]
+                             for m in live.get("Mounts") or [] if isinstance(m, dict))}
+
+
+def _verified_target(engine, passed, values):
+    """Why the passing run's reported router is NOT a stop target to record,
+    or "" when it is. The child's snapshot must be whole; the router is
+    re-inspected BY ID and must be that very container, running, with the
+    live config as its identity read-only bind and its ROUTER_CONFIG, and
+    hash to the child's projection; the live config and the cited evidence,
+    read now, must be the bytes the child judged. Never a name, and never an
+    id from a name."""
+    seen, digest = passed.get("router_seen"), passed.get("inspect_digest")
+    erid, live = passed.get("evidence_run_id"), values["live_config"]
+    if not all(isinstance(passed.get(k), str) and _HEX64.fullmatch(passed[k])
+               for k in ("router_seen", "config_sha256", "evidence_sha256", "inspect_digest")) \
+            or not isinstance(erid, str) or not _RUN_ID_RE.fullmatch(erid):
+        return "the run reported no whole snapshot of the approved activation"
+    doc = engine.identity(seen)
+    if doc is None or doc.get("Id") != seen:
+        return f"the engine does not answer for {seen} by its id"
+    state = doc.get("State")
+    if not isinstance(state, dict) or state.get("Running") is not True or state.get("Paused") is not False \
+            or state.get("Restarting") is not False:
+        return f"the engine does not state that {seen} is running"
+    if not any(isinstance(m, dict) and m.get("Type") == "bind" and m.get("Source") == live
+               and m.get("Destination") == live and m.get("RW") is False for m in doc.get("Mounts") or []):
+        return f"{seen} does not bind the live config {live} read-only at its own path"
+    if f"ROUTER_CONFIG={live}" not in ((doc.get("Config") or {}).get("Env") or []):
+        return f"{seen} does not run with ROUTER_CONFIG={live}"
+    if hashlib.sha256(_canonical(inspect_projection(doc))).hexdigest() != digest:
+        return f"{seen} has changed since the run judged it"
+    try:
+        cfd, cname = _config_dir(live)
+        try:
+            config = _read_at(cfd, cname, DOC_MAX)[0]
+        finally:
+            os.close(cfd)
+        evfd = _evidence_dir(values["evidence_dir"])
+        try:
+            evidence = _read_at(evfd, f"partition-{erid}.json", DOC_MAX, want=(ROOT_UID, ROOT_GID, 0o444, 1))[0]
+        finally:
+            os.close(evfd)
+    except (OSError, ValueError, Tooling) as e:
+        return f"the live config or the token's evidence cannot be read again: {e}"
+    if hashlib.sha256(config).hexdigest() != passed["config_sha256"]:
+        return "the live config has changed since the run judged it"
+    if hashlib.sha256(evidence).hexdigest() != passed["evidence_sha256"]:
+        return "the token's evidence has changed since the run judged it"
+    return ""
+
+
+def _stage_write(dfd, name, data, fs):
+    """`name` in `dfd` atomically: a temporary file (O_EXCL), written and
+    fsynced, renamed into place, then the directory fsynced. Returns None,
+    ("before", why) when the rename did not happen (the temporary file is
+    removed), or ("after", why) when it did and only the directory fsync
+    failed."""
+    tmp = f".{name}.{os.getpid()}.tmp"
+    try:
+        fd = fs.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=dfd)
+        try:
+            if fs.write(fd, data) != len(data):
+                raise OSError("a short write")
+            fs.fchmod(fd, 0o444)
+            fs.fsync(fd)
+        finally:
+            fs.close(fd)
+        fs.rename(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)
+    except OSError as e:
+        try:
+            os.unlink(tmp, dir_fd=dfd)
+        except OSError:
+            pass
+        return "before", str(e)
+    try:
+        fs.fsync(dfd)
+    except OSError as e:
+        return "after", str(e)
+    return None
+
+
+def _publish_target(efd, evidence_dir, data, fs=os):
+    """The stop target, under the lock, in three steps, each failure a
+    stated state and never success: (1) invalidate the old verify copy,
+    (2) recovery.json, (3) the byte-identical copy. Returns why it is not
+    published, or "" when it is."""
+    try:
+        evfd = _evidence_dir(evidence_dir)
+    except Tooling as e:
+        return f"stop target not published: the old copy could not be invalidated: {e}"
+    try:
+        try:
+            try:
+                fs.unlink(STOP_TARGET, dir_fd=evfd)
+            except FileNotFoundError:
+                pass
+            fs.fsync(evfd)
+        except OSError as e:
+            return f"stop target not published: the old copy could not be invalidated: {e}"
+        got = _stage_write(efd, "recovery.json", data, fs)
+        if got and got[0] == "before":
+            return f"stop target not published: recovery.json not written: {got[1]}"
+        if got:
+            return f"recovery.json written, its durability uncertain ({got[1]}); stop target not published"
+        got = _stage_write(evfd, STOP_TARGET, data, fs)
+        if got and got[0] == "before":
+            return f"stop target not published: {got[1]}"
+        if got:
+            return f"stop target published, its durability uncertain ({got[1]})"
+        return ""
+    finally:
+        os.close(evfd)
+
+
 def _recovery(efd):
     """The recovery description, root's alone, or None."""
     try:
@@ -1747,10 +1908,11 @@ def _recovery(efd):
     return doc
 
 
-def partition_weekly(exec_root, host, document, sha256, now=None, child_timeout=None, emit=print):
+def partition_weekly(exec_root, host, document, sha256, activation, activation_sha256, now=None, child_timeout=None,
+                     emit=print):
     """One weekly partition run (see the section comment). Returns its exit."""
     child_timeout = CHILD_TIMEOUT_S if child_timeout is None else child_timeout
-    if not RUN_ID.fullmatch(host) or not _HEX64.fullmatch(sha256):
+    if not RUN_ID.fullmatch(host) or not _HEX64.fullmatch(sha256) or not _HEX64.fullmatch(activation_sha256):
         raise Refused("usage")
     at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now if now is not None else time.time()))
     rid = time.strftime("w%Y%m%dT%H%M%SZ", time.gmtime(now if now is not None else time.time()))
@@ -1772,12 +1934,17 @@ def partition_weekly(exec_root, host, document, sha256, now=None, child_timeout=
         os.close(_evidence_dir(values["evidence_dir"]))
         cfd, _ = _config_dir(values["live_config"])
         os.close(cfd)
+        approved = _activation(values["evidence_dir"], activation, activation_sha256)
         recovery = _recovery(efd)
         current = {"engine": values["engine"], "docker": docker, "exec_root": exec_root}
         for n in sorted(os.listdir(efd)):
             if RUN_NAME.fullmatch(n):
                 said.append(f"{n}: abandoned; completing its decision before removing it")
-                _, _, keep = _decide(efd, n, current, said)
+                try:
+                    _, _, keep = _decide(efd, n, current, said)
+                except OSError as e:
+                    said.append(f"{n}: cannot be read ({e.strerror}); kept, undecided, for the operator")
+                    continue
                 if keep:
                     said.append(f"{n}: kept, since an effect is not yet shown done")
                 else:
@@ -1792,6 +1959,7 @@ def partition_weekly(exec_root, host, document, sha256, now=None, child_timeout=
             for d in ("docker", "home"):
                 os.mkdir(d, 0o700, dir_fd=rfd)
             _write_at(rfd, "document.json", raw, 0o400, exclusive=True)
+            _write_at(rfd, ACTIVATION, approved, 0o400, exclusive=True)
             _write_at(rfd, "context.json", _canonical(
                 {"schema": CONTEXT_SCHEMA, "run_id": rid, "host": host, "started_at": at,
                  "evidence_dir": values["evidence_dir"], "live_config_path": values["live_config"],
@@ -1819,12 +1987,24 @@ def partition_weekly(exec_root, host, document, sha256, now=None, child_timeout=
                 pass
             child.wait()
         code, passed, keep = _decide(efd, run_name, current, said)
-        seen = passed.get("router_seen") if passed else None
-        if isinstance(seen, str) and _HEX64.fullmatch(seen):
-            _write_at(efd, "recovery.json", _canonical(
-                {"schema": RECOVERY_SCHEMA, "host": host, "at": at, "evidence_dir": values["evidence_dir"],
-                 "live_config_path": values["live_config"], "router_container_id": seen,
-                 "engine": values["engine"], "docker": docker}), 0o444)
+        if code == EXIT_PASS:
+            why = _verified_target(_Engine(docker, values["engine"], run_dir), passed, values)
+            if why:
+                said.append(f"{rid}: passed; no stop target recorded: {why}")
+                code = EXIT_HANDOFF
+            else:
+                record = {k: passed[k] for k in ("config_sha256", "evidence_run_id", "evidence_sha256",
+                                                 "inspect_digest")}
+                record.update(schema=RECOVERY_SCHEMA, host=host, run_id=rid, at=at,
+                              evidence_dir=values["evidence_dir"], live_config_path=values["live_config"],
+                              engine=values["engine"], docker=docker, router_container_id=passed["router_seen"],
+                              activation_sha256=activation_sha256)
+                why = _publish_target(efd, values["evidence_dir"], _canonical(record))
+                if why:
+                    said.append(f"{rid}: passed; {why}")
+                    code = EXIT_HANDOFF
+                else:
+                    said.append(f"{rid}: passed; stop target {passed['router_seen']} recorded")
         if keep:
             said.append(f"{run_name}: kept, since an effect is not yet shown done")
         else:
@@ -1962,11 +2142,14 @@ def main(argv):
             place(argv[1], argv[2], sha256=argv[4], mode=int(argv[6], 8))
         elif len(argv) == 2 and argv[0] == "marker":
             marker(argv[1])
-        elif len(argv) == 9 and argv[0] == "partition-weekly":
+        elif len(argv) == 13 and argv[0] == "partition-weekly":
             opts = dict(zip(argv[1::2], argv[2::2]))
-            if set(opts) != {"--exec-root", "--host", "--document", "--document-sha256"}:
-                raise StepError("partition-weekly --exec-root DIR --host NAME --document PATH --document-sha256 HEX")
-            return partition_weekly(opts["--exec-root"], opts["--host"], opts["--document"], opts["--document-sha256"])
+            if set(opts) != {"--exec-root", "--host", "--document", "--document-sha256", "--activation",
+                             "--activation-sha256"}:
+                raise StepError("partition-weekly --exec-root DIR --host NAME --document PATH --document-sha256 HEX "
+                                "--activation PATH --activation-sha256 HEX")
+            return partition_weekly(opts["--exec-root"], opts["--host"], opts["--document"], opts["--document-sha256"],
+                                    opts["--activation"], opts["--activation-sha256"])
         elif len(argv) == 2 and argv[0] == "partition-provision":
             return partition_provision(argv[1])
         else:

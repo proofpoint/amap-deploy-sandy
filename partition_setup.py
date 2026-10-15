@@ -29,10 +29,14 @@ record, and nothing here writes either. Both have closed member sets, and a
   own member, which it must equal.
 """
 
+import calendar
+import hashlib
+import json
 import os
 import posixpath
 import re
 import stat
+import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
@@ -230,6 +234,121 @@ def verify(ps: Optional[PartitionSpec], gs: Optional[GateSpec], *, delegation_en
                             "(the design's §11.2 steps); until then delegation stays off",
                             do_not="never edit the record or the section to make it hold"))
     return out
+
+
+#: The stop target's verify copy and A1's approved record, under evidence_dir;
+#: the pinned writer and the operator place them, never the library's store.
+STOP_TARGET, ACTIVATION = "stop-target.json", "activation.json"
+TARGET_SCHEMA = "amap-deploy.partition-recovery/1"
+TARGET_MEMBERS = {"schema": str, "host": str, "run_id": str, "at": str, "evidence_dir": str, "live_config_path": str,
+                  "engine": str, "docker": str, "router_container_id": str, "config_sha256": str,
+                  "evidence_run_id": str, "evidence_sha256": str, "inspect_digest": str, "activation_sha256": str}
+TARGET_CLAIM = "the weekly job has a stop target: the recorded id is the running local router"
+TARGET_REMEDY = ("run the weekly job once now, in the foreground, with its unit's exact argv (A5's last step; after "
+                 "any change of the local router's spec or image, A1 through A5 again)")
+
+
+def read_placed(path: str, lstat: Callable = os.lstat) -> bytes:
+    """A file only root placed: a regular file, never a link, root:root 0444
+    with one link, as lstat sees it and as the descriptor read from is."""
+    st = lstat(path)
+    want = (0, 0, RECORD_MODE, 1)
+    if not stat.S_ISREG(st.st_mode) or (st.st_uid, st.st_gid, stat.S_IMODE(st.st_mode), st.st_nlink) != want:
+        raise OSError(f"{path} is not a root:root 0444 regular file with one link")
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+    try:
+        fst = os.fstat(fd)
+        if (fst.st_dev, fst.st_ino) != (st.st_dev, st.st_ino):
+            raise OSError(f"{path} changed while it was read")
+        return os.read(fd, 1 << 20)
+    finally:
+        os.close(fd)
+
+
+def _created_seconds(created: Any) -> Optional[float]:
+    """docker's Created (RFC 3339, nanoseconds), to the second, or None."""
+    if not isinstance(created, str) or len(created) < 20 or created[19] not in ".Z":
+        return None
+    try:
+        return calendar.timegm(time.strptime(created[:19], "%Y-%m-%dT%H:%M:%S"))
+    except ValueError:
+        return None
+
+
+def verify_target(ps: Optional[PartitionSpec], gs: Optional[GateSpec], *, live_config: str, engine: str,
+                  docker: str, router_name: str, inspect: Callable[[str], Any],
+                  read: Callable[[str], bytes] = read_placed,
+                  read_live: Callable[[str], bytes] = read_record) -> List[rh.Check]:
+    """The stop target, judged from the verify copy the weekly job published:
+    every approved field equal, the recorded id the running local router's
+    (inspected by id, and by name only to COMPARE), and the record no older
+    than that container's creation. A NOTE only when delegation is
+    affirmatively off in the live config AND the gate is not set; UNKNOWN
+    when either cannot be told or the engine cannot answer. `inspect(ref)`:
+    the container's document, None when the engine affirms there is none,
+    or an Unresolved."""
+    if ps is None:
+        return []
+    want = rh.Fact("stop target", True, "the weekly job's own verified record of the running local router")
+    try:
+        live_raw = read_live(live_config)
+        rendered = "delegation" in json.loads(live_raw)
+    except (OSError, ValueError, TypeError) as e:
+        return [rh.unknown(TARGET_CLAIM, want, f"whether delegation is rendered cannot be told: {e}",
+                           "make the local router's live config readable")]
+    if not rendered and gs is None:
+        return [rh.check(f"{TARGET_CLAIM} (not required: delegation is not rendered and the gate is not set)",
+                         want, True, TARGET_REMEDY, ok=lambda e, a: a is True)]
+
+    def fail(why: str) -> List[rh.Check]:
+        return [rh.check(TARGET_CLAIM, want, f"no stop target: {why}", TARGET_REMEDY, ok=lambda e, a: a is True,
+                         do_not="never write the record by hand, and never copy an id from a name lookup")]
+    try:
+        raw = read(posixpath.join(ps.evidence_dir, STOP_TARGET))
+        doc = json.loads(raw.decode("utf-8"))
+    except FileNotFoundError:
+        return fail("the weekly job has not recorded one")
+    except (OSError, ValueError, UnicodeDecodeError) as e:
+        return fail(f"its record is not usable: {e}")
+    if not isinstance(doc, dict) or set(doc) != set(TARGET_MEMBERS) or doc.get("schema") != TARGET_SCHEMA \
+            or not all(isinstance(doc[k], t) and not isinstance(doc[k], bool) for k, t in TARGET_MEMBERS.items()):
+        return fail("its record is not the writer's grammar")
+    for k, v in (("evidence_dir", ps.evidence_dir), ("live_config_path", live_config), ("engine", engine),
+                 ("docker", docker)):
+        if doc[k] != v:
+            return fail(f"its {k} is not the approved document's")
+    try:
+        activation = read(posixpath.join(ps.evidence_dir, ACTIVATION))
+        evidence = read(posixpath.join(ps.evidence_dir, f"partition-{doc['evidence_run_id']}.json"))
+    except OSError as e:
+        return fail(f"what it was recorded against cannot be read: {e}")
+    if hashlib.sha256(activation).hexdigest() != doc["activation_sha256"]:
+        return fail("it was recorded against another A1 activation than the approved one")
+    if hashlib.sha256(evidence).hexdigest() != doc["evidence_sha256"]:
+        return fail("its token's evidence has changed since it was recorded")
+    if hashlib.sha256(live_raw).hexdigest() != doc["config_sha256"]:
+        return fail("the live config has changed since it was recorded")
+    by_id, by_name = inspect(doc["router_container_id"]), inspect(router_name)
+    blocked = next((v for v in (by_id, by_name) if isinstance(v, rh.Unresolved)), None)
+    if blocked is not None:
+        return [rh.unknown(TARGET_CLAIM, want, blocked.reason, "make the engine answer")]
+    if not isinstance(by_name, dict) or by_name.get("Id") != doc["router_container_id"]:
+        return fail("the running local router is another container than the recorded one: the record is stale "
+                    "(the router was recreated)")
+    state = (by_id or {}).get("State")
+    if not isinstance(state, dict) or state.get("Running") is not True:
+        return fail("the recorded container is not running")
+    created = _created_seconds(by_name.get("Created"))
+    try:
+        recorded = calendar.timegm(time.strptime(doc["at"], "%Y-%m-%dT%H:%M:%SZ"))
+    except ValueError:
+        return fail("its record's time cannot be read")
+    if created is None:
+        return [rh.unknown(TARGET_CLAIM, want, "the engine gives no creation time for the local router",
+                           "make the engine answer")]
+    if recorded < created:
+        return fail("it was recorded before the running local router was created")
+    return [rh.check(TARGET_CLAIM, want, True, TARGET_REMEDY, ok=lambda e, a: a is True)]
 
 
 def verify_tools(ps: PartitionSpec, lstat: Callable, owned_chain: Callable,

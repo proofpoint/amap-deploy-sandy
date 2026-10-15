@@ -25,6 +25,7 @@ def main(argv):
         return pr.INCOMPLETE
     docker = opts.get("--docker", "docker")
     try:
+        pr.check_run_dir(opts["--run-dir"])
         return pr.run_child(opts["--run-dir"], int(opts["--lock-fd"]), runner=pp.Runner([docker]))
     except pr.ChildError as e:
         print(f"partition-weekly: {e}", file=sys.stderr)

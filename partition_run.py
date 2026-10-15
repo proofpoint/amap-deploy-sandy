@@ -25,7 +25,9 @@ import hashlib
 import json
 import os
 import posixpath
+import re
 import stat
+import time
 from typing import Any, Callable, Dict, List, Optional
 
 import host_setup as hs
@@ -48,8 +50,13 @@ _OPT_STR = (str, type(None))
 CONTEXT_MEMBERS = {"schema": str, "run_id": str, "host": str, "started_at": str, "evidence_dir": str,
                    "live_config_path": str, "router_container_id": _OPT_STR, "engine": str, "docker": str}
 EXPECT_MEMBERS = {"schema": str, "run_id": str, "host": str, "bindings": dict}
-OUTCOME_MEMBERS = {"schema": str, "run_id": str, "code": int, "incident": bool, "router_seen": _OPT_STR, "why": str}
+OUTCOME_MEMBERS = {"schema": str, "run_id": str, "code": int, "incident": bool, "router_seen": _OPT_STR, "why": str,
+                   "config_sha256": _OPT_STR, "evidence_run_id": _OPT_STR, "evidence_sha256": _OPT_STR,
+                   "inspect_digest": _OPT_STR}
+#: The snapshot a passing run records for its writer: all of these, or none.
+SNAPSHOT = ("router_seen", "config_sha256", "evidence_run_id", "evidence_sha256", "inspect_digest")
 CONTEXT, DOCUMENT, EXPECT, OUTCOME = "context.json", "document.json", "expect.json", "outcome.json"
+ACTIVATION = "activation.json"
 LOCK = "lock"
 #: The child's own exit codes, as outcome.json records them.
 PASSED, FAILED, INCOMPLETE = 0, 1, 2
@@ -99,6 +106,28 @@ def check_lock(lock_fd: int, exec_root: str, stat_: Callable = os.stat) -> None:
         raise ChildError("the descriptor passed is not the run's lock")
 
 
+def check_run_dir(run_dir: str, lstat_: Callable = os.lstat, root_uid: int = 0,
+                  bundle_dir: Optional[str] = None) -> str:
+    """The run directory the writer passed: an absolute, normalised path
+    named run-<id>, directly under the exec root this bundle sits in, a real
+    directory (never a link) that only root can enter. Returns the exec
+    root."""
+    exec_root = posixpath.dirname(run_dir)
+    if not run_dir.startswith("/") or posixpath.normpath(run_dir) != run_dir \
+            or not re.fullmatch(r"run-[A-Za-z0-9._-]{1,64}", posixpath.basename(run_dir)):
+        raise ChildError(f"the run directory {run_dir!r} is not <exec_root>/run-<id>")
+    here = posixpath.dirname(bundle_dir or posixpath.dirname(os.path.realpath(__file__)))
+    if here != exec_root:
+        raise ChildError(f"the run directory is not under this bundle's exec root {here}")
+    try:
+        st = lstat_(run_dir)
+    except OSError as e:
+        raise ChildError(f"the run directory cannot be checked: {e}") from None
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != root_uid or stat.S_IMODE(st.st_mode) != 0o700:
+        raise ChildError("the run directory is not a real directory, root's, mode 0700")
+    return exec_root
+
+
 def document_section(raw: bytes) -> Dict[str, Any]:
     """The host-setup section of the approved document's bytes."""
     doc = pst.strict_object(raw)
@@ -145,6 +174,17 @@ class Docker:
         except ValueError:
             return rh.Unresolved(f"docker inspect {name} printed no JSON")
         return doc[0] if isinstance(doc, list) and doc and isinstance(doc[0], dict) else None
+
+    def image_config(self, image: str) -> Any:
+        """The image's own config ({Env, Entrypoint, Cmd}), or an Unresolved."""
+        p = self.runner(["image", "inspect", "--format", "{{json .Config}}", image])
+        if isinstance(p, rh.Unresolved) or p.rc != 0:
+            return rh.Unresolved(f"docker image inspect {image} did not answer")
+        try:
+            cfg = json.loads(p.out)
+        except ValueError:
+            return rh.Unresolved(f"docker image inspect {image} printed no JSON")
+        return cfg if isinstance(cfg, dict) else rh.Unresolved(f"docker image inspect {image} printed no config")
 
     def image_env(self, image: str) -> Any:
         p = self.runner(["image", "inspect", "--format", "{{json .Config.Env}}", image])
@@ -195,9 +235,45 @@ def selected_lanes(router_doc: Dict[str, Any], read: Callable[[str], bytes] = ps
     return {s: posixpath.join(inst, s, "peer") for s in slugs}
 
 
+def a5_snapshot(*, store: pst.RootedStore, run_dir: str, context: Dict[str, Any], live: Any, image: Any,
+                live_raw: bytes, bound: Dict[str, str], now: float,
+                read_placed: Callable[[str], bytes] = pe.read_placed) -> Any:
+    """The stop target this passing run may report, with the snapshot its
+    writer re-checks: only when A5's comparison holds against A1's APPROVED
+    record (handed over as activation.json) and the live config's token is
+    the current passing evidence's. Otherwise an Unresolved saying why. The
+    name only found the candidate; the id is the one these facts are of."""
+    try:
+        approved = pa.parse_activation(store.read(posixpath.join(run_dir, ACTIVATION)))
+    except (OSError, pa.ActivationError) as e:
+        return rh.Unresolved(f"no approved activation record: {e}")
+    if approved["host"] != context["host"] or approved["final_config_path"] != context["live_config_path"]:
+        return rh.Unresolved("the approved activation record is another host's or another config path's")
+    bad = pa.a5_differences(live, image, approved, live_raw)
+    if bad:
+        return rh.Unresolved("the local router is not the approved activation: " + "; ".join(bad))
+    token = json.loads(live_raw)["delegation"]["partition_verified"]
+    evidence_rid = token.partition(":")[0]
+    if not pe._RUN_ID.fullmatch(evidence_rid):
+        return rh.Unresolved("the live config's token names no run")
+    try:
+        raw = read_placed(posixpath.join(context["evidence_dir"], f"partition-{evidence_rid}.json"))
+        doc = pe.parse(raw, host=context["host"])
+    except (OSError, ValueError) as e:
+        return rh.Unresolved(f"the token's evidence cannot be read: {e}")
+    if pe.token_of(doc) != token:
+        return rh.Unresolved("the live config's token is not its evidence's")
+    stale = pe.staleness(doc, now=now, bindings=bound)
+    if stale:
+        return rh.Unresolved("the token's evidence is not current: " + "; ".join(stale))
+    return {"router_seen": live["Id"], "config_sha256": pe.sha_bytes(live_raw), "evidence_run_id": evidence_rid,
+            "evidence_sha256": pe.sha_bytes(raw), "inspect_digest": pe.sha_json(pa.inspect_projection(live))}
+
+
 def run_child(run_dir: str, lock_fd: int, *, runner: pp.Runner, stat_: Callable = os.stat,
               realpath_: Callable = os.path.realpath, lstat_: Callable = os.lstat,
-              emit: Callable[[str], None] = print) -> int:
+              emit: Callable[[str], None] = print, now_: Callable[[], float] = time.time,
+              read_placed_: Callable[[str], bytes] = pe.read_placed) -> int:
     """One run, start to outcome. Returns the child's exit code."""
     exec_root = posixpath.dirname(run_dir)
     check_lock(lock_fd, exec_root, stat_)
@@ -209,9 +285,9 @@ def run_child(run_dir: str, lock_fd: int, *, runner: pp.Runner, stat_: Callable 
                             live_config=context["live_config_path"])
     rid, at = context["run_id"], context["started_at"]
 
-    def finish(code: int, incident: bool, seen: Optional[str], why: str) -> int:
-        out = {"schema": OUTCOME_SCHEMA, "run_id": rid, "code": code, "incident": incident, "router_seen": seen,
-               "why": why}
+    def finish(code: int, incident: bool, why: str, snapshot: Optional[Dict[str, str]] = None) -> int:
+        out = dict({k: None for k in SNAPSHOT}, **(snapshot or {}), schema=OUTCOME_SCHEMA, run_id=rid, code=code,
+                   incident=incident, why=why)
         failed = pi._try(store.new_file, posixpath.join(run_dir, OUTCOME), canonical(out))
         emit(f"partition-weekly {rid}: code {code}: {why}" + (f" (outcome NOT recorded: {failed})" if failed else ""))
         return code
@@ -223,7 +299,7 @@ def run_child(run_dir: str, lock_fd: int, *, runner: pp.Runner, stat_: Callable 
         live_raw = store.read(context["live_config_path"])
         router_doc = pst.strict_object(live_raw)
     except (OSError, ValueError, UnicodeDecodeError) as e:
-        return finish(INCOMPLETE, False, None, f"the run's inputs cannot be read: {e}")
+        return finish(INCOMPLETE, False, f"the run's inputs cannot be read: {e}")
     docker = Docker(runner)
     email = hr.run_spec(spec, spec.hub)
     email_view = hr.view(email, hr.environment(spec, spec.hub))
@@ -232,29 +308,28 @@ def run_child(run_dir: str, lock_fd: int, *, runner: pp.Runner, stat_: Callable 
     router = pa.spec_from_running(router_live) if isinstance(router_live, dict) else (
         router_live if isinstance(router_live, rh.Unresolved) else rh.Unresolved("the local router is not running"))
     if isinstance(router, rh.Unresolved):
-        return finish(INCOMPLETE, False, None, f"the local router's spec cannot be read: {router.reason}")
-    seen = router_live.get("Id") if isinstance(router_live, dict) else None
+        return finish(INCOMPLETE, False, f"the local router's spec cannot be read: {router.reason}")
     lanes = selected_lanes(router_doc)
     if isinstance(lanes, rh.Unresolved):
-        return finish(INCOMPLETE, False, seen, lanes.reason)
+        return finish(INCOMPLETE, False, lanes.reason)
     key = ((router_doc.get("delegation") or {}).get("signing_key") or {}).get("path")
     if not isinstance(key, str):
-        return finish(INCOMPLETE, False, seen, "the live config carries no signing key")
+        return finish(INCOMPLETE, False, "the live config carries no signing key")
     bound = bindings(document=document, email=email, lanes=lanes, key_path=key, key_dir=posixpath.dirname(key),
                      router=router, live_raw=live_raw, stat_=stat_)
     if isinstance(bound, rh.Unresolved):
-        return finish(INCOMPLETE, False, seen, bound.reason)
+        return finish(INCOMPLETE, False, bound.reason)
     failed = pi._try(store.new_file, posixpath.join(run_dir, EXPECT),
                      canonical({"schema": EXPECT_SCHEMA, "run_id": rid, "host": context["host"], "bindings": bound}))
     if failed:
-        return finish(INCOMPLETE, False, seen, f"the expectation cannot be recorded, so nothing is probed: {failed}")
+        return finish(INCOMPLETE, False, f"the expectation cannot be recorded, so nothing is probed: {failed}")
     try:
         plan = ppl.gather(host=context["host"], run_id=rid, at=at, email=email, email_view=email_view,
                           email_live=docker.inspect(email["name"]), email_image_env=docker.image_env(email["image"]),
                           email_volume=spec.secrets.volume, router=router, router_doc=router_doc, lanes=lanes,
                           agent_inspects={s: docker.inspect(s) for s in lanes}, bindings=bound)
     except ppl.PlanError as e:
-        return finish(INCOMPLETE, False, seen, f"no plan: {e}")
+        return finish(INCOMPLETE, False, f"no plan: {e}")
     doc, code, report = pp.run(plan, runner, ppl.run_argv_for(router), stat_=stat_, realpath_=realpath_,
                                lstat_=lstat_)
     for line in report:
@@ -264,7 +339,14 @@ def run_child(run_dir: str, lock_fd: int, *, runner: pp.Runner, stat_: Callable 
     failing = sorted(p["id"] for p in (json.loads(doc)["probes"] if doc else [])
                      if p["id"] in pe.FAIL_STOP and p["verdict"] == "FAIL")
     if not failing:
-        return finish(PASSED if code == 0 else INCOMPLETE, False, seen, "no fail-stop failure")
+        if code != 0:
+            return finish(INCOMPLETE, False, "no fail-stop failure, but the run did not pass")
+        snap = a5_snapshot(store=store, run_dir=run_dir, context=context, live=router_live,
+                           image=docker.image_config(router_live.get("Image")), live_raw=live_raw, bound=bound,
+                           now=now_(), read_placed=read_placed_)
+        if isinstance(snap, rh.Unresolved):
+            return finish(PASSED, False, f"passed; no stop target: {snap.reason}")
+        return finish(PASSED, False, "passed", snap)
     target = context["router_container_id"]
     fx = pi.Effects(rewrite=lambda: store.replace_live_config(pst.without_delegation(store.read(store.live_config))),
                     inspect=docker.running,
@@ -275,5 +357,5 @@ def run_child(run_dir: str, lock_fd: int, *, runner: pp.Runner, stat_: Callable 
            token=(router_doc.get("delegation") or {}).get("partition_verified"),
            identity=target if isinstance(target, str) else rh.Unresolved("the run's context names no target"),
            evidence_persisted=placed, emit=emit)
-    return finish(FAILED, True, seen, f"fail-stop: {', '.join(failing)}")
+    return finish(FAILED, True, f"fail-stop: {', '.join(failing)}")
 

@@ -706,6 +706,27 @@ def ask_container(container: str) -> Any:
     return {"image": image, "binds": binds}
 
 
+def ask_identity(ref: str) -> Any:
+    """`docker inspect` of the container `ref` names (an id, or a name only
+    to compare): its whole document; None when the engine affirms there is
+    no such container (a failed inspect, then a listing by id or name that
+    succeeds and is empty); an Unresolved otherwise."""
+    try:
+        p = rh.run(["docker", "inspect", "--type", "container", "--format", "{{json .}}", ref])
+        if p.rc == 0:
+            doc = json.loads(p.out)
+            return doc if isinstance(doc, dict) else rh.Unresolved(f"`docker inspect {ref}` printed no object")
+        q = rh.run(["docker", "ps", "--all", "--quiet", "--no-trunc", "--filter", f"id={ref}"])
+        r = rh.run(["docker", "ps", "--all", "--quiet", "--no-trunc", "--filter", f"name=^/{ref}$"])
+    except rh.CannotRun as e:
+        return rh.Unresolved(str(e))
+    except ValueError:
+        return rh.Unresolved(f"`docker inspect {ref}` printed no JSON")
+    if q.rc == 0 and r.rc == 0 and not q.out.strip() and not r.out.strip():
+        return None
+    return rh.Unresolved(f"`docker inspect {ref}` exited {p.rc}, and the engine does not affirm it is absent")
+
+
 def ask_mount(container: str, path: str, marker: Optional[str] = None) -> Any:
     """`(identity, marker content or None)` of `path` as the RUNNING container
     `container` sees it, or an Unresolved. Read-only: stat and cat."""
@@ -1068,7 +1089,24 @@ def checks(spec: Spec, *, production: bool, lstat: Callable = os.lstat,
                          rl_sha=p["rl_sha"] if "rl_sha" in p else hp.hop_pin(),
                          hop_sha=(spec.overlay_pin or {}).get("commit", rh.Unresolved("the overlay has no plugin pin")),
                          plugin_sha256=hp.PLUGIN_SHA256, read=p.get("read", ps.read_record))
+        out += verify_stop_target(spec, p)
     return out
+
+
+def verify_stop_target(spec: Spec, p: Dict[str, Any]) -> List[rh.Check]:
+    """The weekly job's stop target, against this document's approved values:
+    the local router's live config, the engine, the docker it runs (its
+    realpath) and the local router's container name, which is inspected only
+    to compare. `p` may supply `inspect`, `read_placed`, `read` and
+    `realpath`."""
+    if spec.partition is None or spec.keys is None or spec.supervision is None or not spec.hops:
+        return []
+    return ps.verify_target(spec.partition, spec.gate, live_config=spec.keys.local_config,
+                            engine=spec.supervision.engine,
+                            docker=p.get("realpath", os.path.realpath)(spec.partition.tools["docker"]),
+                            router_name=spec.runtime_of(spec.hops[0][1])["container"],
+                            inspect=p.get("inspect", ask_identity), read=p.get("read_placed", ps.read_placed),
+                            read_live=p.get("read", ps.read_record))
 
 
 def verify_recovery_horizon(spec: Spec, read: Callable[[str], Any] = hk.read_json,

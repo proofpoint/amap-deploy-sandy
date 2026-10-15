@@ -362,6 +362,73 @@ class StagedBytesTest(unittest.TestCase):
 
 
 
+def approved_record(tree, final, host="alpha"):
+    """A1's record as its producer will write it, from the library's own
+    staged_bytes and prospective_spec (the producer verb is the
+    delegation-rendering unit's)."""
+    doc = json.loads(tree.config())
+    block = doc.pop("delegation")
+    staged = pa.staged_bytes(doc, block, lambda d: None if (d.get("delegation") or {}).get("partition_verified")
+                             else "config.delegation.partition_verified: required")
+    spec = pa.prospective_spec(checkout=str(HOP_ROUTER_ROOT), final_path=final, staged=staged,
+                               image="sha256:" + "b" * 64, container="ex-up", uid=2101, gid=2101)
+    return pa.activation_record(host=host, spec=spec, staged=staged, final_config_path=final), spec, staged
+
+
+class ActivationRecordTest(unittest.TestCase):
+    """A1's approved record, and A5's comparison against it."""
+
+    TOKEN = "r1:" + "a" * 64
+
+    def setUp(self):
+        t = tempfile.TemporaryDirectory()
+        self.addCleanup(t.cleanup)
+        self.tree = Tree(os.path.realpath(t.name))
+        self.final = os.path.join(self.tree.root, "conf", "router.json")
+        self.raw, self.spec, self.staged = approved_record(self.tree, self.final)
+        self.approved = pa.parse_activation(self.raw)
+        self.live = dict(inspect_of(self.spec), Id="c" * 64)
+        self.live_raw = pa.final_bytes(self.staged, self.TOKEN)
+
+    def test_the_record_round_trips_canonically(self):
+        self.assertEqual(self.approved["spec"], self.spec)
+        self.assertEqual(self.approved["staged"].encode(), self.staged)
+        self.assertEqual(pe.canonical(self.approved), self.raw)
+
+    def test_a_record_that_is_not_exactly_a1s_is_refused(self):
+        doc = json.loads(self.raw)
+        bad = [b"{", json.dumps(doc, sort_keys=True).encode(), pe.canonical(dict(doc, extra=1)),
+               pe.canonical(dict(doc, schema="other/1")), pe.canonical(dict(doc, staged=doc["staged"] + " ")),
+               pe.canonical(dict(doc, spec=dict(doc["spec"], extra=1))), pe.canonical(dict(doc, host=""))]
+        for raw in bad:
+            with self.subTest(raw=raw[:40]):
+                with self.assertRaises(pa.ActivationError):
+                    pa.parse_activation(raw)
+
+    def test_a5_holds_for_the_approved_router_and_its_config_plus_the_token(self):
+        self.assertEqual(pa.a5_differences(self.live, IMAGE, self.approved, self.live_raw), [])
+
+    def test_each_departure_from_the_approved_activation_is_named(self):
+        rows = {"another image": (dict(self.live, Image="sha256:" + "9" * 64), self.live_raw),
+                "another spec (a decoy config mount)": (dict(self.live, Mounts=self.live["Mounts"][:-1] + [
+                    {"Type": "bind", "Source": "/decoy", "Destination": self.final, "RW": False}]), self.live_raw),
+                "not running": (dict(self.live, State={"Running": False}), self.live_raw),
+                "a short id": (dict(self.live, Id="c" * 12), self.live_raw),
+                "a config other than the approved bytes plus its token": (
+                    self.live, self.live_raw.replace(b'"state_dir"', b'"state_dir" ', 1)),
+                "a config with no token": (self.live, self.staged)}
+        for what, (live, raw) in rows.items():
+            with self.subTest(what):
+                self.assertTrue(pa.a5_differences(live, IMAGE, self.approved, raw), what)
+        self.assertTrue(pa.a5_differences(self.live, rh.Unresolved("no image"), self.approved, self.live_raw))
+
+    def test_the_projection_names_the_containers_identity_and_structure(self):
+        p = pa.inspect_projection(dict(self.live, Created="2026-10-15T06:00:00Z"))
+        self.assertEqual(set(p), {"Id", "Created", "Image", "User", "Env", "NetworkMode", "RestartPolicy", "Mounts"})
+        moved = dict(self.live, Mounts=list(reversed(self.live["Mounts"])))
+        self.assertEqual(pa.inspect_projection(moved), pa.inspect_projection(self.live), "order is not identity")
+
+
 class SpecFromRunningTest(unittest.TestCase):
     def test_a_router_started_from_a_spec_reads_back_as_it_and_binds_the_same(self):
         live = dict(inspect_of(SPEC), Name="/" + SPEC["name"])
