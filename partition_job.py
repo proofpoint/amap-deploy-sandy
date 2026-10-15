@@ -104,37 +104,44 @@ def provision_steps(p: ps.PartitionSpec, pin: str, writer: str, q: Callable[[str
 def validation_steps(p: ps.PartitionSpec, q: Callable[[str], str] = shlex.quote) -> List[str]:
     """The operator's install-time check of what root will run, with the
     operating system's own tools only, never the interpreter under test (its
-    paths are only discovered with it, under an empty environment): the
-    tools, the interpreter's library, its extension modules and any zip on
-    its path, the libraries and the loader the tools and every extension
-    module link, the developer directory on macOS, every link's target, and
-    every directory above each of them and their targets. Every path printed
-    must be root-owned and writable by no one else; a discovery that fails
-    prints its file. The pinned writer applies the same rule before every
-    run."""
+    paths are only discovered with it, under an empty environment). The
+    lines are one shell block, run in order: they name the closure (P, the
+    library and the extension modules; Z, each zip on the interpreter's
+    path; T, the binaries and modules whose links are listed; L, those
+    links and the loader, by ldd on Linux and otool on macOS, never both),
+    then print every path, link target and directory above each that is not
+    root-owned or is writable by others, and each file whose listing failed
+    or that is required and absent. A zip that is absent has its would-be
+    place's directories checked instead. Every line prints nothing on a host
+    that passes. The pinned writer applies the same rule before every run."""
     py, docker = q(p.tools["python3"]), q(p.tools["docker"])
     bad = "\\( ! -user root -o -perm -g+w -o -perm -o+w \\) -print"
-    paths = (f"$(env -i {py} -I -S -B -c 'import os,sys,sysconfig; g=sysconfig.get_paths(); "
-             "print(g[\"stdlib\"], g[\"platstdlib\"], sysconfig.get_config_var(\"DESTSHARED\") or "
-             "os.path.join(g[\"platstdlib\"], \"lib-dynload\"), *[x for x in sys.path if x.endswith(\".zip\")])')")
-    dynload = (f"$(env -i {py} -I -S -B -c 'import os,sysconfig; print(sysconfig.get_config_var(\"DESTSHARED\") or "
-               "os.path.join(sysconfig.get_paths()[\"platstdlib\"], \"lib-dynload\"))')")
-    tools = f"$(realpath {py}) $(realpath {docker}) {dynload}/*.so"
+    # Without -L, find judges a link itself: only its owner (its mode is always 0777); -L judges its target.
+    own = ("\\( -type l ! -user root -o ! -type l \\( ! -user root -o -perm -g+w -o -perm -o+w \\) \\) "
+           "-print")
+    query = "env -i " + py + " -I -S -B -c 'import os,sys,sysconfig; g=sysconfig.get_paths(); "
     return [
-        "# The tools the weekly job runs as root: each must be the operating system's or its vendor's,",
-        "# and nothing in their startup closure may be writable by anyone but root (each command prints nothing):",
-        f"for f in {tools}; do ldd \"$f\" >/dev/null 2>&1 || {{ file \"$f\" | grep -q 'statically linked' "
-        "|| echo \"discovery failed: $f\"; }; done   # Linux: a file ldd cannot list must be a static ELF",
-        f"for f in {tools}; do otool -L \"$f\" >/dev/null 2>&1 || echo \"discovery failed: $f\"; done   # macOS",
-        f"L=$(ldd {tools} 2>/dev/null | awk '/=>/ {{print $3}} /^[[:space:]]*\\// {{print $1}}' | sort -u)   # Linux",
-        f"L=$(otool -L {tools} | awk '/^\\t/ {{print $1}}' | sort -u)   # macOS: a /usr/lib or /System/Library library "
-        "absent from disk is in the dyld shared cache on the sealed system volume",
-        f"find {py} {docker} $(realpath {py} {docker}) {paths} $L {bad} 2>&1",
-        f"find -L {py} {docker} $(realpath {py} {docker}) {paths} $L {bad} 2>&1   # every link's target",
-        f"find \"$(xcode-select -p)\" {bad}; find -L \"$(xcode-select -p)\" {bad}   # macOS: the developer directory "
-        "/usr/bin/python3 runs",
-        "# Every directory above each of those paths, and above each one's realpath (each prints nothing):",
-        f"for p in {py} {docker} {paths} $L \"$(xcode-select -p 2>/dev/null)\"; do for x in \"$p\" "
-        f"\"$(realpath \"$p\" 2>/dev/null)\"; do while [ -n \"$x\" ] && [ \"$x\" != / ]; do x=$(dirname \"$x\"); "
-        f"find \"$x\" -maxdepth 0 {bad}; done; done; done",
+        "# The tools the weekly job runs as root, and their startup closure. Run these lines in order, as one",
+        "# block: each prints nothing on a host whose closure is root's alone.",
+        f"P=$({query}print(g[\"stdlib\"], g[\"platstdlib\"], sysconfig.get_config_var(\"DESTSHARED\") or "
+        "os.path.join(g[\"platstdlib\"], \"lib-dynload\"))')",
+        f"Z=$({query}print(*[x for x in sys.path if x.endswith(\".zip\")])')",
+        f"T=\"$(realpath {py}) $(realpath {docker}) $(for d in $P; do ls \"$d\"/*.so 2>/dev/null; done)\"",
+        "if [ \"$(uname)\" = Darwin ]; then "
+        "for f in $T; do otool -L \"$f\" >/dev/null 2>&1 || echo \"discovery failed: $f\"; done; "
+        "L=$(otool -L $T | awk '/^\\t/ {print $1}' | sort -u); "
+        "else "
+        "for f in $T; do ldd \"$f\" >/dev/null 2>&1 || { file \"$f\" | grep -q 'statically linked' "
+        "|| echo \"discovery failed: $f\"; }; done; "
+        "L=$(ldd $T 2>/dev/null | awk '/=>/ {print $3} /^[[:space:]]+\\// {print $1}' | sort -u); fi",
+        f"for x in {py} {docker} $(realpath {py} {docker}) $P $L; do [ -e \"$x\" ] || "
+        "{ [ \"$(uname)\" = Darwin ] && case \"$x\" in /usr/lib/*|/System/Library/*) true;; *) false;; esac; } "
+        "|| echo \"absent: $x\"; done   # macOS: a system library in the shared cache is not on disk",
+        f"find {py} {docker} $(realpath {py} {docker}) $P $L {own} 2>/dev/null",
+        f"find -L {py} {docker} $(realpath {py} {docker}) $P $L {bad} 2>/dev/null   # every link's target",
+        f"for z in $Z; do [ -e \"$z\" ] && {{ find \"$z\" {own}; find -L \"$z\" {bad}; }}; done   # a zip present",
+        "[ \"$(uname)\" = Darwin ] && { D=$(xcode-select -p); find \"$D\" " + own + "; find -L \"$D\" " + bad + "; }",
+        f"for p in {py} {docker} $P $Z $L \"$( [ \"$(uname)\" = Darwin ] && xcode-select -p)\"; do for x in \"$p\" "
+        "\"$(realpath \"$p\" 2>/dev/null)\"; do while [ -n \"$x\" ] && [ \"$x\" != / ]; do x=$(dirname \"$x\"); "
+        f"find \"$x\" -maxdepth 0 {own}; done; done; done   # every directory above each, and above its realpath",
     ]

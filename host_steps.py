@@ -696,8 +696,9 @@ EVIDENCE_DIR_MODE = 0o755
 PLACED_SLACK_S = 2
 #: The operating system's own tools that list a binary's linked libraries.
 LDD, OTOOL, XCODE_SELECT = "/usr/bin/ldd", "/usr/bin/otool", "/usr/bin/xcode-select"
-#: An ELF program header naming the program interpreter (a dynamic binary's loader).
-PT_INTERP = 3
+#: ELF: the program header naming the interpreter (a dynamic binary's loader),
+#: the dynamic section's, and its entries naming a needed library and its end.
+PT_INTERP, PT_DYNAMIC, DT_NEEDED, DT_NULL = 3, 2, 1, 0
 #: Where macOS keeps system libraries in the dyld shared cache, on the sealed system volume, not on disk.
 SEALED_PREFIXES = ("/usr/lib/", "/System/Library/")
 
@@ -1085,33 +1086,56 @@ def _trusted_tool(path):
         d = os.path.dirname(d)
 
 
-def _static_elf(path):
-    """True when `path` is an ELF executable with no program interpreter (a
-    statically linked binary, which loads no shared library), False when it
-    is an ELF that names one, None when it is not an ELF that can be read."""
+def _links_nothing(path):
+    """True only when `path` is PROVEN to load no shared library: an ELF with
+    no program interpreter AND no DT_NEEDED entry in its dynamic section (a
+    static executable, or a static-PIE). False when it names an interpreter
+    or a needed library (a dynamic executable, or a shared object such as an
+    extension module with dependencies). None when it is not an ELF that can
+    be read completely: never proof."""
     try:
         with open(path, "rb") as f:
             head = f.read(64)
             if len(head) < 52 or head[:4] != b"\x7fELF" or head[4] not in (1, 2) or head[5] not in (1, 2):
                 return None
-            end = "<" if head[5] == 1 else ">"
-            if head[4] == 2:
+            end, wide = ("<" if head[5] == 1 else ">"), head[4] == 2
+            if wide:
                 phoff, = struct.unpack(end + "Q", head[32:40])
                 phentsize, phnum = struct.unpack(end + "HH", head[54:58])
+                ph, dyn = end + "IIQQQQQQ", end + "qQ"
             else:
                 phoff, = struct.unpack(end + "I", head[28:32])
                 phentsize, phnum = struct.unpack(end + "HH", head[42:46])
-            if phentsize < 4 or phnum == 0xFFFF:
+                ph, dyn = end + "IIIIIIII", end + "iI"
+            if phnum == 0xFFFF or phentsize < struct.calcsize(ph):
                 return None
+            segments = []
             for i in range(phnum):
                 f.seek(phoff + i * phentsize)
-                entry = f.read(4)
-                if len(entry) != 4:
+                entry = f.read(struct.calcsize(ph))
+                if len(entry) != struct.calcsize(ph):
                     return None
-                if struct.unpack(end + "I", entry)[0] == PT_INTERP:
-                    return False
+                v = struct.unpack(ph, entry)
+                # (type, offset, file size): the field order differs by class
+                segments.append((v[0], v[2], v[5]) if wide else (v[0], v[1], v[4]))
+            if any(t == PT_INTERP for t, _, _ in segments):
+                return False
+            for t, off, size in segments:
+                if t != PT_DYNAMIC:
+                    continue
+                f.seek(off)
+                table = f.read(size)
+                if len(table) != size:
+                    return None
+                step = struct.calcsize(dyn)
+                for at in range(0, size - step + 1, step):
+                    tag, _ = struct.unpack(dyn, table[at:at + step])
+                    if tag == DT_NEEDED:
+                        return False
+                    if tag == DT_NULL:
+                        break
             return True
-    except OSError:
+    except (OSError, struct.error):
         return None
 
 
@@ -1120,9 +1144,9 @@ def _ldd_libraries(b, out, err, rc):
     named them completely, or `b` is a static ELF, which links none."""
     text = out.decode("utf-8", "replace")
     if rc != 0:
-        if _static_elf(b) is True:
+        if _links_nothing(b) is True:
             return []
-        raise Tooling(f"ldd could not list {b}'s libraries (exit {rc}), and it is not a static ELF")
+        raise Tooling(f"ldd could not list {b}'s libraries (exit {rc}), and it is not proven to link nothing")
     libs = []
     for line in text.splitlines():
         line = line.strip()
@@ -1133,12 +1157,12 @@ def _ldd_libraries(b, out, err, rc):
             libs.append(target[0])
         elif line.startswith("/"):
             libs.append(line.split()[0])   # the program interpreter, the loader itself
-        elif "statically linked" in line and _static_elf(b) is not False:
+        elif "statically linked" in line and _links_nothing(b) is True:
             return []
         elif line and not line.startswith("linux-vdso") and not line.startswith("linux-gate"):
             raise Tooling(f"ldd printed what is not a library of {b}: {line}")
-    if not libs and _static_elf(b) is not True:
-        raise Tooling(f"ldd named no library for {b}, which is not a static ELF")
+    if not libs and _links_nothing(b) is not True:
+        raise Tooling(f"ldd named no library for {b}, which is not proven to link nothing")
     return libs
 
 
@@ -1178,13 +1202,19 @@ _CLOSURE_QUERY = ("import json,os,sys,sysconfig\n"
                   "d=sysconfig.get_config_var('DESTSHARED') or os.path.join(p['platstdlib'],'lib-dynload')\n"
                   "print(json.dumps({'paths':[p['stdlib'],p['platstdlib'],d],"
                   "'zips':[x for x in sys.path if x.endswith('.zip')]}))\n")
+#: The parts of a startup closure: paths that must exist; libraries the
+#: operating system's tool named (on macOS possibly only in the shared
+#: cache); and optional paths the interpreter would load if present (a zip on
+#: its path), whose would-be place is protected when they are absent.
+REQUIRED, LIBRARIES, OPTIONAL = "required", "libraries", "optional"
 
 
 def startup_closure(python, docker):
-    """Every path root's runs of `python` and `docker` load from: the
-    interpreter's standard library, its extension modules and any zip on its
-    path, the shared libraries both binaries and every extension module link,
-    and on macOS the developer directory xcode-select chose."""
+    """Every path root's runs of `python` and `docker` load from, by part:
+    REQUIRED, the binaries, the interpreter's standard library and its
+    extension modules, and on macOS the developer directory xcode-select
+    chose; LIBRARIES, what both binaries and every extension module link;
+    OPTIONAL, each zip on the interpreter's path."""
     try:
         p = subprocess.run([python, "-I", "-S", "-B", "-c", _CLOSURE_QUERY], shell=False, close_fds=True,
                            stdin=subprocess.DEVNULL, env={}, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
@@ -1192,12 +1222,19 @@ def startup_closure(python, docker):
         found = json.loads(p.stdout)
     except (OSError, subprocess.TimeoutExpired, ValueError) as e:
         raise Tooling(f"the interpreter cannot say where its library is: {e}") from None
-    paths = [x for x in found.get("paths", []) + found.get("zips", []) if isinstance(x, str) and x.startswith("/")]
-    dynload = found["paths"][2] if len(found.get("paths", [])) > 2 else None
+    def absolute(xs):
+        if not isinstance(xs, list) or not all(isinstance(x, str) and x.startswith("/") for x in xs):
+            raise Tooling("the interpreter named its library in a form that is not absolute paths")
+        return xs
+    paths = absolute(found.get("paths")) + [python, docker]
+    optional = absolute(found.get("zips"))
+    if len(found["paths"]) != 3:
+        raise Tooling("the interpreter did not name its library, platform library and extension modules")
+    dynload = found["paths"][2]
     modules = []
-    if dynload and os.path.isdir(dynload):
+    if os.path.isdir(dynload):
         modules = [os.path.join(dynload, n) for n in os.listdir(dynload) if n.endswith(".so")]
-    paths += _linked_libraries([python, docker] + modules)
+    libraries = _linked_libraries([python, docker] + modules)
     if sys.platform == "darwin" and os.path.exists(XCODE_SELECT):
         try:
             dev = subprocess.run([XCODE_SELECT, "-p"], shell=False, close_fds=True, stdin=subprocess.DEVNULL, env={},
@@ -1206,27 +1243,33 @@ def startup_closure(python, docker):
             raise Tooling(f"xcode-select cannot say which developer directory is chosen: {e}") from None
         if dev.startswith("/"):
             paths.append(dev)
-    return sorted(set(paths))
+    return {REQUIRED: sorted(set(paths)), LIBRARIES: libraries, OPTIONAL: sorted(set(optional))}
 
 
-def closure_problems(paths, lstat=os.lstat, walk=os.walk, realpath=os.path.realpath, platform=None):
+def closure_problems(closure, lstat=os.lstat, walk=os.walk, realpath=os.path.realpath, platform=None):
     """Every path in the startup closure, every directory above it and
     everything under it, root-owned and writable by no one else; a link is
     judged itself, and then its target, the target's directories and, for a
     link inside the closure, everything under the target. Each path is
-    covered once, so a cycle ends. On macOS, a system library that is not on
-    disk is in the dyld shared cache on the sealed system volume. The
+    covered once, so a cycle ends. `closure`: a startup closure by part, or
+    a list of required paths. A required path must exist. A library must
+    exist, except on macOS a system library its tool named that is absent
+    from disk, which is in the dyld shared cache on the sealed system
+    volume. An optional path is judged whole when present, and when absent
+    the directories its would-be place is under are judged instead. The
     problems, empty when there are none."""
+    if not isinstance(closure, dict):
+        closure = {REQUIRED: list(closure), LIBRARIES: [], OPTIONAL: []}
     bad, covered, chained = [], set(), set()
-    darwin = (platform or sys.platform) == "darwin"
+    cached = frozenset(p for p in closure[LIBRARIES] if p.startswith(SEALED_PREFIXES)) \
+        if (platform or sys.platform) == "darwin" else frozenset()
 
     def meta(p):
         try:
             st = lstat(p)
         except FileNotFoundError:
-            if darwin and p.startswith(SEALED_PREFIXES):
-                return None
-            bad.append(f"{p}: absent")
+            if p not in cached:
+                bad.append(f"{p}: absent")
             return None
         except OSError as e:
             bad.append(f"{p}: {e.strerror}")
@@ -1268,7 +1311,16 @@ def closure_problems(paths, lstat=os.lstat, walk=os.walk, realpath=os.path.realp
                     est = meta(e)
                     if est is not None and stat.S_ISLNK(est.st_mode):
                         cover(realpath(e))
-    for path in paths:
+    for path in closure[REQUIRED] + closure[LIBRARIES]:
+        cover(path)
+    for path in closure[OPTIONAL]:
+        try:
+            lstat(path)
+        except FileNotFoundError:
+            chain(os.path.dirname(path))   # its would-be place: whoever can write there could plant it
+            continue
+        except OSError:
+            pass
         cover(path)
     return sorted(set(bad))
 
@@ -1276,7 +1328,7 @@ def closure_problems(paths, lstat=os.lstat, walk=os.walk, realpath=os.path.realp
 def _docker_closure(docker):
     """What root's run of `docker` alone loads: the binary, and every
     library and the loader it links."""
-    return [docker] + _linked_libraries([docker])
+    return {REQUIRED: [docker], LIBRARIES: _linked_libraries([docker]), OPTIONAL: []}
 
 
 def _verified_tools(python3, docker):

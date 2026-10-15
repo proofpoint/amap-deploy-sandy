@@ -998,66 +998,126 @@ class ClosureTest(unittest.TestCase):
                                                "/usr/lib/python3/b": "/usr/lib/python3/a"})
         self.assertEqual(hs.closure_problems(self.PATHS, lstat, walk, realpath), [])
 
-    def test_on_macos_a_system_library_in_the_shared_cache_is_not_a_problem_elsewhere_it_is(self):
+    def test_on_macos_only_a_discovered_system_library_may_be_in_the_shared_cache(self):
         tree = {k: v for k, v in self.tree().items() if k != "/usr/lib/libssl.so.3"}
         lstat, walk, realpath = self.fs(tree)
-        self.assertEqual(hs.closure_problems(self.PATHS, lstat, walk, realpath, platform="darwin"), [])
-        self.assertEqual(hs.closure_problems(self.PATHS, lstat, walk, realpath, platform="linux"),
+        closure = {hs.REQUIRED: ["/usr/lib/python3"], hs.LIBRARIES: ["/usr/lib/libssl.so.3"], hs.OPTIONAL: []}
+        self.assertEqual(hs.closure_problems(closure, lstat, walk, realpath, platform="darwin"), [])
+        self.assertEqual(hs.closure_problems(closure, lstat, walk, realpath, platform="linux"),
                          ["/usr/lib/libssl.so.3: absent"])
+        for absent in ("/usr/lib/absent-python-tree", "/usr/lib/absent-python.zip", "/System/Library/absent"):
+            with self.subTest(absent=absent):
+                required = dict(closure, **{hs.REQUIRED: ["/usr/lib/python3", absent]})
+                self.assertIn(f"{absent}: absent", hs.closure_problems(required, lstat, walk, realpath,
+                                                                         platform="darwin"),
+                              "a required path is never excused as cached")
+
+    def test_an_absent_optional_zip_is_judged_by_its_would_be_place(self):
+        zipped = "/usr/lib/python313.zip"
+        closure = {hs.REQUIRED: ["/usr/lib/python3"], hs.LIBRARIES: [], hs.OPTIONAL: [zipped]}
+        lstat, walk, realpath = self.fs(self.tree())
+        self.assertEqual(hs.closure_problems(closure, lstat, walk, realpath), [], "absent, under root's directories")
+        own = {hs.REQUIRED: ["/usr/lib/python3"], hs.LIBRARIES: [], hs.OPTIONAL: ["/opt/pyzip/python313.zip"]}
+        lstat, walk, realpath = self.fs(self.tree(**{"/opt": (0, self.D), "/opt/pyzip": (501, self.D)}))
+        self.assertEqual(hs.closure_problems(own, lstat, walk, realpath),
+                         ["/opt/pyzip is not root-owned, or is writable by others"],
+                         "whoever owns the would-be place could plant it, though no required path is there")
+        lstat, walk, realpath = self.fs(self.tree(**{zipped: (0, stat.S_IFREG | 0o666)}))
+        self.assertEqual(hs.closure_problems(closure, lstat, walk, realpath),
+                         [f"{zipped} is not root-owned, or is writable by others"], "present, it is judged whole")
+
+    def test_this_hosts_own_interpreter_has_no_closure_problem(self):
+        """The real discovery on a healthy interpreter (an absent zip on its
+        path is ordinary): no finding, so the weekly job does not refuse."""
+        if not os.path.exists("/usr/bin/ldd") or sys.platform != "linux":
+            self.skipTest("measured on Linux")
+        py, sh = os.path.realpath("/usr/bin/python3"), os.path.realpath("/bin/sh")
+        if not all(os.path.exists(x) and os.stat(x).st_uid == 0 for x in (py, sh)):
+            self.skipTest("this host's interpreter is not root's")
+        closure = hs.startup_closure(py, sh)
+        self.assertTrue(closure[hs.LIBRARIES])
+        self.assertEqual(hs.closure_problems(closure), [])
 
     @staticmethod
-    def elf(path, interp):
-        """A minimal 64-bit little-endian ELF: one program header, PT_INTERP or PT_LOAD."""
+    def elf(path, kind):
+        """A minimal 64-bit little-endian ELF, `kind`: "static" (ET_EXEC, one
+        PT_LOAD), "dynamic" (PT_INTERP), "shared" (ET_DYN with a dynamic
+        section naming a needed library, no interpreter: an extension module)
+        or "static-pie" (ET_DYN with a dynamic section naming none)."""
         import struct
-        head = b"\x7fELF" + bytes([2, 1, 1]) + bytes(9) + struct.pack("<HHIQQQIHHHHHH", 2, 62, 1, 0, 64, 0, 0,
-                                                                         64, 56, 1, 0, 0, 0)
-        ph = struct.pack("<IIQQQQQQ", 3 if interp else 1, 0, 0, 0, 0, 0, 0, 0)
+        dyn_entries = {"shared": [(1, 1), (0, 0)], "static-pie": [(5, 0), (0, 0)]}.get(kind)
+        etype = 2 if kind in ("static", "dynamic") else 3
+        phs = [(3 if kind == "dynamic" else 1, 0, 0, 0)]
+        dyn_off = 64 + 56 * 2
+        if dyn_entries is not None:
+            phs.append((2, dyn_off, 16 * len(dyn_entries), 0))
+        head = b"\x7fELF" + bytes([2, 1, 1]) + bytes(9) + struct.pack("<HHIQQQIHHHHHH", etype, 62, 1, 0, 64, 0, 0,
+                                                                         64, 56, len(phs), 0, 0, 0)
+        body = b"".join(struct.pack("<IIQQQQQQ", t, 0, off, 0, 0, size, size, 0) for t, off, size, _ in phs)
+        body = body.ljust(56 * 2, b"\0")
+        dyn = b"".join(struct.pack("<qQ", tag, val) for tag, val in dyn_entries or [])
         with open(path, "wb") as f:
-            f.write(head + ph)
+            f.write(head + body + dyn)
 
-    def test_discovery_that_is_incomplete_is_refused_and_a_static_elf_links_nothing(self):
+    def test_only_a_binary_proven_to_link_nothing_may_be_unlisted(self):
         t = tempfile.TemporaryDirectory()
         self.addCleanup(t.cleanup)
-        static, dynamic, text = (os.path.join(t.name, n) for n in ("static", "dynamic", "text"))
-        self.elf(static, False)
-        self.elf(dynamic, True)
+        made = {k: os.path.join(t.name, k) for k in ("static", "static-pie", "dynamic", "shared")}
+        for kind, path in made.items():
+            self.elf(path, kind)
+        text = os.path.join(t.name, "text")
         with open(text, "w") as f:
             f.write("#!/bin/sh\n")
-        self.assertIs(hs._static_elf(static), True)
-        self.assertIs(hs._static_elf(dynamic), False)
-        self.assertIsNone(hs._static_elf(text))
+        self.assertEqual({k: hs._links_nothing(p) for k, p in made.items()},
+                         {"static": True, "static-pie": True, "dynamic": False, "shared": False})
+        self.assertIsNone(hs._links_nothing(text))
         not_dyn = b"\tnot a dynamic executable\n"
-        self.assertEqual(hs._ldd_libraries(static, b"", not_dyn, 1), [], "a static ELF links nothing")
+        self.assertEqual(hs._ldd_libraries(made["static"], b"", not_dyn, 1), [], "a static ELF links nothing")
+        self.assertEqual(hs._ldd_libraries(made["static-pie"], b"\tstatically linked\n", b"", 0), [])
         good = (b"\tlinux-vdso.so.1 (0x1)\n\tlibc.so.6 => /lib/libc.so.6 (0x2)\n"
                 b"\t/lib/ld-linux-aarch64.so.1 (0x3)\n")
-        self.assertEqual(hs._ldd_libraries(dynamic, good, b"", 0), ["/lib/libc.so.6", "/lib/ld-linux-aarch64.so.1"],
-                         "the loader is part of the closure")
-        for b, out, rc in ((dynamic, b"", 2), (text, b"", 1), (dynamic, b"\tlibz.so.1 => not found\n", 0),
-                           (dynamic, b"", 0), (dynamic, b"\tsomething else\n", 0), (text, good, 1)):
-            with self.subTest(b=os.path.basename(b), out=out, rc=rc):
+        self.assertEqual(hs._ldd_libraries(made["dynamic"], good, b"", 0),
+                         ["/lib/libc.so.6", "/lib/ld-linux-aarch64.so.1"], "the loader is part of the closure")
+        refused = [(made["shared"], b"", 2, "an extension module with dependencies, its listing failed"),
+                   (made["dynamic"], b"", 2, "a dynamic binary, its listing failed"),
+                   (text, b"", 1, "not an ELF"),
+                   (text, b"\tstatically linked\n", 0, "not an ELF, though the text says static"),
+                   (made["shared"], b"\tstatically linked\n", 0, "the text says static, the binary needs a library"),
+                   (made["dynamic"], b"\tlibz.so.1 => not found\n", 0, "an unresolved library"),
+                   (made["dynamic"], b"", 0, "nothing listed for a dynamic binary"),
+                   (made["dynamic"], b"\tsomething else\n", 0, "unexpected output"),
+                   (text, good, 1, "a failed listing")]
+        for b, out, rc, what in refused:
+            with self.subTest(what):
                 with self.assertRaises(hs.Tooling):
                     hs._ldd_libraries(b, out, not_dyn, rc)
         for out, rc in ((b"x:\n", 1), (b"x:\n\t/usr/lib/libSystem.B.dylib (compat 1)\n", 1),
-                        (b"x:\n\t@rpath/libz.dylib (compat 1)\n", 0)):
+                        (b"x:\n\t@rpath/libz.dylib (compat 1)\n", 0), (b"x:\n", 0)):
             with self.subTest(out=out, rc=rc):
                 with self.assertRaises(hs.Tooling):
-                    hs._otool_libraries(dynamic, out, b"", rc)
-        with self.assertRaises(hs.Tooling):
-            hs._otool_libraries(dynamic, b"x:\n", b"", 0)
-        self.assertEqual(hs._otool_libraries(dynamic, b"x:\n\t/usr/lib/libSystem.B.dylib (compat 1)\n", b"", 0),
+                    hs._otool_libraries(made["dynamic"], out, b"", rc)
+        self.assertEqual(hs._otool_libraries(made["dynamic"], b"x:\n\t/usr/lib/libSystem.B.dylib (compat 1)\n", b"", 0),
                          ["/usr/lib/libSystem.B.dylib"])
+
+    def test_this_hosts_extension_modules_are_not_taken_for_static_binaries(self):
+        import glob
+        mods = glob.glob(os.path.join(sysconfig_dynload(), "_ssl*.so"))
+        if not mods:
+            self.skipTest("no _ssl extension module here")
+        self.assertIs(hs._links_nothing(mods[0]), False)
 
     def test_the_fallback_dockers_closure_is_the_binary_and_everything_it_links(self):
         if not os.path.exists("/usr/bin/ldd"):
             self.skipTest("no ldd here")
         sh = os.path.realpath("/bin/sh")
-        found = hs._docker_closure(sh)
-        self.assertEqual(found[0], sh)
+        closure = hs._docker_closure(sh)
+        self.assertEqual(closure[hs.REQUIRED], [sh])
+        found = closure[hs.LIBRARIES]
         self.assertTrue(any(os.path.basename(p).startswith("libc.") for p in found), found)
         self.assertTrue(any("/ld-linux" in p for p in found), found)
 
     def test_discovery_names_the_library_its_extension_modules_and_every_linked_library(self):
-        found = hs.startup_closure(os.path.realpath(sys.executable), os.path.realpath("/bin/sh"))
+        found = sum(hs.startup_closure(os.path.realpath(sys.executable), os.path.realpath("/bin/sh")).values(), [])
         import sysconfig
         self.assertIn(sysconfig.get_paths()["stdlib"], found)
         self.assertTrue(any(os.path.basename(p).startswith("libc.") for p in found), found)
@@ -1079,8 +1139,13 @@ class ClosureTest(unittest.TestCase):
         for name, value in (("XCODE_SELECT", xs), ("sys", types.SimpleNamespace(platform="darwin"))):
             self.addCleanup(setattr, hs, name, getattr(hs, name))
             setattr(hs, name, value)
-        found = hs.startup_closure(os.path.realpath(sys.executable), os.path.realpath("/bin/sh"))
+        found = sum(hs.startup_closure(os.path.realpath(sys.executable), os.path.realpath("/bin/sh")).values(), [])
         self.assertIn("/Library/Developer/CommandLineTools", found)
+
+
+def sysconfig_dynload():
+    import sysconfig
+    return sysconfig.get_config_var("DESTSHARED") or os.path.join(sysconfig.get_paths()["platstdlib"], "lib-dynload")
 
 
 class GrammarDriftTest(unittest.TestCase):
