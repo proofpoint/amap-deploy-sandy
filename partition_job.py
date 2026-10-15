@@ -124,17 +124,21 @@ def validation_steps(p: ps.PartitionSpec, q: Callable[[str], str] = shlex.quote)
         "# The tools the weekly job runs as root, and their startup closure. Paste these lines as one block into",
         "# one shell (bash or dash; the functions below are defined on earlier lines and used on later ones).",
         "# Each prints nothing on a host whose closure is root's alone. A path holding whitespace is named, never",
-        "# split, since the lists below are split on it.",
+        "# split, since the lists below are split on it. It needs realpath(1): on macOS, 13 or later.",
         f"P=$({query}print(g[\"stdlib\"], g[\"platstdlib\"], sysconfig.get_config_var(\"DESTSHARED\") or "
         "os.path.join(g[\"platstdlib\"], \"lib-dynload\"))')",
         f"Z=$({query}print(*[x for x in sys.path if x.endswith(\".zip\")])')",
         f"T=\"$(realpath {py}) $(realpath {docker}) $(for d in $P; do ls \"$d\"/*.so 2>/dev/null; done)\"",
         "if [ \"$(uname)\" = Darwin ]; then "
         "for f in $T; do otool -L \"$f\" >/dev/null 2>&1 || echo \"discovery failed: $f\"; done; "
+        "otool -L $T | awk '/^\\t/ { sub(/^\\t/, \"\"); sub(/ \\(compatibility.*$/, \"\"); "
+        "if ($0 ~ /[[:space:]]/) print \"discovery failed: whitespace in \" $0 }'; "
         "L=$(otool -L $T | awk '/^\\t/ {print $1}' | sort -u); "
         "else "
         "for f in $T; do ldd \"$f\" >/dev/null 2>&1 || { file \"$f\" | grep -q 'statically linked' "
         "|| echo \"discovery failed: $f\"; }; done; "
+        "ldd $T 2>/dev/null | awk '/=>/ { sub(/^.*=> /, \"\"); sub(/ \\(0x[0-9a-f]+\\)$/, \"\"); "
+        "if ($0 ~ /[[:space:]]/) print \"discovery failed: whitespace in \" $0 }'; "
         "L=$(ldd $T 2>/dev/null | awk '/=>/ {print $3} /^[[:space:]]+\\// {print $1}' | sort -u); fi",
         f"for x in {py} {docker} $(realpath {py} {docker}) $P; do [ -e \"$x\" ] || echo \"absent: $x\"; done"
         "   # required: never excused",
@@ -147,28 +151,29 @@ def validation_steps(p: ps.PartitionSpec, q: Callable[[str], str] = shlex.quote)
         # Every link met in the closure, followed one hop at a time, as the writer's own check does: a
         # link inside the closure has its target, everything under a target directory and every
         # directory above it judged (a tree visit); a link among those directories has only its target
-        # and the directories above it judged (a chain visit). A target is known by what it is on disk
-        # (its realpath), so every cycle ends, relative or not; a chain visit never stands in for a
-        # later tree visit of the same target. A directory is known by its spelling and what it is, so
-        # no link among them goes unjudged.
+        # and the directories above it judged (a chain visit). Every path a hop reaches has the
+        # directories above it judged first, whatever was visited before. A visit is then known by the
+        # directory entry its target names (its parent's realpath and its own name): each link along a
+        # chain is visited once, and every cycle ends, relative or not. A chain visit never stands in
+        # for a later tree visit of the same entry. A directory is known by its spelling and what it
+        # is, so no link among them goes unjudged.
         f"chk() {{ find \"$1\" -maxdepth 0 {own}; }}",
         "norm() { local c o IFS=/; o=; set -f; for c in $1; do case $c in ''|.) ;; ..) o=${o%/*};; "
         "*) o=\"$o/$c\";; esac; done; set +f; echo \"${o:-/}\"; }",
-        # What a path is on disk: its realpath, or, when it cannot be resolved (a link that loops onto
-        # itself), the directory entry it names: its parent's realpath and its own name.
-        "real() { realpath \"$1\" 2>/dev/null || { local p; p=$(realpath \"$(dirname \"$1\")\" 2>/dev/null) "
-        "&& echo \"$p/$(basename \"$1\")\"; } || echo \"?$(norm \"$1\")\"; }",
+        "ent() { local p; p=$(realpath \"$(dirname \"$1\")\" 2>/dev/null) && echo \"$p/$(basename \"$1\")\" "
+        "|| echo \"?$(norm \"$1\")\"; }",
         "up() { local x=$1 k; while [ \"$x\" != / ] && [ \"$x\" != . ]; do x=$(dirname \"$x\"); "
-        "k=\"$(norm \"$x\")|$(real \"$x\")\"; case \" $ups \" in *\" $k \"*) return;; esac; ups=\"$ups $k\"; "
-        "chk \"$x\"; [ -L \"$x\" ] && hop \"$x\" chain; done; }",
+        "k=\"$(norm \"$x\")|$(realpath \"$x\" 2>/dev/null)\"; case \" $ups \" in *\" $k \"*) return;; esac; "
+        "ups=\"$ups $k\"; chk \"$x\"; [ -L \"$x\" ] && hop \"$x\" chain; done; }",
         "hop() { local r t l k; r=$(readlink \"$1\"); case \"$r\" in /*) t=$r;; *) t=\"$(dirname \"$1\")/$r\";; esac; "
-        "case \"$t\" in *[[:space:]]*) echo \"discovery failed: whitespace in $t\"; return;; esac; k=$(real \"$t\"); "
+        "case \"$t\" in *[[:space:]]*) echo \"discovery failed: whitespace in $t\"; return;; esac; "
+        "up \"$t\"; k=$(ent \"$t\"); "
         "if [ \"$2\" = tree ]; then case \" $trees \" in *\" $k \"*) return;; esac; trees=\"$trees $k\"; "
         f"find \"$t\" {own} 2>/dev/null; "
         "find \"$t\" -name '*[[:space:]]*' -print 2>/dev/null | sed 's/^/discovery failed: whitespace in /'; "
         "for l in $(find \"$t\" -type l 2>/dev/null); do hop \"$l\" tree; done; "
         "else case \" $trees $chains \" in *\" $k \"*) return;; esac; chains=\"$chains $k\"; "
-        "chk \"$t\"; [ -L \"$t\" ] && hop \"$t\" chain; fi; up \"$t\"; }",
+        "chk \"$t\"; [ -L \"$t\" ] && hop \"$t\" chain; fi; }",
         f"find {py} {docker} $(realpath {py} {docker}) $P $L $(for z in $Z; do [ -e \"$z\" ] && echo \"$z\"; done) "
         "$( [ \"$(uname)\" = Darwin ] && xcode-select -p) -name '*[[:space:]]*' -print 2>/dev/null "
         "| sed 's/^/discovery failed: whitespace in /'   # a path the lists would split",
