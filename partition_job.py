@@ -121,8 +121,10 @@ def validation_steps(p: ps.PartitionSpec, q: Callable[[str], str] = shlex.quote)
            "-print")
     query = "env -i " + py + " -I -S -B -c 'import os,sys,sysconfig; g=sysconfig.get_paths(); "
     return [
-        "# The tools the weekly job runs as root, and their startup closure. Run these lines in order, as one",
-        "# block: each prints nothing on a host whose closure is root's alone.",
+        "# The tools the weekly job runs as root, and their startup closure. Paste these lines as one block into",
+        "# one shell (bash or dash; the functions below are defined on earlier lines and used on later ones).",
+        "# Each prints nothing on a host whose closure is root's alone. A path holding whitespace is named, never",
+        "# split, since the lists below are split on it.",
         f"P=$({query}print(g[\"stdlib\"], g[\"platstdlib\"], sysconfig.get_config_var(\"DESTSHARED\") or "
         "os.path.join(g[\"platstdlib\"], \"lib-dynload\"))')",
         f"Z=$({query}print(*[x for x in sys.path if x.endswith(\".zip\")])')",
@@ -151,10 +153,15 @@ def validation_steps(p: ps.PartitionSpec, q: Callable[[str], str] = shlex.quote)
         "case \" $ups \" in *\" $x \"*) return;; esac; ups=\"$ups $x\"; chk \"$x\"; "
         "[ -L \"$x\" ] && hop \"$x\" chain; done; }",
         "hop() { local r t l; r=$(readlink \"$1\"); case \"$r\" in /*) t=$r;; *) t=\"$(dirname \"$1\")/$r\";; esac; "
+        "case \"$t\" in *[[:space:]]*) echo \"discovery failed: whitespace in $t\"; return;; esac; "
         "case \" $seen \" in *\" $t \"*) return;; esac; seen=\"$seen $t\"; "
         f"if [ \"$2\" = tree ]; then find \"$t\" {own} 2>/dev/null; "
+        "find \"$t\" -name '*[[:space:]]*' -print 2>/dev/null | sed 's/^/discovery failed: whitespace in /'; "
         "for l in $(find \"$t\" -type l 2>/dev/null); do hop \"$l\" tree; done; "
         "else chk \"$t\"; [ -L \"$t\" ] && hop \"$t\" chain; fi; up \"$t\"; }",
+        f"find {py} {docker} $(realpath {py} {docker}) $P $L $(for z in $Z; do [ -e \"$z\" ] && echo \"$z\"; done) "
+        "$( [ \"$(uname)\" = Darwin ] && xcode-select -p) -name '*[[:space:]]*' -print 2>/dev/null "
+        "| sed 's/^/discovery failed: whitespace in /'   # a path the lists would split",
         f"seen=; ups=; for l in $(find {py} {docker} $P $L $(for z in $Z; do [ -e \"$z\" ] && echo \"$z\"; done) "
         "$( [ \"$(uname)\" = Darwin ] && xcode-select -p) -type l 2>/dev/null); do hop \"$l\" tree; done"
         "   # every link's target, its tree and its directories",

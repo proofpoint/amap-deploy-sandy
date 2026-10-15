@@ -203,6 +203,23 @@ class ValidationMirrorTest(unittest.TestCase):
         out = self.run_block(py, as_owner=True)
         self.assertIn(outside + "\n", out.replace(outside + "/", "\0"), "the target's own directory")
 
+    def test_a_path_holding_whitespace_is_named_never_split(self):
+        """stdlib/link.py -> "out side"/linked.py, and stdlib/"a b.py": each is
+        named as a discovery failure rather than split into fragments that
+        would be judged in its place."""
+        stdlib, spaced = os.path.join(self.d, "stdlib"), os.path.join(self.d, "out side")
+        os.mkdir(stdlib)
+        os.mkdir(spaced)
+        with open(os.path.join(spaced, "linked.py"), "w") as f:
+            f.write("x = 1\n")
+        os.symlink(os.path.join(spaced, "linked.py"), os.path.join(stdlib, "link.py"))
+        with open(os.path.join(stdlib, "a b.py"), "w") as f:
+            f.write("y = 2\n")
+        py = self.interpreter([stdlib, stdlib, stdlib])
+        out = self.run_block(py, as_owner=True)
+        self.assertIn(f"discovery failed: whitespace in {spaced}/linked.py\n", out)
+        self.assertIn(f"discovery failed: whitespace in {stdlib}/a b.py\n", out)
+
     def test_nested_directory_links_and_a_cycle_are_followed_once(self):
         """stdlib/sub -> outside (a directory link); outside/deeper -> elsewhere/,
         elsewhere/ 0777; elsewhere/back -> stdlib (a cycle)."""
