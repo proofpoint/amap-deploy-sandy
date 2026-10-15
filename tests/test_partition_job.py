@@ -23,6 +23,31 @@ ARGV = pj.job_argv(P, writer="/opt/amap/host_steps.py", host="alpha", document="
                    document_bytes=DOC, activation_bytes=ACT)
 
 
+def halves(spec, *, darwin=False, owner="root", stubs=None, shell="/bin/sh", bound=180, work=None):
+    """Discovery then judging, as step 3 runs them but as this test's user:
+    discovery under an empty environment (PATH the system's, after `stubs`),
+    its output captured as closure.env, then judge.sh over it. The output,
+    which must end with the sentinel: a judging that stopped early fails."""
+    path = (stubs + ":" if stubs else "") + pj.DISCOVERY_PATH
+    with tempfile.TemporaryDirectory(dir=work) as t:
+        judge, ce = os.path.join(t, "judge.sh"), os.path.join(t, "closure.env")
+        with open(judge, "w") as f:
+            f.write(pj.judge_script(spec, darwin, owner=owner))
+        try:
+            found = subprocess.run([shell, "-c", pj.discover_script(spec, darwin)], stdin=subprocess.DEVNULL,
+                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=bound,
+                                   env={"PATH": path, "HOME": "/", "LC_ALL": "C"}).stdout
+            with open(ce, "wb") as f:
+                f.write(found[:pj.CLOSURE_MAX + 1])
+            out = subprocess.run([shell, judge, ce], capture_output=True, text=True, timeout=bound,
+                                 stdin=subprocess.DEVNULL).stdout
+        except subprocess.TimeoutExpired:
+            raise AssertionError(f"the halves did not finish within {bound} s") from None
+    if not out.endswith(pj.SENTINEL + "\n"):
+        raise AssertionError(f"the judging did not reach its sentinel: {out!r}")
+    return out
+
+
 class JobTest(unittest.TestCase):
     def test_the_argv_carries_every_input_the_job_must_not_take_from_operator_files(self):
         self.assertEqual(ARGV[:5], ["/usr/bin/python3", "-I", "-S", "-B", "/opt/amap/host_steps.py"])
@@ -65,17 +90,24 @@ class JobTest(unittest.TestCase):
         self.assertNotIn("file://", text)
 
     def test_validation_uses_the_systems_own_tools_and_an_empty_environment(self):
-        text = "\n".join(pj.validation_steps(P))
-        for words in ("env -i /usr/bin/python3 -I -S -B", "find ", "ldd ", "otool -L", "xcode-select -p",
-                      "! -user root -o -perm -g+w -o -perm -o+w", "DESTSHARED", ".zip", "-maxdepth 0", "find -L ",
-                      "discovery failed", 'realpath "$p"', 'uname)" = Darwin'):
+        text = pj.discover_script(P, False) + pj.discover_script(P, True)
+        for words in ("/usr/bin/python3 -I -S -B", "ldd ", "otool -L", "xcode-select -p", "DESTSHARED", ".zip"):
             self.assertIn(words, text)
+        judge = pj.judge_script(P, False)
+        for words in ("find ", "! -user root -o -perm -g+w -o -perm -o+w", "-maxdepth 0", "find -L ",
+                      "discovery failed", 'realpath "$p"'):
+            self.assertIn(words, judge)
+        self.assertIn("env -i PATH=" + pj.DISCOVERY_PATH, pj.step3("systemd"))
 
     def block(self, python, docker, then=""):
-        """The steps run as the operator runs them: one shell block, in order."""
+        """Discovery then judging, as step 3 runs them, on this host; `then`
+        names a list to print from discovery's output instead."""
         spec = dataclasses.replace(P, tools={"python3": python, "docker": docker})
-        script = "\n".join(pj.validation_steps(spec)) + "\n" + then
-        return subprocess.run(["/bin/sh", "-c", script], capture_output=True, text=True, timeout=180).stdout
+        if then:
+            found = subprocess.run(["/bin/sh", "-c", pj.discover_script(spec, False)], capture_output=True,
+                                   text=True, timeout=180, env={"PATH": pj.DISCOVERY_PATH}).stdout
+            return [l for l in found.splitlines() if l.startswith(then + "=")][0][len(then) + 1:]
+        return halves(spec)
 
     def healthy(self):
         """This host's own interpreter and shell, when root's alone; else skip."""
@@ -88,11 +120,11 @@ class JobTest(unittest.TestCase):
 
     def test_a_host_whose_closure_is_roots_alone_prints_nothing(self):
         py, sh = self.healthy()
-        self.assertEqual(self.block(py, sh), "", "an absent optional zip is not a finding")
+        self.assertEqual(self.block(py, sh), pj.SENTINEL + "\n", "an absent optional zip is not a finding")
 
     def test_the_list_the_checks_consume_is_ldds_on_linux_with_every_link_and_the_loader(self):
         py, sh = self.healthy()
-        listed = self.block(py, sh, 'echo "$L"').split()
+        listed = self.block(py, sh, "L").split()
         self.assertTrue(any("libssl" in x for x in listed), "an extension module's own link")
         self.assertTrue(any("/ld-linux" in x for x in listed), "the loader")
         self.assertFalse([x for x in listed if x.endswith(":") or not x.startswith("/")], "no header, nothing else")
@@ -108,8 +140,8 @@ class JobTest(unittest.TestCase):
 
     def test_a_writable_target_behind_a_link_is_printed_by_the_target_check(self):
         """The link check alone: a test can only make a link it owns, which
-        the owner check already prints, so the target check runs here with
-        just the discovery lines before it."""
+        the owner check already prints, so the target check is run here by
+        itself, as judge.sh's fixed list renders it."""
         py, _ = self.healthy()
         with tempfile.TemporaryDirectory() as t:
             d = os.path.realpath(t)
@@ -119,11 +151,10 @@ class JobTest(unittest.TestCase):
             os.chmod(target, 0o666)
             os.symlink(target, link)
             spec = dataclasses.replace(P, tools={"python3": py, "docker": link})
-            steps = pj.validation_steps(spec)
-            targets = [l for l in steps if l.startswith("find -L ")]
+            targets = [l for l in pj.judge_script(spec, False).split("; ") if l.startswith('find -L "$PY"')]
             if len(targets) != 1:
-                self.fail(f"the steps hold {len(targets)} link-target check(s)")
-            script = "\n".join([l for l in steps if l.startswith(("P=", "Z=", "T=", "if "))] + targets)
+                self.fail(f"judge.sh holds {len(targets)} link-target check(s) of the tools")
+            script = f"PY={py}\nDOCKER={link}\nPYR={py}\nDR={target}\n" + targets[0]
             out = subprocess.run(["/bin/sh", "-c", script], capture_output=True, text=True, timeout=180).stdout
             self.assertIn(link + "\n", out, "the target is judged through the link")
 
@@ -158,16 +189,14 @@ class ValidationMirrorTest(unittest.TestCase):
         return py
 
     def run_block(self, py, env=None, as_owner=False, bound=180, shell="/bin/sh"):
+        """Both halves, rendered for macOS when a stub uname says Darwin, with
+        the stubs first on discovery's PATH."""
+        import getpass
         spec = dataclasses.replace(P, tools={"python3": py, "docker": os.path.realpath("/bin/sh")})
-        script = "\n".join(pj.validation_steps(spec))
-        if as_owner:
-            import getpass
-            script = script.replace("-user root", f"-user {getpass.getuser()}")
-        try:
-            return subprocess.run([shell, "-c", script], capture_output=True, text=True, timeout=bound,
-                                  env=dict(os.environ, **(env or {}))).stdout
-        except subprocess.TimeoutExpired:
-            self.fail(f"the block did not finish within {bound} s")
+        stubs = os.path.join(self.d, "stub")
+        darwin = os.path.exists(os.path.join(stubs, "uname"))
+        return halves(spec, darwin=darwin, owner=getpass.getuser() if as_owner else "root",
+                      stubs=stubs if os.path.isdir(stubs) else None, shell=shell, bound=bound)
 
     def test_on_macos_a_missing_required_path_is_named_though_it_is_under_a_system_prefix(self):
         stub = os.path.join(self.d, "stub")
@@ -177,7 +206,7 @@ class ValidationMirrorTest(unittest.TestCase):
         os.chmod(os.path.join(stub, "uname"), 0o755)
         missing = "/usr/lib/absent-required-python"
         py = self.interpreter([missing, missing, missing + "/lib-dynload"])
-        out = self.run_block(py, env={"PATH": stub + ":" + os.environ["PATH"]})
+        out = self.run_block(py)
         self.assertIn(f"absent: {missing}\n", out, "a required path is never taken for the shared cache")
         self.assertIn(f"absent: {missing}/lib-dynload\n", out)
 

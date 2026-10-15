@@ -708,3 +708,50 @@ Three changes are refused rather than rendered:
 - removing `hop_link` while `state_dir` holds hop state: run
   `python3 amap-sandy.py install --decommission-hop --apply`, then restart
   the router.
+
+### The weekly partition job's tools
+
+The weekly partition job runs the host's interpreter and docker as root, so
+before it is placed the plan's partition section checks them and everything
+they load at startup. Run these steps at install AND again after any
+operating-system, interpreter or docker update, before the next weekly run.
+Those updates change the startup closure the per-run tripwire holds to the
+install-time state.
+
+Root makes a directory only root can open, and writes two scripts into it
+from the plan's text before anything that is being checked runs:
+`discover.sh`, which runs the interpreter, `ldd` (or `otool`) and
+`xcode-select` to list the closure, and `judge.sh`, which judges that list
+with the operating system's own `find` and executes nothing it judges. The
+plan prints both scripts and their sha256 digests:
+
+```sh
+R=$(sudo mktemp -d /tmp/amap-judge.XXXXXXXX)
+sudo chmod 0400 "$R/judge.sh" "$R/discover.sh"
+```
+
+Then one root invocation checks the digests, runs discovery as `nobody`
+(no terminal, an empty environment, its output cut at 1 MiB and one byte)
+and judges what it wrote. On Linux:
+
+```sh
+sudo sh -c 'sha256sum --status -c "$1/judge.sha256" || { echo "discovery failed: the judging scripts do not match their digests; nothing is run"; exit 1; }; ( cd / && setsid -w runuser -u nobody -- env -i PATH=/usr/bin:/bin HOME=/ LC_ALL=C sh -c "$(cat "$1/discover.sh")" </dev/null 2>/dev/null ) | head -c 1048577 > "$1/closure.env"; chmod 0400 "$1/closure.env" && sh "$1/judge.sh" "$1/closure.env"' sh "$R"
+```
+
+On macOS:
+
+```sh
+sudo sh -c 'shasum -a 256 --status -c "$1/judge.sha256" || { echo "discovery failed: the judging scripts do not match their digests; nothing is run"; exit 1; }; ( cd / && /usr/bin/perl -MPOSIX -e "POSIX::setsid() >= 0 or exit 1; exec @ARGV" /usr/bin/sudo -u nobody -g nobody /usr/bin/env -i PATH=/usr/bin:/bin HOME=/var/empty LC_ALL=C /bin/sh -c "$(cat "$1/discover.sh")" </dev/null 2>/dev/null ) | head -c 1048577 > "$1/closure.env"; chmod 0400 "$1/closure.env" && sh "$1/judge.sh" "$1/closure.env"' sh "$R"
+```
+
+Go on only when it printed exactly `END-OF-BLOCK` and exited 0: nothing
+before it runs the interpreter as root, and the bundle's provisioning
+(`partition-provision`, under the job's lock) comes after it. `nobody` must
+hold no sudoers rule and own nothing in the closure, and sudo's default
+`closefrom` must hold. The check trusts, as given, the completeness of the
+lists discovery writes beyond the tools themselves and its self-checks, and
+only as far as no hostile process runs as `nobody`. The interpreter
+names its own library paths from its standard library, so whoever can already
+write that library can make it misreport them: a known limit, the same for
+the per-run tripwire. A process discovery leaves behind that holds the pipe
+makes the step hang visibly; interrupt it, and run nothing after it.

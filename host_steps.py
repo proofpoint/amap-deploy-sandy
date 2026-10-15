@@ -687,6 +687,18 @@ RUN_NAME = re.compile(r"run-([A-Za-z0-9._-]{1,64})")
 DOC_MAX = 1 << 20
 #: `docker stop -t` for the local router, as its supervision renders it.
 STOP_TIMEOUT_S = 100
+#: One engine call's bound (`_Engine.run`'s).
+ENGINE_CALL_S = STOP_TIMEOUT_S + 60
+#: The most engine calls the parent makes after its child ends: remove_run's
+#: ps and rm, then on a fail-stop _act's running (an inspect, then a ps),
+#: stop, and running again (a test counts them on that trace).
+POST_CHILD_ENGINE_CALLS = 7
+#: The filesystem work, the publications and the wait after a kill.
+STALE_MARGIN_S = 600
+#: How long a run may be recorded as running before verify reads it as
+#: overdue: the child's bound, the parent's calls after it, and the margin.
+#: A conservative threshold, never a proof that anything stopped.
+STALE_AFTER_S = CHILD_TIMEOUT_S + POST_CHILD_ENGINE_CALLS * ENGINE_CALL_S + STALE_MARGIN_S
 INCIDENT_PREFIX = "incident-"
 #: Who must own what the job trusts: root.
 ROOT_UID, ROOT_GID = 0, 0
@@ -753,6 +765,12 @@ RECOVERY_MEMBERS = {"schema": str, "host": str, "run_id": str, "at": str, "evide
 #: never reads it, and the library's store cannot write it (it is outside
 #: partition_setup.EVIDENCE_NAME).
 STOP_TARGET = "stop-target.json"
+#: The weekly job's record of the runs it has not finished deciding, beside
+#: the stop target: a writer-only name, outside EVIDENCE_NAME, so the child's
+#: store can neither create nor replace it.
+WEEKLY_RUNS = "weekly-runs.json"
+RUNS_SCHEMA = "amap-deploy.partition-runs/1"
+RUNNING, KEPT, UNDECIDED = "running", "kept", "undecided"
 #: A1's approved record, placed by the operator, read only under the unit's digest.
 ACTIVATION = "activation.json"
 
@@ -1236,9 +1254,10 @@ _CLOSURE_QUERY = ("import json,os,sys,sysconfig\n"
 REQUIRED, LIBRARIES, OPTIONAL = "required", "libraries", "optional"
 
 
-def startup_closure(python, docker):
+def startup_closure(python, docker, spelled=()):
     """Every path root's runs of `python` and `docker` load from, by part:
-    REQUIRED, the binaries, the interpreter's standard library and its
+    REQUIRED, the binaries (their realpaths, and `spelled`, the approved
+    document's spellings, whose routes the unit execs), the interpreter's standard library and its
     extension modules, and on macOS the developer directory xcode-select
     chose; LIBRARIES, what both binaries and every extension module link;
     OPTIONAL, each zip on the interpreter's path."""
@@ -1253,7 +1272,7 @@ def startup_closure(python, docker):
         if not isinstance(xs, list) or not all(isinstance(x, str) and x.startswith("/") for x in xs):
             raise Tooling("the interpreter named its library in a form that is not absolute paths")
         return xs
-    paths = absolute(found.get("paths")) + [python, docker]
+    paths = absolute(found.get("paths")) + [python, docker] + list(spelled)
     optional = absolute(found.get("zips"))
     if len(found["paths"]) != 3:
         raise Tooling("the interpreter did not name its library, platform library and extension modules")
@@ -1273,21 +1292,57 @@ def startup_closure(python, docker):
     return {REQUIRED: sorted(set(paths)), LIBRARIES: libraries, OPTIONAL: sorted(set(optional))}
 
 
-def closure_problems(closure, lstat=os.lstat, walk=os.walk, realpath=os.path.realpath, platform=None):
+def _norm(x):
+    """The shell's textual collapse of "." and ".." (the install block's
+    norm()): a leading "//" becomes "/", which os.path.normpath keeps."""
+    out = []
+    for c in x.split("/"):
+        if c in ("", "."):
+            continue
+        if c == "..":
+            if out:
+                out.pop()
+            continue
+        out.append(c)
+    return "/" + "/".join(out)
+
+
+def _entry(t, stat_=os.stat, realpath=os.path.realpath):
+    """The directory entry `t` names, as the install block's ent() keys it:
+    its directory's realpath and its own name; "?" and its normalised
+    spelling exactly when os.stat of its directory raises, which follows
+    links, so an absent directory and a looping one alike (an lstat would
+    succeed on a looping link)."""
+    try:
+        stat_(os.path.dirname(t))
+    except OSError:
+        return "?" + _norm(t)
+    return realpath(os.path.dirname(t)) + "/" + os.path.basename(t)
+
+
+def closure_problems(closure, lstat=os.lstat, walk=os.walk, realpath=os.path.realpath, platform=None,
+                     readlink=os.readlink, stat_=os.stat):
     """Every path in the startup closure, every directory above it and
-    everything under it, root-owned and writable by no one else; a link is
-    judged itself, and then its target, the target's directories and, for a
-    link inside the closure, everything under the target. Each path is
-    covered once, so a cycle ends. `closure`: a startup closure by part, or
-    a list of required paths. A required path must exist. A library must
-    exist, except on macOS a system library its tool named that is absent
-    from disk, which is in the dyld shared cache on the sealed system
-    volume. An optional path is judged whole when present, and when absent
-    the directories its would-be place is under are judged instead. The
-    problems, empty when there are none."""
+    everything under it, root-owned and writable by no one else, exactly as
+    the install-time block judges it. A link is judged itself, then followed
+    one hop at a time to its TEXTUAL target (never its realpath alone): every
+    directory on the target's own path is judged first, then the target, and
+    for a link inside the closure everything under the target (a tree
+    visit); a link among those directories has only its target and the
+    directories above it judged (a chain visit). A visit is known by the
+    directory entry its target names, so each link along a chain is visited
+    once and every cycle ends; a chain visit never stands in for a later
+    tree visit. A directory above a path is known by its spelling and its
+    realpath. `closure`: a startup closure by part, or a list of required
+    paths. A required path must exist. A library must exist, except on macOS
+    a system library its tool named that is absent from disk, which is in
+    the dyld shared cache on the sealed system volume. An optional path is
+    judged whole when present; when absent, the directories its would-be
+    place is under are judged instead. A directory the walk cannot list is
+    a problem. The problems, empty when there are none."""
     if not isinstance(closure, dict):
         closure = {REQUIRED: list(closure), LIBRARIES: [], OPTIONAL: []}
-    bad, covered, chained = [], set(), set()
+    bad, trees, chains, ups = [], set(), set(), set()
     cached = frozenset(p for p in closure[LIBRARIES] if p.startswith(SEALED_PREFIXES)) \
         if (platform or sys.platform) == "darwin" else frozenset()
 
@@ -1305,64 +1360,118 @@ def closure_problems(closure, lstat=os.lstat, walk=os.walk, realpath=os.path.rea
             bad.append(f"{p} is not root-owned, or is writable by others")
         return st
 
-    def chain(p):
-        """`p` and every directory above it; a link among them, its target's too."""
-        if p in chained:
-            return
-        chained.add(p)
-        d = p
-        while True:
-            st = meta(d)
-            if st is not None and stat.S_ISLNK(st.st_mode):
-                chain(realpath(d))
-            if d == "/":
-                break
-            d = os.path.dirname(d)
+    def unlisted(e):
+        bad.append(f"{e.filename}: {e.strerror}")
 
-    def cover(p):
-        """`p`, its directories, and everything under it, following each link."""
-        if p in covered:
-            return
-        covered.add(p)
-        chain(p)
-        st = meta(p)
+    def under(t):
+        """Judge `t`, and everything under it when it is a directory; the
+        links found, `t` itself when it is one."""
+        st = meta(t)
         if st is None:
-            return
+            return []
         if stat.S_ISLNK(st.st_mode):
-            cover(realpath(p))
-            return
+            return [t]
+        found = []
         if stat.S_ISDIR(st.st_mode):
-            for top, dirs, files in walk(p):
+            for top, dirs, files in walk(t, onerror=unlisted):
                 for n in dirs + files:
                     e = os.path.join(top, n)
                     est = meta(e)
                     if est is not None and stat.S_ISLNK(est.st_mode):
-                        cover(realpath(e))
-    for path in closure[REQUIRED] + closure[LIBRARIES]:
-        cover(path)
-    for path in closure[OPTIONAL]:
-        try:
-            lstat(path)
-        except FileNotFoundError:
-            chain(os.path.dirname(path))   # its would-be place: whoever can write there could plant it
-            continue
-        except OSError:
-            pass
-        cover(path)
+                        found.append(e)
+        return found
+
+    # The walk is iterative, so no input can exhaust the interpreter's stack:
+    # ("up", x) judges the next directory above x; ("hop", link, mode)
+    # follows a link one step; ("visit", t, mode) visits a reached target
+    # after the directories above it.
+    work = []
+
+    def run():
+        while work:
+            task = work.pop()
+            if task[0] == "up":
+                x = task[1]
+                if x in ("/", "."):
+                    continue
+                x = os.path.dirname(x)
+                k = (_norm(x), realpath(x))
+                if k in ups:
+                    continue
+                ups.add(k)
+                work.append(("up", x))
+                st = meta(x)
+                if st is not None and stat.S_ISLNK(st.st_mode):
+                    work.append(("hop", x, "chain"))
+            elif task[0] == "hop":
+                _, link, mode = task
+                try:
+                    r = readlink(link)
+                except OSError as e:
+                    bad.append(f"{link}: {e.strerror}")
+                    continue
+                t = r if r.startswith("/") else os.path.dirname(link) + "/" + r
+                work.append(("visit", t, mode))
+                work.append(("up", t))
+            else:
+                _, t, mode = task
+                k = _entry(t, stat_, realpath)
+                if mode == "tree":
+                    if k in trees:
+                        continue
+                    trees.add(k)
+                    for link in reversed(under(t)):
+                        work.append(("hop", link, "tree"))
+                else:
+                    if k in trees or k in chains:
+                        continue
+                    chains.add(k)
+                    st = meta(t)
+                    if st is not None and stat.S_ISLNK(st.st_mode):
+                        work.append(("hop", t, "chain"))
+
+    def cover(p):
+        """A closure path: the directories above it, then it and everything
+        under it, each link found followed as a tree visit."""
+        work.append(("up", p))
+        run()
+        for link in reversed(under(p)):
+            work.append(("hop", link, "tree"))
+        run()
+
+    try:
+        for path in closure[REQUIRED] + closure[LIBRARIES]:
+            cover(path)
+        for path in closure[OPTIONAL]:
+            try:
+                lstat(path)
+            except FileNotFoundError:
+                # Its would-be place: up() starts at its immediate parent, so
+                # whoever can write there, or above, could plant it.
+                work.append(("up", path))
+                run()
+                continue
+            except OSError:
+                pass
+            cover(path)
+    except RecursionError:
+        raise Tooling("the closure's links are too deep to judge") from None
     return sorted(set(bad))
 
 
-def _docker_closure(docker):
-    """What root's run of `docker` alone loads: the binary, and every
+def _docker_closure(docker, spelled=None):
+    """What root's run of `docker` alone loads: the binary (and the approved
+    document's spelling of it, when the document could be read), and every
     library and the loader it links."""
-    return {REQUIRED: [docker], LIBRARIES: _linked_libraries([docker]), OPTIONAL: []}
+    return {REQUIRED: [docker] + ([spelled] if spelled else []), LIBRARIES: _linked_libraries([docker]),
+            OPTIONAL: []}
 
 
 def _verified_tools(python3, docker):
     """The interpreter's and docker's realpaths once they and their startup
     closure are root's alone; Tooling otherwise."""
     python, dock = _trusted_tool(python3), _trusted_tool(docker)
-    bad = closure_problems(startup_closure(python, dock))
+    bad = closure_problems(startup_closure(python, dock, (python3, docker)))
     if bad:
         raise Tooling("the startup closure is not root's alone: " + "; ".join(bad[:5]))
     return python, dock
@@ -1389,7 +1498,7 @@ class _Engine:
         self.docker, self.env = docker, {"DOCKER_HOST": engine, "DOCKER_CONFIG": os.path.join(run_dir, "docker"),
                                          "HOME": os.path.join(run_dir, "home"), "LC_ALL": "C"}
 
-    def run(self, args, timeout=STOP_TIMEOUT_S + 60):
+    def run(self, args, timeout=ENGINE_CALL_S):
         try:
             return subprocess.run([self.docker] + args, shell=False, close_fds=True, stdin=subprocess.DEVNULL,
                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=self.env, timeout=timeout)
@@ -1908,139 +2017,245 @@ def _recovery(efd):
     return doc
 
 
+def _runs_fs(phase):
+    """The filesystem the run record goes through in `phase` (W2, W5 or
+    W7): the real one; a test faults a single phase."""
+    return os
+
+
+def _invalidate_runs(evfd, fs):
+    """W2: the old record removed, durably, before any run directory is
+    made. Raises OSError: on the unlink (the old record may remain) or on
+    the directory fsync (it is gone now, not durably)."""
+    try:
+        fs.unlink(WEEKLY_RUNS, dir_fd=evfd)
+    except FileNotFoundError:
+        pass
+    fs.fsync(evfd)
+
+
+def _runs_record(efd, host, at, kept, running=None):
+    """The record from a fresh listing of the exec root: every run directory
+    present now, `running` as running, one whose decision kept it as kept,
+    and any other (unreadable, a failed removal, not decided here) as
+    undecided. Empty only when no run directory remains."""
+    runs = []
+    for n in sorted(os.listdir(efd)):
+        m = RUN_NAME.fullmatch(n)
+        if m:
+            state = RUNNING if m.group(1) == running else KEPT if n in kept else UNDECIDED
+            runs.append({"run_id": m.group(1), "state": state, "since": at})
+    return _canonical({"schema": RUNS_SCHEMA, "host": host, "at": at, "runs": runs})
+
+
+def _status(code):
+    """A status failure (a run record or a run directory the writer could not
+    settle) maps the exit once: a pass becomes a handoff; an incident, a
+    handoff and a tooling exit stay as they are."""
+    return EXIT_HANDOFF if code == EXIT_PASS else code
+
+
 def partition_weekly(exec_root, host, document, sha256, activation, activation_sha256, now=None, child_timeout=None,
                      emit=print):
-    """One weekly partition run (see the section comment). Returns its exit."""
+    """One weekly partition run (see the section comment). Returns its exit.
+
+    Its run record, under the lock: W2 removes the old one, durably, before
+    any run directory is made (else no run starts); W5 publishes every run
+    directory with this run as running, durably, before the child starts
+    (else the child never starts); W7 publishes what remains, from a fresh
+    listing, on every path once W2 succeeded, before the lock is released.
+    So whenever a run directory exists, the record is absent or lists it.
+    A record or a run directory the writer cannot settle never reads as a
+    pass, and never hides an incident or a stop."""
     child_timeout = CHILD_TIMEOUT_S if child_timeout is None else child_timeout
     if not RUN_ID.fullmatch(host) or not _HEX64.fullmatch(sha256) or not _HEX64.fullmatch(activation_sha256):
         raise Refused("usage")
     at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now if now is not None else time.time()))
     rid = time.strftime("w%Y%m%dT%H%M%SZ", time.gmtime(now if now is not None else time.time()))
+
+    def stamp():
+        return at if now is not None else time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time()))
     said = []
     try:
         efd = _root_dir(exec_root, 0o700)
     except Tooling as e:
         emit(f"partition-weekly: tooling_unverified: {e}; no recovery context can be trusted without the exec root")
         return EXIT_TOOLING
-    lock_fd = None
-    try:
-        lock_fd = _take_partition_lock(efd)
-        raw, sec = _document(document, sha256)
-        values = _authority(sec, exec_root)
-        # Everything root will run or write under, verified before any engine call.
-        python, docker = _verified_tools(values["python3"], values["docker"])
-        _engine_socket(values["engine"])
-        _verify_bundle(efd, values["pin"])
-        os.close(_evidence_dir(values["evidence_dir"]))
-        cfd, _ = _config_dir(values["live_config"])
-        os.close(cfd)
-        approved = _activation(values["evidence_dir"], activation, activation_sha256)
-        recovery = _recovery(efd)
-        current = {"engine": values["engine"], "docker": docker, "exec_root": exec_root}
-        for n in sorted(os.listdir(efd)):
-            if RUN_NAME.fullmatch(n):
-                said.append(f"{n}: abandoned; completing its decision before removing it")
-                try:
-                    _, _, keep = _decide(efd, n, current, said)
-                except OSError as e:
-                    said.append(f"{n}: cannot be read ({e.strerror}); kept, undecided, for the operator")
-                    continue
-                if keep:
-                    said.append(f"{n}: kept, since an effect is not yet shown done")
-                else:
-                    _remove_tree(efd, n)
-        target = recovery["router_container_id"] if recovery and recovery["host"] == host \
-            and recovery["live_config_path"] == values["live_config"] and recovery["engine"] == values["engine"] \
-            and recovery["evidence_dir"] == values["evidence_dir"] else None
-        run_name = RUN_PREFIX + rid
-        os.mkdir(run_name, 0o700, dir_fd=efd)
-        rfd = os.open(run_name, _DIR, dir_fd=efd)
+    lock_fd = values = None
+    # The record's state: the evidence directory once W2 removed the old
+    # record, the runs a decision kept, and whether any status failed.
+    rec = {"evfd": None, "kept": set(), "status": False}
+
+    def remove(name):
         try:
-            for d in ("docker", "home"):
-                os.mkdir(d, 0o700, dir_fd=rfd)
-            _write_at(rfd, "document.json", raw, 0o400, exclusive=True)
-            _write_at(rfd, ACTIVATION, approved, 0o400, exclusive=True)
-            _write_at(rfd, "context.json", _canonical(
-                {"schema": CONTEXT_SCHEMA, "run_id": rid, "host": host, "started_at": at,
-                 "evidence_dir": values["evidence_dir"], "live_config_path": values["live_config"],
-                 "router_container_id": target, "engine": values["engine"], "docker": docker}), 0o400, exclusive=True)
-        finally:
-            os.close(rfd)
-        run_dir = os.path.join(exec_root, run_name)
-        child_fd = os.dup(lock_fd)
+            _remove_tree(efd, name)
+        except OSError as e:
+            said.append(f"{name}: cannot be removed ({e.strerror or e}); kept, undecided")
+            rec["status"] = True
+
+    def body():
+        nonlocal lock_fd, values
         try:
-            child = subprocess.Popen(
-                [python, "-I", "-S", "-B", os.path.join(exec_root, BUNDLE, LAUNCHER), "--run-dir", run_dir,
-                 "--lock-fd", str(child_fd), "--docker", docker],
-                shell=False, close_fds=True, pass_fds=(child_fd,), stdin=subprocess.DEVNULL, cwd=run_dir,
-                env={"DOCKER_HOST": values["engine"], "DOCKER_CONFIG": os.path.join(run_dir, "docker"),
-                     "HOME": os.path.join(run_dir, "home"), "LC_ALL": "C"}, start_new_session=True)
-        finally:
-            os.close(child_fd)
-        try:
-            child.wait(timeout=child_timeout)
-        except subprocess.TimeoutExpired:
-            said.append(f"{rid}: the child outran {child_timeout} s; its group is killed")
+            lock_fd = _take_partition_lock(efd)
+            raw, sec = _document(document, sha256)
+            values = _authority(sec, exec_root)
+            # Everything root will run or write under, verified before any engine call.
+            python, docker = _verified_tools(values["python3"], values["docker"])
+            _engine_socket(values["engine"])
+            _verify_bundle(efd, values["pin"])
+            os.close(_evidence_dir(values["evidence_dir"]))
+            cfd, _ = _config_dir(values["live_config"])
+            os.close(cfd)
+            approved = _activation(values["evidence_dir"], activation, activation_sha256)
+            recovery = _recovery(efd)
+            current = {"engine": values["engine"], "docker": docker, "exec_root": exec_root}
+            # W2: no run directory is made unless the old record is durably gone.
+            evfd = _evidence_dir(values["evidence_dir"])
             try:
-                os.killpg(child.pid, signal.SIGKILL)
-            except OSError:
-                pass
-            child.wait()
-        code, passed, keep = _decide(efd, run_name, current, said)
-        if code == EXIT_PASS:
-            why = _verified_target(_Engine(docker, values["engine"], run_dir), passed, values)
-            if why:
-                said.append(f"{rid}: passed; no stop target recorded: {why}")
-                code = EXIT_HANDOFF
-            else:
-                record = {k: passed[k] for k in ("config_sha256", "evidence_run_id", "evidence_sha256",
-                                                 "inspect_digest")}
-                record.update(schema=RECOVERY_SCHEMA, host=host, run_id=rid, at=at,
-                              evidence_dir=values["evidence_dir"], live_config_path=values["live_config"],
-                              engine=values["engine"], docker=docker, router_container_id=passed["router_seen"],
-                              activation_sha256=activation_sha256)
-                why = _publish_target(efd, values["evidence_dir"], _canonical(record))
+                _invalidate_runs(evfd, _runs_fs("W2"))
+                rec["evfd"] = evfd
+            except OSError as e:
+                os.close(evfd)
+                said.append(f"the run record cannot be invalidated ({e.strerror or e}); no run is started")
+            incident = False
+            for n in sorted(os.listdir(efd)):
+                if RUN_NAME.fullmatch(n):
+                    said.append(f"{n}: abandoned; completing its decision before removing it")
+                    try:
+                        code, _, keep = _decide(efd, n, current, said)
+                    except OSError as e:
+                        said.append(f"{n}: cannot be read ({e.strerror}); kept, undecided, for the operator")
+                        continue
+                    incident = incident or code == EXIT_INCIDENT
+                    if keep:
+                        said.append(f"{n}: kept, since an effect is not yet shown done")
+                        rec["kept"].add(n)
+                    else:
+                        remove(n)
+            # With no child, an abandoned run's incident is the exit; a status failure never hides it.
+            no_child = EXIT_INCIDENT if incident else EXIT_HANDOFF
+            if rec["evfd"] is None:
+                return no_child
+            target = recovery["router_container_id"] if recovery and recovery["host"] == host \
+                and recovery["live_config_path"] == values["live_config"] and recovery["engine"] == values["engine"] \
+                and recovery["evidence_dir"] == values["evidence_dir"] else None
+            run_name = RUN_PREFIX + rid
+            os.mkdir(run_name, 0o700, dir_fd=efd)
+            rfd = os.open(run_name, _DIR, dir_fd=efd)
+            try:
+                for d in ("docker", "home"):
+                    os.mkdir(d, 0o700, dir_fd=rfd)
+                _write_at(rfd, "document.json", raw, 0o400, exclusive=True)
+                _write_at(rfd, ACTIVATION, approved, 0o400, exclusive=True)
+                _write_at(rfd, "context.json", _canonical(
+                    {"schema": CONTEXT_SCHEMA, "run_id": rid, "host": host, "started_at": at,
+                     "evidence_dir": values["evidence_dir"], "live_config_path": values["live_config"],
+                     "router_container_id": target, "engine": values["engine"], "docker": docker}), 0o400,
+                    exclusive=True)
+            finally:
+                os.close(rfd)
+            # W5: no child starts unless this run is durably published as running.
+            got = _stage_write(rec["evfd"], WEEKLY_RUNS, _runs_record(efd, host, stamp(), rec["kept"], rid),
+                               _runs_fs("W5"))
+            if got:
+                said.append(f"the run record cannot be published ({got[0]} its rename: {got[1]}); nothing is run")
+                remove(run_name)
+                return no_child
+            run_dir = os.path.join(exec_root, run_name)
+            child_fd = os.dup(lock_fd)
+            try:
+                child = subprocess.Popen(
+                    [python, "-I", "-S", "-B", os.path.join(exec_root, BUNDLE, LAUNCHER), "--run-dir", run_dir,
+                     "--lock-fd", str(child_fd), "--docker", docker],
+                    shell=False, close_fds=True, pass_fds=(child_fd,), stdin=subprocess.DEVNULL, cwd=run_dir,
+                    env={"DOCKER_HOST": values["engine"], "DOCKER_CONFIG": os.path.join(run_dir, "docker"),
+                         "HOME": os.path.join(run_dir, "home"), "LC_ALL": "C"}, start_new_session=True)
+            finally:
+                os.close(child_fd)
+            try:
+                child.wait(timeout=child_timeout)
+            except subprocess.TimeoutExpired:
+                said.append(f"{rid}: the child outran {child_timeout} s; its group is killed")
+                try:
+                    os.killpg(child.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+                child.wait()
+            code, passed, keep = _decide(efd, run_name, current, said)
+            if code == EXIT_PASS:
+                why = _verified_target(_Engine(docker, values["engine"], run_dir), passed, values)
                 if why:
-                    said.append(f"{rid}: passed; {why}")
+                    said.append(f"{rid}: passed; no stop target recorded: {why}")
                     code = EXIT_HANDOFF
                 else:
-                    said.append(f"{rid}: passed; stop target {passed['router_seen']} recorded")
-        if keep:
-            said.append(f"{run_name}: kept, since an effect is not yet shown done")
-        else:
-            _remove_tree(efd, run_name)
-        return code
-    except Handoff as e:
-        said.append(f"handoff: {e}")
-        return EXIT_HANDOFF
-    except Tooling as e:
-        said.append(f"tooling_unverified: {e}")
-        if lock_fd is None:
-            said.append("the lock is not held: nothing is acted on")
+                    record = {k: passed[k] for k in ("config_sha256", "evidence_run_id", "evidence_sha256",
+                                                     "inspect_digest")}
+                    record.update(schema=RECOVERY_SCHEMA, host=host, run_id=rid, at=at,
+                                  evidence_dir=values["evidence_dir"], live_config_path=values["live_config"],
+                                  engine=values["engine"], docker=docker, router_container_id=passed["router_seen"],
+                                  activation_sha256=activation_sha256)
+                    why = _publish_target(efd, values["evidence_dir"], _canonical(record))
+                    if why:
+                        said.append(f"{rid}: passed; {why}")
+                        code = EXIT_HANDOFF
+                    else:
+                        said.append(f"{rid}: passed; stop target {passed['router_seen']} recorded")
+            if keep:
+                said.append(f"{run_name}: kept, since an effect is not yet shown done")
+                rec["kept"].add(run_name)
+            else:
+                remove(run_name)
+            return code
+        except Handoff as e:
+            said.append(f"handoff: {e}")
+            return EXIT_HANDOFF
+        except Tooling as e:
+            said.append(f"tooling_unverified: {e}")
+            if lock_fd is None:
+                said.append("the lock is not held: nothing is acted on")
+                return EXIT_TOOLING
+            recovery = _recovery(efd)
+            if recovery is None:
+                said.append("no recovery description: no target, nothing stopped")
+                return EXIT_TOOLING
+            try:
+                docker = _trusted_tool(recovery["docker"])
+                bad = closure_problems(_docker_closure(docker, values["docker"] if values else None))
+                if bad:
+                    raise Tooling("its own startup closure is not root's alone: " + "; ".join(bad[:5]))
+                _engine_socket(recovery["engine"])
+            except Tooling as e2:
+                said.append(f"handoff: the recovery description's docker is not verified either ({e2}): "
+                            "it is not run, and nothing is stopped")
+                return EXIT_TOOLING
+            _act(recovery["evidence_dir"], recovery["live_config_path"], recovery["router_container_id"],
+                 "tooling-" + rid, at, ["tooling_unverified"], _Engine(docker, recovery["engine"], exec_root), said)
             return EXIT_TOOLING
-        recovery = _recovery(efd)
-        if recovery is None:
-            said.append("no recovery description: no target, nothing stopped")
-            return EXIT_TOOLING
-        try:
-            docker = _trusted_tool(recovery["docker"])
-            bad = closure_problems(_docker_closure(docker))
-            if bad:
-                raise Tooling("its own startup closure is not root's alone: " + "; ".join(bad[:5]))
-            _engine_socket(recovery["engine"])
-        except Tooling as e2:
-            said.append(f"handoff: the recovery description's docker is not verified either ({e2}): "
-                        "it is not run, and nothing is stopped")
-            return EXIT_TOOLING
-        _act(recovery["evidence_dir"], recovery["live_config_path"], recovery["router_container_id"],
-             "tooling-" + rid, at, ["tooling_unverified"], _Engine(docker, recovery["engine"], exec_root), said)
-        return EXIT_TOOLING
+
+    try:
+        code = body()
+        if rec["evfd"] is not None:
+            # W7, after every effect and before the lock is released: what
+            # remains, from a fresh listing. Visible is never taken for durable.
+            try:
+                data = _runs_record(efd, host, stamp(), rec["kept"])
+            except OSError as e:
+                said.append(f"the run record cannot be listed ({e.strerror or e}); the last one stays")
+                rec["status"] = True
+            else:
+                got = _stage_write(rec["evfd"], WEEKLY_RUNS, data, _runs_fs("W7"))
+                if got:
+                    said.append(f"the run record cannot be published durably ({got[0]} its rename: {got[1]})")
+                    rec["status"] = True
+        return _status(code) if rec["status"] else code
     finally:
         for s in said:
             try:
                 emit(f"partition-weekly: {s}")
             except Exception:  # a diagnostic is never an action
                 pass
+        if rec["evfd"] is not None:
+            os.close(rec["evfd"])
         if lock_fd is not None:
             os.close(lock_fd)
         os.close(efd)

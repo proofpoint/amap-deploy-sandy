@@ -497,6 +497,15 @@ def render_plan(spec: Spec, overlay_source: Optional[Path] = None,
         lines += hv.plan(spec, q, steps)
     if spec.partition is not None:
         lines += ps.plan(spec.partition, spec.gate, q, anchor=spec.secrets.anchor if spec.secrets else None)
+        if spec.supervision is None or spec.secrets is None:
+            lines.append("# The weekly job's validation and bundle steps need the supervision and secrets sections "
+                         "(the host's kind, the deploy pin and the pinned writer).")
+        else:
+            # Imported here: host_setup is in the weekly job's bundle, and the job's own installation is not.
+            import partition_job as pj
+            # The validation first: nothing below runs the vetted interpreter as root until it passes.
+            lines += pj.validation_steps(spec.partition, spec.supervision.kind, q)
+            lines += pj.provision_steps(spec.partition, spec.secrets.clones["deploy"]["sha"], spec.secrets.writer, q)
     lines.append("# Start no runtime until every step above has run: each root exists and is synced "
                  "before a runtime opens it.")
     return lines
@@ -1096,7 +1105,26 @@ def checks(spec: Spec, *, production: bool, lstat: Callable = os.lstat,
                          hop_sha=(spec.overlay_pin or {}).get("commit", rh.Unresolved("the overlay has no plugin pin")),
                          plugin_sha256=hp.PLUGIN_SHA256, read=p.get("read", ps.read_record))
         out += verify_stop_target(spec, p)
+        out += verify_weekly_runs(spec, p)
     return out
+
+
+def verify_weekly_runs(spec: Spec, p: Dict[str, Any]) -> List[rh.Check]:
+    """No run of the weekly job left undecided, from its own record, in scope
+    exactly as the stop target is. `p` may supply `read_placed`, `read` and
+    `now`."""
+    # Imported here: host_setup is in the weekly job's bundle, and this check is not.
+    import partition_runs as pr
+    if spec.partition is None:
+        return []
+    if spec.keys is None:
+        return [rh.check(pr.RUNS_CLAIM, rh.Fact("undecided runs", True, "the weekly job's own record"),
+                         "cannot be judged: the document has no keys section",
+                         "add the keys section: whether the record is required is judged against the local "
+                         "router's live config", ok=lambda e, a: a is True)]
+    return pr.verify_runs(spec.partition, spec.gate, live_config=spec.keys.local_config,
+                          read=p.get("read_placed", ps.read_placed), read_live=p.get("read", ps.read_record),
+                          **({"now": p["now"]} if "now" in p else {}))
 
 
 def verify_stop_target(spec: Spec, p: Dict[str, Any]) -> List[rh.Check]:
