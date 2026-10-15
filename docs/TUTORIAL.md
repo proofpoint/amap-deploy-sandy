@@ -755,7 +755,10 @@ the router on the activated config with `docker/run.sh --config <the live
 config> --detach`. `verify` passes the signing check only when the router
 signs exactly as the policy and the gate allow, under the token of current
 evidence, and has adopted the host's config: it watches two of the router's
-polls while the file it reads stays unchanged.
+polls while the file it reads stays unchanged. That witness holds only where
+the router reads its config through a bind of the same file the host holds
+(native Linux Docker); through a VM's file share (Docker on macOS) the
+signing check is UNKNOWN by design, and says so.
 
 
 ### The weekly partition job's tools
