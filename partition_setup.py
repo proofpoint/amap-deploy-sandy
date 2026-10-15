@@ -248,71 +248,146 @@ TARGET_REMEDY = ("run the weekly job once now, in the foreground, with its unit'
                  "any change of the local router's spec or image, A1 through A5 again)")
 
 
-def read_placed(path: str, lstat: Callable = os.lstat) -> bytes:
-    """A file only root placed: a regular file, never a link, root:root 0444
-    with one link, as lstat sees it and as the descriptor read from is."""
-    st = lstat(path)
+#: The most a protected record may hold; anything longer is refused, never cut.
+PLACED_MAX = 1 << 20
+_HEX64_RE = re.compile(r"[0-9a-f]{64}")
+_AT_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
+#: docker's Created: RFC 3339 in UTC, with up to nanoseconds.
+_CREATED_RE = re.compile(r"([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(\.[0-9]{1,9})?Z")
+
+
+def read_placed(path: str, lstat: Callable = os.lstat, fstat: Callable = os.fstat) -> bytes:
+    """A file only root placed, read whole: a regular file, never a link,
+    root:root 0444 with one link, as lstat sees it AND as the descriptor
+    read from is (the same file), opened without blocking on a special
+    file, and read to its end within PLACED_MAX, an oversized file refused."""
     want = (0, 0, RECORD_MODE, 1)
-    if not stat.S_ISREG(st.st_mode) or (st.st_uid, st.st_gid, stat.S_IMODE(st.st_mode), st.st_nlink) != want:
+
+    def placed(st: Any) -> bool:
+        return stat.S_ISREG(st.st_mode) and (st.st_uid, st.st_gid, stat.S_IMODE(st.st_mode), st.st_nlink) == want
+    st = lstat(path)
+    if not placed(st):
         raise OSError(f"{path} is not a root:root 0444 regular file with one link")
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))
     try:
-        fst = os.fstat(fd)
-        if (fst.st_dev, fst.st_ino) != (st.st_dev, st.st_ino):
-            raise OSError(f"{path} changed while it was read")
-        return os.read(fd, 1 << 20)
+        fst = fstat(fd)
+        if (fst.st_dev, fst.st_ino) != (st.st_dev, st.st_ino) or not placed(fst):
+            raise OSError(f"{path} as opened is not the root:root 0444 regular file with one link it was")
+        chunks, total = [], 0
+        while total <= PLACED_MAX:
+            chunk = os.read(fd, PLACED_MAX + 1 - total)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        if total > PLACED_MAX:
+            raise OSError(f"{path} is larger than {PLACED_MAX} bytes")
+        return b"".join(chunks)
     finally:
         os.close(fd)
 
 
-def _created_seconds(created: Any) -> Optional[float]:
-    """docker's Created (RFC 3339, nanoseconds), to the second, or None."""
-    if not isinstance(created, str) or len(created) < 20 or created[19] not in ".Z":
+def created_seconds(created: Any) -> Optional[int]:
+    """docker's Created, to the second, or None unless it is exactly the
+    engine's form (RFC 3339 in UTC, up to nanoseconds)."""
+    m = _CREATED_RE.fullmatch(created) if isinstance(created, str) else None
+    if m is None:
         return None
     try:
-        return calendar.timegm(time.strptime(created[:19], "%Y-%m-%dT%H:%M:%S"))
+        return calendar.timegm(time.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S"))
     except ValueError:
         return None
+
+
+def _strict(raw: bytes) -> Any:
+    import partition_evidence as pe
+    return json.loads(raw.decode("utf-8"), object_pairs_hook=pe._no_duplicates, parse_constant=pe._no_constant)
+
+
+def parse_target(raw: bytes) -> Dict[str, Any]:
+    """The writer's stop-target record, or ValueError: canonical bytes,
+    exactly its members and types, run ids, full 64-hex ids and digests,
+    and a real UTC time."""
+    import partition_evidence as pe
+    doc = _strict(raw)
+    if not isinstance(doc, dict) or set(doc) != set(TARGET_MEMBERS) or doc.get("schema") != TARGET_SCHEMA:
+        raise ValueError("not exactly the writer's members and schema")
+    if not all(isinstance(doc[k], t) and not isinstance(doc[k], bool) for k, t in TARGET_MEMBERS.items()):
+        raise ValueError("a member of the wrong type")
+    if pe.canonical(doc) != raw:
+        raise ValueError("not in canonical form")
+    for k in ("router_container_id", "config_sha256", "evidence_sha256", "inspect_digest", "activation_sha256"):
+        if not _HEX64_RE.fullmatch(doc[k]):
+            raise ValueError(f"its {k} is not 64 lower-case hex")
+    for k in ("run_id", "evidence_run_id", "host"):
+        if not re.fullmatch(_RUN, doc[k]):
+            raise ValueError(f"its {k} is malformed")
+    if not _AT_RE.fullmatch(doc["at"]):
+        raise ValueError("its time is malformed")
+    calendar.timegm(time.strptime(doc["at"], "%Y-%m-%dT%H:%M:%SZ"))
+    return doc
+
+
+def _answer(doc: Any, cid: str) -> Optional[str]:
+    """Why an inspect answer does not affirm container `cid` running, or None."""
+    if not isinstance(doc, dict):
+        return "the engine's answer is not a container"
+    if doc.get("Id") != cid:
+        return f"the engine answered for {doc.get('Id')!r}, not {cid}"
+    state = doc.get("State")
+    if not isinstance(state, dict) or not isinstance(state.get("Running"), bool):
+        return "the engine's answer states no running state"
+    return None if state["Running"] else f"{cid} is not running"
 
 
 def verify_target(ps: Optional[PartitionSpec], gs: Optional[GateSpec], *, live_config: str, engine: str,
                   docker: str, router_name: str, inspect: Callable[[str], Any],
                   read: Callable[[str], bytes] = read_placed,
                   read_live: Callable[[str], bytes] = read_record) -> List[rh.Check]:
-    """The stop target, judged from the verify copy the weekly job published:
-    every approved field equal, the recorded id the running local router's
-    (inspected by id, and by name only to COMPARE), and the record no older
-    than that container's creation. A NOTE only when delegation is
-    affirmatively off in the live config AND the gate is not set; UNKNOWN
-    when either cannot be told or the engine cannot answer. `inspect(ref)`:
-    the container's document, None when the engine affirms there is none,
-    or an Unresolved."""
+    """The stop target, judged from the verify copy the weekly job published,
+    by its strict grammar: every approved field equal; A1's approved record
+    and the cited evidence parsed by their own grammars, their hosts the
+    record's and the evidence its cited run's; the live config's token the
+    cited evidence's; the recorded id affirmed running by id AND by the
+    local router's name (inspected only to compare); and the record no older
+    than that container's creation, to the second. A NOTE only when the live
+    config, a strict object, carries no delegation AND the gate is not set;
+    UNKNOWN when either cannot be told or the engine cannot answer.
+    `inspect(ref)`: the container's document, None when the engine affirms
+    there is none, or an Unresolved. Never raises on what it reads."""
+    import partition_activation as pa
+    import partition_evidence as pe
     if ps is None:
         return []
     want = rh.Fact("stop target", True, "the weekly job's own verified record of the running local router")
     try:
         live_raw = read_live(live_config)
-        rendered = "delegation" in json.loads(live_raw)
-    except (OSError, ValueError, TypeError) as e:
+        live = _strict(live_raw)
+        if not isinstance(live, dict):
+            raise ValueError("it is not a JSON object")
+    except (OSError, ValueError, UnicodeDecodeError) as e:
         return [rh.unknown(TARGET_CLAIM, want, f"whether delegation is rendered cannot be told: {e}",
-                           "make the local router's live config readable")]
-    if not rendered and gs is None:
+                           "make the local router's live config readable, one JSON object")]
+    if "delegation" not in live and gs is None:
         return [rh.check(f"{TARGET_CLAIM} (not required: delegation is not rendered and the gate is not set)",
                          want, True, TARGET_REMEDY, ok=lambda e, a: a is True)]
 
     def fail(why: str) -> List[rh.Check]:
         return [rh.check(TARGET_CLAIM, want, f"no stop target: {why}", TARGET_REMEDY, ok=lambda e, a: a is True,
                          do_not="never write the record by hand, and never copy an id from a name lookup")]
+
+    def unknown(why: str) -> List[rh.Check]:
+        return [rh.unknown(TARGET_CLAIM, want, why, "make the engine answer for the local router")]
     try:
         raw = read(posixpath.join(ps.evidence_dir, STOP_TARGET))
-        doc = json.loads(raw.decode("utf-8"))
     except FileNotFoundError:
         return fail("the weekly job has not recorded one")
-    except (OSError, ValueError, UnicodeDecodeError) as e:
+    except OSError as e:
         return fail(f"its record is not usable: {e}")
-    if not isinstance(doc, dict) or set(doc) != set(TARGET_MEMBERS) or doc.get("schema") != TARGET_SCHEMA \
-            or not all(isinstance(doc[k], t) and not isinstance(doc[k], bool) for k, t in TARGET_MEMBERS.items()):
-        return fail("its record is not the writer's grammar")
+    try:
+        doc = parse_target(raw)
+    except (ValueError, UnicodeDecodeError) as e:
+        return fail(f"its record is not the writer's grammar: {e}")
     for k, v in (("evidence_dir", ps.evidence_dir), ("live_config_path", live_config), ("engine", engine),
                  ("docker", docker)):
         if doc[k] != v:
@@ -328,25 +403,40 @@ def verify_target(ps: Optional[PartitionSpec], gs: Optional[GateSpec], *, live_c
         return fail("its token's evidence has changed since it was recorded")
     if hashlib.sha256(live_raw).hexdigest() != doc["config_sha256"]:
         return fail("the live config has changed since it was recorded")
-    by_id, by_name = inspect(doc["router_container_id"]), inspect(router_name)
-    blocked = next((v for v in (by_id, by_name) if isinstance(v, rh.Unresolved)), None)
-    if blocked is not None:
-        return [rh.unknown(TARGET_CLAIM, want, blocked.reason, "make the engine answer")]
-    if not isinstance(by_name, dict) or by_name.get("Id") != doc["router_container_id"]:
-        return fail("the running local router is another container than the recorded one: the record is stale "
-                    "(the router was recreated)")
-    state = (by_id or {}).get("State")
-    if not isinstance(state, dict) or state.get("Running") is not True:
-        return fail("the recorded container is not running")
-    created = _created_seconds(by_name.get("Created"))
     try:
-        recorded = calendar.timegm(time.strptime(doc["at"], "%Y-%m-%dT%H:%M:%SZ"))
-    except ValueError:
-        return fail("its record's time cannot be read")
-    if created is None:
-        return [rh.unknown(TARGET_CLAIM, want, "the engine gives no creation time for the local router",
-                           "make the engine answer")]
-    if recorded < created:
+        approved = pa.parse_activation(activation)
+        cited = pe.parse(evidence, host=doc["host"])
+    except ValueError as e:
+        return fail(f"what it was recorded against is not by its grammar, or is another host's: {e}")
+    if approved["host"] != doc["host"] or approved["final_config_path"] != live_config:
+        return fail("the approved activation is another host's or another config path's")
+    if cited["run_id"] != doc["evidence_run_id"]:
+        return fail("the cited evidence is another run's")
+    delegation = live.get("delegation")
+    if not isinstance(delegation, dict) or delegation.get("partition_verified") != pe.token_of(cited):
+        return fail("the live config's token is not the cited evidence's")
+    cid = doc["router_container_id"]
+    try:
+        by_id, by_name = inspect(cid), inspect(router_name)
+    except Exception as e:  # an answer that cannot be had is not a verdict
+        return unknown(f"the engine could not be asked: {e}")
+    for what, got in (("by its id", by_id), ("by the local router's name", by_name)):
+        if isinstance(got, rh.Unresolved):
+            return unknown(f"the engine cannot say {what}: {got.reason}")
+        if got is None:
+            return fail(f"the engine has no such container {what}: the record is stale (the router was recreated)")
+        why = _answer(got, cid)
+        if why is None:
+            continue
+        if isinstance(got, dict) and isinstance(got.get("Id"), str) and got["Id"] != cid:
+            return fail(f"{why} ({what}): the record is stale (the router was recreated)")
+        if why.endswith("is not running"):
+            return fail(f"{why} ({what})")
+        return unknown(f"{why} ({what})")
+    created = created_seconds(by_name.get("Created"))
+    if created is None or created_seconds(by_id.get("Created")) != created:
+        return unknown("the engine gives no creation time for the local router in its own form")
+    if calendar.timegm(time.strptime(doc["at"], "%Y-%m-%dT%H:%M:%SZ")) < created:
         return fail("it was recorded before the running local router was created")
     return [rh.check(TARGET_CLAIM, want, True, TARGET_REMEDY, ok=lambda e, a: a is True)]
 

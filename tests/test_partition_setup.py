@@ -296,35 +296,59 @@ class PlanTest(unittest.TestCase):
 
 
 class StopTargetTest(unittest.TestCase):
-    """verify's stop-target check, judged from the writer's verify copy: every
-    approved field, the recorded id the running router's by id AND by name,
-    and no older than that container's creation (to the second). A NOTE
-    only when delegation and the gate are both affirmatively off."""
+    """verify's stop-target check, judged from the writer's verify copy by
+    its strict grammar. The records are real: A1's record by
+    activation_record, the evidence by partition_evidence.build, the copy in
+    the writer's canonical form, the live config carrying the evidence's
+    token. A NOTE only when delegation and the gate are both affirmatively
+    off."""
 
     CID, OTHER = "c" * 64, "d" * 64
     LIVE = "/opt/ex/router.json"
     ENGINE, DOCKER = "unix:///var/run/docker.sock", "/usr/local/libexec/amap/docker"
     AT, CREATED = "2026-10-15T06:00:05Z", "2026-10-15T06:00:05.900000000Z"
+    SPEC = {"name": "ex-up", "image": "sha256:" + "b" * 64, "user": "2101:2101", "network": "none",
+            "restart": "unless-stopped", "env": {"ROUTER_CONFIG": "/opt/ex/router.json"},
+            "mounts": [{"type": "bind", "source": "/opt/ex/router.json", "target": "/opt/ex/router.json",
+                        "readonly": True}]}
 
     def setUp(self):
         self.part = ps.PartitionSpec(evidence_dir=EV, scratch_dir=SCRATCH, weekday=0, hour=3, exec_root=EXEC,
                                      tools=dict(TOOLS))
-        self.config = b'{"delegation": {"partition_verified": "r1:x"}}\n'
-        self.activation, self.evidence = b'{"approved": 1}', b'{"evidence": 1}'
-        self.record = {"schema": ps.TARGET_SCHEMA, "host": "alpha", "run_id": "w1", "at": self.AT,
-                       "evidence_dir": EV, "live_config_path": self.LIVE, "engine": self.ENGINE, "docker": self.DOCKER,
-                       "router_container_id": self.CID, "config_sha256": hashlib.sha256(self.config).hexdigest(),
-                       "evidence_run_id": "r1", "evidence_sha256": hashlib.sha256(self.evidence).hexdigest(),
-                       "inspect_digest": "e" * 64, "activation_sha256": hashlib.sha256(self.activation).hexdigest()}
+        self.build()
+
+    def evidence_doc(self, host="alpha", run_id="r1"):
+        import partition_evidence as pe
+        from test_partition_evidence import probe
+        return pe.build(host=host, run_id=run_id, at="2026-10-15T05:00:00Z", script_sha256={"s": "0" * 64},
+                        bindings={"b": "1" * 64}, probes=[probe(p) for p in pe.PROBE_IDS])
+
+    def build(self, live=None, engine=None, docker=None, evidence_dir=EV, host="alpha"):
+        import partition_activation as pa
+        import partition_evidence as pe
+        self.live = live or self.LIVE
+        staged = (json.dumps({"state_dir": "/s", "delegation": {"signing_key": {"path": "/k/s"}}}, indent=2)
+                  + "\n").encode()
+        self.activation = pa.activation_record(host=host, spec=self.SPEC, staged=staged, final_config_path=self.live)
+        self.evidence = self.evidence_doc(host=host)
+        self.token = pe.token_of(json.loads(self.evidence))
+        self.config = pa.final_bytes(staged, self.token)
+        self.record = {"schema": ps.TARGET_SCHEMA, "host": host, "run_id": "w1", "at": self.AT,
+                       "evidence_dir": evidence_dir, "live_config_path": self.live, "engine": engine or self.ENGINE,
+                       "docker": docker or self.DOCKER, "router_container_id": self.CID,
+                       "config_sha256": hashlib.sha256(self.config).hexdigest(), "evidence_run_id": "r1",
+                       "evidence_sha256": hashlib.sha256(self.evidence).hexdigest(), "inspect_digest": "e" * 64,
+                       "activation_sha256": hashlib.sha256(self.activation).hexdigest()}
         self.running = {self.CID: {"Id": self.CID, "Created": self.CREATED, "State": {"Running": True}},
                         "ex-up": {"Id": self.CID, "Created": self.CREATED, "State": {"Running": True}}}
-        self.files = {f"{EV}/stop-target.json": None, f"{EV}/activation.json": self.activation,
-                      f"{EV}/partition-r1.json": self.evidence}
+        self.files = {f"{evidence_dir}/stop-target.json": None, f"{evidence_dir}/activation.json": self.activation,
+                      f"{evidence_dir}/partition-r1.json": self.evidence}
 
     def read(self, path):
+        import partition_evidence as pe
         data = self.files.get(path)
         if path.endswith("stop-target.json") and data is None:
-            data = json.dumps(self.record).encode()
+            data = pe.canonical(self.record)
         if data is None or data is FileNotFoundError:
             raise FileNotFoundError(2, "No such file or directory", path)
         if isinstance(data, Exception):
@@ -333,7 +357,7 @@ class StopTargetTest(unittest.TestCase):
 
     def judge(self, gs=None, config=None):
         try:
-            return ps.verify_target(self.part, gs, live_config=self.LIVE, engine=self.ENGINE, docker=self.DOCKER,
+            return ps.verify_target(self.part, gs, live_config=self.live, engine=self.ENGINE, docker=self.DOCKER,
                                     router_name="ex-up", inspect=lambda ref: self.running.get(ref), read=self.read,
                                     read_live=lambda p: self.config if config is None else config)
         except Exception as e:  # a crash is not a verdict
@@ -344,37 +368,115 @@ class StopTargetTest(unittest.TestCase):
         self.assertEqual(len(out), 1)
         return out[0]
 
-    def test_the_running_routers_own_record_passes(self):
+    def judged(self, rows, want):
+        for what, change in rows.items():
+            with self.subTest(what):
+                self.build()
+                change()
+                c = self.result()
+                self.assertEqual(c.result, want, f"{what}: {c.actual}")
+                if want == rh.FAIL:
+                    self.assertIn("no stop target", str(c.actual))
+                    self.assertIn("A5", c.remedy)
+
+    def test_the_running_routers_own_real_record_passes(self):
         self.assertEqual(self.result().result, rh.PASS)
 
     def test_no_record_or_any_field_not_the_approved_ones_fails_with_the_remedy(self):
-        rows = {"absent": lambda: self.files.update({f"{EV}/stop-target.json": FileNotFoundError}),
-                "a foreign owner, a link or a mode": lambda: self.files.update(
-                    {f"{EV}/stop-target.json": OSError("not a root:root 0444 regular file with one link")}),
-                "another engine": lambda: self.record.update(engine="unix:///other.sock"),
-                "another docker": lambda: self.record.update(docker="/usr/bin/docker"),
-                "another live config": lambda: self.record.update(live_config_path="/elsewhere.json"),
-                "another evidence directory": lambda: self.record.update(evidence_dir="/elsewhere"),
-                "another activation": lambda: self.files.update({f"{EV}/activation.json": b"{}"}),
-                "the evidence changed": lambda: self.files.update({f"{EV}/partition-r1.json": b"{}"}),
-                "a member short": lambda: self.record.pop("inspect_digest"),
-                "a member of the wrong type": lambda: self.record.update(at=5),
-                "stale: the router was recreated": lambda: self.running.update(
-                    {"ex-up": {"Id": self.OTHER, "Created": self.CREATED, "State": {"Running": True}}}),
-                "the recorded container is gone": lambda: self.running.update({self.CID: None}),
-                "recorded a second before the router was created": lambda: self.record.update(
-                    at="2026-10-15T06:00:04Z")}
-        for what, change in rows.items():
-            with self.subTest(what):
-                self.setUp()
-                change()
-                c = self.result()
-                self.assertEqual(c.result, rh.FAIL, what)
-                self.assertIn("no stop target", str(c.actual))
-                self.assertIn("A5", c.remedy)
-        self.setUp()
-        c = self.result(config=b'{"delegation": {}}\n')
-        self.assertEqual(c.result, rh.FAIL, "the live config changed since the record")
+        self.judged({
+            "absent": lambda: self.files.update({f"{EV}/stop-target.json": FileNotFoundError}),
+            "a foreign owner, a link or a mode": lambda: self.files.update(
+                {f"{EV}/stop-target.json": OSError("not a root:root 0444 regular file with one link")}),
+            "another engine": lambda: self.record.update(engine="unix:///other.sock"),
+            "another docker": lambda: self.record.update(docker="/usr/bin/docker"),
+            "another live config": lambda: self.record.update(live_config_path="/elsewhere.json"),
+            "another evidence directory": lambda: self.record.update(evidence_dir="/elsewhere"),
+            "another activation": lambda: self.files.update({f"{EV}/activation.json": b"{}"}),
+            "the evidence changed": lambda: self.files.update({f"{EV}/partition-r1.json": b"{}"}),
+            "a member short": lambda: self.record.pop("inspect_digest"),
+            "a member of the wrong type": lambda: self.record.update(at=5),
+            "stale: the router was recreated": lambda: self.running.update(
+                {"ex-up": {"Id": self.OTHER, "Created": self.CREATED, "State": {"Running": True}}}),
+            "the recorded container is gone": lambda: self.running.update({self.CID: None}),
+            "recorded a second before the router was created": lambda: self.record.update(
+                at="2026-10-15T06:00:04Z")}, rh.FAIL)
+        self.build()
+        self.assertEqual(self.result(config=self.config + b" ").result, rh.FAIL, "the live config changed")
+
+    def test_the_record_is_held_to_its_strict_grammar_and_its_host(self):
+        import partition_evidence as pe
+
+        def raw(data):
+            return lambda: self.files.update({f"{EV}/stop-target.json": data})
+
+        def foreign_evidence():
+            """A separately valid document of another host, its own token in the
+            live config, and every recorded digest matching it."""
+            import partition_activation as pa
+            other = self.evidence_doc(host="beta")
+            self.files[f"{EV}/partition-r1.json"] = other
+            staged = json.loads(self.activation)["staged"].encode()
+            self.config = pa.final_bytes(staged, pe.token_of(json.loads(other)))
+            self.record.update(evidence_sha256=hashlib.sha256(other).hexdigest(),
+                               config_sha256=hashlib.sha256(self.config).hexdigest())
+        def other_run():
+            import partition_activation as pa
+            other = self.evidence_doc(run_id="r2")
+            self.files[f"{EV}/partition-r1.json"] = other
+            staged = json.loads(self.activation)["staged"].encode()
+            self.config = pa.final_bytes(staged, pe.token_of(json.loads(other)))
+            self.record.update(evidence_sha256=hashlib.sha256(other).hexdigest(),
+                               config_sha256=hashlib.sha256(self.config).hexdigest())
+
+        def other_host_activation():
+            import partition_activation as pa
+            staged = json.loads(self.activation)["staged"].encode()
+            beta = pa.activation_record(host="beta", spec=self.SPEC, staged=staged, final_config_path=self.live)
+            self.files[f"{EV}/activation.json"] = beta
+            self.record.update(activation_sha256=hashlib.sha256(beta).hexdigest())
+        canonical = pe.canonical(self.record)
+        self.judged({
+            "a foreign host in the record": lambda: self.record.update(host="beta"),
+            "a foreign host's evidence, consistent with itself": foreign_evidence,
+            "a name for the id": lambda: (self.record.update(router_container_id="ex-up"),
+                                          self.running.update({"ex-up": dict(self.running["ex-up"], Id="ex-up")})),
+            "a short id": lambda: self.record.update(router_container_id="c" * 12),
+            "an id in upper case": lambda: self.record.update(router_container_id="C" * 64),
+            "a digest that is not hex": lambda: self.record.update(activation_sha256="z" * 64),
+            "an evidence run that is a path": lambda: self.record.update(evidence_run_id="../r1"),
+            "a time that is not a time": lambda: self.record.update(at="2026-13-45T99:00:00Z"),
+            "duplicate members": raw(canonical[:-1] + b',"host":"alpha"}'),
+            "not canonical": raw(json.dumps(self.record, indent=1).encode()),
+            "a non-finite number": raw(canonical.replace(b'"at":"' + self.AT.encode() + b'"', b'"at":NaN')),
+            "not JSON": raw(b"\xff{"),
+            "the evidence is another run's, its token in the live config": other_run,
+            "an activation of another host, all else consistent": other_host_activation,
+            "the live config's token not the evidence's": lambda: (
+                setattr(self, "config", self.config.replace(self.token.encode(), b"r1:" + b"0" * 64)),
+                self.record.update(config_sha256=hashlib.sha256(self.config).hexdigest()))}, rh.FAIL)
+
+    def test_both_answers_must_affirm_the_recorded_id_running_and_a_creation_time(self):
+        running = {"Running": True}
+        self.judged({
+            "by id, another full id": lambda: self.running.update(
+                {self.CID: {"Id": self.OTHER, "Created": self.CREATED, "State": running}}),
+            "by name, not running": lambda: self.running.update(
+                {"ex-up": {"Id": self.CID, "Created": self.CREATED, "State": {"Running": False}}}),
+            "by id, not running": lambda: self.running.update(
+                {self.CID: {"Id": self.CID, "Created": self.CREATED, "State": {"Running": False}}})}, rh.FAIL)
+        self.judged({
+            "by id, no id": lambda: self.running.update({self.CID: {"Created": self.CREATED, "State": running}}),
+            "by id, not a container": lambda: self.running.update({self.CID: "x"}),
+            "by name, a state that is not one": lambda: self.running.update(
+                {"ex-up": {"Id": self.CID, "Created": self.CREATED, "State": "running"}}),
+            "by name, a list": lambda: self.running.update({"ex-up": [1]}),
+            "a creation time with a bad suffix": lambda: [d.update(Created="2026-10-15T06:00:05.garbage")
+                                                          for d in self.running.values()],
+            "no creation time": lambda: [d.pop("Created") for d in self.running.values()],
+            "a creation time in another zone": lambda: [d.update(Created="2026-10-15T06:00:05+02:00")
+                                                        for d in self.running.values()],
+            "the two answers disagree on the creation": lambda: self.running[self.CID].update(
+                Created="2026-10-15T07:00:00Z")}, rh.UNKNOWN)
 
     def test_the_creation_boundary_is_the_second_and_the_id_comes_first(self):
         """A record dated the same second the router was created is fresh; one
@@ -399,17 +501,26 @@ class StopTargetTest(unittest.TestCase):
         self.assertIn("not required", c.claim)
         self.assertEqual(self.result(config=off, gs=gate()).result, rh.FAIL, "the gate set: required")
         self.assertEqual(self.result().result, rh.FAIL, "delegation rendered: required")
+        for raw in (b"[]", b'"x"', b'{"a": 1, "a": 2}', b'{"delegation": NaN}', b"\xff"):
+            with self.subTest(raw=raw):
+                self.assertEqual(self.result(config=raw).result, rh.UNKNOWN,
+                                 "no strict object, no proof delegation is off")
         out = ps.verify_target(self.part, None, live_config=self.LIVE, engine=self.ENGINE, docker=self.DOCKER,
                                router_name="ex-up", inspect=lambda ref: None, read=self.read,
                                read_live=lambda p: (_ for _ in ()).throw(OSError("unreadable")))
         self.assertEqual(out[0].result, rh.UNKNOWN, "an unreadable live config is not proof delegation is off")
 
-    def test_host_setup_judges_it_with_the_documents_own_values(self):
+    def document_spec(self, **drop):
         import hub_supervise as hv
         from test_hub_supervise import sup_section
-        d = doc()
+        d = doc(gate=gate()) if drop.pop("gate", False) else doc()
         d[hv.SECTION] = sup_section()
-        spec = hs.load_spec(d)
+        for section in drop:
+            d.pop(section, None)
+        return hs.load_spec(d)
+
+    def test_host_setup_judges_it_with_the_documents_own_values(self):
+        spec = self.document_spec()
         seen = {}
 
         def inspect(ref):
@@ -421,8 +532,8 @@ class StopTargetTest(unittest.TestCase):
         self.assertEqual([c.claim for c in out], [ps.TARGET_CLAIM])
         self.assertEqual(seen["live"], spec.keys.local_config)
         self.assertEqual(out[0].result, rh.FAIL, "the record is not this document's (another config, engine, docker)")
-        self.record.update(live_config_path=spec.keys.local_config, engine=spec.supervision.engine,
-                           docker=spec.partition.tools["docker"], evidence_dir=spec.partition.evidence_dir)
+        self.build(live=spec.keys.local_config, engine=spec.supervision.engine, docker=spec.partition.tools["docker"],
+                   evidence_dir=spec.partition.evidence_dir)
         name = spec.runtime_of(spec.hops[0][1])["container"]
         self.running[name] = self.running.pop("ex-up")
         out = hs.verify_stop_target(spec, {"inspect": lambda ref: self.running.get(ref), "read_placed": self.read,
@@ -430,12 +541,57 @@ class StopTargetTest(unittest.TestCase):
         self.assertEqual(out[0].result, rh.PASS, "the document's own values, and its local router by name")
         self.assertEqual(hs.verify_stop_target(dataclasses_replace(spec, partition=None), {}), [])
 
-    def test_verify_runs_the_stop_target_check_for_a_document_with_a_partition_section(self):
+    def test_a_document_in_scope_without_the_context_to_judge_it_is_never_silent(self):
         import hub_supervise as hv
-        from test_hub_supervise import sup_section
-        d = doc()
-        d[hv.SECTION] = sup_section()
-        spec = hs.load_spec(d)
+        for drop in ({hv.SECTION: True}, {"keys": True}, {hv.SECTION: True, "gate": True}):
+            with self.subTest(drop=sorted(drop)):
+                try:
+                    spec = self.document_spec(**dict(drop))
+                except hs.SpecError as e:
+                    self.skipTest(f"the loader refuses such a document itself: {e}")
+                out = hs.verify_stop_target(spec, {"inspect": lambda ref: None, "read_placed": self.read,
+                                                   "read": lambda p: self.config})
+                self.assertEqual([(c.claim, c.result) for c in out], [(ps.TARGET_CLAIM, rh.FAIL)])
+                self.assertIn("no", str(out[0].actual))
+
+    def test_the_default_inspector_asks_the_approved_engine_with_the_approved_docker(self):
+        """Ambient PATH, DOCKER_HOST and DOCKER_CONTEXT point elsewhere; every
+        query of the default inspector (by id, by name, and the absence
+        listings) runs the approved docker against the approved engine."""
+        spec = self.document_spec()
+        approved_docker = spec.partition.tools["docker"]
+        calls = []
+
+        def run(argv, extra_env=None, **kw):
+            calls.append((list(argv), dict(extra_env or {})))
+            if "inspect" in argv:
+                return rh.Proc(tuple(argv), 1, "", "No such object")
+            return rh.Proc(tuple(argv), 0, "", "")
+        self.addCleanup(setattr, hs.rh, "run", hs.rh.run)
+        hs.rh.run = run
+        ambient = {"PATH": "/elsewhere/bin", "DOCKER_HOST": "tcp://elsewhere:2375", "DOCKER_CONTEXT": "elsewhere"}
+        saved = {k: os.environ.get(k) for k in ambient}
+        self.addCleanup(lambda: [os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+                                 for k, v in saved.items()])
+        os.environ.update(ambient)
+        self.build(live=spec.keys.local_config, engine=spec.supervision.engine, docker=approved_docker,
+                   evidence_dir=spec.partition.evidence_dir)
+        out = hs.verify_stop_target(spec, {"read_placed": self.read, "realpath": lambda p: p,
+                                           "read": lambda p: self.config})
+        self.assertEqual(out[0].result, rh.FAIL, "the engine affirms no such container")
+        name = spec.runtime_of(spec.hops[0][1])["container"]
+        asked = [a for a, _ in calls]
+        self.assertTrue(any(self.CID in a and "inspect" in a for a in asked), asked)
+        self.assertTrue(any(f"id={self.CID}" in a for a in asked), asked)
+        self.assertTrue(any(f"name=^/{name}$" in a for a in asked) or not any(name in a for a in asked), asked)
+        for argv, env in calls:
+            with self.subTest(argv=argv):
+                self.assertEqual(argv[0], approved_docker, "the approved docker, by path")
+                self.assertEqual(argv[1:3], ["--host", spec.supervision.engine], "the approved engine")
+                self.assertEqual(env, {"DOCKER_HOST": spec.supervision.engine, "DOCKER_CONTEXT": "default"})
+
+    def test_verify_runs_the_stop_target_check_for_a_document_with_a_partition_section(self):
+        spec = self.document_spec()
         for name in ("verify_roots", "verify_overlay", "verify_containers", "verify_mounts", "verify_openssl",
                      "verify_umasks", "verify_groups", "secret_checks", "start_checks", "verify_recovery_horizon"):
             self.addCleanup(setattr, hs, name, getattr(hs, name))
@@ -453,32 +609,52 @@ class StopTargetTest(unittest.TestCase):
                   enablement={"disabled": {}, "loaded": lambda l: False})
         self.assertEqual(seen, [(spec, probes)])
 
-    def test_only_a_root_placed_regular_file_is_read(self):
+    def test_only_a_root_placed_regular_file_is_read_whole_as_opened(self):
+        def as_root(stat_fn, **over):
+            def f(p):
+                st = stat_fn(p)
+                fields = dict(mode=st.st_mode, nlink=st.st_nlink, uid=0, gid=0)
+                fields.update(over)
+                return os.stat_result((fields["mode"], st.st_ino, st.st_dev, fields["nlink"], fields["uid"],
+                                       fields["gid"]) + tuple(st)[6:])
+            return f
         with tempfile.TemporaryDirectory() as t:
             f = os.path.join(t, "stop-target.json")
             with open(f, "w") as h:
                 h.write("{}")
             os.chmod(f, 0o444)
             os.symlink(f, os.path.join(t, "link"))
-            os.link(f, os.path.join(t, "second"))
             for path in (f, os.path.join(t, "link"), os.path.join(t, "absent")):
                 with self.subTest(path=os.path.basename(path)):
                     with self.assertRaises(OSError):
                         ps.read_placed(path)
-
-            def as_root(p):
-                st = os.lstat(p)
-                return os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, 0, 0) + tuple(st)[6:])
+            lst, fst = as_root(os.lstat), as_root(os.fstat)
+            self.assertEqual(ps.read_placed(f, lstat=lst, fstat=fst), b"{}", "root:root 0444, one link, as opened")
+            rows = {"the path is not 0444, as lstat sees it": dict(lstat=as_root(os.lstat, mode=0o100666)),
+                    "the descriptor is not root's": dict(fstat=as_root(os.fstat, uid=501)),
+                    "the descriptor is not 0444": dict(fstat=as_root(os.fstat, mode=0o100666)),
+                    "the descriptor has two links": dict(fstat=as_root(os.fstat, nlink=2)),
+                    "the descriptor is another file": dict(fstat=lambda fd: as_root(os.lstat)(t))}
+            for what, kw in rows.items():
+                with self.subTest(what):
+                    with self.assertRaises(OSError):
+                        ps.read_placed(f, **dict({"lstat": lst, "fstat": fst}, **kw))
+            os.link(f, os.path.join(t, "second"))
             with self.assertRaises(OSError):
-                ps.read_placed(f, lstat=as_root)
+                ps.read_placed(f, lstat=as_root(os.lstat), fstat=as_root(os.fstat))
             os.unlink(os.path.join(t, "second"))
-            self.assertEqual(ps.read_placed(f, lstat=as_root), b"{}", "root:root 0444 with one link")
-            os.chmod(f, 0o644)
-            with self.assertRaises(OSError):
-                ps.read_placed(f, lstat=as_root)
+            big = os.path.join(t, "big.json")
+            with open(big, "wb") as h:
+                h.write(b"{}" + b" " * (ps.PLACED_MAX - 2) + b"not json")
+            os.chmod(big, 0o444)
+            with self.assertRaises(OSError, msg="read whole, never cut to a parseable prefix"):
+                ps.read_placed(big, lstat=lst, fstat=fst)
 
     def test_an_engine_that_cannot_answer_is_unknown(self):
         self.running[self.CID] = rh.Unresolved("the engine did not answer")
+        self.assertEqual(self.result().result, rh.UNKNOWN)
+        self.build()
+        self.running["ex-up"] = rh.Unresolved("the engine did not answer")
         self.assertEqual(self.result().result, rh.UNKNOWN)
 
 

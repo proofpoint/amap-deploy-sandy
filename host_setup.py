@@ -706,18 +706,24 @@ def ask_container(container: str) -> Any:
     return {"image": image, "binds": binds}
 
 
-def ask_identity(ref: str) -> Any:
+def ask_identity(ref: str, *, docker: str, engine: str) -> Any:
     """`docker inspect` of the container `ref` names (an id, or a name only
-    to compare): its whole document; None when the engine affirms there is
-    no such container (a failed inspect, then a listing by id or name that
-    succeeds and is empty); an Unresolved otherwise."""
+    to compare), asked of the APPROVED engine with the APPROVED docker,
+    whatever the operator's PATH, DOCKER_HOST or DOCKER_CONTEXT select: its
+    whole document; None when that engine affirms there is no such
+    container (a failed inspect, then listings by id and by name that
+    succeed and are empty); an Unresolved otherwise. Read-only."""
+    env = {"DOCKER_HOST": engine, "DOCKER_CONTEXT": "default"}
+
+    def ask(*args: str) -> Any:
+        return rh.run([docker, "--host", engine, *args], extra_env=env)
     try:
-        p = rh.run(["docker", "inspect", "--type", "container", "--format", "{{json .}}", ref])
+        p = ask("inspect", "--type", "container", "--format", "{{json .}}", ref)
         if p.rc == 0:
             doc = json.loads(p.out)
             return doc if isinstance(doc, dict) else rh.Unresolved(f"`docker inspect {ref}` printed no object")
-        q = rh.run(["docker", "ps", "--all", "--quiet", "--no-trunc", "--filter", f"id={ref}"])
-        r = rh.run(["docker", "ps", "--all", "--quiet", "--no-trunc", "--filter", f"name=^/{ref}$"])
+        q = ask("ps", "--all", "--quiet", "--no-trunc", "--filter", f"id={ref}")
+        r = ask("ps", "--all", "--quiet", "--no-trunc", "--filter", f"name=^/{ref}$")
     except rh.CannotRun as e:
         return rh.Unresolved(str(e))
     except ValueError:
@@ -1099,14 +1105,22 @@ def verify_stop_target(spec: Spec, p: Dict[str, Any]) -> List[rh.Check]:
     realpath) and the local router's container name, which is inspected only
     to compare. `p` may supply `inspect`, `read_placed`, `read` and
     `realpath`."""
-    if spec.partition is None or spec.keys is None or spec.supervision is None or not spec.hops:
+    if spec.partition is None and spec.gate is None:
         return []
-    return ps.verify_target(spec.partition, spec.gate, live_config=spec.keys.local_config,
-                            engine=spec.supervision.engine,
-                            docker=p.get("realpath", os.path.realpath)(spec.partition.tools["docker"]),
-                            router_name=spec.runtime_of(spec.hops[0][1])["container"],
-                            inspect=p.get("inspect", ask_identity), read=p.get("read_placed", ps.read_placed),
-                            read_live=p.get("read", ps.read_record))
+    missing = [what for what, absent in (("partition", spec.partition is None), ("keys", spec.keys is None),
+                                         ("supervision", spec.supervision is None), ("hops", not spec.hops)) if absent]
+    if missing:
+        return [rh.check(ps.TARGET_CLAIM, rh.Fact("stop target", True, "the weekly job's record of the local router"),
+                         f"cannot be judged: the document has no {', '.join(missing)} section",
+                         "add the missing sections: the stop target is judged against the local router's live "
+                         "config (keys), its engine (supervision) and its container (hops)",
+                         ok=lambda e, a: a is True)]
+    docker = p.get("realpath", os.path.realpath)(spec.partition.tools["docker"])
+    engine = spec.supervision.engine
+    return ps.verify_target(spec.partition, spec.gate, live_config=spec.keys.local_config, engine=engine,
+                            docker=docker, router_name=spec.runtime_of(spec.hops[0][1])["container"],
+                            inspect=p.get("inspect", lambda ref: ask_identity(ref, docker=docker, engine=engine)),
+                            read=p.get("read_placed", ps.read_placed), read_live=p.get("read", ps.read_record))
 
 
 def verify_recovery_horizon(spec: Spec, read: Callable[[str], Any] = hk.read_json,
