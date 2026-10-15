@@ -153,8 +153,9 @@ class ProbeRunTest(unittest.TestCase):
     # P04
     def test_a_created_file_in_a_lane_fails_p04(self):
         self.engine.p04 = "CREATED"
-        doc, code, _ = self.run_it()
+        doc, code, report = self.run_it()
         self.assertEqual((self.verdicts(doc)["P04"], code), ("FAIL", 1))
+        self.assertIn("created a file in a peer lane", report[3])
 
     def test_a_visible_lane_fails_p04_even_unwritten(self):
         self.engine.p04 = "EACCES"
@@ -195,7 +196,9 @@ class ProbeRunTest(unittest.TestCase):
 
     def test_an_unreadable_status_makes_p01_unknown(self):
         self.engine.walks["ex-up"] += "12 UNREADABLE\n"
-        self.assertEqual(self.verdicts(self.run_it()[0])["P01"], "UNKNOWN")
+        doc, _, report = self.run_it()
+        self.assertEqual(self.verdicts(doc)["P01"], "UNKNOWN")
+        self.assertIn("/proc/12/status could not be read", report[0])
 
     def test_p01_reads_proc_as_each_principal_never_as_root(self):
         self.run_it()
@@ -227,11 +230,50 @@ class ProbeRunTest(unittest.TestCase):
         doc, _, _ = self.run_it()
         self.assertEqual(self.verdicts(doc)["P02"], "UNKNOWN")
 
+    def test_a_router_witness_that_could_not_run_makes_p03_unknown(self):
+        self.engine.fail.add("ex-up-partition-probe-p03w-r1")
+        try:
+            doc, code, _ = self.run_it()
+        except Exception as e:  # a crash is not a verdict
+            self.fail(f"the run raised {e!r}")
+        self.assertEqual((self.verdicts(doc)["P03"], code), ("UNKNOWN", 2))
+        self.assertIsNone(json.loads(doc)[pe.TOKEN_MEMBER])
+
     def test_a_probe_that_could_not_run_is_unknown_and_exits_2(self):
         self.engine.fail.add("ex-down-partition-probe-p03-r1")
         doc, code, _ = self.run_it()
         self.assertEqual((self.verdicts(doc)["P03"], code), ("UNKNOWN", 2))
         self.assertIsNone(json.loads(doc)[pe.TOKEN_MEMBER])
+
+
+class VerdictTest(unittest.TestCase):
+    """The guards a whole run cannot reach on its own: run() never hands a
+    verdict a shape its earlier steps already refused, so each is judged
+    directly here."""
+
+    def judged(self, fn, *args):
+        try:
+            return fn(*args)
+        except Exception as e:  # a crash is not a verdict
+            self.fail(f"{fn.__name__} raised {e!r}")
+
+    def test_hop_ends_sharing_a_uid_fail_p01(self):
+        walks = {"upstream": [(1, 2101, 2101)], "downstream": [(1, 2101, 2101)]}
+        got = self.judged(pp.verdict_p01, walks, {"upstream": 2101, "downstream": 2101}, [("upstream", "downstream")])
+        self.assertEqual(got[0], "FAIL")
+        self.assertIn("share uid 2101", got[2])
+
+    def test_unestablished_lanes_are_unknown_whatever_the_rows_say(self):
+        got = self.judged(pp.verdict_p04, [(0, "ENOENT")], rh.Unresolved("beta is not running"), [])
+        self.assertEqual(got[:2], ("UNKNOWN", "unresolved"))
+
+    def test_a_router_witness_that_did_not_open_the_key_is_unknown(self):
+        got = self.judged(pp.verdict_p03, [(0, "ENOENT")], [(0, "ENOENT")])
+        self.assertEqual(got[:2], ("UNKNOWN", "ENOENT"))
+
+    def test_an_unresolved_router_witness_is_unknown(self):
+        got = self.judged(pp.verdict_p03, [(0, "ENOENT")], rh.Unresolved("the one-shot did not start"))
+        self.assertEqual(got[:2], ("UNKNOWN", "ENOENT"))
 
 
 class OneshotTest(unittest.TestCase):
