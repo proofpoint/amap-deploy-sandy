@@ -104,6 +104,17 @@ class RecordTest(unittest.TestCase):
         self.assertEqual(pr.read_record(self.store, self.run + "/context.json"), {"run_id": "r1"})
 
 
+class SelectionTest(unittest.TestCase):
+    def test_a_slug_that_could_name_another_path_is_refused(self):
+        doc = {"instances_dir": "/i", "selected_json": "/s/selected.json"}
+        for slug in ("../x", "a/b", ".hidden", "", 7):
+            with self.subTest(slug=slug):
+                got = pr.selected_lanes(doc, read=lambda p, s=slug: json.dumps({"selected": [{"slug": s}]}).encode())
+                self.assertIsInstance(got, rh.Unresolved)
+        got = pr.selected_lanes(doc, read=lambda p: b'{"selected": [{"slug": "alpha"}]}')
+        self.assertEqual(got, {"alpha": "/i/alpha/peer"})
+
+
 class LockTest(unittest.TestCase):
     def test_only_the_runs_own_lock_descriptor_is_accepted(self):
         with tempfile.TemporaryDirectory() as t:

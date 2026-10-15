@@ -60,7 +60,7 @@ for step in plan:
     elif kind == "evidence":
         doc = {"run_id": rid, "host": ctx["host"], "bindings": step[1],
                "probes": [{"id": p, "verdict": v} for p, v in sorted(step[2].items())]}
-        place(os.path.join(ev, "partition-%s.json" % rid), canonical(doc), 0o444)
+        place(os.path.join(ev, "partition-%s.json" % rid), canonical(doc), step[3] if len(step) > 3 else 0o444)
     elif kind == "detected":
         d = os.path.join(ev, "incident-" + rid)
         os.makedirs(d, exist_ok=True)
@@ -249,6 +249,7 @@ class WriterTest(unittest.TestCase):
         self.h.plan([["expect", B], ["evidence", B, PASS], ["outcome", 0, TARGET]])
         p = self.h.run()
         self.assertEqual(p.returncode, hs.EXIT_PASS, p.stdout + p.stderr)
+        self.assertTrue(os.path.exists(f"{self.h.exec}/recovery.json"), "a passing run records its target")
         rec = json.load(open(f"{self.h.exec}/recovery.json"))
         self.assertEqual((rec["router_container_id"], rec["live_config_path"]), (TARGET, self.h.conf))
         self.assertEqual(self.h.runs(), [])
@@ -309,6 +310,13 @@ class WriterTest(unittest.TestCase):
         self.h.plan([["expect", B], ["evidence", {"host_setup": "2" * 64}, FAIL3], ["exit", 9]])
         p = self.h.run()
         self.assertEqual(p.returncode, hs.EXIT_HANDOFF, p.stdout + p.stderr)
+        self.assertEqual([c for c in self.h.calls() if c[0] == "stop"], [])
+        self.assertTrue(self.delegation())
+
+    def test_evidence_not_placed_as_root_places_it_is_never_used(self):
+        self.h.recovery()
+        self.h.plan([["expect", B], ["evidence", B, FAIL3, 0o644], ["exit", 9]])
+        self.assertEqual(self.h.run().returncode, hs.EXIT_HANDOFF)
         self.assertEqual([c for c in self.h.calls() if c[0] == "stop"], [])
         self.assertTrue(self.delegation())
 
@@ -385,6 +393,14 @@ class WriterTest(unittest.TestCase):
         p = subprocess.run(self.h.argv(digest=hashlib.sha256(b"approved earlier").hexdigest()),
                            capture_output=True, text=True, timeout=60)
         self.assertEqual(p.returncode, hs.EXIT_HANDOFF)
+        self.assertIsNone(self.h.side_read("child-started.json"))
+
+    def test_a_document_naming_another_exec_root_than_the_unit_runs_nothing(self):
+        self.h.document(partition={"evidence_dir": self.h.ev, "exec_root": self.h.root + "/other",
+                                   "tools": {"python3": sys.executable, "docker": self.h.docker}})
+        p = self.h.run()
+        self.assertEqual(p.returncode, hs.EXIT_HANDOFF, p.stdout + p.stderr)
+        self.assertIn("exec_root", p.stdout)
         self.assertIsNone(self.h.side_read("child-started.json"))
 
     def test_a_bundle_at_another_pin_is_a_handoff_and_a_tampered_one_is_tooling(self):
