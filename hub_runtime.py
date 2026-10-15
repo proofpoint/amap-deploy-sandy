@@ -99,6 +99,11 @@ _OWN = re.compile(rf"({_LABEL})\.internal")
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _COMMIT = re.compile(r"[0-9a-f]{40}")
+#: A path inside the producer repository, safe to print in a shell recipe:
+#: segments of [A-Za-z0-9._-], each starting with a letter, digit or "_"
+#: (so no ".", "..", hidden or option-like segment), no space, no
+#: metacharacter, no control character.
+_REPO_PATH = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]*(/[A-Za-z0-9_][A-Za-z0-9._-]*)*")
 _LINK = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
 _DOMAIN = re.compile(rf"{_LABEL}(?:\.{_LABEL})*")
 #: The frozen login and probe names (the hub design): the login's local
@@ -242,8 +247,9 @@ def load(sec: Any, spec: Any) -> HubSpec:
         if not isinstance(f["commit"], str) or not _COMMIT.fullmatch(f["commit"]):
             raise HubSpecError("hub.d7.source.commit must be the D7 commit, 40 lower-case hex")
         fr = f["from"]
-        if not isinstance(fr, str) or fr.startswith("/") or posixpath.normpath(fr) != fr or fr.split("/")[0] == "..":
-            raise HubSpecError("hub.d7.source.from must be the file's path inside the producer repository")
+        if not isinstance(fr, str) or not _REPO_PATH.fullmatch(fr):
+            raise HubSpecError("hub.d7.source.from must be the file's path inside the producer repository: "
+                               "segments of letters, digits, '.', '_' and '-', none starting with '.' or '-'")
         src_sha, src_commit, src_from = f["sha256"], f["commit"], fr
     elif not isinstance(src, str) or src.startswith("/") or posixpath.normpath(src) != src \
             or src.split("/")[0] == "..":
@@ -641,7 +647,7 @@ def plan(spec: Any, hs: HubSpec, r: Rendered, q: Callable[[str], str], steps: st
         staged = "<staging>"
         lines += [f"# The D7 source: ONE file from the pinned commit {hs.d7_source_commit}, never the producer tree.",
                   f"# On the runner: git -C <the runner's producer clone> show "
-                  f"{hs.d7_source_commit}:{hs.d7_source_from} > {staged}",
+                  f"{q(hs.d7_source_commit + ':' + hs.d7_source_from)} > {staged}",
                   f"# On the runner: shasum -a 256 {staged}   # must print {hs.d7_source_sha256}",
                   f"# Copy that one file to this host as {staged} (scp, or ssh with cat), never a directory.",
                   f"# A later D7 commit leaves verify UNKNOWN until this document's pin moves to it.",

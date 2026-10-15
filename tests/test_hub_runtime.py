@@ -581,8 +581,12 @@ class D7FileFormTest(unittest.TestCase):
         self.refuses(file_form_doc(sha="AB" * 32), "64 lower-case hex")
         self.refuses(file_form_doc(path="relative/example-d7-source.json"), "absolute")
         self.refuses(file_form_doc(commit="5" * 12), "40 lower-case hex")
-        self.refuses(file_form_doc(frm="/abs/d7.json"), "inside the producer repository")
-        self.refuses(file_form_doc(frm="../d7.json"), "inside the producer repository")
+        for bad in ("/abs/d7.json", "../d7.json", ".", "gen/./d7.json", "gen/with space.json", "; echo marker",
+                    "gen/d7.json\n# x", "gen/d7\x00.json", "-x/d7.json", "gen/$(id).json", "gen/`id`.json", ""):
+            with self.subTest(frm=bad):
+                self.refuses(file_form_doc(frm=bad), "inside the producer repository")
+        self.assertEqual(hs.load_spec(file_form_doc(frm="homelab/generated/a-d7_1.json")).hub.d7_source_from,
+                         "homelab/generated/a-d7_1.json")
         d = file_form_doc()
         d[hr.SECTION]["d7"]["source"]["extra"] = 1
         self.refuses(d, "must have")
@@ -663,6 +667,9 @@ class D7FileFormTest(unittest.TestCase):
         pin = hashlib.sha256(d7_source()).hexdigest()
         self.assertIn(f"# On the runner: git -C <the runner's producer clone> show {D7_COMMIT}:gen/d7.json > <staging>",
                       lines)
+        quoted = hr.plan(s, s.hub, r, lambda x: f"[{x}]", "steps")
+        self.assertIn(f"# On the runner: git -C <the runner's producer clone> show [{D7_COMMIT}:gen/d7.json] > <staging>",
+                      quoted, "the commit:path argument goes through the plan's quoting")
         self.assertTrue(any(f"shasum -a 256 <staging>   # must print {pin}" in l for l in lines))
         self.assertTrue(any("never a directory" in l for l in lines))
         self.assertIn(f"steps place <staging> {FILE} --sha256 {pin}", lines)
