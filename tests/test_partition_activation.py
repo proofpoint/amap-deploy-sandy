@@ -15,13 +15,16 @@ from _workspace import HOP_ROUTER_ROOT
 
 class Tree:
     """A host layout derive-mounts accepts: state, instances, the selection,
-    a hop root, a registry and a plugin directory."""
+    a hop root, a registry, a plugin directory, and the signing key alone in
+    its directory (the hop pin binds that directory read-only whenever the
+    config carries delegation, and refuses anything else in it)."""
 
     def __init__(self, root):
         self.root = root
-        for d in ("state", "inst", "sel", "hop", "reg", "plugin", "run", "conf"):
+        for d in ("state", "inst", "sel", "hop", "reg", "plugin", "run", "conf", "keys"):
             os.makedirs(os.path.join(root, d))
         open(os.path.join(root, "plugin", "p.py"), "w").close()
+        open(os.path.join(root, "keys", "signing.key"), "w").close()
 
     def config(self, **over):
         doc = {"state_dir": f"{self.root}/state", "instances_dir": f"{self.root}/inst",
@@ -29,7 +32,7 @@ class Tree:
                "hop": {"root": f"{self.root}/hop", "peer_uid": 2102, "version_write": 1, "caps": {}, "link": "l1"},
                "registry_dir": f"{self.root}/reg",
                "transport_plugin": {"path": f"{self.root}/plugin/p.py", "sha256": "f" * 64},
-               "delegation": {"signing_key": {"path": "/k/signing.key", "key_id": "k1"}}}
+               "delegation": {"signing_key": {"path": f"{self.root}/keys/signing.key", "key_id": "k1"}}}
         doc.update(over)
         return (json.dumps(doc, indent=2) + "\n").encode()
 
@@ -58,6 +61,7 @@ class ProspectiveSpecTest(unittest.TestCase):
         self.assertEqual(sources[f"{self.tree.root}/state"], False)
         self.assertEqual(sources[f"{self.tree.root}/hop"], False)
         self.assertEqual(sources[f"{self.tree.root}/reg"], True)
+        self.assertEqual(sources[f"{self.tree.root}/keys"], True, "the key's directory, read-only")
         self.assertTrue(all(m["source"] == m["target"] for m in s["mounts"]))
 
     def test_the_overlap_check_uses_the_final_path_not_the_staged_one(self):
