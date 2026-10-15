@@ -194,9 +194,6 @@ class ReadRecordTest(unittest.TestCase):
                 ps.read_record(link)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class PlanTest(unittest.TestCase):
     def setUp(self):
@@ -222,3 +219,7 @@ class PlanTest(unittest.TestCase):
         self.assertIn("the placed record's harness_sha is " + "4" * 40, text)
         self.assertIn("reachable from the harness PR's head ref in the harness repository", text)
         self.assertNotIn("://", text, "no URL: the harness repository is not named in public code")
+
+
+if __name__ == "__main__":
+    unittest.main()

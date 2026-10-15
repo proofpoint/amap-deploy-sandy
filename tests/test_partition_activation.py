@@ -175,9 +175,6 @@ class ArgvTest(unittest.TestCase):
         self.assertIn("ROUTER_CONFIG=/c/router.json", a)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class SupervisorTest(unittest.TestCase):
     def setUp(self):
@@ -206,3 +203,7 @@ class SupervisorTest(unittest.TestCase):
 
     def test_a_missing_supervisor_directory_is_not_a_problem(self):
         self.assertEqual(pa.supervisor_problems("ex-up", dirs=[self.dirs[0] + "-absent"]), [])
+
+
+if __name__ == "__main__":
+    unittest.main()
