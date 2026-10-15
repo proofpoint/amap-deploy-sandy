@@ -27,8 +27,11 @@ its path, as `hop_router.validate_with_hop_router` does:
    peers', and the own key's selection and length.
 `read_seed`, `make_signer` and `make_verifier` are never called. An audit
 hook in that process refuses any open of the signing key or of anything in
-its directory, so the check cannot read the key even by accident. The seed
-is proved only by the router itself, when it starts.
+its directory, so the check cannot read the key even by accident. The own
+key's selection and length catch the SELECT form of signing_key_mismatch
+without the seed; the check never proves the key pair. The seed's own
+proof, its signature verified by the configured public key, is only the
+router's, when it starts (A4).
 """
 
 import json
