@@ -849,6 +849,21 @@ class ActTest(InProcess):
         self.assertEqual(engine.stopped, [TARGET])
         self.assertTrue(any("NOT recorded" in s for s in said), said)
 
+    def test_a_resolved_incident_is_never_acted_on_again(self):
+        """The operator's resolution is final for that incident: _act
+        neither rewrites nor stops for it, whoever calls it."""
+        d = f"{self.ev}/incident-r1"
+        os.mkdir(d)
+        with open(f"{d}/detected.json", "wb") as f:
+            f.write(pe.canonical({"run_id": "r1", "at": "x", "failing": ["P03"], "pending": ["rewrite", "stop"]}))
+        with open(f"{d}/events.jsonl", "w") as f:
+            f.write(json.dumps({"event": "resolved", "at": "x", "evidence": "e", "reason": "r"}) + "\n")
+        engine = Engine([True, False])
+        self.assertTrue(self.act(TARGET, engine, []))
+        self.assertEqual(engine.stopped, [])
+        with open(self.conf) as f:
+            self.assertIn("delegation", json.load(f))
+
     def test_only_a_full_id_is_ever_stopped(self):
         for target in (None, "router-up", "c" * 12):
             with self.subTest(target=target):
