@@ -280,5 +280,41 @@ class VerifyActivationTest(unittest.TestCase):
         self.assertEqual(self.results(staged=staged_with_token)[1][1], rh.UNKNOWN)
 
 
+
+class StagedBytesTest(unittest.TestCase):
+    """A1: the rendering plus the delegation block, held to a loader that, like
+    the hop pin's, refuses `delegation` without a non-empty token."""
+    DOC = {"state_dir": "/s", "hop": {"root": "/h"}}
+    BLOCK = {"signing_key": {"path": "/k/signing.key", "key_id": "k1", "public_key": "a" * 64}}
+
+    def setUp(self):
+        self.seen = []
+
+    def loader(self, doc):
+        self.seen.append(doc)
+        tok = doc.get("delegation", {}).get("partition_verified")
+        return None if isinstance(tok, str) and tok.strip() else "config.delegation.partition_verified: required"
+
+    def test_the_staged_bytes_are_the_rendering_plus_the_block_and_no_token(self):
+        raw = pa.staged_bytes(self.DOC, self.BLOCK, self.loader)
+        self.assertEqual(json.loads(raw), dict(self.DOC, delegation=self.BLOCK))
+        self.assertEqual(raw, (json.dumps(dict(self.DOC, delegation=self.BLOCK), indent=2) + "\n").encode())
+        self.assertNotIn(pa.LOADER_PLACEHOLDER.encode(), raw)
+
+    def test_the_loader_sees_it_as_a3_will_write_it(self):
+        raw = pa.staged_bytes(self.DOC, self.BLOCK, self.loader)
+        self.assertEqual(self.seen, [json.loads(pa.final_bytes(raw, pa.LOADER_PLACEHOLDER))])
+
+    def test_a_refusal_or_a_malformed_block_refuses(self):
+        cases = {"loader": (self.DOC, self.BLOCK, lambda d: "config.delegation.signing_key: needs exactly"),
+                 "no signing key": (self.DOC, {}, self.loader),
+                 "a token already": (self.DOC, dict(self.BLOCK, partition_verified="r1:x"), self.loader),
+                 "a block already": (dict(self.DOC, delegation=self.BLOCK), self.BLOCK, self.loader)}
+        for name, args in cases.items():
+            with self.subTest(name=name):
+                with self.assertRaises(pa.ActivationError):
+                    pa.staged_bytes(*args)
+
+
 if __name__ == "__main__":
     unittest.main()

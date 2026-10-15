@@ -24,7 +24,7 @@ import os
 import subprocess
 import sys
 from collections import Counter
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 import router_health as rh
 
@@ -145,6 +145,32 @@ def activation_binding(spec: Dict[str, Any], staged: bytes) -> str:
     spec, never its container id."""
     import partition_evidence as pe
     return pe.sha_json({"config": pe.config_binding(json.loads(staged)), "spec": spec})
+
+
+#: What A1's loader check puts where A3 will put the token: the loader
+#: refuses `delegation` without a non-empty `partition_verified`. It is never
+#: written anywhere.
+LOADER_PLACEHOLDER = "a1-loader-check:" + "0" * 64
+
+
+def staged_bytes(doc: Dict[str, Any], delegation: Any, validate: Callable[[Dict[str, Any]], Optional[str]]) -> bytes:
+    """A1: install's rendering of the local router's config (`doc`) with the
+    `delegation` block the delegation rendering supplies, which carries no
+    `partition_verified`, in install's own serialisation. It is held to the
+    hop pin's loader (`validate`: None when it accepts) as A3 will write it,
+    with LOADER_PLACEHOLDER as the token; the placeholder is never in the
+    bytes returned."""
+    if not isinstance(delegation, dict) or not isinstance(delegation.get("signing_key"), dict):
+        raise ActivationError("the delegation block needs a signing_key")
+    if "partition_verified" in delegation:
+        raise ActivationError("the delegation block must not carry partition_verified: A3 adds the token")
+    if "delegation" in doc:
+        raise ActivationError("the rendering already carries a delegation block")
+    staged = (json.dumps(dict(doc, delegation=delegation), indent=2) + "\n").encode("utf-8")
+    refused = validate(json.loads(final_bytes(staged, LOADER_PLACEHOLDER)))
+    if refused:
+        raise ActivationError(f"the hop router's loader refuses the activation rendering: {refused}")
+    return staged
 
 
 def final_bytes(staged: bytes, token: str) -> bytes:
