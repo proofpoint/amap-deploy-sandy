@@ -335,6 +335,25 @@ class ClonesTest(Base):
         f["/srv/op/clones/runtime"] = dr(0o750, OP)
         self.assertOnly(self.run_checks(f=f), "the runtime clone /srv/op/clones/runtime is a directory")
 
+    def test_a_host_without_the_producer_clone_checks_only_the_clones_it_has(self):
+        """A host that pins the D7 source as one file holds no producer tree:
+        no producer claim is made, and the other clones are checked as ever."""
+        no_producer = {k: v for k, v in sec()["clones"].items() if k != "producer"}
+        found = self.run_checks(s=spec(clones=no_producer))
+        self.assertFalse([c.claim for c in found if "producer clone" in c.claim])
+        self.assertEqual([(c.claim, c.actual) for c in found if c.result != rh.PASS], [])
+        self.assertTrue([c for c in found if "the deploy clone's HEAD" in c.claim])
+
+    def test_only_the_producer_clone_may_be_left_out(self):
+        for role in ss.CLONE_ROLES:
+            with self.subTest(role=role):
+                clones = {k: v for k, v in sec()["clones"].items() if k != role}
+                if role == ss.OPTIONAL_CLONE_ROLE:
+                    self.assertNotIn(role, spec(clones=clones).clones)
+                else:
+                    with self.assertRaises(hs.SpecError):
+                        spec(clones=clones)
+
     def test_git_that_cannot_answer_is_unknown(self):
         def broken(argv):
             return argv[0].endswith("git") and "rev-parse" in argv and argv[2].endswith("deploy")

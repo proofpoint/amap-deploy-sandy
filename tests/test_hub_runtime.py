@@ -536,6 +536,134 @@ class VerifyTest(unittest.TestCase):
         self.assertEqual(c.result, rh.FAIL)
 
 
+FILE = "/opt/ex/d7src/example-d7-source.json"
+
+
+def file_form(sha=None, path=FILE):
+    """hub.d7 with the source pinned as one file (no producer clone)."""
+    return {"dir": "/opt/ex/d7", "file": "d7.json",
+            "source": {"path": path, "sha256": sha or hashlib.sha256(d7_source()).hexdigest()}}
+
+
+def file_form_doc(**over):
+    d = full_doc(d7=file_form(**over))
+    del d[ss.SECTION]["clones"]["producer"]
+    return d
+
+
+class D7FileFormTest(unittest.TestCase):
+    """hub.d7.source as {path, sha256}: one pinned file, for a host that
+    holds no producer clone (whose tree carries secrets)."""
+
+    def refuses(self, doc, words):
+        with self.assertRaises(hs.SpecError) as e:
+            hs.load_spec(doc)
+        self.assertIn(words, str(e.exception))
+
+    def test_it_loads_without_a_producer_clone(self):
+        h = hs.load_spec(file_form_doc()).hub
+        self.assertEqual((h.d7_source, h.d7_source_sha256), (FILE, hashlib.sha256(d7_source()).hexdigest()))
+        self.assertNotIn("producer", hs.load_spec(file_form_doc()).secrets.clones)
+
+    def test_the_clone_form_is_unchanged_and_needs_the_clone(self):
+        h = spec().hub
+        self.assertEqual((h.d7_source, h.d7_source_sha256), ("gen/d7.json", None))
+        d = full_doc()
+        del d[ss.SECTION]["clones"]["producer"]
+        self.refuses(d, "secrets.clones has no producer")
+
+    def test_a_bad_file_form_refuses(self):
+        self.refuses(file_form_doc(sha="ab" * 31), "64 lower-case hex")
+        self.refuses(file_form_doc(sha="AB" * 32), "64 lower-case hex")
+        self.refuses(file_form_doc(path="relative/example-d7-source.json"), "absolute")
+        d = file_form_doc()
+        d[hr.SECTION]["d7"]["source"]["extra"] = 1
+        self.refuses(d, "must have")
+
+    def test_the_reader_uses_the_bytes_only_when_they_hash_to_the_pin(self):
+        s = hs.load_spec(file_form_doc())
+        try:
+            path = hr.source_path(s, s.hub)
+        except KeyError as e:   # a host with no producer clone must never need one
+            self.fail(f"the file form looked for a clone: {e!r}")
+        self.assertEqual(path, FILE)
+        self.assertEqual(hr.read_source(s, s.hub, lambda p: d7_source()), d7_source())
+        other = hr.read_source(s, s.hub, lambda p: d7_source() + b" ")
+        self.assertIsInstance(other, rh.Unresolved)
+        self.assertIn("does not hash to its pin", other.reason)
+
+        def absent(p):
+            raise FileNotFoundError(p)
+        self.assertIsInstance(hr.read_source(s, s.hub, absent), rh.Unresolved)
+
+    def test_the_pinned_file_wins_on_a_host_that_still_has_the_clone(self):
+        """The file form names the source, whatever clone the host holds."""
+        s = hs.load_spec(full_doc(d7=file_form()))
+        self.assertIn("producer", s.secrets.clones)
+        self.assertEqual(hr.source_path(s, s.hub), FILE)
+        self.assertEqual(hr.read_source(s, s.hub, lambda p: d7_source() if p == FILE else b"the clone's"),
+                         d7_source())
+
+    def test_a_render_from_a_file_that_differs_refuses(self):
+        s = hs.load_spec(file_form_doc())
+        r = hr.render_all(s, s.hub, hr.read_source(s, s.hub, lambda p: d7_source() + b" "))
+        self.assertIsInstance(r.d7, rh.Unresolved)
+
+    def checks(self, files_over=None, data=None):
+        s = hs.load_spec(file_form_doc())
+        files = {"/": st(stat.S_IFDIR | 0o755), "/opt": st(stat.S_IFDIR | 0o755),
+                 "/opt/ex": st(stat.S_IFDIR | 0o755), "/opt/ex/d7src": st(stat.S_IFDIR | 0o755),
+                 FILE: st(stat.S_IFREG | 0o444)}
+        files.update(files_over or {})
+        data = {FILE: d7_source()} if data is None else data
+
+        def lstat(p):
+            if p not in files or files[p] is None:
+                raise FileNotFoundError(p)
+            return files[p]
+
+        def read(p):
+            if p not in data:
+                raise FileNotFoundError(p)
+            return data[p]
+        return hr.verify_d7_source(s.hub, lstat, read)
+
+    def test_a_good_source_file_passes(self):
+        self.assertEqual([(c.claim, c.actual) for c in self.checks() if c.result != rh.PASS], [])
+
+    def test_a_file_that_differs_absent_or_writable_fails(self):
+        cases = {
+            "other bytes": dict(data={FILE: d7_source() + b"x"}),
+            "absent": dict(files_over={FILE: None}, data={}),
+            "writable": dict(files_over={FILE: st(stat.S_IFREG | 0o644)}),
+            "not root's": dict(files_over={FILE: st(stat.S_IFREG | 0o444, uid=1000)}),
+            "a writable parent": dict(files_over={"/opt/ex/d7src": st(stat.S_IFDIR | 0o777)}),
+        }
+        for label, kw in cases.items():
+            with self.subTest(label):
+                self.assertIn(rh.FAIL, [c.result for c in self.checks(**kw)])
+
+    def test_the_clone_form_adds_no_file_check(self):
+        self.assertEqual(hr.verify_d7_source(spec().hub, os.lstat, dd.read_file), [])
+
+    def test_the_plan_places_the_source_with_the_pinned_hash(self):
+        s = hs.load_spec(file_form_doc())
+        r = hr.render_all(s, s.hub, d7_source())
+        lines = hr.plan(s, s.hub, r, lambda x: x, "steps")
+        pin = hashlib.sha256(d7_source()).hexdigest()
+        self.assertIn(f"steps place <the pinned D7 source file> {FILE} --sha256 {pin}", lines)
+        self.assertTrue(any(l.endswith("-m 0755 /opt/ex/d7src") for l in lines))
+        clone = hr.plan(spec(), spec().hub, hr.render_all(spec(), spec().hub, d7_source()), lambda x: x, "steps")
+        self.assertFalse(any("<the pinned D7 source file>" in l for l in clone))
+
+    def test_the_source_file_is_an_integrity_root(self):
+        import secret_exposure as se
+        s = hs.load_spec(file_form_doc())
+        _, integrity = se.protected_roots(s.secrets, [], lambda p: p, also=[s.hub.d7_source])
+        self.assertIn(FILE, integrity)
+        self.assertNotIn("producer", s.secrets.clones)
+
+
 class PlanAndFilesTest(unittest.TestCase):
     def setUp(self):
         self.spec = spec()
