@@ -1,8 +1,9 @@
 """harness_gate: the full-run gate record's one shape and its checks G1-G7.
 The healthy record is the design's example with real-length values; every
 refusal row breaks it one way and requires the gate that names that thing.
-The mutant list is not pinned in the module until the harness freezes it,
-so the tests pin one for themselves and restore the module after."""
+The refusal rows pin a small mutant list for themselves and restore the
+module after; RealPinTest judges records against the module's own pinned
+list, untouched."""
 
 import copy
 import hashlib
@@ -15,6 +16,11 @@ RL = "1" * 40
 HOP = "2" * 40
 PLUGIN = "3" * 64
 IDS = ["m01", "m02", "m03"]
+#: The harness's frozen mutant list for the deploy's gate run, as relayed.
+FROZEN_IDS = ("A2-drop-wrapper A3-no-registry A3-precreate-state A4-no-first-sight A6-write-during-read "
+              "A7-old-target A8-control-on-null A8-widened M1 M10 M11 M12 M12b M12c M13 M14 M15a M15b M16 "
+              "M17a M17b M17c M17d M17e M2 M20 M21 M26-carry-clock M27 M3 M4 M4b M6 M7 M8 RT-double-send "
+              "RT-drop-send RT-wrong-tree").split()
 #: Stand-ins for the record's schema and unit values, which the module pins by
 #: hash alone; the tests pin these the same way.
 SCHEMA = "example.gate/1"
@@ -173,15 +179,28 @@ class GateTest(unittest.TestCase):
         why = self.check(self.broken(edit))
         self.assertEqual(why, [("G6", "no mutant list is pinned yet: the harness's design has not frozen it")])
 
-    def test_the_module_ships_with_no_mutant_list_pinned(self):
+    def test_the_module_ships_with_the_frozen_list_pinned(self):
         """Read from the source, since this class pins a list for its own tests."""
         import ast
         with open(hg.__file__, encoding="utf-8") as f:
             tree = ast.parse(f.read())
-        pinned = {n.target.id: n.value for n in tree.body if isinstance(n, ast.AnnAssign)}
-        for name in ("MUTANT_IDS_SHA256", "MUTANT_COUNT"):
-            self.assertIsInstance(pinned[name], ast.Constant)
-            self.assertIsNone(pinned[name].value, name)
+        pinned = {n.target.id: n.value.value for n in tree.body if isinstance(n, ast.AnnAssign)
+                  and isinstance(n.value, ast.Constant)}
+        self.assertEqual((pinned["MUTANT_IDS_SHA256"], pinned["MUTANT_COUNT"]),
+                         (hg.set_sha256(FROZEN_IDS), len(FROZEN_IDS)))
+        self.assertEqual(len(FROZEN_IDS), len(set(FROZEN_IDS)))
+
+    def test_the_module_ships_with_the_deploy_runs_unit_pinned(self):
+        """The unit is pinned by its sha256 alone: the record's unit names
+        are not written in this repository."""
+        import ast
+        with open(hg.__file__, encoding="utf-8") as f:
+            tree = ast.parse(f.read())
+        pinned = {n.targets[0].id: n.value.value for n in tree.body if isinstance(n, ast.Assign)
+                  and isinstance(n.value, ast.Constant) and isinstance(n.targets[0], ast.Name)}
+        self.assertEqual(pinned["UNIT_SHA256"], "0b576199029d7b0d5bc6c156ab5ef62dd57f95fa431c9e4c9c7607f41b5bcc53")
+        self.assertNotEqual(pinned["UNIT_SHA256"], "6310dd4912a80935203600f1d24922f49744b9324b494c6310b12479608995d5",
+                            "not the earlier unit's")
 
     def test_a_self_consistent_record_with_other_mutant_ids_refuses(self):
         def edit(r):
@@ -231,6 +250,42 @@ class PinsTest(unittest.TestCase):
                          {"pending", "overlay_pending", "fail", "fail_stale_label", "known_erratum_unratified"})
         self.assertEqual(hg.OUTCOME_KINDS - set(hg.BLOCKING_KINDS),
                          {"pass", "overlay_mapped", "known_erratum", "declared_difference", "spec_question"})
+
+
+
+class RealPinTest(unittest.TestCase):
+    """G6 against the module's OWN mutant pins, which nothing here patches.
+    Only the schema and unit hashes are pinned to the test record's
+    stand-ins, as GateTest does; G1-G5 and G7 are not under test here."""
+
+    def setUp(self):
+        for name, value in (("SCHEMA_SHA256", hashlib.sha256(SCHEMA.encode()).hexdigest()),
+                            ("UNIT_SHA256", hashlib.sha256(UNIT.encode()).hexdigest())):
+            self.addCleanup(setattr, hg, name, getattr(hg, name))
+            setattr(hg, name, value)
+
+    def g6(self, expected, judged=None):
+        r = healthy()
+        judged = list(expected) if judged is None else judged
+        r["mutants_expected"] = {"count": len(expected), "ids": list(expected)}
+        r["mutants"] = [{"id": i, "outcome": "killed", "by": "verdict"} for i in judged]
+        raw = raw_of(r)
+        return [why for gate, why in hg.problems(raw, record_sha256=hashlib.sha256(raw).hexdigest(), rl_sha=RL,
+                                                 hop_sha=HOP, plugin_sha256=PLUGIN) if gate == "G6"]
+
+    def test_the_frozen_list_all_killed_holds(self):
+        self.assertEqual(self.g6(FROZEN_IDS), [])
+
+    def test_any_other_list_is_not_the_pin(self):
+        historical = [i for i in FROZEN_IDS if not i.startswith("RT-")]
+        renamed = FROZEN_IDS[:-1] + ["RT-wrong-tree2"]
+        for name, ids in (("one dropped", FROZEN_IDS[:-1]), ("the earlier 35", historical),
+                          ("one renamed", renamed)):
+            with self.subTest(name=name):
+                self.assertEqual(self.g6(ids), ["the expected mutants are not the pinned list"])
+
+    def test_the_frozen_list_with_a_mutant_not_judged_refuses(self):
+        self.assertTrue(self.g6(FROZEN_IDS, judged=FROZEN_IDS[:-1]))
 
 
 if __name__ == "__main__":
