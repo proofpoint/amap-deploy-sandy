@@ -479,14 +479,178 @@ def ask_live_config(spec: Any, container: str) -> Any:
     return parts[0], parts[1]
 
 
+SIGNING_CLAIM = "the local router signs exactly as the policy and the gate allow"
+
+
+@dataclass(frozen=True)
+class Signing:
+    """What decides whether the local router may sign, each as read now.
+    `policy_on`: the policy's hop_link.delegation is present (bool), or
+    Unresolved. `gate_ok`: the harness gate holds (gate_problems == []), or
+    Unresolved. `approved`: A1's placed record, parsed; None when it is absent
+    or invalid (`approved_why` says which); Unresolved when it cannot be read.
+    `named(token)`: partition_evidence.named_document for this host.
+    `status`: the local router's status.json document, or Unresolved.
+    `config_mtime`: the live config's mtime, or Unresolved. `now`: epoch s."""
+    policy_on: Any
+    gate_ok: Any
+    approved: Any
+    approved_why: str
+    named: Callable[[str], Tuple[Any, Any, str]]
+    status: Any
+    config_mtime: Any
+    now: float
+
+
+def _ts(text: Any) -> Any:
+    """The router's UTC timestamp as epoch seconds, or Unresolved."""
+    import calendar
+    if not isinstance(text, str):
+        return rh.Unresolved(f"{text!r} is not a timestamp")
+    try:
+        return calendar.timegm(time.strptime(text, "%Y-%m-%dT%H:%M:%SZ"))
+    except ValueError:
+        return rh.Unresolved(f"{text!r} is not a YYYY-MM-DDTHH:MM:SSZ timestamp")
+
+
+def _member(doc: Dict[str, Any]) -> bytes:
+    """The delegation member as compared: canonical JSON, the token removed."""
+    block = dict(doc[DELEGATION_KEY])
+    block.pop("partition_verified", None)
+    return json.dumps(block, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def _verdict(doc: Dict[str, Any], policy_on: bool, gate_ok: bool, sg: Signing) -> Tuple[str, str]:
+    """(PASS | FAIL | UNKNOWN, why) for one value of the policy and the gate:
+    d2's matrix, row by row."""
+    import partition_evidence as pe
+    present = DELEGATION_KEY in doc
+    if not policy_on:
+        return (rh.FAIL, "it signs, and the policy does not enable delegation for this host") if present \
+            else (rh.PASS, "it does not sign, and the policy does not enable it")
+    if not gate_ok:
+        return (rh.FAIL, "it signs while the harness gate does not hold: the fail-stop case") if present \
+            else (rh.PASS, "it does not sign: the gate does not hold")
+    if not present:
+        return rh.UNKNOWN, "NOT YET ACTIVATED: the policy and the gate allow signing, and the router does not sign"
+    if isinstance(sg.approved, rh.Unresolved):
+        return rh.UNKNOWN, f"A1's placed record cannot be read: {sg.approved.reason}"
+    if sg.approved is None:
+        return rh.FAIL, f"it signs, and there is no approved activation to compare the block with: {sg.approved_why}"
+    try:
+        staged = parse_json(sg.approved["staged"].encode("utf-8"))
+        same = isinstance(staged, dict) and DELEGATION_KEY in staged and _member(staged) == _member(doc)
+    except (ValueError, TypeError):
+        same = False
+    if not same:
+        return rh.FAIL, "its delegation block is not A1's approved block"
+    token = doc[DELEGATION_KEY].get("partition_verified") if isinstance(doc[DELEGATION_KEY], dict) else None
+    named, raw, why = sg.named(token)
+    if named is None:
+        return rh.FAIL, f"its token's named document does not hold: {why}"
+    age = sg.now - pe.at_seconds(named["at"])
+    if age > pe.FRESH_FOR_S or age < -pe.CLOCK_TOLERANCE_S:
+        return rh.FAIL, f"its token's document ({named['run_id']}) is not current: re-run A2 to A5, or un-render"
+    return rh.PASS, f"it signs under the token of {named['run_id']}, current and passing"
+
+
+def verify_signing(ks: KeySpec, raw: Any, bind: rh.Check, sg: Signing) -> rh.Check:
+    """d2's matrix over the policy, the gate and the live config, held to
+    A1's placed record and the token's named document, and to the router's
+    own status.json. An input that cannot be read decides nothing: the
+    verdict is the one every value of it gives, else UNKNOWN. Evidence
+    bindings are not re-checked here (they stat the key's 0700 directory,
+    which only root can): the weekly run holds the document to them."""
+    claim = SIGNING_CLAIM
+    want = _fact("signing", True, "the policy's hop_link.delegation, the harness gate, A1's placed record "
+                                  "and the token's named document")
+    remedy = (f"make {ks.local_config} what the policy and the gate allow: install --apply renders it without "
+              "delegation; activation is A1 to A5")
+    if isinstance(raw, rh.Unresolved):
+        return rh.unknown(claim, want, raw.reason, "render and place the local router's config")
+    try:
+        doc = parse_json(raw)
+    except ValueError as e:
+        return rh.unknown(claim, want, f"{ks.local_config} is not readable JSON: {e}", "render it again")
+    if not isinstance(doc, dict):
+        return rh.unknown(claim, want, f"{ks.local_config} is not a JSON object", "render it again")
+    status = sg.status
+    section = status.get("classification") if isinstance(status, dict) else None
+    if isinstance(section, dict) and section.get("config_reload_failed") is True:
+        return rh.check(claim, want, "the running router refused its config file and runs an older one",
+                        f"correct {ks.local_config}, then restart the local router with docker/run.sh --detach (A4)",
+                        do_not="never read the file as what the router runs while the flag is set")
+    unknown_inputs = [v.reason for v in (sg.policy_on, sg.gate_ok) if isinstance(v, rh.Unresolved)]
+    seen = {_verdict(doc, p, g, sg)
+            for p in ((sg.policy_on,) if isinstance(sg.policy_on, bool) else (False, True))
+            for g in ((sg.gate_ok,) if isinstance(sg.gate_ok, bool) else (False, True))}
+    results = {r for r, _ in seen}
+    if len(results) > 1:
+        return rh.unknown(claim, want, "the verdict depends on what could not be read: " + "; ".join(unknown_inputs),
+                          "make the policy and the harness gate readable")
+    result, why = sorted(seen)[0]
+    if result == rh.FAIL:
+        return rh.check(claim, want, why, remedy, do_not="never add or keep a delegation block by hand")
+    if result == rh.UNKNOWN:
+        return rh.unknown(claim, want, why, "complete A1 to A5" if why.startswith("NOT YET") else remedy)
+    if bind.result is not rh.PASS:
+        return rh.unknown(claim, want, f"{why}, but the local router is not shown to read {ks.local_config}: "
+                                       f"{bind.reason or 'it reads another file'}", "make the binding above pass")
+    return _status_witness(claim, want, why, ks, sg, remedy)
+
+
+def _status_witness(claim: str, want: rh.Fact, why: str, ks: KeySpec, sg: Signing, remedy: str) -> rh.Check:
+    """A PASS needs the router's own status.json: written within
+    FRESHNESS_MULTIPLE x its interval, by a process started no earlier than
+    the second its config was placed."""
+    status = sg.status
+    if isinstance(status, rh.Unresolved):
+        return rh.unknown(claim, want, f"{why}; the router's status.json cannot be read: {status.reason}",
+                          "start the local router, or make the engine answer")
+    interval, polled, started = status.get("interval_s"), _ts(status.get("last_poll_ts")), _ts(status.get("started_ts"))
+    if not isinstance(interval, (int, float)) or isinstance(interval, bool) or interval <= 0:
+        return rh.unknown(claim, want, f"{why}; status.json carries no interval_s, so its age has no bound",
+                          "start the local router from the hop checkout")
+    if isinstance(polled, rh.Unresolved) or sg.now - polled > rh.FRESHNESS_MULTIPLE * interval:
+        return rh.unknown(claim, want, f"{why}; status.json is not fresh: "
+                                       f"{polled.reason if isinstance(polled, rh.Unresolved) else 'its last poll is old'}",
+                          "start the local router, or wait for its next poll")
+    if isinstance(started, rh.Unresolved) or isinstance(sg.config_mtime, rh.Unresolved) \
+            or started < int(sg.config_mtime):
+        return rh.unknown(claim, want, f"{why}; the running router started before its config was placed",
+                          f"restart the local router with docker/run.sh --config {ks.local_config} --detach (A4)")
+    return rh.check(claim, want, True, remedy)
+
+
+#: The local router's own status document, read from inside its container:
+#: the state_dir its config names, and status.json there.
+STATUS_SCRIPT = ("import json,os,sys\n"
+                 "c=json.load(open(os.environ['ROUTER_CONFIG']))\n"
+                 "sys.stdout.write(open(os.path.join(c['state_dir'],'status.json')).read())\n")
+
+
+def ask_status(spec: Any, container: str) -> Any:
+    """The local router's status.json, as it wrote it, or an Unresolved."""
+    try:
+        p = rh.run(ss.docker(spec.secrets) + ["exec", container, "python3", "-I", "-S", "-c", STATUS_SCRIPT])
+    except rh.CannotRun as e:
+        return rh.Unresolved(str(e))
+    if p.rc != 0:
+        return rh.Unresolved(f"docker exec {container} could not read its status.json (exit {p.rc})")
+    try:
+        doc = parse_json(p.out.encode("utf-8"))
+    except ValueError as e:
+        return rh.Unresolved(f"{container}'s status.json is not JSON: {e}")
+    return doc if isinstance(doc, dict) else rh.Unresolved(f"{container}'s status.json is not an object")
+
+
 def verify_no_delegation(ks: KeySpec, live: Any = None,
-                         read_bytes_: Callable[[str], bytes] = read_bytes) -> List[rh.Check]:
-    """No live peer signing. A delegation block in `local_config` fails
-    whatever else holds. Its absence passes only when the running local
-    router is shown to read that file, byte for byte (`live`, from inside
-    its container): otherwise the file proves nothing about the router. One
-    read of the file is both hashed and parsed, so the decision is about the
-    bytes the binding compared."""
+                         read_bytes_: Callable[[str], bytes] = read_bytes, signing: Optional[Signing] = None
+                         ) -> List[rh.Check]:
+    """The local router reads `local_config`, byte for byte (`live`, from
+    inside its container), and signs exactly as the policy and the gate
+    allow (`verify_signing`). One read of the file is both hashed and
+    judged, so the decision is about the bytes the binding compared."""
     out: List[rh.Check] = []
     bind_claim = f"the local router reads {ks.local_config}, byte for byte the host's copy"
     try:
@@ -510,25 +674,13 @@ def verify_no_delegation(ks: KeySpec, live: Any = None,
         bind = rh.check(bind_claim, bind_want, tuple(live), bind_remedy,
                         do_not="never point keys.local_config at the file the router happens to read")
     out.append(bind)
-    claim = f"the local router's config {ks.local_config} has no {DELEGATION_KEY} block"
-    want = _fact("delegation", False, "the operator's decision: no live peer signing until the full "
-                                      "signed-case harness passes; its absence is the whole of 'no signing'")
-    remedy = f"remove the {DELEGATION_KEY} member and render the config again"
-    if isinstance(raw, rh.Unresolved):
-        return out + [rh.unknown(claim, want, raw.reason, "render and place the local router's config")]
-    try:
-        doc = parse_json(raw)
-    except ValueError as e:
-        return out + [rh.unknown(claim, want, f"{ks.local_config} is not readable JSON: {e}", "render it again")]
-    if not isinstance(doc, dict):
-        return out + [rh.unknown(claim, want, f"{ks.local_config} is not a JSON object", "render it again")]
-    if DELEGATION_KEY in doc:
-        return out + [rh.check(claim, want, True, remedy, do_not="never add the block by hand to test signing")]
-    if bind.result is not rh.PASS:
-        return out + [rh.unknown(claim, want, f"{ks.local_config} has none, but the local router is not shown "
-                                              f"to read it: {bind.reason or 'it reads another file'}",
-                                 "make the binding above pass")]
-    return out + [rh.check(claim, want, False, remedy)]
+    sg = signing or Signing(policy_on=rh.Unresolved("the policy was not read"),
+                            gate_ok=rh.Unresolved("the harness gate was not read"),
+                            approved=rh.Unresolved("A1's record was not read"), approved_why="",
+                            named=lambda t: (None, None, "the evidence was not read"),
+                            status=rh.Unresolved("the local router's status.json was not read"),
+                            config_mtime=rh.Unresolved("the live config was not inspected"), now=time.time())
+    return out + [verify_signing(ks, raw, bind, sg)]
 
 
 def verify_evidence_dir(ks: KeySpec, lstat: Callable) -> List[rh.Check]:
@@ -666,10 +818,10 @@ ASK = hr.ASK
 def checks(spec: Any, ks: KeySpec, *, lstat: Callable = os.lstat, read_json_: Callable[[str], Any] = read_json,
            d7_hash: Any = ASK, ask: Any = ASK, containers: Any = ASK, stat_: Callable = os.stat,
            realpath: Callable[[str], str] = os.path.realpath, live: Any = ASK,
-           read_bytes_: Callable[[str], bytes] = read_bytes) -> List[rh.Check]:
+           read_bytes_: Callable[[str], bytes] = read_bytes, signing: Optional[Signing] = None) -> List[rh.Check]:
     out = verify_placement(ks, lstat)
     out += verify_no_delegation(ks, ask_live_config(spec, local_container(spec, ks)) if live is ASK else live,
-                                read_bytes_)
+                                read_bytes_, signing)
     out += verify_evidence_dir(ks, lstat)
     out += verify_evidence_binds(ks, ask_containers(spec) if containers is ASK else containers, stat_, realpath)
     out += verify_evidence(spec, ks, lstat, read_json_)

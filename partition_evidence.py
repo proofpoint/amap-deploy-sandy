@@ -311,6 +311,38 @@ def _read_fd(fd: int) -> bytes:
     return b"".join(chunks)
 
 
+#: The outcomes of `named_document`, besides a document: why no document is
+#: selected for a token. Each is its own answer, never a reason to search.
+NAMED_NO_RUN, NAMED_MISSING, NAMED_UNREADABLE, NAMED_MALFORMED, NAMED_MISMATCH = (
+    "no_run", "missing", "unreadable", "malformed", "mismatch")
+
+
+def named_document(token: Any, *, evidence_dir: str, host: str,
+                   read: Callable[[str], bytes] = read_placed) -> Tuple[Any, Any, str]:
+    """The evidence a token names, and only that one: (doc, raw, "") or
+    (None, outcome, why). The token's run id gives exactly
+    `partition-<run id>.json` in the evidence directory, read as placed,
+    parsed for this host, and its own token must be the token. Never the
+    newest document, and never a glob."""
+    rid = token.partition(":")[0] if isinstance(token, str) else ""
+    if not _RUN_ID.fullmatch(rid):
+        return None, NAMED_NO_RUN, "the token names no run"
+    path = os.path.join(evidence_dir, f"partition-{rid}.json")
+    try:
+        raw = read(path)
+    except FileNotFoundError:
+        return None, NAMED_MISSING, f"{path}, the document the token names, is absent"
+    except OSError as e:
+        return None, NAMED_UNREADABLE, f"{path} cannot be read as placed: {e}"
+    try:
+        doc = parse(raw, host=host)
+    except ValueError as e:
+        return None, NAMED_MALFORMED, f"{path} is not this host's evidence document: {e}"
+    if token_of(doc) != token:
+        return None, NAMED_MISMATCH, f"the token is not {path}'s own"
+    return doc, raw, ""
+
+
 #: What a running local router must be told when it signs without a current
 #: passing document: the same action the weekly job takes on a failure.
 UNSIGN_REMEDY = ("render the local router's config without delegation (install --apply) and restart it; "

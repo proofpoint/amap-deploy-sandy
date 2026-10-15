@@ -253,16 +253,15 @@ def a5_snapshot(*, store: pst.RootedStore, run_dir: str, context: Dict[str, Any]
     if bad:
         return rh.Unresolved("the local router is not the approved activation: " + "; ".join(bad))
     token = json.loads(live_raw)["delegation"]["partition_verified"]
+    doc, raw, why = pe.named_document(token, evidence_dir=context["evidence_dir"], host=context["host"],
+                                      read=read_placed)
+    if doc is None:
+        if raw == pe.NAMED_NO_RUN:
+            return rh.Unresolved("the live config's token names no run")
+        if raw == pe.NAMED_MISMATCH:
+            return rh.Unresolved("the live config's token is not its evidence's")
+        return rh.Unresolved(f"the token's evidence cannot be read: {why}")
     evidence_rid = token.partition(":")[0]
-    if not pe._RUN_ID.fullmatch(evidence_rid):
-        return rh.Unresolved("the live config's token names no run")
-    try:
-        raw = read_placed(posixpath.join(context["evidence_dir"], f"partition-{evidence_rid}.json"))
-        doc = pe.parse(raw, host=context["host"])
-    except (OSError, ValueError) as e:
-        return rh.Unresolved(f"the token's evidence cannot be read: {e}")
-    if pe.token_of(doc) != token:
-        return rh.Unresolved("the live config's token is not its evidence's")
     stale = pe.staleness(doc, now=now, bindings=bound)
     if stale:
         return rh.Unresolved("the token's evidence is not current: " + "; ".join(stale))

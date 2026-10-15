@@ -89,6 +89,7 @@ import posixpath
 import re
 import shlex
 import stat
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -98,6 +99,8 @@ import hub_keys as hk      # the local router's key, kept from the email router;
 import hub_runtime as hr   # the hub-link router's files and rendering
 import hub_supervise as hv  # the hub-link router's supervision, weekly probe job and start check
 import hop_router as hp     # the local router's hop constant and recorded image (the router section)
+import partition_activation as pa   # A1's placed record, which the signing check compares the live block with
+import partition_evidence as pe   # the evidence document a live token names
 import partition_setup as ps   # the partition evidence's directories and the harness gate (two sections)
 import router_health as rh
 import secret_exposure as se   # who else could reach that secret: every container, every engine
@@ -1062,7 +1065,8 @@ def checks(spec: Spec, *, production: bool, lstat: Callable = os.lstat,
            supervision: Optional[Dict[str, Any]] = None,
            enablement: Optional[Dict[str, Any]] = None,
            router: Optional[Dict[str, Any]] = None,
-           partition: Optional[Dict[str, Any]] = None) -> List[rh.Check]:
+           partition: Optional[Dict[str, Any]] = None,
+           policy_on: Any = None) -> List[rh.Check]:
     """Every check of the host against the plan. `production` is ORed with
     the document's own. `secrets` passes probes to the secret's checks;
     `overlay` is the file the document was read from (None for --spec). The
@@ -1093,8 +1097,9 @@ def checks(spec: Spec, *, production: bool, lstat: Callable = os.lstat,
     if spec.hub is not None:
         out += hr.checks(spec, spec.hub, lstat=lstat, **(hub or {}))
     if spec.keys is not None:
-        out += hk.checks(spec, spec.keys, lstat=lstat,
-                         **{k: v for k, v in (keys or {}).items() if k != "horizon_default"})
+        k = keys or {}
+        out += hk.checks(spec, spec.keys, lstat=lstat, signing=signing_inputs(spec, policy_on, partition or {}, k),
+                         **{n: v for n, v in k.items() if n not in ("horizon_default", "status", "config_mtime", "now")})
     if spec.hub is not None:
         out += verify_recovery_horizon(spec, (keys or {}).get("read_json_", hk.read_json),
                                        (keys or {}).get("horizon_default"))
@@ -1113,13 +1118,70 @@ def checks(spec: Spec, *, production: bool, lstat: Callable = os.lstat,
         out += hp.checks(spec, **(router or {}))
     if spec.partition is not None or spec.gate is not None:
         p = partition or {}
-        out += ps.verify(spec.partition, spec.gate, delegation_enabled=False, lstat=lstat, owned_chain=ss._owned_chain,
+        out += ps.verify(spec.partition, spec.gate, delegation_enabled=policy_on is not False, lstat=lstat,
+                         owned_chain=ss._owned_chain,
                          rl_sha=p["rl_sha"] if "rl_sha" in p else hp.hop_pin(),
                          hop_sha=(spec.overlay_pin or {}).get("commit", rh.Unresolved("the overlay has no plugin pin")),
                          plugin_sha256=hp.PLUGIN_SHA256, read=p.get("read", ps.read_record))
         out += verify_stop_target(spec, p)
         out += verify_weekly_runs(spec, p)
     return out
+
+
+def partition_host(spec: Spec) -> Any:
+    """The name the partition records carry for this host: the hub section's
+    host label, the one field that names the host."""
+    return spec.hub.host_label if spec.hub is not None else rh.Unresolved("the document has no hub section")
+
+
+def signing_inputs(spec: Spec, policy_on: Any, p: Dict[str, Any], k: Dict[str, Any]) -> hk.Signing:
+    """Everything the signing check reads, as read now. `policy_on` is the
+    fleet policy's answer (its hop_link has `delegation`), None when this run
+    read no policy. `p` may supply `rl_sha`, `read`, `read_placed` and
+    `read_evidence`; `k` may supply `status` and `config_mtime`."""
+    if policy_on is None:
+        policy_on = rh.Unresolved("this run read no fleet policy (verify reads it from the manifest)")
+    bad = ps.gate_problems(spec.gate, rl_sha=p["rl_sha"] if "rl_sha" in p else hp.hop_pin(),
+                           hop_sha=(spec.overlay_pin or {}).get("commit", rh.Unresolved("the overlay has no plugin pin")),
+                           plugin_sha256=hp.PLUGIN_SHA256, read=p.get("read", ps.read_record))
+    approved: Any = None
+    why = "the document has no partition section"
+    host = partition_host(spec)
+    if spec.partition is not None:
+        path = posixpath.join(spec.partition.evidence_dir, ps.ACTIVATION)
+        try:
+            approved = pa.parse_activation(p.get("read_placed", ps.read_placed)(path))
+        except FileNotFoundError:
+            approved, why = None, f"{path} is absent"
+        except OSError as e:
+            approved = rh.Unresolved(f"cannot read {path} as placed: {e}")
+        except pa.ActivationError as e:
+            approved, why = None, f"{path} is not an activation record: {e}"
+        if isinstance(approved, dict) and (approved["final_config_path"] != spec.keys.local_config
+                                           or approved["host"] != host):
+            approved, why = None, f"{path} is another host's or another config path's"
+
+    def named(token: Any) -> Any:
+        if spec.partition is None or isinstance(host, rh.Unresolved):
+            return None, pe.NAMED_MISSING, "the document has no partition or hub section"
+        return pe.named_document(token, evidence_dir=spec.partition.evidence_dir, host=host,
+                                 read=p.get("read_evidence", pe.read_placed))
+    status = k.get("status", hk.ASK)
+    if status is hk.ASK:
+        try:
+            container = hk.local_container(spec, spec.keys)
+        except StopIteration:
+            container = None
+        status = hk.ask_status(spec, container) if container else \
+            rh.Unresolved(f"the document declares no runtime for {spec.keys.principal}, the local router")
+    mtime = k.get("config_mtime", hk.ASK)
+    if mtime is hk.ASK:
+        try:
+            mtime = os.stat(spec.keys.local_config).st_mtime
+        except OSError as e:
+            mtime = rh.Unresolved(f"cannot inspect {spec.keys.local_config}: {e}")
+    return hk.Signing(policy_on=policy_on, gate_ok=not bad, approved=approved, approved_why=why, named=named,
+                      status=status, config_mtime=mtime, now=k.get("now", time.time()))
 
 
 def verify_weekly_runs(spec: Spec, p: Dict[str, Any]) -> List[rh.Check]:

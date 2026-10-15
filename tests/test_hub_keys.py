@@ -12,6 +12,7 @@ import json
 import os
 import stat
 import tempfile
+import time
 import unittest
 
 import host_setup as hs
@@ -287,7 +288,19 @@ class VerifyTest(unittest.TestCase):
         sha256 of the bytes the host holds there."""
         return LOCAL, hk._sha(self.raw(LOCAL))
 
-    def run_checks(self, d7_hash="a" * 64, seen=None, containers=(), live=None):
+    def signing(self, **over):
+        """The deployed state: no policy member, a gate that does not hold,
+        and a router whose status.json is fresh and newer than its config."""
+        now = 2_000_000_000
+        ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 1))
+        fields = dict(policy_on=False, gate_ok=False, approved=None, approved_why="no record",
+                      named=lambda t: (None, "missing", "no document"),
+                      status={"interval_s": 5.0, "last_poll_ts": ts, "started_ts": ts},
+                      config_mtime=now - 60, now=now)
+        fields.update(over)
+        return hk.Signing(**fields)
+
+    def run_checks(self, d7_hash="a" * 64, seen=None, containers=(), live=None, signing=None):
         seen = seen or {}
         ids = {}
 
@@ -297,7 +310,8 @@ class VerifyTest(unittest.TestCase):
         return hk.checks(self.spec, self.k, lstat=self.lstat, read_json_=self.read, d7_hash=d7_hash,
                          ask=lambda c, p: seen.get(c, "a" * 64), containers=list(containers),
                          stat_=stat_, realpath=lambda p: p,
-                         live=self.live_ok() if live is None else live, read_bytes_=self.raw)
+                         live=self.live_ok() if live is None else live, read_bytes_=self.raw,
+                         signing=signing or self.signing())
 
     def claim(self, found, words):
         hits = [c for c in found if words in c.claim]
@@ -309,7 +323,7 @@ class VerifyTest(unittest.TestCase):
         has no delegation block: nothing is left UNKNOWN."""
         found = self.run_checks()
         self.assertEqual([(c.claim, c.result) for c in found if c.result != rh.PASS], [])
-        self.assertEqual(self.claim(found, "no delegation block").result, rh.PASS)
+        self.assertEqual(self.claim(found, "signs exactly").result, rh.PASS)
 
     def test_an_exact_read_only_bind_of_the_evidence_dir_fails(self):
         c = {"Name": "/ex-up", "Mounts": [{"Type": "bind", "Source": EVIDENCE_DIR, "Destination": "/e", "RW": False}]}
@@ -366,24 +380,24 @@ class VerifyTest(unittest.TestCase):
         for value in ({}, None, {"attachment_basis": "closed_fleet"}, {"signing_key": {}}):
             with self.subTest(value=value):
                 self.json["/opt/ex/local/router.json"] = {"instances": {}, "delegation": value}
-                self.assertEqual(self.claim(self.run_checks(), "no delegation block").result, rh.FAIL)
+                self.assertEqual(self.claim(self.run_checks(), "signs exactly").result, rh.FAIL)
 
     def test_a_delegation_block_fails_even_when_the_router_reads_another_file(self):
         self.json[LOCAL] = {"instances": {}, "delegation": {}}
         found = self.run_checks(live=("/elsewhere/router.json", "b" * 64))
-        self.assertEqual(self.claim(found, "no delegation block").result, rh.FAIL)
+        self.assertEqual(self.claim(found, "signs exactly").result, rh.FAIL)
 
     def test_a_router_reading_another_file_fails_the_binding_and_proves_nothing(self):
         found = self.run_checks(live=("/elsewhere/router.json", self.live_ok()[1]))
         self.assertEqual(self.claim(found, "byte for byte").result, rh.FAIL)
-        c = self.claim(found, "no delegation block")
+        c = self.claim(found, "signs exactly")
         self.assertEqual(c.result, rh.UNKNOWN)
-        self.assertIn("not shown to read it", c.reason)
+        self.assertIn("not shown to read", c.reason)
 
     def test_a_router_reading_other_bytes_at_the_path_fails_the_binding(self):
         found = self.run_checks(live=(LOCAL, "b" * 64))
         self.assertEqual(self.claim(found, "byte for byte").result, rh.FAIL)
-        self.assertEqual(self.claim(found, "no delegation block").result, rh.UNKNOWN)
+        self.assertEqual(self.claim(found, "signs exactly").result, rh.UNKNOWN)
 
     def test_the_bytes_hashed_are_the_bytes_judged(self):
         """A file replaced between two reads must not split the decision from
@@ -395,22 +409,22 @@ class VerifyTest(unittest.TestCase):
         def raw(p):
             reads.append(p)
             return signing if len(reads) == 1 else clean
-        found = hk.verify_no_delegation(self.k, (LOCAL, hk._sha(signing)), raw)
+        found = hk.verify_no_delegation(self.k, (LOCAL, hk._sha(signing)), raw, self.signing())
         self.assertEqual(self.claim(found, "byte for byte").result, rh.PASS)
-        self.assertEqual(self.claim(found, "no delegation block").result, rh.FAIL)
+        self.assertEqual(self.claim(found, "signs exactly").result, rh.FAIL)
         self.assertEqual(reads, [LOCAL])
 
     def test_a_router_that_cannot_be_asked_leaves_both_unknown(self):
         found = self.run_checks(live=rh.Unresolved("docker exec local exited 1"))
         self.assertEqual(self.claim(found, "byte for byte").result, rh.UNKNOWN)
-        c = self.claim(found, "no delegation block")
+        c = self.claim(found, "signs exactly")
         self.assertEqual(c.result, rh.UNKNOWN)
         self.assertIn("exited 1", c.reason)
 
     def test_an_absent_local_config_is_unknown(self):
         del self.json["/opt/ex/local/router.json"]
         found = self.run_checks(live=(LOCAL, "b" * 64))
-        self.assertEqual(self.claim(found, "no delegation block").result, rh.UNKNOWN)
+        self.assertEqual(self.claim(found, "signs exactly").result, rh.UNKNOWN)
         self.assertEqual(self.claim(found, "byte for byte").result, rh.UNKNOWN)
 
     def test_a_failed_probe_record_fails(self):

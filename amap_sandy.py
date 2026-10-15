@@ -5020,7 +5020,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             return run_teardown(args, home, boxes_dir)
 
         if args.command == "host-setup":
-            return hsu.run(args.spec, production=args.production, overlay=ha.overlay_path(args.overlay))
+            return hsu.run(args.spec, production=args.production, overlay=ha.overlay_path(args.overlay),
+                           policy_on=delegation_policy(home))
 
         if args.command == "hub-render":
             return hsu.hub_render(args.spec, apply=args.apply, overlay=ha.overlay_path(args.overlay))
@@ -5054,7 +5055,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 2
 
 
-def run_verify_host_setup(args: argparse.Namespace) -> int:
+def delegation_policy(home: Path) -> Any:
+    """Whether this host's policy turns delegation on (its hop_link carries
+    `delegation`): True or False, or an Unresolved naming why the policy
+    could not be read. The signing check decides nothing on an Unresolved."""
+    try:
+        link = hp.parse_hop_link(fp.load_policy(feature_manifest_path(home)))
+    except (OSError, ValueError, fp.PolicyError) as e:
+        return rh.Unresolved(f"the fleet policy cannot be read: {e}")
+    return link is not None and link.inbound is not None
+
+
+def run_verify_host_setup(args: argparse.Namespace, home: Path) -> int:
     """verify's host-setup part: when the deployment overlay has a
     `host_setup` section, every `host-setup` check, with an UNKNOWN a
     problem like a FAIL. Silent without an overlay. `--host-facts` does not
@@ -5063,7 +5075,7 @@ def run_verify_host_setup(args: argparse.Namespace) -> int:
     if overlay is None:
         return 0
     print("\nverify: the hop deployment's host setup")
-    return hsu.verify_section(overlay)
+    return hsu.verify_section(overlay, policy_on=delegation_policy(home))
 
 
 def run_verify_command(args: argparse.Namespace, home: Path, boxes_dir: Path) -> int:
@@ -5084,7 +5096,7 @@ def run_verify_command(args: argparse.Namespace, home: Path, boxes_dir: Path) ->
                                  notes_out=install_notes)
         print("\nverify (2/2): the checks the install cannot make")
         live_rc = run_verify(args, servers, home, boxes_dir, facts, install_notes=install_notes)
-        hop_rc = run_verify_host_setup(args)
+        hop_rc = run_verify_host_setup(args, home)
         rc = stale_rc or live_rc or hop_rc
         return rc
     finally:
