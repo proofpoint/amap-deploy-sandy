@@ -237,7 +237,8 @@ def verdict_p01(walks: Dict[str, Any], uids: Dict[str, int], hops: Sequence[Tupl
         if foreign:
             return "FAIL", "ok", f"{principal}: processes under uid(s) {foreign}, not {uids[principal]}"
     for up, down in hops:
-        if up in walks and down in walks and uids[up] == uids[down]:
+        # The planned uids, so a principal left unmeasured is still held to it.
+        if up in uids and down in uids and uids[up] == uids[down]:
             return "FAIL", "ok", f"{up} and {down} share uid {uids[up]}"
     if unmeasured:
         return "UNKNOWN", "unresolved", unmeasured_detail(unmeasured)

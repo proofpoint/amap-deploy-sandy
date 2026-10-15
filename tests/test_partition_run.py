@@ -513,6 +513,13 @@ class A2OutcomeTest(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertEqual(self.outcome(**args)[0], pr.INCOMPLETE)
 
+    def test_a_shared_planned_uid_fails_with_one_end_unmeasured(self):
+        ok = {"downstream": [(1, 2102, 2102)]}
+        shared = {"upstream": 2102, "downstream": 2102}
+        self.assertEqual(pp.verdict_p01(ok, shared, [("upstream", "downstream")], self.UNMEASURED)[0], "FAIL")
+        self.assertEqual(pp.p01_dispositions(ok, shared, [("upstream", "downstream")], self.UNMEASURED),
+                         {"upstream": "FAIL", "downstream": "FAIL"})
+
     def test_the_unmeasured_router_never_hides_a_failure(self):
         walks = {"downstream": [(1, 2102, 2102), (2, 0, 0)]}
         self.assertEqual(pp.verdict_p01(walks, {"upstream": 2101, "downstream": 2102}, [("upstream", "downstream")],
