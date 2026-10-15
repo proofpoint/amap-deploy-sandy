@@ -145,10 +145,49 @@ class ProbeRunTest(unittest.TestCase):
         self.email["mounts"].append({"type": "bind", "source": "/opt/ex", "target": "/mnt/ex", "readonly": True})
         doc, _, _ = self.run_it()
         roles = next(p for p in json.loads(doc)["probes"] if p["id"] == "P03")["target_role"]
-        self.assertEqual(roles, ["key:signing", "key:dir", "mount:/mnt/ex/keys/signing.key", "mount:/mnt/ex/keys"])
+        self.assertEqual(roles, ["key:signing", "key:dir", "mount:1", "mount:3"])
         p03 = [a for a in self.engine.seen if pp.P03_SCRIPT in a][0]
         args = p03[p03.index("-c") + 2:]
         self.assertEqual(sorted(args), sorted([KEY, "/opt/ex/keys", "/mnt/ex/keys/signing.key", "/mnt/ex/keys"]))
+
+    # Host facts outside the evidence vocabulary
+    def test_a_mount_path_no_role_could_spell_still_produces_evidence(self):
+        """Roles name a candidate by its index, so a host's real paths (a
+        space, an @, more than 128 characters) never reach the vocabulary."""
+        for where in ("/Library/Application Support/ex", "/run/user@1000", "/" + "d" * 140):
+            with self.subTest(where=where):
+                self.email = json.loads(json.dumps(EMAIL))
+                self.email["mounts"].append({"type": "bind", "source": "/opt/ex", "target": where, "readonly": True})
+                self.engine.seen = []
+                doc, code, report = self.run_it()
+                self.assertEqual(code, 0, report)
+                p03 = next(p for p in json.loads(doc)["probes"] if p["id"] == "P03")
+                self.assertEqual(p03["target_role"], ["key:signing", "key:dir", "mount:1", "mount:3"])
+                argv = [a for a in self.engine.seen if pp.P03_SCRIPT in a][0]
+                self.assertIn(where + "/keys/signing.key", argv)
+
+    def test_a_lane_no_role_could_spell_or_no_lane_at_all_refuses_with_exit_2(self):
+        for slugs, words in ((["al+pha"], "'peer:al+pha'"), (["a" * 65], "'peer:" + "a" * 65 + "'"),
+                             ([], "no lane to probe")):
+            with self.subTest(slugs=slugs):
+                self.lanes = {s: os.path.join(self.root, "instances", "alpha", "peer") for s in slugs}
+                self.sources = dict(self.lanes)
+                self.engine.seen = []
+                doc, code, report = self.run_it()
+                self.assertEqual((doc, code), (None, 2))
+                self.assertIn(words, report[-1])
+                self.assertEqual(self.engine.seen, [], "refused before any probe runs")
+
+    def test_evidence_that_cannot_be_built_is_exit_2_never_a_traceback(self):
+        plan = self.plan()
+        plan = pp.Plan(**dict(plan.__dict__, bindings={"host_setup": "not a sha256"}))
+        try:
+            doc, code, report = pp.run(plan, pp.Runner(["docker"], self.engine), hr.argv)
+        except Exception as e:  # a crash is not a verdict
+            self.fail(f"the run raised {e!r}")
+        self.assertEqual((doc, code), (None, 2))
+        self.assertIn("cannot be built", report[-1])
+        self.assertTrue(report[0].startswith("P01: PASS"), "the probes' own lines are kept")
 
     # P04
     def test_a_created_file_in_a_lane_fails_p04(self):

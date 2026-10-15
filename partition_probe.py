@@ -416,6 +416,22 @@ def oneshot_argv(one: Dict[str, Any], run_argv: Callable[[Dict[str, Any]], List[
 # --- The run -------------------------------------------------------------------------
 
 
+#: The probes, in the order the evidence lists them.
+PROBE_ORDER = ("P01", "P02", "P03", "P04")
+
+
+def p03_roles(cands: Sequence[str], key_path: str, key_dir: str) -> List[str]:
+    """P03's roles: the key and its directory, then each other candidate by
+    its index in `cands` (the index its verdict's detail names), never by
+    its path, which a host may spell outside the evidence vocabulary."""
+    return ["key:signing", "key:dir"] + [f"mount:{i}" for i, c in enumerate(cands) if c not in (key_path, key_dir)]
+
+
+def p04_roles(lanes: Dict[str, str]) -> List[str]:
+    """P04's roles: each enrolled agent's lane, by its slug."""
+    return [f"peer:{s}" for s in sorted(lanes)]
+
+
 def _probe_entry(pid: str, vantage: List[Dict[str, Any]], operation: str, roles: List[str],
                  verdict: Tuple[str, str, str], witness: Tuple[str, str]) -> Dict[str, Any]:
     return {"id": pid, "vantage": vantage, "operation": operation, "target_role": list(dict.fromkeys(roles)),
@@ -505,6 +521,17 @@ def run(plan: Plan, runner: Runner, run_argv: Callable, stat_: Callable = os.sta
         return None, 2, [f"refused: the running email router is not its rendering: {why}"]
     report = []
     email_vantage = [spec_vantage(plan.email)]
+    cands = candidates(plan.email["mounts"], [plan.key_path, plan.key_dir])
+    roles = {"P01": [f"runtime:{p}" for p in sorted(plan.runtimes)],
+             "P02": [f"marker:{s}/{n}" for n, s, _, _ in MARKERS if s in plan.sides],
+             "P03": p03_roles(cands, plan.key_path, plan.key_dir),
+             "P04": p04_roles(plan.lanes)}
+    if not plan.lanes:
+        return None, 2, ["refused: P04 has no lane to probe: no agent's peer/ is enrolled"]
+    for pid in PROBE_ORDER:
+        bad = [r for r in roles[pid] if not pe.role_ok(r)]
+        if bad:
+            return None, 2, [f"refused: {pid}'s role {bad[0]!r} is outside the evidence vocabulary"]
 
     # P01: each hop runtime's processes, read as its own principal.
     walks = {}
@@ -536,7 +563,6 @@ def run(plan: Plan, runner: Runner, run_argv: Callable, stat_: Callable = os.sta
     p02 = verdict_p02(nonowner, witness, {side: plan.owners[side][2] for side in plan.owners})
 
     # P03: every path reaching the key, from the email router; the local router's witness.
-    cands = candidates(plan.email["mounts"], [plan.key_path, plan.key_dir])
     out = run_oneshot(runner, plan.email, "P03", rid, P03_SCRIPT, cands, run_argv, plan.email_volume)
     rows3 = out if isinstance(out, rh.Unresolved) else parse_rows(out, len(cands))
     w3 = run_oneshot(runner, plan.router, "P03W", rid, OPEN_WITNESS_SCRIPT, ["r", plan.key_path], run_argv)
@@ -556,27 +582,29 @@ def run(plan: Plan, runner: Runner, run_argv: Callable, stat_: Callable = os.sta
 
     p02_witness = "unresolved" if any(isinstance(w, rh.Unresolved) for w in witness.values()) else (
         "ok" if all(_witnessed(w) == "ok" for w in witness.values()) else "EACCES")
-    mount_roles = [f"mount:{c}" for c in cands if c not in (plan.key_path, plan.key_dir)]
     probes = [
         _probe_entry("P01", [plan.vantages[p] for p in sorted(plan.runtimes)], "read /proc/*/status as the principal",
-                     [f"runtime:{p}" for p in sorted(plan.runtimes)], p01,
+                     roles["P01"], p01,
                      ("read each uid from the process", "unresolved" if p01[1] == "unresolved" else "ok")),
         _probe_entry("P02", [spec_vantage(plan.sides[s][0]) for s in sorted(plan.sides)],
                      "lstat; open for writing; create beside",
-                     [f"marker:{s}/{n}" for n, s, _, _ in MARKERS if s in plan.sides], p02,
+                     roles["P02"], p02,
                      ("the owner opens its markers for writing", p02_witness)),
-        _probe_entry("P03", email_vantage, "lstat", ["key:signing", "key:dir"] + mount_roles, p03,
+        _probe_entry("P03", email_vantage, "lstat", roles["P03"], p03,
                      ("the local router opens the key read-only", _witnessed(w3))),
-        _probe_entry("P04", email_vantage, "lstat; create the probe name", [f"peer:{s}" for s in sorted(plan.lanes)], p04,
+        _probe_entry("P04", email_vantage, "lstat; create the probe name", roles["P04"], p04,
                      ("each lane is its agent's live mount", "unresolved" if isinstance(lanes, rh.Unresolved) else "ok")),
     ]
     details = {"P01": p01[2], "P02": p02[2], "P03": p03[2], "P04": p04[2]}
     probes = json.loads(json.dumps(probes, default=list))
-    doc = pe.build(host=plan.host, run_id=rid, at=plan.at, script_sha256=script_sha256(),
-                   bindings=plan.bindings, probes=probes)
     verdicts = [p["verdict"] for p in probes]
     for p in probes:
         report.append(f"{p['id']}: {p['verdict']}: {details[p['id']]}")
+    try:
+        doc = pe.build(host=plan.host, run_id=rid, at=plan.at, script_sha256=script_sha256(),
+                       bindings=plan.bindings, probes=probes)
+    except pe.EvidenceError as e:
+        return None, 2, report + [f"refused: the evidence cannot be built from this host's facts: {e}"]
     code = 1 if "FAIL" in verdicts else 2 if "UNKNOWN" in verdicts else 0
     return doc, code, report
 

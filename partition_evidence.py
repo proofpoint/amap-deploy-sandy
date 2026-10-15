@@ -125,6 +125,11 @@ def build(*, host: str, run_id: str, at: str, script_sha256: Dict[str, str], bin
     return raw
 
 
+def role_ok(role: str) -> bool:
+    """Whether `role` is in the evidence vocabulary a probe's target_role holds."""
+    return isinstance(role, str) and _ROLE.fullmatch(role) is not None
+
+
 def _no_duplicates(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
     for k, v in pairs:
@@ -210,7 +215,7 @@ def _probe_problem(p: Dict[str, Any]) -> None:
     if not isinstance(p["operation"], str) or not p["operation"]:
         raise EvidenceError(f"{pid}'s operation must be a non-empty string")
     roles = p["target_role"]
-    if not isinstance(roles, list) or not roles or not all(isinstance(r, str) and _ROLE.fullmatch(r) for r in roles):
+    if not isinstance(roles, list) or not roles or not all(role_ok(r) for r in roles):
         raise EvidenceError(f"{pid}'s target_role must be a list of typed roles")
     if len(set(roles)) != len(roles):
         raise EvidenceError(f"{pid}'s target_role must not repeat a role")
