@@ -13,6 +13,15 @@ import partition_incident as pi
 import router_health as rh
 
 ID = "c0ffee" * 10 + "abcd"
+
+
+def called(test, fn, *a, **k):
+    """`fn`'s result; any exception it raises fails the test, so a crash is
+    never taken for a verdict."""
+    try:
+        return fn(*a, **k)
+    except Exception as e:  # a crash is not a verdict
+        test.fail(f"{fn.__name__} raised {e!r}")
 AT = "2026-10-15T00:00:00Z"
 
 
@@ -83,10 +92,18 @@ class ActTest(unittest.TestCase):
         self.router = Router()
         self.said = []
 
-    def act(self, store=None, identity=ID):
-        return pi.act(store or pi.Store(), self.router.effects(), evidence_dir=self.dir, run_id="r1", at=AT,
-                      failing=["P04"], token="r0:" + "a" * 64, identity=identity, evidence_persisted=True,
+    def act(self, store=None, identity=ID, run_id="r1"):
+        return called(self, pi.act, store or pi.Store(), self.router.effects(), evidence_dir=self.dir, run_id=run_id,
+                      at=AT, failing=["P04"], token="r0:" + "a" * 64, identity=identity, evidence_persisted=True,
                       emit=self.said.append)
+
+    def test_a_run_id_that_could_name_another_path_refuses_before_anything(self):
+        for bad in ("../r1", "a/b", ""):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    pi.act(pi.Store(), self.router.effects(), evidence_dir=self.dir, run_id=bad, at=AT,
+                           failing=["P04"], token=None, identity=ID, evidence_persisted=True, emit=lambda s: None)
+        self.assertEqual((os.listdir(self.dir), self.router.stops), ([], []))
 
     def events(self):
         with open(os.path.join(self.dir, "incident-r1", "events.jsonl")) as f:
@@ -175,8 +192,16 @@ class LifecycleTest(unittest.TestCase):
         self.store = pi.Store()
 
     def act(self, store=None):
-        pi.act(store or self.store, self.router.effects(), evidence_dir=self.dir, run_id="r1", at=AT,
+        called(self, pi.act, store or self.store, self.router.effects(), evidence_dir=self.dir, run_id="r1", at=AT,
                failing=["P03"], token=None, identity=ID, evidence_persisted=True, emit=lambda s: None)
+
+    def opened(self):
+        got = called(self, pi.open_incidents, self.store, self.dir)
+        return got if isinstance(got, rh.Unresolved) else [i.run_id for i in got]
+
+    def complete(self, **k):
+        return called(self, pi.complete, self.store, self.router.effects(), evidence_dir=self.dir, at=AT,
+                      identity=ID, emit=lambda s: None, **k)
 
     def fresh(self, at="2026-10-16T00:00:00Z", stale=()):
         return {"run_id": "r2", "at": at}, list(stale)
@@ -185,7 +210,7 @@ class LifecycleTest(unittest.TestCase):
         args = dict(evidence_dir=self.dir, run_id="r1", reason="the peer mount was removed", at="2026-10-16T01:00:00Z",
                     fresh=self.fresh(), identity=ID)
         args.update(over)
-        return pi.resolve(self.store, self.router.effects(), **args)
+        return called(self, pi.resolve, self.store, self.router.effects(), **args)
 
     def test_an_incident_is_open_until_resolved_and_vetoes_meanwhile(self):
         self.act()
@@ -207,6 +232,17 @@ class LifecycleTest(unittest.TestCase):
                 self.assertTrue(any(words in w for w in why), why)
         self.assertEqual([i.run_id for i in pi.open_incidents(self.store, self.dir)], ["r1"])
 
+    def test_resolve_refuses_an_unobservable_config_and_a_pending_rewrite(self):
+        self.act()
+        self.router.delegation = rh.Unresolved("the config cannot be read")
+        self.assertTrue(any("cannot observe the live config" in w for w in self.resolve()))
+        self.setUp()
+        self.router.rewrite_error = "rename failed"
+        self.act()
+        self.router.delegation = False
+        self.assertTrue(any("its rewrite is not complete" in w for w in self.resolve()))
+        self.assertEqual(self.opened(), ["r1"])
+
     def test_resolve_checks_current_facts_not_history(self):
         self.act()
         self.router.delegation = True
@@ -219,17 +255,16 @@ class LifecycleTest(unittest.TestCase):
         os.makedirs(os.path.join(self.dir, "incident-r1"))
         with open(os.path.join(self.dir, "incident-r1", "detected.json"), "w") as f:
             json.dump({"run_id": "r1", "at": AT, "pending": ["rewrite", "stop"]}, f)
-        said = pi.complete(self.store, self.router.effects(), evidence_dir=self.dir, at=AT, identity=ID,
-                           emit=lambda s: None)
+        said = self.complete()
         self.assertEqual(said, ["r1: rewrite_ok", "r1: stop_ok"])
         self.assertEqual(self.router.stops, [ID])
+        self.assertFalse(self.router.delegation, "the rewrite was done, not only recorded")
         self.assertEqual(pi.read_all(self.store, self.dir)[0].pending(), [])
 
     def test_completion_is_idempotent_and_reads_current_facts(self):
         self.act(store=Failing("append", times=2))
         self.assertEqual(self.router.stops, [ID])
-        said = pi.complete(self.store, self.router.effects(), evidence_dir=self.dir, at=AT, identity=ID,
-                           emit=lambda s: None)
+        said = self.complete()
         self.assertEqual(self.router.stops, [ID], "a stopped router is not stopped again")
         self.assertEqual(said, ["r1: rewrite_ok", "r1: stop_ok"])
         self.assertEqual(pi.read_all(self.store, self.dir)[0].pending(), [], "nothing left to repeat")
@@ -240,25 +275,31 @@ class LifecycleTest(unittest.TestCase):
         pi.act(Failing("mkdir"), self.router.effects(), evidence_dir=self.dir, run_id="r1", at=AT, failing=["P04"],
                token=None, identity=ID, evidence_persisted=False, emit=lambda s: None)
         self.assertEqual(pi.open_incidents(self.store, self.dir), [])
-        pi.complete(self.store, self.router.effects(), evidence_dir=self.dir, at=AT, identity=ID,
-                    late={"run_id": "r1", "at": AT, "failing": ["P04"], "token": None, "failing_evidence_persisted": False},
-                    emit=lambda s: None)
-        inc = pi.open_incidents(self.store, self.dir)[0]
+        self.complete(late={"run_id": "r1", "at": AT, "failing": ["P04"], "token": None,
+                            "failing_evidence_persisted": False})
+        inc = called(self, pi.open_incidents, self.store, self.dir)[0]
         self.assertEqual(inc.run_id, "r1")
         for k in ("recorded_late", "taken_without_record"):
-            self.assertIs(inc.detected[k], True)
+            self.assertIs(inc.detected.get(k), True, k)
         self.assertIs(inc.detected["failing_evidence_persisted"], False)
 
     def test_a_malformed_or_truncated_history_is_open(self):
         self.act()
-        self.assertEqual(self.resolve(), [])
         path = os.path.join(self.dir, "incident-r1", "events.jsonl")
-        with open(path, "a") as f:
-            f.write('{"event":"resolved"')
-        self.assertEqual([i.run_id for i in pi.open_incidents(self.store, self.dir)], ["r1"])
+        for name, tail in (("a broken last line", '{"event":"resolved"'),
+                           ("a whole last line with no newline", '{"event":"resolved","at":"x"}'),
+                           ("an event outside the vocabulary", '{"event":"closed_by_hand"}\n{"event":"resolved"}\n')):
+            with self.subTest(name=name):
+                with open(path, "w") as f:
+                    f.write('{"event":"rewrite_ok"}\n' + tail)
+                self.assertEqual(self.opened(), ["r1"])
+        detected = os.path.join(self.dir, "incident-r1", "detected.json")
+        os.chmod(detected, 0o644)
+        with open(detected, "w") as f:
+            f.write("[]")
         with open(path, "w") as f:
-            f.write('{"event":"closed_by_hand"}\n')
-        self.assertEqual([i.run_id for i in pi.open_incidents(self.store, self.dir)], ["r1"])
+            f.write('{"event":"resolved"}\n')
+        self.assertEqual(self.opened(), ["r1"], "an unreadable detected.json is open")
 
     def test_nothing_is_ever_deleted(self):
         self.act()

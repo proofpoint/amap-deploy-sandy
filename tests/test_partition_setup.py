@@ -231,13 +231,19 @@ class ReadRecordTest(unittest.TestCase):
                 ps.read_record(f)
 
     def test_a_symbolic_link_is_never_followed(self):
+        """Even to a file the descriptor checks would accept: the link is
+        refused at the open."""
+        import unittest.mock as um
+        fake = os.stat_result((0o100444, 0, 0, 1, 0, 0, 2, 0, 0, 0))
         with tempfile.TemporaryDirectory() as t:
             real = os.path.join(t, "real.json")
-            open(real, "wb").close()
+            with open(real, "wb") as f:
+                f.write(b"{}")
             link = os.path.join(t, "gate-record.json")
             os.symlink(real, link)
-            with self.assertRaises(OSError):
-                ps.read_record(link)
+            with um.patch.object(ps.os, "fstat", lambda fd: fake):
+                with self.assertRaises(OSError):
+                    ps.read_record(link)
 
 
 

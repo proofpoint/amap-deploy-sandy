@@ -85,6 +85,20 @@ class ProspectiveSpecTest(unittest.TestCase):
             self.spec(staged=staged)
         self.assertIn("derive-mounts refuses", str(e.exception))
 
+    def test_derive_mounts_output_that_is_not_a_mount_line_refuses(self):
+        """A checkout whose derive-mounts prints a relative path or an unknown
+        mode: the spec is never built from it."""
+        for line in ("relative/path\trw", f"{self.tree.root}/state\trwx", f"{self.tree.root}/state"):
+            with self.subTest(line=line):
+                with tempfile.TemporaryDirectory() as t:
+                    os.makedirs(os.path.join(t, "docker"))
+                    with open(os.path.join(t, "docker", "derive-mounts.py"), "w") as f:
+                        f.write(f"print({line!r})\n")
+                    with self.assertRaises(pa.ActivationError) as e:
+                        pa.prospective_spec(checkout=t, final_path=self.final, staged=self.tree.config(),
+                                            image="i", container="c", uid=1, gid=1)
+                    self.assertIn("derive-mounts printed", str(e.exception))
+
     def test_a_relative_or_unnormalised_final_path_refuses(self):
         for bad in ("router.json", "/a/../router.json"):
             with self.subTest(bad=bad):
@@ -229,6 +243,7 @@ class SupervisorTest(unittest.TestCase):
         def read(p):
             raise PermissionError(p)
         got = pa.supervisor_problems("ex-up", dirs=self.dirs, read=read)
+        self.assertIsInstance(got, rh.Unresolved, got)
         self.assertIn("cannot read", got.reason)
 
     def test_a_missing_supervisor_directory_is_not_a_problem(self):
@@ -305,15 +320,19 @@ class StagedBytesTest(unittest.TestCase):
         raw = pa.staged_bytes(self.DOC, self.BLOCK, self.loader)
         self.assertEqual(self.seen, [json.loads(pa.final_bytes(raw, pa.LOADER_PLACEHOLDER))])
 
-    def test_a_refusal_or_a_malformed_block_refuses(self):
-        cases = {"loader": (self.DOC, self.BLOCK, lambda d: "config.delegation.signing_key: needs exactly"),
-                 "no signing key": (self.DOC, {}, self.loader),
-                 "a token already": (self.DOC, dict(self.BLOCK, partition_verified="r1:x"), self.loader),
-                 "a block already": (dict(self.DOC, delegation=self.BLOCK), self.BLOCK, self.loader)}
-        for name, args in cases.items():
+    def test_a_refusal_or_a_malformed_block_refuses_by_its_own_reason(self):
+        cases = {"loader": ((self.DOC, self.BLOCK, lambda d: "config.delegation.signing_key: needs exactly"),
+                            "loader refuses"),
+                 "no signing key": ((self.DOC, {}, self.loader), "needs a signing_key"),
+                 "a token already": ((self.DOC, dict(self.BLOCK, partition_verified="r1:x"), self.loader),
+                                     "must not carry partition_verified"),
+                 "a block already": ((dict(self.DOC, delegation=self.BLOCK), self.BLOCK, self.loader),
+                                     "already carries a delegation block")}
+        for name, (args, words) in cases.items():
             with self.subTest(name=name):
-                with self.assertRaises(pa.ActivationError):
+                with self.assertRaises(pa.ActivationError) as e:
                     pa.staged_bytes(*args)
+                self.assertIn(words, str(e.exception))
 
 
 if __name__ == "__main__":
