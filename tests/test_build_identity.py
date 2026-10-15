@@ -319,7 +319,7 @@ class HostFactsDocumentTest(unittest.TestCase):
         self.assertEqual(doc["schema"], 3)
         [p] = doc["phases"]
         self.assertEqual((p["id"], p["title"]), ("runtime-builds", "runtime builds"))
-        self.assertEqual(p["deployed_roles"], ["hop_router", "hub_router"])
+        self.assertEqual(p.get("deployed_roles"), ["hop_router", "hub_router"])
 
     def test_each_check_has_exactly_the_members_the_harness_reads(self):
         a, b, c = self.doc()["phases"][0]["checks"]
