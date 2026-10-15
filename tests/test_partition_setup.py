@@ -344,6 +344,28 @@ class StopTargetTest(unittest.TestCase):
         self.files = {f"{evidence_dir}/stop-target.json": None, f"{evidence_dir}/activation.json": self.activation,
                       f"{evidence_dir}/partition-r1.json": self.evidence}
 
+    def another_activation(self):
+        """A valid A1 record of the same host and config path (another image),
+        not the one the copy was recorded against."""
+        import partition_activation as pa
+        staged = json.loads(self.activation)["staged"].encode()
+        spec = dict(self.SPEC, image="sha256:" + "9" * 64)
+        self.files[f"{EV}/activation.json"] = pa.activation_record(host="alpha", spec=spec, staged=staged,
+                                                                   final_config_path=self.live)
+
+    def other_evidence(self):
+        """A valid document of the same run and host (other bindings), its own
+        token in the live config, not the one the copy was recorded against."""
+        import partition_activation as pa
+        import partition_evidence as pe
+        from test_partition_evidence import probe
+        other = pe.build(host="alpha", run_id="r1", at="2026-10-15T05:00:00Z", script_sha256={"s": "0" * 64},
+                         bindings={"b": "2" * 64}, probes=[probe(p) for p in pe.PROBE_IDS])
+        self.files[f"{EV}/partition-r1.json"] = other
+        staged = json.loads(self.activation)["staged"].encode()
+        self.config = pa.final_bytes(staged, pe.token_of(json.loads(other)))
+        self.record.update(config_sha256=hashlib.sha256(self.config).hexdigest())
+
     def read(self, path):
         import partition_evidence as pe
         data = self.files.get(path)
@@ -391,8 +413,8 @@ class StopTargetTest(unittest.TestCase):
             "another docker": lambda: self.record.update(docker="/usr/bin/docker"),
             "another live config": lambda: self.record.update(live_config_path="/elsewhere.json"),
             "another evidence directory": lambda: self.record.update(evidence_dir="/elsewhere"),
-            "another activation": lambda: self.files.update({f"{EV}/activation.json": b"{}"}),
-            "the evidence changed": lambda: self.files.update({f"{EV}/partition-r1.json": b"{}"}),
+            "another activation, valid and bound, not the recorded one": self.another_activation,
+            "other evidence, valid and bound, not the recorded one": self.other_evidence,
             "a member short": lambda: self.record.pop("inspect_digest"),
             "a member of the wrong type": lambda: self.record.update(at=5),
             "stale: the router was recreated": lambda: self.running.update(
