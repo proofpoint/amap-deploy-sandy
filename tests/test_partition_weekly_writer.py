@@ -232,6 +232,36 @@ if os.environ.get("PW_RUNS_FAULT"):
             return maybe
     real_fs = hs._runs_fs
     hs._runs_fs = lambda p: Faulty() if p == phase else real_fs(p)
+# PW_SETUP_FAULT names one step between W2 and the child that fails with an
+# OSError: mkdir of the run directory or of its docker directory, the
+# context record, W5's listing, or the child's launch.
+_fault = os.environ.get("PW_SETUP_FAULT")
+if _fault in ("mkdir-run", "mkdir-docker"):
+    _real_mkdir = os.mkdir
+    def _mkdir(path, *a, **k):
+        if (path.startswith("run-") if _fault == "mkdir-run" else path == "docker"):
+            raise OSError(28, "No space left on device", path)
+        return _real_mkdir(path, *a, **k)
+    os.mkdir = _mkdir
+elif _fault == "context":
+    _real_write_at = hs._write_at
+    def _write_at(dfd, name, *a, **k):
+        if name == "context.json":
+            raise OSError(28, "No space left on device", name)
+        return _real_write_at(dfd, name, *a, **k)
+    hs._write_at = _write_at
+elif _fault == "listing":
+    _real_record, _calls = hs._runs_record, []
+    def _runs_record(*a, **k):
+        _calls.append(1)
+        if len(_calls) == 1:
+            raise OSError(5, "Input/output error", "exec_root")
+        return _real_record(*a, **k)
+    hs._runs_record = _runs_record
+elif _fault == "launch":
+    def _launch(*a, **k):
+        raise OSError(8, "Exec format error", a[0][0])
+    hs._launch = _launch
 if os.environ.get("PW_REMOVE_FAIL"):
     import re as _re
     real_rm = hs._remove_tree

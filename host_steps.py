@@ -2048,6 +2048,11 @@ def _runs_record(efd, host, at, kept, running=None):
     return _canonical({"schema": RUNS_SCHEMA, "host": host, "at": at, "runs": runs})
 
 
+def _launch(argv, **kw):
+    """The child's start (a test faults it)."""
+    return subprocess.Popen(argv, **kw)
+
+
 def _status(code):
     """A status failure (a run record or a run directory the writer could not
     settle) maps the exit once: a pass becomes a handoff; an incident, a
@@ -2083,8 +2088,11 @@ def partition_weekly(exec_root, host, document, sha256, activation, activation_s
         return EXIT_TOOLING
     lock_fd = values = None
     # The record's state: the evidence directory once W2 removed the old
-    # record, the runs a decision kept, and whether any status failed.
-    rec = {"evfd": None, "kept": set(), "status": False}
+    # record, the runs a decision kept, whether any status failed, whether an
+    # abandoned run's decision was an incident, this run's directory once
+    # made, whether its child started, and this run's decided exit.
+    rec = {"evfd": None, "kept": set(), "status": False, "incident": False, "made": None, "started": False,
+           "code": None}
 
     def remove(name):
         try:
@@ -2117,7 +2125,6 @@ def partition_weekly(exec_root, host, document, sha256, activation, activation_s
             except OSError as e:
                 os.close(evfd)
                 said.append(f"the run record cannot be invalidated ({e.strerror or e}); no run is started")
-            incident = False
             for n in sorted(os.listdir(efd)):
                 if RUN_NAME.fullmatch(n):
                     said.append(f"{n}: abandoned; completing its decision before removing it")
@@ -2126,14 +2133,14 @@ def partition_weekly(exec_root, host, document, sha256, activation, activation_s
                     except OSError as e:
                         said.append(f"{n}: cannot be read ({e.strerror}); kept, undecided, for the operator")
                         continue
-                    incident = incident or code == EXIT_INCIDENT
+                    rec["incident"] = rec["incident"] or code == EXIT_INCIDENT
                     if keep:
                         said.append(f"{n}: kept, since an effect is not yet shown done")
                         rec["kept"].add(n)
                     else:
                         remove(n)
             # With no child, an abandoned run's incident is the exit; a status failure never hides it.
-            no_child = EXIT_INCIDENT if incident else EXIT_HANDOFF
+            no_child = EXIT_INCIDENT if rec["incident"] else EXIT_HANDOFF
             if rec["evfd"] is None:
                 return no_child
             target = recovery["router_container_id"] if recovery and recovery["host"] == host \
@@ -2141,6 +2148,7 @@ def partition_weekly(exec_root, host, document, sha256, activation, activation_s
                 and recovery["evidence_dir"] == values["evidence_dir"] else None
             run_name = RUN_PREFIX + rid
             os.mkdir(run_name, 0o700, dir_fd=efd)
+            rec["made"] = run_name
             rfd = os.open(run_name, _DIR, dir_fd=efd)
             try:
                 for d in ("docker", "home"):
@@ -2164,12 +2172,13 @@ def partition_weekly(exec_root, host, document, sha256, activation, activation_s
             run_dir = os.path.join(exec_root, run_name)
             child_fd = os.dup(lock_fd)
             try:
-                child = subprocess.Popen(
+                child = _launch(
                     [python, "-I", "-S", "-B", os.path.join(exec_root, BUNDLE, LAUNCHER), "--run-dir", run_dir,
                      "--lock-fd", str(child_fd), "--docker", docker],
                     shell=False, close_fds=True, pass_fds=(child_fd,), stdin=subprocess.DEVNULL, cwd=run_dir,
                     env={"DOCKER_HOST": values["engine"], "DOCKER_CONFIG": os.path.join(run_dir, "docker"),
                          "HOME": os.path.join(run_dir, "home"), "LC_ALL": "C"}, start_new_session=True)
+                rec["started"] = True
             finally:
                 os.close(child_fd)
             try:
@@ -2182,6 +2191,7 @@ def partition_weekly(exec_root, host, document, sha256, activation, activation_s
                     pass
                 child.wait()
             code, passed, keep = _decide(efd, run_name, current, said)
+            rec["code"] = code
             if code == EXIT_PASS:
                 why = _verified_target(_Engine(docker, values["engine"], run_dir), passed, values)
                 if why:
@@ -2209,6 +2219,16 @@ def partition_weekly(exec_root, host, document, sha256, activation, activation_s
         except Handoff as e:
             said.append(f"handoff: {e}")
             return EXIT_HANDOFF
+        except OSError as e:
+            # Setting up, listing or launching failed. A run whose child never
+            # started has no effect, and its directory goes; a decided run
+            # keeps its exit; otherwise it is a handoff, never an incident.
+            said.append(f"handoff: {e.strerror or e}" + (f" ({e.filename})" if e.filename else ""))
+            if rec["made"] is not None and not rec["started"]:
+                remove(rec["made"])
+            if rec["code"] is not None:
+                return rec["code"] if rec["code"] in (EXIT_INCIDENT, EXIT_TOOLING) else EXIT_HANDOFF
+            return EXIT_INCIDENT if rec["incident"] else EXIT_HANDOFF
         except Tooling as e:
             said.append(f"tooling_unverified: {e}")
             if lock_fd is None:
@@ -2232,21 +2252,28 @@ def partition_weekly(exec_root, host, document, sha256, activation, activation_s
                  "tooling-" + rid, at, ["tooling_unverified"], _Engine(docker, recovery["engine"], exec_root), said)
             return EXIT_TOOLING
 
+    def publish():
+        """W7, after every effect and before the lock is released, on every
+        path once W2 succeeded: what remains, from a fresh listing. Visible is
+        never taken for durable."""
+        if rec["evfd"] is None:
+            return
+        try:
+            data = _runs_record(efd, host, stamp(), rec["kept"])
+        except OSError as e:
+            said.append(f"the run record cannot be listed ({e.strerror or e}); the last one stays")
+            rec["status"] = True
+            return
+        got = _stage_write(rec["evfd"], WEEKLY_RUNS, data, _runs_fs("W7"))
+        if got:
+            said.append(f"the run record cannot be published durably ({got[0]} its rename: {got[1]})")
+            rec["status"] = True
+
     try:
-        code = body()
-        if rec["evfd"] is not None:
-            # W7, after every effect and before the lock is released: what
-            # remains, from a fresh listing. Visible is never taken for durable.
-            try:
-                data = _runs_record(efd, host, stamp(), rec["kept"])
-            except OSError as e:
-                said.append(f"the run record cannot be listed ({e.strerror or e}); the last one stays")
-                rec["status"] = True
-            else:
-                got = _stage_write(rec["evfd"], WEEKLY_RUNS, data, _runs_fs("W7"))
-                if got:
-                    said.append(f"the run record cannot be published durably ({got[0]} its rename: {got[1]})")
-                    rec["status"] = True
+        try:
+            code = body()
+        finally:
+            publish()
         return _status(code) if rec["status"] else code
     finally:
         for s in said:

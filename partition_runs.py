@@ -132,9 +132,11 @@ def verify_runs(part: Any, gs: Any, *, live_config: str, read: Callable[[str], b
     if doc["host"] != host:
         return fail("its record is another host's")
     clock = now()
-    if _seconds(doc["at"]) > clock + PLACED_SLACK_S:
-        return unknown("the record's time is ahead of this host's clock", "check the host's clock")
     failing, unsure, kept = [], [], False
+    if _seconds(doc["at"]) > clock + PLACED_SLACK_S:
+        # An observation, not a verdict: the entries are still judged, and a
+        # known failing one still FAILs.
+        unsure.append("the record's time is ahead of this host's clock")
     for run in doc["runs"]:
         rid = run["run_id"]
         if run["state"] == KEPT:
@@ -151,5 +153,5 @@ def verify_runs(part: Any, gs: Any, *, live_config: str, read: Callable[[str], b
     if failing:
         return fail("; ".join(failing + unsure), KEPT_REMEDY if kept else RUNS_REMEDY)
     if unsure:
-        return unknown("; ".join(unsure))
+        return unknown("; ".join(unsure), RUNS_REMEDY + "; check the host's clock if a time is ahead of it")
     return [rh.check(RUNS_CLAIM, want, True, RUNS_REMEDY, ok=lambda e, a: a is True)]

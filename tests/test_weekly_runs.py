@@ -196,6 +196,19 @@ class VerifyTest(unittest.TestCase):
         self.assertEqual(self.verdict(record([]), act=activation("beta")).result, rh.FAIL, "another host's")
         self.assertEqual(self.verdict(record([], when=NOW + 60)).result, rh.UNKNOWN, "a record ahead of the clock")
 
+    def test_a_record_ahead_of_the_clock_still_fails_what_it_knows(self):
+        rows = {"kept": ([run("w1", pr.KEPT)], rh.FAIL), "undecided": ([run("w1", pr.UNDECIDED)], rh.FAIL),
+                "overdue": ([run("w1", pr.RUNNING, NOW - pr.STALE_AFTER_S - 1)], rh.FAIL),
+                "empty": ([], rh.UNKNOWN), "recent running": ([run("w1", pr.RUNNING, NOW - 60)], rh.UNKNOWN)}
+        for what, (runs, want) in rows.items():
+            with self.subTest(what):
+                out = self.verdict(record(runs, when=NOW + 60))
+                self.assertEqual(out.result, want)
+                detail = out.actual if want == rh.FAIL else out.actual.reason
+                self.assertIn("ahead of this host's clock", detail, "the observation is kept")
+                for r in runs:
+                    self.assertIn(f"run {r['run_id']}", detail, "every entry's detail is kept")
+
     def test_only_the_grammar_is_read(self):
         good = json.loads(record([run("w1", pr.KEPT), run("w2", pr.RUNNING)]))
         rows = {"an extra member": dict(good, extra=1),
@@ -420,6 +433,31 @@ class WriterRunsTest(unittest.TestCase):
                 self.assertIn("the run record cannot be published", p.stdout)
                 self.assertIsNone(self.h.side_read("child-started.json"))
                 self.assertEqual(self.h.runs(), [], "this run's directory, which had no child, is gone")
+
+    def test_a_setup_failure_before_the_child_is_a_handoff_and_the_end_record_is_still_published(self):
+        """Each step between W2 and the child, failing with an OSError: no
+        child and no engine call, this run's directory (made, no child) gone,
+        the end record published from a fresh listing, and exit 3; with an
+        abandoned run whose decision was an incident, exit 1."""
+        for fault in ("mkdir-run", "mkdir-docker", "context", "listing", "launch"):
+            with self.subTest(fault):
+                self.setUp()
+                self.h.plan([["expect", B], ["evidence", B, PASS], ["outcome", 0, TARGET]])
+                p = self.h.run(env={"PW_SETUP_FAULT": fault})
+                self.invariant()
+                self.assertEqual(p.returncode, hs.EXIT_HANDOFF, p.stdout + p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+                self.assertIn("handoff:", p.stdout)
+                self.assertIsNone(self.h.side_read("child-started.json"))
+                self.assertEqual(self.h.logged(), [], "no engine call")
+                self.assertEqual(self.h.runs(), [], "a run whose child never started has no directory left")
+                self.assertEqual(self.states(), {}, "the end record was published, from a fresh listing")
+        self.setUp()
+        self.h.recovery()
+        self.h.abandoned("wfail", FAIL3)
+        p = self.h.run(env={"PW_SETUP_FAULT": "launch"})
+        self.assertEqual(p.returncode, hs.EXIT_INCIDENT, p.stdout + p.stderr)
+        self.assertEqual(self.h.stops(), [TARGET], "the abandoned run's effects stand")
 
     def test_w7_failing_after_a_pass_is_never_a_pass(self):
         for fault, left in (("W7:open", "running"), ("W7:rename", "running"), ("W7:fsync#2", "empty")):

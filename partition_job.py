@@ -160,8 +160,10 @@ def discover_script(p: ps.PartitionSpec, darwin: bool, q: Callable[[str], str] =
     ldd, which may run a binary's program interpreter, otool, xcode-select),
     run as an unprivileged identity under an empty environment, never as
     root. It prints only the six lists and its own "discovery failed:"
-    lines; root captures them as data. A path holding whitespace is named and
-    left out of the lists."""
+    lines; root captures them as data. Each list is written sorted and
+    without repeats, so T holds the tools' spellings and realpaths among the
+    extension modules, in that order; judge.sh checks it by containment. A
+    path holding whitespace is named and left out of the lists."""
     py, docker = q(p.tools["python3"]), q(p.tools["docker"])
     query = py + " -I -S -B -c 'import os,sys,sysconfig; g=sysconfig.get_paths(); "
     lines = [
