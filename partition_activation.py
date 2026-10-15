@@ -164,10 +164,35 @@ def running_differences(live: Dict[str, Any], spec: Dict[str, Any], image: Dict[
 
 def activation_binding(spec: Dict[str, Any], staged: bytes) -> str:
     """The binding the evidence carries for the local router: its activation
-    config (canonical, without `partition_verified`) and its prospective
-    spec, never its container id."""
+    config (canonical, without `partition_verified`) and its run spec, never
+    its container id. The mounts are bound as a set, so the spec derive-mounts
+    builds and the one read back from the running router (spec_from_running)
+    bind the same when A5's comparison holds."""
     import partition_evidence as pe
-    return pe.sha_json({"config": pe.config_binding(json.loads(staged)), "spec": spec})
+    mounts = sorted(spec["mounts"], key=lambda m: (m["source"], m["target"], m["readonly"]))
+    return pe.sha_json({"config": pe.config_binding(json.loads(staged)), "spec": dict(spec, mounts=mounts)})
+
+
+def spec_from_running(live: Dict[str, Any]) -> Any:
+    """The local router's run spec as `docker inspect` shows it running: the
+    form prospective_spec builds, read back. The weekly job uses it because
+    it runs as root and never executes the hop checkout, which the operator
+    owns; A5's comparison (running_differences empty) is what makes it the
+    activation spec. An Unresolved when the container is not one run.sh
+    could have started: a non-bind mount, or no ROUTER_CONFIG."""
+    cfg, host = live.get("Config") or {}, live.get("HostConfig") or {}
+    env = dict(e.partition("=")[::2] for e in cfg.get("Env") or [])
+    mounts = []
+    for m in live.get("Mounts") or []:
+        if m.get("Type") != "bind":
+            return rh.Unresolved(f"it has a {m.get('Type')} mount at {m.get('Destination')}, which run.sh never makes")
+        mounts.append({"type": "bind", "source": m.get("Source"), "target": m.get("Destination"),
+                       "readonly": not m.get("RW")})
+    if "ROUTER_CONFIG" not in env:
+        return rh.Unresolved("it has no ROUTER_CONFIG")
+    return {"name": (live.get("Name") or "").lstrip("/"), "image": live.get("Image"), "user": cfg.get("User"),
+            "network": host.get("NetworkMode"), "restart": (host.get("RestartPolicy") or {}).get("Name"),
+            "env": {k: env[k] for k in ("ROUTER_CONFIG", "ROUTER_INTERVAL") if k in env}, "mounts": mounts}
 
 
 #: What A1's loader check puts where A3 will put the token: the loader

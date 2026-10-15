@@ -361,5 +361,30 @@ class StagedBytesTest(unittest.TestCase):
                 self.assertIn(words, str(e.exception))
 
 
+
+class SpecFromRunningTest(unittest.TestCase):
+    def test_a_router_started_from_a_spec_reads_back_as_it_and_binds_the_same(self):
+        live = dict(inspect_of(SPEC), Name="/" + SPEC["name"])
+        live["Mounts"] = list(reversed(live["Mounts"]))
+        back = pa.spec_from_running(live)
+        self.assertEqual(pa.running_differences(live, back, IMAGE_ENV), [])
+        staged = FinalBytesTest.STAGED
+        self.assertEqual(pa.activation_binding(back, staged), pa.activation_binding(SPEC, staged),
+                         "the mount order a running container reports does not move the binding")
+
+    def test_a_router_run_sh_could_not_have_started_is_unresolved(self):
+        live = dict(inspect_of(SPEC), Name="/ex-up")
+        live["Mounts"] = live["Mounts"] + [{"Type": "volume", "Source": "v", "Destination": "/v", "RW": True}]
+        self.assertIsInstance(pa.spec_from_running(live), rh.Unresolved)
+        live = dict(inspect_of(SPEC), Name="/ex-up")
+        live["Config"] = {"User": SPEC["user"], "Env": ["PATH=/usr/bin"]}
+        self.assertIsInstance(pa.spec_from_running(live), rh.Unresolved)
+
+    def test_a_changed_binding_moves_the_binding(self):
+        staged = FinalBytesTest.STAGED
+        other = dict(SPEC, mounts=SPEC["mounts"][:-1])
+        self.assertNotEqual(pa.activation_binding(other, staged), pa.activation_binding(SPEC, staged))
+
+
 if __name__ == "__main__":
     unittest.main()
