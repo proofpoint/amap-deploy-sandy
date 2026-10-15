@@ -250,6 +250,40 @@ class CollectTest(unittest.TestCase):
                 self.assertEqual(bi.ID_HOP in ids, bi.ROLE_HOP in p.deployed_roles)
                 self.assertEqual(bi.ID_HUB in ids, bi.ROLE_HUB in p.deployed_roles)
 
+    def test_every_host_shape_keeps_the_harness_invariants(self):
+        """What the harness refuses on, over every shape a host can have: no
+        id twice (build.hop_plugin keyed by its host_role), every plugin claim
+        names its role, and an id is present exactly when its role is listed,
+        the connector included; a plugin claim only for a listed router whose
+        document records the overlay."""
+        role_of = {bi.ID_HOP: bi.ROLE_HOP, bi.ID_HUB: bi.ROLE_HUB, bi.ID_CONNECTOR: bi.ROLE_CONNECTOR}
+        for router_ in (True, False):
+            for hub in (True, False):
+                for overlay in (True, False):
+                    for payload in (True, False):
+                        with self.subTest(router=router_, hub=hub, overlay=overlay, payload=payload):
+                            if payload:
+                                self.payload.mkdir(exist_ok=True)
+                                (self.payload / bi.STAMP_NAME).write_text(bi.stamp_text(PIN, False, PIN))
+                            else:
+                                (self.payload / bi.STAMP_NAME).unlink(missing_ok=True)
+                                if self.payload.exists():
+                                    self.payload.rmdir()
+                            p = self.run_collect(self.spec(router_, hub, overlay))
+                            keys = [(c.id, c.host_role) for c in p.claims]
+                            self.assertEqual(len(keys), len(set(keys)))
+                            for c in p.claims:
+                                if c.id == bi.ID_PLUGIN:
+                                    self.assertIn(c.host_role, p.deployed_roles)
+                                    self.assertIn(c.host_role, (bi.ROLE_HOP, bi.ROLE_HUB))
+                                else:
+                                    self.assertEqual(c.host_role, "")
+                            for cid, role in role_of.items():
+                                self.assertEqual(cid in {c.id for c in p.claims}, role in p.deployed_roles)
+                            plugins = {c.host_role for c in p.claims if c.id == bi.ID_PLUGIN}
+                            self.assertEqual(plugins, {r for r in (bi.ROLE_HOP, bi.ROLE_HUB)
+                                                       if r in p.deployed_roles} if overlay else set())
+
     def test_no_host_setup_document_leaves_only_the_connector(self):
         p = self.run_collect(None)
         self.assertEqual(([c.id for c in p.claims], p.deployed_roles), ([bi.ID_CONNECTOR], [bi.ROLE_CONNECTOR]))
