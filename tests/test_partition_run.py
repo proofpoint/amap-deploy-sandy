@@ -491,7 +491,8 @@ class A2OutcomeTest(unittest.TestCase):
         return build(verdicts=verdicts)
 
     def outcome(self, doc, placed=True, p01=None):
-        p01 = [("UNKNOWN", "unresolved", pp.unmeasured_detail(self.UNMEASURED))] if p01 is None else p01
+        p01 = [{"verdict": "UNKNOWN", "principals": {"upstream": pp.UNMEASURED, "downstream": "PASS"}}] \
+            if p01 is None else p01
         return pr.a2_outcome(doc, placed, p01, self.UNMEASURED)
 
     def test_the_stopped_router_s_unknown_passes(self):
@@ -503,9 +504,12 @@ class A2OutcomeTest(unittest.TestCase):
         for name, args in (("no token", dict(doc=self.doc(P03="FAIL"))),
                            ("not placed", dict(doc=self.doc(P01="UNKNOWN"), placed=False)),
                            ("P02", dict(doc=self.doc(P01="UNKNOWN", P02="FAIL"))),
-                           ("P01 FAIL", dict(doc=self.doc(P01="FAIL"), p01=[("FAIL", "ok", "x")])),
-                           ("P01 other UNKNOWN", dict(doc=self.doc(P01="UNKNOWN"),
-                                                      p01=[("UNKNOWN", "unresolved", "downstream: exec failed")]))):
+                           ("P01 FAIL", dict(doc=self.doc(P01="FAIL"), p01=[{"verdict": "FAIL", "principals": {
+                               "upstream": pp.UNMEASURED, "downstream": "FAIL"}}])),
+                           ("P01 downstream UNKNOWN", dict(doc=self.doc(P01="UNKNOWN"), p01=[{"verdict": "UNKNOWN",
+                               "principals": {"upstream": pp.UNMEASURED, "downstream": "UNKNOWN"}}])),
+                           ("P01 upstream measured UNKNOWN", dict(doc=self.doc(P01="UNKNOWN"), p01=[{
+                               "verdict": "UNKNOWN", "principals": {"upstream": "UNKNOWN", "downstream": "PASS"}}]))):
             with self.subTest(name=name):
                 self.assertEqual(self.outcome(**args)[0], pr.INCOMPLETE)
 
@@ -517,3 +521,8 @@ class A2OutcomeTest(unittest.TestCase):
         verdict, _, detail = pp.verdict_p01(ok, {"upstream": 2101, "downstream": 2102},
                                             [("upstream", "downstream")], self.UNMEASURED)
         self.assertEqual((verdict, detail), ("UNKNOWN", pp.unmeasured_detail(self.UNMEASURED)))
+        self.assertEqual(pp.p01_dispositions(ok, {"upstream": 2101, "downstream": 2102},
+                                             [("upstream", "downstream")], self.UNMEASURED),
+                         {"upstream": pp.UNMEASURED, "downstream": "PASS"})
+        self.assertEqual(pp.p01_dispositions(walks, {"upstream": 2101, "downstream": 2102},
+                                             [("upstream", "downstream")], self.UNMEASURED)["downstream"], "FAIL")

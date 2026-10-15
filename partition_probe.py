@@ -244,6 +244,26 @@ def verdict_p01(walks: Dict[str, Any], uids: Dict[str, int], hops: Sequence[Tupl
     return "PASS", "ok", "every process under its principal's uid; no hop's ends share one"
 
 
+UNMEASURED = "UNMEASURED"
+
+
+def p01_dispositions(walks: Dict[str, Any], uids: Dict[str, int], hops: Sequence[Tuple[str, str]],
+                     unmeasured: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    """P01 per principal: PASS, FAIL or UNKNOWN for each one measured, and
+    UNMEASURED for each deliberately skipped. A hop whose two ends share a
+    uid fails both ends."""
+    out = {p: UNMEASURED for p in (unmeasured or {})}
+    for principal, w in walks.items():
+        if isinstance(w, rh.Unresolved):
+            out[principal] = "UNKNOWN"
+        else:
+            out[principal] = "FAIL" if any((r, e) != (uids[principal], uids[principal]) for _, r, e in w) else "PASS"
+    for up, down in hops:
+        if uids.get(up) is not None and uids.get(up) == uids.get(down):
+            out.update({k: "FAIL" for k in (up, down) if k in out})
+    return out
+
+
 def unmeasured_detail(unmeasured: Dict[str, str]) -> str:
     return "; ".join(f"{p}: not measured: {why}" for p, why in sorted(unmeasured.items()))
 
@@ -776,7 +796,7 @@ def run(plan: Plan, runner: Runner, run_argv: Callable, stat_: Callable = os.sta
     uids = {p: u for p, (_, u, _) in plan.runtimes.items()}
     p01 = verdict_p01(walks, uids, plan.hops, p01_unmeasured)
     if p01_out is not None:
-        p01_out.append(p01)
+        p01_out.append({"verdict": p01[0], "principals": p01_dispositions(walks, uids, plan.hops, p01_unmeasured)})
 
     # P02: per side, the owner's enumeration, the non-owner's answers, the owner's witness.
     sides, nonowner, witness, marker_dirs = {}, {}, {}, []

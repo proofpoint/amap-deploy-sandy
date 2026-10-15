@@ -298,7 +298,8 @@ def a5_snapshot(*, store: pst.RootedStore, run_dir: str, context: Dict[str, Any]
 def a2_outcome(doc: Optional[bytes], placed: bool, p01: List[Any], unmeasured: Dict[str, str]) -> Tuple[int, bool, str]:
     """A2's outcome when no fail-stop probe failed: PASSED only with the
     token in the document, the document placed, P02 PASS and P01 PASS or
-    UNKNOWN for exactly the deliberately unmeasured stopped router; any
+    UNKNOWN for exactly the deliberately unmeasured stopped router, judged
+    per principal (never by the aggregate or a reason string); any
     other shortfall is INCOMPLETE (a handoff), and T, when placed, is named."""
     parsed = json.loads(doc) if doc else None
     token = parsed[pe.TOKEN_MEMBER] if parsed else None
@@ -308,8 +309,11 @@ def a2_outcome(doc: Optional[bytes], placed: bool, p01: List[Any], unmeasured: D
         return INCOMPLETE, False, "A2 produced no token"
     if not placed:
         return INCOMPLETE, False, "A2's evidence was not placed, so it is not A2's evidence"
-    p01_ok = verdicts.get("P01") == "PASS" or (
-        verdicts.get("P01") == "UNKNOWN" and len(p01) == 1 and p01[0][2] == pp.unmeasured_detail(unmeasured))
+    dispositions = p01[0]["principals"] if len(p01) == 1 else {}
+    measured = {p: v for p, v in dispositions.items() if v != pp.UNMEASURED}
+    p01_ok = bool(dispositions) and all(v == "PASS" for v in measured.values()) \
+        and set(dispositions) - set(measured) == set(unmeasured) \
+        and verdicts.get("P01") in ("PASS", "UNKNOWN") and (verdicts.get("P01") == "PASS") == (not unmeasured)
     if not p01_ok:
         return INCOMPLETE, False, f"A2's P01 is {verdicts.get('P01')}, not PASS or the stopped router's UNKNOWN{named}"
     if verdicts.get("P02") != "PASS":
