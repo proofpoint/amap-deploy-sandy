@@ -175,9 +175,10 @@ class ProbeShapeTest(unittest.TestCase):
                 ("outcome", [], "outcome"), ("outcome", "maybe", "outcome"), ("witness", "not-a-witness", "witness"),
                 ("witness", {"operation": "open"}, "witness"), ("target_role", "key:signing", "target_role"),
                 ("target_role", ["/opt/ex/keys"], "target_role"), ("target_role", ["key:dir", "key:dir"], "target_role")]
+        # On P01, which is not fail-stop, so only the type check can refuse.
         for member, value, words in rows:
             with self.subTest(member=member, value=value):
-                self.refuses(lambda d, m=member, v=value: self.p(d, "P03").__setitem__(m, v), words)
+                self.refuses(lambda d, m=member, v=value: self.p(d, "P01").__setitem__(m, v), words)
 
     def test_a_vantage_uid_that_is_not_an_integer_refuses(self):
         self.refuses(lambda d: self.p(d, "P01")["vantage"][0].__setitem__("uid", True), "vantage")
@@ -317,8 +318,42 @@ class VerifyDocumentTest(unittest.TestCase):
                                    lstat=self.lstat, read=gone)
         self.assertEqual(self.claim(found, "current and passing").result, rh.UNKNOWN)
 
+    def test_a_signing_router_without_a_readable_passing_document_fails_on_every_path(self):
+        """The token claim is made on every path: absent, unreadable and
+        malformed evidence each leave no current token, so a live one FAILs
+        with the remedy that stops the signing."""
+        def gone(p):
+            raise FileNotFoundError(p)
+
+        def unreadable(p):
+            raise PermissionError(p)
+        reads = {"absent": gone, "unreadable": unreadable, "malformed": lambda p: b"{}"}
+        for name, read in reads.items():
+            with self.subTest(path=name):
+                found = pe.verify_document(self.PATH, host=HOST, now=NOW, bindings=BINDINGS,
+                                           live_token="run1:" + "a" * 64, lstat=self.lstat, read=read)
+                c = self.claim(found, "signs with")
+                self.assertEqual(c.result, rh.FAIL)
+                self.assertIn("without delegation", c.remedy)
+                found = pe.verify_document(self.PATH, host=HOST, now=NOW, bindings=BINDINGS, live_token=None,
+                                           lstat=self.lstat, read=read)
+                self.assertEqual(self.claim(found, "signs with").result, rh.PASS)
+
 
 class ReadProtectedTest(unittest.TestCase):
+    def test_the_opened_file_must_itself_be_root_0444_with_one_link(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as t:
+            f = os.path.join(t, "e.json")
+            with open(f, "wb") as fh:
+                fh.write(b"{}")
+            os.chmod(f, 0o444)
+            if os.geteuid() == 0:
+                self.skipTest("root owns what it writes")
+            with self.assertRaises(OSError) as e:
+                pe.read_placed(f)
+            self.assertIn("as opened", str(e.exception))
+
     def test_a_symbolic_link_is_never_followed(self):
         import tempfile
         with tempfile.TemporaryDirectory() as t:

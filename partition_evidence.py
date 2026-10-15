@@ -281,13 +281,35 @@ def read_protected(path: str) -> bytes:
         os.close(fd)
 
 
+def read_placed(path: str) -> bytes:
+    """`read_protected`, and the opened file itself as the placement requires
+    (root:root 0444, one link), so the bytes read are the file the placement
+    checks judged."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or (st.st_uid, st.st_gid, stat.S_IMODE(st.st_mode), st.st_nlink) != (0, 0, 0o444, 1):
+            raise OSError(f"{path} as opened is not a root:root 0444 file with one link")
+    finally:
+        os.close(fd)
+    return read_protected(path)
+
+
+#: What a running local router must be told when it signs without a current
+#: passing document: the same action the weekly job takes on a failure.
+UNSIGN_REMEDY = ("render the local router's config without delegation (install --apply) and restart it; "
+                 "a token without a current passing document must never stay live")
+
+
 def verify_document(path: str, *, host: str, now: float, bindings: Dict[str, str], live_token: Any,
                     roles: Optional[Dict[str, List[str]]] = None, lstat: Callable = os.lstat,
-                    read: Callable[[str], bytes] = read_protected) -> List[rh.Check]:
+                    read: Callable[[str], bytes] = read_placed) -> List[rh.Check]:
     """The evidence document at `path`: placed as only root could place it,
-    well-formed for `host`, current against `bindings`, and the one whose
-    token the running local router carries (`live_token`; None when it
-    carries none, an Unresolved when it could not be asked)."""
+    well-formed for `host`, current against `bindings`; and, on EVERY path,
+    whether the running local router signs with the current passing
+    document's token or not at all (`live_token`: None when it carries none,
+    an Unresolved when it could not be asked). With no current passing
+    document, the only acceptable token is none."""
     why = "the evidence is trusted only as root placed it"
     out = [ss._pinned_file(f"the partition evidence {path} is root:root 0444 with one link", path, why, lstat),
            ss._owned_chain(f"every directory above {path} is root-owned and not group- or world-writable",
@@ -296,28 +318,30 @@ def verify_document(path: str, *, host: str, now: float, bindings: Dict[str, str
     want = rh.Fact("evidence", True, "a week plus a 24-hour grace, both fail-stop probes passing, every "
                                      "binding unchanged since the run")
     remedy = "run partition-probe --apply again against the current rendering"
+    current: Optional[str] = None
     try:
         raw = read(path)
     except FileNotFoundError:
-        return out + [rh.unknown(claim, want, f"{path} is absent", "run partition-probe --apply")]
+        out.append(rh.unknown(claim, want, f"{path} is absent", "run partition-probe --apply"))
     except OSError as e:
-        return out + [rh.unknown(claim, want, f"cannot read {path}: {e}", remedy)]
-    try:
-        doc = parse(raw, host=host)
-    except EvidenceError as e:
-        return out + [rh.check(claim, want, f"malformed: {e}", remedy, do_not="never edit the document")]
-    stale = staleness(doc, now=now, bindings=bindings, roles=roles)
-    out.append(rh.check(claim, want, "; ".join(stale) if stale else True, remedy,
-                        do_not="never move the clock or a binding to make a document current"))
-    claim = "the local router signs with this document's token, or not at all"
-    want = rh.Fact("token", doc[TOKEN_MEMBER] if not stale else None,
-                   "the token of the current passing document; none when there is none")
-    remedy = ("render the local router's config again (install --apply) and restart it; a token from any "
-              "other document must never stay live")
+        out.append(rh.unknown(claim, want, f"cannot read {path}: {e}", remedy))
+    else:
+        try:
+            doc = parse(raw, host=host)
+        except EvidenceError as e:
+            out.append(rh.check(claim, want, f"malformed: {e}", remedy, do_not="never edit the document"))
+        else:
+            stale = staleness(doc, now=now, bindings=bindings, roles=roles)
+            out.append(rh.check(claim, want, "; ".join(stale) if stale else True, remedy,
+                                do_not="never move the clock or a binding to make a document current"))
+            current = None if stale else doc[TOKEN_MEMBER]
+    claim = "the local router signs with the current passing document's token, or not at all"
+    want = rh.Fact("token", current, "the token of the current passing document; none when there is none")
     if isinstance(live_token, rh.Unresolved):
         out.append(rh.unknown(claim, want, live_token.reason, "start the local router, or make the engine answer"))
     elif live_token is None:
-        out.append(rh.check(claim, want, True, remedy, ok=lambda e, a: True))
+        out.append(rh.check(claim, want, True, UNSIGN_REMEDY, ok=lambda e, a: True))
     else:
-        out.append(rh.check(claim, want, live_token, remedy))
+        out.append(rh.check(claim, want, live_token, UNSIGN_REMEDY,
+                            do_not="never keep signing while the evidence is being regenerated"))
     return out
