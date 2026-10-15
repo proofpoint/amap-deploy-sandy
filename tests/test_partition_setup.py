@@ -20,7 +20,10 @@ from test_hub_runtime import setUpModule, tearDownModule  # noqa: F401 -- the fi
 
 EV = "/opt/ex/partition-evidence"
 SCRATCH = "/opt/ex/partition-scratch"
-PART = {"evidence_dir": EV, "scratch_dir": SCRATCH, "weekly": {"weekday": 0, "hour": 3}}
+EXEC = "/opt/ex/partition-exec"
+TOOLS = {"python3": "/usr/bin/python3", "docker": "/usr/local/libexec/amap/docker"}
+PART = {"evidence_dir": EV, "scratch_dir": SCRATCH, "exec_root": EXEC, "tools": dict(TOOLS),
+        "weekly": {"weekday": 0, "hour": 3}}
 
 
 def doc(partition=PART, gate=None):
@@ -48,11 +51,16 @@ class LoadTest(unittest.TestCase):
     def test_both_sections_load(self):
         s = hs.load_spec(doc(gate=gate()))
         self.assertEqual((s.partition.evidence_dir, s.partition.weekday, s.partition.hour), (EV, 0, 3))
+        self.assertEqual((s.partition.exec_root, s.partition.tools), (EXEC, TOOLS))
         self.assertEqual(s.gate.record_path, f"{EV}/gate-record.json")
 
     def test_closed_member_sets(self):
         self.refuses(doc(partition=dict(PART, extra=1)), "exactly evidence_dir")
         self.refuses(doc(partition={k: v for k, v in PART.items() if k != "weekly"}), "exactly evidence_dir")
+        self.refuses(doc(partition={k: v for k, v in PART.items() if k != "exec_root"}), "exactly evidence_dir")
+        self.refuses(doc(partition=dict(PART, tools=dict(TOOLS, git="/usr/bin/git"))), "exactly docker, python3")
+        self.refuses(doc(partition=dict(PART, tools={"python3": "/usr/bin/python3"})), "exactly docker, python3")
+        self.refuses(doc(partition=dict(PART, tools=dict(TOOLS, docker="docker"))), "absolute")
         self.refuses(doc(gate=dict(gate(), extra=1)), "exactly harness_sha")
         self.refuses(doc(gate={k: v for k, v in gate().items() if k != "record_sha256"}), "exactly harness_sha")
 
@@ -70,6 +78,11 @@ class LoadTest(unittest.TestCase):
 
     def test_a_scratch_dir_overlapping_a_live_path_refuses(self):
         self.refuses(doc(partition=dict(PART, scratch_dir=EV + "/s")), "overlaps")
+
+    def test_the_exec_root_stays_apart_from_live_paths_and_the_scratch(self):
+        self.refuses(doc(partition=dict(PART, exec_root=EV + "/x")), "overlaps")
+        self.refuses(doc(partition=dict(PART, exec_root=SCRATCH)), "overlaps")
+        self.refuses(doc(partition=dict(PART, exec_root=SCRATCH + "/run")), "overlaps")
 
     def test_the_weekly_schedule_is_bounded(self):
         self.refuses(doc(partition=dict(PART, weekly={"weekday": 7, "hour": 3})), "weekly")
@@ -128,23 +141,56 @@ class GateTest(unittest.TestCase):
         self.assertEqual(self.problems(gs=gs),
                          ["delegation_gate.harness_sha is not the record's own harness_sha (copy it from the record)"])
 
-    def test_verify_reports_the_gate_and_the_directories(self):
-        files = {"/": st(stat.S_IFDIR | 0o755), "/opt": st(stat.S_IFDIR | 0o755), "/opt/ex": st(stat.S_IFDIR | 0o755),
-                 EV: st(stat.S_IFDIR | 0o755), SCRATCH: st(stat.S_IFDIR | 0o700)}
+    def host(self):
+        """A host where every partition directory and tool is as the design
+        wants it, as lstat shows it; realpath is the identity."""
+        d = stat.S_IFDIR
+        files = {p: st(d | 0o755) for p in ("/", "/opt", "/opt/ex", "/usr", "/usr/bin", "/usr/local",
+                                              "/usr/local/libexec", "/usr/local/libexec/amap", EV)}
+        files.update({SCRATCH: st(d | 0o700), EXEC: st(d | 0o700)})
+        files.update({t: st(stat.S_IFREG | 0o755) for t in TOOLS.values()})
+        return files
 
+    def verify(self, files):
         def lstat(p):
             if p not in files:
                 raise FileNotFoundError(p)
             return files[p]
-        part = ps.PartitionSpec(evidence_dir=EV, scratch_dir=SCRATCH, weekday=0, hour=3)
-        found = ps.verify(part, self.gs, delegation_enabled=True, lstat=lstat, owned_chain=ss._owned_chain,
-                          rl_sha=self.RL, hop_sha=self.HOP, plugin_sha256=self.PLUGIN, read=lambda p: self.raw)
-        self.assertEqual([(c.claim, c.result) for c in found if c.result != rh.PASS], [])
-        files[SCRATCH] = st(stat.S_IFDIR | 0o755)
-        found = ps.verify(part, self.gs, delegation_enabled=True, lstat=lstat, owned_chain=ss._owned_chain,
-                          rl_sha=self.RL, hop_sha=self.HOP, plugin_sha256=self.PLUGIN, read=lambda p: self.raw)
-        self.assertEqual([c.claim for c in found if c.result == rh.FAIL],
-                         [f"the partition scratch directory {SCRATCH} is root:root 700"])
+        part = ps.PartitionSpec(evidence_dir=EV, scratch_dir=SCRATCH, weekday=0, hour=3, exec_root=EXEC, tools=TOOLS)
+        return ps.verify(part, self.gs, delegation_enabled=True, lstat=lstat, owned_chain=ss._owned_chain,
+                         rl_sha=self.RL, hop_sha=self.HOP, plugin_sha256=self.PLUGIN, read=lambda p: self.raw,
+                         realpath=lambda p: p)
+
+    def test_verify_reports_the_gate_and_the_directories(self):
+        files = self.host()
+        self.assertEqual([(c.claim, c.result) for c in self.verify(files) if c.result != rh.PASS], [])
+        for path, words in ((SCRATCH, "scratch"), (EXEC, "weekly job's")):
+            with self.subTest(path=path):
+                files = self.host()
+                files[path] = st(stat.S_IFDIR | 0o755)
+                self.assertEqual([c.claim for c in self.verify(files) if c.result == rh.FAIL],
+                                 [f"the partition {words} directory {path} is root:root 700"])
+
+    def test_a_tool_the_operator_could_replace_fails(self):
+        docker = TOOLS["docker"]
+        for name, bad in (("operator-owned", st(stat.S_IFREG | 0o755, uid=501)),
+                          ("group-writable", st(stat.S_IFREG | 0o775)),
+                          ("not executable", st(stat.S_IFREG | 0o644))):
+            with self.subTest(name=name):
+                files = self.host()
+                files[docker] = bad
+                failed = [c.claim for c in self.verify(files) if c.result == rh.FAIL]
+                self.assertEqual(len(failed), 1, failed)
+                self.assertIn(docker, failed[0])
+        files = self.host()
+        files["/usr/local/libexec/amap"] = st(stat.S_IFDIR | 0o755, uid=501)
+        self.assertTrue(any("/usr/local/libexec/amap/docker" in c.claim
+                            for c in self.verify(files) if c.result == rh.FAIL))
+
+    def test_a_tool_that_cannot_be_inspected_is_unknown(self):
+        files = self.host()
+        del files[TOOLS["python3"]]
+        self.assertEqual([c.result for c in self.verify(files) if TOOLS["python3"] in c.claim][0], rh.UNKNOWN)
 
     def test_absent_sections_are_a_note_without_delegation_and_a_fail_with_it(self):
         kw = dict(lstat=lambda p: None, owned_chain=ss._owned_chain, rl_sha=self.RL, hop_sha=self.HOP,
@@ -202,13 +248,15 @@ class PlanTest(unittest.TestCase):
                             ("UNIT_SHA256", hashlib.sha256(UNIT.encode()).hexdigest())):
             self.addCleanup(setattr, hg, name, getattr(hg, name))
             setattr(hg, name, value)
-        self.part = ps.PartitionSpec(evidence_dir=EV, scratch_dir=SCRATCH, weekday=0, hour=3)
+        self.part = ps.PartitionSpec(evidence_dir=EV, scratch_dir=SCRATCH, weekday=0, hour=3, exec_root=EXEC,
+                                     tools=TOOLS)
 
     def test_the_plan_prints_the_six_steps_with_this_hosts_paths(self):
         def gone(p):
             raise FileNotFoundError(p)
         text = "\n".join(ps.plan(self.part, None, lambda s: s, anchor="/opt/amap/etc/overlay.sha", read=gone))
         for words in (f"install -d -o 0 -g 0 -m 0755 {EV}", f"install -d -o 0 -g 0 -m 0700 {SCRATCH}",
+                      f"install -d -o 0 -g 0 -m 0700 {EXEC}",
                       f"{EV}/gate-record.json", "COPIED from the record's own", "squash",
                       "/opt/amap/etc/overlay.sha", "no placed record"):
             self.assertIn(words, text)

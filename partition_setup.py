@@ -3,7 +3,8 @@ the partition evidence lives, where the controls may make throwaway paths,
 when the weekly probe runs, and the conformance harness's passing record
 that, with current evidence, lets `delegation` be rendered at all.
 
-`partition` {evidence_dir, scratch_dir, weekly{weekday, hour}} is authored
+`partition` {evidence_dir, scratch_dir, exec_root, tools{python3, docker},
+weekly{weekday, hour}} is authored
 with the rest of the overlay. `delegation_gate` {harness_sha, record_sha256,
 record_path} is the operator's alone: install and verify READ it and the
 record, and nothing here writes either. Both have closed member sets, and a
@@ -16,6 +17,11 @@ record, and nothing here writes either. Both have closed member sets, and a
   are named by `EVIDENCE_NAME`; the gate record is not among them.
 - `scratch_dir`: root-owned 0700, outside every root the document declares;
   the control pass's throwaway paths live under `<scratch_dir>/<run_id>/`.
+- `exec_root`: root-owned 0700, outside every root the document declares and
+  apart from `scratch_dir`: the weekly job's provisioned bundle, its lock,
+  each run's work directory and the recovery description.
+- `tools`: the interpreter and the docker CLI the weekly job runs as root,
+  absolute paths, separate from the secrets section's own tools.
 - `weekly`: the probe job's day and hour only.
 - `record_path`: exactly `<evidence_dir>/gate-record.json`, a regular file,
   root:root 0444, one link, checked and read through ONE descriptor.
@@ -38,6 +44,9 @@ GATE_SECTION = "delegation_gate"
 GATE_RECORD = "gate-record.json"
 EVIDENCE_MODE = 0o755
 SCRATCH_MODE = 0o700
+EXEC_MODE = 0o700
+#: The tools the weekly job runs as root, and nothing else.
+WEEKLY_TOOLS = ("docker", "python3")
 RECORD_MODE = 0o444
 _HEX40 = re.compile(r"[0-9a-f]{40}")
 _HEX64 = re.compile(r"[0-9a-f]{64}")
@@ -58,6 +67,8 @@ class PartitionSpec:
     scratch_dir: str
     weekday: int
     hour: int
+    exec_root: str
+    tools: Dict[str, str]
 
 
 @dataclass(frozen=True)
@@ -82,9 +93,14 @@ def _int(v: Any) -> bool:
 
 
 def load(sec: Any, spec: Any) -> PartitionSpec:
-    if not isinstance(sec, dict) or set(sec) != {"evidence_dir", "scratch_dir", "weekly"}:
-        raise PartitionSpecError("partition must have exactly evidence_dir, scratch_dir and weekly")
+    if not isinstance(sec, dict) or set(sec) != {"evidence_dir", "scratch_dir", "exec_root", "tools", "weekly"}:
+        raise PartitionSpecError("partition must have exactly evidence_dir, scratch_dir, exec_root, tools and weekly")
     ev, scratch = _abs(sec["evidence_dir"], "partition.evidence_dir"), _abs(sec["scratch_dir"], "partition.scratch_dir")
+    ex = _abs(sec["exec_root"], "partition.exec_root")
+    t = sec["tools"]
+    if not isinstance(t, dict) or set(t) != set(WEEKLY_TOOLS):
+        raise PartitionSpecError(f"partition.tools must be exactly {', '.join(WEEKLY_TOOLS)}")
+    tools = {k: _abs(t[k], f"partition.tools.{k}") for k in WEEKLY_TOOLS}
     w = sec["weekly"]
     if not isinstance(w, dict) or set(w) != {"weekday", "hour"} or not _int(w["weekday"]) or not _int(w["hour"]) \
             or not 0 <= w["weekday"] <= 6 or not 0 <= w["hour"] <= 23:
@@ -101,7 +117,12 @@ def load(sec: Any, spec: Any) -> PartitionSpec:
         if _related(scratch, o):
             raise PartitionSpecError(f"partition.scratch_dir {scratch} overlaps {o}; the controls' throwaway paths "
                                      "stay outside every live path")
-    return PartitionSpec(evidence_dir=ev, scratch_dir=scratch, weekday=w["weekday"], hour=w["hour"])
+    for o in others + [scratch]:
+        if _related(ex, o):
+            raise PartitionSpecError(f"partition.exec_root {ex} overlaps {o}; the weekly job's bundle and runs "
+                                     "stay apart from every live path and from the controls' scratch")
+    return PartitionSpec(evidence_dir=ev, scratch_dir=scratch, weekday=w["weekday"], hour=w["hour"], exec_root=ex,
+                         tools=tools)
 
 
 def load_gate(sec: Any, partition: Optional[PartitionSpec]) -> GateSpec:
@@ -171,7 +192,8 @@ def gate_problems(gs: Optional[GateSpec], *, rl_sha: Any, hop_sha: Any, plugin_s
 
 def verify(ps: Optional[PartitionSpec], gs: Optional[GateSpec], *, delegation_enabled: bool, lstat: Callable,
            owned_chain: Callable, rl_sha: Any, hop_sha: Any, plugin_sha256: str,
-           read: Callable[[str], bytes] = read_record) -> List[rh.Check]:
+           read: Callable[[str], bytes] = read_record,
+           realpath: Callable[[str], str] = os.path.realpath) -> List[rh.Check]:
     """The two sections against the host. Absent sections are a NOTE (PASS
     with the reason in the claim) where nothing enables delegation, and a
     FAIL where something does."""
@@ -183,7 +205,8 @@ def verify(ps: Optional[PartitionSpec], gs: Optional[GateSpec], *, delegation_en
         out.append(rh.check(claim, need, not delegation_enabled or None, "add the partition section to the overlay",
                             ok=lambda e, a: a is True))
     else:
-        for path, mode, what in ((ps.evidence_dir, EVIDENCE_MODE, "evidence"), (ps.scratch_dir, SCRATCH_MODE, "scratch")):
+        for path, mode, what in ((ps.evidence_dir, EVIDENCE_MODE, "evidence"), (ps.scratch_dir, SCRATCH_MODE, "scratch"),
+                                 (ps.exec_root, EXEC_MODE, "weekly job's")):
             claim = f"the partition {what} directory {path} is root:root {oct(mode)[2:]}"
             want = rh.Fact(f"{what} dir", (0, 0, mode), "only root places or removes what is there")
             remedy = f"create it: install -d -o 0 -g 0 -m {oct(mode)[2:]} {path}"
@@ -198,6 +221,7 @@ def verify(ps: Optional[PartitionSpec], gs: Optional[GateSpec], *, delegation_en
                        else rh.check(claim, want, got, remedy))
             out.append(owned_chain(f"every directory above {path} is root-owned and not group- or world-writable",
                                    path, (0,), "the partition products are trusted only as root placed them", lstat))
+        out += verify_tools(ps, lstat, owned_chain, realpath)
     if delegation_enabled or gs is not None:
         bad = gate_problems(gs, rl_sha=rl_sha, hop_sha=hop_sha, plugin_sha256=plugin_sha256, read=read)
         claim = "the conformance harness's gate record holds for this deployment"
@@ -205,6 +229,35 @@ def verify(ps: Optional[PartitionSpec], gs: Optional[GateSpec], *, delegation_en
         out.append(rh.check(claim, want, bad, "the operator places the harness's record and writes delegation_gate "
                             "(the design's §11.2 steps); until then delegation stays off",
                             do_not="never edit the record or the section to make it hold"))
+    return out
+
+
+def verify_tools(ps: PartitionSpec, lstat: Callable, owned_chain: Callable,
+                 realpath: Callable[[str], str] = os.path.realpath) -> List[rh.Check]:
+    """The weekly job's tools as root will run them: each one's realpath a
+    regular executable, root-owned and not group- or world-writable, under
+    root-owned directories that are not either. The tripwire half of the
+    design's tool rule; the startup closure is validated at install time,
+    with the operating system's own tools."""
+    out: List[rh.Check] = []
+    why = "the weekly job runs it as root"
+    for name in WEEKLY_TOOLS:
+        path = ps.tools[name]
+        claim = f"the weekly job's {name} {path} resolves to a root-owned executable no one else can write"
+        want = rh.Fact("tool", True, why)
+        remedy = f"record a {name} the operating system or its vendor installed, root-owned, as partition.tools.{name}"
+        try:
+            real = realpath(path)
+            st = lstat(real)
+        except OSError as e:
+            out.append(rh.unknown(claim, want, f"cannot inspect {path}: {e}", remedy))
+            continue
+        ok = stat.S_ISREG(st.st_mode) and bool(st.st_mode & 0o111) and st.st_uid == 0 and not st.st_mode & 0o022
+        out.append(rh.check(claim, want, ok or f"{real}: owner {st.st_uid}, mode {oct(stat.S_IMODE(st.st_mode))}",
+                            remedy, ok=lambda e, a: a is True,
+                            do_not="never record a tool the operator's account can replace"))
+        out.append(owned_chain(f"every directory above {real} is root-owned and not group- or world-writable",
+                               real, (0,), why, lstat))
     return out
 
 
@@ -218,6 +271,8 @@ def plan(p: PartitionSpec, gs: Optional[GateSpec], q: Callable[[str], str], *, a
         "# The partition evidence: root-owned, under root-owned directories; the controls' scratch space:",
         f"install -d -o 0 -g 0 -m 0755 {q(p.evidence_dir)}",
         f"install -d -o 0 -g 0 -m 0700 {q(p.scratch_dir)}",
+        "# The weekly job's root: its provisioned bundle, lock, run directories and recovery description:",
+        f"install -d -o 0 -g 0 -m 0700 {q(p.exec_root)}",
         "# The delegation gate, the operator's alone, when the conformance harness reports its full run passed,",
         "# given the relayed record and its sha256:",
         "#   1. shasum -a 256 <the relayed file>   (or sha256sum): it must print the relayed sha256",
