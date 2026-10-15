@@ -58,7 +58,7 @@ class JobTest(unittest.TestCase):
         text = "\n".join(pj.validation_steps(P))
         for words in ("env -i /usr/bin/python3 -I -S -B", "find ", "ldd ", "otool -L", "xcode-select -p",
                       "! -user root -o -perm -g+w -o -perm -o+w", "DESTSHARED", "/*.so", ".zip",
-                      "-maxdepth 0"):
+                      "-maxdepth 0", "find -L ", "discovery failed", 'realpath "$p"'):
             self.assertIn(words, text)
 
     def test_the_parent_chain_check_prints_a_directory_others_can_write_above_a_tool(self):
@@ -75,15 +75,47 @@ class JobTest(unittest.TestCase):
             out = subprocess.run(["/bin/sh", "-c", line], capture_output=True, text=True, timeout=60).stdout
             self.assertIn(w + "\n", out)
 
-    def test_the_linux_library_check_reaches_the_extension_modules_links(self):
+    def test_the_linux_library_check_reaches_the_extension_modules_links_and_the_loader(self):
         if not os.path.exists("/usr/bin/ldd"):
             self.skipTest("no ldd here")
         spec = dataclasses.replace(P, tools={"python3": os.path.realpath(sys.executable), "docker": "/bin/sh"})
-        line = next(l for l in pj.validation_steps(spec) if l.startswith("ldd "))
-        listing = line.split(" | awk")[0].replace(" 2>/dev/null", "")
-        out = subprocess.run(["/bin/sh", "-c", listing], capture_output=True, text=True, timeout=120).stdout
-        self.assertIn("lib-dynload", out, "each extension module is listed")
+        line = next(l for l in pj.validation_steps(spec) if l.startswith("L=$(ldd "))
+        out = subprocess.run(["/bin/sh", "-c", line + '\necho "$L"'], capture_output=True, text=True,
+                             timeout=120).stdout
+        self.assertIn("libssl", out, "an extension module's own link is listed")
+        self.assertRegex(out, r"/ld-linux[^ \n]*\.so", "the loader is listed")
 
+    def shell(self, starts, spec, holding=""):
+        lines = [l for l in pj.validation_steps(spec) if l.startswith(starts) and holding in l]
+        if len(lines) != 1:
+            self.fail(f"the steps hold {len(lines)} line(s) starting {starts!r}")
+        line = lines[0]
+        return subprocess.run(["/bin/sh", "-c", line], capture_output=True, text=True, timeout=120).stdout
+
+    def test_a_writable_target_behind_a_root_owned_link_is_printed(self):
+        with tempfile.TemporaryDirectory() as t:
+            d = os.path.realpath(t)
+            target, link = os.path.join(d, "real-docker"), os.path.join(d, "docker")
+            with open(target, "w") as f:
+                f.write("x")
+            os.chmod(target, 0o666)
+            os.symlink(target, link)
+            spec = dataclasses.replace(P, tools={"python3": "/nonexistent/python3", "docker": link})
+            self.assertIn(link, self.shell("find -L ", spec), "the target is judged through the link")
+
+    def test_a_discovery_that_fails_names_its_file(self):
+        if not os.path.exists("/usr/bin/ldd"):
+            self.skipTest("no ldd here")
+        with tempfile.TemporaryDirectory() as t:
+            d = os.path.realpath(t)
+            script = os.path.join(d, "docker")
+            with open(script, "w") as f:
+                f.write("#!/bin/sh\n")
+            os.chmod(script, 0o755)
+            spec = dataclasses.replace(P, tools={"python3": os.path.realpath(sys.executable), "docker": script})
+            out = self.shell("for f in ", spec, holding="ldd ")
+            self.assertIn(f"discovery failed: {script}", out)
+            self.assertNotIn(f"discovery failed: {os.path.realpath(sys.executable)}", out)
 
 if __name__ == "__main__":
     unittest.main()

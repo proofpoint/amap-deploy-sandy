@@ -61,6 +61,7 @@ import re
 import resource
 import signal
 import stat
+import struct
 import subprocess
 import sys
 import time
@@ -695,6 +696,10 @@ EVIDENCE_DIR_MODE = 0o755
 PLACED_SLACK_S = 2
 #: The operating system's own tools that list a binary's linked libraries.
 LDD, OTOOL, XCODE_SELECT = "/usr/bin/ldd", "/usr/bin/otool", "/usr/bin/xcode-select"
+#: An ELF program header naming the program interpreter (a dynamic binary's loader).
+PT_INTERP = 3
+#: Where macOS keeps system libraries in the dyld shared cache, on the sealed system volume, not on disk.
+SEALED_PREFIXES = ("/usr/lib/", "/System/Library/")
 
 _HEX40 = re.compile(r"[0-9a-f]{40}")
 _HEX64 = re.compile(r"[0-9a-f]{64}")
@@ -1080,26 +1085,90 @@ def _trusted_tool(path):
         d = os.path.dirname(d)
 
 
+def _static_elf(path):
+    """True when `path` is an ELF executable with no program interpreter (a
+    statically linked binary, which loads no shared library), False when it
+    is an ELF that names one, None when it is not an ELF that can be read."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(64)
+            if len(head) < 52 or head[:4] != b"\x7fELF" or head[4] not in (1, 2) or head[5] not in (1, 2):
+                return None
+            end = "<" if head[5] == 1 else ">"
+            if head[4] == 2:
+                phoff, = struct.unpack(end + "Q", head[32:40])
+                phentsize, phnum = struct.unpack(end + "HH", head[54:58])
+            else:
+                phoff, = struct.unpack(end + "I", head[28:32])
+                phentsize, phnum = struct.unpack(end + "HH", head[42:46])
+            if phentsize < 4 or phnum == 0xFFFF:
+                return None
+            for i in range(phnum):
+                f.seek(phoff + i * phentsize)
+                entry = f.read(4)
+                if len(entry) != 4:
+                    return None
+                if struct.unpack(end + "I", entry)[0] == PT_INTERP:
+                    return False
+            return True
+    except OSError:
+        return None
+
+
+def _ldd_libraries(b, out, err, rc):
+    """The libraries and the loader ldd named for `b`; Tooling unless ldd
+    named them completely, or `b` is a static ELF, which links none."""
+    text = out.decode("utf-8", "replace")
+    if rc != 0:
+        if _static_elf(b) is True:
+            return []
+        raise Tooling(f"ldd could not list {b}'s libraries (exit {rc}), and it is not a static ELF")
+    libs = []
+    for line in text.splitlines():
+        line = line.strip()
+        if "=>" in line:
+            target = line.split("=>", 1)[1].split()
+            if not target or not target[0].startswith("/"):
+                raise Tooling(f"ldd could not resolve a library of {b}: {line}")
+            libs.append(target[0])
+        elif line.startswith("/"):
+            libs.append(line.split()[0])   # the program interpreter, the loader itself
+        elif "statically linked" in line and _static_elf(b) is not False:
+            return []
+        elif line and not line.startswith("linux-vdso") and not line.startswith("linux-gate"):
+            raise Tooling(f"ldd printed what is not a library of {b}: {line}")
+    if not libs and _static_elf(b) is not True:
+        raise Tooling(f"ldd named no library for {b}, which is not a static ELF")
+    return libs
+
+
+def _otool_libraries(b, out, err, rc):
+    """The libraries otool -L named for `b`; Tooling unless it named them."""
+    lines = out.decode("utf-8", "replace").splitlines()
+    libs = [l.split()[0] for l in lines[1:] if l.startswith(("\t", " ")) and l.split()]
+    if rc != 0 or not libs or not all(x.startswith("/") for x in libs):
+        raise Tooling(f"otool could not list {b}'s libraries (exit {rc})")
+    return libs
+
+
 def _linked_libraries(binaries):
-    """The shared libraries `binaries` link, as the operating system's own
-    tool lists them; Tooling when neither tool is there."""
+    """The shared libraries `binaries` link, and the loader, as the operating
+    system's own tool names them, completely; Tooling when neither tool is
+    there or discovery is incomplete for any binary."""
     if os.path.exists(LDD):
-        argv, pick = [LDD], lambda line: line.split("=>")[1].split()[0] if "=>" in line else ""
+        argv, parse = [LDD], _ldd_libraries
     elif os.path.exists(OTOOL):
-        argv, pick = [OTOOL, "-L"], lambda line: line.split()[0] if line.startswith(("\t", " ")) else ""
+        argv, parse = [OTOOL, "-L"], _otool_libraries
     else:
         raise Tooling("no ldd and no otool: the startup closure's libraries cannot be listed")
     out = set()
     for b in binaries:
         try:
             p = subprocess.run(argv + [b], shell=False, close_fds=True, stdin=subprocess.DEVNULL, env={},
-                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=60)
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
         except (OSError, subprocess.TimeoutExpired) as e:
             raise Tooling(f"cannot list {b}'s libraries: {e}") from None
-        for line in p.stdout.decode("utf-8", "replace").splitlines():
-            lib = pick(line)
-            if lib.startswith("/"):
-                out.add(lib)
+        out.update(parse(b, p.stdout, p.stderr, p.returncode))
     return sorted(out)
 
 
@@ -1140,32 +1209,74 @@ def startup_closure(python, docker):
     return sorted(set(paths))
 
 
-def closure_problems(paths, lstat=os.lstat, walk=os.walk):
-    """Every path in the startup closure, and every directory above it and
-    everything under it, root-owned and writable by no one else; the
+def closure_problems(paths, lstat=os.lstat, walk=os.walk, realpath=os.path.realpath, platform=None):
+    """Every path in the startup closure, every directory above it and
+    everything under it, root-owned and writable by no one else; a link is
+    judged itself, and then its target, the target's directories and, for a
+    link inside the closure, everything under the target. Each path is
+    covered once, so a cycle ends. On macOS, a system library that is not on
+    disk is in the dyld shared cache on the sealed system volume. The
     problems, empty when there are none."""
-    bad = []
+    bad, covered, chained = [], set(), set()
+    darwin = (platform or sys.platform) == "darwin"
 
-    def judge(p):
+    def meta(p):
         try:
             st = lstat(p)
+        except FileNotFoundError:
+            if darwin and p.startswith(SEALED_PREFIXES):
+                return None
+            bad.append(f"{p}: absent")
+            return None
         except OSError as e:
             bad.append(f"{p}: {e.strerror}")
-            return
+            return None
         if st.st_uid != ROOT_UID or st.st_mode & 0o022 and not stat.S_ISLNK(st.st_mode):
             bad.append(f"{p} is not root-owned, or is writable by others")
-    for path in paths:
-        d = os.path.dirname(path)
+        return st
+
+    def chain(p):
+        """`p` and every directory above it; a link among them, its target's too."""
+        if p in chained:
+            return
+        chained.add(p)
+        d = p
         while True:
-            judge(d)
+            st = meta(d)
+            if st is not None and stat.S_ISLNK(st.st_mode):
+                chain(realpath(d))
             if d == "/":
                 break
             d = os.path.dirname(d)
-        judge(path)
-        for top, dirs, files in walk(path):
-            for n in dirs + files:
-                judge(os.path.join(top, n))
+
+    def cover(p):
+        """`p`, its directories, and everything under it, following each link."""
+        if p in covered:
+            return
+        covered.add(p)
+        chain(p)
+        st = meta(p)
+        if st is None:
+            return
+        if stat.S_ISLNK(st.st_mode):
+            cover(realpath(p))
+            return
+        if stat.S_ISDIR(st.st_mode):
+            for top, dirs, files in walk(p):
+                for n in dirs + files:
+                    e = os.path.join(top, n)
+                    est = meta(e)
+                    if est is not None and stat.S_ISLNK(est.st_mode):
+                        cover(realpath(e))
+    for path in paths:
+        cover(path)
     return sorted(set(bad))
+
+
+def _docker_closure(docker):
+    """What root's run of `docker` alone loads: the binary, and every
+    library and the loader it links."""
+    return [docker] + _linked_libraries([docker])
 
 
 def _verified_tools(python3, docker):
@@ -1499,8 +1610,9 @@ def _act(evidence_dir, live_config, target, rid, at, failing, engine, said):
     else:
         up = engine.running(target)
         if up is False:
-            event({"event": "stop_ok", "id": target, "observed": "the engine affirms it is not running"})
-            stopped = True
+            # Not [1]'s running container: never certified stopped, since a
+            # stale id leaves the router that replaced it running.
+            event({"event": "stop_not_attempted", "reason": f"{target} is not running: the target may be stale"})
         elif up is None:
             event({"event": "stop_not_attempted", "reason": "the engine cannot say whether it runs"})
         else:
@@ -1551,14 +1663,18 @@ def _decide(efd, run_name, current, said):
         incident = _incident(evfd, rid)
     finally:
         os.close(evfd)
-    if incident is not None and not failing:
+    done = set()
+    if incident is not None:
         det, events = incident
         done = {e["event"] for e in events} if events is not None else set()
-        if "resolved" not in done and not {"rewrite_ok", "stop_ok"} <= done:
+        if not failing and "resolved" not in done and not {"rewrite_ok", "stop_ok"} <= done:
             # Its own open incident, completed with its ORIGINAL cause; a
             # record that cannot be read is completed too, never trusted done.
             failing, why = (list(det["failing"]) if det else ["cause_unrecorded"]), ""
     if failing:
+        if "resolved" in done or {"rewrite_ok", "stop_ok"} <= done:
+            said.append(f"{rid}: its incident's history already shows every effect done; none is repeated")
+            return EXIT_INCIDENT, None, False
         complete = _act(context["evidence_dir"], context["live_config_path"], context["router_container_id"], rid,
                         context["started_at"], failing, engine, said)
         return EXIT_INCIDENT, None, not complete
@@ -1676,9 +1792,13 @@ def partition_weekly(exec_root, host, document, sha256, now=None, child_timeout=
             return EXIT_TOOLING
         try:
             docker = _trusted_tool(recovery["docker"])
+            bad = closure_problems(_docker_closure(docker))
+            if bad:
+                raise Tooling("its own startup closure is not root's alone: " + "; ".join(bad[:5]))
             _engine_socket(recovery["engine"])
         except Tooling as e2:
-            said.append(f"the recovery description's tools are not trusted either ({e2}): nothing stopped")
+            said.append(f"handoff: the recovery description's docker is not verified either ({e2}): "
+                        "it is not run, and nothing is stopped")
             return EXIT_TOOLING
         _act(recovery["evidence_dir"], recovery["live_config_path"], recovery["router_container_id"],
              "tooling-" + rid, at, ["tooling_unverified"], _Engine(docker, recovery["engine"], exec_root), said)

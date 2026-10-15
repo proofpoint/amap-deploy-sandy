@@ -106,10 +106,12 @@ def validation_steps(p: ps.PartitionSpec, q: Callable[[str], str] = shlex.quote)
     operating system's own tools only, never the interpreter under test (its
     paths are only discovered with it, under an empty environment): the
     tools, the interpreter's library, its extension modules and any zip on
-    its path, the libraries the tools and every extension module link, the
-    developer directory on macOS, and every directory above each of them.
-    Every path printed must be root-owned and writable by no one else. The
-    pinned writer applies the same rule before every run."""
+    its path, the libraries and the loader the tools and every extension
+    module link, the developer directory on macOS, every link's target, and
+    every directory above each of them and their targets. Every path printed
+    must be root-owned and writable by no one else; a discovery that fails
+    prints its file. The pinned writer applies the same rule before every
+    run."""
     py, docker = q(p.tools["python3"]), q(p.tools["docker"])
     bad = "\\( ! -user root -o -perm -g+w -o -perm -o+w \\) -print"
     paths = (f"$(env -i {py} -I -S -B -c 'import os,sys,sysconfig; g=sysconfig.get_paths(); "
@@ -121,12 +123,18 @@ def validation_steps(p: ps.PartitionSpec, q: Callable[[str], str] = shlex.quote)
     return [
         "# The tools the weekly job runs as root: each must be the operating system's or its vendor's,",
         "# and nothing in their startup closure may be writable by anyone but root (each command prints nothing):",
-        f"find {py} {docker} $(realpath {py} {docker}) {bad}",
-        f"find {paths} {bad}",
-        f"ldd {tools} 2>/dev/null | awk '/=>/ {{print $3}}' | sort -u | xargs -r find {bad}   # Linux",
-        f"otool -L {tools} | awk '/^\\t/ {{print $1}}' | sort -u | xargs find {bad} 2>/dev/null   # macOS",
-        f"find \"$(xcode-select -p)\" {bad}   # macOS: the developer directory /usr/bin/python3 runs",
-        "# Every directory above each of those paths (each prints nothing):",
-        f"for p in $(realpath {py} {docker}) {paths} \"$(xcode-select -p 2>/dev/null)\"; do "
-        f"while [ -n \"$p\" ] && [ \"$p\" != / ]; do p=$(dirname \"$p\"); find \"$p\" -maxdepth 0 {bad}; done; done",
+        f"for f in {tools}; do ldd \"$f\" >/dev/null 2>&1 || {{ file \"$f\" | grep -q 'statically linked' "
+        "|| echo \"discovery failed: $f\"; }; done   # Linux: a file ldd cannot list must be a static ELF",
+        f"for f in {tools}; do otool -L \"$f\" >/dev/null 2>&1 || echo \"discovery failed: $f\"; done   # macOS",
+        f"L=$(ldd {tools} 2>/dev/null | awk '/=>/ {{print $3}} /^[[:space:]]*\\// {{print $1}}' | sort -u)   # Linux",
+        f"L=$(otool -L {tools} | awk '/^\\t/ {{print $1}}' | sort -u)   # macOS: a /usr/lib or /System/Library library "
+        "absent from disk is in the dyld shared cache on the sealed system volume",
+        f"find {py} {docker} $(realpath {py} {docker}) {paths} $L {bad} 2>&1",
+        f"find -L {py} {docker} $(realpath {py} {docker}) {paths} $L {bad} 2>&1   # every link's target",
+        f"find \"$(xcode-select -p)\" {bad}; find -L \"$(xcode-select -p)\" {bad}   # macOS: the developer directory "
+        "/usr/bin/python3 runs",
+        "# Every directory above each of those paths, and above each one's realpath (each prints nothing):",
+        f"for p in {py} {docker} {paths} $L \"$(xcode-select -p 2>/dev/null)\"; do for x in \"$p\" "
+        f"\"$(realpath \"$p\" 2>/dev/null)\"; do while [ -n \"$x\" ] && [ \"$x\" != / ]; do x=$(dirname \"$x\"); "
+        f"find \"$x\" -maxdepth 0 {bad}; done; done; done",
     ]

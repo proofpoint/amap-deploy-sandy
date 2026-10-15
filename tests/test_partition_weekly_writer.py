@@ -156,6 +156,7 @@ sys.path.insert(0, %r)
 import host_steps as hs
 hs.ROOT_UID, hs.ROOT_GID = os.getuid(), os.getgid()
 hs.startup_closure = lambda python, docker: json.loads(os.environ.get("PW_CLOSURE", "[]"))
+hs._docker_closure = lambda docker: json.loads(os.environ.get("PW_DOCKER_CLOSURE", "[]"))
 hs._ancestor_ok = lambda st: True
 hs._trusted_tool = lambda p: os.path.realpath(p)
 hs.CHILD_TIMEOUT_S = float(os.environ.get("PW_CHILD_TIMEOUT", hs.CHILD_TIMEOUT_S))
@@ -396,17 +397,24 @@ class WriterTest(unittest.TestCase):
         self.assertEqual(self.h.run().returncode, hs.EXIT_INCIDENT)
         self.assertEqual(self.events(), ["rewrite_ok", "stop_failed"])
 
-    def test_a_target_the_engine_affirms_is_not_running_is_never_stopped_and_counts_as_stopped(self):
+    def test_a_stale_target_is_never_stopped_and_never_certified_stopped(self):
+        """After [1] is recreated, the recorded id is not running or gone,
+        while the router that replaced it runs: the stop stays pending."""
         self.h.recovery()
-        for state in ({TARGET: False}, {}):
-            with self.subTest(state=state):
+        replacement = "d" * 64
+        for state in ({TARGET: False, replacement: True}, {replacement: True}):
+            with self.subTest(state=sorted(state)):
                 self.h.containers(state)
                 self.h.plan([["expect", B], ["evidence", B, FAIL3], ["exit", 9]])
                 self.assertEqual(self.h.run().returncode, hs.EXIT_INCIDENT)
-                self.assertEqual(self.h.stops(), [])
-                self.assertEqual(self.event_records()[-1]["event"], "stop_ok")
-                self.assertIn("observed", self.event_records()[-1])
-                self.assertEqual(self.h.runs(), [], "every effect is shown done")
+                self.assertEqual(self.h.stops(), [], "nothing stopped, by id or by name")
+                last = self.event_records()[-1]
+                self.assertEqual(last["event"], "stop_not_attempted")
+                self.assertIn("may be stale", last["reason"])
+                self.assertNotIn("stop_ok", self.events())
+                self.assertEqual(len(self.h.runs()), 1, "kept: the stop is pending")
+                subprocess.run(["rm", "-rf"] + [f"{self.h.ev}/{n}" for n in os.listdir(self.h.ev)]
+                               + [f"{self.h.exec}/{n}" for n in self.h.runs()])
                 time.sleep(1.1)  # the next run's id is the next second
 
     def test_a_child_that_outruns_its_bound_is_killed_with_its_group(self):
@@ -526,6 +534,19 @@ class WriterTest(unittest.TestCase):
                 p = self.h.run()
                 self.assertEqual(p.returncode, hs.EXIT_TOOLING, p.stdout + p.stderr)
                 self.assertIsNone(self.h.side_read("child-started.json"))
+
+    def test_tooling_whose_fallback_docker_has_an_untrusted_dependency_runs_no_docker(self):
+        self.h.recovery()
+        self.h.bundle(extra={"stray.py": "x = 1\n"})
+        dep = f"{self.h.root}/libdocker.so"
+        with open(dep, "w") as f:
+            f.write("x")
+        os.chmod(dep, 0o666)
+        p = self.h.run(env={"PW_DOCKER_CLOSURE": json.dumps([dep])})
+        self.assertEqual(p.returncode, hs.EXIT_TOOLING, p.stdout + p.stderr)
+        self.assertIn("not verified either", p.stdout)
+        self.assertEqual(self.h.logged(), [], "no engine call at all")
+        self.assertTrue(self.delegation())
 
     def test_tooling_with_a_recovery_description_stops_its_target_and_without_one_stops_nothing(self):
         self.h.bundle(extra={"stray.py": "x = 1\n"})
@@ -880,8 +901,9 @@ class ClosureTest(unittest.TestCase):
     """The startup closure: discovered by the operating system's own tools,
     and judged path by path, up every parent and down every tree."""
 
-    def fs(self, entries):
-        """A fake tree: path -> (uid, mode); lstat and walk over it."""
+    def fs(self, entries, links=None):
+        """A fake tree: path -> (uid, mode); lstat, walk and realpath over
+        it, with `links` mapping each link to its target."""
         def lstat(p):
             if p not in entries:
                 raise FileNotFoundError(2, "No such file or directory")
@@ -897,7 +919,7 @@ class ClosureTest(unittest.TestCase):
             for k in kids:
                 if stat.S_ISDIR(entries[k][1]):
                     yield from walk(k)
-        return lstat, walk
+        return lstat, walk, lambda p: (links or {}).get(p, p)
 
     D, F, L = stat.S_IFDIR | 0o755, stat.S_IFREG | 0o644, stat.S_IFLNK | 0o777
 
@@ -915,7 +937,7 @@ class ClosureTest(unittest.TestCase):
     PATHS = ["/usr/lib/python3", "/usr/lib/libssl.so.3", "/Library/Developer/CommandLineTools"]
 
     def test_a_closure_root_alone_has_no_problems(self):
-        lstat, walk = self.fs(self.tree())
+        lstat, walk, _ = self.fs(self.tree())
         self.assertEqual(hs.closure_problems(self.PATHS, lstat, walk), [])
 
     def test_every_writable_or_foreign_startup_dependency_is_a_problem(self):
@@ -930,11 +952,94 @@ class ClosureTest(unittest.TestCase):
                     "/Library/Developer": (0, stat.S_IFDIR | 0o775)}}
         for what, over in rows.items():
             with self.subTest(what):
-                lstat, walk = self.fs(self.tree(**over))
+                lstat, walk, _ = self.fs(self.tree(**over))
                 bad = hs.closure_problems(self.PATHS, lstat, walk)
                 self.assertEqual([b.split(" ")[0] for b in bad], list(over), bad)
-        lstat, walk = self.fs({k: v for k, v in self.tree().items() if k != "/usr/lib/libssl.so.3"})
+        lstat, walk, _ = self.fs({k: v for k, v in self.tree().items() if k != "/usr/lib/libssl.so.3"})
         self.assertTrue(hs.closure_problems(self.PATHS, lstat, walk), "a missing dependency is a problem")
+
+    def test_a_link_is_judged_by_its_target_and_the_targets_directories_too(self):
+        out = {"/opt": (0, self.D), "/opt/w": (501, stat.S_IFDIR | 0o777), "/opt/w/libssl.so.3": (501, self.F)}
+        rows = {"a root-owned link in the tree to a writable file outside it": (
+                    {"/usr/lib/python3/evil.py": (0, self.L)}, {"/usr/lib/python3/evil.py": "/opt/w/libssl.so.3"}),
+                "a linked library that is a root-owned link to a writable file": (
+                    {"/usr/lib/libssl.so.3": (0, self.L)}, {"/usr/lib/libssl.so.3": "/opt/w/libssl.so.3"}),
+                "a parent that is a link to a writable directory": (
+                    {"/Library": (0, self.L)}, {"/Library": "/opt/w"}),
+                "a closure directory that is a link to a tree holding a writable file": (
+                    {"/Library/Developer/CommandLineTools": (0, self.L), "/opt/clt": (0, self.D),
+                     "/opt/clt/bin": (0, self.D), "/opt/clt/bin/clang": (0, stat.S_IFREG | 0o666)},
+                    {"/Library/Developer/CommandLineTools": "/opt/clt"})}
+        for what, (over, links) in rows.items():
+            with self.subTest(what):
+                tree = dict(self.tree(**over), **out)
+                lstat, walk, realpath = self.fs(tree, links)
+                bad = hs.closure_problems(self.PATHS, lstat, walk, realpath)
+                self.assertTrue(any(b.startswith(("/opt/w", "/opt/clt")) for b in bad), bad)
+
+    def test_a_link_cycle_ends(self):
+        tree = dict(self.tree(**{"/usr/lib/python3/a": (0, self.L), "/usr/lib/python3/b": (0, self.L)}))
+        lstat, walk, realpath = self.fs(tree, {"/usr/lib/python3/a": "/usr/lib/python3/b",
+                                               "/usr/lib/python3/b": "/usr/lib/python3/a"})
+        self.assertEqual(hs.closure_problems(self.PATHS, lstat, walk, realpath), [])
+
+    def test_on_macos_a_system_library_in_the_shared_cache_is_not_a_problem_elsewhere_it_is(self):
+        tree = {k: v for k, v in self.tree().items() if k != "/usr/lib/libssl.so.3"}
+        lstat, walk, realpath = self.fs(tree)
+        self.assertEqual(hs.closure_problems(self.PATHS, lstat, walk, realpath, platform="darwin"), [])
+        self.assertEqual(hs.closure_problems(self.PATHS, lstat, walk, realpath, platform="linux"),
+                         ["/usr/lib/libssl.so.3: absent"])
+
+    @staticmethod
+    def elf(path, interp):
+        """A minimal 64-bit little-endian ELF: one program header, PT_INTERP or PT_LOAD."""
+        import struct
+        head = b"\x7fELF" + bytes([2, 1, 1]) + bytes(9) + struct.pack("<HHIQQQIHHHHHH", 2, 62, 1, 0, 64, 0, 0,
+                                                                         64, 56, 1, 0, 0, 0)
+        ph = struct.pack("<IIQQQQQQ", 3 if interp else 1, 0, 0, 0, 0, 0, 0, 0)
+        with open(path, "wb") as f:
+            f.write(head + ph)
+
+    def test_discovery_that_is_incomplete_is_refused_and_a_static_elf_links_nothing(self):
+        t = tempfile.TemporaryDirectory()
+        self.addCleanup(t.cleanup)
+        static, dynamic, text = (os.path.join(t.name, n) for n in ("static", "dynamic", "text"))
+        self.elf(static, False)
+        self.elf(dynamic, True)
+        with open(text, "w") as f:
+            f.write("#!/bin/sh\n")
+        self.assertIs(hs._static_elf(static), True)
+        self.assertIs(hs._static_elf(dynamic), False)
+        self.assertIsNone(hs._static_elf(text))
+        not_dyn = b"\tnot a dynamic executable\n"
+        self.assertEqual(hs._ldd_libraries(static, b"", not_dyn, 1), [], "a static ELF links nothing")
+        good = (b"\tlinux-vdso.so.1 (0x1)\n\tlibc.so.6 => /lib/libc.so.6 (0x2)\n"
+                b"\t/lib/ld-linux-aarch64.so.1 (0x3)\n")
+        self.assertEqual(hs._ldd_libraries(dynamic, good, b"", 0), ["/lib/libc.so.6", "/lib/ld-linux-aarch64.so.1"],
+                         "the loader is part of the closure")
+        for b, out, rc in ((dynamic, b"", 2), (text, b"", 1), (dynamic, b"\tlibz.so.1 => not found\n", 0),
+                           (dynamic, b"", 0), (dynamic, b"\tsomething else\n", 0), (text, good, 1)):
+            with self.subTest(b=os.path.basename(b), out=out, rc=rc):
+                with self.assertRaises(hs.Tooling):
+                    hs._ldd_libraries(b, out, not_dyn, rc)
+        for out, rc in ((b"x:\n", 1), (b"x:\n\t/usr/lib/libSystem.B.dylib (compat 1)\n", 1),
+                        (b"x:\n\t@rpath/libz.dylib (compat 1)\n", 0)):
+            with self.subTest(out=out, rc=rc):
+                with self.assertRaises(hs.Tooling):
+                    hs._otool_libraries(dynamic, out, b"", rc)
+        with self.assertRaises(hs.Tooling):
+            hs._otool_libraries(dynamic, b"x:\n", b"", 0)
+        self.assertEqual(hs._otool_libraries(dynamic, b"x:\n\t/usr/lib/libSystem.B.dylib (compat 1)\n", b"", 0),
+                         ["/usr/lib/libSystem.B.dylib"])
+
+    def test_the_fallback_dockers_closure_is_the_binary_and_everything_it_links(self):
+        if not os.path.exists("/usr/bin/ldd"):
+            self.skipTest("no ldd here")
+        sh = os.path.realpath("/bin/sh")
+        found = hs._docker_closure(sh)
+        self.assertEqual(found[0], sh)
+        self.assertTrue(any(os.path.basename(p).startswith("libc.") for p in found), found)
+        self.assertTrue(any("/ld-linux" in p for p in found), found)
 
     def test_discovery_names_the_library_its_extension_modules_and_every_linked_library(self):
         found = hs.startup_closure(os.path.realpath(sys.executable), os.path.realpath("/bin/sh"))
