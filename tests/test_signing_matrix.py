@@ -173,9 +173,25 @@ class AdoptionTest(unittest.TestCase):
 
     HOST = "a" * 64
 
-    def run_it(self, tuples, statuses):
+    def record(self, **over):
+        cap = {"schema": hk.CAPABILITY_SCHEMA, "host": "alpha", "engine": "unix:///e.sock", "at": "x",
+               "share": {"host_dev": 9, "container_dev": 1}, "tick_bound_ns": 1_000_000, "visible_within_s": 0.5,
+               "rename": {"seen_by_path": False, "ino_or_ctime_changed": False, "bytes_changed": True},
+               "writes": ["write", "rename"]}
+        cap.update(over)
+        return cap
+
+    def run_it(self, tuples, statuses, cap=None, host=None, slept=None):
         t, s = iter(tuples), iter(statuses)
-        return hk.adoption(lambda: next(t), lambda: next(s), self.HOST, sleep=lambda x: None)
+        cap = self.record() if cap is None else cap
+
+        def capability(dev, interval):
+            why = hk.capability_problem(cap, host="alpha", engine="unix:///e.sock", host_dev=9, container_dev=dev,
+                                        interval_s=interval)
+            return (why, None) if why else ("", cap)
+        settle = host if host is not None else (lambda: (1_000_000_000_000_000_000, 1_000_000_060.0))
+        return hk.adoption(lambda: next(t), lambda: next(s), self.HOST, capability=capability, host_settle=settle,
+                           sleep=(slept.append if slept is not None else (lambda x: None)))
 
     def a(self, ctime=1_000_000_000_000_000_000, sha=None, ino=7):
         return {"dev": 1, "ino": ino, "ctime_ns": ctime, "size": 10, "sha256": sha or self.HOST,
@@ -201,9 +217,34 @@ class AdoptionTest(unittest.TestCase):
     def test_a_host_replacement_the_container_does_not_see_is_unknown(self):
         self.assertEqual(self.run_it([self.a(sha="b" * 64)], [])[0], rh.UNKNOWN)
 
-    def test_a_config_changed_moments_ago_is_unknown(self):
-        young = dict(self.a(), now=1_000_000_000 + 1)
-        self.assertIn("moments ago", self.run_it([young], [])[1])
+    def test_a_config_changed_moments_ago_on_the_host_s_clock_is_unknown(self):
+        """The host stamps ctime, so the settle is judged on the host's clock,
+        whatever the container's clock says."""
+        young = lambda: (1_000_000_000_000_000_000, 1_000_000_001.0)
+        self.assertIn("moments ago", self.run_it([self.a(), self.a()], self.polls(10, 11, 12), host=young)[1])
+
+    def test_the_settle_covers_twice_the_largest_tick_a_record_may_declare(self):
+        self.assertGreaterEqual(hk.CTIME_SETTLE_S * 1_000_000_000, 2 * hk.TICK_BOUND_MAX_NS)
+        self.assertIn("tick", self.run_it([self.a()], self.polls(10),
+                                          cap=self.record(tick_bound_ns=hk.TICK_BOUND_MAX_NS + 1))[1])
+
+    def test_no_qualifying_capability_record_is_unknown_before_the_witness(self):
+        cases = {"none": rh.Unresolved("absent"), "host": self.record(host="beta"),
+                 "engine": self.record(engine="unix:///other"),
+                 "share": self.record(share={"host_dev": 8, "container_dev": 1}),
+                 "tick": self.record(tick_bound_ns=2_000_000_000), "visible": self.record(visible_within_s=5.0),
+                 "rename": self.record(rename={"seen_by_path": True, "ino_or_ctime_changed": False,
+                                               "bytes_changed": False}),
+                 "writes": self.record(writes=["write"])}
+        for name, cap in cases.items():
+            with self.subTest(case=name):
+                result, why = self.run_it([self.a(), self.a()], self.polls(10, 11, 12), cap=cap)
+                self.assertEqual(result, rh.UNKNOWN, why)
+
+    def test_step_five_waits_the_visibility_bound(self):
+        slept = []
+        self.assertEqual(self.run_it([self.a(), self.a()], self.polls(10, 11, 12), slept=slept)[0], rh.PASS)
+        self.assertEqual(slept[-1], 0.5)
 
     def test_one_poll_is_not_enough(self):
         result, why = self.run_it([self.a(), self.a()], self.polls(10, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11))
