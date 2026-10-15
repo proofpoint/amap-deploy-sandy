@@ -158,6 +158,35 @@ class JobTest(unittest.TestCase):
             out = subprocess.run(["/bin/sh", "-c", script], capture_output=True, text=True, timeout=180).stdout
             self.assertIn(link + "\n", out, "the target is judged through the link")
 
+    def test_each_lists_link_target_check_fires_alone(self):
+        """The -L finds over the lists, a present zip and the developer
+        directory, each run by itself (the walk, which also follows these
+        links, absent): a writable target behind a link is printed through
+        the link by that line alone. Each line is required exactly once."""
+        judge = pj.judge_script(P, False)
+        segments = [x.strip() for x in judge.replace("\n", "; ").split("; ")]
+        rows = {"find -L $P $Lw": lambda d, link: f"P={d}\nLw=\n",
+                'find -L "$z"': lambda d, link: f"z={link}\n",
+                'find -L "$X"': lambda d, link: f"X={d}\n"}
+        for prefix, setup in rows.items():
+            with self.subTest(prefix):
+                found = [x for x in segments if x.startswith(prefix + " ")]
+                if len(found) != 1:
+                    self.fail(f"judge.sh holds {len(found)} {prefix} line(s)")
+                with tempfile.TemporaryDirectory() as t:
+                    d = os.path.realpath(t)
+                    tree, target = os.path.join(d, "tree"), os.path.join(d, "target.py")
+                    os.mkdir(tree)
+                    with open(target, "w") as f:
+                        f.write("x")
+                    os.chmod(target, 0o666)
+                    link = os.path.join(tree, "link.py")
+                    os.symlink(target, link)
+                    script = "set -f\n" + setup(tree, link) + found[0]
+                    out = subprocess.run(["/bin/sh", "-c", script], capture_output=True, text=True, timeout=60,
+                                         stdin=subprocess.DEVNULL).stdout
+                    self.assertIn(link + "\n", out, "the target is judged through the link, by this line alone")
+
     def test_a_discovery_that_fails_names_its_file_and_a_missing_path_is_named(self):
         py, _ = self.healthy()
         with tempfile.TemporaryDirectory() as t:
