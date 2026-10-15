@@ -157,11 +157,18 @@ class ProbeShapeTest(unittest.TestCase):
     otherwise healthy document, re-signed so only that thing is wrong."""
 
     def refuses(self, edit, words):
+        """Refused as malformed evidence: any other exception is a failure
+        here, since verify catches only EvidenceError."""
         doc = json.loads(build())
         edit(doc)
-        with self.assertRaises(pe.EvidenceError) as e:
+        try:
             pe.parse(resign(doc), host=HOST)
-        self.assertIn(words, str(e.exception))
+        except pe.EvidenceError as e:
+            self.assertIn(words, str(e))
+        except Exception as e:  # noqa: BLE001 -- the point of the test
+            self.fail(f"refused by {type(e).__name__}, not as malformed evidence: {e}")
+        else:
+            self.fail("accepted")
 
     def p(self, doc, pid):
         return next(x for x in doc["probes"] if x["id"] == pid)
@@ -174,7 +181,9 @@ class ProbeShapeTest(unittest.TestCase):
                 ("vantage", [], "vantage"), ("vantage", [{"container": "x"}], "vantage"),
                 ("outcome", [], "outcome"), ("outcome", "maybe", "outcome"), ("witness", "not-a-witness", "witness"),
                 ("witness", {"operation": "open"}, "witness"), ("target_role", "key:signing", "target_role"),
-                ("target_role", ["/opt/ex/keys"], "target_role"), ("target_role", ["key:dir", "key:dir"], "target_role")]
+                ("target_role", ["/opt/ex/keys"], "target_role"), ("target_role", ["key:dir", "key:dir"], "repeat a role"),
+                ("target_role", [{}], "typed roles"), ("target_role", [[]], "typed roles"),
+                ("target_role", ["runtime:upstream", {}], "typed roles")]
         # On P01, which is not fail-stop, so only the type check can refuse.
         for member, value, words in rows:
             with self.subTest(member=member, value=value):
@@ -318,6 +327,20 @@ class VerifyDocumentTest(unittest.TestCase):
                                    lstat=self.lstat, read=gone)
         self.assertEqual(self.claim(found, "current and passing").result, rh.UNKNOWN)
 
+    def test_an_unhashable_role_is_a_malformed_fail_never_an_exception(self):
+        doc = json.loads(self.raw)
+        next(p for p in doc["probes"] if p["id"] == "P01")["target_role"] = [{}]
+        self.raw = resign(doc)
+        try:
+            found = self.run_it(live="run1:" + "a" * 64)
+        except Exception as e:  # noqa: BLE001 -- verify must report, never raise
+            self.fail(f"verify raised {type(e).__name__}: {e}")
+        self.assertEqual(self.claim(found, "current and passing").result, rh.FAIL)
+        self.assertEqual(self.claim(found, "signs with").result, rh.FAIL)
+        doc = json.loads(build())
+        self.raw = resign(doc)
+        self.assertEqual(self.claim(self.run_it(), "current and passing").result, rh.PASS, "the valid companion")
+
     def test_a_signing_router_without_a_readable_passing_document_fails_on_every_path(self):
         """The token claim is made on every path: absent, unreadable and
         malformed evidence each leave no current token, so a live one FAILs
@@ -341,6 +364,25 @@ class VerifyDocumentTest(unittest.TestCase):
 
 
 class ReadProtectedTest(unittest.TestCase):
+    def test_the_bytes_come_from_the_descriptor_that_was_checked(self):
+        """One open: the fd that passed the fstat check is the one read."""
+        import tempfile
+        import unittest.mock as um
+        opened = []
+        real_open = os.open
+
+        def counting(*a, **k):
+            opened.append(a[0])
+            return real_open(*a, **k)
+        fake = os.stat_result((0o100444, 0, 0, 1, 0, 0, 2, 0, 0, 0))
+        with tempfile.TemporaryDirectory() as t:
+            f = os.path.join(t, "e.json")
+            with open(f, "wb") as fh:
+                fh.write(b"{}")
+            with um.patch.object(pe.os, "open", counting), um.patch.object(pe.os, "fstat", lambda fd: fake):
+                self.assertEqual(pe.read_placed(f), b"{}")
+        self.assertEqual(opened, [f])
+
     def test_the_opened_file_must_itself_be_root_0444_with_one_link(self):
         import tempfile
         with tempfile.TemporaryDirectory() as t:

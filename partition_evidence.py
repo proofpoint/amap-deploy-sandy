@@ -210,9 +210,10 @@ def _probe_problem(p: Dict[str, Any]) -> None:
     if not isinstance(p["operation"], str) or not p["operation"]:
         raise EvidenceError(f"{pid}'s operation must be a non-empty string")
     roles = p["target_role"]
-    if not isinstance(roles, list) or not roles or len(set(roles)) != len(roles) or not all(
-            isinstance(r, str) and _ROLE.fullmatch(r) for r in roles):
-        raise EvidenceError(f"{pid}'s target_role must be a list of distinct roles")
+    if not isinstance(roles, list) or not roles or not all(isinstance(r, str) and _ROLE.fullmatch(r) for r in roles):
+        raise EvidenceError(f"{pid}'s target_role must be a list of typed roles")
+    if len(set(roles)) != len(roles):
+        raise EvidenceError(f"{pid}'s target_role must not repeat a role")
     if not isinstance(p["outcome"], str) or not _OUTCOME.fullmatch(p["outcome"]):
         raise EvidenceError(f"{pid}'s outcome must be an errno name, ok or unresolved")
     w = p["witness"]
@@ -269,14 +270,7 @@ def read_protected(path: str) -> bytes:
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise OSError(f"{path} is not a regular file")
-        chunks, total = [], 0
-        while total <= MAX_BYTES:
-            chunk = os.read(fd, MAX_BYTES + 1 - total)
-            if not chunk:
-                break
-            chunks.append(chunk)
-            total += len(chunk)
-        return b"".join(chunks)
+        return _read_fd(fd)
     finally:
         os.close(fd)
 
@@ -290,9 +284,22 @@ def read_placed(path: str) -> bytes:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode) or (st.st_uid, st.st_gid, stat.S_IMODE(st.st_mode), st.st_nlink) != (0, 0, 0o444, 1):
             raise OSError(f"{path} as opened is not a root:root 0444 file with one link")
+        return _read_fd(fd)
     finally:
         os.close(fd)
-    return read_protected(path)
+
+
+def _read_fd(fd: int) -> bytes:
+    """Up to MAX_BYTES + 1 bytes from `fd`: one more than the limit, so an
+    oversized file is seen as one."""
+    chunks, total = [], 0
+    while total <= MAX_BYTES:
+        chunk = os.read(fd, MAX_BYTES + 1 - total)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+    return b"".join(chunks)
 
 
 #: What a running local router must be told when it signs without a current
