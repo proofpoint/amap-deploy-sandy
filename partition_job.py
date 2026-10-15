@@ -134,13 +134,25 @@ def validation_steps(p: ps.PartitionSpec, q: Callable[[str], str] = shlex.quote)
         "for f in $T; do ldd \"$f\" >/dev/null 2>&1 || { file \"$f\" | grep -q 'statically linked' "
         "|| echo \"discovery failed: $f\"; }; done; "
         "L=$(ldd $T 2>/dev/null | awk '/=>/ {print $3} /^[[:space:]]+\\// {print $1}' | sort -u); fi",
-        f"for x in {py} {docker} $(realpath {py} {docker}) $P $L; do [ -e \"$x\" ] || "
-        "{ [ \"$(uname)\" = Darwin ] && case \"$x\" in /usr/lib/*|/System/Library/*) true;; *) false;; esac; } "
-        "|| echo \"absent: $x\"; done   # macOS: a system library in the shared cache is not on disk",
+        f"for x in {py} {docker} $(realpath {py} {docker}) $P; do [ -e \"$x\" ] || echo \"absent: $x\"; done"
+        "   # required: never excused",
+        "for x in $L; do [ -e \"$x\" ] || { [ \"$(uname)\" = Darwin ] && case \"$x\" in /usr/lib/*|/System/Library/*) "
+        "true;; *) false;; esac; } || echo \"absent: $x\"; done   # a library otool named may be in macOS's shared cache",
         f"find {py} {docker} $(realpath {py} {docker}) $P $L {own} 2>/dev/null",
         f"find -L {py} {docker} $(realpath {py} {docker}) $P $L {bad} 2>/dev/null   # every link's target",
         f"for z in $Z; do [ -e \"$z\" ] && {{ find \"$z\" {own}; find -L \"$z\" {bad}; }}; done   # a zip present",
         "[ \"$(uname)\" = Darwin ] && { D=$(xcode-select -p); find \"$D\" " + own + "; find -L \"$D\" " + bad + "; }",
+        # Every link met anywhere in the closure, followed one hop at a time: its target, everything
+        # under a target directory, and every directory above the target, each target once (a cycle ends).
+        f"seen=; todo=$(find {py} {docker} $P $L $(for z in $Z; do [ -e \"$z\" ] && echo \"$z\"; done) "
+        "$( [ \"$(uname)\" = Darwin ] && xcode-select -p) -type l 2>/dev/null); "
+        "while [ -n \"$todo\" ]; do next=; for l in $todo; do r=$(readlink \"$l\"); "
+        "case \"$r\" in /*) t=$r;; *) t=\"$(dirname \"$l\")/$r\";; esac; "
+        "case \" $seen \" in *\" $t \"*) continue;; esac; seen=\"$seen $t\"; "
+        f"find \"$t\" {own} 2>/dev/null; next=\"$next $(find \"$t\" -type l 2>/dev/null)\"; x=$t; "
+        "while [ \"$x\" != / ] && [ \"$x\" != . ]; do x=$(dirname \"$x\"); "
+        f"find \"$x\" -maxdepth 0 {own}; [ -L \"$x\" ] && next=\"$next $x\"; done; done; todo=$next; done"
+        "   # every link's target, its tree and its directories",
         f"for p in {py} {docker} $P $Z $L \"$( [ \"$(uname)\" = Darwin ] && xcode-select -p)\"; do for x in \"$p\" "
         "\"$(realpath \"$p\" 2>/dev/null)\"; do while [ -n \"$x\" ] && [ \"$x\" != / ]; do x=$(dirname \"$x\"); "
         f"find \"$x\" -maxdepth 0 {own}; done; done; done   # every directory above each, and above its realpath",

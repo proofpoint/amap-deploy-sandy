@@ -129,5 +129,94 @@ class JobTest(unittest.TestCase):
             self.assertNotIn(f"discovery failed: {py}", out)
             self.assertIn("absent: /nonexistent/docker", self.block(py, "/nonexistent/docker"))
 
+class ValidationMirrorTest(unittest.TestCase):
+    """The install-time block against closures this host does not have: an
+    interpreter stand-in names the library paths, `uname` may be stubbed,
+    and (for links) ownership is mapped to this test's user so that only
+    the permission checks decide."""
+
+    def setUp(self):
+        t = tempfile.TemporaryDirectory()
+        self.addCleanup(t.cleanup)
+        self.d = os.path.realpath(t.name)
+
+    def interpreter(self, paths):
+        py = os.path.join(self.d, "python3")
+        with open(py, "w") as f:
+            f.write("#!/bin/sh\ncase \"$*\" in *zip*) echo ;; *) echo %s ;; esac\n" % " ".join(paths))
+        os.chmod(py, 0o755)
+        return py
+
+    def run_block(self, py, env=None, as_owner=False):
+        spec = dataclasses.replace(P, tools={"python3": py, "docker": os.path.realpath("/bin/sh")})
+        script = "\n".join(pj.validation_steps(spec))
+        if as_owner:
+            import getpass
+            script = script.replace("-user root", f"-user {getpass.getuser()}")
+        return subprocess.run(["/bin/sh", "-c", script], capture_output=True, text=True, timeout=180,
+                              env=dict(os.environ, **(env or {}))).stdout
+
+    def test_on_macos_a_missing_required_path_is_named_though_it_is_under_a_system_prefix(self):
+        stub = os.path.join(self.d, "stub")
+        os.mkdir(stub)
+        with open(os.path.join(stub, "uname"), "w") as f:
+            f.write("#!/bin/sh\necho Darwin\n")
+        os.chmod(os.path.join(stub, "uname"), 0o755)
+        missing = "/usr/lib/absent-required-python"
+        py = self.interpreter([missing, missing, missing + "/lib-dynload"])
+        out = self.run_block(py, env={"PATH": stub + ":" + os.environ["PATH"]})
+        self.assertIn(f"absent: {missing}\n", out, "a required path is never taken for the shared cache")
+        self.assertIn(f"absent: {missing}/lib-dynload\n", out)
+
+    def stub(self, name, text):
+        d = os.path.join(self.d, "stub")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, name), "w") as f:
+            f.write("#!/bin/sh\n" + text)
+        os.chmod(os.path.join(d, name), 0o755)
+        return {"PATH": d + ":" + os.environ["PATH"]}
+
+    def test_a_library_the_tool_names_that_is_missing_is_named(self):
+        py = self.interpreter([self.d, self.d, self.d])
+        env = self.stub("ldd", "printf '\\tlibz.so.1 => /nonexistent/libz.so.1 (0x1)\\n'\n")
+        self.assertIn("absent: /nonexistent/libz.so.1\n", self.run_block(py, env=env))
+
+    def test_on_macos_only_a_system_library_the_tool_names_may_be_absent(self):
+        py = self.interpreter([self.d, self.d, self.d])
+        self.stub("uname", "echo Darwin\n")
+        env = self.stub("otool", "echo \"$1:\"; printf '\\t/usr/lib/libSystem.B.dylib (c)\\n\\t/opt/absent/lib.dylib (c)\\n'\n")
+        out = self.run_block(py, env=env)
+        self.assertIn("absent: /opt/absent/lib.dylib\n", out)
+        self.assertNotIn("absent: /usr/lib/libSystem.B.dylib", out, "in the shared cache")
+
+    def test_a_writable_directory_above_a_link_target_inside_the_tree_is_printed(self):
+        """stdlib/link.py -> outside/linked.py, the file 0444, outside/ 0777."""
+        stdlib, outside = os.path.join(self.d, "stdlib"), os.path.join(self.d, "outside")
+        os.mkdir(stdlib)
+        os.mkdir(outside)
+        with open(os.path.join(outside, "linked.py"), "w") as f:
+            f.write("x = 1\n")
+        os.chmod(os.path.join(outside, "linked.py"), 0o444)
+        os.chmod(outside, 0o777)
+        os.symlink(os.path.join(outside, "linked.py"), os.path.join(stdlib, "link.py"))
+        py = self.interpreter([stdlib, stdlib, stdlib])
+        out = self.run_block(py, as_owner=True)
+        self.assertIn(outside + "\n", out.replace(outside + "/", "\0"), "the target's own directory")
+
+    def test_nested_directory_links_and_a_cycle_are_followed_once(self):
+        """stdlib/sub -> outside (a directory link); outside/deeper -> elsewhere/,
+        elsewhere/ 0777; elsewhere/back -> stdlib (a cycle)."""
+        stdlib, outside, elsewhere = (os.path.join(self.d, n) for n in ("stdlib", "outside", "elsewhere"))
+        for n in (stdlib, outside, elsewhere):
+            os.mkdir(n)
+        os.chmod(elsewhere, 0o777)
+        os.symlink(outside, os.path.join(stdlib, "sub"))
+        os.symlink(elsewhere, os.path.join(outside, "deeper"))
+        os.symlink(stdlib, os.path.join(elsewhere, "back"))
+        py = self.interpreter([stdlib, stdlib, stdlib])
+        out = self.run_block(py, as_owner=True)
+        self.assertIn(elsewhere + "\n", out, "a link found inside a linked directory is followed too")
+
+
 if __name__ == "__main__":
     unittest.main()
