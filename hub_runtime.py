@@ -98,6 +98,7 @@ _LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
 _OWN = re.compile(rf"({_LABEL})\.internal")
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
+_COMMIT = re.compile(r"[0-9a-f]{40}")
 _LINK = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
 _DOMAIN = re.compile(rf"{_LABEL}(?:\.{_LABEL})*")
 #: The frozen login and probe names (the hub design): the login's local
@@ -148,6 +149,10 @@ class HubSpec:
     #: The file form: the D7 source's pinned sha256, `d7_source` then being
     #: the absolute path of that one file on this host. None: the clone form.
     d7_source_sha256: Optional[str] = None
+    #: The file form: the D7 commit the file is taken from, and its path in
+    #: the producer repository (the runner's one-file copy names both).
+    d7_source_commit: Optional[str] = None
+    d7_source_from: Optional[str] = None
 
     @property
     def d7_path(self) -> str:
@@ -227,20 +232,23 @@ def load(sec: Any, spec: Any) -> HubSpec:
     d7 = _exact(sec["d7"], ("dir", "file", "source"), "d7")
     if not isinstance(d7["file"], str) or not _NAME.fullmatch(d7["file"]):
         raise HubSpecError("hub.d7.file must be one file name")
-    src, src_sha = d7["source"], None
+    src, src_sha, src_commit, src_from = d7["source"], None, None, None
     if isinstance(src, dict):
         # The file form: one pinned file, for a host that holds no producer clone.
-        f = _exact(src, ("path", "sha256"), "d7.source")
+        f = _exact(src, ("path", "sha256", "commit", "from"), "d7.source")
         src = _abs(f["path"], "d7.source.path")
         if not isinstance(f["sha256"], str) or not _SHA256.fullmatch(f["sha256"]):
             raise HubSpecError("hub.d7.source.sha256 must be 64 lower-case hex digits")
-        src_sha = f["sha256"]
+        if not isinstance(f["commit"], str) or not _COMMIT.fullmatch(f["commit"]):
+            raise HubSpecError("hub.d7.source.commit must be the D7 commit, 40 lower-case hex")
+        fr = f["from"]
+        if not isinstance(fr, str) or fr.startswith("/") or posixpath.normpath(fr) != fr or fr.split("/")[0] == "..":
+            raise HubSpecError("hub.d7.source.from must be the file's path inside the producer repository")
+        src_sha, src_commit, src_from = f["sha256"], f["commit"], fr
     elif not isinstance(src, str) or src.startswith("/") or posixpath.normpath(src) != src \
             or src.split("/")[0] == "..":
-        raise HubSpecError("hub.d7.source must be a path inside the producer clone, or {path, sha256}")
-    elif "producer" not in s.clones:
-        raise HubSpecError("hub.d7.source is a path inside the producer clone, and secrets.clones has no "
-                           "producer: clone it, or pin the one file as {path, sha256}")
+        raise HubSpecError("hub.d7.source must be a path inside the producer clone, or "
+                           "{path, sha256, commit, from}")
     hop = _exact(sec["hop"], ("name", "root", "registry_dir", "registry_uid", "link"), "hop")
     if hop["name"] not in {h[0] for h in spec.hops}:
         raise HubSpecError(f"hub.hop.name {hop['name']!r} is not one of the document's hops")
@@ -268,7 +276,8 @@ def load(sec: Any, spec: Any) -> HubSpec:
         host_label=sec["host_label"], own_domain=sec["own_domain"], login_local=login["local"],
         login_domain=login["domain"], excluded=excluded, statement=sec["statement"],
         fleet_hosts=tuple(sorted(fleet)), d7_dir=_abs(d7["dir"], "d7.dir"), d7_file=d7["file"],
-        d7_source=src, d7_source_sha256=src_sha, env_file=_abs(sec["env_file"], "env_file"), hop=hop["name"], hop_root=hop["root"],
+        d7_source=src, d7_source_sha256=src_sha, d7_source_commit=src_commit, d7_source_from=src_from,
+        env_file=_abs(sec["env_file"], "env_file"), hop=hop["name"], hop_root=hop["root"],
         registry_dir=_abs(hop["registry_dir"], "hop.registry_dir"),
         registry_uid=_uint(hop["registry_uid"], "hop.registry_uid"), link=hop["link"], dirs=paths,
         lock_file=dirs["lock_file"], prefix_template=_abs(sec["prefix_template"], "prefix_template"),
@@ -629,10 +638,16 @@ def plan(spec: Any, hs: HubSpec, r: Rendered, q: Callable[[str], str], steps: st
     lines = ["# The hub-link router's files. First, as the operator: `amap-sandy.py hub-render --apply` writes "
              f"them into {run_dir}."]
     if hs.d7_source_sha256 is not None:
-        lines += [f"# The D7 source: the one file, copied by the operator from the runner's producer clone at the "
-                  f"pinned commit (no clone reaches this host).",
+        staged = "<staging>"
+        lines += [f"# The D7 source: ONE file from the pinned commit {hs.d7_source_commit}, never the producer tree.",
+                  f"# On the runner: git -C <the runner's producer clone> show "
+                  f"{hs.d7_source_commit}:{hs.d7_source_from} > {staged}",
+                  f"# On the runner: shasum -a 256 {staged}   # must print {hs.d7_source_sha256}",
+                  f"# Copy that one file to this host as {staged} (scp, or ssh with cat), never a directory.",
+                  f"# A later D7 commit leaves verify UNKNOWN until this document's pin moves to it.",
                   f"{install} -d -o 0 -g 0 -m 0755 {q(posixpath.dirname(hs.d7_source))}",
-                  f"{steps} place <the pinned D7 source file> {q(hs.d7_source)} --sha256 {hs.d7_source_sha256}"]
+                  f"{steps} place {staged} {q(hs.d7_source)} --sha256 {hs.d7_source_sha256}",
+                  f"rm -f {staged}"]
     if isinstance(r.d7, (bytes, bytearray)):
         lines += [f"{install} -d -o 0 -g 0 -m 0755 {q(hs.d7_dir)}  # holds the D7 file and nothing else",
                   f"{steps} place {q(posixpath.join(run_dir, D7_RENDERED))} {q(hs.d7_path)} --sha256 {_sha(r.d7)}"]

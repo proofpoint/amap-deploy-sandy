@@ -339,20 +339,27 @@ class ClonesTest(Base):
         """A host that pins the D7 source as one file holds no producer tree:
         no producer claim is made, and the other clones are checked as ever."""
         no_producer = {k: v for k, v in sec()["clones"].items() if k != "producer"}
-        found = self.run_checks(s=spec(clones=no_producer))
+        host = hs.load_spec(full_doc())
+        s = ss.load(dict(sec(), clones=no_producer), host.principals, host.runtimes)
+        found = self.run_checks(s=s)
         self.assertFalse([c.claim for c in found if "producer clone" in c.claim])
         self.assertEqual([(c.claim, c.actual) for c in found if c.result != rh.PASS], [])
         self.assertTrue([c for c in found if "the deploy clone's HEAD" in c.claim])
 
     def test_only_the_producer_clone_may_be_left_out(self):
+        """At the section, only the producer may be absent; whether THIS host
+        may leave it out is the document's rule (a hub pinning the file)."""
+        host = hs.load_spec(full_doc())
         for role in ss.CLONE_ROLES:
             with self.subTest(role=role):
                 clones = {k: v for k, v in sec()["clones"].items() if k != role}
                 if role == ss.OPTIONAL_CLONE_ROLE:
-                    self.assertNotIn(role, spec(clones=clones).clones)
-                else:
+                    self.assertNotIn(role, ss.load(dict(sec(), clones=clones), host.principals, host.runtimes).clones)
                     with self.assertRaises(hs.SpecError):
                         spec(clones=clones)
+                else:
+                    with self.assertRaises(ss.SecretSpecError):
+                        ss.load(dict(sec(), clones=clones), host.principals, host.runtimes)
 
     def test_git_that_cannot_answer_is_unknown(self):
         def broken(argv):
