@@ -3,6 +3,7 @@
 The engine is faked at the one place the module reaches it (Runner), and the
 fake answers each one-shot by the script and the arguments in its argv, so a
 probe that sent the wrong script or the wrong paths gets the wrong answer.
+The host side is a real temporary tree, because the path model stats it.
 The scripts themselves are also EXECUTED here, against temporary trees,
 because a verdict is only as good as the script that produced its rows."""
 
@@ -37,19 +38,46 @@ def proc(rc, out):
     return rh.Proc(("docker",), rc, out, "")
 
 
+def rebased(spec, root):
+    """`spec` with each bind's host source moved under `root`, so the path
+    model can stat it; an identity bind stays an identity bind."""
+    s = json.loads(json.dumps(spec))
+    for m in s["mounts"]:
+        if m["type"] == "bind":
+            same = m["target"] == m["source"]
+            m["source"] = root + m["source"]
+            if same:
+                m["target"] = m["source"]
+    return s
+
+
+def owner_rows(side_rows):
+    return {"up": {"dir": "2101 0o750 ok", "identity.json": "present 2101 0o640 REG",
+                   "versions.json": "present 2101 0o640 REG", "frontier.json": "ENOENT - - -",
+                   "retired.json": "ENOENT - - -"},
+            "down": {"dir": "2102 0o750 ok", "versions.json": "present 2102 0o640 REG"}}
+
+
 class Engine:
-    """Answers `docker exec` (P01) and `docker run` one-shots by script."""
+    """Answers `docker exec` (P01) and `docker run` one-shots by script and
+    operand. `owner[side]` is the owner's view of l1/g1 by name ("dir" for
+    the side directory, "gens" for the link's generations); `markers[side]`
+    the non-owner's answers by name, "." for its create attempt; `p04_at`
+    the email router's answer per P04 operand; `access_at` the local
+    router's per P04W operand."""
 
     def __init__(self):
         self.walks = {"ex-up": "1 2101 2101\n7 2101 2101\n", "ex-down": "1 2102 2102\n"}
-        self.markers = {"up": ["l1 g1 identity.json present 2101 0o640 EACCES",
-                               "l1 g1 versions.json present 2101 0o640 EACCES",
-                               "l1 g1 frontier.json ENOENT - - -", "l1 g1 retired.json ENOENT - - -",
-                               "l1 g1 . create - - EACCES"],
-                        "down": ["l1 g1 versions.json present 2102 0o640 EROFS",
-                                 "l1 g1 . create - - EROFS"]}
+        self.owner = owner_rows(None)
+        self.gens = {"l1": ["g1"]}
+        self.markers = {"up": {"identity.json": "present 2101 0o640 EACCES",
+                               "versions.json": "present 2101 0o640 EACCES",
+                               "frontier.json": "ENOENT - - -", "retired.json": "ENOENT - - -", ".": "EACCES"},
+                        "down": {"versions.json": "present 2102 0o640 EROFS", ".": "EROFS"}}
+        self.drop = set()
         self.p03 = "ENOENT"
-        self.p04 = "ENOENT"
+        self.p04, self.p04_at = "ENOENT", {}
+        self.access, self.access_at = "DIRW", {}
         self.witness = "OPENED"
         self.fail = set()
         self.seen = []
@@ -65,12 +93,36 @@ class Engine:
         name = argv[argv.index("--name") + 1]
         if name in self.fail:
             return proc(125, "")
+        if script == pp.P02_OWNER_SCRIPT:
+            side, k = args[1], int(args[2])
+            names, links = args[3:3 + k], args[3 + k:]
+            out = []
+            for lid in links:
+                if not self.gens.get(lid):
+                    out.append(f"{lid} - . enum - - {'EMPTY' if lid in self.gens else 'ENOENT'}")
+                    continue
+                for gen in self.gens[lid]:
+                    d = self.owner[side]["dir"]
+                    out.append(f"{lid} {gen} . dir {d}")
+                    if not d.endswith(" ok"):
+                        continue
+                    out += [f"{lid} {gen} {n} {self.owner[side].get(n, 'ENOENT - - -')}" for n in names]
+            return proc(0, "".join(l + "\n" for l in out))
         if script == pp.P02_SCRIPT:
-            return proc(0, "\n".join(self.markers[args[1]]) + "\n")
+            side, k = args[1], int(args[3])
+            names, targets = args[4:4 + k], args[4 + k:]
+            out = []
+            for t in targets:
+                lid, gen = t.split("/")
+                out += [f"{lid} {gen} {n} {self.markers[side][n]}" for n in names if (side, n) not in self.drop]
+                out.append(f"{lid} {gen} . create - - {self.markers[side]['.']}")
+            return proc(0, "".join(l + "\n" for l in out))
         if script == pp.P03_SCRIPT:
             return proc(0, "".join(f"{n} {self.p03}\n" for n in range(len(args))))
         if script == pp.P04_SCRIPT:
-            return proc(0, "".join(f"{n} {self.p04}\n" for n in range(len(args) - 1)))
+            return proc(0, "".join(f"{n} {self.p04_at.get(p, self.p04)}\n" for n, p in enumerate(args[1:])))
+        if script == pp.ACCESS_WITNESS_SCRIPT:
+            return proc(0, "".join(f"{n} {self.access_at.get(p, self.access)}\n" for n, p in enumerate(args)))
         if script == pp.OPEN_WITNESS_SCRIPT:
             return proc(0, "".join(f"{n} {self.witness}\n" for n in range(len(args) - 1)))
         raise AssertionError(f"an unknown script: {script[:40]!r}")
@@ -81,6 +133,9 @@ class ProbeRunTest(unittest.TestCase):
         t = tempfile.TemporaryDirectory()
         self.addCleanup(t.cleanup)
         self.root = os.path.realpath(t.name)
+        for d in ("srv/hop", "opt/d7", "opt/ex/keys"):
+            os.makedirs(os.path.join(self.root, d))
+        open(self.root + KEY, "w").close()
         self.lanes = {}
         for slug in ("alpha", "beta"):
             d = os.path.join(self.root, "instances", slug, "peer")
@@ -89,24 +144,37 @@ class ProbeRunTest(unittest.TestCase):
         self.sources = dict(self.lanes)
         self.engine = Engine()
         self.drift = []
-        self.email = json.loads(json.dumps(EMAIL))
+        self.email = rebased(EMAIL, self.root)
+        self.router = rebased(ROUTER, self.root)
+        inst = os.path.join(self.root, "instances")
+        self.router["mounts"].append({"type": "bind", "source": inst, "target": inst, "readonly": False})
+        self.stat, self.lstat = os.stat, os.lstat
 
     def plan(self):
         return pp.Plan(host="alpha", run_id="r1", at="2026-10-14T12:00:00Z", email=self.email,
-                       email_drift=self.drift, email_volume="ex-secret", router=ROUTER, key_path=KEY,
-                       key_dir="/opt/ex/keys", lanes=self.lanes, agent_sources=self.sources,
+                       email_drift=self.drift, email_volume="ex-secret", router=self.router,
+                       key_path=self.root + KEY, key_dir=self.root + "/opt/ex/keys", lanes=self.lanes,
+                       agent_sources=self.sources, links=["l1"], hop_root=self.root + "/srv/hop",
                        runtimes={"upstream": ("ex-up", 2101, 2101), "downstream": ("ex-down", 2102, 2102)},
-                       vantages={"upstream": pp.spec_vantage(ROUTER), "downstream": pp.spec_vantage(self.email)},
+                       vantages={"upstream": pp.spec_vantage(ROUTER), "downstream": pp.spec_vantage(EMAIL)},
                        hops=[("upstream", "downstream")],
-                       sides={"up": (self.email, "/hop"), "down": (ROUTER, "/srv/hop")},
-                       owners={"up": (ROUTER, "/srv/hop", 2101), "down": (self.email, "/hop", 2102)},
+                       sides={"up": (self.email, "/hop"), "down": (self.router, self.root + "/srv/hop")},
+                       owners={"up": (self.router, self.root + "/srv/hop", 2101), "down": (self.email, "/hop", 2102)},
                        bindings={"host_setup": "c" * 64})
 
-    def run_it(self):
-        return pp.run(self.plan(), pp.Runner(["docker"], self.engine), hr.argv)
+    def run_it(self, plan=None):
+        try:
+            return pp.run(plan or self.plan(), pp.Runner(["docker"], self.engine), hr.argv, stat_=self.stat,
+                          lstat_=self.lstat)
+        except Exception as e:  # a crash is not a verdict
+            self.fail(f"the run raised {e!r}")
 
     def verdicts(self, doc):
         return {p["id"]: p["verdict"] for p in json.loads(doc)["probes"]}
+
+    def p04_args(self):
+        p04 = [a for a in self.engine.seen if pp.P04_SCRIPT in a][0]
+        return p04[p04.index("-c") + 3:]
 
     def test_a_healthy_host_passes_every_probe_and_gets_a_token(self):
         doc, code, report = self.run_it()
@@ -115,6 +183,7 @@ class ProbeRunTest(unittest.TestCase):
         self.assertEqual(probes["P03"]["target_role"], ["key:signing", "key:dir"])
         self.assertEqual(probes["P04"]["target_role"], ["peer:alpha", "peer:beta"])
         self.assertEqual((probes["P03"]["outcome"], probes["P03"]["witness"]["outcome"]), ("ENOENT", "ok"))
+        self.assertEqual(probes["P04"]["witness"]["outcome"], "ok")
         self.assertEqual(probes["P03"]["vantage"], [{"container": "ex-down", "image": EMAIL["image"], "uid": 2102,
                                                      "gids": [2102, 2200]}])
         self.assertEqual(self.verdicts(doc), {"P01": "PASS", "P02": "PASS", "P03": "PASS", "P04": "PASS"})
@@ -127,6 +196,22 @@ class ProbeRunTest(unittest.TestCase):
         self.assertEqual((doc, code), (None, 2))
         self.assertIn("not its rendering", report[0])
         self.assertEqual(self.engine.seen, [], "no probe runs against a container that is not its spec")
+
+    # The one-shot's argv
+    def test_every_probe_one_shot_replaces_the_image_program_and_carries_only_its_operands(self):
+        self.run_it()
+        runs = [a for a in self.engine.seen if a[1] == "run"]
+        self.assertTrue(runs)
+        for a in runs:
+            with self.subTest(name=a[a.index("--name") + 1]):
+                self.assertEqual(a[a.index("--entrypoint") + 1], "python3")
+                self.assertEqual(a[a.index("--pull") + 1], "never")
+                self.assertEqual(a[a.index("--network") + 1], "none")
+                image = next(x for x in a if x.startswith("sha256:"))
+                tail = a[a.index(image) + 1:]
+                self.assertEqual(tail[:3], ["-I", "-S", "-c"], "nothing of the image's own command")
+        p03 = [a for a in self.engine.seen if pp.P03_SCRIPT in a][0]
+        self.assertEqual(p03[p03.index("-c") + 2:], [self.root + KEY, self.root + "/opt/ex/keys"])
 
     # P03
     def test_a_reachable_key_fails_p03_and_withholds_the_token(self):
@@ -141,23 +226,37 @@ class ProbeRunTest(unittest.TestCase):
         self.assertEqual(self.verdicts(doc)["P03"], "UNKNOWN")
         self.assertIsNone(json.loads(doc)[pe.TOKEN_MEMBER])
 
+    def test_a_router_witness_that_could_not_run_makes_p03_unknown(self):
+        self.engine.fail.add("ex-up-partition-probe-p03w-r1")
+        doc, code, _ = self.run_it()
+        self.assertEqual((self.verdicts(doc)["P03"], code), ("UNKNOWN", 2))
+        self.assertIsNone(json.loads(doc)[pe.TOKEN_MEMBER])
+
     def test_p03_probes_the_key_and_its_directory_through_every_mount(self):
-        self.email["mounts"].append({"type": "bind", "source": "/opt/ex", "target": "/mnt/ex", "readonly": True})
+        self.email["mounts"].append({"type": "bind", "source": self.root + "/opt/ex", "target": "/mnt/ex",
+                                     "readonly": True})
         doc, _, _ = self.run_it()
         roles = next(p for p in json.loads(doc)["probes"] if p["id"] == "P03")["target_role"]
         self.assertEqual(roles, ["key:signing", "key:dir", "mount:1", "mount:3"])
         p03 = [a for a in self.engine.seen if pp.P03_SCRIPT in a][0]
-        args = p03[p03.index("-c") + 2:]
-        self.assertEqual(sorted(args), sorted([KEY, "/opt/ex/keys", "/mnt/ex/keys/signing.key", "/mnt/ex/keys"]))
+        self.assertEqual(sorted(p03[p03.index("-c") + 2:]), sorted(
+            [self.root + KEY, self.root + "/opt/ex/keys", "/mnt/ex/keys/signing.key", "/mnt/ex/keys"]))
+
+    def test_a_key_reached_through_a_symlinked_source_is_still_a_candidate(self):
+        os.symlink(self.root + "/opt/ex", self.root + "/ex-alias")
+        self.email["mounts"].append({"type": "bind", "source": self.root + "/ex-alias", "target": "/mnt/ex",
+                                     "readonly": True})
+        self.run_it()
+        p03 = [a for a in self.engine.seen if pp.P03_SCRIPT in a][0]
+        self.assertIn("/mnt/ex/keys/signing.key", p03)
 
     # Host facts outside the evidence vocabulary
     def test_a_mount_path_no_role_could_spell_still_produces_evidence(self):
-        """Roles name a candidate by its index, so a host's real paths (a
-        space, an @, more than 128 characters) never reach the vocabulary."""
         for where in ("/Library/Application Support/ex", "/run/user@1000", "/" + "d" * 140):
             with self.subTest(where=where):
-                self.email = json.loads(json.dumps(EMAIL))
-                self.email["mounts"].append({"type": "bind", "source": "/opt/ex", "target": where, "readonly": True})
+                self.email = rebased(EMAIL, self.root)
+                self.email["mounts"].append({"type": "bind", "source": self.root + "/opt/ex", "target": where,
+                                             "readonly": True})
                 self.engine.seen = []
                 doc, code, report = self.run_it()
                 self.assertEqual(code, 0, report)
@@ -181,24 +280,88 @@ class ProbeRunTest(unittest.TestCase):
     def test_evidence_that_cannot_be_built_is_exit_2_never_a_traceback(self):
         plan = self.plan()
         plan = pp.Plan(**dict(plan.__dict__, bindings={"host_setup": "not a sha256"}))
-        try:
-            doc, code, report = pp.run(plan, pp.Runner(["docker"], self.engine), hr.argv)
-        except Exception as e:  # a crash is not a verdict
-            self.fail(f"the run raised {e!r}")
+        doc, code, report = self.run_it(plan)
         self.assertEqual((doc, code), (None, 2))
         self.assertIn("cannot be built", report[-1])
         self.assertTrue(report[0].startswith("P01: PASS"), "the probes' own lines are kept")
 
     # P04
     def test_a_created_file_in_a_lane_fails_p04(self):
-        self.engine.p04 = "CREATED"
-        doc, code, report = self.run_it()
-        self.assertEqual((self.verdicts(doc)["P04"], code), ("FAIL", 1))
-        self.assertIn("created a file in a peer lane", report[3])
+        for cls in ("CREATED", "LEFT"):
+            with self.subTest(cls=cls):
+                self.engine.p04 = cls
+                doc, code, report = self.run_it()
+                self.assertEqual((self.verdicts(doc)["P04"], code), ("FAIL", 1))
+                self.assertIn("created a file in a peer lane", report[3])
 
     def test_a_visible_lane_fails_p04_even_unwritten(self):
         self.engine.p04 = "EACCES"
         self.assertEqual(self.verdicts(self.run_it()[0])["P04"], "FAIL")
+
+    def test_a_lane_reached_through_an_alias_is_still_probed_where_the_email_router_sees_it(self):
+        """real/peer is the live lane, lane-alias points to it,
+        and the email router binds `real` at /visible. /visible/peer must be
+        a candidate, so the EACCES there FAILs P04."""
+        real = os.path.join(self.root, "real", "peer")
+        os.makedirs(real)
+        alias = os.path.join(self.root, "lane-alias")
+        os.symlink(real, alias)
+        self.lanes, self.sources = {"alpha": alias}, {"alpha": real}
+        self.email["mounts"].append({"type": "bind", "source": os.path.join(self.root, "real"), "target": "/visible",
+                                     "readonly": True})
+        self.router["mounts"].append({"type": "bind", "source": os.path.join(self.root, "real"),
+                                      "target": os.path.join(self.root, "real"), "readonly": False})
+        self.engine.p04_at = {"/visible/peer": "EACCES"}
+        doc, code, report = self.run_it()
+        self.assertIn("/visible/peer", self.p04_args())
+        self.assertEqual((self.verdicts(doc)["P04"], code), ("FAIL", 1), report)
+
+    def test_a_directory_at_a_second_host_path_is_related_by_identity(self):
+        """A bind source that is the instances tree under another spelling
+        (here a symbolic link to it) is caught as holding the lanes."""
+        os.symlink(os.path.join(self.root, "instances"), os.path.join(self.root, "inst-alias"))
+        self.email["mounts"].append({"type": "bind", "source": os.path.join(self.root, "inst-alias"), "target": "/x",
+                                     "readonly": True})
+        doc, _, report = self.run_it()
+        self.assertEqual(self.verdicts(doc)["P04"], "FAIL")
+        self.assertIn("mounts a lane", report[3])
+
+    def test_an_ancestor_that_cannot_be_stat_ed_is_unknown_never_pass(self):
+        blocked = os.path.join(self.root, "instances")
+
+        def stat_(p):
+            if p == blocked:
+                raise PermissionError(13, "denied", p)
+            return os.stat(p)
+        self.stat = stat_
+        doc, code, _ = self.run_it()
+        self.assertEqual((self.verdicts(doc)["P04"], code), ("UNKNOWN", 2))
+
+    def test_a_lane_the_local_router_cannot_be_shown_to_reach_is_unknown(self):
+        """The permitted side's read-only witness, per lane."""
+        for case in ("no answer", "an errno", "no mount"):
+            with self.subTest(case=case):
+                self.engine = Engine()
+                self.router = rebased(ROUTER, self.root)
+                inst = os.path.join(self.root, "instances")
+                if case != "no mount":
+                    self.router["mounts"].append({"type": "bind", "source": inst, "target": inst, "readonly": False})
+                if case == "no answer":
+                    self.engine.fail.add("ex-up-partition-probe-p04w-r1")
+                if case == "an errno":
+                    self.engine.access_at = {self.lanes["beta"]: "EACCES"}
+                doc, code, report = self.run_it()
+                self.assertEqual((self.verdicts(doc)["P04"], code), ("UNKNOWN", 2), report)
+                p04 = next(p for p in json.loads(doc)["probes"] if p["id"] == "P04")
+                self.assertNotEqual(p04["witness"]["outcome"], "ok")
+
+    def test_the_local_routers_witness_only_looks(self):
+        self.run_it()
+        w = [a for a in self.engine.seen if pp.ACCESS_WITNESS_SCRIPT in a][0]
+        self.assertEqual(w[w.index("--name") + 1], "ex-up-partition-probe-p04w-r1")
+        self.assertEqual(sorted(w[w.index("-c") + 2:]), sorted(self.lanes.values()))
+        for word in ("os.open", "O_CREAT", "listdir", "unlink", "mkdir"):
+            self.assertNotIn(word, pp.ACCESS_WITNESS_SCRIPT)
 
     def test_a_lane_that_is_not_the_agents_live_one_is_unknown_and_not_probed(self):
         other = os.path.join(self.root, "elsewhere")
@@ -226,6 +389,30 @@ class ProbeRunTest(unittest.TestCase):
         p04 = [a for a in self.engine.seen if pp.P04_SCRIPT in a][0]
         self.assertEqual(p04[p04.index("-c") + 2], pp.probe_file("r1"))
 
+    # The non-effect, host-side
+    def test_a_probe_name_left_in_a_lane_or_a_marker_directory_fails_on_the_host(self):
+        for where, pid in ((lambda: self.lanes["beta"], "P04"),
+                           (lambda: os.path.join(self.root, "srv", "hop", "l1", "g1", "up"), "P02")):
+            with self.subTest(pid=pid):
+                d = where()
+                os.makedirs(d, exist_ok=True)
+                left = os.path.join(d, pp.probe_file("r1"))
+                open(left, "w").close()
+                doc, code, report = self.run_it()
+                os.unlink(left)
+                self.assertEqual((self.verdicts(doc)[pid], code), ("FAIL", 1))
+                self.assertIn(left, "\n".join(report))
+
+    def test_a_non_effect_check_that_cannot_be_made_is_unknown(self):
+        def lstat_(p):
+            if p.endswith(pp.probe_file("r1")):
+                raise PermissionError(13, "denied", p)
+            return os.lstat(p)
+        self.lstat = lstat_
+        doc, code, _ = self.run_it()
+        v = self.verdicts(doc)
+        self.assertEqual((v["P02"], v["P04"], code), ("UNKNOWN", "UNKNOWN", 2))
+
     # P01
     def test_a_foreign_uid_process_fails_p01_but_keeps_the_token(self):
         self.engine.walks["ex-down"] += "9 0 0\n"
@@ -246,37 +433,55 @@ class ProbeRunTest(unittest.TestCase):
 
     # P02
     def test_a_non_owner_opening_a_marker_for_writing_fails_p02(self):
-        self.engine.markers["up"][0] = "l1 g1 identity.json present 2101 0o640 OPENED"
+        self.engine.markers["up"]["identity.json"] = "present 2101 0o640 OPENED"
         self.assertEqual(self.verdicts(self.run_it()[0])["P02"], "FAIL")
 
     def test_a_non_owner_creating_beside_the_markers_fails_p02(self):
-        self.engine.markers["down"][1] = "l1 g1 . create - - CREATED"
-        self.assertEqual(self.verdicts(self.run_it()[0])["P02"], "FAIL")
+        for cls in ("CREATED", "LEFT"):
+            with self.subTest(cls=cls):
+                self.engine.markers["down"]["."] = cls
+                self.assertEqual(self.verdicts(self.run_it()[0])["P02"], "FAIL")
 
-    def test_a_wrong_owner_or_mode_fails_p02(self):
-        self.engine.markers["up"][1] = "l1 g1 versions.json present 2101 0o664 EACCES"
-        self.assertEqual(self.verdicts(self.run_it()[0])["P02"], "FAIL")
-        self.engine.markers["up"][1] = "l1 g1 versions.json present 2102 0o640 EACCES"
-        self.assertEqual(self.verdicts(self.run_it()[0])["P02"], "FAIL")
+    def test_a_wrong_owner_mode_or_type_fails_p02(self):
+        for row in ("present 2101 0o664 REG", "present 2102 0o640 REG", "present 2101 0o640 NOTREG"):
+            with self.subTest(row=row):
+                self.engine.owner["up"]["versions.json"] = row
+                self.assertEqual(self.verdicts(self.run_it()[0])["P02"], "FAIL")
 
-    def test_a_missing_required_marker_fails_and_a_missing_optional_one_passes(self):
+    def test_a_missing_required_marker_or_side_fails_and_a_missing_optional_one_passes(self):
         self.assertEqual(self.verdicts(self.run_it()[0])["P02"], "PASS", "frontier and retired absent")
-        self.engine.markers["up"][0] = "l1 g1 identity.json ENOENT - - -"
+        self.engine.owner["up"]["identity.json"] = "ENOENT - - -"
+        self.engine.markers["up"]["identity.json"] = "ENOENT - - -"
         self.assertEqual(self.verdicts(self.run_it()[0])["P02"], "FAIL")
+        self.engine = Engine()
+        self.engine.owner["down"]["dir"] = "- - ENOENT"
+        self.assertEqual(self.verdicts(self.run_it()[0])["P02"], "FAIL")
+
+    def test_an_incomplete_or_empty_observation_is_unknown(self):
+        """A configured link with no generation, a link the owner cannot
+        list, a row missing from the non-owner's answer, and a marker the
+        owner sees but the non-owner's path does not reach."""
+        cases = {"no generation": lambda e: e.gens.update(l1=[]),
+                 "a link the owner cannot list": lambda e: e.gens.pop("l1"),
+                 "a missing answer": lambda e: e.drop.add(("up", "identity.json")),
+                 "an unreached marker": lambda e: e.markers["up"].update({"identity.json": "ENOENT - - -"})}
+        for name, breaks in cases.items():
+            with self.subTest(name=name):
+                self.engine = Engine()
+                breaks(self.engine)
+                doc, code, report = self.run_it()
+                self.assertEqual((self.verdicts(doc)["P02"], code), ("UNKNOWN", 2), report)
 
     def test_an_owner_that_cannot_open_its_marker_makes_p02_unknown(self):
         self.engine.witness = "EACCES"
         doc, _, _ = self.run_it()
         self.assertEqual(self.verdicts(doc)["P02"], "UNKNOWN")
 
-    def test_a_router_witness_that_could_not_run_makes_p03_unknown(self):
-        self.engine.fail.add("ex-up-partition-probe-p03w-r1")
-        try:
-            doc, code, _ = self.run_it()
-        except Exception as e:  # a crash is not a verdict
-            self.fail(f"the run raised {e!r}")
-        self.assertEqual((self.verdicts(doc)["P03"], code), ("UNKNOWN", 2))
-        self.assertIsNone(json.loads(doc)[pe.TOKEN_MEMBER])
+    def test_the_non_owner_is_given_exactly_the_owners_targets(self):
+        self.engine.gens = {"l1": ["g1", "g2"]}
+        self.run_it()
+        p02 = [a for a in self.engine.seen if pp.P02_SCRIPT in a]
+        self.assertEqual({tuple(a[-2:]) for a in p02}, {("l1/g1", "l1/g2")})
 
     def test_a_probe_that_could_not_run_is_unknown_and_exits_2(self):
         self.engine.fail.add("ex-down-partition-probe-p03-r1")
@@ -303,8 +508,16 @@ class VerdictTest(unittest.TestCase):
         self.assertIn("share uid 2101", got[2])
 
     def test_unestablished_lanes_are_unknown_whatever_the_rows_say(self):
-        got = self.judged(pp.verdict_p04, [(0, "ENOENT")], rh.Unresolved("beta is not running"), [])
+        got = self.judged(pp.verdict_p04, [(0, "ENOENT")], rh.Unresolved("beta is not running"), [], [])
         self.assertEqual(got[:2], ("UNKNOWN", "unresolved"))
+
+    def test_an_unprovable_mount_relation_is_unknown(self):
+        got = self.judged(pp.verdict_p04, [(0, "ENOENT")], [], rh.Unresolved("cannot stat /x"), [])
+        self.assertEqual(got[:2], ("UNKNOWN", "unresolved"))
+
+    def test_a_fail_stands_whatever_the_permitted_witness_says(self):
+        got = self.judged(pp.verdict_p04, [(0, "EACCES")], [], [], rh.Unresolved("no witness"))
+        self.assertEqual(got[0], "FAIL")
 
     def test_a_router_witness_that_did_not_open_the_key_is_unknown(self):
         got = self.judged(pp.verdict_p03, [(0, "ENOENT")], [(0, "ENOENT")])
@@ -313,6 +526,11 @@ class VerdictTest(unittest.TestCase):
     def test_an_unresolved_router_witness_is_unknown(self):
         got = self.judged(pp.verdict_p03, [(0, "ENOENT")], rh.Unresolved("the one-shot did not start"))
         self.assertEqual(got[:2], ("UNKNOWN", "ENOENT"))
+
+    def test_a_non_effect_check_holds_a_verdict(self):
+        self.assertEqual(pp.with_non_effect(("PASS", "ENOENT", "x"), ["/l/.p"])[0], "FAIL")
+        self.assertEqual(pp.with_non_effect(("PASS", "ENOENT", "x"), rh.Unresolved("EACCES"))[0], "UNKNOWN")
+        self.assertEqual(pp.with_non_effect(("FAIL", "ok", "x"), rh.Unresolved("EACCES"))[0], "FAIL")
 
 
 class OneshotTest(unittest.TestCase):
@@ -324,6 +542,13 @@ class OneshotTest(unittest.TestCase):
         self.assertNotIn("--read-only", argv, "never hardening the runtime lacks")
         self.assertIn("--rm", argv)
         self.assertEqual(argv[argv.index("--network") + 1], "none")
+
+    def test_the_command_after_the_image_is_exactly_the_script_and_its_operands(self):
+        one = pp.oneshot(EMAIL, "P03", "r1", pp.P03_SCRIPT, [KEY, "/opt/ex/keys"], "ex-secret")
+        argv = pp.oneshot_argv(one, hr.argv)
+        self.assertEqual(argv[argv.index("--entrypoint") + 1], "python3")
+        self.assertEqual(argv[argv.index(EMAIL["image"]) + 1:], ["-I", "-S", "-c", pp.P03_SCRIPT, KEY, "/opt/ex/keys"])
+        self.assertEqual(argv[argv.index("--pull") + 1], "never")
 
     def test_only_the_named_secret_volume_is_dropped(self):
         one = pp.oneshot(EMAIL, "P03", "r1", pp.P03_SCRIPT, [KEY], "ex-secret")
@@ -342,11 +567,13 @@ class OneshotTest(unittest.TestCase):
 class ControlEngine:
     """The controls' engine: each planted one-shot answers as a broken
     partition would, unless told the probe stayed green. C05's exec reads the
-    scratch config as a re-resolved bind would, unless `stale`."""
+    scratch config as a re-resolved bind would, unless `stale`. `c04` is the
+    scratch lane's create-and-delete answer."""
 
     def __init__(self, scratch):
         self.scratch, self.green, self.stale, self.seen = scratch, set(), False, []
         self.c05_before = None
+        self.c04 = "CREATED"
 
     def __call__(self, argv):
         argv = list(argv)
@@ -367,13 +594,26 @@ class ControlEngine:
                 return proc(0, f.read())
         i = argv.index("-c")
         script = argv[i + 1]
+        if script == pp.P02_OWNER_SCRIPT:
+            mode = "0o640" if "C02" in self.green else "0o660"
+            return proc(0, "l1 g1 . dir 2101 0o750 ok\n"
+                           "l1 g1 frontier.json ENOENT - - -\n"
+                           f"l1 g1 identity.json present 2101 {mode} REG\n"
+                           "l1 g1 retired.json ENOENT - - -\n"
+                           "l1 g1 versions.json present 2101 0o640 REG\n")
         if script == pp.P02_SCRIPT:
             w = "EACCES" if "C02" in self.green else "OPENED"
-            return proc(0, f"l1 g1 identity.json present 2101 0o640 {w}\n")
+            return proc(0, "l1 g1 frontier.json ENOENT - - -\n"
+                           f"l1 g1 identity.json present 2101 0o640 {w}\n"
+                           "l1 g1 retired.json ENOENT - - -\n"
+                           "l1 g1 versions.json present 2101 0o640 EACCES\n"
+                           "l1 g1 . create - - EACCES\n")
+        if script == pp.OPEN_WITNESS_SCRIPT:
+            return proc(0, "".join(f"{n} OPENED\n" for n in range(len(argv) - i - 3)))
         if script == pp.P03_SCRIPT:
             return proc(0, "0 ENOENT\n" if "C03" in self.green else "0 exists\n")
         if script == pp.P04_SCRIPT:
-            return proc(0, "0 ENOENT\n" if "C04" in self.green else "0 CREATED\n")
+            return proc(0, "0 ENOENT\n" if "C04" in self.green else f"0 {self.c04}\n")
         raise AssertionError(argv)
 
 
@@ -385,6 +625,7 @@ class ControlsTest(unittest.TestCase):
         self.scratch = {"key_dir": os.path.join(root, "keys"), "key": os.path.join(root, "keys", "dummy"),
                         "peer": os.path.join(root, "peer"), "markers": os.path.join(root, "hop"),
                         "config": os.path.join(root, "c.json"), "config_next": os.path.join(root, "c.next")}
+        os.makedirs(self.scratch["peer"])
         with open(self.scratch["config"], "wb") as f:
             f.write(pp.C05_BEFORE)
         with open(self.scratch["config_next"], "wb") as f:
@@ -412,10 +653,33 @@ class ControlsTest(unittest.TestCase):
                 self.engine.green = {cid}
                 self.assertEqual(self.run_it()[cid]["control"], "FAIL")
 
+    def test_c04_passes_only_on_a_created_and_removed_probe_name(self):
+        """Any other red P04 answer is not the witness."""
+        for answer in ("EACCES", "LEFT"):
+            with self.subTest(answer=answer):
+                self.engine.c04 = answer
+                self.assertEqual(self.run_it()["C04"]["control"], "FAIL")
+        self.engine.c04 = "CREATED"
+        left = os.path.join(self.scratch["peer"], pp.probe_file("r1"))
+        open(left, "w").close()
+        c = self.run_it()["C04"]
+        self.assertEqual(c["control"], "FAIL")
+        self.assertIn("left the probe name", c["outcome"])
+
     def test_c05_fails_when_a_restarted_container_reads_the_old_file(self):
         self.engine.stale = True
         c = self.run_it()["C05"]
         self.assertEqual((c["probe_verdict"], c["control"]), ("FAIL", "FAIL"))
+
+    def test_the_throwaways_are_hardened(self):
+        self.run_it()
+        for argv in self.engine.seen:
+            if argv[1] in ("create",) or (argv[1] == "run" and "-d" in argv):
+                with self.subTest(verb=argv[1]):
+                    for flag, value in (("--pull", "never"), ("--cap-drop", "ALL"),
+                                        ("--security-opt", "no-new-privileges")):
+                        self.assertEqual(argv[argv.index(flag) + 1], value)
+                    self.assertIn("--read-only", argv)
 
     def test_no_control_touches_a_live_container(self):
         self.run_it()
@@ -431,10 +695,17 @@ class ControlsTest(unittest.TestCase):
         self.assertEqual(doc["schema"], pp.CONTROL_SCHEMA)
 
 
-def run_script(script, *args):
-    p = subprocess.run([sys.executable, "-I", "-S", "-c", script, *args], capture_output=True, text=True, timeout=30)
+def run_script(script, *args, prelude=""):
+    code = script if not prelude else prelude + "\nexec(compile(SCRIPT, '<probe>', 'exec'))"
+    env_args = [] if not prelude else ["-c", f"SCRIPT = {script!r}\n" + code]
+    argv = [sys.executable, "-I", "-S"] + (env_args or ["-c", script]) + list(args)
+    p = subprocess.run(argv, capture_output=True, text=True, timeout=30)
     assert p.returncode == 0, p.stderr
     return p.stdout
+
+
+#: Makes every os.unlink fail, as a lane whose removal is refused would.
+NO_UNLINK = "import os\ndef _no(p, *a, **k): raise PermissionError(13, 'refused', p)\nos.unlink = _no"
 
 
 class ScriptsTest(unittest.TestCase):
@@ -458,6 +729,17 @@ class ScriptsTest(unittest.TestCase):
         self.assertEqual(out, "0 CREATED\n1 ENOENT\n")
         self.assertEqual(os.listdir(lane), [], "the probe name never stays")
 
+    def test_a_create_whose_removal_fails_is_left_never_refused(self):
+        """Create and unlink are separate steps, in P04 and P02."""
+        lane = os.path.join(self.t, "peer")
+        os.mkdir(lane)
+        self.assertEqual(run_script(pp.P04_SCRIPT, pp.probe_file("r1"), lane, prelude=NO_UNLINK), "0 LEFT\n")
+        side = os.path.join(self.t, "hop", "l1", "g1", "down")
+        os.makedirs(side)
+        out = run_script(pp.P02_SCRIPT, os.path.join(self.t, "hop"), "down", pp.probe_file("r2"), "0", "l1/g1",
+                         prelude=NO_UNLINK)
+        self.assertEqual(out, "l1 g1 . create - - LEFT\n")
+
     def test_p04_in_a_read_only_lane_is_refused(self):
         lane = os.path.join(self.t, "peer")
         os.mkdir(lane)
@@ -467,19 +749,48 @@ class ScriptsTest(unittest.TestCase):
             self.skipTest("root bypasses the mode")
         self.assertEqual(run_script(pp.P04_SCRIPT, pp.probe_file("r1"), lane), "0 EACCES\n")
 
-    def test_p02_reports_each_marker_and_the_create_attempt(self):
+    def test_p02_answers_every_target_and_marker_and_the_create_attempt(self):
         side = os.path.join(self.t, "l1", "g1", "up")
         os.makedirs(side)
         m = os.path.join(side, "identity.json")
         open(m, "w").close()
         os.chmod(m, 0o640)
-        out = run_script(pp.P02_SCRIPT, self.t, "up", pp.probe_file("r1"), "identity.json", "frontier.json")
+        out = run_script(pp.P02_SCRIPT, self.t, "up", pp.probe_file("r1"), "2", "identity.json", "frontier.json",
+                         "l1/g1", "l1/g9")
         rows = [l.split() for l in out.splitlines()]
-        self.assertEqual(rows[0][:4], ["l1", "g1", "identity.json", "present"])
+        self.assertEqual([r[:4] for r in rows], [["l1", "g1", "identity.json", "present"],
+                                                 ["l1", "g1", "frontier.json", "ENOENT"],
+                                                 ["l1", "g1", ".", "create"],
+                                                 ["l1", "g9", "identity.json", "ENOENT"],
+                                                 ["l1", "g9", "frontier.json", "ENOENT"],
+                                                 ["l1", "g9", ".", "create"]])
         self.assertEqual(rows[0][5], "0o640")
-        self.assertEqual(rows[1][:4], ["l1", "g1", "frontier.json", "ENOENT"])
-        self.assertEqual(rows[2][:4], ["l1", "g1", ".", "create"])
         self.assertNotIn(pp.probe_file("r1"), os.listdir(side), "the probe name never stays")
+
+    def test_the_owner_enumerates_generations_sides_and_markers(self):
+        os.makedirs(os.path.join(self.t, "l1", "g1", "up"))
+        os.makedirs(os.path.join(self.t, "l1", "g2"))
+        os.makedirs(os.path.join(self.t, "l2"))
+        m = os.path.join(self.t, "l1", "g1", "up", "versions.json")
+        open(m, "w").close()
+        os.chmod(m, 0o640)
+        out = run_script(pp.P02_OWNER_SCRIPT, self.t, "up", "1", "versions.json", "l1", "l2", "l3")
+        rows = [l.split() for l in out.splitlines()]
+        self.assertEqual([(r[0], r[1], r[2], r[3], r[6]) for r in rows],
+                         [("l1", "g1", ".", "dir", "ok"), ("l1", "g1", "versions.json", "present", "REG"),
+                          ("l1", "g2", ".", "dir", "ENOENT"), ("l2", "-", ".", "enum", "EMPTY"),
+                          ("l3", "-", ".", "enum", "ENOENT")])
+        for word in ("os.open", "O_CREAT", "unlink"):
+            self.assertNotIn(word, pp.P02_OWNER_SCRIPT)
+
+    def test_the_access_witness_reports_a_searchable_writable_directory(self):
+        d = os.path.join(self.t, "peer")
+        os.mkdir(d)
+        f = os.path.join(self.t, "file")
+        open(f, "w").close()
+        out = run_script(pp.ACCESS_WITNESS_SCRIPT, d, f, os.path.join(self.t, "none"))
+        self.assertEqual(out, "0 DIRW\n1 NOTDIR\n2 ENOENT\n")
+        self.assertEqual(os.listdir(d), [], "nothing created")
 
     def test_the_write_witness_never_truncates_appends_or_writes(self):
         f = os.path.join(self.t, "m")
