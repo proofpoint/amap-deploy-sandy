@@ -726,3 +726,26 @@ class LaunchdEnablementTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StopBudgetTest(unittest.TestCase):
+    """The stop timeout against the router's own join bound, derived from the
+    rendered budgets; and the start probe's window, named."""
+
+    def test_the_rendered_budgets_give_91_and_185_and_100_covers_the_join(self):
+        env = dict(hs.hr.environment(spec(), spec().hub))
+        self.assertEqual(hv.stop_budget(env), (91, 185))
+        [c] = hv.verify_stop_budget(spec())
+        self.assertEqual(c.result, rh.PASS)
+        self.assertIn("does not cover the start probe's login window (185 s)", c.claim)
+
+    def test_a_dot_budget_past_the_stop_timeout_fails(self):
+        self.addCleanup(setattr, hs.hr, "environment", hs.hr.environment)
+        real = hs.hr.environment
+        hs.hr.environment = lambda sp, hub: [(k, "60" if k == "RELAY_SMTP_DOT_TIMEOUT" else v) for k, v in real(sp, hub)]
+        [c] = hv.verify_stop_budget(spec())
+        self.assertEqual((c.result, c.expected.value), (rh.FAIL, 121))
+
+    def test_each_term_of_the_bound_counts(self):
+        env = {"RELAY_SMTP_DOT_TIMEOUT": "10", "RELAY_SMTP_CONNECT_TIMEOUT": "7", "RELAY_SMTP_COMMAND_TIMEOUT": "3"}
+        self.assertEqual(hv.stop_budget(env), (10 + hv.JOIN_SLACK_S + hv.DONE_POLL_S, 7 + 5 * 3 + hv.QUIT_S))
