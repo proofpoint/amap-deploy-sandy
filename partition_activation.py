@@ -199,3 +199,47 @@ def supervisor_problems(container: str, *, dirs: Sequence[str] = SUPERVISOR_DIRS
             if needle in data:
                 bad.append(p)
     return bad
+
+
+#: The way back to a router that does not sign, for any A5 failure (§3.2).
+A5_REMEDY = ("render the local router's config without delegation (install --apply) and restart it; then a "
+             "fresh partition-probe --apply and the activation again")
+
+
+def verify_activation(*, live: Any, image_env: Any, spec: Dict[str, Any], staged: bytes, final_raw: Any,
+                      token: Optional[str]) -> List[rh.Check]:
+    """A5: the running local router is exactly A1's activation spec, its live
+    config is A1's staged bytes plus the token and nothing else, and that
+    token is the current passing evidence's (`token`: None when there is no
+    current passing document). `live`, `image_env` and `final_raw` are
+    Unresolved when they could not be read."""
+    import partition_evidence as pe
+    out = []
+    claim = "the running local router is exactly its activation spec"
+    want = rh.Fact("activation spec", True, "A1's prospective spec for the final config path, as run.sh builds it")
+    blocked = next((v for v in (live, image_env) if isinstance(v, rh.Unresolved)), None)
+    if blocked is not None:
+        out.append(rh.unknown(claim, want, blocked.reason, "start the local router, or make the engine answer"))
+    else:
+        bad = running_differences(live, spec, image_env)
+        out.append(rh.check(claim, want, "; ".join(bad) if bad else True, A5_REMEDY,
+                            do_not="never edit the spec to match what is running"))
+
+    claim = "the local router's live config is the activation rendering plus the token, and nothing else"
+    if token is None:
+        out.append(rh.unknown(claim, rh.Fact("config", rh.Unresolved("no token"), "A1's bytes plus the token"),
+                              "there is no current passing evidence, so no token to expect", A5_REMEDY))
+    else:
+        try:
+            expected = pe.sha_bytes(final_bytes(staged, token))
+        except ActivationError as e:
+            expected = rh.Unresolved(str(e))
+        want = rh.Fact("config", expected, "A1's staged bytes with the current passing evidence's token added")
+        if isinstance(expected, rh.Unresolved):
+            out.append(rh.unknown(claim, want, f"the expected bytes cannot be built: {expected.reason}", A5_REMEDY))
+        elif isinstance(final_raw, rh.Unresolved):
+            out.append(rh.unknown(claim, want, final_raw.reason, "make the final config path readable"))
+        else:
+            out.append(rh.check(claim, want, pe.sha_bytes(final_raw), A5_REMEDY,
+                                do_not="never rewrite the live config by hand"))
+    return out

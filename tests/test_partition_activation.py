@@ -9,6 +9,7 @@ import unittest
 
 import partition_activation as pa
 import partition_evidence as pe
+import router_health as rh
 from _workspace import HOP_ROUTER_ROOT
 
 
@@ -232,6 +233,51 @@ class SupervisorTest(unittest.TestCase):
 
     def test_a_missing_supervisor_directory_is_not_a_problem(self):
         self.assertEqual(pa.supervisor_problems("ex-up", dirs=[self.dirs[0] + "-absent"]), [])
+
+
+
+class VerifyActivationTest(unittest.TestCase):
+    """A5 over a spec built by the hop checkout's own derive-mounts, and a
+    router "started" from it the way run.sh would."""
+    T = "r1:" + "a" * 64
+
+    def setUp(self):
+        t = tempfile.TemporaryDirectory()
+        self.addCleanup(t.cleanup)
+        self.tree = Tree(os.path.realpath(t.name))
+        self.final = os.path.join(self.tree.root, "conf", "router.json")
+        self.staged = self.tree.config()
+        self.spec = pa.prospective_spec(checkout=str(HOP_ROUTER_ROOT), final_path=self.final, staged=self.staged,
+                                        image="sha256:" + "b" * 64, container="ex-up", uid=2101, gid=2101)
+
+    def results(self, **over):
+        kw = dict(live=inspect_of(self.spec), image_env=IMAGE_ENV, spec=self.spec, staged=self.staged,
+                  final_raw=pa.final_bytes(self.staged, self.T), token=self.T)
+        kw.update(over)
+        return [(c.claim.split(" is ")[0], c.result) for c in pa.verify_activation(**kw)]
+
+    def test_a_router_activated_as_a1_to_a4_say_passes(self):
+        self.assertEqual({r for _, r in self.results()}, {rh.PASS})
+
+    def test_a_live_config_with_another_token_or_another_member_fails(self):
+        for raw in (pa.final_bytes(self.staged, "r2:" + "b" * 64),
+                    pa.final_bytes(self.tree.config(registry_dir=f"{self.tree.root}/state"), self.T),
+                    self.staged):
+            with self.subTest(raw=raw[-60:]):
+                self.assertEqual([r for _, r in self.results(final_raw=raw)], [rh.PASS, rh.FAIL])
+
+    def test_a_router_started_on_another_spec_fails(self):
+        live = inspect_of(self.spec)
+        live["Mounts"] = live["Mounts"][:-1]
+        self.assertEqual([r for _, r in self.results(live=live)], [rh.FAIL, rh.PASS])
+
+    def test_what_cannot_be_read_or_expected_is_unknown(self):
+        self.assertEqual([r for _, r in self.results(live=rh.Unresolved("not running"))], [rh.UNKNOWN, rh.PASS])
+        self.assertEqual([r for _, r in self.results(image_env=rh.Unresolved("no image"))], [rh.UNKNOWN, rh.PASS])
+        self.assertEqual([r for _, r in self.results(token=None)], [rh.PASS, rh.UNKNOWN])
+        self.assertEqual([r for _, r in self.results(final_raw=rh.Unresolved("EACCES"))], [rh.PASS, rh.UNKNOWN])
+        staged_with_token = pa.final_bytes(self.staged, self.T)
+        self.assertEqual(self.results(staged=staged_with_token)[1][1], rh.UNKNOWN)
 
 
 if __name__ == "__main__":
