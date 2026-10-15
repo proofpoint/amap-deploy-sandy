@@ -36,19 +36,22 @@ import json
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
-#: sha256 of the record's `schema` value and of its `unit` value.
+#: sha256 of the record's `schema` value and of its `unit` value: the unit
+#: that produces the record for the deploy's gate run. A record names the
+#: unit that produced it, so an earlier unit's record is refused here.
 SCHEMA_SHA256 = "c898385441775a67c15497eb7dcc2e9735bdb0697108dc5b41ff3c838376acae"
-UNIT_SHA256 = "6310dd4912a80935203600f1d24922f49744b9324b494c6310b12479608995d5"
+UNIT_SHA256 = "0b576199029d7b0d5bc6c156ab5ef62dd57f95fa431c9e4c9c7607f41b5bcc53"
 #: The expected case set: its count, and the sha256 of the sorted lower-case
 #: case sha256s joined by "\n" (no trailing newline), each the sha256 of the
 #: case document's raw blob in the pinned specification bundle.
 CASE_COUNT = 112
 CASES_SET_SHA256 = "10e1401b725739d050686d92bb6e642cb4d85dc0e61c898e451e6fe565576f43"
 #: The expected mutant ids, as the sha256 of the sorted ids joined by "\n"
-#: (no trailing newline), and their count. None until the harness's design
-#: freezes the list: G6 refuses while it is None.
-MUTANT_IDS_SHA256: Optional[str] = None
-MUTANT_COUNT: Optional[int] = None
+#: (no trailing newline), and their count: the harness's frozen list for the
+#: deploy's gate run, 38 ids. G6 refuses a record whose expected ids are any
+#: other list, and refused every record while this was unpinned.
+MUTANT_IDS_SHA256: Optional[str] = "0414be3811ee6bfc19dcaf8591cfc1f48999e75c7af074165a531ad49155a3e4"
+MUTANT_COUNT: Optional[int] = 38
 #: Every case outcome kind the record may report, and the ones that block:
 #: the harness gate's own kinds, exactly, with no renames.
 BLOCKING_KINDS = ("pending", "overlay_pending", "fail", "fail_stale_label", "known_erratum_unratified")
