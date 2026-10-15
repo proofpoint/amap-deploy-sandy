@@ -562,12 +562,14 @@ class TagExceptionTest(GateTest):
         self.assertEqual(rc, 1, out)
         self.assertEqual(len([l for l in self.findings(out) if "(nested 1) tagger" in l]), 1)
 
-    def chain(self, depth):
+    def chain(self, depth, keep_inner=False):
+        """t0 <- t1 <- ... <- t<depth>; the inner refs deleted unless kept."""
         self.tag("t0", email="clean@example.org")
         for i in range(1, depth + 1):
             self.nest(f"t{i - 1}", f"t{i}")
-        for i in range(depth):
-            self.repo.git("tag", "-d", f"t{i}")
+        if not keep_inner:
+            for i in range(depth):
+                self.repo.git("tag", "-d", f"t{i}")
         return f"t{depth}"
 
     def test_a_chain_at_the_bound_is_scanned(self):
@@ -580,6 +582,18 @@ class TagExceptionTest(GateTest):
         rc, out = self.run_gate("--refs")
         self.assertEqual(rc, 2, out)
         self.assertIn("nested tags", out)
+
+    def test_inner_refs_cannot_hide_a_chain_past_the_bound(self):
+        """Refs naming the inner tags get them scanned first; the outer
+        chain's depth must still be measured to its end."""
+        self.chain(hg.MAX_TAG_CHAIN + 1, keep_inner=True)
+        rc, out = self.run_gate("--refs")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("nested tags", out)
+
+    def test_a_chain_at_the_bound_with_inner_refs_is_scanned(self):
+        self.chain(hg.MAX_TAG_CHAIN, keep_inner=True)
+        self.assert_clean(["--refs"])
 
     def test_the_chain_bound_is_the_reviewed_value(self):
         self.assertEqual(hg.MAX_TAG_CHAIN, 8)

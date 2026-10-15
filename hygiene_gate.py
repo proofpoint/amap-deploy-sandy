@@ -119,8 +119,8 @@ MAX_LINE = 4096
 #: Where a long line is cut for regex scanning, each piece overlaps the next
 #: by this much, so a match no longer than MAX_REGEX's worth is not split.
 LINE_OVERLAP = 512
-#: The deepest chain of tags pointing at tags that scan_refs follows; a
-#: deeper one is "cannot run", never a partial scan.
+#: The most nested tags scan_refs follows below a ref's own tag; a deeper
+#: chain is "cannot run", never a partial scan.
 MAX_TAG_CHAIN = 8
 #: git's own test for binary content: a NUL in the first 8000 bytes.
 BINARY_SNIFF = 8000
@@ -728,9 +728,12 @@ def _added(m: Matcher, commit: str, out: bytes, parents: int) -> None:
 def scan_refs(m: Matcher, repo: str, blobs: Blobs) -> None:
     """Every ref's name, and every annotated tag object reachable from a ref,
     following a tag whose target is itself a tag (a chain) down to the first
-    non-tag object. Each tag object is scanned once, however many refs or
-    chains reach it; a nested one is labelled `<ref> (nested <depth>)`. A
-    chain deeper than MAX_TAG_CHAIN is "cannot run", never a silent stop."""
+    non-tag object. Each tag object's tagger and message are scanned once,
+    under the first ref that reaches it, however many refs or chains do; a
+    nested one is labelled `<ref> (nested <depth>)`. Every chain is walked
+    to its end whatever was scanned before, so a chain nested deeper than
+    MAX_TAG_CHAIN is "cannot run" whichever refs also name its inner tags,
+    never a silent stop."""
     out = git(repo, "for-each-ref", "--format=%(refname)%00%(objecttype)%00%(objectname)%1e")
     seen: Set[str] = set()
     for rec in out.decode("utf-8", "surrogateescape").split("\x1e"):
@@ -740,26 +743,28 @@ def scan_refs(m: Matcher, repo: str, blobs: Blobs) -> None:
         name, kind, oid = rec.split("\x00")
         m.text(Where("ref", m.repo, path=name, field="ref name"), name)
         depth = 0
-        while kind == "tag" and oid not in seen:
+        while kind == "tag":
             if depth > MAX_TAG_CHAIN:
                 raise CannotRun(f"{name}: a chain of more than {MAX_TAG_CHAIN} nested tags")
-            seen.add(oid)
-            label = name if not depth else f"{name} (nested {depth})"
             body = blobs.read(oid).decode("utf-8", "surrogateescape")
             head, _, message = body.partition("\n\n")
-            target, kind = "", ""
+            target, kind, taggers = "", "", []
             for hl in head.split("\n"):
                 if hl.startswith("object "):
                     target = hl[len("object "):].strip()
                 elif hl.startswith("type "):
                     kind = hl[len("type "):].strip()
                 elif hl.startswith("tagger "):
-                    who = hl[len("tagger "):]
+                    taggers.append(hl[len("tagger "):])
+            if oid not in seen:
+                seen.add(oid)
+                label = name if not depth else f"{name} (nested {depth})"
+                for who in taggers:
                     nm, _, rest = who.partition(" <")
                     m.identity(Where("tag", m.repo, path=label, field="tagger", obj=oid), nm,
                                rest.partition(">")[0])
-            for n, line in enumerate(message.split("\n"), 1):
-                m.text(Where("tag", m.repo, path=label, field=f"message:{n}", obj=oid), line)
+                for n, line in enumerate(message.split("\n"), 1):
+                    m.text(Where("tag", m.repo, path=label, field=f"message:{n}", obj=oid), line)
             oid, depth = target, depth + 1
 
 
