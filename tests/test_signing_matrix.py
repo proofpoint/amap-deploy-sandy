@@ -221,6 +221,11 @@ class AdoptionTest(unittest.TestCase):
         young = lambda: self.view(now=self.C / 1e9 + 1)
         self.assertIn("moments ago", self.run_it([self.a(), self.a()], self.polls(10, 11, 12), host=young)[1])
 
+    def test_an_interval_under_one_second_is_unknown(self):
+        result, why = self.run_it([self.a(), self.a()], self.polls(10, 11, 12, interval=0.5))
+        self.assertEqual(result, rh.UNKNOWN)
+        self.assertIn("at least 1s", why)
+
     def test_a_missing_interval_is_unknown(self):
         self.assertEqual(self.run_it([self.a()], [{"polls": 10, "started_ts": "s"}])[0], rh.UNKNOWN)
 

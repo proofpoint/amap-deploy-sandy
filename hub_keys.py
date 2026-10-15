@@ -663,8 +663,10 @@ def adoption(read_tuple: Callable[[], Any], read_status: Callable[[], Any], host
         return rh.UNKNOWN, f"the router's status.json cannot be read: {s0.reason}"
     polls, started, interval = s0.get("polls"), s0.get("started_ts"), s0.get("interval_s")
     if not isinstance(polls, int) or isinstance(polls, bool) or not isinstance(started, str) \
-            or not isinstance(interval, (int, float)) or isinstance(interval, bool) or interval <= 0:
+            or not isinstance(interval, (int, float)) or isinstance(interval, bool):
         return rh.UNKNOWN, "status.json carries no polls, started_ts or interval_s"
+    if interval < 1:
+        return rh.UNKNOWN, f"the router polls every {interval}s; the witness needs an interval of at least 1s"
     waited, bound = 0.0, (2 + rh.FRESHNESS_MULTIPLE) * interval
     while True:
         sleep(interval / 2)
