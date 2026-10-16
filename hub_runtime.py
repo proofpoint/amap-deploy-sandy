@@ -300,9 +300,9 @@ def load(sec: Any, spec: Any) -> HubSpec:
 # --- The rendering --------------------------------------------------------------
 
 
-def _in_container(spec: Any, principal: str, host: str) -> str:
-    """Where `host` is seen inside the principal's runtime, through its
-    declared mounts; a path no mount holds refuses."""
+def mount_holding(spec: Any, principal: str, host: str) -> Dict[str, Any]:
+    """The principal's declared mount that holds `host` (the deepest one); a
+    path no mount holds refuses."""
     best = None
     for m in spec.mounts:
         if m["principal"] == principal and (host == m["host"] or host.startswith(m["host"].rstrip("/") + "/")):
@@ -310,6 +310,13 @@ def _in_container(spec: Any, principal: str, host: str) -> str:
                 best = m
     if best is None:
         raise HubSpecError(f"{host}: no mount of {principal}'s runtime holds it")
+    return best
+
+
+def _in_container(spec: Any, principal: str, host: str) -> str:
+    """Where `host` is seen inside the principal's runtime, through its
+    declared mounts; a path no mount holds refuses."""
+    best = mount_holding(spec, principal, host)
     return best["container"] + host[len(best["host"]):]
 
 

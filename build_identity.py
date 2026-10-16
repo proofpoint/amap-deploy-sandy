@@ -350,6 +350,172 @@ def read_status(live: Any, state_dir: str, who: str,
     return doc
 
 
+#: The program `docker exec` runs in [2], as its own user, under `python3 -I
+#: -S -c`: argv is the document's container path, the most it may wait, the
+#: margin beyond 2 × the document's own interval_s, the step and the byte
+#: bound. It reads the document like _read_nofollow (no symlink, no FIFO, a
+#: regular file, bounded, read to the end), and, while `pumps` has not risen
+#: under the same process_started_ts and the window has not passed, reads it
+#: again. It writes nothing and takes no lock. It prints
+#: {"first": ..., "later": ...} ("later" null when nothing rose) and exits 0,
+#: or exits HUB_EXIT[...] with nothing on stdout. The host judges every
+#: value it prints again (read_hub_status); it trusts only that the reads
+#: were the container's own.
+HUB_READER = r"""
+import errno, json, os, stat, sys, time
+path, most, margin, step, limit = sys.argv[1], float(sys.argv[2]), float(sys.argv[3]), float(sys.argv[4]), int(sys.argv[5])
+def read():
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        sys.exit(3)
+    except OSError as e:
+        sys.exit(4 if e.errno == errno.ELOOP else 6)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            sys.exit(4)
+        data = b""
+        while len(data) <= limit:
+            chunk = os.read(fd, limit + 1 - len(data))
+            if not chunk:
+                break
+            data += chunk
+    except OSError:
+        sys.exit(6)
+    finally:
+        os.close(fd)
+    if len(data) > limit:
+        sys.exit(5)
+    try:
+        return json.loads(data)
+    except ValueError:
+        sys.exit(7)
+def counted(d):
+    p = d.get("pumps") if isinstance(d, dict) else None
+    return p if isinstance(p, int) and not isinstance(p, bool) else None
+first = read()
+interval = first.get("interval_s") if isinstance(first, dict) else None
+later = None
+if counted(first) is not None and isinstance(interval, (int, float)) and not isinstance(interval, bool) \
+        and 0 < interval and interval * 2 + margin <= most:
+    deadline = time.monotonic() + interval * 2 + margin
+    while time.monotonic() < deadline:
+        time.sleep(step)
+        doc = read()
+        if not isinstance(doc, dict) or doc.get("process_started_ts") != first.get("process_started_ts"):
+            continue
+        n = counted(doc)
+        if n is not None and n != counted(first):
+            later = doc
+            break
+sys.stdout.write(json.dumps({"first": first, "later": later}))
+"""
+
+#: [2]'s status document and its progress counter (RE-HUB-PROGRESS), and how
+#: long past the reader's own longest wait `docker exec` may take.
+HUB_STATUS_NAME, HUB_COUNTER = "hub-status.json", "pumps"
+HUB_EXEC_SLACK_S = 15.0
+
+#: HUB_READER's exit codes, by what each means.
+HUB_EXIT = {3: "{who} has written no status document yet", 4: "{who}'s status document is not a regular file",
+            5: "{who}'s status document is larger than " + str(MAX_STATUS_BYTES) + " bytes",
+            6: "{who}'s status document cannot be read", 7: "{who}'s status document is not a JSON document"}
+
+
+def hub_mounts_refusal(live: Any, host_root: str, container_root: str, ledger: str, who: str) -> Any:
+    """None when [2]'s inspect shows its principal bind (`host_root` at
+    `container_root`) exactly once and nothing else of its own at or below
+    the part of that bind that holds `ledger` (a container path): no bind
+    over hub-status.json, no subdirectory mount, no tmpfs. Else an
+    Unresolved. Paths are compared under _spellings."""
+    mounts = live.get("Mounts") if isinstance(live, dict) else None
+    host = live.get("HostConfig") if isinstance(live, dict) else None
+    tmpfs = host.get("Tmpfs") if isinstance(host, dict) else None
+    if not isinstance(mounts, list) or not isinstance(host, dict) or not isinstance(tmpfs, (dict, type(None))) \
+            or not all(isinstance(m, dict) and isinstance(m.get("Source"), str)
+                       and isinstance(m.get("Destination"), str) for m in mounts) \
+            or not all(isinstance(t, str) for t in (tmpfs or {})):
+        return rh.Unresolved(f"docker inspect of {who} does not list its mounts in the engine's shape, so "
+                             "its ledger directory cannot be shown to be the host's")
+    binds = [m for m in mounts if _same(m["Destination"], container_root)]
+    if len(binds) != 1 or not _same(binds[0]["Source"], host_root):
+        return rh.Unresolved(f"{who} does not mount {host_root} at {container_root} exactly once, so its "
+                             "ledger directory is not the host's")
+    # Under the bind, any mount whose path meets the ledger directory's line
+    # (an ancestor of it below the bind, the directory, or anything inside)
+    # puts something other than the host's directory there.
+    def meets(dest: str) -> bool:
+        return _within(dest, container_root) and _overlaps(dest, ledger)
+    if any(m is not binds[0] and meets(m["Destination"]) for m in mounts) or any(meets(t) for t in (tmpfs or {})):
+        return rh.Unresolved(f"{who} mounts something else over its ledger directory {ledger}, so the host's "
+                             "status document may not be the one it writes")
+    return None
+
+
+def _same(a: str, b: str) -> bool:
+    """Whether two paths are one under any spelling _spellings gives."""
+    return bool(_spellings(a) & _spellings(b))
+
+
+def read_hub_status(docker: List[str], live: Any, path: str, user: str, who: str, *, margin: float,
+                    run: Optional[Callable[..., rh.Proc]] = None) -> Any:
+    """[2]'s status document, read by HUB_READER through `docker exec` into
+    the container `live` names (its Id), as `user`, with `path` its
+    container path: Progressed (the later document) when `pumps` rose under
+    the same process start within 2 × interval_s + `margin`, else an
+    Unresolved. Every value the reader prints is judged here again."""
+    run = run or rh.run
+    argv = docker + ["exec", "-u", user, str(live.get("Id")), "python3", "-I", "-S", "-c", HUB_READER, path,
+                     repr(MAX_PROGRESS_WAIT_S), repr(margin), repr(PROGRESS_STEP_S), str(MAX_STATUS_BYTES)]
+    try:
+        p = run(argv, timeout=int(MAX_PROGRESS_WAIT_S + HUB_EXEC_SLACK_S))
+    except rh.CannotRun as e:
+        return rh.Unresolved(str(e))
+    if p.rc in HUB_EXIT:
+        return rh.Unresolved(HUB_EXIT[p.rc].format(who=who))
+    if p.rc != 0:
+        return rh.Unresolved(f"the status reader in {who} exited {p.rc}")
+    try:
+        out = json.loads(p.out)
+    except ValueError:
+        return rh.Unresolved(f"the status reader in {who} printed no JSON")
+    first, later = (out.get("first"), out.get("later")) if isinstance(out, dict) else (None, None)
+    return _progress(first, later, HUB_COUNTER, margin, who)
+
+
+def _counter(doc: Any, name: str) -> Optional[int]:
+    v = doc.get(name) if isinstance(doc, dict) else None
+    return v if isinstance(v, int) and not isinstance(v, bool) else None
+
+
+def _usable_interval(doc: Any, margin: float) -> bool:
+    v = doc.get("interval_s") if isinstance(doc, dict) else None
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and 0 < v \
+        and v * PROGRESS_INTERVALS + margin <= MAX_PROGRESS_WAIT_S
+
+
+def _progress(first: Any, later: Any, counter: str, margin: float, who: str) -> Any:
+    """The witness, judged: Progressed(later) when `counter` rose under the
+    same process start, else an Unresolved naming why."""
+    if not isinstance(first, dict) or _counter(first, counter) is None or not _usable_interval(first, margin):
+        return rh.Unresolved(f"{who}'s status document has no usable interval_s and {counter}, so its writer "
+                             "cannot be seen to advance it")
+    if later is None:
+        return rh.Unresolved(f"{who}'s status document did not advance within {PROGRESS_INTERVALS} intervals, "
+                             "so it is not shown to be written by the running process")
+    if not isinstance(later, dict) or later.get(PROCESS_START) != first.get(PROCESS_START) \
+            or _counter(later, counter) is None:
+        return rh.Unresolved(f"{who}'s later status document is not the same process's, so it is not progress")
+    if _counter(later, counter) < _counter(first, counter):
+        return rh.Unresolved(f"{who}'s status document went back from {_counter(first, counter)} {counter} to "
+                             f"{_counter(later, counter)} under the same process start, so it is not one "
+                             "process's progress")
+    if _counter(later, counter) == _counter(first, counter):
+        return rh.Unresolved(f"{who}'s status document did not advance, so it is not shown to be written by "
+                             "the running process")
+    return Progressed(later)
+
+
 class Progressed(dict):
     """A status document the reader saw advance: `polls` rose under the same
     process start between two of its reads."""

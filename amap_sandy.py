@@ -53,6 +53,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import posixpath
 import re
 import shutil
 import stat
@@ -80,6 +81,7 @@ import hop_router as hp     # the local router's hop keys, on a host with a hop 
 import delivery_checks as dc  # delivery itself: lister mode, session posture, daemon build, backlog
 import connector_pin as cpin  # install refuses a connector checkout not at its siblings.json pin
 import build_identity as bi  # what each running runtime was built from: verify's "runtime builds" phase
+import hub_runtime as hr     # the hub-link router's rendering: where its ledger directory is seen
 
 # `fleet_policy.py` sits beside this module. Guarded rather than bare: this
 # module is imported by its tests and by its sibling tools, where HERE is not
@@ -3812,8 +3814,8 @@ def build_identity_outcome(args: argparse.Namespace, home: Path) -> rh.Outcome:
         return bi.inspect_container(hub_docker if role == bi.ROLE_HUB else ["docker"], name)
 
     def status(role: str, name: str, live: Any) -> Any:
-        if role != bi.ROLE_HOP:
-            return None
+        if role == bi.ROLE_HUB:
+            return hub_status(name, live)
         state_dir = str(sibling_state_dir(home, getattr(args, "state_dir", None)))
         who = f"[1] ({name})"
         read = bi.read_progressing if bi.no_recorded_exit(live) else bi.read_status
@@ -3823,6 +3825,28 @@ def build_identity_outcome(args: argparse.Namespace, home: Path) -> rh.Outcome:
             return others
         if others:
             return rh.Unresolved(f"another container shares {who}'s state directory {state_dir} "
+                                 f"({', '.join(str(i)[:12] for i in others)}), so the status document may be its")
+        return doc
+
+    def hub_status(name: str, live: Any) -> Any:
+        who = f"[2] ({name})"
+        s, hs = spec.secrets, spec.hub
+        try:
+            ledger_host = hs.dirs["RELAY_LEDGER_DIR"]
+            m = hr.mount_holding(spec, s.principal, ledger_host)
+        except (hr.HubSpecError, KeyError) as e:
+            return rh.Unresolved(f"{who}'s ledger directory cannot be placed from the host-setup document: {e}")
+        ledger = m["container"] + ledger_host[len(m["host"]):]
+        refused = bi.hub_mounts_refusal(live, m["host"], m["container"], ledger, who)
+        if refused is not None:
+            return refused
+        doc = bi.read_hub_status(hub_docker, live, posixpath.join(ledger, bi.HUB_STATUS_NAME),
+                                 f"{s.uid}:{s.gid}", who, margin=bi.PROGRESS_MARGIN_S)
+        others = bi.state_sharers(hub_docker, ledger_host, live.get("Id"))
+        if isinstance(others, rh.Unresolved):
+            return others
+        if others:
+            return rh.Unresolved(f"another container shares {who}'s ledger directory {ledger_host} "
                                  f"({', '.join(str(i)[:12] for i in others)}), so the status document may be its")
         return doc
 

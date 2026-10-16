@@ -10,6 +10,8 @@ docker."""
 import hashlib
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -553,6 +555,178 @@ class ReadStatusTest(unittest.TestCase):
         self.assertIsInstance(bi.read_status(self.live(), self.sd, "[1] (zz-r1)"), rh.Unresolved)
 
 
+class HubReaderTest(unittest.TestCase):
+    """HUB_READER, run as `docker exec` runs it (python3 -I -S -c, the
+    constant program, then its arguments) against a private directory."""
+
+    def setUp(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        self.path = os.path.join(os.path.realpath(td.name), bi.HUB_STATUS_NAME)
+
+    def run_reader(self, most=10.0, margin=0.0, step=0.05, limit=bi.MAX_STATUS_BYTES):
+        """The reader's run; one that outlasts its own bound fails the row."""
+        try:
+            return subprocess.run([sys.executable, "-I", "-S", "-c", bi.HUB_READER, self.path, repr(most),
+                                   repr(margin), repr(step), str(limit)], capture_output=True, text=True, timeout=15)
+        except subprocess.TimeoutExpired:
+            self.fail("the reader ran past its own bound")
+
+    @staticmethod
+    def doc(pumps, interval=0.5, began="2026-10-15T10:00:00.050000Z"):
+        return {"pumps": pumps, "interval_s": interval, "process_started_ts": began}
+
+    def test_a_document_that_advances_is_printed_with_its_first(self):
+        Path(self.path).write_text(json.dumps(self.doc(3)))
+        timer = threading.Timer(0.2, lambda: Path(self.path).write_text(json.dumps(self.doc(4))))
+        timer.start()
+        self.addCleanup(timer.cancel)
+        p = self.run_reader()
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(json.loads(p.stdout), {"first": self.doc(3), "later": self.doc(4)})
+
+    def test_a_document_that_never_advances_prints_no_later(self):
+        Path(self.path).write_text(json.dumps(self.doc(3, interval=0.1)))
+        p = self.run_reader()
+        self.assertEqual((p.returncode, json.loads(p.stdout)), (0, {"first": self.doc(3, interval=0.1), "later": None}))
+
+    def test_a_rewrite_under_another_process_start_is_not_its_later(self):
+        Path(self.path).write_text(json.dumps(self.doc(3, interval=0.2)))
+        later = self.doc(9, interval=0.2, began="2026-10-15T10:00:09.000000Z")
+        timer = threading.Timer(0.1, lambda: Path(self.path).write_text(json.dumps(later)))
+        timer.start()
+        self.addCleanup(timer.cancel)
+        self.assertIsNone(json.loads(self.run_reader().stdout)["later"])
+
+    def test_an_unusable_interval_is_not_waited_on(self):
+        for interval in (0, -1, "5", True, 100.0):
+            with self.subTest(interval=interval):
+                Path(self.path).write_text(json.dumps(self.doc(3, interval=interval)))
+                p = self.run_reader(most=10.0)
+                self.assertEqual(json.loads(p.stdout)["later"], None)
+
+    def test_each_refusal_has_its_exit(self):
+        cases = {3: lambda: None,
+                 4: lambda: os.mkfifo(self.path),
+                 5: lambda: Path(self.path).write_text(json.dumps(self.doc(3)) + " " * 64),
+                 7: lambda: Path(self.path).write_text("not json")}
+        for rc, make in cases.items():
+            with self.subTest(rc=rc):
+                if os.path.lexists(self.path):
+                    os.unlink(self.path)
+                make()
+                p = self.run_reader(limit=64)
+                self.assertEqual((p.returncode, p.stdout), (rc, ""))
+
+    def test_a_symlink_or_a_directory_is_not_a_regular_file(self):
+        target = self.path + ".real"
+        Path(target).write_text(json.dumps(self.doc(3)))
+        os.symlink(target, self.path)
+        self.assertEqual(self.run_reader().returncode, 4)
+        os.unlink(self.path)
+        os.mkdir(self.path)
+        self.assertEqual(self.run_reader().returncode, 4)
+
+
+class HubJudgeTest(unittest.TestCase):
+    """What the host makes of the reader's output, and of [2]'s mounts."""
+
+    WHO = "[2] (zz-hub)"
+
+    @staticmethod
+    def doc(pumps, interval=5.0, began="2026-10-15T10:00:00.050000Z"):
+        return {"pumps": pumps, "interval_s": interval, "process_started_ts": began}
+
+    def judge(self, first, later):
+        return bi._progress(first, later, bi.HUB_COUNTER, bi.PROGRESS_MARGIN_S, self.WHO)
+
+    def test_a_rise_under_the_same_start_is_progressed(self):
+        got = self.judge(self.doc(3), self.doc(5))
+        self.assertIsInstance(got, bi.Progressed)
+        self.assertEqual(got["pumps"], 5)
+
+    def test_anything_else_is_unknown(self):
+        cases = {"no later": (self.doc(3), None),
+                 "equal": (self.doc(3), self.doc(3)),
+                 "went back": (self.doc(5), self.doc(4)),
+                 "another start": (self.doc(3), self.doc(4, began="2026-10-15T10:00:09.000000Z")),
+                 "later pumps a bool": (self.doc(3), dict(self.doc(4), pumps=True)),
+                 "first pumps missing": ({"interval_s": 5.0}, self.doc(4)),
+                 "interval a bool": (dict(self.doc(3), interval_s=True), self.doc(4)),
+                 "interval too long": (self.doc(3, interval=bi.MAX_PROGRESS_WAIT_S), self.doc(4)),
+                 "first not an object": ([], self.doc(4))}
+        for label, (first, later) in cases.items():
+            with self.subTest(label):
+                self.assertIsInstance(self.judge(first, later), rh.Unresolved)
+
+    def test_read_hub_status_runs_the_reader_and_judges_its_output(self):
+        calls = []
+
+        def run(argv, **k):
+            calls.append((list(argv), k))
+            return rh.Proc(tuple(argv), 0, json.dumps({"first": self.doc(3), "later": self.doc(4)}), "")
+        got = bi.read_hub_status(["docker"], {"Id": "1" * 64}, "/data/ledger/hub-status.json", "2101:2100",
+                                 self.WHO, margin=2.0, run=run)
+        self.assertIsInstance(got, bi.Progressed)
+        [(argv, k)] = calls
+        self.assertEqual(argv[:9], ["docker", "exec", "-u", "2101:2100", "1" * 64, "python3", "-I", "-S", "-c"])
+        self.assertEqual(argv[10:], ["/data/ledger/hub-status.json", repr(bi.MAX_PROGRESS_WAIT_S), "2.0",
+                                     repr(bi.PROGRESS_STEP_S), str(bi.MAX_STATUS_BYTES)])
+        self.assertEqual(k["timeout"], int(bi.MAX_PROGRESS_WAIT_S + bi.HUB_EXEC_SLACK_S))
+
+    def test_a_reader_that_prints_no_json_or_cannot_run_is_unknown(self):
+        for proc in ((0, "not json"), (0, "[]")):
+            with self.subTest(proc=proc):
+                got = bi.read_hub_status(["docker"], {"Id": "1"}, "/p", "1:1", self.WHO, margin=2.0,
+                                         run=lambda argv, **k: rh.Proc(tuple(argv), proc[0], proc[1], ""))
+                self.assertIsInstance(got, rh.Unresolved)
+
+        def cannot(argv, **k):
+            raise rh.CannotRun("no docker")
+        self.assertEqual(bi.read_hub_status(["docker"], {"Id": "1"}, "/p", "1:1", self.WHO, margin=2.0,
+                                            run=cannot).reason, "no docker")
+
+    def live(self, *extra, tmpfs=None):
+        bind = {"Type": "bind", "Source": "/zz/h", "Destination": "/data", "RW": True}
+        live = container(mounts=[bind, *extra])
+        if tmpfs is not None:
+            live["HostConfig"]["Tmpfs"] = tmpfs
+        return live
+
+    def refusal(self, live):
+        return bi.hub_mounts_refusal(live, "/zz/h", "/data", "/data/ledger", self.WHO)
+
+    @staticmethod
+    def bind(dest, src="/zz/elsewhere"):
+        return {"Type": "bind", "Source": src, "Destination": dest, "RW": True}
+
+    def test_the_principal_bind_alone_or_with_mounts_elsewhere_is_fine(self):
+        for extra in ((), (self.bind("/data/other"),), (self.bind("/run"),), (self.bind("/data/ledgerx"),)):
+            with self.subTest(extra=extra):
+                self.assertIsNone(self.refusal(self.live(*extra)))
+        bind = {"Type": "bind", "Source": "/zz//h/", "Destination": "/data/", "RW": True}
+        self.assertIsNone(self.refusal(container(mounts=[bind])))
+
+    def test_a_mount_over_the_ledger_line_is_refused(self):
+        for label, extra in (("over the document", self.bind("/data/ledger/hub-status.json")),
+                             ("over the directory", self.bind("/data/ledger")),
+                             ("inside it", self.bind("/data/ledger/sub")),
+                             ("an ancestor below the bind", self.bind("/data/ledger/..", "/x")),
+                             ("respelled", self.bind("/data//ledger/"))):
+            with self.subTest(label):
+                self.assertIsInstance(self.refusal(self.live(extra)), rh.Unresolved)
+        for path in ("/data/ledger", "/data/ledger/x", "/data"):
+            with self.subTest(tmpfs=path):
+                self.assertIsInstance(self.refusal(self.live(tmpfs={path: ""})), rh.Unresolved)
+        self.assertIsNone(self.refusal(self.live(tmpfs={"/run": ""})))
+
+    def test_the_principal_bind_missing_twice_or_from_elsewhere_is_refused(self):
+        for mounts in ([], [self.bind("/data", "/zz/h"), self.bind("/data", "/zz/h")], [self.bind("/data")],
+                       ["x"], [{"Destination": "/data"}]):
+            with self.subTest(mounts=mounts):
+                self.assertIsInstance(self.refusal(container(mounts=mounts)), rh.Unresolved)
+
+
 class CollectTest(unittest.TestCase):
     def setUp(self):
         td = tempfile.TemporaryDirectory()
@@ -817,8 +991,11 @@ class InstallAndVerifyTest(unittest.TestCase):
         """A host whose hub is reached through `sudo -n docker`: the shape
         build_identity_outcome reads (no hop router, no plugin pin)."""
         secrets = SimpleNamespace(principal="zz-hub-principal", image="zz-hub:recorded", image_commit=COMMIT,
-                                  docker_via_sudo=True, tools={"sudo": "/zz/sudo", "docker": "/zz/docker"})
-        return SimpleNamespace(router=None, hub=object(), secrets=secrets, overlay_path=None, overlay_pin=None,
+                                  docker_via_sudo=True, tools={"sudo": "/zz/sudo", "docker": "/zz/docker"},
+                                  uid=2101, gid=2100)
+        return SimpleNamespace(router=None, hub=SimpleNamespace(dirs={"RELAY_LEDGER_DIR": "/zz/h/ledger"}),
+                               secrets=secrets, overlay_path=None, overlay_pin=None,
+                               mounts=[{"principal": "zz-hub-principal", "host": "/zz/h", "container": "/data"}],
                                runtime_of=lambda principal: {"container": "zz-hub"})
 
     def patch(self, obj, name, value):
@@ -1041,21 +1218,78 @@ class InstallAndVerifyTest(unittest.TestCase):
         c, _ = self.hop_outcome(self.status_doc("2026-10-15T10:00:00.050000Z"), ps_rc=1)
         self.assertEqual(c.result, rh.UNKNOWN)
 
-    def test_the_hub_router_has_no_status_reader_so_its_plugin_is_not_published(self):
+    def hub_outcome(self, reader_out, others=(), reader_rc=0):
+        """build_identity_outcome on a hub host with the overlay pin: [2]
+        mounts /zz/h at /data, its ledger /zz/h/ledger is /data/ledger, and
+        the reader prints `reader_out`. Returns the plugin claim, its extras
+        and every argv run, in order."""
         spec = self.hub_spec()
         spec.overlay_path, spec.overlay_pin = "/zz/overlay/plugin.py", {"sha256": "c" * 64}
+        live = container(mounts=[{"Type": "bind", "Source": "/zz/h", "Destination": "/data", "RW": True}])
+        calls = []
 
         def run(argv, **k):
+            calls.append(list(argv))
             if "image" in argv:
                 return rh.Proc(tuple(argv), 0, json.dumps({LABEL: COMMIT}), "")
-            return rh.Proc(tuple(argv), 0, json.dumps([container()]), "")
+            if "exec" in argv:
+                return rh.Proc(tuple(argv), reader_rc, json.dumps(reader_out), "")
+            if "ps" in argv:
+                return rh.Proc(tuple(argv), 0, "\n".join([live["Id"]] + [o["Id"] for o in others]) + "\n", "")
+            if argv[-1] != "zz-hub":
+                return rh.Proc(tuple(argv), 0, json.dumps(list(others)), "")
+            return rh.Proc(tuple(argv), 0, json.dumps([live]), "")
         self.patch(self.prov, "_builds_spec", lambda overlay: spec)
         self.patch(rh, "run", run)
         self.patch(self.cpin, "pinned_commit", lambda *a, **k: PIN)
         out = self.prov.build_identity_outcome(SimpleNamespace(overlay=None), self.home)
-        [plugin] = [c for e, c in zip(out.extras, out.checks) if e["id"] == bi.ID_PLUGIN]
-        self.assertEqual((plugin.result, plugin.reason),
-                         (rh.UNKNOWN, "the router does not publish the plugin it loaded"))
+        [(plugin, extras)] = [(c, e) for e, c in zip(out.extras, out.checks) if e["id"] == bi.ID_PLUGIN]
+        return plugin, extras, calls
+
+    @staticmethod
+    def hub_doc(pumps, sha="c" * 64, began="2026-10-15T10:00:00.050000Z"):
+        return {"v": 1, "complete": True, "pumps": pumps, "interval_s": 5.0, "process_started_ts": began,
+                "started_ts": began[:19] + "Z", "transport_plugin": {"path": "/zz/overlay/plugin.py", "sha256": sha}}
+
+    def test_the_hub_plugin_is_read_in_its_container_and_passes_when_it_advanced(self):
+        c, e, calls = self.hub_outcome({"first": self.hub_doc(3), "later": self.hub_doc(4)})
+        self.assertEqual((c.result, e.get("observed_sha256"), e.get("host_role")), (rh.PASS, "c" * 64, bi.ROLE_HUB))
+        prefix = ["/zz/sudo", "-n", "/zz/docker"]
+        kinds = [("exec" if "exec" in a else "ps" if "ps" in a else "image" if "image" in a else
+                  "inspect " + a[-1]) for a in calls]
+        # The plugin claim shares the hub claim's inspect: inspect, labels,
+        # then the read and the sharer listing, then the second inspect.
+        self.assertEqual(kinds, ["inspect zz-hub", "image", "exec", "ps", "inspect zz-hub"])
+        [ex] = [a for a in calls if "exec" in a]
+        self.assertEqual(ex[:11], prefix + ["exec", "-u", "2101:2100", container()["Id"], "python3", "-I", "-S", "-c"])
+        self.assertEqual(ex[11:13], [bi.HUB_READER, "/data/ledger/hub-status.json"])
+        self.assertTrue(all(a[:3] == prefix for a in calls))
+
+    def test_a_hub_document_that_did_not_advance_is_unknown(self):
+        c, e, _ = self.hub_outcome({"first": self.hub_doc(3), "later": None})
+        self.assertEqual(c.result, rh.UNKNOWN)
+        self.assertIn("did not advance", c.reason)
+        self.assertNotIn("observed_sha256", e)
+
+    def test_another_hub_digest_fails(self):
+        c, e, _ = self.hub_outcome({"first": self.hub_doc(3, sha="d" * 64), "later": self.hub_doc(4, sha="d" * 64)})
+        self.assertEqual((c.result, e.get("observed_sha256")), (rh.FAIL, "d" * 64))
+
+    def test_a_container_sharing_the_hub_ledger_is_unknown(self):
+        other = container(cid="a" * 64, running=False, status="exited",
+                          mounts=[{"Type": "bind", "Source": "/zz/h/ledger/hub-status.json", "Destination": "/x",
+                                   "RW": True}])
+        c, _, _ = self.hub_outcome({"first": self.hub_doc(3), "later": self.hub_doc(4)}, others=[other])
+        self.assertEqual(c.result, rh.UNKNOWN)
+        self.assertIn("another container shares [2] (zz-hub)'s ledger directory /zz/h/ledger", c.reason)
+
+    def test_a_reader_exit_is_unknown_with_its_meaning(self):
+        for rc, text in ((3, "[2] (zz-hub) has written no status document yet"),
+                         (4, "[2] (zz-hub)'s status document is not a regular file"),
+                         (126, "the status reader in [2] (zz-hub) exited 126")):
+            with self.subTest(rc=rc):
+                c, _, _ = self.hub_outcome({}, reader_rc=rc)
+                self.assertEqual((c.result, c.reason), (rh.UNKNOWN, text))
 
 
 class VerifyTailTest(unittest.TestCase):
