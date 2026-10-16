@@ -189,7 +189,16 @@ class SequenceTest(Host):
         self.seven_d()
         self.files[f"{self.ev}/partition-r9.json"] = self.document(run_id="r9", at=AT_7D, key="e" * 64)
         doc, c = self.check()
-        self.assertEqual((c["E1"]["result"], doc["inputs"]["key_observed"]["run_id"]), (rh.PASS, "r7"))
+        self.assertEqual((c["E1"]["result"], (doc["inputs"]["key_observed"] or {}).get("run_id")), (rh.PASS, "r7"))
+
+    def retarget(self, **over):
+        path = f"{self.ev}/stop-target.json"
+        self.files[path] = pe.canonical(dict(json.loads(self.files[path]), **over))
+
+    def move_live_key(self):
+        live = json.loads(self.live_raw)
+        live["delegation"]["signing_key"]["path"] = "/opt/ex/other-keys/key"
+        self.live_raw = json.dumps(live).encode()
 
     def test_each_7d_clause_failing_is_unknown_and_names_it(self):
         rows = {
@@ -199,6 +208,14 @@ class SequenceTest(Host):
                 lambda: self.files.update({f"{self.ev}/stop-target.json": self.files[f"{self.ev}/stop-target.json"]
                                            .replace(hashlib.sha256(self.a2_raw).hexdigest().encode(),
                                                     b"0" * 64)}), "does not cite A2's document"),
+            "a stop target of another host": (lambda: self.retarget(host="beta"), "another host's"),
+            "a stop target from another activation_sha256": (
+                lambda: self.retarget(activation_sha256="0" * 64), "another A1 activation"),
+            "a signing key path differing in the live config": (self.move_live_key, "signing key path"),
+            "a 7d document ahead of the clock": (
+                lambda: self.seven_d(at=pc.utc_now(NOW + pe.CLOCK_TOLERANCE_S + 60)), "not current"),
+            "a 7d document older than A2's": (
+                lambda: self.seven_d(at=pc.utc_now(pe.at_seconds(AT) - 60)), "older than A2's document"),
         }
         for label, (change, words) in rows.items():
             with self.subTest(label):
@@ -226,6 +243,276 @@ class StatusExecTest(Host):
                     document_sha256=hashlib.sha256(self.document_raw).hexdigest(), now=NOW, p=p)
         execs = [a for a in seen if a[:1] == ["exec"]]
         self.assertEqual([a[1] for a in execs], [CID])
+
+
+class MalformedLiveTest(Host):
+    """Wherever the host-setup document loads, a malformed live config or
+    status still yields the whole six-cell object, with no PASS on a claim
+    the malformed value decides, in both the normal and --ready modes."""
+
+    SHAPES = ("bad", "", 0, 1.5, True, False, None, [], ["x"], {})
+
+    def configs(self):
+        base = json.loads(self.live_raw)
+        block = base["delegation"]
+        rows = {}
+        for shape in self.SHAPES:
+            rows[f"delegation={shape!r}"] = json.dumps(dict(base, delegation=shape)).encode()
+            rows[f"partition_verified={shape!r}"] = json.dumps(
+                dict(base, delegation=dict(block, partition_verified=shape))).encode()
+            rows[f"signing_key={shape!r}"] = json.dumps(dict(base, delegation=dict(block, signing_key=shape))).encode()
+        for label, raw in (("not JSON", b"not json"), ("null", b"null"), ("a list", b"[1]"), ("a string", b'"x"'),
+                           ("deeply nested", b"[" * 100000 + b"]" * 100000), ("not UTF-8", b"\xff\xfe")):
+            rows[label] = raw
+        return rows
+
+    def test_every_shape_keeps_the_six_cells(self):
+        import tempfile
+        verb = VerbTest.run_verb
+        for seven in (False, True):
+            self.setUp()
+            if seven:
+                self.seven_d()
+            for label, raw in self.configs().items():
+                with self.subTest(label, after_7d=seven):
+                    self.setUp()
+                    if seven:
+                        self.seven_d()
+                    good = self.live_raw
+                    self.live_raw = raw
+                    doc, cells = self.check()
+                    self.assertEqual(list(cells), list(pc.IDS))
+                    if raw != good:
+                        self.assertNotEqual(cells["E2"]["result"], rh.PASS, cells["E2"])
+                        self.assertNotEqual(cells["V2"]["result"], rh.PASS, cells["V2"])
+                    with tempfile.TemporaryDirectory() as tmp:
+                        for ready_only, want in ((False, 0), (True, 1)):
+                            rc, said = verb(self, ready_only, tmp)
+                            self.assertEqual(rc, want, said)
+                            written = [json.loads(x) for x in said if x.startswith("{")]
+                            self.assertEqual(len(written), 1, said)
+                            self.assertEqual([c["id"] for c in written[0]["checks"]], list(pc.IDS))
+
+    def test_a_malformed_status_keeps_the_six_cells(self):
+        import tempfile
+        self.seven_d()
+        for label, status in (("a huge clock", {"now": 10 ** 400, "status": self.status["status"]}),
+                              ("a huge interval", {"now": NOW, "status": json.dumps(
+                                  {"interval_s": 10 ** 400, "last_poll_ts": ts(NOW - 1)})}),
+                              ("a bool interval", {"now": NOW, "status": json.dumps(
+                                  {"interval_s": True, "last_poll_ts": ts(NOW - 1)})})):
+            with self.subTest(label):
+                self.status = status
+                with tempfile.TemporaryDirectory() as tmp:
+                    for ready_only, want in ((False, 0), (True, 1)):
+                        rc, said = VerbTest.run_verb(self, ready_only, tmp)
+                        self.assertEqual(rc, want, said)
+                        checks = {c["id"]: c for c in json.loads(said[-1])["checks"]}
+                        self.assertEqual(list(checks), list(pc.IDS))
+                        self.assertEqual(checks["V2"]["result"], rh.UNKNOWN, checks["V2"])
+
+    def test_the_valid_control(self):
+        import tempfile
+        self.seven_d()
+        with tempfile.TemporaryDirectory() as tmp:
+            for ready_only in (False, True):
+                rc, said = VerbTest.run_verb(self, ready_only, tmp)
+                self.assertEqual(rc, 0, said)
+                self.assertEqual({c["result"] for c in json.loads(said[-1])["checks"]}, {rh.PASS})
+
+
+CLAIMS = {
+    "V1": "the running local router is exactly its activation spec",
+    "V2": "the local router's live config is the activation rendering plus the token, and nothing else",
+    "E1": ("the partition evidence /opt/ex/partition-evidence/partition-r1.json is well-formed and passing, with "
+           "the key identity as root observed it in run {run_id} at {at}"),
+    "E2": "the local router signs with the current passing document's token, or not at all",
+    "T1": "the weekly job has a stop target: the recorded id is the running local router",
+    "R1": "no run of the weekly job is left undecided",
+}
+
+
+class ClaimsTest(Host):
+    """d2 §4.4: the six ids pinned to their claim strings, on every path that
+    emits them; and an unreadable input keeps all six ids, UNKNOWN."""
+
+    def claims(self, cells, run_id="r7", at=AT_7D):
+        return {k: v["claim"] for k, v in cells.items()}, dict(CLAIMS, E1=CLAIMS["E1"].format(run_id=run_id, at=at))
+
+    def test_the_six_claims_after_7d(self):
+        self.seven_d()
+        got, want = self.claims(self.check()[1])
+        self.assertEqual(got, want)
+
+    def test_the_six_claims_before_7d(self):
+        got, want = self.claims(self.check()[1], run_id=pc.NONE, at=pc.NONE)
+        self.assertEqual(got, want)
+
+    def test_a1_s_record_unreadable(self):
+        self.seven_d()
+        self.files.pop(f"{self.ev}/{ps.ACTIVATION}")
+        doc, cells = self.check()
+        self.assertEqual(list(cells), list(pc.IDS))
+        for cid in ("V1", "V2", "E1", "E2"):
+            with self.subTest(cid):
+                self.assertEqual(cells[cid]["result"], rh.UNKNOWN, cells[cid])
+                self.assertTrue(cells[cid]["reason"], cells[cid])
+        self.assertEqual({k: cells[k]["claim"] for k in ("V1", "V2", "E2")},
+                         {k: CLAIMS[k] for k in ("V1", "V2", "E2")})
+
+    def test_the_evidence_unreadable(self):
+        self.seven_d()
+        self.files.pop(f"{self.ev}/partition-r1.json")
+        doc, cells = self.check()
+        self.assertEqual(list(cells), list(pc.IDS))
+        for cid in ("E1", "E2"):
+            with self.subTest(cid):
+                self.assertEqual(cells[cid]["result"], rh.UNKNOWN, cells[cid])
+                self.assertTrue(cells[cid]["reason"], cells[cid])
+        self.assertEqual(cells["E2"]["claim"], CLAIMS["E2"])
+
+
+class V2WiringTest(Host):
+    """V2's cell carries the router's own status through evaluate and the
+    verb: a refused reload FAILs with its sentence; a stale status, or one
+    ahead of the router's clock, is UNKNOWN; --ready refuses each."""
+
+    def status_of(self, age=1.0, **doc):
+        body = {"interval_s": 5, "last_poll_ts": ts(NOW - age)}
+        body.update(doc)
+        return {"now": NOW, "status": json.dumps(body)}
+
+    def test_each_status_reaches_the_cell(self):
+        import tempfile
+        rows = {"a refused reload": (self.status_of(classification={"config_reload_failed": True}), rh.FAIL),
+                "stale": (self.status_of(age=rh.FRESHNESS_MULTIPLE * 5 + 1), rh.UNKNOWN),
+                "ahead of the router's clock": (self.status_of(age=-pe.CLOCK_TOLERANCE_S - 1), rh.UNKNOWN)}
+        for label, (status, want) in rows.items():
+            with self.subTest(label):
+                self.setUp()
+                self.seven_d()
+                self.status = status
+                cells = self.check()[1]
+                self.assertEqual(cells["V2"]["result"], want, cells["V2"])
+                if want == rh.FAIL:
+                    self.assertEqual(cells["V2"]["reason"], pc.RELOAD_FAILED)
+                self.assertEqual({k: v["result"] for k, v in cells.items() if k != "V2"},
+                                 dict.fromkeys(("V1", "E1", "E2", "T1", "R1"), rh.PASS))
+                with tempfile.TemporaryDirectory() as tmp:
+                    self.assertEqual(VerbTest.run_verb(self, True, tmp)[0], 1)
+
+
+class WriterHostSetupTest(unittest.TestCase):
+    """PRb-d3 B3: on the writer harness's own output, the host_setup the
+    weekly run binds is the one partition-check computes. The real writer
+    (host_steps partition-weekly, as a process) hands its child the document
+    as `document.json`; the weekly child binds sha256 of those bytes
+    (partition_run.bindings), and partition-check binds sha256 of the bytes
+    at the unit's --document. The harness's child copies what it was handed
+    out of its run directory."""
+
+    def test_the_child_s_document_is_the_unit_s(self):
+        import subprocess
+        import tempfile
+        import host_steps as hsteps
+        import partition_run as prun
+        import test_partition_weekly_writer as tw
+        root = tempfile.mkdtemp(dir="/tmp", prefix="pc")
+        self.addCleanup(tw.WriterTest._rm, root)
+        h = tw.Host(os.path.realpath(root))
+        self.addCleanup(h.sock.close)
+        copy = ("run_dir, fd = args[\"--run-dir\"], int(args[\"--lock-fd\"])\n"
+                "import shutil; shutil.copyfile(os.path.join(run_dir, 'document.json'), "
+                "os.path.join(SIDE, 'document.json'))\n")
+        child = tw.CHILD.replace('run_dir, fd = args["--run-dir"], int(args["--lock-fd"])\n', copy)
+        self.assertNotEqual(child, tw.CHILD)
+        h.bundle(extra={"partition_weekly.py": f"PLAN, SIDE, REPO, STATE = {h.root + '/plan.json'!r}, {h.side!r}, "
+                                               f"{str(tw.REPO)!r}, {h.state!r}\n" + child})
+        h.plan([["expect", tw.B], ["evidence", tw.B, tw.PASS], ["outcome", 0, tw.TARGET]])
+        p = h.run()
+        self.assertEqual(p.returncode, hsteps.EXIT_PASS, p.stdout + p.stderr)
+        with open(os.path.join(h.side, "document.json"), "rb") as f:
+            handed = f.read()
+        with open(h.doc, "rb") as f:
+            unit = f.read()
+        weekly = prun.bindings(document=handed, email={}, lanes={}, key_path=h.doc, key_dir=root,
+                               router={"mounts": []}, live_raw=b"{}")
+        self.assertEqual(handed, unit)
+        self.assertEqual(weekly["host_setup"], hashlib.sha256(unit).hexdigest())
+        self.assertEqual(weekly["host_setup"], h.digest)                     # the unit's --document-sha256
+
+
+class VerifySequenceTest(Host):
+    """d4 S1 / d5: the fresh-host sequence through `verify`'s host-setup
+    section on the same fixture: host_setup.checks and report, the real
+    stop-target and weekly-runs checks (T1, R1) over the fixture's placed
+    files and engine, and verify --a5's real exception logic. The host's
+    other sections are stubbed empty, and the signing row is the verdict
+    each platform gives an activated router (proved in test_signing_matrix
+    and test_hub_supervise): PASS where the adoption witness runs, the
+    launchd UNKNOWN with its exact reason on the Mac."""
+
+    def verify(self, *, a5=False, launchd=False):
+        import dataclasses
+        import host_setup as hsu
+        import hub_supervise as hv
+        from pathlib import Path
+        spec = self.spec
+        if launchd:
+            spec = dataclasses.replace(spec, supervision=dataclasses.replace(spec.supervision, kind=hv.KINDS[1]))
+        run_id = json.loads(self.live_raw)["delegation"]["partition_verified"].partition(":")[0]
+        want = rh.Fact("signing", True, "the policy and the gate")
+        signing = (rh.unknown(hsu.hk.SIGNING_CLAIM, want, hsu.hk.a5_launchd_reason(run_id), "use a Linux host")
+                   if launchd else rh.check(hsu.hk.SIGNING_CLAIM, want, True, "x"))
+        stubs = [(hsu, "overlay_section", lambda overlay: {}), (hsu, "load_spec", lambda sec: spec),
+                 (hsu, "print_notes", lambda *a, **k: None), (hsu.hk, "read_bytes", lambda p: self.live_raw),
+                 (hsu.hk, "checks", lambda *a, **k: [signing])]
+        for name in ("verify_roots", "verify_overlay", "verify_containers", "verify_mounts", "verify_openssl",
+                     "verify_umasks", "verify_groups", "secret_checks", "verify_recovery_horizon"):
+            stubs.append((hsu, name, lambda *a, **k: []))
+        for mod, name in ((hsu.hr, "checks"), (hsu.hv, "checks"), (hsu.hv, "verify_enablement"), (hsu.hv, "labels"),
+                          (hsu.hp, "checks"), (hsu.ps, "verify")):
+            stubs.append((mod, name, lambda *a, **k: []))
+        for mod, name, value in stubs:
+            self.addCleanup(setattr, mod, name, getattr(mod, name))
+            setattr(mod, name, value)
+        said = []
+        q = {"inspect": lambda ref: self.inspects.get(ref), "read_placed": self.read, "read": lambda p: self.live_raw}
+        rc = hsu.verify_section(Path("/overlay.json"), out=said.append, a5=a5, containers=lambda c: None,
+                                openssl={}, partition=q, policy_on=True)
+        return rc, said
+
+    def t1_lines(self, said):
+        at = next(i for i, l in enumerate(said) if ps.TARGET_CLAIM in l)
+        return said[at:at + 4]
+
+    def test_before_7d_verify_fails_on_t1_with_its_found_line(self):
+        rc, said = self.verify()
+        self.assertEqual(rc, 1, said)
+        lines = self.t1_lines(said)
+        self.assertEqual(lines[0].split()[0], rh.FAIL, lines)
+        self.assertIn("found: 'no stop target: the weekly job has not recorded one'", lines[2])
+        self.assertEqual([l.split()[0] for l in said if l.startswith("  ") and not l.startswith("   ")],
+                         [rh.PASS, rh.FAIL, rh.PASS], said)        # signing, T1, R1
+
+    def test_after_7d_verify_passes(self):
+        self.seven_d()
+        rc, said = self.verify()
+        self.assertEqual(rc, 0, said)
+        self.assertIn(f"  {rh.PASS:7} {ps.TARGET_CLAIM}", said)
+
+    def test_after_7d_verify_a5_passes_on_launchd_with_the_one_excused_row(self):
+        self.seven_d()
+        rc, said = self.verify(a5=True, launchd=True)
+        self.assertEqual(rc, 0, said)
+        self.assertTrue(any("the one expected non-pass" in l for l in said), said)
+        import host_setup as hsu
+        self.assertIn(f"  {rh.UNKNOWN:7} {hsu.hk.SIGNING_CLAIM}", said)
+        self.assertEqual(self.verify(launchd=True)[0], 1)                 # plain verify does not excuse it
+
+    def test_before_7d_verify_a5_still_fails_on_t1(self):
+        rc, said = self.verify(a5=True, launchd=True)
+        self.assertEqual(rc, 1, said)
 
 
 class NotRequiredTest(Host):
@@ -291,6 +578,31 @@ class StatusTest(unittest.TestCase):
         for bad in (True, "5", float("nan"), 0.5):
             with self.subTest(interval=bad):
                 self.assertEqual(pc.status_problem(self.read(interval=bad))[0], rh.UNKNOWN)
+
+    def judge(self, read):
+        try:
+            return pc.status_problem(read)
+        except Exception as e:  # a crash is not a verdict
+            self.fail(f"status_problem raised {e!r}")
+
+    def test_numeric_admission_is_total(self):
+        """Any JSON number reaching the clock or interval_s is admitted or
+        UNKNOWN, never an exception: huge ints (past a float), non-finite
+        floats and bools. The approved predicate stands: a huge but finite
+        interval is in range."""
+        huge = 10 ** 400
+        for bad in (huge, -huge, True, False, float("inf"), float("-inf"), float("nan"), None, [1], {"n": 1}):
+            with self.subTest(now=bad):
+                got = self.judge(dict(self.read(), now=bad))
+                self.assertEqual(got, (rh.UNKNOWN, "the container printed no clock"))
+            with self.subTest(interval=bad):
+                got = self.judge(self.read(interval=bad))
+                self.assertEqual(got[0], rh.UNKNOWN, got)
+                self.assertIn("interval_s is", got[1])
+                self.assertLess(len(got[1]), 200)
+        self.assertEqual(self.judge(self.read(interval=10.0 ** 300))[0], rh.PASS)
+        self.assertEqual(self.judge(dict(self.read(), now=NOW + 0.5, status=json.dumps(
+            {"interval_s": 5, "last_poll_ts": ts(NOW)})))[0], rh.PASS)
 
     def test_the_six_classification_cases(self):
         rows = [({}, rh.PASS), ({"classification": None}, rh.PASS), ({"classification": {"other": 1}}, rh.PASS),

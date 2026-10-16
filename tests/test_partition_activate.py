@@ -116,14 +116,38 @@ class PrepareTest(A1):
 
         def no_seed():
             dr.no_seed_problem_bytes = lambda b, checkout: "a key table refused"
+        def no_partition():
+            self.spec.partition = None
+
+        def no_overlay():
+            prov.ha.overlay_path = lambda o: None
+
+        def overlay_unreadable():
+            prov.ha.overlay_path = lambda o: self.t / "absent-overlay.json"
         for label, change in (("no delegation member", no_delegation), ("the gate", gate_shut),
-                              ("the inventory pin", inventory_pin), ("the no-seed check", no_seed)):
+                              ("the inventory pin", inventory_pin), ("the no-seed check", no_seed),
+                              ("no partition section", no_partition), ("no overlay", no_overlay),
+                              ("an overlay that cannot be read, after the record is ready", overlay_unreadable)):
             with self.subTest(label):
                 self.setUp()
                 change()
                 rc, before, after, out, err = self.prepare(apply=True)
                 self.assertEqual((rc, after), (2, before), out + err)
                 self.assertIn("nothing was written", err)
+
+    def test_the_interval_is_the_one_a4_s_run_sh_starts_with(self):
+        """PRb-d2 Q4 N2: the prospective spec's ROUTER_INTERVAL is run.sh's
+        default in the hop checkout, so A5's verify_activation compares A1's
+        spec with a router A4 started."""
+        import re
+        rc, _, after, out, err = self.prepare(apply=True)
+        self.assertEqual(rc, 0, err)
+        approved = pa.parse_activation(after[str(self.t / "run" / ps.ACTIVATION)])
+        run_sh = (Path(str(hp.hop_checkout())) / "docker" / "run.sh").read_text()
+        defaults = re.findall(r"\$\{ROUTER_INTERVAL:-([0-9]+)\}", run_sh)
+        self.assertEqual(len(set(defaults)), 1, defaults)
+        self.assertEqual(approved["spec"]["env"]["ROUTER_INTERVAL"], defaults[0])
+        self.assertIn(f"ROUTER_INTERVAL: {defaults[0]} ", out)
 
     def test_a_live_delegation_prints_the_de_activate_note(self):
         self.live.write_text(json.dumps(dict(self.doc, delegation={}), indent=2) + "\n")
@@ -141,6 +165,55 @@ class PrepareTest(A1):
                        self.spec.partition.evidence_dir + "/partition-r1.json": evidence}
         self.staged = staged
         final, why = self.run_a3(activation_sha256=hashlib.sha256(record).hexdigest())
+        self.assertIsNotNone(final, why)
+        self.assertEqual(final, pa.final_bytes(staged, json.loads(evidence)[pe.TOKEN_MEMBER]))
+
+
+class ChainTest(A1):
+    """d1 P1's chain on one fixture: A1's record, as A1 wrote it, is what the
+    real writer (host_steps partition-weekly --prospective, as a process, in
+    the writer harness) takes as A2's activation; the evidence the writer's
+    run placed is what A3 accepts. The harness's child writes that evidence
+    from the bindings its plan names, as the bundle's child would."""
+
+    def test_a1_then_the_writer_then_a3(self):
+        import os
+        import subprocess
+        import tempfile
+        import host_steps as hsteps
+        import test_partition_weekly_writer as tw
+        import dataclasses
+        root = tempfile.mkdtemp(dir="/tmp", prefix="pc")
+        self.addCleanup(tw.WriterTest._rm, root)
+        h = tw.Host(os.path.realpath(root))
+        self.addCleanup(h.sock.close)
+        self.spec.keys = dataclasses.replace(self.spec.keys, local_config=h.conf)   # one live config path
+        rc, _, after, out, err = self.prepare(apply=True)
+        self.assertEqual(rc, 0, err)
+        record = after[str(self.t / "run" / ps.ACTIVATION)]
+        approved = pa.parse_activation(record)
+        staged = approved["staged"].encode()
+        bindings = json.loads(build(bindings={"local_router": pa.activation_binding(approved["spec"], staged)}))[
+            "bindings"]
+        with open(h.conf, "w") as f:
+            f.write(json.dumps({"state_dir": "/s"}, indent=2) + "\n")       # before activation: no delegation
+        h.activation(record)                                              # A1's bytes, as A1 wrote them
+        h.containers({})                                                  # the local router stopped
+        h.plan([["expect", bindings], ["evidence", bindings, tw.PASS], ["outcome", 0, None]])
+        argv = h.argv() + ["--prospective"]
+        argv[argv.index("--host") + 1] = approved["host"]
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=120)
+        self.assertEqual(p.returncode, hsteps.EXIT_PASS, p.stdout + p.stderr)
+        placed = [n for n in os.listdir(h.ev) if n.startswith("partition-") and n != "partition-a2.json"]
+        self.assertEqual(len(placed), 1, placed)
+        with open(os.path.join(h.ev, placed[0]), "rb") as f:
+            evidence = f.read()
+        doc = pe.parse(evidence, host=approved["host"])
+        self.placed = {self.spec.partition.evidence_dir + "/activation.json": record,
+                       self.spec.partition.evidence_dir + "/" + placed[0]: evidence}
+        self.staged = staged
+        final, why = self.run_a3(activation_sha256=hashlib.sha256(record).hexdigest(), run_id=doc["run_id"],
+                                 now=pe.at_seconds(doc["at"]) + 1)
         self.assertIsNotNone(final, why)
         self.assertEqual(final, pa.final_bytes(staged, json.loads(evidence)[pe.TOKEN_MEMBER]))
 

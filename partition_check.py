@@ -59,6 +59,7 @@ RUN_7D = "run step 7d"
 NO_CURRENT = "no current document yet: run step 7d"
 RELOAD_FAILED = "the running router refused its config file and runs an older one"
 KEY_CHANGED = "the key changed between A2 and 7d"
+DEEP_REMEDY = "restore the live config to the rendering install wrote, then run partition-check again"
 
 #: The router's status.json and the container's own clock, in one exec: the
 #: freshness is judged on [1]'s clock. argv[1] is the state_dir A1's staged
@@ -103,6 +104,39 @@ def ready(doc: Dict[str, Any]) -> bool:
 # --- V2: the router's own status, on its own clock ------------------------------
 
 
+def dig(doc: Any, *keys: str) -> Any:
+    """`doc[k1][k2]...`, or None where a level is absent or not an object: a
+    malformed config reads as a missing value, never as a crash."""
+    for k in keys:
+        if not isinstance(doc, dict):
+            return None
+        doc = doc.get(k)
+    return doc
+
+
+def short(x: Any, limit: int = 80) -> str:
+    """A value for a reason sentence: its repr, cut to `limit` characters, so
+    a hostile value cannot flood the document (and a huge int, whose repr
+    Python refuses past its digit limit, still reads)."""
+    try:
+        r = repr(x)
+    except ValueError:
+        return f"a {type(x).__name__} too large to show"
+    return r if len(r) <= limit else r[:limit] + "..."
+
+
+def finite_number(x: Any) -> Optional[float]:
+    """A JSON number as a finite float, or None: a bool, a non-number, an
+    int too large for a float, and a non-finite float are all None."""
+    if isinstance(x, bool) or not isinstance(x, (int, float)):
+        return None
+    try:
+        f = float(x)
+    except OverflowError:
+        return None
+    return f if math.isfinite(f) else None
+
+
 def status_problem(read: Any, *, interval_floor: float = 1.0) -> Tuple[str, str]:
     """(PASS | FAIL | UNKNOWN, why) for the in-container read: fresh iff
     -CLOCK_TOLERANCE_S <= now - last_poll_ts <= FRESHNESS_MULTIPLE x
@@ -112,24 +146,24 @@ def status_problem(read: Any, *, interval_floor: float = 1.0) -> Tuple[str, str]
     present non-object section, or a non-bool member, is UNKNOWN."""
     if isinstance(read, rh.Unresolved):
         return rh.UNKNOWN, read.reason
-    now = read.get("now") if isinstance(read, dict) else None
-    if not isinstance(now, (int, float)) or isinstance(now, bool) or not math.isfinite(now):
+    now = finite_number(read.get("now")) if isinstance(read, dict) else None
+    if now is None:
         return rh.UNKNOWN, "the container printed no clock"
     if "status" not in read:
         return rh.UNKNOWN, f"status.json cannot be read in the container: {read.get('error')}"
     try:
         doc = json.loads(read["status"])
-    except (TypeError, ValueError) as e:
+    except (TypeError, ValueError, RecursionError) as e:
         return rh.UNKNOWN, f"status.json is not JSON: {e}"
     if not isinstance(doc, dict):
         return rh.UNKNOWN, "status.json is not an object"
-    interval = doc.get("interval_s")
-    if not isinstance(interval, (int, float)) or isinstance(interval, bool) or not math.isfinite(interval) \
-            or interval < interval_floor:
-        return rh.UNKNOWN, f"status.json's interval_s is {interval!r}, not a finite number of at least 1"
+    interval = finite_number(doc.get("interval_s"))
+    if interval is None or interval < interval_floor:
+        return rh.UNKNOWN, (f"status.json's interval_s is {short(doc.get('interval_s'))}, not a finite number "
+                            "of at least 1")
     last = parse_router_ts(doc.get("last_poll_ts"))
     if last is None:
-        return rh.UNKNOWN, f"status.json's last_poll_ts is {doc.get('last_poll_ts')!r}, not the router's timestamp"
+        return rh.UNKNOWN, f"status.json's last_poll_ts is {short(doc.get('last_poll_ts'))}, not the router's timestamp"
     age = now - last
     bound = rh.FRESHNESS_MULTIPLE * interval
     if age < -pe.CLOCK_TOLERANCE_S:
@@ -141,7 +175,7 @@ def status_problem(read: Any, *, interval_floor: float = 1.0) -> Tuple[str, str]
         return rh.UNKNOWN, "status.json's classification section is not an object"
     flag = (section or {}).get("config_reload_failed", False)
     if not isinstance(flag, bool):
-        return rh.UNKNOWN, f"status.json's config_reload_failed is {flag!r}, not a JSON boolean"
+        return rh.UNKNOWN, f"status.json's config_reload_failed is {short(flag)}, not a JSON boolean"
     if flag:
         return rh.FAIL, RELOAD_FAILED
     return rh.PASS, ""
@@ -208,8 +242,8 @@ def key_observation(*, host: str, evidence_dir: str, live: Dict[str, Any], a2_ra
         return None, None, f"{name} cannot be read as placed, for this host: {e}"
     if doc["run_id"] != target["run_id"]:
         return None, None, f"{name} is another run's"
-    staged_key = (((json.loads(approved["staged"]).get("delegation") or {}).get("signing_key") or {}).get("path"))
-    live_key = ((live.get("delegation") or {}).get("signing_key") or {}).get("path")
+    staged_key = dig(json.loads(approved["staged"]), "delegation", "signing_key", "path")
+    live_key = dig(live, "delegation", "signing_key", "path")
     if not (staged_key == live_key == key_path):
         return None, None, "the signing key path is not the same in A1, the live config and the document"
     age = now - pe.at_seconds(doc["at"])
@@ -355,7 +389,7 @@ def evaluate(spec: Any, *, document_raw: bytes, document_sha256: str, now: float
         if not isinstance(live_doc, dict):
             raise ValueError("it is not a JSON object")
         inputs["live_config_sha256"] = hashlib.sha256(live_raw).hexdigest()
-    except (OSError, ValueError, UnicodeDecodeError) as e:
+    except (OSError, ValueError, UnicodeDecodeError, RecursionError) as e:
         live_raw, live_doc = rh.Unresolved(f"the live config {live_path} cannot be read: {e}"), None
     try:
         activation_raw = read(posixpath.join(evidence_dir, ps.ACTIVATION))
@@ -367,7 +401,7 @@ def evaluate(spec: Any, *, document_raw: bytes, document_sha256: str, now: float
     if isinstance(live, dict):
         inputs["router_container_id"] = live.get("Id")
         inputs["inspect_digest"] = pe.sha_json(pa.inspect_projection(live))
-    token = ((live_doc or {}).get("delegation") or {}).get("partition_verified") if live_doc else None
+    token = dig(live_doc, "delegation", "partition_verified")
     inputs["token"] = token if isinstance(token, str) else None
     a2_doc = a2_raw = None
     named_why = "the live config carries no token" if not isinstance(token, str) else ""
@@ -376,7 +410,7 @@ def evaluate(spec: Any, *, document_raw: bytes, document_sha256: str, now: float
         if a2_doc is not None:
             inputs["evidence_path"] = posixpath.join(evidence_dir, f"partition-{a2_doc['run_id']}.json")
             inputs["evidence_sha256"] = hashlib.sha256(a2_raw).hexdigest()
-    evidence_path = inputs["evidence_path"] or posixpath.join(evidence_dir, f"partition-{(token or '').partition(':')[0] or NONE}.json")
+    evidence_path = inputs["evidence_path"] or posixpath.join(evidence_dir, f"partition-{(token if isinstance(token, str) else '').partition(':')[0] or NONE}.json")
 
     # V1, V2.
     if isinstance(approved, rh.Unresolved) or isinstance(live_raw, rh.Unresolved):
@@ -419,7 +453,7 @@ def evaluate(spec: Any, *, document_raw: bytes, document_sha256: str, now: float
                      else live_raw.reason)
         e2 = e2_unknown()
     else:
-        key_path = ((json.loads(approved["staged"]).get("delegation") or {}).get("signing_key") or {}).get("path")
+        key_path = dig(json.loads(approved["staged"]), "delegation", "signing_key", "path")
         observed, doc7d, why = key_observation(
             host=host, evidence_dir=evidence_dir, live=live_doc, a2_raw=a2_raw, a2_doc=a2_doc,
             activation_raw=activation_raw, approved=approved, key_path=key_path, now=now, read=read)
@@ -456,8 +490,18 @@ def evaluate(spec: Any, *, document_raw: bytes, document_sha256: str, now: float
 
     # T1, R1: their own results, through ss.docker for the engine.
     q = {"inspect": inspect, "read_placed": read, "read": read_live}
-    t1 = cell("T1", hsu.verify_stop_target(spec, q)[0], base=ps.TARGET_CLAIM)
-    r1 = cell("R1", hsu.verify_weekly_runs(spec, {k: q[k] for k in ("read_placed", "read")})[0], base=pruns.RUNS_CLAIM)
+    # Their readers are the weekly job's, which a JSON document nested past
+    # the parser's depth makes raise: that is a cell that cannot be told,
+    # never a lost object.
+    try:
+        t1 = cell("T1", hsu.verify_stop_target(spec, q)[0], base=ps.TARGET_CLAIM)
+    except RecursionError:
+        t1 = unknown_cell("T1", ps.TARGET_CLAIM, "a file it reads is nested too deeply to parse", DEEP_REMEDY)
+    try:
+        r1 = cell("R1", hsu.verify_weekly_runs(spec, {k: q[k] for k in ("read_placed", "read")})[0],
+                  base=pruns.RUNS_CLAIM)
+    except RecursionError:
+        r1 = unknown_cell("R1", pruns.RUNS_CLAIM, "a file it reads is nested too deeply to parse", DEEP_REMEDY)
     return inputs, [v1, v2, e1, e2, t1, r1]
 
 

@@ -746,49 +746,66 @@ reads as not running.
    post-activation document and the key probe's record bind the approved
    document and the hub-link router's run spec. Anything that changes either
    after activation makes them stale.
-   1. Move the deployment to its final deploy commit
+   1. Generate the signing key as the operator (below). The one root command
+      installs the 32-byte seed. If keys.dir does not exist yet, create it
+      first with the plan's own step (`install -d -o <uid> -g <gid> -m 0700
+      <keys.dir>`), from the document as it stands. That run is not the
+      approval in step 5.
+   2. Add this host's entry (its `public_key` and `key_id`) to the fleet
+      inventory, and pin the inventory in this host's document:
+      `fleet_keys {path, sha256}`. The pin is part of the host-setup
+      document, so it changes the document. Every host's entry must be in
+      the inventory before any host pins it. A1 refuses without the pin.
+   3. Move the deployment to its final deploy commit
       (`secrets.clones.deploy.sha`).
-   2. Build the hub-link router's image and update `secrets.image`.
-   3. Approve and anchor the host-setup document, and render the unit, ONCE,
-      now: steps 1 and 2 both change the document.
-   4. Run the hub key probe, and start the hub-link router on that image.
-   5. Provision the weekly job's bundle once, at that deploy commit (its PIN
+   4. Build the hub-link router's image and update `secrets.image`.
+   5. Approve and anchor the host-setup document, and render the unit, ONCE,
+      now: steps 2, 3 and 4 all change the document.
+   6. Run the hub key probe, and start the hub-link router on that image.
+   7. Provision the weekly job's bundle once, at that deploy commit (its PIN
       is that commit, so the weekly job hands off until it is provisioned).
-   6. Only then begin A1.
+   8. Only then begin A1.
 
    `secrets.writer.commit` stays at its reviewed commit. The writer's pin is
    the sha256 of `host_steps.py`, not the deploy commit: a deploy commit that
    leaves `host_steps.py` unchanged leaves the writer as it is, so do not
    "update" `secrets.writer.commit` to the deploy commit.
 
-   Generate the signing key as the operator; the one root command installs
-   the 32-byte seed:
+   The key, step 1. Every check stops the block before the root install,
+   and its exit status says whether the seed was installed:
 
    ```sh
-   umask 077; T=$(mktemp -d -p /dev/shm amap-key.XXXXXX)
-   "$OPENSSL" genpkey -algorithm ed25519 -outform DER -out "$T/k.der"
-   test "$(wc -c < "$T/k.der")" -eq 48 || echo 'STOP: the private DER is not 48 bytes'
-   tail -c 32 "$T/k.der" > "$T/seed"
-   "$OPENSSL" pkey -inform DER -in "$T/k.der" -pubout -outform DER > "$T/pub.der"
-   test "$(wc -c < "$T/pub.der")" -eq 44 || echo 'STOP: the public DER is not 44 bytes'
-   tail -c 32 "$T/pub.der" > "$T/pub.raw"
-   printf 'public_key '; od -An -tx1 "$T/pub.raw" | tr -d ' \n'; echo
-   printf 'key_id     '; "$OPENSSL" dgst -sha256 -r "$T/pub.raw" | cut -c1-64
-   /usr/bin/sudo /usr/bin/install -o <the local router's uid> -g <its gid> -m 0400 "$T/seed" <keys.dir>/<keys.file>
-   rm -rf "$T"
+   (
+     set -eu
+     umask 077
+     if [ -d /dev/shm ]; then T=$(mktemp -d /dev/shm/amap-key.XXXXXX); else T=$(mktemp -d "$HOME/amap-key.XXXXXX"); fi
+     trap 'rm -rf "$T"' EXIT
+     "$OPENSSL" genpkey -algorithm ed25519 -outform DER -out "$T/k.der"
+     test "$(wc -c < "$T/k.der")" -eq 48
+     tail -c 32 "$T/k.der" > "$T/seed"
+     test "$(wc -c < "$T/seed")" -eq 32
+     "$OPENSSL" pkey -inform DER -in "$T/k.der" -pubout -outform DER > "$T/pub.der"
+     test "$(wc -c < "$T/pub.der")" -eq 44
+     tail -c 32 "$T/pub.der" > "$T/pub.raw"
+     printf 'public_key '; od -An -tx1 "$T/pub.raw" | tr -d ' \n'; echo
+     printf 'key_id     '; "$OPENSSL" dgst -sha256 -r "$T/pub.raw" | cut -c1-64
+     /usr/bin/sudo /usr/bin/install -o <the local router's uid> -g <its gid> -m 0400 "$T/seed" <keys.dir>/<keys.file>
+   ); echo "exit $? (anything but 0: STOP, nothing was installed)"
    ```
 
+   - Run it as shown, never as the left side of `||` or `&&`: there the
+     shell ignores `set -e` inside the parentheses, and a failed check no
+     longer stops the install.
    - `$OPENSSL` is OpenSSL 3, run as the operator only. On macOS, the system
-     `openssl` is LibreSSL; use an OpenSSL 3 build.
+     `openssl` is LibreSSL; use an OpenSSL 3 build. An unset `$OPENSSL` stops
+     the block.
    - `install -o` names the local router's in-container uid. Every directory on
      the key's path is owned by root or that uid, and is not group- or
-     other-writable. keys.dir is made by the plan first (`install -d -o <uid>
-     -g <gid> -m 0700`).
-   - `$T` is on tmpfs. On macOS a RAM disk is optional, and `rm -rf` does not
-     scrub.
-   - Then this host's entry joins the fleet inventory (its `public_key` and
-     `key_id`), and each host's overlay pins the inventory
-     (`fleet_keys {path, sha256}`). A1 refuses without them.
+     other-writable.
+   - `$T` is on tmpfs where the host has `/dev/shm` (Linux). A host without
+     it (macOS) uses a private directory in the operator's home instead,
+     which is on disk: `rm -rf` does not scrub it. A RAM disk there is
+     optional.
 1. **A1.** `python3 amap-sandy.py partition-activate --apply` renders the
    staged config from install's rendering, after every hop-host check install
    makes, and writes A1's record into the run directory. It prints the root
@@ -805,9 +822,13 @@ reads as not running.
    evidence is placed and P02 passes, and it names the run whose token A3
    takes. Copy its printed pre-activation line into
    `<run_dir>/a2-pre-activation.sha256`, labelled with this host and A2's run
-   id. That file is your convenience, never evidence. It must equal the
-   `sha256sum` recorded at step 2. On a non-zero exit, take the back-out
-   before the place.
+   id, under the header line
+   `# operator-copied from A2's and A3's output; not evidence`. That file is
+   your convenience, never evidence. A2's line must equal the `sha256sum`
+   recorded at step 2. If it differs, something moved the live config during
+   the window: stop, take the back-out before the place, and find what
+   changed before trying again. On a non-zero exit, take the back-out before
+   the place.
 4. **A3.** `python3 amap-sandy.py install --apply --activate <A2's run id>
    --activation-sha256 <A1's printed digest>`, then the root place it prints.
    Add A3's printed sha256 line to the same file, labelled.
@@ -818,10 +839,21 @@ reads as not running.
    the weekly job once now", is step 8). E1 and E2 are UNKNOWN until then.
 7. **The post-activation document.** `python3 amap-sandy.py partition-probe
    --post-activation <A2's run id> --document <...> --document-sha256 <...>
-   --apply`, then the root place it prints.
+   --apply`, then the root place it prints. It writes the document whatever
+   its verdicts, and it is placed whatever they are: it records what P01 and
+   P02 saw against the final router. Exit 1 means one of them did not PASS.
+   A FAIL means the partition does not hold against that router: after
+   placing the document, take the back-out after the place. An UNKNOWN means
+   a probe could not tell (for P02, the operator's access to the hop tree):
+   read its reason, and run the step again once it can be measured.
 8. **The weekly job's first run (7d).** As root, the printed 7d argv, in the
    foreground. It must end with exit 0, `weekly-runs.json` `runs: []` and
-   `stop-target.json` present.
+   `stop-target.json` present. Run it once, before any collection that reads
+   E1 (a canary's, for example), and never during that collection: a re-run
+   renews the stop target and moves E1's subject under it. Plan the
+   collection so that this run's `at` (E1's `key_observed.at`) plus
+   `FRESH_FOR_S` (691200 s, eight days) is at or after the collection's
+   planned end plus its collection budget.
 9. **A5, final.** `python3 amap-sandy.py partition-check ... --ready` exits 0
    only when all six claims PASS. `partition-check`'s exit 0 without `--ready`
    means only that its object was written, so read all six cells. Then

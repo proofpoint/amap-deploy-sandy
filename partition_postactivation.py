@@ -83,6 +83,12 @@ def parse(raw: bytes, *, host: str) -> Dict[str, Any]:
         raise PostActivationError("its router is not {container_id, inspect_digest}, both 64 hex")
     if not isinstance(doc["bindings"], dict) or set(doc["bindings"]) != set(BINDING_KEYS):
         raise PostActivationError("its bindings are not exactly the operator's four")
+    if not all(isinstance(v, str) and _HEX64.fullmatch(v) for v in doc["bindings"].values()):
+        raise PostActivationError("a binding is not 64 hex")
+    scripts = doc["script_sha256"]
+    if not isinstance(scripts, dict) or set(scripts) != set(pp.SCRIPTS) or \
+            not all(isinstance(v, str) and _HEX64.fullmatch(v) for v in scripts.values()):
+        raise PostActivationError("its script_sha256 is not one 64-hex digest per probe script")
     probes = doc["probes"]
     if not isinstance(probes, list) or [p.get("id") if isinstance(p, dict) else None for p in probes] != list(PROBE_IDS):
         raise PostActivationError("its probes are not exactly P01 and P02, in order")

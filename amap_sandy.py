@@ -4356,15 +4356,22 @@ def run_prepare(args: argparse.Namespace, policy: Dict[str, Any], doc: Dict[str,
         print("partition-activate: cannot prepare A1 — no deployment overlay names the approved document; "
               "nothing was written", file=sys.stderr)
         return 2
+    # Everything printed is computed before the record is written, so a
+    # failure here leaves nothing behind.
     source = Path(spec.secrets.run_dir) / ps.ACTIVATION
+    writer = os.path.join(spec.secrets.writer_dir, ss.WRITER)
+    try:
+        steps = list(pj.activation_steps(spec.partition, writer=writer, source=str(source), activation_bytes=record))
+        argv = pj.job_argv(spec.partition, writer=writer, host=hsu.partition_host(spec), document=str(overlay),
+                           document_bytes=overlay.read_bytes(), activation_bytes=record)
+    except (OSError, ValueError) as e:
+        print(f"partition-activate: cannot prepare A1 — {e}; nothing was written", file=sys.stderr)
+        return 2
     print(f"partition-activate: A1's record {_write_file(source, record.decode('utf-8'), dry_run=not apply, label=ps.ACTIVATION)}")
     print(f"  its sha256, A3's --activation-sha256: {hashlib.sha256(record).hexdigest()}")
     print(f"  the prospective spec's ROUTER_INTERVAL: {pa.DEFAULT_INTERVAL} (A4's docker/run.sh must use the same)")
-    writer = os.path.join(spec.secrets.writer_dir, ss.WRITER)
-    for line in pj.activation_steps(spec.partition, writer=writer, source=str(source), activation_bytes=record):
+    for line in steps:
         print(f"  {line}")
-    argv = pj.job_argv(spec.partition, writer=writer, host=hsu.partition_host(spec), document=str(overlay),
-                       document_bytes=overlay.read_bytes(), activation_bytes=record)
     print("  # 7b, A2 (with the local router stopped):")
     print(f"  /usr/bin/sudo {shlex.join(argv + ['--prospective'])}")
     print("  # 7d, the manual weekly run (after A4):")

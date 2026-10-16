@@ -51,7 +51,13 @@ class GrammarTest(unittest.TestCase):
                 "P02 before P01": dict(good, probes=list(reversed(good["probes"]))),
                 "a key binding": dict(good, bindings=dict(good["bindings"], key="f" * 64)),
                 "a short container id": dict(good, router={"container_id": "c", "inspect_digest": "d" * 64}),
-                "the evidence schema": dict(good, schema=pe.SCHEMA)}
+                "the evidence schema": dict(good, schema=pe.SCHEMA),
+                "a list-valued binding": dict(good, bindings=dict(good["bindings"], lanes=["e" * 64])),
+                "a short binding": dict(good, bindings=dict(good["bindings"], host_setup="e")),
+                "an empty script map": dict(good, script_sha256={}),
+                "a script map missing a script": dict(good, script_sha256={
+                    k: v for k, v in list(good["script_sha256"].items())[1:]}),
+                "a non-hex script digest": dict(good, script_sha256=dict.fromkeys(good["script_sha256"], ["x"]))}
         for label, d in rows.items():
             with self.subTest(label):
                 with self.assertRaises(ppa.PostActivationError):
@@ -154,6 +160,32 @@ class RefusalTest(Host):
                 self.assertIn("the running email router is not its rendering", "\n".join(said))
                 self.assertEqual(written, ["document.json"])
                 self.assertFalse([c for c in calls if c[:1] in (["run"], ["exec"])])
+
+    def test_a_stopped_router_is_refused_before_any_probe(self):
+        """An inspectable [1] whose State.Running is false: is_running's own
+        refusal, not the engine's silence."""
+        import partition_activation as pa
+        self.live = dict(self.live, State=dict(self.live["State"], Running=False))
+        self.assertIs(pa.is_running(self.live), False)
+        runner, calls = self.engine(None)
+        rc, said, written, _ = self.verb(runner=runner)
+        self.assertEqual((rc, written), (2, ["document.json"]), said)
+        self.assertIn("not affirmed running", "\n".join(said))
+        self.assertTrue([c for c in calls if c[:3] == ["inspect", "--type", "container"]], calls)
+        self.assertFalse([c for c in calls if c[:1] in (["run"], ["exec"])])
+
+    def test_an_unresolved_lane_identity_writes_nothing(self):
+        """The selected lanes resolve; a lane that cannot be stat'd makes
+        lane_binding, not selected_lanes, Unresolved."""
+        from test_partition_check import LANES
+
+        def no_stat(path):
+            raise PermissionError(13, "Permission denied", path)
+        runner, calls = self.engine(None)
+        rc, said, written, _ = self.verb(runner=runner, read_lanes=lambda q: LANES, stat=no_stat)
+        self.assertEqual((rc, written), (2, ["document.json"]), said)
+        self.assertIn("cannot stat", "\n".join(said))
+        self.assertFalse([c for c in calls if c[:1] in (["run"], ["exec"])])
 
     def test_an_unresolved_lane_binding_writes_nothing(self):
         runner, calls = self.engine(None)
