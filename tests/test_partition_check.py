@@ -58,7 +58,7 @@ class Host(tai.A3):
             tai.A3.setUp(self)
         finally:
             tai.partition_doc = orig
-        self.document_raw = b'{"host_setup": "the unit argv\'s document"}'
+        self.document_raw = b'{"host_setup": {"fixture": "the unit argv\'s document"}}'
         self.ev = self.spec.partition.evidence_dir
         name = self.spec.runtime_of(self.spec.hops[0][1])["container"]
         final = self.spec.keys.local_config
@@ -305,3 +305,44 @@ class DocumentTest(unittest.TestCase):
     def test_e1_literal(self):
         self.assertEqual(pc.E1_CLAIM, "the partition evidence {path} is well-formed and passing, with the key "
                                       "identity as root observed it in run {run_id} at {at}")
+
+
+class VerbTest(Host):
+    """`partition-check`: the object is written whenever the document loads;
+    exit 0 means only that, and --ready means six PASS."""
+
+    def run_verb(self, ready_only, tmp):
+        import host_setup as hsu
+        path = os.path.join(tmp, "document.json")
+        with open(path, "wb") as f:
+            f.write(self.document_raw)
+        self.addCleanup(setattr, hsu, "load_spec", hsu.load_spec)
+        hsu.load_spec = lambda sec: self.spec
+        said = []
+        p = {"read": self.read, "read_live": lambda q: self.live_raw, "read_lanes": lambda q: LANES,
+             "inspect": lambda ref: self.inspects.get(ref), "image": lambda live: IMAGE, "status": self.status,
+             "stat": self.stat, "lstat": self.lstat}
+        rc = pc.run(path, hashlib.sha256(self.document_raw).hexdigest(), ready_only=ready_only, out=said.append,
+                    now=NOW, p=p)
+        return rc, said
+
+    def test_exit_status(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            for ready_only, want in ((False, 0), (True, 1)):          # before 7d: written, not ready
+                with self.subTest(ready_only=ready_only):
+                    rc, said = self.run_verb(ready_only, tmp)
+                    self.assertEqual(rc, want)
+                    self.assertEqual(json.loads(said[-1])["schema"], pc.SCHEMA)
+            self.seven_d()
+            self.assertEqual(self.run_verb(True, tmp)[0], 0)         # after 7d: ready
+        self.assertEqual(pc.run("/nonexistent/document.json", "0" * 64, out=lambda s: None), 2)
+
+    def test_the_cli_passes_the_flag(self):
+        import amap_sandy as prov
+        seen = []
+        self.addCleanup(setattr, pc, "run", pc.run)
+        pc.run = lambda path, sha, ready_only=False, **k: seen.append((path, sha, ready_only)) or 0
+        self.assertEqual(prov.main(["partition-check", "--document", "/d.json", "--document-sha256", "a" * 64,
+                                    "--ready"]), 0)
+        self.assertEqual(seen, [("/d.json", "a" * 64, True)])

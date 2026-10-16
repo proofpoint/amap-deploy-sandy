@@ -440,3 +440,31 @@ def evaluate(spec: Any, *, document_raw: bytes, document_sha256: str, now: float
     t1 = cell("T1", hsu.verify_stop_target(spec, q)[0], base=ps.TARGET_CLAIM)
     r1 = cell("R1", hsu.verify_weekly_runs(spec, {k: q[k] for k in ("read_placed", "read")})[0], base=pruns.RUNS_CLAIM)
     return inputs, [v1, v2, e1, e2, t1, r1]
+
+
+def run(document_path: str, document_sha256: str, *, ready_only: bool = False, out=print,
+        now: Optional[float] = None, p: Optional[Dict[str, Any]] = None) -> int:
+    """The verb: the unit argv's `--document` and `--document-sha256` name the
+    approved document. The object is written on every path where the
+    document loads; the exit is 0 when it was written in full, or with
+    `ready_only` (`--ready`), 0 only when all six are PASS. A document that
+    cannot be read or loaded is exit 2 and no object."""
+    import host_setup as hsu
+    import partition_run as prun
+    now = time.time() if now is None else now
+    try:
+        with open(document_path, "rb") as f:
+            raw = f.read()
+        spec = hsu.load_spec(prun.document_section(raw))
+    except (OSError, ValueError) as e:
+        out(f"partition-check: the document cannot be loaded: {e}")
+        return 2
+    if spec.partition is None or spec.keys is None or not spec.hops:
+        out("partition-check: the document has no partition, keys or hops section")
+        return 2
+    inputs, cells = evaluate(spec, document_raw=raw, document_sha256=document_sha256, now=now, p=p)
+    doc = document(host=hsu.partition_host(spec), at=utc_now(now), inputs=inputs, cells=cells)
+    out(doc.decode("utf-8"))
+    if ready_only:
+        return 0 if ready(json.loads(doc)) else 1
+    return 0
