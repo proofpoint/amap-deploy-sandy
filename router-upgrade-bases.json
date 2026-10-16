@@ -1,9 +1,13 @@
 {
-  "schema": 1,
+  "schema": 2,
   "target": "99329945edd20adb4b8b83f025ea1ef6382456ff",
   "measured_from": "6479a05c164b11e2ff38df08b3f93e9e0079d779",
   "property": "for a state_dir that holds no peer-lane state (no entry named peer-* under it), no persisted-state write outside the peer lane changes between each first-parent commit in [measured_from, target] and target, so target reads all state the base wrote",
   "peer_lane": "not measured",
   "premises": "amap-router-local's measured property over the first-parent range [6479a05c, 99329945] (no persisted-state write is added or changed outside the peer lane, between any commit in the range and 99329945) is a property of the router package's source alone. Any image whose /app/router top-level *.py {name: git blob} map equals that of some commit C in the range behaves as C does for this property, under these premises:\n  P1. The image runs the router as amap-router-local's docker/ entrypoint does: PID 1 is `python3 -m router … run`, from WORKDIR /app, with no PYTHONPATH, PYTHONHOME or PYTHONUSERBASE, so the code executed is /app/router/*.py and the standard library (the package has no third-party dependencies);\n  P2. Under /app/router, the only subdirectory the runtime imports is none: router/tests is never imported by the runtime, and there is NO __pycache__ directory (a cached .pyc may run in place of the source);\n  P3. The transport plugin is outside this property; the stop gate checks it separately against the pinned plugin digest;\n  P4. The interpreter is CPython 3 from the image's base. The state formats depend on the package's own json/os calls, not on the interpreter's version.",
+  "pre_registry": {
+    "before": "a84e0d986e96460a4c1ad0563675fbf32c6a104f",
+    "statement": "An upgrade of the local router from a commit that predates `registry_dir` to the M1 pin (99329945), on a configuration that sets `registry_dir`, is not covered by router-upgrade-bases.json, whose measured property does not hold across that span. It is supported by the router's own migration instead. The router holds each instance (`state_not_migrated`, then `legacy_state_unadopted`) until, with the router stopped, the operator moves the instance's state directory to its logical id and runs `generation adopt <name> --reason <text>` (with `--no-transport-history=N` when asked, which is true for a base that never had a transport). After adopt, the first-sight marker and the reply ledger carry over, and the instance drains. measured_from stays 6479a05c. The stop gate should report a pre-registry base distinctly (e.g. `pre_registry_base`), so the operator is sent to this branch, not left UNMEASURED."
+  },
   "measured_by": "amap-router-local's maintainers, in the review of the pull request that adds this file"
 }

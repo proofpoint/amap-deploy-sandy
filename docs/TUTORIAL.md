@@ -845,6 +845,11 @@ reads as not running.
    python3 amap-sandy.py router-fingerprint --match <the file it wrote>
    ```
 
+   If the running router's container does not yet have the host-setup
+   document's `router.container` name (a router started before activation),
+   add `--container <its current name>` to both commands. Whatever its name,
+   the stop below is by the Id the file records.
+
    - The match must print `MEASURED` and exit 0. That means:
      - the running router's source, its process and its transport plugin are
        what the upgrade to the pinned router was measured from
@@ -875,6 +880,11 @@ reads as not running.
      - If the live config is not one regular file at its own path
        (`config_identity`), relaunch the router with the config bound at its
        own real path, as `docker/run.sh` does.
+     - If the reason is `pre_registry_base`, the running router predates
+       `registry_dir`: each instance's state is kept under its name. The
+       upgrade is not transparent for it. Continue the activation, and take
+       A4's migration branch (below). Run that branch's dry run first, after
+       A1 and before this step's stop.
      - Only for `no_match`, `unmeasured`, `mixed` or `peer_lane` does the
        upgrade wait until its base is measured and recorded in
        `router-upgrade-bases.json` in a reviewed change. That moves the
@@ -898,7 +908,29 @@ reads as not running.
 4. **A3.** `python3 amap-sandy.py install --apply --activate <A2's run id>
    --activation-sha256 <A1's printed digest>`, then the root place it prints.
    Add A3's printed sha256 line to the same file, labelled.
-5. **A4.** `docker/run.sh --config <the live config> --detach`.
+5. **A4.** `docker/run.sh --config <the live config> --detach`. For a
+   pre-registry base (step 2's `pre_registry_base`), take the migration branch
+   below first, with the router still stopped.
+   **A4's migration branch (a pre-registry base only).** The router holds each
+   instance (`state_not_migrated`, then `legacy_state_unadopted`) until it is
+   migrated, places nothing for it, and loses nothing.
+   1. Before step 2's stop, after A1: run
+      `python3 -m router --config <the activated config> generation adopt <name> --reason <text> --dry-run`
+      for each instance, against the configuration A3 will place, and read
+      what it reports. If it cannot be run, or it reports anything but a
+      clean adoption, do not open the window.
+   2. In the window, after A3's place and with the router stopped: move each
+      instance's state directory to its logical id,
+      `mv <state_dir>/<name> <state_dir>/<logical_id>`, checking first that
+      the source exists and the target does not.
+   3. Run the same `generation adopt <name> --reason <text>` without
+      `--dry-run`, adding `--no-transport-history=N` when the command asks
+      for it (it does for a base that never had a transport).
+   4. Then A4, starting the router under the host-setup document's
+      `router.container` name: `docker/run.sh --config <the live config> --name <router.container> --detach`.
+   5. Only after A4's router runs and A5's preliminary check passes, remove
+      the old, stopped container by the Id step 2's file records:
+      `docker rm <that Id>`.
 6. **A5, preliminary.** `python3 amap-sandy.py partition-check --document <the
    unit argv's document> --document-sha256 <its sha256>`. Only V1 and V2 must
    PASS here. T1 FAILs until step 8 records a stop target (its remedy, "run
@@ -999,6 +1031,8 @@ removed.
 > LOST OR DROPPED BY THE STOP ITSELF: nothing.
 > C1: The local router installs no SIGTERM handler, so `docker stop` ends PID 1 at once, mid-poll if one is running. It is the same as a crash, and SIGKILL after docker's grace period is the same again. The router is built for this: every side effect is atomic and durable and passes through one crash seam, and recovery from a crash after any single write is a tested property. On restart the interrupted poll's work is redone or settled EXACTLY ONCE (idempotency anchors; a handed request is never re-handed under a new id).
 >
+> If the local router's state predates `registry_dir` (each instance's private state is kept under its name), a restart on a configuration that sets `registry_dir` does not drain that instance by itself. With the router stopped, move each instance's state directory to its logical id, then run `python3 -m router --config <config> generation adopt <name> --reason <text>`, adding `--no-transport-history=N` when the command asks for it. Until then the router holds the instance, places nothing for it, and loses nothing. The first-sight marker and the reply ledger carry over.
+>
 > DRAINS ON RESTART WITH NO OPERATOR STEP: yes.
 > - The kernel releases the drain lock when the process dies.
 > - First sight is a persisted marker, so a restart never re-snapshots or quarantines waiting requests.
@@ -1020,6 +1054,7 @@ removed.
 > - Plan target, NOT a cancellation point: the whole window, from `docker stop <router>` to A4's start of the router on the activated config (or the back-out's start on the unchanged config), is planned to close within 30 minutes. That is half of P's default 3600 s, leaving margin for clock skew and the first poll. Missing the target cancels nothing.
 > - Worst case: the window lasts until A2 exits plus the steps after it. No figure here caps it, and it can exceed P (P's default is 3600 s). However long it lasts, the only effect on the local router past P is the inbound clause above: waiting signed statements older than now - P are demoted, each with a notice to its sender, and none is dropped. Local delivery and hand-over simply wait, as C1 says. Nothing on disk is lost, and the restart drains with no operator step. The 7-day reply windows are the only later limit, and only an outage measured in days would reach them.
 > - If no peer signs tasks to this router before its own activation, the inbound clause has nothing to act on, and the window only bounds the local-delivery and hand-over outage C1 describes, however long A2 runs.
+> - For such a router, the window also includes that migration, after the stop and before A4's start. The effects past P are unchanged.
 
 `verify` passes the signing check only when the router
 signs exactly as the policy and the gate allow, under the token of current

@@ -5348,6 +5348,9 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--verify-image", metavar="FILE", help="check an image capture against --commit: EXACT (0), "
                                                              "DIFFERS (1) or UNKNOWN (2)")
     rfp.add_argument("--commit", help="the commit --verify-image checks against (the hop pin)")
+    rfp.add_argument("--container", help="with --step or --match: the running local router's container name, when it "
+                                         "is not yet the host-setup document's router.container (a router started "
+                                         "before activation)")
     rfp.add_argument("--spec", type=Path, default=None,
                      help="the host-setup document (default: the deployment overlay's host_setup section)")
     rfp.add_argument("--apply", action="store_true", help="capture and write the file (default: show)")

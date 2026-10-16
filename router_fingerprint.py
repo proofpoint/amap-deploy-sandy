@@ -54,6 +54,7 @@ import hygiene_gate as hg
 
 SCHEMA = "amap-deploy.router-fingerprint/1"
 BASES_NAME = "router-upgrade-bases.json"
+BASES_SCHEMA = 2
 BASES_PATH = Path(__file__).resolve().parent / BASES_NAME
 
 MEASURED, UNMEASURED, UNKNOWN = "MEASURED", "UNMEASURED", "UNKNOWN"
@@ -750,11 +751,15 @@ def _bases(bases_bytes: bytes, pin: str) -> Tuple[Optional[Dict[str, Any]], Opti
         b = json.loads(bases_bytes)
     except ValueError:
         return None, _unknown("bases_schema", f"{BASES_NAME} is not JSON")
-    keys = {"schema", "target", "measured_from", "property", "peer_lane", "premises", "measured_by"}
+    keys = {"schema", "target", "measured_from", "property", "peer_lane", "premises", "measured_by", "pre_registry"}
     if not isinstance(b, dict) or set(b) != keys:
         return None, _unknown("bases_schema", f"{BASES_NAME} does not have exactly the members {sorted(keys)}")
-    if not _is_int(b["schema"]) or b["schema"] != 1:
-        return None, _unknown("bases_schema", f"{BASES_NAME}'s schema is not 1")
+    if not _is_int(b["schema"]) or b["schema"] != BASES_SCHEMA:
+        return None, _unknown("bases_schema", f"{BASES_NAME}'s schema is not {BASES_SCHEMA}")
+    pre = b["pre_registry"]
+    if (not isinstance(pre, dict) or set(pre) != {"before", "statement"} or not isinstance(pre["before"], str)
+            or not _HEX40.fullmatch(pre["before"]) or not isinstance(pre["statement"], str)):
+        return None, _unknown("bases_schema", f"{BASES_NAME}'s pre_registry is not {{before: 40-hex, statement}}")
     if not all(isinstance(b[k], str) and _HEX40.fullmatch(b[k]) for k in ("target", "measured_from")):
         return None, _unknown("bases_schema", f"{BASES_NAME}'s target and measured_from are not 40-hex")
     if not all(isinstance(b[k], str) for k in ("property", "peer_lane", "premises", "measured_by")):
@@ -828,6 +833,13 @@ def _match(capture_bytes: bytes, bases_bytes: bytes, history: Any, pin: str,
         return _unknown("history_root", "the history's first-parent chain does not start at target")
     if mfrom not in fp:
         return _unknown("off_chain", "measured_from is not on target's first-parent chain")
+    before = bases["pre_registry"]["before"]
+    if before not in fp:
+        return _unknown("pre_registry_off_chain", "the bases file's pre_registry.before is not on target's "
+                        "first-parent chain")
+    if fp.index(before) <= fp.index(mfrom):
+        return _unknown("pre_registry_order", "the bases file's pre_registry.before is not older than "
+                        "measured_from")
     # 4. The domains.
     measured = set(fp[:fp.index(mfrom) + 1])
     # 5. The match.
@@ -837,6 +849,10 @@ def _match(capture_bytes: bytes, bases_bytes: bytes, history: Any, pin: str,
         return _unknown("no_match", "the running router's source is no commit on the pin's first-parent chain")
     if not set(m) <= measured:
         if not set(m) & measured:
+            if all(fp.index(c) > fp.index(before) for c in m):
+                return _out(UNMEASURED, "pre_registry_base", "pre-registry base: migration required. The running "
+                            "router predates registry_dir; do not upgrade it transparently. Take the runbook's "
+                            "A4 migration branch: " + ", ".join(m))
             return _out(UNMEASURED, "unmeasured", "the running router is older than the measured range: "
                         + ", ".join(m))
         return _unknown("mixed", "the running router's source matches commits both inside and outside the "
@@ -1315,13 +1331,14 @@ def _run(args: Any, *, out: Callable[[str], None], git: Optional[str], runner: R
     if spec.router is None:
         out("router-fingerprint: the host-setup document has no router section")
         return EXIT[UNKNOWN]
+    name = getattr(args, "container", None) or spec.router.container
     if not args.apply:
-        out(f"would run: {' '.join(docker)} inspect {spec.router.container}; image inspect <its Image>; exec "
+        out(f"would run: {' '.join(docker)} inspect {name}; image inspect <its Image>; exec "
             f"<its Id> python3 -I -S -c PROGRAM running; inspect again; and write "
             f"router-fingerprint-{args.step}-<at>.json into {spec.secrets.run_dir} (dry run; --apply to capture)")
         return 0
     try:
-        doc = capture_running(docker, spec.router.container, args.step, run=runner)
+        doc = capture_running(docker, name, args.step, run=runner)
     except CaptureError as e:
         out(f"router-fingerprint: {e}")
         return EXIT[UNKNOWN]
@@ -1364,7 +1381,8 @@ def _run_match(args: Any, spec: Any, out: Callable[[str], None], git: str, hp: A
     if dirty:
         return _show(_unknown("bases_dirty", dirty), out)
     name = json.loads(capture)["container"]["name"]
-    if spec.router is None or not container_name_ok(name, spec.router.container):
+    expected = getattr(args, "container", None) or (spec.router.container if spec.router is not None else None)
+    if expected is None or not container_name_ok(name, expected):
         return _show(_unknown("container_name", f"the capture is of {name!r}, not of the router container"), out)
     b = json.loads(bases)
     try:

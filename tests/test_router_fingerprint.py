@@ -88,9 +88,13 @@ def history(trees=None, fp=None, types=None):
             "first_parent": fp, "trees": {c: trees[c] for c in fp}}
 
 
-def bases(target=TARGET, measured_from=FROM, **ov):
+def bases(target=TARGET, measured_from=FROM, before=None, **ov):
+    """The repository's bases file, with the synthetic (or a fixture's) ids.
+    pre_registry.before defaults to the synthetic chain's oldest commit, so
+    no synthetic commit is a pre-registry base unless a row says so."""
     doc = json.loads(rf.BASES_PATH.read_text(encoding="utf-8"))
     doc.update(target=target, measured_from=measured_from, **ov)
+    doc["pre_registry"] = dict(doc["pre_registry"], before=before or C[6])
     return json.dumps(doc).encode()
 
 
@@ -189,6 +193,29 @@ class DomainRows(Outcome):
         for c in (C[4], C[6]):
             with self.subTest(commit=c):
                 self.assertGate(gate(capture(TREE[c])), rf.UNMEASURED, "unmeasured")
+
+    def test_a_base_older_than_pre_registry_before_is_a_pre_registry_base(self):
+        """before = c5: c6 predates registry_dir, so it is sent to the
+        migration branch; c5 itself and c4 stay `unmeasured`."""
+        bb = bases(before=C[5])
+        self.assertGate(rf.match(b(capture(TREE[C[6]])), bb, H, TARGET, PLUGIN), rf.UNMEASURED, "pre_registry_base")
+        for c in (C[4], C[5]):
+            with self.subTest(commit=c):
+                self.assertGate(rf.match(b(capture(TREE[c])), bb, H, TARGET, PLUGIN), rf.UNMEASURED, "unmeasured")
+
+    def test_a_class_on_both_sides_of_before_stays_unmeasured(self):
+        trees = {c: {"router": router(i), "entrypoint": ENTRY} for i, c in enumerate(C)}
+        trees[C[6]]["router"] = copy.deepcopy(trees[C[4]]["router"])
+        got = rf.match(b(capture(trees[C[4]])), bases(before=C[5]), history(trees), TARGET, PLUGIN)
+        self.assertGate(got, rf.UNMEASURED, "unmeasured")
+
+    def test_pre_registry_before_off_the_chain_or_too_new(self):
+        self.assertGate(gate(capture(TREE[C[1]]), bases_bytes=bases(before=oid("elsewhere"))), rf.UNKNOWN,
+                        "pre_registry_off_chain")
+        for before in (C[2], FROM):
+            with self.subTest(before=before):
+                self.assertGate(gate(capture(TREE[C[1]]), bases_bytes=bases(before=before)), rf.UNKNOWN,
+                                "pre_registry_order")
 
     def test_a_class_straddling_the_boundary_is_mixed(self):
         trees = {c: {"router": router(i), "entrypoint": ENTRY} for i, c in enumerate(C)}
@@ -377,7 +404,7 @@ class BasesAndHistoryRows(Outcome):
 
     def test_each_bases_schema_defect(self):
         doc = json.loads(bases())
-        defects = {"not JSON": b"{", "schema 2": bases(schema=2), "schema true": bases(schema=True),
+        defects = {"not JSON": b"{", "schema 1": bases(schema=1), "schema 3": bases(schema=3), "schema true": bases(schema=True),
                    "short target": bases(target=TARGET[:39]), "an extra key": bases(extra="x")}
         for key in ("premises", "peer_lane"):
             d = dict(doc)
@@ -797,6 +824,17 @@ class RealHistory(Outcome):
                 self.assertGate(rf.match(b(self.real_capture(c)), bases_bytes, self.h, REAL_TARGET, PLUGIN),
                                 rf.MEASURED, "measured")
 
+    def test_a_base_older_than_registry_dir_is_a_pre_registry_base(self):
+        """The real chain: a84e0d98 is the first commit whose router config
+        has registry_dir; a capture of 9854a5e8, older, is sent to the
+        migration branch."""
+        bases_bytes = rf.BASES_PATH.read_bytes()
+        fp = self.h["first_parent"]
+        old = next(c for c in fp if c.startswith("9854a5e8"))
+        got = rf.match(b(self.real_capture(old)), bases_bytes, self.h, REAL_TARGET, PLUGIN)
+        self.assertGate(got, rf.UNMEASURED, "pre_registry_base")
+        self.assertIn("migration required", got[3])
+
     def test_below_the_range_is_unmeasured(self):
         bases_bytes = rf.BASES_PATH.read_bytes()
         c = self.h["first_parent"][12]
@@ -1184,9 +1222,9 @@ class HistoryGatedRows(Outcome):
         (repo.path / ".git" / "info" / "grafts").write_text(f"{repo.commits[3]} {y}\n")
         ych = read_or_fail(self, repo.path, y, y)
         d = capture(ych["trees"][y])
-        h = read_or_fail(self, repo.path, repo.head(), repo.commits[0])
-        self.assertGate(rf.match(b(d), bases(repo.head(), repo.commits[0]), h, repo.head(), PLUGIN),
-                        rf.UNKNOWN, "no_match")
+        h = read_or_fail(self, repo.path, repo.head(), repo.commits[1])
+        self.assertGate(rf.match(b(d), bases(repo.head(), repo.commits[1], before=repo.commits[0]), h, repo.head(),
+                                 PLUGIN), rf.UNKNOWN, "no_match")
 
     def test_the_parent_reader_seam_synthetic(self):
         """SYNTHETIC, reduced scope: this test's OWN environment removes
@@ -1208,7 +1246,8 @@ class HistoryGatedRows(Outcome):
         rf.hg.git_env = lambda: {k: v for k, v in real().items() if k != "GIT_GRAFT_FILE"}
         d = capture(read_or_fail(self, repo.path, y, y)["trees"][y])
         h = read_or_fail(self, repo.path, repo.head(), repo.commits[2])
-        self.assertGate(rf.match(b(d), bases(repo.head(), repo.commits[2]), h, repo.head(), PLUGIN),
+        self.assertGate(rf.match(b(d), bases(repo.head(), repo.commits[2], before=repo.commits[1]), h, repo.head(),
+                                 PLUGIN),
                         rf.UNKNOWN, "no_match")
 
     def test_a_replace_graft_does_not_reach_the_gate(self):
@@ -1221,9 +1260,9 @@ class HistoryGatedRows(Outcome):
         _git(repo.path, "reset", "-q", "--hard")
         _git(repo.path, "replace", "--graft", repo.commits[3], y)
         d = capture(read_or_fail(self, repo.path, y, y)["trees"][y])
-        h = read_or_fail(self, repo.path, repo.head(), repo.commits[0])
-        self.assertGate(rf.match(b(d), bases(repo.head(), repo.commits[0]), h, repo.head(), PLUGIN),
-                        rf.UNKNOWN, "no_match")
+        h = read_or_fail(self, repo.path, repo.head(), repo.commits[1])
+        self.assertGate(rf.match(b(d), bases(repo.head(), repo.commits[1], before=repo.commits[0]), h, repo.head(),
+                                 PLUGIN), rf.UNKNOWN, "no_match")
 
 
 # --- PROGRAM ----------------------------------------------------------------------
@@ -1619,6 +1658,13 @@ class CaptureVerb(unittest.TestCase):
                 self.assertEqual(rf.run(self.args(step=2, apply=True), out=lambda s: None, runner=eng), 2)
                 self.assertEqual(list(self.run_dir.iterdir()), [])
 
+    def test_container_names_the_router_started_before_activation(self):
+        eng = Engine(self.result)
+        self.assertEqual(rf.run(self.args(step=2, apply=True, container="amap-router-local"), out=lambda s: None,
+                                runner=eng), 0)
+        self.assertEqual(eng.calls[0][1:], ["inspect", "amap-router-local"])
+        self.assertEqual(eng.calls[3][1:], ["inspect", "f" * 64])
+
     def test_an_image_capture_runs_by_the_inspected_id(self):
         eng = Engine(capture(TREE[C[1]], source="image")["result"])
         self.assertEqual(rf.run(self.args(image="example.org/rl:pin", apply=True), out=lambda s: None,
@@ -1647,7 +1693,7 @@ class MatchVerb(Outcome):
         rf.bases_dirty = lambda *a, **k: None
         self.h = read_or_fail(self, HOP, REAL_TARGET, REAL_FROM)
 
-    def cli(self, capture_doc, bases_bytes=None, git=GIT):
+    def cli(self, capture_doc, bases_bytes=None, git=GIT, container=None):
         real_bases = rf.BASES_PATH
         self.addCleanup(setattr, rf, "BASES_PATH", real_bases)
         if bases_bytes is not None:
@@ -1658,7 +1704,7 @@ class MatchVerb(Outcome):
         f.write_bytes(b(capture_doc))
         lines = []
         args = SimpleNamespace(verify_image=None, match=str(f), image=None, step=None, apply=False, commit=None,
-                               spec=None, overlay=None)
+                               spec=None, overlay=None, container=container)
         code = rf.run(args, out=lines.append, git=git)
         return code, lines
 
@@ -1674,6 +1720,14 @@ class MatchVerb(Outcome):
         rf.bases_dirty = lambda *a, **k: "router-upgrade-bases.json is modified in the deploy checkout"
         code, lines = self.cli(capture(self.h["trees"][REAL_TARGET]))
         self.assertEqual((code, lines[-1].split(":")[0]), (2, "UNKNOWN bases_dirty"))
+
+    def test_container_names_the_router_the_capture_was_of(self):
+        d = capture(self.h["trees"][REAL_TARGET])
+        d["container"]["name"] = "/amap-router-local"
+        code, lines = self.cli(d)
+        self.assertEqual((code, lines[-1].split(":")[0]), (2, "UNKNOWN container_name"))
+        code, lines = self.cli(d, container="amap-router-local")
+        self.assertEqual(code, 0, lines[-1])
 
     def test_another_container(self):
         d = capture(self.h["trees"][REAL_TARGET])
@@ -1718,7 +1772,7 @@ class MatchVerbNoHop(Outcome):
         real_bases = rf.BASES_PATH
         self.addCleanup(setattr, rf, "BASES_PATH", real_bases)
         doc = json.loads(rf.BASES_PATH.read_bytes())
-        doc["schema"] = 2
+        doc["schema"] = 3
         rf.BASES_PATH = self.base / "bases.json"
         rf.BASES_PATH.write_text(json.dumps(doc))
         f = self.base / "cap.json"
@@ -1870,6 +1924,16 @@ class BasesDirty(unittest.TestCase):
 
 
 class Pins(unittest.TestCase):
+
+    def test_pre_registry_before_is_where_registry_dir_lands(self):
+        """Measured on the hop checkout: the first first-parent commit whose
+        router/config.py names registry_dir, and the one below it does not."""
+        before = json.loads(rf.BASES_PATH.read_bytes())["pre_registry"]["before"]
+        self.assertEqual(before, "a84e0d986e96460a4c1ad0563675fbf32c6a104f")
+        show = lambda c: subprocess.run([GIT, "-C", HOP, "show", c + ":router/config.py"], capture_output=True,
+                                        text=True).stdout
+        self.assertIn('"registry_dir"', show(before))
+        self.assertNotIn('"registry_dir"', show(before + "^"))
 
     def test_the_bases_target_is_the_hop_pin(self):
         doc = json.loads(rf.BASES_PATH.read_bytes())
