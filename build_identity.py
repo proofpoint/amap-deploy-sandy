@@ -314,6 +314,50 @@ def read_status(live: Any, state_dir: str, who: str,
     return doc
 
 
+def state_sharers(docker: List[str], state_dir: str, own_id: Any,
+                  run: Optional[Callable[..., rh.Proc]] = None) -> Any:
+    """The Ids of every OTHER container, in any state, with a mount whose
+    source is `state_dir` or a directory above it, so that it could have
+    written the status document there: a list (empty when none), or an
+    Unresolved. The router's lock keeps two routers from running at once,
+    not one from running after another, so a stopped container that shares
+    the directory may have left the document there. Read after the status
+    document: a container created later cannot have written it."""
+    run = run or rh.run
+    try:
+        p = run(docker + ["ps", "-a", "-q", "--no-trunc"])
+    except rh.CannotRun as e:
+        return rh.Unresolved(str(e))
+    if p.rc != 0:
+        return rh.Unresolved(f"docker ps -a exited {p.rc}, so the containers sharing {state_dir} cannot be listed")
+    ids = [i for i in p.out.split() if i != own_id]
+    if not ids:
+        return []
+    try:
+        q = run(docker + ["inspect", "--type", "container"] + ids)
+    except rh.CannotRun as e:
+        return rh.Unresolved(str(e))
+    try:
+        docs = json.loads(q.out) if q.rc == 0 else None
+    except ValueError:
+        docs = None
+    if not isinstance(docs, list) or len(docs) != len(ids):
+        return rh.Unresolved(f"the other containers cannot all be inspected, so the ones sharing {state_dir} "
+                             "cannot be ruled out")
+    sharers = []
+    for doc in docs:
+        mounts = (doc.get("Mounts") or []) if isinstance(doc, dict) else None
+        if not isinstance(mounts, list):
+            return rh.Unresolved(f"docker inspect shows no mounts for a container, so it cannot be ruled out "
+                                 f"as sharing {state_dir}")
+        for m in mounts:
+            src = m.get("Source") if isinstance(m, dict) else None
+            if isinstance(src, str) and (src == state_dir or state_dir.startswith(src.rstrip("/") + "/")):
+                sharers.append(doc.get("Id"))
+                break
+    return sharers
+
+
 def _read_nofollow(path: str) -> bytes:
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     with os.fdopen(fd, "rb") as f:
@@ -336,9 +380,10 @@ def hop_plugin(role: str, container: str, before: Any, published: Any, after: An
     removed, so before `Created`; an earlier run of this container started
     before it exited, so before `FinishedAt`. StartedAt is NOT the bound:
     the engine records it after the task starts, so the current process can
-    precede it. Two routers never share a state directory (the router's own
-    lock). A whole-second or missing start cannot separate the two and is
-    UNKNOWN. Nothing read host-side about the plugin file is evidence of
+    precede it. Both hold only for one container's processes: the reader
+    refuses a document from a directory another container, in any state,
+    also mounts (state_sharers). A whole-second or missing start cannot
+    separate the two and is UNKNOWN. Nothing read host-side about the plugin file is evidence of
     what was loaded."""
     who = f"[{1 if role == ROLE_HOP else 2}] ({container})"
     claim = f"the transport plugin {who} loaded is the pinned overlay"

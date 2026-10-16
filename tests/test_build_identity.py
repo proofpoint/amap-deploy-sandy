@@ -539,6 +539,27 @@ class DockerReadersTest(unittest.TestCase):
         self.assertEqual(calls[0][:3], ["docker", "image", "inspect"])
         self.assertEqual(calls[0][-1], DIGEST)
 
+    def test_state_sharers_excludes_the_container_itself_and_lists_the_rest(self):
+        own, other = "1" * 64, "2" * 64
+        sd = "/zz/state"
+        docs = [{"Id": other, "Mounts": [{"Source": "/zz", "Destination": "/zz"}]}]
+        run, calls = self.runner((0, f"{own}\n{other}\n", ""), (0, json.dumps(docs), ""))
+        self.assertEqual(bi.state_sharers(["docker"], sd, own, run), [other])
+        self.assertEqual(calls[0], ["docker", "ps", "-a", "-q", "--no-trunc"])
+        self.assertEqual(calls[1], ["docker", "inspect", "--type", "container", other])
+
+    def test_state_sharers_with_only_the_container_itself_is_empty(self):
+        run, calls = self.runner((0, "1" * 64 + "\n", ""))
+        self.assertEqual(bi.state_sharers(["docker"], "/zz/state", "1" * 64, run), [])
+        self.assertEqual(len(calls), 1)
+
+    def test_state_sharers_that_cannot_all_be_inspected_are_unknown(self):
+        for second in ((1, "", "No such container"), (0, "[]", ""), (0, "not json", ""),
+                       (0, json.dumps([{"Id": "2" * 64, "Mounts": "x"}]), "")):
+            with self.subTest(second=second):
+                run, _ = self.runner((0, "2" * 64 + "\n", ""), second)
+                self.assertIsInstance(bi.state_sharers(["docker"], "/zz/state", "1" * 64, run), rh.Unresolved)
+
     def test_an_image_without_labels_has_none(self):
         run, _ = self.runner((0, "null", ""))
         self.assertEqual(bi.image_labels(["docker"], DIGEST, run), {})
@@ -627,19 +648,30 @@ class InstallAndVerifyTest(unittest.TestCase):
         return json.dumps({"started_ts": began[:19] + "Z", "process_started_ts": began, "polls": 4,
                            "transport_plugin": {"path": "/zz/overlay/plugin.py", "sha256": sha}})
 
-    def hop_outcome(self, on_disk, written_on_first_inspect=None):
+    def hop_outcome(self, on_disk, written_on_first_inspect=None, others=(), ps_rc=0):
         """build_identity_outcome on a hop host whose [1] mounts its state
         directory by identity; `on_disk` is status.json when verify starts,
         and the router rewrites it with `written_on_first_inspect` as the
-        first inspect runs. `self.events` records inspects and reads."""
+        first inspect runs. `others` are the engine's other containers, as
+        `others(sd)` builds them; `docker ps -a` lists them after [1].
+        `self.events` records [1]'s inspects, the read, the listing and the
+        other containers' inspect."""
         sd = os.path.realpath(self.home / "state")
         os.makedirs(sd)
         status = os.path.join(sd, bi.STATUS_NAME)
         Path(status).write_text(on_disk)
         live = container(mounts=[{"Type": "bind", "Source": sd, "Destination": sd, "RW": True}])
+        other_docs = [o(sd) for o in others]
         self.events = []
 
         def run(argv, **k):
+            if "ps" in argv:
+                self.events.append("ps")
+                ids = [live["Id"]] + [o["Id"] for o in other_docs]
+                return rh.Proc(tuple(argv), ps_rc, "\n".join(ids) + "\n", "")
+            if argv[-1] != "zz-r1":
+                self.events.append("others")
+                return rh.Proc(tuple(argv), 0, json.dumps(other_docs), "")
             self.events.append("inspect")
             if written_on_first_inspect is not None and self.events.count("inspect") == 1:
                 Path(status).write_text(written_on_first_inspect)
@@ -675,7 +707,48 @@ class InstallAndVerifyTest(unittest.TestCase):
         c, e = self.hop_outcome(self.status_doc("2026-10-15T09:59:58.000000Z", sha="a" * 64),
                                 written_on_first_inspect=self.status_doc("2026-10-15T10:00:00.050000Z"))
         self.assertEqual((c.result, e.get("observed_sha256")), (rh.PASS, "c" * 64))
-        self.assertEqual(self.events, ["inspect", "read", "inspect"])
+        self.assertEqual(self.events, ["inspect", "read", "ps", "inspect"])
+
+    @staticmethod
+    def sibling(source, cid="a" * 64, running=False):
+        """Another container, in the engine's own inspect shape, with one
+        bind mount from `source(sd)`."""
+        def build(sd):
+            src = source(sd)
+            return container(cid=cid, running=running, status="running" if running else "exited",
+                             mounts=[{"Type": "bind", "Source": src, "Destination": src, "RW": True}])
+        return build
+
+    def test_a_stopped_container_sharing_the_state_directory_is_unknown(self):
+        """HAR's trace: B is created at 09:59:59.9 and never run before; A,
+        mounting the same state directory, ran after that, wrote its
+        document and stopped; B starts and verify runs before B's first
+        poll. A's process start is after B's Created, so only the sharing
+        check refuses it."""
+        c, e = self.hop_outcome(self.status_doc("2026-10-15T10:00:00.030000Z", sha="a" * 64),
+                                others=[self.sibling(lambda sd: sd)])
+        self.assertEqual(c.result, rh.UNKNOWN)
+        self.assertIn("another container shares [1] (zz-r1)'s state directory", c.reason)
+        self.assertNotIn("observed_sha256", e)
+        self.assertEqual(self.events, ["inspect", "read", "ps", "others", "inspect"])
+
+    def test_a_container_mounting_a_directory_above_the_state_directory_shares_it(self):
+        c, _ = self.hop_outcome(self.status_doc("2026-10-15T10:00:00.050000Z"),
+                                others=[self.sibling(lambda sd: os.path.dirname(sd))])
+        self.assertEqual(c.result, rh.UNKNOWN)
+
+    def test_containers_mounting_elsewhere_do_not_share_it(self):
+        """Beside it, below it, or a path that only starts with the same
+        letters: none can write status.json in the state directory."""
+        others = [self.sibling(lambda sd: sd + "-other", cid="b" * 64),
+                  self.sibling(lambda sd: os.path.join(sd, "sub"), cid="e" * 64, running=True),
+                  self.sibling(lambda sd: sd[:-2], cid="f" * 64)]
+        c, e = self.hop_outcome(self.status_doc("2026-10-15T10:00:00.050000Z"), others=others)
+        self.assertEqual((c.result, e.get("observed_sha256")), (rh.PASS, "c" * 64))
+
+    def test_containers_that_cannot_be_listed_are_unknown(self):
+        c, _ = self.hop_outcome(self.status_doc("2026-10-15T10:00:00.050000Z"), ps_rc=1)
+        self.assertEqual(c.result, rh.UNKNOWN)
 
     def test_the_hub_router_has_no_status_reader_so_its_plugin_is_not_published(self):
         spec = self.hub_spec()

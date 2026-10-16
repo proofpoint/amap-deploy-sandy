@@ -3801,7 +3801,8 @@ def build_identity_outcome(args: argparse.Namespace, home: Path) -> rh.Outcome:
     """verify's "runtime builds" phase (build_identity): each runtime's build
     against what the deployment recorded and siblings.json pins. [1]'s status
     document is read fresh, inside the inspect bracket, from the state
-    directory the inspected container mounts; [2]'s router has no reader
+    directory the inspected container mounts, and then no other container,
+    in any state, may mount that directory; [2]'s router has no reader
     here, so its plugin claim says the digest is not published."""
     spec = _builds_spec(ha.overlay_path(getattr(args, "overlay", None)))
     hub_docker = hsu.ss.docker(spec.secrets) if not isinstance(spec, rh.Unresolved) and spec is not None \
@@ -3814,7 +3815,15 @@ def build_identity_outcome(args: argparse.Namespace, home: Path) -> rh.Outcome:
         if role != bi.ROLE_HOP:
             return None
         state_dir = str(sibling_state_dir(home, getattr(args, "state_dir", None)))
-        return bi.read_status(live, state_dir, f"[1] ({name})")
+        who = f"[1] ({name})"
+        doc = bi.read_status(live, state_dir, who)
+        others = bi.state_sharers(["docker"], state_dir, live.get("Id"))
+        if isinstance(others, rh.Unresolved):
+            return others
+        if others:
+            return rh.Unresolved(f"another container shares {who}'s state directory {state_dir} "
+                                 f"({', '.join(str(i)[:12] for i in others)}), so the status document may be its")
+        return doc
 
     try:
         connector = cpin.pinned_commit()
