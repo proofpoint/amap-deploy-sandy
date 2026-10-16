@@ -75,6 +75,18 @@ class ProbeTest(unittest.TestCase):
         self.assertEqual({p["id"]: p for p in probes}, want)
         self.assertEqual(code, 0, report)
 
+    def test_a_role_outside_the_vocabulary_runs_no_probe(self):
+        """partition_probe.run's other precondition: refused before any
+        exec, run or lstat."""
+        looked = []
+        self.addCleanup(setattr, pe, "role_ok", pe.role_ok)
+        pe.role_ok = lambda r: not r.startswith("marker:")
+        self.engine.seen.clear()
+        probes, code, report = ppa.probe(self.plan(), pp.Runner(["docker"], self.engine), hr.argv,
+                                         lambda q: looked.append(q))
+        self.assertEqual((probes, code, self.engine.seen, looked), ([], 2, [], []), report)
+        self.assertIn("is outside the evidence vocabulary", report[0])
+
 
 class EvidenceIgnoresItTest(Host):
     """A placed post-activation document is never what E1 and E2 judge."""
@@ -147,6 +159,7 @@ class RefusalTest(Host):
         runner, calls = self.engine(None)
         rc, said, written, _ = self.verb(runner=runner, read_lanes=lambda q: b"not json")
         self.assertEqual((rc, written), (2, ["document.json"]), said)
+        self.assertFalse([c for c in calls if c[:1] in (["run"], ["exec"])])
 
     def test_each_refusal(self):
         def unissued():

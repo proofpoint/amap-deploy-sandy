@@ -739,13 +739,19 @@ is required before the next, and each command prints the next step.
    document and the hub-link router's run spec. Anything that changes either
    after activation makes them stale.
    1. Move the deployment to its final deploy commit
-      (`secrets.clones.deploy.sha`), and re-render the approved host-setup
-      document for it.
-   2. Build the hub-link router's image, update `secrets.image`, run the hub
-      key probe, and start the hub-link router on that image.
-   3. Provision the weekly job's bundle once, at that deploy commit (its PIN
+      (`secrets.clones.deploy.sha`).
+   2. Build the hub-link router's image and update `secrets.image`.
+   3. Approve and anchor the host-setup document, and render the unit, ONCE,
+      now: steps 1 and 2 both change the document.
+   4. Run the hub key probe, and start the hub-link router on that image.
+   5. Provision the weekly job's bundle once, at that deploy commit (its PIN
       is that commit, so the weekly job hands off until it is provisioned).
-   4. Only then begin A1.
+   6. Only then begin A1.
+
+   `secrets.writer.commit` stays at its reviewed commit. The writer's pin is
+   the sha256 of `host_steps.py`, not the deploy commit: a deploy commit that
+   leaves `host_steps.py` unchanged leaves the writer as it is, so do not
+   "update" `secrets.writer.commit` to the deploy commit.
 
    Generate the signing key as the operator; the one root command installs
    the 32-byte seed:
