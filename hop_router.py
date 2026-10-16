@@ -21,8 +21,9 @@ router's, the hop plugin's and the email router's owners):
 The host-setup document's `router` section names, all operator data:
 - `image`: `name`, `digest` and `commit`, the router image the operator
   built. `digest` is the image's ID (`docker image inspect --format
-  '{{.Id}}'`, `sha256:<64 hex>`): a local build has no registry digest, and
-  the running container's `.Image` is that ID. The name is never the
+  '{{.Id}}'`, `sha256:<64 hex>`), the engine's content-addressed image Id:
+  the config digest on the classic image store, the manifest (list) digest
+  on the containerd store. The running container's `.Image` is that ID. The name is never the
   factory router's own default tag, and the commit is the one the image was
   built from, which must be the deployment's hop pin (siblings.json's
   `amap-router-local-hop` entry): a recorded-commit check, not a label rule;

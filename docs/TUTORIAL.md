@@ -680,8 +680,9 @@ router.json `install` renders. Two inputs turn them on, and both are needed:
 Build the local router's image from the hop checkout (`siblings.json`'s
 `amap-router-local-hop` entry), under a name other than the factory
 default. Record its image ID as the `digest` (`docker image inspect
---format '{{.Id}}' <name>`: a local build has no registry digest), and the
-commit it was built from. Then:
+--format '{{.Id}}' <name>`, the engine's content-addressed image Id: the
+config digest on the classic image store, the manifest (list) digest on the
+containerd store), and the commit it was built from. Then:
 
 ```sh
 python3 amap-sandy.py install --apply

@@ -88,10 +88,11 @@ PROBE_CLASSES_NOT_FAILURES = ("ok", "engine_unavailable", "hub_unreachable", "tl
 _HEX40 = re.compile(r"[0-9a-f]{40}")
 _HEX64 = re.compile(r"[0-9a-f]{64}")
 #: The runtime image, content-addressed: a name by its manifest digest, or a
-#: locally built image by its Id (the sha256 of its config, which binds its
-#: layers), as `docker image inspect` prints it. Either is passed to docker
-#: verbatim, and hub_runtime.compare holds the container's Config.Image to
-#: the same string.
+#: locally built image by its Id as `docker image inspect` prints it, the
+#: engine's content-addressed image Id: the config digest on the classic image
+#: store, the manifest (list) digest on the containerd store. Either is passed
+#: to docker verbatim, and hub_runtime.compare holds the container's
+#: Config.Image to the same string.
 _IMAGE = re.compile(r"[a-z0-9][a-z0-9._/:-]*@sha256:[0-9a-f]{64}|sha256:[0-9a-f]{64}")
 _LABEL = re.compile(r"[a-z0-9][a-z0-9._-]*=[A-Za-z0-9._-]+")
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
