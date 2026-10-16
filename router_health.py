@@ -49,6 +49,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -276,7 +277,8 @@ class Proc:
 
 
 def run(argv: Sequence[str], *, cwd: Optional[Path] = None,
-        timeout: int = DEFAULT_TIMEOUT, extra_env: Optional[Dict[str, str]] = None) -> Proc:
+        timeout: float = DEFAULT_TIMEOUT, extra_env: Optional[Dict[str, str]] = None,
+        max_output: Optional[int] = None) -> Proc:
     """The ONLY way this module starts a child process.
 
     * never `shell=True`, and never a pipe: `a | grep X` reports GREP's exit
@@ -287,19 +289,65 @@ def run(argv: Sequence[str], *, cwd: Optional[Path] = None,
     * always a timeout. `docker logs -f` blocks forever.
     * FileNotFoundError is a NAMED failure, not a traceback: a missing
       docker CLI raises rather than exiting non-zero.
+    * output is captured as bytes and decoded with replacement, so a child
+      that prints undecodable bytes never raises here. Newlines are passed
+      through as the child wrote them ("\\r\\n" stays "\\r\\n"); callers split
+      with splitlines() or strip().
+    * with `max_output`, stdout and stderr together are bounded: past that
+      many bytes the child is killed and CannotRun raised, so a child cannot
+      make the caller read without limit.
     """
     env = dict(os.environ)
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     if extra_env:
         env.update(extra_env)
+    if max_output is not None:
+        return _run_bounded(list(argv), cwd, timeout, env, max_output)
     try:
-        r = subprocess.run(list(argv), capture_output=True, text=True,
+        r = subprocess.run(list(argv), capture_output=True,
                            cwd=str(cwd) if cwd else None, timeout=timeout, env=env)
     except FileNotFoundError:
         raise CannotRun(f"{argv[0]} not found on PATH")
     except subprocess.TimeoutExpired:
         raise CannotRun(f"{argv[0]} did not finish within {timeout}s: {' '.join(argv)}")
-    return Proc(tuple(argv), r.returncode, r.stdout or "", r.stderr or "")
+    return Proc(tuple(argv), r.returncode, _text(r.stdout), _text(r.stderr))
+
+
+def _text(b: Optional[bytes]) -> str:
+    return (b or b"").decode("utf-8", errors="replace")
+
+
+#: How often a bounded run looks at its child's output and clock.
+_BOUNDED_POLL_S = 0.05
+
+
+def _run_bounded(argv: List[str], cwd: Optional[Path], timeout: float, env: Dict[str, str],
+                 max_output: int) -> Proc:
+    """run() with stdout and stderr in private temporary files, watched as
+    the child runs: past `max_output` bytes together, or past `timeout`, the
+    child is killed and CannotRun raised."""
+    with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
+        try:
+            child = subprocess.Popen(argv, stdout=out, stderr=err, cwd=str(cwd) if cwd else None, env=env)
+        except FileNotFoundError:
+            raise CannotRun(f"{argv[0]} not found on PATH")
+        deadline = time.monotonic() + timeout
+        try:
+            while child.poll() is None:
+                if os.fstat(out.fileno()).st_size + os.fstat(err.fileno()).st_size > max_output:
+                    raise CannotRun(f"{argv[0]} printed more than {max_output} bytes: {' '.join(argv)}")
+                if time.monotonic() >= deadline:
+                    raise CannotRun(f"{argv[0]} did not finish within {timeout}s: {' '.join(argv)}")
+                time.sleep(_BOUNDED_POLL_S)
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait()
+        if os.fstat(out.fileno()).st_size + os.fstat(err.fileno()).st_size > max_output:
+            raise CannotRun(f"{argv[0]} printed more than {max_output} bytes: {' '.join(argv)}")
+        out.seek(0)
+        err.seek(0)
+        return Proc(tuple(argv), child.returncode, _text(out.read(max_output + 1)), _text(err.read(max_output + 1)))
 
 
 def oneshot_name(section: str) -> str:

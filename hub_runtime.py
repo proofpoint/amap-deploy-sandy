@@ -300,9 +300,13 @@ def load(sec: Any, spec: Any) -> HubSpec:
 # --- The rendering --------------------------------------------------------------
 
 
-def _in_container(spec: Any, principal: str, host: str) -> str:
-    """Where `host` is seen inside the principal's runtime, through its
-    declared mounts; a path no mount holds refuses."""
+def mount_holding(spec: Any, principal: str, host: str) -> Dict[str, Any]:
+    """The `spec.mounts` entry of `principal` that holds `host`: its `host`
+    is `host`, or a prefix followed by "/"; the longest such, the first in
+    document order on a tie. Raises when none holds it, and when the chosen
+    entry's host is "/" or not in normal form, because the suffix arithmetic
+    `host[len(m["host"]):]` is right only for a normalised root other than
+    "/" ("/c" + "/a/b"[len("/"):] would be "/ca/b")."""
     best = None
     for m in spec.mounts:
         if m["principal"] == principal and (host == m["host"] or host.startswith(m["host"].rstrip("/") + "/")):
@@ -310,6 +314,16 @@ def _in_container(spec: Any, principal: str, host: str) -> str:
                 best = m
     if best is None:
         raise HubSpecError(f"{host}: no mount of {principal}'s runtime holds it")
+    root = best["host"]
+    if root == "/" or posixpath.normpath(root) != root or root.startswith("//"):
+        raise HubSpecError(f"{principal}'s mount of {root!r} is not a normalised directory other than /")
+    return best
+
+
+def _in_container(spec: Any, principal: str, host: str) -> str:
+    """Where `host` is seen inside the principal's runtime, through the
+    declared mount mount_holding chooses; a path no mount holds refuses."""
+    best = mount_holding(spec, principal, host)
     return best["container"] + host[len(best["host"]):]
 
 
