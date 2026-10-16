@@ -39,6 +39,13 @@ class Fixture(unittest.TestCase):
         self.addCleanup(setattr, hs, "ROOT_UID", hs.ROOT_UID)
         hs.ROOT_UID = os.getuid()
 
+    def judged(self, path):
+        """_trusted_tool's answer: the path it trusts, or its refusal as text."""
+        try:
+            return hs._trusted_tool(path)
+        except hs.Tooling as e:
+            return f"refused: {e}"
+
     def file(self, rel, mode=0o755):
         p = os.path.join(self.d, rel)
         os.makedirs(os.path.dirname(p), mode=0o755, exist_ok=True)
@@ -53,7 +60,7 @@ class TrustedToolRowsTest(Fixture):
 
     def test_a_root_owned_chain_passes(self):
         tool = self.file("bin/docker")
-        self.assertEqual(hs._trusted_tool(tool), tool)
+        self.assertEqual(self.judged(tool), tool)
 
     def test_an_operator_owned_target_refuses(self):
         tool = self.file("bin/docker")
@@ -75,7 +82,7 @@ class TrustedToolRowsTest(Fixture):
         link = os.path.join(self.d, "bin", "docker")
         os.makedirs(os.path.dirname(link), mode=0o755)
         os.symlink(target, link)
-        self.assertEqual(hs._trusted_tool(link), target)
+        self.assertEqual(self.judged(link), target, "the link resolves to a root-owned target under root's chain")
         os.chmod(os.path.join(self.d, "app"), 0o777)
         with self.assertRaisesRegex(hs.Tooling, "/app, above"):
             hs._trusted_tool(link)
