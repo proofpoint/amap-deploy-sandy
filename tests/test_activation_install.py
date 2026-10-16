@@ -198,7 +198,7 @@ class CommandTest(unittest.TestCase):
             secrets=SimpleNamespace(run_dir=str(self.t / "run"), writer_dir="/opt/ex/libexec"),
             partition=SimpleNamespace(tools={"python3": "/usr/bin/python3"}), keys=SimpleNamespace(local_config="/x"),
             gate=None, overlay_pin={"commit": "a" * 40}, hub=SimpleNamespace(host_label="alpha"),
-            router=SimpleNamespace(container="router-a"))
+            router=SimpleNamespace(container="router-a"), supervision=SimpleNamespace(kind="systemd"))
         self.policy = {"fleet_domain": FLEET_DOMAIN, "hop_link": {"link": "link-a", "trusted_fleet_hosts": ["beta.internal"],
                                                                   "egress": True, "delegation": {"inbound": False}}}
         self.verdict = (None, ["(a) the harness gate does not hold"])
@@ -244,7 +244,10 @@ class CommandTest(unittest.TestCase):
         before = self.tree()
         err, self.out = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(self.out), contextlib.redirect_stderr(err):
-            rc = self.prov.run_sync(args, self.home, self.t / "boxes")
+            try:
+                rc = self.prov.run_sync(args, self.home, self.t / "boxes")
+            except Exception as e:  # a crash is not an outcome
+                self.fail(f"run_sync raised {e!r}")
         return rc, before, self.tree(), err.getvalue()
 
     def test_either_argument_alone_writes_nothing_and_refuses(self):
@@ -300,3 +303,19 @@ class CommandTest(unittest.TestCase):
         self.assertEqual(at, sorted(at), out)
         pre = hashlib.sha256(self.prov.sibling_text(self.base).encode()).hexdigest()
         self.assertIn(f"pre-activation sha256 {pre}", out)
+
+    def test_a_launchd_host_s_a5_step_names_verify_a5(self):
+        """A5 on a launchd host is `verify --a5`; a systemd host's is plain
+        verify, whose signing check must pass."""
+        from types import SimpleNamespace
+        self.verdict = (b'{"activated": true}\n', [])
+        for kind, want, never in (("launchd", "5. A5: python3 amap-sandy.py verify --a5;", None),
+                                  ("systemd", "5. A5: python3 amap-sandy.py verify; the signing check must PASS",
+                                   "--a5")):
+            with self.subTest(kind=kind):
+                self.spec.supervision = SimpleNamespace(kind=kind)
+                rc, _, _, err = self.install(self.args())
+                self.assertEqual(rc, 0, err)
+                self.assertIn(want, self.out.getvalue())
+                if never:
+                    self.assertNotIn(never, self.out.getvalue())

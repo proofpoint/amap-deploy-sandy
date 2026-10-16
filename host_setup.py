@@ -1120,7 +1120,8 @@ def checks(spec: Spec, *, production: bool, lstat: Callable = os.lstat,
                 en.get("gate") or (lambda: start_gate(spec, lstat=lstat, digest=digest, hub=hub, keys=keys,
                                                       supervision=supervision, overlay=overlay,
                                                       secrets=secrets, exposure=exposure,
-                                                      secret_lock=secret_lock)),
+                                                      secret_lock=secret_lock, policy_on=policy_on,
+                                                      partition=partition)),
                 en.get("loaded") or hv.ask_loaded)
     if spec.router is not None:
         out += hp.checks(spec, **(router or {}))
@@ -1207,6 +1208,16 @@ def signing_inputs(spec: Spec, policy_on: Any, p: Dict[str, Any], k: Dict[str, A
             else (lambda host_sha: (rh.UNKNOWN, missing.reason))
     return hk.Signing(policy_on=policy_on, gate_ok=not bad, approved=approved, approved_why=why, named=named,
                       status=status, witness=witness, now=k.get("now", time.time()))
+
+
+def start_inputs(spec: Spec, policy_on: Any, p: Dict[str, Any]) -> hk.Signing:
+    """The static matrix's inputs for the start gate, read as verify reads
+    them (`signing_inputs`): the policy's answer, the harness gate, A1's
+    placed record and the token's named evidence. The router's status and
+    the adoption witness are verify's alone and are never asked here."""
+    return signing_inputs(spec, policy_on, p, {
+        "status": rh.Unresolved("the start gate reads no router status"),
+        "witness": lambda host_sha: (rh.UNKNOWN, "the start gate asks no adoption witness")})
 
 
 def verify_weekly_runs(spec: Spec, p: Dict[str, Any]) -> List[rh.Check]:
@@ -1369,11 +1380,38 @@ def run(spec_path: Optional[Path], *, production: bool, overlay: Optional[Path] 
     return rc
 
 
-def verify_section(overlay: Optional[Path], out=print, **probes: Any) -> int:
+def a5_expected(spec: Spec, found: List[rh.Check], read_bytes_: Optional[Callable[[str], bytes]] = None) -> Any:
+    """A5's one expected non-pass, or None: on a host whose document
+    declares launchd supervision, the signing check UNKNOWN with exactly the
+    reason an activated router gives under its live token when the adoption
+    witness stops at the platform's kind clause (hk.a5_launchd_reason, the
+    token's run id read from the host's live config now). Only that whole
+    string matches; anything else, or a second such row, is None."""
+    if spec.supervision is None or spec.supervision.kind != hv.KINDS[1] or spec.keys is None:
+        return None
+    try:
+        doc = hk.parse_json((read_bytes_ or hk.read_bytes)(spec.keys.local_config))
+        token = doc[hk.DELEGATION_KEY]["partition_verified"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    if not isinstance(token, str):
+        return None
+    reason = hk.a5_launchd_reason(token.partition(":")[0])
+    rows = [c for c in found if c.claim == hk.SIGNING_CLAIM]
+    # A check carries a reason only when it is UNKNOWN, so the whole-string
+    # match is also the result's.
+    if len(rows) != 1 or rows[0].reason != reason:
+        return None
+    return rows[0]
+
+
+def verify_section(overlay: Optional[Path], out=print, a5: bool = False, **probes: Any) -> int:
     """`verify`'s part: when the deployment overlay has a `host_setup`
     section, every check of the host against it, printed; 0 only when all
     pass. No overlay, or one without the section, is not configured: 0. An
-    unusable overlay or document is 1."""
+    unusable overlay or document is 1. With `a5` (verify --a5, A5 on a
+    launchd host), the one row `a5_expected` names is still printed as
+    UNKNOWN and is the only non-pass excused; every other check must pass."""
     if overlay is None:
         return 0
     try:
@@ -1385,7 +1423,17 @@ def verify_section(overlay: Optional[Path], out=print, **probes: Any) -> int:
     except ValueError as e:
         out(f"  UNKNOWN host setup: {e}")
         return 1
-    rc = report(checks(spec, production=False, overlay=overlay, **probes), out)
+    found = checks(spec, production=False, overlay=overlay, **probes)
+    rc = report(found, out)
+    if a5:
+        expected = a5_expected(spec, found)
+        if expected is None:
+            out("  A5: no expected non-pass applies to this host; every check must pass")
+        else:
+            out(f"  A5: the one expected non-pass is the signing check's UNKNOWN on a launchd host, matched by its "
+                f"exact reason (the gated exception for the Mac's VM file share): {expected.reason}")
+            others = [c for c in found if c is not expected]
+            rc = 0 if others and all(c.result == rh.PASS for c in others) else 1
     print_notes(spec, out)
     return rc
 
@@ -1425,17 +1473,21 @@ def start_checks(spec: Spec, *, lstat: Callable = os.lstat, digest: Callable[[st
                  supervision: Optional[Dict[str, Any]] = None, state: Any = hr.ASK,
                  overlay: Optional[Path] = None, secrets: Optional[Dict[str, Any]] = None,
                  exposure: Optional[Dict[str, Any]] = None,
-                 secret_lock: Optional[Callable[[Any], Any]] = None) -> List[rh.Check]:
+                 secret_lock: Optional[Callable[[Any], Any]] = None, policy_on: Any = None,
+                 partition: Optional[Dict[str, Any]] = None) -> List[rh.Check]:
     """Everything that must hold before the hub-link
     router starts. The secret's state is active; the secret's own checks
     and the exposure sweep over every container (`secret_checks`, §7b and
     §7d); the D7 file and the environment file are placed and current and
     the rendering meets every rule (hub_runtime); the production overlay
     pin; the key probe's CURRENT evidence and the key's placement (hub_keys,
-    without the in-container D7 read, which needs the router running); and
-    the supervision's files and the live-start ancestry check
-    (hub_supervise). It never calls `checks`, which calls it back through
-    `start_gate`."""
+    without the in-container D7 read, which needs the router running); the
+    local router's config unsigned, or signing exactly as A1 approved under
+    the static matrix, read from `policy_on` (the fleet policy's answer, None
+    when not read) and `partition`'s probes (`start_inputs`); and the
+    supervision's files and the live-start ancestry check (hub_supervise).
+    It never calls `checks`, which calls it back through `start_gate`. A
+    crash or boot restart is the supervisor's and is not gated here."""
     out: List[rh.Check] = []
     st = ss.state(spec.secrets) if state is hr.ASK else state
     claim = "the secret's state is active"
@@ -1456,7 +1508,8 @@ def start_checks(spec: Spec, *, lstat: Callable = os.lstat, digest: Callable[[st
         live = k.get("live", hk.ASK)
         if live is hk.ASK:
             live = hk.ask_live_config(spec, hk.local_container(spec, spec.keys))
-        out += hk.verify_unsigned_start(spec.keys, live, k.get("read_bytes_", hk.read_bytes))
+        out += hk.verify_start_delegation(spec.keys, live, k.get("read_bytes_", hk.read_bytes),
+                                          start_inputs(spec, policy_on, partition or {}))
         out += hk.verify_evidence_dir(spec.keys, lstat)
         out += hk.verify_evidence_binds(spec.keys, hk.ask_containers(spec) if k.get("containers", hr.ASK)
                                         is hr.ASK else k["containers"])

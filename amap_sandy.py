@@ -82,6 +82,7 @@ import activation_install as ai   # A3: the activation config, checked before an
 import delegation_render as dr    # the delegation block's no-seed check
 import partition_setup as ps      # the harness gate A3 requires
 import hub_keys as hk             # the local router's container, named in the back-out
+import hub_supervise as hv        # the supervision kinds: A5's command on a launchd host
 import delivery_checks as dc  # delivery itself: lister mode, session posture, daemon build, backlog
 import connector_pin as cpin  # install refuses a connector checkout not at its siblings.json pin
 
@@ -3623,7 +3624,10 @@ def activation_sequence(spec: Any, source: str, final: bytes, path: Path, pre_ac
         f"2. as root: {ai.place_step(spec, source, final)}",
         f"3. the host's {path} is byte for byte that file: sha256 {final_sha}",
         f"4. A4: restart the local router: docker/run.sh --config {path} --detach, from the hop checkout",
-        "5. A5: python3 amap-sandy.py verify; the signing check must PASS",
+        ("5. A5: python3 amap-sandy.py verify --a5; every check must PASS except the signing check's UNKNOWN for "
+         "the VM file share, which --a5 excuses only by its exact reason"
+         if spec.supervision is not None and spec.supervision.kind == hv.KINDS[1] else
+         "5. A5: python3 amap-sandy.py verify; the signing check must PASS"),
         f"if step 2, 3, 4 or 5 fails, back out in this order (pre-activation sha256 {pre}); stopping the "
         f"router first (docker stop {container}) shortens the time it may sign:",
         "B1. python3 amap-sandy.py install            (read the diff it prints)",
@@ -4980,6 +4984,10 @@ def build_parser() -> argparse.ArgumentParser:
                              "JSON, for the router's operator console. Written atomically on "
                              "every exit, carrying its own generated_ts and this run's exit "
                              "status; cron-safe")
+    verify.add_argument("--a5", action="store_true",
+                        help="A5 after activation: on a host whose host-setup document declares launchd, "
+                             "the signing check's UNKNOWN with the exact VM-file-share reason under the live "
+                             "token is the one non-pass excused; every other check must pass")
     verify.add_argument("--container", default=rh.DEFAULT_CONTAINER,
                         help="the detached router's container name (default: $CONTAINER, as "
                              "the router's docker/run.sh reads it)")
@@ -5132,7 +5140,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             return hsu.hub_supervise(args.spec, apply=args.apply, overlay=ha.overlay_path(args.overlay))
 
         if args.command == "hub-start-check":
-            return hsu.hub_start_check(args.spec, overlay=ha.overlay_path(args.overlay))
+            return hsu.hub_start_check(args.spec, overlay=ha.overlay_path(args.overlay),
+                                       policy_on=delegation_policy(home))
 
         if args.command == "migrate-registry":
             return run_migrate_registry(args, home)
@@ -5174,7 +5183,7 @@ def run_verify_host_setup(args: argparse.Namespace, home: Path) -> int:
     if overlay is None:
         return 0
     print("\nverify: the hop deployment's host setup")
-    return hsu.verify_section(overlay, policy_on=delegation_policy(home))
+    return hsu.verify_section(overlay, a5=getattr(args, "a5", False), policy_on=delegation_policy(home))
 
 
 def run_verify_command(args: argparse.Namespace, home: Path, boxes_dir: Path) -> int:

@@ -140,6 +140,82 @@ class Matrix(Base):
         self.assertEqual(self.verdict(b"[1]").result, rh.UNKNOWN)
 
 
+class StartGateTest(Base):
+    """hub_keys.verify_start_delegation, the hub-link router's start gate on
+    the local router's config: no block, or exactly A1's approved block
+    with the static matrix holding over real inputs. The router's status
+    and the adoption witness are never asked."""
+
+    NEVER = rh.Unresolved("the start gate reads no router status")
+
+    def never(self, host_sha):
+        self.fail("the start gate asked the adoption witness")
+
+    def gate(self, raw, live_ok=True, signing=True, **over):
+        fields = dict(policy_on=True, gate_ok=True, approved=approved(), approved_why="", named=named(),
+                      status=self.NEVER, witness=self.never, now=NOW)
+        fields.update(over)
+        sha = hk._sha(raw) if isinstance(raw, bytes) else None
+        found = hk.verify_start_delegation(self.k, (self.k.local_config, sha if live_ok else "0" * 64),
+                                           lambda p: raw, hk.Signing(**fields) if signing else None)
+        self.assertEqual(len(found), 2)
+        self.assertEqual(found[1].claim, hk.START_CLAIM.format(path=self.k.local_config))
+        return found[1]
+
+    def test_unsigned_passes_whatever_the_activation_inputs(self):
+        self.assertEqual(self.gate(live()).result, rh.PASS)
+        self.assertEqual(self.gate(live(), signing=False).result, rh.PASS)
+        self.assertEqual(self.gate(live(), policy_on=rh.Unresolved("no manifest"), approved=None).result, rh.PASS)
+
+    def test_a1_s_approved_block_under_the_static_matrix_passes_with_no_witness(self):
+        self.assertEqual(self.gate(live(SIGNED)).result, rh.PASS)
+
+    def test_a_block_that_is_not_a1_s_fails(self):
+        other = dict(SIGNED, crypto={"crypto_backend": "openssl"})
+        self.assertEqual(self.gate(live(other)).result, rh.FAIL)
+
+    def test_a_failing_static_matrix_fails(self):
+        for label, over in (("policy off", dict(policy_on=False)), ("gate not holding", dict(gate_ok=False)),
+                            ("no A1 record", dict(approved=None, approved_why="absent")),
+                            ("stale evidence", dict(named=named(at=NOW - 9 * 86400))),
+                            ("no named evidence", dict(named=named(outcome="missing")))):
+            with self.subTest(label):
+                self.assertEqual(self.gate(live(SIGNED), **over).result, rh.FAIL)
+
+    def test_inputs_that_cannot_be_read_are_unknown_never_pass(self):
+        unread = rh.Unresolved("no manifest")
+        for label, kw in (("policy unread", dict(policy_on=unread)), ("gate unread", dict(gate_ok=unread)),
+                          ("A1 unreadable", dict(approved=rh.Unresolved("EIO"))),
+                          ("no inputs at all", dict(signing=False))):
+            with self.subTest(label):
+                c = self.gate(live(SIGNED), **kw)
+                self.assertEqual(c.result, rh.UNKNOWN)
+
+    def test_an_unreadable_or_unbound_config_is_unknown(self):
+        self.assertEqual(self.gate(b"[1]").result, rh.UNKNOWN)
+        self.assertEqual(self.gate(b"{").result, rh.UNKNOWN)
+        for raw in (live(), live(SIGNED)):
+            with self.subTest(signed=raw == live(SIGNED)):
+                c = self.gate(raw, live_ok=False)
+                self.assertEqual(c.result, rh.UNKNOWN)
+                self.assertIn("not shown to read", c.reason)
+
+
+class ConstantsTest(unittest.TestCase):
+    """The two strings another program pins are emitted from these symbols,
+    verbatim."""
+
+    def test_the_activated_reason_and_the_kind_clause_are_the_emitted_strings(self):
+        sg = hk.Signing(policy_on=True, gate_ok=True, approved=approved(), approved_why="", named=named(),
+                        status=fresh_status(), witness=lambda h: (rh.PASS, ""), now=NOW)
+        self.assertEqual(hk._verdict(json.loads(live(SIGNED)), True, True, sg),
+                         (rh.PASS, hk.SIGNING_ACTIVATED.format(run_id=RID)))
+        self.assertEqual(hk.platform_problem({"kind": "launchd"}, {}), hk.KIND_NOT_LINUX)
+        self.assertEqual(hk.SIGNING_ACTIVATED, "it signs under the token of {run_id}, current and passing")
+        self.assertEqual(hk.KIND_NOT_LINUX,
+                         "the host-setup document declares no Linux host (its supervision is not systemd)")
+
+
 class StatusWitness(Base):
 
     def test_a_reload_failure_fails_from_the_router_s_own_document(self):
@@ -176,9 +252,16 @@ class AdoptionTest(unittest.TestCase):
     C = 1_000_000_000_000_000_000
 
     def run_it(self, tuples, statuses, host=None):
+        """The scripted reads end in an Unresolved, never StopIteration, so a
+        row past its script fails on its reason, not on a crash."""
         t, s = iter(tuples), iter(statuses)
         view = host if host is not None else (lambda: self.view())
-        return hk.adoption(lambda: next(t), lambda: next(s), self.HOST, host_view=view, sleep=lambda x: None)
+        try:
+            return hk.adoption(lambda: next(t, rh.Unresolved("the row scripted no further config read")),
+                               lambda: next(s, rh.Unresolved("the row scripted no further status document")),
+                               self.HOST, host_view=view, sleep=lambda x: None)
+        except Exception as e:  # a crash is not an outcome
+            self.fail(f"adoption raised {e!r}")
 
     def a(self, ctime=None, sha=None, ino=7, dev=1):
         return {"dev": dev, "ino": ino, "ctime_ns": ctime or self.C, "size": 10, "sha256": sha or self.HOST,
@@ -321,6 +404,12 @@ class MountinfoTest(unittest.TestCase):
             "5 1 8:4 / /back\\134slash rw - ext4 d rw\n"
             "6 1 8:5 / /esc\\303\\251 rw - xfs e rw\n")
 
+    def fstype(self, *a, host=False, **k):
+        try:
+            return (hk.host_fstype if host else hk.mount_fstype)(*a, **k)
+        except Exception as e:  # a crash is not an outcome
+            self.fail(f"mount_fstype raised {e!r}")
+
     def setUp(self):
         import os
         import tempfile
@@ -335,34 +424,34 @@ class MountinfoTest(unittest.TestCase):
         self.text = self.TEXT.format(fuse=self.fuse)
 
     def test_an_alias_names_its_target_s_filesystem(self):
-        self.assertEqual(hk.host_fstype(self.alias, self.text), "fuse.example")
-        self.assertEqual(hk.mount_fstype(self.alias, self.text), "ext4")   # the lexical path would lie
+        self.assertEqual(self.fstype(self.alias, self.text, host=True), "fuse.example")
+        self.assertEqual(self.fstype(self.alias, self.text), "ext4")   # the lexical path would lie
 
     def test_unicode_escapes_and_boundaries(self):
-        self.assertEqual(hk.mount_fstype("/mnt/\u6587\u4ef6/r.json", self.text), "xfs")
-        self.assertEqual(hk.mount_fstype("/my dir/r.json", self.text), "btrfs")
-        self.assertEqual(hk.mount_fstype("/back\\slash/r.json", self.text), "ext4")
-        self.assertEqual(hk.mount_fstype("/mnt/\u6587\u4ef6x/r.json", self.text), "ext4")    # not a component of it
+        self.assertEqual(self.fstype("/mnt/\u6587\u4ef6/r.json", self.text), "xfs")
+        self.assertEqual(self.fstype("/my dir/r.json", self.text), "btrfs")
+        self.assertEqual(self.fstype("/back\\slash/r.json", self.text), "ext4")
+        self.assertEqual(self.fstype("/mnt/\u6587\u4ef6x/r.json", self.text), "ext4")    # not a component of it
 
     def test_of_equal_mount_points_the_last_listed_is_the_one_on_top(self):
         text = ("1 0 8:1 / / rw - ext4 a rw\n"
                 "2 1 8:2 / /srv rw - xfs b rw\n"
                 "3 2 0:9 / /srv rw - tmpfs c rw\n")
-        self.assertEqual(hk.mount_fstype("/srv/r.json", text), "tmpfs")
-        self.assertEqual(hk.mount_fstype("/srv", text, exact=True), "tmpfs")
+        self.assertEqual(self.fstype("/srv/r.json", text), "tmpfs")
+        self.assertEqual(self.fstype("/srv", text, exact=True), "tmpfs")
 
     def test_an_unescaped_mount_point_never_matches_its_escaped_spelling(self):
-        self.assertEqual(hk.mount_fstype("/my\\040dir/r.json", self.text), "ext4")
+        self.assertEqual(self.fstype("/my\\040dir/r.json", self.text), "ext4")
 
     def test_escaped_bytes_decode_as_a_file_name_not_as_latin_1(self):
         """mountinfo escapes bytes; two escaped bytes that are one UTF-8
         character name that character, as the kernel's path does."""
-        self.assertEqual(hk.mount_fstype("/esc\u00e9/r.json", self.text), "xfs")
-        self.assertEqual(hk.mount_fstype("/esc\u00c3\u00a9/r.json", self.text), "ext4")
+        self.assertEqual(self.fstype("/esc\u00e9/r.json", self.text), "xfs")
+        self.assertEqual(self.fstype("/esc\u00c3\u00a9/r.json", self.text), "ext4")
 
     def test_the_container_counts_only_the_entry_at_the_path_itself(self):
-        self.assertEqual(hk.mount_fstype("/mnt/\u6587\u4ef6", self.text, exact=True), "xfs")
-        self.assertIsNone(hk.mount_fstype("/mnt/\u6587\u4ef6/r.json", self.text, exact=True))
+        self.assertEqual(self.fstype("/mnt/\u6587\u4ef6", self.text, exact=True), "xfs")
+        self.assertIsNone(self.fstype("/mnt/\u6587\u4ef6/r.json", self.text, exact=True))
 
 
 class OpenResolvedTest(unittest.TestCase):

@@ -11,7 +11,8 @@ UNMUTATED in that copy and refuses (exit 2) unless
 each is green, so a target that cannot import never counts as a kill. With
 labels, only those run, and a label that names no mutant refuses the whole
 run rather than run everything. Exit 0 only when every selected mutant is
-KILLED."""
+KILLED. A kill is reported as by assertion when a test FAILED, and as
+"error only" when the target went red through errors alone."""
 import os
 import shutil
 import subprocess
@@ -131,8 +132,8 @@ M = [
     ('hs-backout-unread', 'host_steps.py', '    if not pre_sha:\n        return ("back-out: this run did not read', '    if False:\n        return ("back-out: this run did not read', 'test_partition_weekly_writer.ProspectiveWriterTest'),
     ('hs-backout-delegation', 'host_steps.py', '    if live_delegation:\n', '    if False:\n', 'test_partition_weekly_writer.ProspectiveWriterTest'),
     ('hs-g1-seen', 'host_steps.py', '        seen["live_delegation"] = True\n', '', 'test_partition_weekly_writer.ProspectiveWriterTest'),
-    ('hk-start-gate', 'host_setup.py', '        out += hk.verify_unsigned_start(spec.keys, live,', '        out += hk.verify_no_delegation(spec.keys, live,', 'test_hub_supervise.StartSweepTest'),
-    ('hk-start-block', 'hub_keys.py', '    if DELEGATION_KEY in doc:\n        return [bind, rh.check(claim, want, True,', '    if False:\n        return [bind, rh.check(claim, want, True,', 'test_hub_supervise.StartSweepTest'),
+    ('hk-start-gate', 'host_setup.py', '        out += hk.verify_start_delegation(spec.keys, live,', '        out += hk.verify_no_delegation(spec.keys, live,', 'test_hub_supervise.StartSweepTest'),
+    ('hk-start-block', 'hub_keys.py', '    if DELEGATION_KEY not in doc:\n        result, why = rh.PASS', '    if True:\n        result, why = rh.PASS', 'test_signing_matrix.StartGateTest'),
     ('hs-decide-weekly', 'host_steps.py', '    prospective = context["mode"] == MODES[1]\n    done, events = set(), None', '    prospective = False\n    done, events = set(), None', 'test_partition_weekly_writer.DecideModeTest'),
     ('hs-done-weekly', 'host_steps.py', '            prospective and events is not None and {"rewrite_ok", "stop_not_required"} <= done', '            events is not None and {"rewrite_ok", "stop_not_required"} <= done', 'test_partition_weekly_writer.DecideModeTest'),
     ('hs-done-history', 'host_steps.py', '            and _only_observed(events))', '            )', 'test_partition_weekly_writer.DecideModeTest'),
@@ -150,6 +151,21 @@ M = [
     ('hk-first-equal', 'hub_keys.py', '"            if best is None or len(mp) >= len(best[0]):\\n"', '"            if best is None or len(mp) > len(best[0]):\\n"', 'test_signing_matrix.MountinfoTest'),
     ('hk-no-unescape', 'hub_keys.py', '"        mp = unescape_mount(f[4])\\n"', '"        mp = f[4]\\n"', 'test_signing_matrix.MountinfoTest'),
     ('hk-raw-prefix', 'hub_keys.py', '"        if path == mp or (not exact and path.startswith(mp.rstrip(\'/\') + \'/\')):\\n"', '"        if path == mp or (not exact and path.startswith(mp)):\\n"', 'test_signing_matrix.MountinfoTest'),
+    ('hk-start-matrix', 'hub_keys.py', '        result, why = static_verdict(doc, signing)\n', '        result, why = rh.PASS, "admitted"\n', 'test_signing_matrix.StartGateTest'),
+    ('hk-start-no-inputs', 'hub_keys.py', '        result, why = rh.UNKNOWN, "it carries a delegation block, and no activation inputs were read"', '        result, why = rh.PASS, "it carries a delegation block, and no activation inputs were read"', 'test_signing_matrix.StartGateTest'),
+    ('hk-start-bind', 'hub_keys.py', '    if bind.result is not rh.PASS:\n        return [bind, rh.unknown(claim, want, f"{why}, but the local router is not shown to read it: "', '    if False:\n        return [bind, rh.unknown(claim, want, f"{why}, but the local router is not shown to read it: "', 'test_signing_matrix.StartGateTest'),
+    ('hk-static-unread', 'hub_keys.py', '    if len({r for r, _ in seen}) > 1:\n        unread =', '    if False:\n        unread =', 'test_signing_matrix.StartGateTest'),
+    ('hs-start-inputs', 'host_setup.py', '                                          start_inputs(spec, policy_on, partition or {}))', '                                          None)', 'test_hub_supervise.ActivatedEnablementTest'),
+    ('hs-start-inputs-witness', 'host_setup.py', '    return signing_inputs(spec, policy_on, p, {\n        "status": rh.Unresolved("the start gate reads no router status"),\n', '    return signing_inputs(spec, policy_on, p, {\n', 'test_hub_supervise.StartInputsTest'),
+    ('hs-gate-policy', 'host_setup.py', '                                                      secret_lock=secret_lock, policy_on=policy_on,', '                                                      secret_lock=secret_lock, policy_on=None,', 'test_hub_supervise.EnablementWiringTest'),
+    ('as-start-policy', 'amap_sandy.py', '                                       policy_on=delegation_policy(home))', '                                       )', 'test_hub_supervise.StartCheckVerbTest'),
+    ('hk-const-activated', 'hub_keys.py', '    return rh.PASS, SIGNING_ACTIVATED.format(run_id=named["run_id"])', '    return rh.PASS, f"it signs under the token of {named[\'run_id\']}, current, passing"', 'test_signing_matrix.ConstantsTest'),
+    ('hs-a5-kind', 'host_setup.py', '    if spec.supervision is None or spec.supervision.kind != hv.KINDS[1] or spec.keys is None:', '    if spec.supervision is None or spec.keys is None:', 'test_hub_supervise.A5OnLaunchdTest'),
+    ('hs-a5-exact', 'host_setup.py', 'rows[0].reason != reason:', 'hk.KIND_NOT_LINUX not in rows[0].reason:', 'test_hub_supervise.A5OnLaunchdTest'),
+    ('hs-a5-count', 'host_setup.py', '    if len(rows) != 1 or rows[0].reason', '    if rows[0].reason', 'test_hub_supervise.A5OnLaunchdTest'),
+    ('hs-a5-others', 'host_setup.py', '            rc = 0 if others and all(c.result == rh.PASS for c in others) else 1', '            rc = 0', 'test_hub_supervise.A5OnLaunchdTest'),
+    ('as-a5-flag', 'amap_sandy.py', 'verify_section(overlay, a5=getattr(args, "a5", False), policy_on=', 'verify_section(overlay, policy_on=', 'test_hub_supervise.VerifyA5FlagTest'),
+    ('as-a5-step', 'amap_sandy.py', '         if spec.supervision is not None and spec.supervision.kind == hv.KINDS[1] else', '         if False else', 'test_activation_install.CommandTest'),
 ]
 
 
@@ -176,7 +192,7 @@ def judge(tree, chosen):
         if run(tree, target).returncode != 0:
             print(f"refused: {target} is not green unmutated, so no kill in it would mean anything")
             return 2
-    killed = survived = broken = 0
+    killed = asserted = survived = broken = 0
     for label, path, old, new, target in chosen:
         full = os.path.join(tree, path)
         with open(full) as f:
@@ -193,10 +209,14 @@ def judge(tree, chosen):
             with open(full, "w") as f:
                 f.write(src)
         red = r.returncode != 0
+        by_assertion = red and "\nFAIL: " in "\n" + r.stderr
         killed += red
+        asserted += by_assertion
         survived += not red
-        print(f"{label}: {'KILLED' if red else 'SURVIVED'} ({target})")
-    print(f"SUMMARY selected={len(chosen)} killed={killed} survived={survived} anchor_broken={broken}")
+        how = "KILLED" if by_assertion else "KILLED (error only)" if red else "SURVIVED"
+        print(f"{label}: {how} ({target})")
+    print(f"SUMMARY selected={len(chosen)} killed={killed} by_assertion={asserted} error_only={killed - asserted} "
+          f"survived={survived} anchor_broken={broken}")
     return 0 if killed == len(chosen) else 1
 
 

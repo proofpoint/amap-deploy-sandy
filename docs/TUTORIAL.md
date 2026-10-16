@@ -759,7 +759,12 @@ is required before the next:
 3. the host's live config is byte for byte that file;
 4. A4: `docker/run.sh --config <the live config> --detach` restarts the
    router on it;
-5. A5: `python3 amap-sandy.py verify`, whose signing check must pass.
+5. A5: `python3 amap-sandy.py verify`, whose signing check must pass. On
+   a host whose host-setup document declares launchd (Docker on macOS),
+   run `python3 amap-sandy.py verify --a5` instead: every check must pass
+   except the signing check, whose UNKNOWN is excused only when its reason
+   is exactly the one an activated router gives under the live token there
+   (the VM file share, below). Any other non-pass fails A5.
 
 If step 2, 3, 4 or 5 fails, back out in this order. Stopping the router
 first shortens the time it may sign.
@@ -791,6 +796,17 @@ the router reads its config through a bind of the same file the host holds
 (Docker on macOS) the signing check is UNKNOWN by design, and says so. Read
 the filesystem type with `findmnt -T <the live config> -o FSTYPE`; `stat -f`
 names ext2, ext3 and ext4 alike.
+
+After activation, the hub-link router's start check (`hub-start-check`, and
+on launchd `verify`'s enablement check) admits the local router's
+delegation block only when it is exactly A1's approved block and the policy,
+the harness gate and the token's current evidence all hold; any other block
+refuses the start, and an input that cannot be read refuses it too. It does
+not ask the adoption witness: the hub-link router's start changes nothing
+the local router signs. A crash or boot restart of the hub-link router is
+its supervisor's (systemd `Restart=on-failure`, launchd `KeepAlive`) and is
+not gated: the check governs the start step it prints and launchd's
+enablement.
 
 
 ### The weekly partition job's tools

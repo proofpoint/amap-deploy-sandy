@@ -453,7 +453,7 @@ class StartChecksCompositionTest(unittest.TestCase):
         hs.checks = lambda *a, **k: self.fail("start_checks must never call checks (it calls start_gate back)")
         patches = {(hs.ss, "checks"): "secret", (hs.se, "checks"): "exposure",
                    (hs.hr, "checks"): "hub", (hs, "verify_overlay"): "overlay",
-                   (hs.hk, "verify_placement"): "placement", (hs.hk, "verify_unsigned_start"): "delegation",
+                   (hs.hk, "verify_placement"): "placement", (hs.hk, "verify_start_delegation"): "delegation",
                    (hs.hk, "verify_evidence_dir"): "evidence_dir", (hs.hk, "verify_evidence_binds"): "binds",
                    (hs.hk, "verify_evidence"): "evidence", (hs.hv, "checks"): "supervision",
                    (hs.hk, "verify_d7_live"): "d7_live"}
@@ -499,7 +499,7 @@ class StartSweepTest(unittest.TestCase):
         patches = [(hs, "read_spec", lambda *a, **k: None), (hs, "load_spec", lambda doc: built),
                    (hs.ss, "checks", secrets_checks or same), (hs.se, "checks", lambda *a, **k: exposure_found),
                    (hs.hr, "checks", same), (hs, "verify_overlay", same), (hs.hk, "verify_placement", same),
-                   (hs.hk, "verify_unsigned_start", no_delegation or same), (hs.hk, "verify_evidence_dir", same),
+                   (hs.hk, "verify_start_delegation", no_delegation or same), (hs.hk, "verify_evidence_dir", same),
                    (hs.hk, "verify_evidence_binds", same), (hs.hk, "verify_evidence", same), (hs.hv, "checks", same),
                    (hs, "verify_recovery_horizon", horizon or same)]
         for mod, name, value in patches:
@@ -517,22 +517,20 @@ class StartSweepTest(unittest.TestCase):
         start check must pass what the router answered, never nothing."""
         seen = []
         answer = ("/opt/ex/local/router.json", "a" * 64)
-        self.gate([], no_delegation=lambda ks, live, rb: seen.append(live) or [],
+        self.gate([], no_delegation=lambda ks, live, rb, sg: seen.append(live) or [],
                   keys={"containers": [], "live": answer})
         self.assertEqual(seen, [answer])
 
     def test_a_bound_delegation_free_config_passes_the_real_gate(self):
-        """hub_keys.verify_unsigned_start unstubbed, with every other group
+        """hub_keys.verify_start_delegation unstubbed, with every other group
         passing: a delegation-free config the router is shown to read lets
-        the hub-link router start, with no policy, gate, record or status
-        read; the same file with a delegation block refuses it."""
+        the hub-link router start; a block with no activation inputs refuses."""
         path = spec().keys.local_config
-        for body, rc_want, verdict in ((b'{"state_dir": "/s"}\n', 0, rh.PASS),
-                                       (b'{"state_dir": "/s", "delegation": {}}\n', 1, rh.FAIL)):
+        self.addCleanup(setattr, hs, "start_inputs", hs.start_inputs)
+        hs.start_inputs = lambda s, policy_on, p: None
+        for body, rc_want in ((b'{"state_dir": "/s"}\n', 0), (b'{"state_dir": "/s", "delegation": {}}\n', 1)):
             with self.subTest(body=body):
                 sha = hashlib.sha256(body).hexdigest()
-                found = hs.hk.verify_unsigned_start(spec().keys, (path, sha), lambda p, b=body: b)
-                self.assertEqual([c.result for c in found], [rh.PASS, verdict])
                 rc, said = self.gate([], no_delegation=UNPATCHED,
                                      keys={"containers": [], "live": (path, sha), "read_bytes_": lambda p, b=body: b})
                 self.assertEqual(rc, rc_want, said)
@@ -791,3 +789,207 @@ class StopBudgetTest(unittest.TestCase):
     def test_each_term_of_the_bound_counts(self):
         env = {"RELAY_SMTP_DOT_TIMEOUT": "10", "RELAY_SMTP_CONNECT_TIMEOUT": "7", "RELAY_SMTP_COMMAND_TIMEOUT": "3"}
         self.assertEqual(hv.stop_budget(env), (10 + hv.JOIN_SLACK_S + hv.DONE_POLL_S, 7 + 5 * 3 + hv.QUIT_S))
+
+
+class ActivatedEnablementTest(unittest.TestCase):
+    """An activated launchd host's enablement, through the REAL start_gate,
+    start_checks and verify_start_delegation, with every other start check
+    passing and both labels enabled and loaded: A1's approved block under
+    the static matrix passes; anything else refuses. The matrix's inputs are
+    built from test_signing_matrix's fixtures; start_inputs reading them is
+    pinned separately."""
+
+    def setUp(self):
+        import test_signing_matrix as tsm
+        self.tsm = tsm
+        self.spec = spec("launchd")
+        good = [rh.check("x", rh.Fact("x", True, "a test"), True, "x")]
+        same = lambda *a, **k: good
+        for mod, name, value in ((hs.ss, "checks", same), (hs.se, "checks", lambda *a, **k: []),
+                                 (hs.hr, "checks", same), (hs, "verify_overlay", same),
+                                 (hs.hk, "verify_placement", same), (hs.hk, "verify_evidence_dir", same),
+                                 (hs.hk, "verify_evidence_binds", same), (hs.hk, "verify_evidence", same),
+                                 (hs.hv, "checks", same), (hs, "verify_recovery_horizon", same),
+                                 (hs, "start_inputs", lambda s, policy_on, p: self.inputs(policy_on))):
+            self.addCleanup(setattr, mod, name, getattr(mod, name))
+            setattr(mod, name, value)
+        self.over = {}
+
+    def inputs(self, policy_on):
+        tsm = self.tsm
+        fields = dict(policy_on=policy_on, gate_ok=True, approved=tsm.approved(), approved_why="",
+                      named=tsm.named(), status=rh.Unresolved("not read"),
+                      witness=lambda h: self.fail("the start gate asked the adoption witness"), now=tsm.NOW)
+        fields.update(self.over)
+        return hs.hk.Signing(**fields)
+
+    def labels(self, body, policy_on=True):
+        path = self.spec.keys.local_config
+        keys = {"containers": [], "live": (path, hashlib.sha256(body).hexdigest()), "read_bytes_": lambda p: body}
+        gate = lambda: hs.start_gate(self.spec, state="active", keys=keys, secret_lock=free_lock, policy_on=policy_on)
+        enabled = {label: False for label in hv.labels(self.spec)}
+        return [c.result for c in hv.verify_enablement(self.spec, enabled, gate, lambda label: True)]
+
+    def test_a1_s_approved_block_passes_enablement(self):
+        self.assertEqual(self.labels(self.tsm.live(self.tsm.SIGNED)), [rh.PASS, rh.PASS])
+
+    def test_an_unapproved_block_fails_enablement(self):
+        other = dict(self.tsm.SIGNED, crypto={"crypto_backend": "openssl"})
+        self.assertEqual(self.labels(self.tsm.live(other)), [rh.FAIL, rh.FAIL])
+
+    def test_a_failing_static_matrix_fails_enablement(self):
+        for label, over, policy_on in (("policy off", {}, False), ("gate not holding", dict(gate_ok=False), True),
+                                       ("stale evidence", dict(named=self.tsm.named(at=self.tsm.NOW - 9 * 86400)), True)):
+            with self.subTest(label):
+                self.over = over
+                self.assertEqual(self.labels(self.tsm.live(self.tsm.SIGNED), policy_on), [rh.FAIL, rh.FAIL])
+
+    def test_unreadable_inputs_leave_enablement_unknown(self):
+        self.assertEqual(self.labels(self.tsm.live(self.tsm.SIGNED), rh.Unresolved("no manifest")),
+                         [rh.UNKNOWN, rh.UNKNOWN])
+
+    def test_unsigned_passes_and_an_unreadable_config_does_not(self):
+        self.assertEqual(self.labels(self.tsm.live()), [rh.PASS, rh.PASS])
+        self.assertEqual(self.labels(b"[1]"), [rh.UNKNOWN, rh.UNKNOWN])
+
+
+class StartInputsTest(unittest.TestCase):
+    """host_setup.start_inputs: the policy's own answer and the document's
+    activation inputs, as verify reads them; the router's status and the
+    adoption witness are never asked."""
+
+    def test_the_policy_answer_passes_through_and_nothing_is_asked_of_the_router(self):
+        self.addCleanup(setattr, hs.hk, "ask_status", hs.hk.ask_status)
+        hs.hk.ask_status = lambda *a, **k: self.fail("the start gate asked the router's status")
+        s = spec("launchd")
+        for answer in (True, False):
+            with self.subTest(policy_on=answer):
+                sg = hs.start_inputs(s, answer, {"rl_sha": "a" * 40, "read": lambda p: b"{}"})
+                self.assertIs(sg.policy_on, answer)
+                self.assertIsInstance(sg.status, rh.Unresolved)
+                self.assertEqual(sg.witness("0" * 64)[0], rh.UNKNOWN)
+        self.assertIsInstance(hs.start_inputs(s, None, {"rl_sha": "a" * 40, "read": lambda p: b"{}"}).policy_on,
+                              rh.Unresolved)
+
+
+class EnablementWiringTest(unittest.TestCase):
+    """verify's host-setup checks hand the enablement gate the same policy
+    answer and partition probes the signing check reads."""
+
+    def test_checks_passes_the_policy_and_the_partition_probes_to_the_gate(self):
+        seen = []
+        self.addCleanup(setattr, hs, "start_gate", hs.start_gate)
+        hs.start_gate = lambda sp, **k: seen.append(k) or True
+        s = spec("launchd")
+        probes = {"rl_sha": "a" * 40}
+        hs.checks(s, production=False, policy_on=True, partition=probes, secret_lock=free_lock,
+                  enablement={"disabled": {label: False for label in hv.labels(s)}, "loaded": lambda label: True},
+                  keys={"containers": [], "status": rh.Unresolved("not asked"),
+                        "witness": lambda h: (rh.UNKNOWN, "not asked")})
+        self.assertEqual([(k.get("policy_on"), k.get("partition")) for k in seen], [(True, probes)])
+
+
+class StartCheckVerbTest(unittest.TestCase):
+    """`amap-sandy.py hub-start-check` reads the fleet policy's answer from
+    the manifest and hands it to the start check."""
+
+    def test_the_verb_passes_the_policy_answer(self):
+        import amap_sandy as prov
+        seen = []
+        for mod, name, value in ((prov.hsu, "hub_start_check", lambda spec_path, **k: seen.append(k) or 0),
+                                 (prov, "delegation_policy", lambda home: "the policy's answer")):
+            self.addCleanup(setattr, mod, name, getattr(mod, name))
+            setattr(mod, name, value)
+        with tempfile.TemporaryDirectory() as home:
+            self.assertEqual(prov.main(["--sandy-home", home, "hub-start-check"]), 0)
+        self.assertEqual([k.get("policy_on") for k in seen], ["the policy's answer"])
+
+
+class A5OnLaunchdTest(unittest.TestCase):
+    """verify --a5 on a launchd host: the signing check's UNKNOWN is excused
+    only with the whole reason an activated router gives under the live
+    token when the adoption witness stops at the kind clause, and only when
+    every other check passes. The reason is the one verify_signing emits,
+    through the real adoption witness and a launchd host view."""
+
+    def setUp(self):
+        import test_signing_matrix as tsm
+        self.tsm = tsm
+        self.spec = spec("launchd")
+        self.live = tsm.live(tsm.SIGNED)
+
+    def emitted(self, kind="launchd"):
+        """verify_signing's own row for an activated router on this host."""
+        tsm, raw = self.tsm, self.live
+        sha = hashlib.sha256(raw).hexdigest()
+        t = {"dev": 1, "ino": 7, "ctime_ns": 10 ** 18, "size": len(raw), "sha256": sha, "now": 0.0,
+             "boot_id": "b", "fstype": "virtiofs"}
+        view = {"kind": kind, "platform": "linux", "boot_id": "b", "fstype": "virtiofs", "dev": 1, "ino": 7,
+                "ctime_ns": 10 ** 18, "sha256": sha, "now": 10 ** 9 + 60}
+        sg = hs.hk.Signing(policy_on=True, gate_ok=True, approved=tsm.approved(), approved_why="", named=tsm.named(),
+                           status=tsm.fresh_status(), now=tsm.NOW,
+                           witness=lambda h: hs.hk.adoption(lambda: dict(t), lambda: tsm.fresh_status(polls=1), h,
+                                                            host_view=lambda: dict(view), sleep=lambda x: None))
+        bind = rh.check("bind", rh.Fact("live config", 1, "test"), 1, "r")
+        return hs.hk.verify_signing(self.spec.keys, raw, bind, sg)
+
+    def expected(self, found, body=None):
+        return hs.a5_expected(self.spec, found, lambda p: self.live if body is None else body)
+
+    def test_the_emitted_reason_is_the_one_excused(self):
+        row = self.emitted()
+        self.assertEqual(row.result, rh.UNKNOWN)
+        self.assertEqual(row.reason, hs.hk.a5_launchd_reason(self.tsm.RID))
+        self.assertIs(self.expected([row]), row)
+
+    def test_nothing_else_is_excused(self):
+        row = self.emitted()
+        other_kind = rh.unknown(row.claim, row.expected, row.reason.replace(hs.hk.KIND_NOT_LINUX, "another clause"),
+                                row.remedy)
+        other_token = self.tsm.live(dict(self.tsm.SIGNED, partition_verified="r9:" + "a" * 64))
+        for label, found, body in (("another clause", [other_kind], None),
+                                   ("another token's run", [row], other_token),
+                                   ("no token", [row], self.tsm.live()),
+                                   ("unreadable config", [row], b"{"),
+                                   ("two signing rows", [row, row], None),
+                                   ("a FAIL", [rh.check(row.claim, row.expected, row.reason, row.remedy)], None)):
+            with self.subTest(label):
+                self.assertIsNone(self.expected(found, body))
+        self.assertIsNone(hs.a5_expected(spec("systemd"), [row], lambda p: self.live))
+
+    def section(self, found, a5):
+        for mod, name, value in ((hs, "overlay_section", lambda overlay: {}), (hs, "load_spec", lambda sec: self.spec),
+                                 (hs, "checks", lambda *a, **k: found), (hs, "print_notes", lambda *a, **k: None),
+                                 (hs.hk, "read_bytes", lambda p: self.live)):
+            self.addCleanup(setattr, mod, name, getattr(mod, name))
+            setattr(mod, name, value)
+        said = []
+        return hs.verify_section(Path("/overlay.json"), out=said.append, a5=a5), "\n".join(said)
+
+    def test_verify_a5_passes_only_with_every_other_check_passing(self):
+        row, good = self.emitted(), rh.check("x", rh.Fact("x", True, "a test"), True, "x")
+        bad = rh.check("y", rh.Fact("y", True, "a test"), False, "fix y")
+        self.assertEqual(self.section([good, row], a5=True)[0], 0)
+        self.assertEqual(self.section([good, row], a5=False)[0], 1)
+        self.assertEqual(self.section([bad, row], a5=True)[0], 1)
+        rc, said = self.section([good, row], a5=True)
+        self.assertIn("UNKNOWN", said)                         # still printed as what it is
+        self.assertIn("the one expected non-pass", said)
+
+
+class VerifyA5FlagTest(unittest.TestCase):
+    """`verify --a5` reaches the host-setup section, and plain verify does
+    not ask for it."""
+
+    def test_the_flag_reaches_the_section(self):
+        import argparse
+        import amap_sandy as prov
+        seen = []
+        for mod, name, value in ((prov.hsu, "verify_section", lambda overlay, **k: seen.append(k.get("a5")) or 0),
+                                 (prov.ha, "overlay_path", lambda p: Path("/overlay.json")),
+                                 (prov, "delegation_policy", lambda home: True)):
+            self.addCleanup(setattr, mod, name, getattr(mod, name))
+            setattr(mod, name, value)
+        for flag in (True, False):
+            prov.run_verify_host_setup(argparse.Namespace(overlay=None, a5=flag), Path("/home"))
+        self.assertEqual(seen, [True, False])

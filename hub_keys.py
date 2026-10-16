@@ -22,9 +22,10 @@ The host-setup document's `keys` section (it needs a `hub` section) names:
   asks the running local router, from inside its container, which file its
   `ROUTER_CONFIG` names and that file's sha256. verify holds a delegation
   block to the policy, the harness gate and the activation
-  (`verify_signing`); the hub-link router's start gate refuses any block
-  (`verify_unsigned_start`). Either passes only when the router reads this
-  file, byte for byte.
+  (`verify_signing`); the hub-link router's start gate admits only A1's
+  approved block under the static part of that matrix
+  (`verify_start_delegation`). Either passes only when the router reads
+  this file, byte for byte.
 
 The key-read probe runs the email router's own rendered run spec with only
 these changes: removed after `run`, no network, its own name and labels, no
@@ -483,6 +484,22 @@ def ask_live_config(spec: Any, container: str) -> Any:
 
 
 SIGNING_CLAIM = "the local router signs exactly as the policy and the gate allow"
+START_CLAIM = ("the local router's config {path} carries no delegation block, or exactly A1's approved one under "
+               "current passing evidence")
+#: The signing check's reason when the router signs as approved, before the
+#: adoption witness's; `run_id` is the token's evidence run.
+SIGNING_ACTIVATED = "it signs under the token of {run_id}, current and passing"
+#: The adoption witness's first platform clause: the document declares no
+#: Linux host.
+KIND_NOT_LINUX = "the host-setup document declares no Linux host (its supervision is not systemd)"
+
+
+def a5_launchd_reason(run_id: str) -> str:
+    """The signing check's whole reason for a router signing as approved
+    under the token of `run_id`, on a host whose document declares launchd:
+    the verdict's, then the adoption witness's unsupported-platform reason
+    with its kind clause. Composed by the code that emits it."""
+    return f"{SIGNING_ACTIVATED.format(run_id=run_id)}; {UNSUPPORTED}; {KIND_NOT_LINUX}"
 
 
 @dataclass(frozen=True)
@@ -544,7 +561,7 @@ def _verdict(doc: Dict[str, Any], policy_on: bool, gate_ok: bool, sg: Signing) -
     age = sg.now - pe.at_seconds(named["at"])
     if age > pe.FRESH_FOR_S or age < -pe.CLOCK_TOLERANCE_S:
         return rh.FAIL, f"its token's document ({named['run_id']}) is not current: re-run A2 to A5, or un-render"
-    return rh.PASS, f"it signs under the token of {named['run_id']}, current and passing"
+    return rh.PASS, SIGNING_ACTIVATED.format(run_id=named["run_id"])
 
 
 def verify_signing(ks: KeySpec, raw: Any, bind: rh.Check, sg: Signing) -> rh.Check:
@@ -709,7 +726,7 @@ def platform_problem(host: Dict[str, Any], seen: Dict[str, Any]) -> str:
     inode (device, inode and ctime), on a local ext4, xfs or btrfs as both
     sides' mountinfo shows it."""
     if host.get("kind") != "systemd":
-        return "the host-setup document declares no Linux host (its supervision is not systemd)"
+        return KIND_NOT_LINUX
     if host.get("platform") != "linux":
         return "verify does not run on Linux"
     if host.get("boot_id") != seen.get("boot_id"):
@@ -864,17 +881,36 @@ def _bind(ks: KeySpec, live: Any, read_bytes_: Callable[[str], bytes]) -> Tuple[
                          do_not="never point keys.local_config at the file the router happens to read")
 
 
-def verify_unsigned_start(ks: KeySpec, live: Any = None,
-                          read_bytes_: Callable[[str], bytes] = read_bytes) -> List[rh.Check]:
-    """The hub-link router's start gate: the local router reads
-    `local_config`, byte for byte, and that file carries no delegation
-    block. It reads no policy, gate, record or status, so it decides on a
-    host where none is readable; a delegation block, whatever approved it,
-    refuses the start."""
+def static_verdict(doc: Dict[str, Any], sg: Signing) -> Tuple[str, str]:
+    """(PASS | FAIL | UNKNOWN, why) for a config carrying a delegation block,
+    over d2's static matrix only: the policy enables delegation, the harness
+    gate holds, the block is byte for byte A1's approved one and its token
+    names current passing evidence bound to that A1. No status and no
+    adoption witness are read. An input that cannot be read decides only
+    where every one of its values gives the same verdict; otherwise UNKNOWN."""
+    seen = {_verdict(doc, p, g, sg)
+            for p in ((sg.policy_on,) if isinstance(sg.policy_on, bool) else (False, True))
+            for g in ((sg.gate_ok,) if isinstance(sg.gate_ok, bool) else (False, True))}
+    if len({r for r, _ in seen}) > 1:
+        unread = [v.reason for v in (sg.policy_on, sg.gate_ok) if isinstance(v, rh.Unresolved)]
+        return rh.UNKNOWN, "the verdict depends on what could not be read: " + "; ".join(unread)
+    return sorted(seen)[0]
+
+
+def verify_start_delegation(ks: KeySpec, live: Any = None, read_bytes_: Callable[[str], bytes] = read_bytes,
+                            signing: Optional[Signing] = None) -> List[rh.Check]:
+    """The hub-link router's start gate on the local router's config: the
+    router reads `local_config`, byte for byte, and that file carries no
+    delegation block, or exactly A1's approved block with the static matrix
+    holding (`static_verdict`, over `signing`'s real inputs). Without
+    `signing`, any block is UNKNOWN. The adoption witness is verify's: the
+    hub-link router's start changes nothing the local router signs or reads."""
     raw, bind = _bind(ks, live, read_bytes_)
-    claim = f"the local router's config {ks.local_config} has no {DELEGATION_KEY} block"
-    want = _fact("delegation", False, "the hub-link router starts only beside a local router that signs nothing")
-    remedy = f"render the config again with install --apply, which renders no {DELEGATION_KEY} member"
+    claim = START_CLAIM.format(path=ks.local_config)
+    want = _fact("delegation", True, "the hub-link router starts beside a local router that signs nothing, or "
+                                     "signs only as A1 approved under current passing evidence")
+    remedy = (f"render the config again with install --apply, which renders no {DELEGATION_KEY} member, or "
+              "complete A1 to A5")
     if isinstance(raw, rh.Unresolved):
         return [bind, rh.unknown(claim, want, raw.reason, "render and place the local router's config")]
     try:
@@ -883,12 +919,20 @@ def verify_unsigned_start(ks: KeySpec, live: Any = None,
         return [bind, rh.unknown(claim, want, f"{ks.local_config} is not readable JSON: {e}", "render it again")]
     if not isinstance(doc, dict):
         return [bind, rh.unknown(claim, want, f"{ks.local_config} is not a JSON object", "render it again")]
-    if DELEGATION_KEY in doc:
-        return [bind, rh.check(claim, want, True, remedy, do_not="never add the block by hand to test signing")]
+    if DELEGATION_KEY not in doc:
+        result, why = rh.PASS, "it carries no delegation block"
+    elif signing is None:
+        result, why = rh.UNKNOWN, "it carries a delegation block, and no activation inputs were read"
+    else:
+        result, why = static_verdict(doc, signing)
+    if result == rh.FAIL:
+        return [bind, rh.check(claim, want, why, remedy, do_not="never add or keep a delegation block by hand")]
+    if result == rh.UNKNOWN:
+        return [bind, rh.unknown(claim, want, why, remedy)]
     if bind.result is not rh.PASS:
-        return [bind, rh.unknown(claim, want, f"the file has none, but the local router is not shown to read it: "
+        return [bind, rh.unknown(claim, want, f"{why}, but the local router is not shown to read it: "
                                               f"{bind.reason or 'it reads another file'}", "make the binding above pass")]
-    return [bind, rh.check(claim, want, False, remedy)]
+    return [bind, rh.check(claim, want, True, remedy)]
 
 
 def verify_no_delegation(ks: KeySpec, live: Any = None,
