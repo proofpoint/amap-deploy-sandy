@@ -267,9 +267,9 @@ class HopPluginTest(unittest.TestCase):
                                                 "RW": False}], started=self.later)
         self.assertEqual(self.claim(live=live).check.result, rh.PASS)
 
-    def test_the_plugin_rewritten_in_place_after_the_start_is_unknown(self):
-        """An in-place overwrite leaves the directory's ctime alone; the
-        file's own ctime is what moves."""
+    def with_file_ctime(self, delta):
+        """The claim with the plugin file's ctime at `delta` seconds from the
+        container's start (`self.later`, which carries a .5 fraction)."""
         start = bi.started_at(container(started=self.later))
         real = os.lstat
 
@@ -277,10 +277,32 @@ class HopPluginTest(unittest.TestCase):
             st = real(p)
             if p == self.path:
                 return os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, st.st_uid, st.st_gid,
-                                       st.st_size, st.st_atime, st.st_mtime, start + 10))
+                                       st.st_size, st.st_atime, st.st_mtime, start + delta))
             return st
-        c = bi.hop_plugin(bi.ROLE_HOP, "zz-r1", container(mounts=[self.mount()], started=self.later),
-                          self.path, self.sha, lstat=lstat)
+        return bi.hop_plugin(bi.ROLE_HOP, "zz-r1", container(mounts=[self.mount()], started=self.later),
+                             self.path, self.sha, lstat=lstat)
+
+    def test_the_plugin_rewritten_in_place_after_the_start_is_unknown(self):
+        """An in-place overwrite leaves the directory's ctime alone; the
+        file's own ctime is what moves. A millisecond after a start with a
+        fraction counts: the comparison is not rounded to whole seconds."""
+        for delta in (10, 0.001):
+            with self.subTest(delta=delta):
+                c = self.with_file_ctime(delta)
+                self.assertEqual(c.check.result, rh.UNKNOWN)
+                self.assertEqual(c.check.reason, "the plugin file changed after the container started")
+                self.assertNotIn("observed_sha256", c.extras())
+
+    def test_the_plugin_changed_just_before_the_start_passes(self):
+        self.assertEqual(self.with_file_ctime(-0.001).check.result, rh.PASS)
+
+    def test_a_symlinked_plugin_is_unknown(self):
+        """The pinned bytes behind a symlink: the router's open follows a
+        link this host does not vouch for."""
+        target = os.path.join(self.dir, "real-plugin.py")
+        os.rename(self.path, target)
+        os.symlink(target, self.path)
+        c = self.claim()
         self.assertEqual(c.check.result, rh.UNKNOWN)
         self.assertEqual(c.check.reason, "the plugin file changed after the container started")
         self.assertNotIn("observed_sha256", c.extras())
