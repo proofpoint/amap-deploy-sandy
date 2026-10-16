@@ -2196,18 +2196,19 @@ def _approved_name_of(raw):
     return name if isinstance(name, str) and _NAME.fullmatch(name) else None
 
 
-def _back_out(name, kept):
+def _back_out(name, kept, pre_sha=None):
     """What brings the local router back after a prospective run that did
     not pass: it was stopped for A2, and its live config is the unchanged
     pre-activation one. A kept run's remedy comes first."""
     start = f"docker start {name}" if name else "docker start <the local router's container>"
+    sha = f" (its sha256 {pre_sha})" if pre_sha else ""
     if kept:
         return (f"back-out: first follow the remedy printed for {', '.join(kept)} (kept: an effect is not shown "
                 f"done), then {start}")
-    return f"back-out: the local router was stopped for A2 and its live config is unchanged: {start}"
+    return f"back-out: the local router was stopped for A2 and its live config is unchanged{sha}: {start}"
 
 
-def _prospective_refusal(efd, host, values, approved, recovery, docker, exec_root):
+def _prospective_refusal(efd, host, values, approved, recovery, docker, exec_root, seen):
     """Why a prospective run (A2) may not start, or "": every read here is a
     guard, made before W2 and any effect. G1: the live config carries no
     delegation. G2: no router a weekly pass certified (recovery.json's, for
@@ -2217,7 +2218,8 @@ def _prospective_refusal(efd, host, values, approved, recovery, docker, exec_roo
     stopped, since nothing the writer can read shows which config a running
     one adopted. Also A1's record must be this host's, for this config.
     Returns (why, whether the local router was found running or could not
-    be said not to run): its back-out is then not to start it."""
+    be said not to run): its back-out is then not to start it. `seen`
+    receives the pre-activation live config's sha256, from G1's own read."""
     try:
         record = _strict_json(approved)
         name, rec_host, final = record["spec"]["name"], record["host"], record["final_config_path"]
@@ -2228,13 +2230,15 @@ def _prospective_refusal(efd, host, values, approved, recovery, docker, exec_roo
     try:
         cfd, cname = _config_dir(values["live_config"])
         try:
-            doc = _strict_json(_read_at(cfd, cname, DOC_MAX)[0])
+            raw = _read_at(cfd, cname, DOC_MAX)[0]
+            doc = _strict_json(raw)
         finally:
             os.close(cfd)
     except (OSError, ValueError, UnicodeDecodeError, Tooling) as e:
         return f"the live config cannot be read: {e}", False
     if not isinstance(doc, dict) or "delegation" in doc:
         return "A2 is pre-activation: the live config already carries delegation", False
+    seen["pre_activation_sha256"] = hashlib.sha256(raw).hexdigest()
     engine = _Engine(docker, values["engine"], exec_root)
     if recovery and recovery["host"] == host and recovery["live_config_path"] == values["live_config"] \
             and recovery["engine"] == values["engine"] and recovery["evidence_dir"] == values["evidence_dir"]:
@@ -2316,7 +2320,7 @@ def partition_weekly(exec_root, host, document, sha256, activation, activation_s
             if prospective:
                 rec["router_name"] = _approved_name_of(approved)
                 refused, rec["router_up"] = _prospective_refusal(efd, host, values, approved, recovery, docker,
-                                                                 exec_root)
+                                                                 exec_root, rec)
                 if refused:
                     said.append(f"refused, nothing written: {refused}")
                     return EXIT_HANDOFF
@@ -2399,6 +2403,9 @@ def partition_weekly(exec_root, host, document, sha256, activation, activation_s
             if code == EXIT_PASS and prospective:
                 said.append(f"{rid}: A2 passed; its evidence carries the token for A3 "
                             f"({passed['why']}); no stop target is recorded before activation")
+                said.append(f"pre-activation live config sha256 {rec['pre_activation_sha256']}: after A3's root "
+                            "place, the back-out is install --apply (delegation-free) and a file of this sha256, "
+                            "then docker start")
             elif code == EXIT_PASS:
                 why = _verified_target(_Engine(docker, values["engine"], run_dir), passed, values)
                 if why:
@@ -2483,7 +2490,7 @@ def partition_weekly(exec_root, host, document, sha256, activation, activation_s
             publish()
         final = _status(code) if rec["status"] else code
         if prospective and final != EXIT_PASS and not rec.get("router_up"):
-            said.append(_back_out(rec.get("router_name"), sorted(rec["kept"])))
+            said.append(_back_out(rec.get("router_name"), sorted(rec["kept"]), rec.get("pre_activation_sha256")))
         return final
     finally:
         for s in said:

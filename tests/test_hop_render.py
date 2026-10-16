@@ -656,6 +656,19 @@ class InstallRenderTest(unittest.TestCase):
             rc = prov.run_render_router(args, self.t, [], {}, apply=apply)
         return rc, out.getvalue() + err.getvalue()
 
+    def test_plain_install_never_renders_delegation_whatever_the_policy(self):
+        """d2.7 §AB: only A1's staged bytes and A3's A1 + T carry the block;
+        plain install --apply is delegation-free with the policy turning it
+        on, so it is the back-out after A3's place."""
+        import argparse, contextlib, io
+        policy = {"hop_link": {"link": "link-a", "trusted_fleet_hosts": ["beta.internal"], "egress": True,
+                               "delegation": {"inbound": True}}}
+        args = argparse.Namespace(state_dir=None, overlay=None, decommission_hop=False)
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            rc = prov.run_render_router(args, self.t, [], policy, apply=True)
+        self.assertEqual(rc, 0)
+        self.assertNotIn("delegation", json.loads((self.t / "router.json").read_text()))
+
     def test_the_hop_keys_are_written_and_validated_by_the_hop_loader(self):
         rc, said = self.render()
         self.assertEqual(rc, 0, said)

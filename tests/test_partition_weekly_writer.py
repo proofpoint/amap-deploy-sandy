@@ -1695,6 +1695,8 @@ class ProspectiveWriterTest(unittest.TestCase):
         p = self.run_a2()
         self.assertEqual(p.returncode, hs.EXIT_PASS, p.stdout + p.stderr)
         self.assertIn("A2 passed", p.stdout + p.stderr)
+        sha = hashlib.sha256(open(self.h.conf, "rb").read()).hexdigest()
+        self.assertIn(f"pre-activation live config sha256 {sha}", p.stdout + p.stderr)
         self.assertEqual(open(f"{self.h.exec}/recovery.json", "rb").read(), rec)
         self.assertFalse(os.path.exists(f"{self.h.ev}/stop-target.json"))
         self.assertEqual((self.h.runs(), self.h.stops()), ([], []))
@@ -1755,8 +1757,9 @@ class ProspectiveWriterTest(unittest.TestCase):
         self.h.plan([["expect", B], ["evidence", B, PASS], ["outcome", 2, None]])
         p = self.run_a2()
         self.assertEqual(p.returncode, hs.EXIT_HANDOFF, p.stdout + p.stderr)
-        self.assertIn(f"back-out: the local router was stopped for A2 and its live config is unchanged: "
-                      f"docker start {self.NAME}", p.stdout + p.stderr)
+        sha = hashlib.sha256(open(self.h.conf, "rb").read()).hexdigest()
+        self.assertIn(f"back-out: the local router was stopped for A2 and its live config is unchanged "
+                      f"(its sha256 {sha}): docker start {self.NAME}", p.stdout + p.stderr)
 
     def test_a_refusal_with_the_router_running_prints_no_start(self):
         self.h.containers({self.NAME: True})
