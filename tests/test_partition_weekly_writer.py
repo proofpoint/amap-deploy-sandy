@@ -1697,6 +1697,8 @@ class ProspectiveWriterTest(unittest.TestCase):
         self.assertIn("A2 passed", p.stdout + p.stderr)
         sha = hashlib.sha256(open(self.h.conf, "rb").read()).hexdigest()
         self.assertIn(f"pre-activation live config sha256 {sha}", p.stdout + p.stderr)
+        self.assertIn("the host's live config file, not the container's view, must parse as a JSON object with no "
+                      "delegation member (if it carries one, or cannot be read or parsed, stop", p.stdout + p.stderr)
         self.assertEqual(open(f"{self.h.exec}/recovery.json", "rb").read(), rec)
         self.assertFalse(os.path.exists(f"{self.h.ev}/stop-target.json"))
         self.assertEqual((self.h.runs(), self.h.stops()), ([], []))

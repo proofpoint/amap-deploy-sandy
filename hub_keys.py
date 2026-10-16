@@ -593,22 +593,52 @@ def verify_signing(ks: KeySpec, raw: Any, bind: rh.Check, sg: Signing) -> rh.Che
 #: The config the local router reads, read from inside its container in one
 #: exec: its identity, its change time, its size, its bytes' sha256, and the
 #: container's own clock.
-#: The filesystem type of the mount holding `path`, from mountinfo's text:
-#: the longest mount point at or above it (its escapes decoded), the type
-#: after the " - " separator. Shared verbatim by the host step and the
-#: in-container script, so both sides answer by one rule.
+#: Shared verbatim by the host step and the in-container script, so both
+#: sides answer by one rule:
+#: - `open_resolved`: the config's real path, resolved once, and the file at
+#:   that path opened without following a link, stat'ed and read through one
+#:   descriptor; a path that resolves elsewhere afterwards is an error, never
+#:   an answer;
+#: - `mount_fstype`: the filesystem type of the mount holding a path, from
+#:   mountinfo's text: the longest mount point at or above it, on a whole
+#:   path component, the type after the " - " separator. Octal escapes are
+#:   decoded as bytes and the result read as a file name, so a non-ASCII
+#:   name is never narrowed to Latin-1.
 MOUNT_FSTYPE_SRC = (
+    "import os\n"
     "def unescape_mount(s):\n"
-    "    out, i = [], 0\n"
-    "    while i < len(s):\n"
-    "        o = s[i + 1:i + 4]\n"
-    "        if s[i] == '\\\\' and len(o) == 3 and all(c in '01234567' for c in o):\n"
-    "            out.append(chr(int(o, 8)))\n"
+    "    b, out, i = os.fsencode(s), bytearray(), 0\n"
+    "    while i < len(b):\n"
+    "        o = b[i + 1:i + 4]\n"
+    "        if b[i] == 92 and len(o) == 3 and all(48 <= c <= 55 for c in o):\n"
+    "            out.append(int(o, 8))\n"
     "            i += 4\n"
     "        else:\n"
-    "            out.append(s[i])\n"
+    "            out.append(b[i])\n"
     "            i += 1\n"
-    "    return ''.join(out)\n"
+    "    return os.fsdecode(bytes(out))\n"
+    "def read_mountinfo():\n"
+    "    with open('/proc/self/mountinfo', 'rb') as f:\n"
+    "        return os.fsdecode(f.read())\n"
+    "def open_resolved(path):\n"
+    "    real = os.path.realpath(path)\n"
+    "    fd = os.open(real, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)\n"
+    "    try:\n"
+    "        st = os.fstat(fd)\n"
+    "        if st.st_mode & 0o170000 != 0o100000:\n"
+    "            raise OSError(f'{real} is not a regular file')\n"
+    "        b = bytearray()\n"
+    "        while True:\n"
+    "            c = os.read(fd, 65536)\n"
+    "            if not c:\n"
+    "                break\n"
+    "            b += c\n"
+    "    finally:\n"
+    "        os.close(fd)\n"
+    "    again = os.stat(real, follow_symlinks=False)\n"
+    "    if os.path.realpath(path) != real or (again.st_dev, again.st_ino) != (st.st_dev, st.st_ino):\n"
+    "        raise OSError(f'{path} resolved to another file while it was read')\n"
+    "    return real, st, bytes(b)\n"
     "def mount_fstype(path, text, exact=False):\n"
     "    best = None\n"
     "    for line in text.splitlines():\n"
@@ -624,6 +654,8 @@ MOUNT_FSTYPE_SRC = (
 _ns: Dict[str, Any] = {}
 exec(MOUNT_FSTYPE_SRC, _ns)  # noqa: S102 -- this module's own constant, so the host and container rule is one text
 mount_fstype = _ns["mount_fstype"]
+read_mountinfo = _ns["read_mountinfo"]
+open_resolved = _ns["open_resolved"]
 
 
 def host_fstype(path: str, mountinfo: str) -> Any:
@@ -635,16 +667,9 @@ def host_fstype(path: str, mountinfo: str) -> Any:
 #: 1 ns granularity, and that hold the inode locally: the supported set.
 LOCAL_FS = ("ext4", "xfs", "btrfs")
 CONFIG_TUPLE_SCRIPT = ("import hashlib,json,os,time\n" + MOUNT_FSTYPE_SRC +
-                       "p=os.environ['ROUTER_CONFIG']\n"
-                       "fd=os.open(p,os.O_RDONLY)\n"
-                       "st=os.fstat(fd)\n"
-                       "b=b''\n"
-                       "while True:\n"
-                       "    c=os.read(fd,65536)\n"
-                       "    if not c: break\n"
-                       "    b+=c\n"
+                       "real,st,b=open_resolved(os.environ['ROUTER_CONFIG'])\n"
                        "boot=open('/proc/sys/kernel/random/boot_id').read().strip()\n"
-                       "fs=mount_fstype(os.path.realpath(p),open('/proc/self/mountinfo').read(),exact=True)\n"
+                       "fs=mount_fstype(real,read_mountinfo(),exact=True)\n"
                        "print(json.dumps({'dev':st.st_dev,'ino':st.st_ino,'ctime_ns':st.st_ctime_ns,'size':st.st_size,"
                        "'sha256':hashlib.sha256(b).hexdigest(),'now':time.time(),'boot_id':boot,'fstype':fs}))\n")
 TUPLE_KEYS = ("dev", "ino", "ctime_ns", "size", "sha256", "boot_id", "fstype")
@@ -695,8 +720,10 @@ def platform_problem(host: Dict[str, Any], seen: Dict[str, Any]) -> str:
 
 def inode_problem(host: Dict[str, Any], seen: Dict[str, Any]) -> str:
     """On the supported platform, why the router does not read the host's
-    inode as the host sees it, or "": a replaced or changed bind."""
-    if (host.get("dev"), host.get("ino"), host.get("ctime_ns")) != (seen["dev"], seen["ino"], seen["ctime_ns"]):
+    inode as the host sees it, or "": a replaced or changed bind. The host's
+    sha256 is of the bytes read through the descriptor it stat'ed."""
+    if (host.get("dev"), host.get("ino"), host.get("ctime_ns"), host.get("sha256")) \
+            != (seen["dev"], seen["ino"], seen["ctime_ns"], seen["sha256"]):
         return ("the local router binds a replaced inode, or one changed since; recreate it with "
                 "docker/run.sh --detach (A4)")
     return ""
@@ -717,7 +744,7 @@ def adoption(read_tuple: Callable[[], Any], read_status: Callable[[], Any], host
     refused reload. 5: the same inode, change time, size and bytes: a write
     moved its ctime, which restoring the bytes cannot undo.
     `host_view()` gives the host's {kind, platform, boot_id, fstype, dev,
-    ino, ctime_ns, now} for the live config, read in one host step; the one
+    ino, ctime_ns, sha256, now} for the live config, read in one host step; the one
     read at T1 serves both the settle and the comparison."""
     t1 = read_tuple()
     if isinstance(t1, rh.Unresolved):

@@ -1137,18 +1137,19 @@ def partition_host(spec: Spec) -> Any:
 
 def host_view(spec: Spec) -> Any:
     """The document's declared supervision, the host's platform, kernel
-    boot_id and the live config's filesystem type, device, inode and ctime
-    with the host's clock, read together: the host stamps that ctime."""
+    boot_id and the live config's filesystem type, device, inode, ctime and
+    sha256 with the host's clock, read together: the host stamps that ctime.
+    The config is resolved once and that file alone is stat'ed, read and
+    looked up in mountinfo (hub_keys.open_resolved)."""
     try:
-        st = os.stat(spec.keys.local_config)
+        real, st, raw = hk.open_resolved(spec.keys.local_config)
         boot = open("/proc/sys/kernel/random/boot_id").read().strip() if sys.platform == "linux" else None
-        fs = hk.host_fstype(spec.keys.local_config, open("/proc/self/mountinfo").read()) \
-            if sys.platform == "linux" else None
+        fs = hk.mount_fstype(real, hk.read_mountinfo()) if sys.platform == "linux" else None
     except OSError as e:
         return rh.Unresolved(f"cannot inspect {spec.keys.local_config} or the host's kernel: {e}")
     return {"kind": spec.supervision.kind if spec.supervision is not None else None, "platform": sys.platform,
             "boot_id": boot, "fstype": fs, "dev": st.st_dev, "ino": st.st_ino, "ctime_ns": st.st_ctime_ns,
-            "now": time.time()}
+            "sha256": hashlib.sha256(raw).hexdigest(), "now": time.time()}
 
 
 def signing_inputs(spec: Spec, policy_on: Any, p: Dict[str, Any], k: Dict[str, Any]) -> hk.Signing:

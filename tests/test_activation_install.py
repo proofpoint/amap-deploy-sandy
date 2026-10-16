@@ -18,7 +18,7 @@ import host_setup as hs
 import hop_router as hp
 import partition_activation as pa
 import partition_evidence as pe
-from test_hop_render import FLEET_DOMAIN, link, router_doc
+from test_hop_render import FLEET_DOMAIN, link, router_doc, spec
 from test_partition_evidence import AT, NOW, build
 from test_partition_setup import doc as partition_doc
 from test_hub_runtime import setUpModule, tearDownModule  # noqa: F401 -- the fixture's pins, restored
@@ -167,3 +167,136 @@ class CliTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CommandTest(unittest.TestCase):
+    """`install --activate` through install's real entry (run_sync): both
+    arguments are checked, and every refusal propagates, before ANY write.
+    The whole throwaway tree is compared before and after. Collaborators
+    that would reach sandy, the engine or the hop checkout are stubbed, as in
+    test_hop_render's InstallRenderTest; the activation verdict itself is
+    activation_install.activate's, proved above, stubbed here per letter."""
+
+    def setUp(self):
+        import argparse
+        import tempfile
+        from pathlib import Path
+        from types import SimpleNamespace
+        import amap_sandy as prov
+        import delegation_render as dr
+        import partition_setup as ps
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        self.t = Path(td.name)
+        self.home = self.t / "home"
+        manifest = prov.feature_manifest_path(self.home)
+        manifest.parent.mkdir(parents=True)
+        manifest.write_text("{}\n")
+        (self.t / "run").mkdir()
+        self.prov, self.ai_ = prov, ai
+        self.spec = SimpleNamespace(
+            secrets=SimpleNamespace(run_dir=str(self.t / "run"), writer_dir="/opt/ex/libexec"),
+            partition=SimpleNamespace(tools={"python3": "/usr/bin/python3"}), keys=SimpleNamespace(local_config="/x"),
+            gate=None, overlay_pin={"commit": "a" * 40}, hub=SimpleNamespace(host_label="alpha"),
+            router=SimpleNamespace(container="router-a"))
+        self.policy = {"fleet_domain": FLEET_DOMAIN, "hop_link": {"link": "link-a", "trusted_fleet_hosts": ["beta.internal"],
+                                                                  "egress": True, "delegation": {"inbound": False}}}
+        self.verdict = (None, ["(a) the harness gate does not hold"])
+        self.asked = []
+        base = {"state_dir": str(self.t / "state"), "instances_dir": str(self.t / "inst"),
+                "selected_json": str(self.t / "sel.json")}
+        self.base = base
+
+        def hop_router_keys(*a, **k):
+            if k.get("spec_out") is not None:
+                k["spec_out"].append(self.spec)
+            return {}, []
+        stubs = {
+            (prov.fp, "load_policy"): lambda p: dict(self.policy),
+            (prov, "discover_sandboxes"): lambda sandy: self.asked.append(sandy) or [],
+            (prov, "router_sibling_path"): lambda home: self.t / "router.json",
+            (prov, "load_membership"): lambda home, boxes: {},
+            (prov, "sibling_state_dir"): lambda home, explicit: self.t / "state",
+            (prov, "render_router_sibling"): lambda *a, **k: {"_doc": dict(base), "_warnings": []},
+            (prov, "install_router_state_dir"): lambda *a, **k: self.fail("state_dir made on the activation path"),
+            (prov, "run_provision"): lambda *a, **k: self.fail("provisioned on the activation path"),
+            (prov, "hop_router_keys"): hop_router_keys,
+            (prov, "validate_with_router"): lambda doc: None,
+            (hp, "validate_with_hop_router"): lambda doc, checkout: None,
+            (hp, "loader_roots"): lambda doc, checkout: [],
+            (hp, "plugin_nesting_problems"): lambda doc, roots: [],
+            (ps, "gate_problems"): lambda *a, **k: [],
+            (ai, "activate"): lambda **k: self.verdict,
+        }
+        for (mod, name), value in stubs.items():
+            self.addCleanup(setattr, mod, name, getattr(mod, name))
+            setattr(mod, name, value)
+        self.args = lambda **over: argparse.Namespace(**dict(
+            dict(apply=True, activate="r1", activation_sha256="a" * 64, sandy="sandy", overlay=None, state_dir=None,
+                 decommission_hop=False, connector_src=None, servers=None), **over))
+
+    def tree(self):
+        return {str(p): (p.read_bytes() if p.is_file() else None) for p in sorted(self.t.rglob("*"))}
+
+    def install(self, args):
+        import contextlib
+        import io
+        before = self.tree()
+        err, self.out = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(self.out), contextlib.redirect_stderr(err):
+            rc = self.prov.run_sync(args, self.home, self.t / "boxes")
+        return rc, before, self.tree(), err.getvalue()
+
+    def test_either_argument_alone_writes_nothing_and_refuses(self):
+        for over in (dict(activation_sha256=None), dict(activate=None), dict(activate="", activation_sha256="")):
+            with self.subTest(args=over):
+                rc, before, after, err = self.install(self.args(**over))
+                self.assertEqual(rc, 2)
+                self.assertEqual(after, before)
+                self.assertIn("go together", err)
+                self.assertEqual(self.asked, [])           # refused before sandy is asked anything
+
+    def test_no_manifest_refuses_before_anything_is_read(self):
+        self.prov.feature_manifest_path(self.home).unlink()
+        rc, before, after, err = self.install(self.args())
+        self.assertEqual((rc, after, self.asked), (2, before, []))
+        self.assertIn("cannot activate — no ", err)
+
+    def test_each_refusal_propagates_and_writes_nothing(self):
+        for letter in ("(a)", "(b)", "(c)", "(d)", "(e)", "(f)"):
+            with self.subTest(refusal=letter):
+                self.verdict = (None, [f"{letter} refused for this row"])
+                rc, before, after, err = self.install(self.args())
+                self.assertEqual(rc, 2)
+                self.assertEqual(after, before)
+                self.assertIn(f"{letter} refused for this row", err)
+
+    def test_a_passing_a3_writes_only_the_activation_config_into_the_run_directory(self):
+        self.verdict = (b'{"activated": true}\n', [])
+        rc, before, after, err = self.install(self.args())
+        self.assertEqual(rc, 0, err)
+        added = set(after) - set(before)
+        self.assertEqual(added, {str(self.t / "run" / ai.ACTIVATED_NAME)})
+        self.assertEqual({k: v for k, v in after.items() if k in before}, before)
+
+    def test_a_dry_run_writes_nothing(self):
+        self.verdict = (b'{"activated": true}\n', [])
+        rc, before, after, err = self.install(self.args(apply=False))
+        self.assertEqual((rc, after), (0, before))
+
+    def test_a3_prints_every_step_through_a5_and_the_back_out_in_order(self):
+        """The printed sequence is the operator's only copy of the order: the
+        root place sits between A3's write and the host-file check, and the
+        back-out gates the start on the HOST file carrying no delegation."""
+        self.verdict = (b'{"activated": true}\n', [])
+        rc, _, _, err = self.install(self.args())
+        self.assertEqual(rc, 0, err)
+        out = self.out.getvalue()
+        order = ["1. done:", "2. as root:", " place ", "3. the host's", "4. A4:", "5. A5:", "back out in this order",
+                 "B1.", "B2.", "B3. read the host's", "no delegation member", "STOP", "B4.", "B5. docker stop router-a",
+                 "docker start router-a"]
+        at = [out.find(m) for m in order]
+        self.assertNotIn(-1, at, out)
+        self.assertEqual(at, sorted(at), out)
+        pre = hashlib.sha256(self.prov.sibling_text(self.base).encode()).hexdigest()
+        self.assertIn(f"pre-activation sha256 {pre}", out)

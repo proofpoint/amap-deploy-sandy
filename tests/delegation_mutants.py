@@ -116,6 +116,17 @@ M = [
     ("as-no-delegation", "amap_sandy.py", "        doc = dict(doc, **keys)\n        nested =",
      '        doc = dict(doc, **keys)\n        if (policy.get("hop_link") or {}).get("delegation"):\n'
      '            doc["delegation"] = {"signing_key": {}}\n        nested =', "test_hop_render.InstallRenderTest"),
+    ('as-activate-early', 'amap_sandy.py', '    if getattr(args, "activate", None) is not None or getattr(args, "activation_sha256", None) is not None:\n        return run_activate_only(args, home)\n', '', 'test_activation_install.CommandTest'),
+    ('as-activate-usage', 'amap_sandy.py', '    if not getattr(args, "activate", None) or not getattr(args, "activation_sha256", None):\n        print("install: --activate', '    if False:\n        print("install: --activate', 'test_activation_install.CommandTest'),
+    ('as-activate-manifest', 'amap_sandy.py', '    if not policy_path.is_file():\n', '    if False:\n', 'test_activation_install.CommandTest'),
+    ('as-backout-host-file', 'amap_sandy.py', '        f"B3. read the host\'s {path}, not the container\'s view:', '        f"B3. read the router\'s view of {path}:', 'test_activation_install.CommandTest'),
+    ('as-place-order', 'amap_sandy.py', '        f"2. as root: {ai.place_step(spec, source, final)}",\n        f"3. the host\'s {path} is byte for byte that file: sha256 {final_sha}",\n', '        f"3. the host\'s {path} is byte for byte that file: sha256 {final_sha}",\n        f"2. as root: {ai.place_step(spec, source, final)}",\n', 'test_activation_install.CommandTest'),
+    ('hk-unescape-latin1', 'hub_keys.py', '    "    return os.fsdecode(bytes(out))\\n"', '    "    return bytes(out).decode(\'latin-1\')\\n"', 'test_signing_matrix.MountinfoTest'),
+    ('hk-resolve-recheck', 'hub_keys.py', '    "    if os.path.realpath(path) != real or (again.st_dev, again.st_ino) != (st.st_dev, st.st_ino):\\n"', '    "    if False:\\n"', 'test_signing_matrix.OpenResolvedTest'),
+    ('hk-nofollow', 'hub_keys.py', 'os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)', 'os.O_RDONLY | os.O_NONBLOCK)', 'test_signing_matrix.OpenResolvedTest'),
+    ('hk-regular', 'hub_keys.py', '    "        if st.st_mode & 0o170000 != 0o100000:\\n"', '    "        if False:\\n"', 'test_signing_matrix.OpenResolvedTest'),
+    ('hk-host-sha', 'hub_keys.py', 'host.get("ctime_ns"), host.get("sha256")) \\\n', 'host.get("ctime_ns"), seen["sha256"]) \\\n', 'test_signing_matrix.AdoptionTest'),
+    ('hs-host-view-once', 'host_setup.py', '        fs = hk.mount_fstype(real, hk.read_mountinfo())', '        fs = hk.mount_fstype(os.path.realpath(spec.keys.local_config), hk.read_mountinfo())', 'test_signing_matrix.OpenResolvedTest'),
 ]
 
 

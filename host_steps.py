@@ -2405,9 +2405,10 @@ def partition_weekly(exec_root, host, document, sha256, activation, activation_s
                             f"({passed['why']}); no stop target is recorded before activation")
                 said.append(f"pre-activation live config sha256 {rec['pre_activation_sha256']}: keep it beside A3's "
                             "place. After that place the back-out is, in order: install (read its diff); install "
-                            "--apply, which must exit 0; the live config must carry no delegation member (if it does, "
-                            "stop: the activated config is still in place); compare its sha256 with this one; then "
-                            "docker stop and docker start the local router")
+                            "--apply, which must exit 0; the host's live config file, not the container's view, must "
+                            "parse as a JSON object with no delegation member (if it carries one, or cannot be read "
+                            "or parsed, stop: the activated config may still be in place); compare its sha256 with "
+                            "this one; then docker stop and docker start the local router")
             elif code == EXIT_PASS:
                 why = _verified_target(_Engine(docker, values["engine"], run_dir), passed, values)
                 if why:

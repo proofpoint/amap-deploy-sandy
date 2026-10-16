@@ -186,7 +186,7 @@ class AdoptionTest(unittest.TestCase):
 
     def view(self, **over):
         v = {"kind": "systemd", "platform": "linux", "boot_id": "boot-1", "fstype": "ext4", "dev": 1, "ino": 7,
-             "ctime_ns": self.C, "now": self.C / 1e9 + 60}
+             "ctime_ns": self.C, "sha256": self.HOST, "now": self.C / 1e9 + 60}
         v.update(over)
         return v
 
@@ -245,9 +245,16 @@ class AdoptionTest(unittest.TestCase):
 
     def test_the_interval_must_be_a_finite_number_of_at_least_one_second(self):
         self.assertEqual(self.run_it([self.a(), self.a()], self.polls(10, 11, 12, interval=1.0))[0], rh.PASS)
-        for bad in (True, float("nan"), float("inf")):
+        for bad in (True, float("nan"), float("inf"), float("-inf"), "5", None):
             with self.subTest(interval=bad):
-                self.assertEqual(self.run_it([self.a()], self.polls(10, interval=bad))[0], rh.UNKNOWN)
+                result, why = self.run_it([self.a()], self.polls(10, interval=bad))
+                self.assertEqual(result, rh.UNKNOWN)
+                self.assertIn("interval_s", why)
+
+    def test_other_host_bytes_under_the_same_inode_are_unknown(self):
+        result, why = self.run_it([self.a()], [], host=lambda: self.view(sha256="b" * 64))
+        self.assertEqual(result, rh.UNKNOWN)
+        self.assertIn("replaced inode, or one changed", why)
 
     def test_the_container_s_filesystem_must_be_the_host_s(self):
         result, why = self.run_it([dict(self.a(), fstype="xfs")], [])
@@ -297,7 +304,8 @@ class MountinfoTest(unittest.TestCase):
             "2 1 0:41 / {fuse} rw - fuse.example f rw\n"
             "3 1 8:2 / /mnt/\u6587\u4ef6 rw - xfs b rw\n"
             "4 1 8:3 / /my\\040dir rw - btrfs c rw\n"
-            "5 1 8:4 / /back\\134slash rw - ext4 d rw\n")
+            "5 1 8:4 / /back\\134slash rw - ext4 d rw\n"
+            "6 1 8:5 / /esc\\303\\251 rw - xfs e rw\n")
 
     def setUp(self):
         import os
@@ -322,9 +330,126 @@ class MountinfoTest(unittest.TestCase):
         self.assertEqual(hk.mount_fstype("/back\\slash/r.json", self.text), "ext4")
         self.assertEqual(hk.mount_fstype("/mnt/\u6587\u4ef6x/r.json", self.text), "ext4")    # not a component of it
 
+    def test_escaped_bytes_decode_as_a_file_name_not_as_latin_1(self):
+        """mountinfo escapes bytes; two escaped bytes that are one UTF-8
+        character name that character, as the kernel's path does."""
+        self.assertEqual(hk.mount_fstype("/esc\u00e9/r.json", self.text), "xfs")
+        self.assertEqual(hk.mount_fstype("/esc\u00c3\u00a9/r.json", self.text), "ext4")
+
     def test_the_container_counts_only_the_entry_at_the_path_itself(self):
         self.assertEqual(hk.mount_fstype("/mnt/\u6587\u4ef6", self.text, exact=True), "xfs")
         self.assertIsNone(hk.mount_fstype("/mnt/\u6587\u4ef6/r.json", self.text, exact=True))
+
+
+class OpenResolvedTest(unittest.TestCase):
+    """hub_keys.open_resolved, which both sides read the config through: the
+    path resolved once, and that file alone opened, stat'ed and read."""
+
+    def setUp(self):
+        import os
+        import tempfile
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        d = os.path.realpath(td.name)
+        self.target, self.alias, self.other = (os.path.join(d, n) for n in ("router.json", "alias.json", "other.json"))
+        for path, body in ((self.target, b"{}"), (self.other, b'{"x": 1}')):
+            with open(path, "wb") as f:
+                f.write(body)
+        os.symlink(self.target, self.alias)
+
+    def test_an_alias_is_read_and_stat_ed_as_its_target(self):
+        import os
+        real, st, raw = hk.open_resolved(self.alias)
+        self.assertEqual((real, raw), (self.target, b"{}"))
+        self.assertEqual((st.st_dev, st.st_ino), (os.stat(self.target).st_dev, os.stat(self.target).st_ino))
+
+    def test_an_alias_that_resolves_elsewhere_while_read_is_refused(self):
+        import os
+        real = os.path.realpath
+        answers = iter([self.target, self.other])
+        os.path.realpath = lambda p, *a, **k: next(answers) if p == self.alias else real(p, *a, **k)
+        self.addCleanup(setattr, os.path, "realpath", real)
+        with self.assertRaisesRegex(OSError, "resolved to another file"):
+            hk.open_resolved(self.alias)
+
+    def test_a_name_still_a_link_after_resolution_is_never_followed(self):
+        import errno
+        import os
+        real = os.path.realpath
+        os.path.realpath = lambda p, *a, **k: p
+        self.addCleanup(setattr, os.path, "realpath", real)
+        with self.assertRaises(OSError) as e:
+            hk.open_resolved(self.alias)
+        self.assertEqual(e.exception.errno, errno.ELOOP)
+
+    def test_the_host_view_is_the_resolved_file_s(self):
+        """host_setup.host_view through an alias: the target's identity and
+        bytes, and the filesystem looked up for the target's own path."""
+        import hashlib
+        import os
+        import sys
+        from types import SimpleNamespace
+        import host_setup as hsu
+        v = hsu.host_view(SimpleNamespace(keys=SimpleNamespace(local_config=self.alias),
+                                          supervision=SimpleNamespace(kind="systemd")))
+        st = os.stat(self.target)
+        self.assertEqual((v["dev"], v["ino"], v["ctime_ns"], v["sha256"]),
+                         (st.st_dev, st.st_ino, st.st_ctime_ns, hashlib.sha256(b"{}").hexdigest()))
+        if sys.platform == "linux":
+            self.assertEqual(v["fstype"], hk.mount_fstype(self.target, hk.read_mountinfo()))
+
+    def test_the_host_view_looks_up_the_file_it_read_never_a_new_resolution(self):
+        """A later resolution of the name (here to another file on another
+        filesystem) never decides the filesystem of the file that was read."""
+        import os
+        import sys
+        from types import SimpleNamespace
+        import host_setup as hsu
+        if sys.platform != "linux":
+            self.skipTest("the host view reads mountinfo on Linux only")
+        real = os.path.realpath
+        answers = iter([self.target, self.target, self.other])
+        os.path.realpath = lambda p, *a, **k: next(answers) if p == self.alias else real(p, *a, **k)
+        self.addCleanup(setattr, os.path, "realpath", real)
+        text = f"1 0 8:1 / / rw - ext4 a rw\n2 1 8:2 / {self.other} rw - fuse.example b rw\n"
+        self.addCleanup(setattr, hk, "read_mountinfo", hk.read_mountinfo)
+        hk.read_mountinfo = lambda: text
+        v = hsu.host_view(SimpleNamespace(keys=SimpleNamespace(local_config=self.alias),
+                                          supervision=SimpleNamespace(kind="systemd")))
+        self.assertEqual(v["fstype"], "ext4")
+
+    def test_a_host_view_whose_alias_moves_is_unresolved(self):
+        import os
+        from types import SimpleNamespace
+        import host_setup as hsu
+        real = os.path.realpath
+        answers = iter([self.target, self.other])
+        os.path.realpath = lambda p, *a, **k: next(answers) if p == self.alias else real(p, *a, **k)
+        self.addCleanup(setattr, os.path, "realpath", real)
+        v = hsu.host_view(SimpleNamespace(keys=SimpleNamespace(local_config=self.alias),
+                                          supervision=SimpleNamespace(kind="systemd")))
+        self.assertIsInstance(v, rh.Unresolved)
+        self.assertIn("resolved to another file", v.reason)
+
+    def test_a_directory_is_not_a_config(self):
+        import os
+        with self.assertRaisesRegex(OSError, "not a regular file"):
+            hk.open_resolved(os.path.dirname(self.target))
+
+    def test_the_container_script_reads_through_the_same_rule(self):
+        """The in-container text runs here against an alias: it prints the
+        target's identity and bytes."""
+        import hashlib
+        import json
+        import os
+        import subprocess
+        import sys
+        p = subprocess.run([sys.executable, "-I", "-S", "-c", hk.CONFIG_TUPLE_SCRIPT], capture_output=True, text=True,
+                           env={"ROUTER_CONFIG": self.alias})
+        if p.returncode and "boot_id" in p.stderr:
+            self.skipTest("no /proc/sys/kernel/random/boot_id here")
+        doc = json.loads(p.stdout)
+        self.assertEqual((doc["ino"], doc["sha256"]), (os.stat(self.target).st_ino, hashlib.sha256(b"{}").hexdigest()))
 
 
 class PolicyTest(unittest.TestCase):

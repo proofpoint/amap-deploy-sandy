@@ -51,6 +51,7 @@ runs Docker or launches sandy, except the read-only `docker` queries
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -80,6 +81,7 @@ import hop_router as hp     # the local router's hop keys, on a host with a hop 
 import activation_install as ai   # A3: the activation config, checked before anything is written
 import delegation_render as dr    # the delegation block's no-seed check
 import partition_setup as ps      # the harness gate A3 requires
+import hub_keys as hk             # the local router's container, named in the back-out
 import delivery_checks as dc  # delivery itself: lister mode, session posture, daemon build, backlog
 import connector_pin as cpin  # install refuses a connector checkout not at its siblings.json pin
 
@@ -3602,10 +3604,36 @@ def run_activation(args: argparse.Namespace, policy: Dict[str, Any], doc: Dict[s
         return 2
     source = Path(spec.secrets.run_dir) / ai.ACTIVATED_NAME
     print(f"router config: activation {_write_file(source, final.decode('utf-8'), dry_run=not apply, label=ai.ACTIVATED_NAME)}")
-    print("  then, as root:")
-    print(f"    {ai.place_step(spec, str(source), final)}")
-    print(f"  then restart the local router (A4): docker/run.sh --config {path} --detach, from the hop checkout")
+    print("  A3 to A5, in order, each step required before the next:")
+    for line in activation_sequence(spec, str(source), final, path, sibling_text(doc).encode("utf-8")):
+        print(f"    {line}")
     return 0
+
+
+def activation_sequence(spec: Any, source: str, final: bytes, path: Path, pre_activation: bytes) -> List[str]:
+    """A3's printed steps after its write, through A5, and the back-out that
+    any failure from the root place on leads to. The back-out reads the HOST
+    file, the bind's source: a running single-file bind may still show the
+    inode it was started with."""
+    container = hk.local_container(spec, spec.keys)
+    final_sha = hashlib.sha256(final).hexdigest()
+    pre = hashlib.sha256(pre_activation).hexdigest()
+    return [
+        f"1. done: the activation config is {source} (sha256 {final_sha})",
+        f"2. as root: {ai.place_step(spec, source, final)}",
+        f"3. the host's {path} is byte for byte that file: sha256 {final_sha}",
+        f"4. A4: restart the local router: docker/run.sh --config {path} --detach, from the hop checkout",
+        "5. A5: python3 amap-sandy.py verify; the signing check must PASS",
+        f"if step 2, 3, 4 or 5 fails, back out in this order (pre-activation sha256 {pre}); stopping the "
+        f"router first (docker stop {container}) shortens the time it may sign:",
+        "B1. python3 amap-sandy.py install            (read the diff it prints)",
+        "B2. python3 amap-sandy.py install --apply    (it must exit 0; it renders no delegation)",
+        f"B3. read the host's {path}, not the container's view: it must parse as a JSON object with no "
+        "delegation member. If it carries one, or cannot be read or parsed, STOP: the activated config may "
+        "still be in place",
+        f"B4. its sha256 against {pre}: equal, or a difference install's diff explains",
+        f"B5. docker stop {container} if it runs, then docker start {container}",
+    ]
 
 
 def run_render_router(args: argparse.Namespace, home: Path, boxes: List[Dict[str, Any]],
@@ -4126,6 +4154,8 @@ def run_sync(args: argparse.Namespace, home: Path, boxes_dir: Path) -> int:
       3. The router's config, a generated sibling of the manifest
          (`router_sibling_path`): written under --apply, compared otherwise.
     """
+    if getattr(args, "activate", None) is not None or getattr(args, "activation_sha256", None) is not None:
+        return run_activate_only(args, home)
     # Before anything is written: the connector checkout the payload is
     # copied from must be at its siblings.json pin (connector_pin).
     try:
@@ -4181,15 +4211,33 @@ def run_sync(args: argparse.Namespace, home: Path, boxes_dir: Path) -> int:
     # a dry install answers "what would change", and an absent sibling is one
     # of the answers.
     print()
-    router_rc = run_render_router(args, home, boxes, policy, apply=apply)
-    if getattr(args, "activate", None) and router_rc:
-        return router_rc
+    run_render_router(args, home, boxes, policy, apply=apply)
 
     # Step 4: the registry's names, only when the policy turns them on.
     if identity_mode(policy) is not None:
         print()
         prov_rc = max(prov_rc, run_install_identity(args, home, policy, boxes, states))
     return prov_rc
+
+
+def run_activate_only(args: argparse.Namespace, home: Path) -> int:
+    """`install --activate RUN --activation-sha256 HEX` (A3): nothing but the
+    activation. Both arguments are checked first; the manifest, the payload,
+    the roster, the router's live config and the registry are never written
+    on this path. Its one write, A1 + T into the run directory under --apply,
+    comes only after every refusal has passed (activation_install)."""
+    if not getattr(args, "activate", None) or not getattr(args, "activation_sha256", None):
+        print("install: --activate and --activation-sha256 go together: A3 names A2's run and A1's printed "
+              "digest, and neither is ever defaulted; nothing was written", file=sys.stderr)
+        return 2
+    policy_path = feature_manifest_path(home)
+    if not policy_path.is_file():
+        print(f"install: cannot activate — no {policy_path}: install the host first; nothing was written",
+              file=sys.stderr)
+        return 2
+    policy = fp.load_policy(policy_path)
+    boxes = discover_sandboxes(args.sandy)
+    return run_render_router(args, home, boxes, policy, apply=args.apply)
 
 
 def run_cadence(args: argparse.Namespace, home: Path) -> int:

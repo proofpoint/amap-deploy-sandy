@@ -750,15 +750,47 @@ python3 amap-sandy.py install --apply --activate <A2's run id> --activation-sha2
 It refuses, writing nothing, unless the gate holds, the placed A1 record
 hashes to the digest given, A2's evidence is this host's, passing, current
 and bound to this A1, today's rendering is A1's staged bytes, and the live
-config is the pre-activation rendering or already the activation. A4 starts
-the router on the activated config with `docker/run.sh --config <the live
-config> --detach`. `verify` passes the signing check only when the router
+config is the pre-activation rendering or already the activation. It prints
+the rest of the sequence, numbered, with the pre-activation sha256. Each step
+is required before the next:
+
+1. A3's write: the activation config in the run directory, and its sha256;
+2. root's place step, which installs that file at the live config's path;
+3. the host's live config is byte for byte that file;
+4. A4: `docker/run.sh --config <the live config> --detach` restarts the
+   router on it;
+5. A5: `python3 amap-sandy.py verify`, whose signing check must pass.
+
+If step 2, 3, 4 or 5 fails, back out in this order. Stopping the router
+first shortens the time it may sign.
+
+1. `python3 amap-sandy.py install`, and read the diff it prints;
+2. `python3 amap-sandy.py install --apply`, which must exit 0. Plain install
+   never renders a `delegation` member;
+3. read the live config on the HOST, not through the container: a running
+   router binds the file it started with. It must parse as a JSON object
+   with no `delegation` member. If it carries one, or cannot be read or
+   parsed, stop: the activated config may still be in place;
+4. compare its sha256 with the pre-activation sha256: equal, or a
+   difference that install's diff explains;
+5. `docker stop` the local router if it runs, then `docker start` it.
+
+Backing out refuses signed work the router has begun but not yet handed
+over, at its next publication check, rather than holding it. Work already
+handed over settles as usual, and the router's peer state stays on disk for
+a later activation. After activation, every change to the local router's
+config goes through A1 to A5 again: a plain `install --apply` renders no
+delegation, so it de-activates the host, and `verify` reports it.
+
+`verify` passes the signing check only when the router
 signs exactly as the policy and the gate allow, under the token of current
 evidence, and has adopted the host's config: it watches two of the router's
 polls while the file it reads stays unchanged. That witness holds only where
 the router reads its config through a bind of the same file the host holds
-(native Linux Docker); through a VM's file share (Docker on macOS) the
-signing check is UNKNOWN by design, and says so.
+(native Linux Docker) on ext4, xfs or btrfs; through a VM's file share
+(Docker on macOS) the signing check is UNKNOWN by design, and says so. Read
+the filesystem type with `findmnt -T <the live config> -o FSTYPE`; `stat -f`
+names ext2, ext3 and ext4 alike.
 
 
 ### The weekly partition job's tools
