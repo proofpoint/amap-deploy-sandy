@@ -106,6 +106,13 @@ MUTANTS = [
     ("bases index compared by blob alone", RF,
      "    if len(staged) != 1 or staged[0][1] != path.name or staged[0][0] != [mode, blob, \"0\"]:",
      "    if not staged or staged[0][0][1] != blob:"),
+    ("bases entry read from the index instead of HEAD", RF,
+     "        head = _records(hg.git(repo, \"ls-tree\", \"-z\", \"HEAD\", \"--\", path.name))",
+     "        head = [([m, \"blob\", o], n) for (m, o, _), n in "
+     "_records(hg.git(repo, \"ls-files\", \"--stage\", \"-z\", \"--\", path.name))]"),
+    ("ls output split at the last tab", RF,
+     "            meta, _, name = rec.partition(\"\\t\")",
+     "            meta, _, name = rec.rpartition(\"\\t\")"),
     ("bases committed mode not checked", RF,
      "    if mode != BASES_MODE:",
      "    if False:"),

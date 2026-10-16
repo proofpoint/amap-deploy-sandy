@@ -1811,6 +1811,25 @@ class BasesDirty(unittest.TestCase):
         self.f.write_bytes(self.committed)
         self.assertIsNotNone(rf.bases_dirty(self.f))
 
+    def test_a_staged_edit_with_the_worktree_equal_to_the_index(self):
+        """Committed, then edited and `git add`ed: the worktree equals the
+        index and both differ from HEAD. Only a reader of HEAD refuses it."""
+        self.f.write_bytes(b'{"measured_from": "b"}\n')
+        _git(self.base, "add", rf.BASES_NAME)
+        self.assertEqual(_git(self.base, "diff", "--stat"), b"")
+        self.assertIsNotNone(rf.bases_dirty(self.f))
+
+    def test_a_single_unmerged_stage(self):
+        info = f"0 {'0' * 40}\t{rf.BASES_NAME}\n100644 {self.blob()} 2\t{rf.BASES_NAME}\n"
+        _git(self.base, "update-index", "--index-info", data=info.encode())
+        self.assertEqual(len(_git(self.base, "ls-files", "--stage", "--", rf.BASES_NAME).splitlines()), 1)
+        self.assertIsNotNone(rf.bases_dirty(self.f))
+
+    def test_a_record_name_may_hold_a_tab(self):
+        """git's -z output separates the fields from the path at the FIRST tab."""
+        self.assertEqual(rf._records(b"100644 blob " + b"a" * 40 + b"\tx\ty\0"),
+                         [(["100644", "blob", "a" * 40], "x\ty")])
+
     def test_a_committed_file_missing_from_the_index(self):
         _git(self.base, "rm", "-q", "--cached", rf.BASES_NAME)
         self.assertEqual(self.f.read_bytes(), self.committed)
