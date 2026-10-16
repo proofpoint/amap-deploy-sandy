@@ -731,43 +731,84 @@ checkout's loader and its plugin's key gate in a separate process that
 refuses to open the key; the key pair itself is proved only by the router,
 when it starts.
 
-Activation is A1 to A5. A2 runs as root with the local router STOPPED, since
-nothing on the host shows which config a running one adopted:
+Activation is A1 to A5, then the weekly job's first manual run. Each step
+is required before the next, and each command prints the next step.
 
-```sh
-docker stop <the local router's container>
-sudo <python3> -I -S -B <writer> partition-weekly ... --prospective
-```
+0. **Before A1, on each host.** Generate the signing key as the operator; the
+   one root command installs the 32-byte seed:
 
-It exits 0 only when both fail-stop probes pass, the evidence is placed and
-P02 passes; its output names the run whose token A3 takes. A3 then writes the
-activation config into the run directory and prints root's place step:
+   ```sh
+   umask 077; T=$(mktemp -d -p /dev/shm amap-key.XXXXXX)
+   "$OPENSSL" genpkey -algorithm ed25519 -outform DER -out "$T/k.der"
+   test "$(wc -c < "$T/k.der")" -eq 48 || echo 'STOP: the private DER is not 48 bytes'
+   tail -c 32 "$T/k.der" > "$T/seed"
+   "$OPENSSL" pkey -inform DER -in "$T/k.der" -pubout -outform DER > "$T/pub.der"
+   test "$(wc -c < "$T/pub.der")" -eq 44 || echo 'STOP: the public DER is not 44 bytes'
+   tail -c 32 "$T/pub.der" > "$T/pub.raw"
+   printf 'public_key '; od -An -tx1 "$T/pub.raw" | tr -d ' \n'; echo
+   printf 'key_id     '; "$OPENSSL" dgst -sha256 -r "$T/pub.raw" | cut -c1-64
+   /usr/bin/sudo /usr/bin/install -o <[1]'s uid> -g <[1]'s gid> -m 0400 "$T/seed" <keys.dir>/<keys.file>
+   rm -rf "$T"
+   ```
 
-```sh
-python3 amap-sandy.py install --apply --activate <A2's run id> --activation-sha256 <A1's printed digest>
-```
+   - `$OPENSSL` is OpenSSL 3, run as the operator only. On macOS, the system
+     `openssl` is LibreSSL; use an OpenSSL 3 build.
+   - `install -o` names the local router's in-container uid. Every directory on
+     the key's path is owned by root or that uid, and is not group- or
+     other-writable. keys.dir is made by the plan first (`install -d -o <uid>
+     -g <gid> -m 0700`).
+   - `$T` is on tmpfs. On macOS a RAM disk is optional, and `rm -rf` does not
+     scrub.
+   - Then this host's entry joins the fleet inventory (its `public_key` and
+     `key_id`), and each host's overlay pins the inventory
+     (`fleet_keys {path, sha256}`). A1 refuses without them.
+1. **A1.** `python3 amap-sandy.py partition-activate --apply` renders the
+   staged config from install's rendering, after every hop-host check install
+   makes, and writes A1's record into the run directory. It prints the root
+   `place` of the record, the record's sha256 (A3 takes it), and the two
+   weekly argv, 7b and 7d. Run the place as root. If the live config already
+   carries delegation, de-activate first (the back-out after the place,
+   below).
+2. **The outage window opens.** Record `sha256sum <the live config>`, then
+   `docker stop <the local router's container>` (never a restart-policy
+   change).
+3. **A2.** Immediately, as root, the printed 7b argv
+   (`partition-weekly ... --prospective`). Never interrupt it: wait for its
+   process to EXIT. It passes only when both fail-stop probes pass, the
+   evidence is placed and P02 passes, and it names the run whose token A3
+   takes. Copy its printed pre-activation line into
+   `<run_dir>/a2-pre-activation.sha256`, labelled with this host and A2's run
+   id. That file is your convenience, never evidence. It must equal the
+   `sha256sum` recorded at step 2. On a non-zero exit, take the back-out
+   before the place.
+4. **A3.** `python3 amap-sandy.py install --apply --activate <A2's run id>
+   --activation-sha256 <A1's printed digest>`, then the root place it prints.
+   Add A3's printed sha256 line to the same file, labelled.
+5. **A4.** `docker/run.sh --config <the live config> --detach`.
+6. **A5, preliminary.** `python3 amap-sandy.py partition-check --document <the
+   unit argv's document> --document-sha256 <its sha256>`. Only V1 and V2 must
+   PASS here. T1 FAILs until step 8 records a stop target (its remedy, "run
+   the weekly job once now", is step 8). E1 and E2 are UNKNOWN until then.
+7. **The post-activation document.** `python3 amap-sandy.py partition-probe
+   --post-activation <A2's run id> --document <...> --document-sha256 <...>
+   --apply`, then the root place it prints.
+8. **The weekly job's first run (7d).** As root, the printed 7d argv, in the
+   foreground. It must end with exit 0, `weekly-runs.json` `runs: []` and
+   `stop-target.json` present.
+9. **A5, final.** `python3 amap-sandy.py partition-check ... --ready` exits 0
+   only when all six claims PASS. `partition-check`'s exit 0 without `--ready`
+   means only that its object was written, so read all six cells. Then
+   `python3 amap-sandy.py verify` (on a launchd host,
+   `python3 amap-sandy.py verify --a5`) must pass. Only then is the host
+   ready. E1's claim names the step-8 run and time it rests on: the key
+   identity is root's observation in that run.
 
-It refuses, writing nothing, unless the gate holds, the placed A1 record
-hashes to the digest given, A2's evidence is this host's, passing, current
-and bound to this A1, today's rendering is A1's staged bytes, and the live
-config is the pre-activation rendering or already the activation. It prints
-the rest of the sequence, numbered, with the pre-activation sha256. Each step
-is required before the next:
+**The back-out before the place.** After a non-zero A2, or an A3 refusal,
+follow a kept incident's printed remedy first, then
+`docker start <the local router's container>`: its live config is unchanged.
 
-1. A3's write: the activation config in the run directory, and its sha256;
-2. root's place step, which installs that file at the live config's path;
-3. the host's live config is byte for byte that file;
-4. A4: `docker/run.sh --config <the live config> --detach` restarts the
-   router on it;
-5. A5: `python3 amap-sandy.py verify`, whose signing check must pass. On
-   a host whose host-setup document declares launchd (Docker on macOS),
-   run `python3 amap-sandy.py verify --a5` instead: every check must pass
-   except the signing check, whose UNKNOWN is excused only when its reason
-   is exactly the one an activated router gives under the live token there
-   (the VM file share, below). Any other non-pass fails A5.
-
-If step 2, 3, 4 or 5 fails, back out in this order. Stopping the router
-first shortens the time it may sign.
+**The back-out after the place.** If a step after A3's place fails, back out
+in this order. Stopping the router first shortens the time it may sign.
 
 1. `python3 amap-sandy.py install`, and read the diff it prints;
 2. `python3 amap-sandy.py install --apply`, which must exit 0. Plain install
@@ -776,8 +817,10 @@ first shortens the time it may sign.
    router binds the file it started with. It must parse as a JSON object
    with no `delegation` member. If it carries one, or cannot be read or
    parsed, stop: the activated config may still be in place;
-4. compare its sha256 with the pre-activation sha256: equal, or a
-   difference that install's diff explains;
+4. compare its sha256 with A2's line, of the SAME run id, in
+   `<run_dir>/a2-pre-activation.sha256`: equal, or a difference that
+   install's diff explains. A missing file, or another host's or run's line,
+   stops you until install's diff has been read;
 5. `docker stop` the local router if it runs, then `docker start` it.
 
 Backing out refuses signed work the router has begun but not yet handed
@@ -785,7 +828,49 @@ over, at its next publication check, rather than holding it. Work already
 handed over settles as usual, and the router's peer state stays on disk for
 a later activation. After activation, every change to the local router's
 config goes through A1 to A5 again: a plain `install --apply` renders no
-delegation, so it de-activates the host, and `verify` reports it.
+delegation, so it de-activates the host, and `verify` reports it. A planned
+restart of the hub-link router after activation goes through
+`hub-start-check`, which needs A2's evidence still current: do it within that
+window, or after the weekly run renews it.
+
+**What the outage window does to the local router.** In the local router's
+own words, two labels aside: "the local router" where it named itself, and
+"(below)" for the back-out it cited.
+
+> While the local router [1] is stopped (docker stop, then A4's restart):
+>
+> WAITS ON DISK, nothing lost:
+> - agents' outbox requests, which stay in their outboxes, unconsumed;
+> - in-flight records and handed markers (state_dir/.../inflight/), held local deliveries (pending/), and pending DSNs;
+> - the peer ledger, the candidate and receive journals, the replay store and the peer clock;
+> - hop items, in the hop root: hand-overs not yet written, handed requests awaiting the downstream result, and inbound candidates;
+> - the first-sight marker.
+> Every one of these is written durably (atomic write plus fsync) and is read again on the next poll.
+>
+> LOST OR DROPPED BY THE STOP ITSELF: nothing.
+> C1: The local router installs no SIGTERM handler, so `docker stop` ends PID 1 at once, mid-poll if one is running. It is the same as a crash, and SIGKILL after docker's grace period is the same again. The router is built for this: every side effect is atomic and durable and passes through one crash seam, and recovery from a crash after any single write is a tested property. On restart the interrupted poll's work is redone or settled EXACTLY ONCE (idempotency anchors; a handed request is never re-handed under a new id).
+>
+> DRAINS ON RESTART WITH NO OPERATOR STEP: yes.
+> - The kernel releases the drain lock when the process dies.
+> - First sight is a persisted marker, so a restart never re-snapshots or quarantines waiting requests.
+> - A restart never begins a generation (the binding and root are unchanged).
+> - Peer admission stays open: it closes only when the clock file is missing, unreadable or uninitialised, or when an operator-declared restore happens, never on a restart.
+> - Delivery resumes on the first poll after start.
+>
+> C2, TIME WINDOWS. These are the only effects of the stop's DURATION, and none applies to a stop shorter than the peer window P (delegation.windows.p, default 3600 s):
+> - Inbound signed tasks (only where delegation.inbound is true): when evaluated after the restart, a statement whose ts is now older than now - P is DEMOTED, not dropped. It is quarantined as "demoted"/ts_window, and the sender gets a "demoted" control notice. It is not placed as a signed task.
+> - Outbound: a signed task this router had SIGNED but not yet HANDED OVER when it stopped, and handed after ts + P + F, will be demoted by the receiver in the same way. `python3 -m router --config C peer-request show <id>` shows its window end.
+> - Reverse-edge replies (no forward edge) must be drained within peer_reply_window_seconds of the record (default 604800 s, 7 days), and mail replies within mail_reply_window_seconds (default 7 days). Irrelevant for a planned outage of minutes.
+>
+> C3 (revised). For the FIRST activation of a router (the M1 case; G1 requires that the live config carries no delegation):
+> - C2's OUTBOUND clause cannot apply. A router without delegation never signed anything, so no signed task is waiting to be handed over.
+> - C2's INBOUND clause applies only where this host's rendering turns `inbound` on, and only to signed statements that peers address to this router during the window.
+>   - While the router has no delegation (or inbound is off) it takes no signed candidates at all: they wait in the hop intake untouched (peerjournal.poll returns before reading them).
+>   - After A4 starts it with delegation and inbound, each waiting statement is judged against the window: ts below (now - P) is DEMOTED (quarantined, plus a "demoted" control notice to its sender), never dropped.
+> - A2 is NEVER interrupted. The operator starts A2 immediately after `docker stop <router>`, with no other step between them, and waits until A2's process is OBSERVED to exit. Neither number below replaces that observation: CHILD_TIMEOUT_S (3600 s) bounds only A2's wait for its child, and the writer treats a run older than STALE_AFTER_S (5320 s) as overdue, a conservative threshold and not proof that the run stopped. [1] is not started while A2's process lives. On a non-zero exit the operator takes the before-place back-out (below), after any kept incident's remedy.
+> - Plan target, NOT a cancellation point: the whole window, from `docker stop <router>` to A4's start of the router on the activated config (or the back-out's start on the unchanged config), is planned to close within 30 minutes. That is half of P's default 3600 s, leaving margin for clock skew and the first poll. Missing the target cancels nothing.
+> - Worst case: the window lasts until A2 exits plus the steps after it. No figure here caps it, and it can exceed P (P's default is 3600 s). However long it lasts, the only effect on the local router past P is the inbound clause above: waiting signed statements older than now - P are demoted, each with a notice to its sender, and none is dropped. Local delivery and hand-over simply wait, as C1 says. Nothing on disk is lost, and the restart drains with no operator step. The 7-day reply windows are the only later limit, and only an outage measured in days would reach them.
+> - If no peer signs tasks to this router before its own activation (the canary's order), the inbound clause has nothing to act on, and the window only bounds the local-delivery and hand-over outage C1 describes, however long A2 runs.
 
 `verify` passes the signing check only when the router
 signs exactly as the policy and the gate allow, under the token of current
