@@ -33,7 +33,8 @@ document must refuse, not read as "nothing deployed".
 """
 
 import calendar
-import math
+import os
+import posixpath
 import json
 import re
 from dataclasses import dataclass, field
@@ -53,7 +54,8 @@ ID_HOP, ID_HUB, ID_CONNECTOR, ID_PLUGIN = "build.hop_router", "build.hub_router"
 
 #: The router's status-document members for the plugin it loaded: the
 #: member, its digest key, and the process start that binds it.
-PLUGIN_MEMBER, PLUGIN_SHA256, PROCESS_START = "transport_plugin", "sha256", "started_ts"
+PLUGIN_MEMBER, PLUGIN_SHA256, PROCESS_START = "transport_plugin", "sha256", "process_started_ts"
+STATUS_NAME = "status.json"
 
 _HEX40 = re.compile(r"[0-9a-f]{40}")
 _HEX64 = re.compile(r"[0-9a-f]{64}")
@@ -262,8 +264,8 @@ def connector(stamp: Any, pin: Any) -> Claim:
 
 
 def started_at(live: Any) -> Any:
-    """State.StartedAt as epoch seconds (the fraction kept), or an Unresolved."""
-    t = _ts(((live.get("State") or {}).get("StartedAt")) if isinstance(live, dict) else None)
+    """State.StartedAt as integer epoch nanoseconds, or an Unresolved."""
+    t = _ns(((live.get("State") or {}).get("StartedAt")) if isinstance(live, dict) else None)
     return rh.Unresolved("the container's start time cannot be read") if t is None else t
 
 
@@ -278,28 +280,66 @@ def _settled(live: Any, who: str) -> Optional[str]:
     return None
 
 
-def _ts(value: Any) -> Any:
-    """An RFC 3339 UTC timestamp as epoch seconds, or None."""
+def _ns(value: Any, *, fraction: bool = False) -> Optional[int]:
+    """An RFC 3339 UTC timestamp as integer epoch nanoseconds (exact, so a
+    comparison never rounds), or None; with `fraction`, None for a value
+    without one."""
     m = _STARTED.fullmatch(value) if isinstance(value, str) else None
-    if not m:
+    if not m or (fraction and m.group(7) is None):
         return None
     y, mo, d, h, mi, se, frac = m.groups()
-    return calendar.timegm((int(y), int(mo), int(d), int(h), int(mi), int(se))) + float(f"0.{frac or 0}")
+    whole = calendar.timegm((int(y), int(mo), int(d), int(h), int(mi), int(se)))
+    return whole * 10 ** 9 + int((frac or "").ljust(9, "0"))
+
+
+def read_status(live: Any, state_dir: str, who: str,
+                read: Callable[[str], bytes] = lambda p: _read_nofollow(p)) -> Any:
+    """The router's status document, read now from the state directory the
+    inspected container `live` itself mounts (by identity, as the router's
+    docker/run.sh mounts it): the document, or an Unresolved."""
+    mounts = [m for m in (live.get("Mounts") or []) if isinstance(m, dict)] if isinstance(live, dict) else []
+    hits = [m for m in mounts if m.get("Destination") == state_dir]
+    if len(hits) != 1 or hits[0].get("Source") != state_dir:
+        return rh.Unresolved(f"{who} does not mount its state directory {state_dir} once and by identity, "
+                             "so its status document cannot be read")
+    path = posixpath.join(state_dir, STATUS_NAME)
+    try:
+        doc = json.loads(read(path))
+    except FileNotFoundError:
+        return rh.Unresolved(f"{who} has written no status document yet")
+    except OSError as e:
+        return rh.Unresolved(f"{path} cannot be read: {e.strerror}")
+    except ValueError:
+        return rh.Unresolved(f"{path} is not a JSON document")
+    return doc
+
+
+def _read_nofollow(path: str) -> bytes:
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, "rb") as f:
+        return f.read()
 
 
 def hop_plugin(role: str, container: str, before: Any, published: Any, after: Any, pin_sha256: str) -> Claim:
     """The plugin the RUNNING router loaded, from its own status document:
     `published[PLUGIN_MEMBER]` is the sha256 the router's loader computed
-    from the bytes it read once and executed, written at activation. The
-    status document outlives the container, so it is bound to this
-    incarnation by `started_ts` (written at process start, on the engine's
-    clock): not before the second of the StartedAt that `before` and `after`
-    both show, each running and not restarting. The document may have been
-    read before either inspect (verify's [1] reuses router_health's earlier
-    `status --json`); a restart in between leaves a document whose
-    `started_ts` precedes the new start, which is refused. The residue is
-    an earlier incarnation started in the same second. Nothing read
-    host-side is evidence of what was loaded."""
+    from the bytes it read once and executed, written at activation.
+    `published` is read between `before` and `after`, two inspects that
+    show the same container (Id and StartedAt), running and not restarting.
+    The status document outlives the container, so it is bound to this
+    incarnation by `PROCESS_START`, the process's own start at full
+    resolution, taken before the load, against a bound the engine records
+    BEFORE the current process can exist (same kernel clock): the
+    container's `Created` (create returns before start is called), and the
+    previous run's `State.FinishedAt` (a restart follows the exit). A
+    process of an earlier container started before that container was
+    removed, so before `Created`; an earlier run of this container started
+    before it exited, so before `FinishedAt`. StartedAt is NOT the bound:
+    the engine records it after the task starts, so the current process can
+    precede it. Two routers never share a state directory (the router's own
+    lock). A whole-second or missing start cannot separate the two and is
+    UNKNOWN. Nothing read host-side about the plugin file is evidence of
+    what was loaded."""
     who = f"[{1 if role == ROLE_HOP else 2}] ({container})"
     claim = f"the transport plugin {who} loaded is the pinned overlay"
     remedy = ("place the overlay at its pin with host_steps.py place, then restart the router so it "
@@ -320,7 +360,7 @@ def hop_plugin(role: str, container: str, before: Any, published: Any, after: An
     start = started_at(before)
     if isinstance(start, rh.Unresolved):
         return unknown(start.reason)
-    if started_at(after) != start:
+    if started_at(after) != start or not isinstance(before.get("Id"), str) or after.get("Id") != before["Id"]:
         return unknown(f"{who} restarted while verify read it")
     if isinstance(published, rh.Unresolved):
         return unknown(published.reason)
@@ -330,11 +370,16 @@ def hop_plugin(role: str, container: str, before: Any, published: Any, after: An
     sha = member.get(PLUGIN_SHA256) if isinstance(member, dict) else None
     if not isinstance(sha, str) or not _HEX64.fullmatch(sha):
         return unknown("the router's published plugin digest is malformed")
-    began = _ts(published.get(PROCESS_START))
+    began = _ns(published.get(PROCESS_START), fraction=True)
     if began is None:
-        return unknown("the router's status document has no readable process start, so it cannot be "
-                       "tied to the running container")
-    if began < math.floor(start):
+        return unknown("the router's status document has no full-resolution process start, so it cannot "
+                       "be tied to the running container")
+    created = _ns(before.get("Created"))
+    finished = _ns(before["State"].get("FinishedAt"))
+    if created is None or finished is None:
+        return unknown(f"docker inspect of {who} does not say when it was created and last exited, so "
+                       "an earlier run's document cannot be excluded")
+    if began < max(created, finished):
         return unknown(f"the status document is from an earlier run of {who}")
     return Claim(ID_PLUGIN, rh.check(claim, want, sha, remedy), {"observed_sha256": sha}, role)
 
@@ -357,14 +402,14 @@ class Phase:
 
 def collect(spec: Any, payload_dir: Path, *, hop_pin: Any, connector_pin: Any,
             inspect: Callable[[str, str], Any], labels: Callable[[str], Any],
-            status: Callable[[str, str], Any]) -> Phase:
+            status: Callable[[str, str, Any], Any]) -> Phase:
     """Every claim this host's deployment calls for. `spec` is the host-setup
     Spec, None when the host has no host-setup document, or an Unresolved
     when it has one that cannot be read. `inspect(role, name)` gives a
     container's inspect document, None or an Unresolved; `labels(image_id)`
-    [2]'s image's own Config.Labels, or an Unresolved; `status(role, name)`
-    that router's status document, None when no reader exists for it, or an
-    Unresolved."""
+    [2]'s image's own Config.Labels, or an Unresolved; `status(role, name,
+    live)` that router's status document read now from the inspected
+    container `live`, None when no reader exists for it, or an Unresolved."""
     claims: List[Claim] = []
     roles: List[str] = []
     if isinstance(spec, rh.Unresolved):
@@ -394,11 +439,11 @@ def collect(spec: Any, payload_dir: Path, *, hop_pin: Any, connector_pin: Any,
 
 
 def _plugin(role: str, name: str, before: Any, spec: Any, inspect: Callable[[str, str], Any],
-            status: Callable[[str, str], Any]) -> Claim:
-    """The plugin claim from `status(role, name)` and the inspects either
-    side of that call; the provider may return a document it read earlier,
-    which `started_ts` binds (hop_plugin)."""
-    published = status(role, name)
+            status: Callable[[str, str, Any], Any]) -> Claim:
+    """The plugin claim: `status(role, name, before)` reads the status document
+    now, from the container `before` inspected, and a second inspect
+    follows it, so the read is inside the bracket hop_plugin checks."""
+    published = status(role, name, before) if isinstance(before, dict) else None
     return hop_plugin(role, name, before, published, inspect(role, name), spec.overlay_pin["sha256"])
 
 
