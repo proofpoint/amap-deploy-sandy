@@ -14,7 +14,9 @@ each exactly {id, claim, result, reason, remedy}.
   roles are root's observation in the step-7d weekly run that the stop target
   names: the operator cannot stat the key through [1]'s 0700 directory.
   Until every input exists, both are UNKNOWN ("run step 7d"), never the
-  stale FAIL that would tell the operator to de-activate.
+  stale FAIL that would tell the operator to de-activate. Their
+  local_router binding hashes the live config FILE beside the running spec;
+  that the router adopted the file is V2's (the reload flag), not E1's.
 - T1: the weekly job's stop target (`partition_setup.verify_target`).
 - R1: no weekly run is left undecided (`partition_runs.verify_runs`).
 

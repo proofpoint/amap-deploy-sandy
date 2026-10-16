@@ -16,6 +16,9 @@ partition_evidence.named_document: a token the evidence did not ISSUE names
 nothing. `bindings` holds what the operator can compute: host_setup,
 email_router, lanes and local_router. The key binding is root's (the key's
 directory is [1]'s 0700), and P01 and P02 do not involve the key.
+`local_router` hashes the live config FILE beside the running spec; it does
+not show that [1] adopted that file, since a refused reload keeps the old
+config running. Adoption is partition-check V2's reload flag.
 
 partition_probe is in the weekly job's bundle; this module calls its P01 and
 P02 pieces unchanged, so the bundle does not move.

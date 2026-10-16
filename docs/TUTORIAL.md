@@ -734,8 +734,15 @@ when it starts.
 Activation is A1 to A5, then the weekly job's first manual run. Each step
 is required before the next, and each command prints the next step.
 
-0. **Before A1, on each host.** Generate the signing key as the operator; the
-   one root command installs the 32-byte seed:
+0. **Before A1, on each host.** The hub-link router must already run the image
+   it will keep. Its image is in its run spec (`secrets.image`), and A2's
+   evidence, the post-activation document and the key probe's record all bind
+   that run spec. Moving it after activation makes them stale. So, in order:
+   build its image, update `secrets.image`, run the hub key probe, start the
+   hub-link router on the new image, and only then begin A1.
+
+   Generate the signing key as the operator; the one root command installs
+   the 32-byte seed:
 
    ```sh
    umask 077; T=$(mktemp -d -p /dev/shm amap-key.XXXXXX)
