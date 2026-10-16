@@ -130,6 +130,13 @@ MUTANTS = [
     ("--container ignored by the match", RF,
      "    expected = getattr(args, \"container\", None) or",
      "    expected = None or"),
+    ("bases entry read from the index instead of HEAD", RF,
+     "        head = _records(hg.git(repo, \"ls-tree\", \"-z\", \"HEAD\", \"--\", path.name))",
+     "        head = [([m, \"blob\", o], n) for (m, o, _), n in "
+     "_records(hg.git(repo, \"ls-files\", \"--stage\", \"-z\", \"--\", path.name))]"),
+    ("ls output split at the last tab", RF,
+     "            meta, _, name = rec.partition(\"\\t\")",
+     "            meta, _, name = rec.rpartition(\"\\t\")"),
     ("bases committed mode not checked", RF,
      "    if mode != BASES_MODE:",
      "    if False:"),

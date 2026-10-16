@@ -1272,6 +1272,7 @@ def bases_dirty(path: Path = BASES_PATH, data: Optional[bytes] = None) -> Option
                 "a staged change, a mode or type change, an unmerged path, or no entry")
     return None
 
+
 def _show(outcome: Tuple[str, int, str, str], out: Callable[[str], None]) -> int:
     o, code, reason, text = outcome
     out(f"{o} {reason}: {text}")
