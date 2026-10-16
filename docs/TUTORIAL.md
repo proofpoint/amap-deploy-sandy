@@ -764,7 +764,10 @@ reads as not running.
    6. Run the hub key probe, and start the hub-link router on that image.
    7. Provision the weekly job's bundle once, at that deploy commit (its PIN
       is that commit, so the weekly job hands off until it is provisioned).
-   8. Only then begin A1.
+   8. Make the operator a member of the hop tree's group before A1, and check
+      it with `id -Gn` after a fresh login: step 7's P02 reads the hop tree as
+      the operator. Never chmod the hop tree.
+   9. Only then begin A1.
 
    `secrets.writer.commit` stays at its reviewed commit. The writer's pin is
    the sha256 of `host_steps.py`, not the deploy commit: a deploy commit that
