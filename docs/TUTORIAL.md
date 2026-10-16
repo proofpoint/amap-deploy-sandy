@@ -793,6 +793,10 @@ reads as not running.
    ); echo "exit $? (anything but 0: STOP, nothing was installed)"
    ```
 
+   - It is written for a POSIX shell and was run under bash and dash. On
+     macOS, whose interactive shell is zsh, run it under `/bin/sh` or
+     `bash` (paste it into `bash`), not zsh.
+
    - Run it as shown, never as the left side of `||` or `&&`: there the
      shell ignores `set -e` inside the parentheses, and a failed check no
      longer stops the install.
@@ -845,7 +849,27 @@ reads as not running.
    A FAIL means the partition does not hold against that router: after
    placing the document, take the back-out after the place. An UNKNOWN means
    a probe could not tell (for P02, the operator's access to the hop tree):
-   read its reason, and run the step again once it can be measured.
+   read its reason, and run the step again once it can be measured; the
+   host is not ready until a run of this step exits 0. Each run has its own
+   `pa-<UTC time>` run id, so a re-run never replaces an earlier document:
+   the one that counts is the newest (by the UTC time in its run id) placed
+   post-activation document whose `names_token` is A2's token. If P02
+   stays UNKNOWN because the operator is outside the hop directories' group,
+   it never becomes measurable: that is the host operator's decision, to add
+   the operator to the group or to back out. Never chmod the hop tree. No
+   check reads this document as a pass by its presence: its verdicts are
+   what it records. A refusal (exit 2) writes no document, and there is
+   nothing to place.
+
+   Step 7 is its own gate. Neither `partition-check --ready` nor `verify`
+   reads P01 or P02 from this document, so a host can show six PASS at
+   step 9 while step 7's P02 is FAIL or UNKNOWN. A2 leaves P01 for the
+   final router to this step, so an UNKNOWN here is a measurement still
+   missing, not a neutral one. Step 7 is complete only when this verb exits
+   0 (P01 and P02 PASS) and that newest document is placed.
+   While P01 or P02 is UNKNOWN, activation is incomplete: the host is not
+   ready, and no collection that depends on it starts, until it resolves or
+   the host operator decides as above.
 8. **The weekly job's first run (7d).** As root, the printed 7d argv, in the
    foreground. It must end with exit 0, `weekly-runs.json` `runs: []` and
    `stop-target.json` present. Run it once, before any collection that reads
@@ -858,8 +882,10 @@ reads as not running.
    only when all six claims PASS. `partition-check`'s exit 0 without `--ready`
    means only that its object was written, so read all six cells. Then
    `python3 amap-sandy.py verify` (on a launchd host,
-   `python3 amap-sandy.py verify --a5`) must pass. Only then is the host
-   ready. E1's claim names the step-8 run and time it rests on: the key
+   `python3 amap-sandy.py verify --a5`) must pass, and step 7 must be
+   complete (above): the newest placed post-activation document for A2's
+   token has P01 and P02 PASS. `--ready` cannot discharge it. Only then is
+   the host ready. E1's claim names the step-8 run and time it rests on: the key
    identity is root's observation in that run.
 
 **The back-out before the place.** After a non-zero A2, or an A3 refusal,

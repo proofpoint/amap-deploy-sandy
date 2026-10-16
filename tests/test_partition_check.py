@@ -601,6 +601,9 @@ class StatusTest(unittest.TestCase):
                 self.assertIn("interval_s is", got[1])
                 self.assertLess(len(got[1]), 200)
         self.assertEqual(self.judge(self.read(interval=10.0 ** 300))[0], rh.PASS)
+        deep = self.judge(dict(self.read(), status="[" * 100000 + "]" * 100000))
+        self.assertEqual(deep[0], rh.UNKNOWN, deep)
+        self.assertIn("not JSON", deep[1])
         self.assertEqual(self.judge(dict(self.read(), now=NOW + 0.5, status=json.dumps(
             {"interval_s": 5, "last_poll_ts": ts(NOW)})))[0], rh.PASS)
 

@@ -105,6 +105,22 @@ class EvidenceIgnoresItTest(Host):
                          (rh.PASS, f"{self.ev}/partition-r1.json"))
 
 
+class NoPassByPresenceTest(Host):
+    """Nothing in this repository reads a placed post-activation document:
+    whatever its verdicts, partition-check's six cells are exactly what they
+    are without it, so its presence can never be read as a pass."""
+
+    def test_a_placed_failing_or_unknown_document_changes_no_cell(self):
+        self.seven_d()
+        without = self.check()[1]
+        for p01, p02 in (("FAIL", "PASS"), ("PASS", "FAIL"), ("UNKNOWN", "PASS"), ("PASS", "UNKNOWN")):
+            with self.subTest(P01=p01, P02=p02):
+                self.files[f"{self.ev}/{ppa.name('pa-1')}"] = doc(
+                    names_token=self.token, probes=[evidence_probe("P01", p01), evidence_probe("P02", p02)])
+                self.assertEqual(self.check()[1], without)
+        self.assertEqual({c["result"] for c in without.values()}, {rh.PASS})
+
+
 class RefusalTest(Host):
     """Each refusal writes nothing and runs no probe."""
 
