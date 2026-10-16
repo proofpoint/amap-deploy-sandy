@@ -772,6 +772,13 @@ class LoadTest(unittest.TestCase):
         cases = {
             "an unknown member": dict(sec(), extra=1),
             "a tag where a digest belongs": dict(sec(), image="ex/runtime:latest"),
+            "an Id one hex short": dict(sec(), image="sha256:" + "a" * 63),
+            "an Id one hex long": dict(sec(), image="sha256:" + "a" * 65),
+            "an upper-case Id": dict(sec(), image="sha256:" + "A" * 64),
+            "a bare 64-hex with no algorithm": dict(sec(), image="a" * 64),
+            "another algorithm": dict(sec(), image="sha512:" + "a" * 64),
+            "a name by another algorithm": dict(sec(), image="ex/runtime@sha512:" + "a" * 64),
+            "an Id with a trailing newline": dict(sec(), image="sha256:" + "a" * 64 + "\n"),
             "a principal with no runtime": dict(sec(), principal="nobody"),
             "a missing tool": dict(sec(), tools={k: v for k, v in sec()["tools"].items() if k != "git"}),
             "a relative tool": dict(sec(), tools=dict(sec()["tools"], git="git")),
@@ -797,6 +804,17 @@ class LoadTest(unittest.TestCase):
                 d[ss.SECTION] = s
                 with self.assertRaises(hs.SpecError):
                     hs.load_spec(d)
+
+    def test_the_image_is_a_name_by_digest_or_a_local_image_by_its_id(self):
+        """A locally built image has no repository digest; `docker image
+        inspect --format '{{.Id}}'` prints its content Id, sha256:<64 hex>."""
+        for image in ("ex/runtime@sha256:" + "a" * 64, "sha256:" + "b" * 64):
+            with self.subTest(image=image):
+                try:
+                    loaded = spec(image=image)
+                except hs.SpecError as e:
+                    self.fail(f"{image} was refused: {e}")
+                self.assertEqual(loaded.image, image)
 
     def test_a_document_without_the_section_has_none(self):
         self.assertIsNone(hs.load_spec(host_doc()).secrets)
