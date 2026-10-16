@@ -193,7 +193,7 @@ class ChildTest(unittest.TestCase):
         self.context = {"schema": pr.CONTEXT_SCHEMA, "run_id": "r1", "host": "alpha",
                         "started_at": "2026-10-15T03:00:00Z", "evidence_dir": f"{r}/evidence",
                         "live_config_path": self.live, "router_container_id": self.TARGET,
-                        "engine": "unix:///var/run/docker.sock", "docker": "/usr/bin/docker"}
+                        "engine": "unix:///var/run/docker.sock", "docker": "/usr/bin/docker", "mode": "weekly"}
         self.document = b'{"host_setup": {"schema": 1}}'
         self.email = rebased(EMAIL, r)
         self.email["mounts"][1]["source"] = f"{r}/srv/hop"
@@ -310,6 +310,71 @@ class ChildTest(unittest.TestCase):
         self.assertEqual(self.run_it(), pr.INCOMPLETE)
         self.assertFalse([a for a in self.engine.seen if a[1] == "run"])
         self.assertFalse(os.path.exists(f"{self.run_dir}/expect.json"))
+
+
+class ProspectiveChildTest(unittest.TestCase):
+    """A2 through the real child (run_child): the local router stopped, its
+    inputs A1's placed record, the live config checked only as G1, and the
+    stopped router never exec'd."""
+
+    APPROVED_IMAGE = "sha256:" + "d" * 64
+    TARGET = ChildTest.TARGET
+    run_it, outcome = ChildTest.run_it, ChildTest.outcome
+
+    def setUp(self):
+        import partition_activation as pa
+        ChildTest.setUp(self)
+        pre = {k: v for k, v in self.config.items() if k != "delegation"}
+        with open(self.live, "w") as f:
+            f.write(json.dumps(pre, indent=2) + "\n")             # pre-activation: no delegation
+        staged = (json.dumps(self.config, indent=2) + "\n").encode("utf-8")
+        spec = dict(pa.spec_from_running(self.router_live), image=self.APPROVED_IMAGE)
+        self.activation = pa.activation_record(host="alpha", spec=spec, staged=staged, final_config_path=self.live)
+        self.context = dict(self.context, mode="prospective", router_container_id=None)
+        self.router_live["State"] = {"Running": False}               # [1] is stopped for A2
+
+    def place(self, context=True, document=True):
+        ChildTest.place(self, context, document)
+        with open(f"{self.run_dir}/{pr.ACTIVATION}", "wb") as f:
+            f.write(self.activation)
+
+    def calls(self, verb):
+        return [a for a in self.engine.seen if a[1] == verb]
+
+    def test_a2_probes_the_approved_spec_and_never_execs_the_stopped_router(self):
+        self.place()
+        code = self.run_it()
+        self.assertEqual(code, pr.PASSED, self.said)
+        execs = {a[4] for a in self.calls("exec")}
+        self.assertIn("ex-down", execs)
+        self.assertNotIn("ex-up", execs)
+        runs = [a for a in self.calls("run") if self.APPROVED_IMAGE in a]
+        self.assertTrue(runs, "the local router's one-shots run A1's approved image")
+        self.assertFalse([a for a in self.calls("run") if self.router_live["Image"] in a],
+                         "nothing is run from the stopped container's image")
+        self.assertFalse([a for a in self.engine.seen if a[1:3] == ["inspect", "--type"] and a[-1] == "ex-up"],
+                         "the stopped router is never inspected for its spec")
+
+    def test_the_child_s_g1_refuses_a_live_delegation_before_anything_is_expected(self):
+        with open(self.live, "w") as f:
+            f.write(json.dumps(self.config, indent=2) + "\n")
+        self.place()
+        self.assertEqual(self.run_it(), pr.INCOMPLETE, self.said)
+        self.assertIn("now carries delegation", self.outcome()["why"])
+        self.assertFalse(os.path.exists(f"{self.run_dir}/expect.json"))
+        self.assertEqual(self.calls("run") + self.calls("exec"), [])
+
+    def test_a_fail_stop_records_a_prospective_incident(self):
+        """Nothing live, nothing running under the name: the child's act is
+        a prospective one, so its stop is not required."""
+        self.engine.p04 = "EACCES"
+        self.place()
+        self.assertEqual(self.run_it(), pr.FAILED, self.said)
+        det = json.load(open(f"{self.root}/evidence/incident-r1/detected.json"))
+        self.assertEqual(det.get("mode"), "prospective")
+        events = [json.loads(l)["event"] for l in open(f"{self.root}/evidence/incident-r1/events.jsonl")]
+        self.assertEqual(events, ["rewrite_ok", "stop_not_required"])
+        self.assertEqual(self.engine.stopped, [])
 
 
 class SnapshotTest(unittest.TestCase):
@@ -477,3 +542,68 @@ class AffirmativeInspectTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class A2OutcomeTest(unittest.TestCase):
+    """partition_run.a2_outcome: A2 passes only with the token, the evidence
+    placed, P02 PASS, and P01 PASS or UNKNOWN for exactly the stopped router.
+    The documents are partition_evidence.build's."""
+
+    UNMEASURED = {"upstream": pr.P01_STOPPED}
+
+    def doc(self, **verdicts):
+        from test_partition_evidence import build
+        return build(verdicts=verdicts)
+
+    def outcome(self, doc, placed=True, p01=None):
+        p01 = [{"verdict": "UNKNOWN", "principals": {"upstream": pp.UNMEASURED, "downstream": "PASS"}}] \
+            if p01 is None else p01
+        return pr.a2_outcome(doc, placed, p01, self.UNMEASURED)
+
+    def test_the_stopped_router_s_unknown_passes(self):
+        code, incident, why = self.outcome(self.doc(P01="UNKNOWN"))
+        self.assertEqual((code, incident), (pr.PASSED, False))
+        self.assertIn("is placed", why)
+
+    def test_each_shortfall_is_a_handoff_never_a_silent_pass(self):
+        for name, args in (("no token", dict(doc=self.doc(P03="FAIL"))),
+                           ("not placed", dict(doc=self.doc(P01="UNKNOWN"), placed=False)),
+                           ("P02", dict(doc=self.doc(P01="UNKNOWN", P02="FAIL"))),
+                           ("P01 FAIL", dict(doc=self.doc(P01="FAIL"), p01=[{"verdict": "FAIL", "principals": {
+                               "upstream": pp.UNMEASURED, "downstream": "FAIL"}}])),
+                           ("P01 downstream UNKNOWN", dict(doc=self.doc(P01="UNKNOWN"), p01=[{"verdict": "UNKNOWN",
+                               "principals": {"upstream": pp.UNMEASURED, "downstream": "UNKNOWN"}}])),
+                           ("P01 upstream measured UNKNOWN", dict(doc=self.doc(P01="UNKNOWN"), p01=[{
+                               "verdict": "UNKNOWN", "principals": {"upstream": "UNKNOWN", "downstream": "PASS"}}])),
+                           ("P01 another principal unmeasured", dict(doc=self.doc(P01="UNKNOWN"), p01=[{
+                               "verdict": "UNKNOWN", "principals": {"upstream": pp.UNMEASURED, "other": pp.UNMEASURED,
+                                                                    "downstream": "PASS"}}])),
+                           ("P01 the stopped router measured, its unknown aggregate kept", dict(
+                               doc=self.doc(P01="UNKNOWN"), p01=[{"verdict": "UNKNOWN", "principals": {
+                                   "upstream": "PASS", "downstream": "PASS"}}])),
+                           ("P01 a principal unmeasured in the stopped router's place", dict(
+                               doc=self.doc(P01="UNKNOWN"), p01=[{"verdict": "UNKNOWN", "principals": {
+                                   "upstream": "PASS", "downstream": pp.UNMEASURED}}]))):
+            with self.subTest(name=name):
+                self.assertEqual(self.outcome(**args)[0], pr.INCOMPLETE)
+
+    def test_a_shared_planned_uid_fails_with_one_end_unmeasured(self):
+        ok = {"downstream": [(1, 2102, 2102)]}
+        shared = {"upstream": 2102, "downstream": 2102}
+        self.assertEqual(pp.verdict_p01(ok, shared, [("upstream", "downstream")], self.UNMEASURED)[0], "FAIL")
+        self.assertEqual(pp.p01_dispositions(ok, shared, [("upstream", "downstream")], self.UNMEASURED),
+                         {"upstream": "FAIL", "downstream": "FAIL"})
+
+    def test_the_unmeasured_router_never_hides_a_failure(self):
+        walks = {"downstream": [(1, 2102, 2102), (2, 0, 0)]}
+        self.assertEqual(pp.verdict_p01(walks, {"upstream": 2101, "downstream": 2102}, [("upstream", "downstream")],
+                                        self.UNMEASURED)[0], "FAIL")
+        ok = {"downstream": [(1, 2102, 2102)]}
+        verdict, _, detail = pp.verdict_p01(ok, {"upstream": 2101, "downstream": 2102},
+                                            [("upstream", "downstream")], self.UNMEASURED)
+        self.assertEqual((verdict, detail), ("UNKNOWN", pp.unmeasured_detail(self.UNMEASURED)))
+        self.assertEqual(pp.p01_dispositions(ok, {"upstream": 2101, "downstream": 2102},
+                                             [("upstream", "downstream")], self.UNMEASURED),
+                         {"upstream": pp.UNMEASURED, "downstream": "PASS"})
+        self.assertEqual(pp.p01_dispositions(walks, {"upstream": 2101, "downstream": 2102},
+                                             [("upstream", "downstream")], self.UNMEASURED)["downstream"], "FAIL")
