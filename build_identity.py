@@ -317,9 +317,13 @@ def read_status(live: Any, state_dir: str, who: str,
 def state_sharers(docker: List[str], state_dir: str, own_id: Any,
                   run: Optional[Callable[..., rh.Proc]] = None) -> Any:
     """The Ids of every OTHER container, in any state, with a mount whose
-    source is `state_dir` or a directory above it, so that it could have
-    written the status document there: a list (empty when none), or an
-    Unresolved. The router's lock keeps two routers from running at once,
+    source is `state_dir`, a directory above it, or anything below it (a
+    single-file bind of the status document itself included), so that it
+    could have written the status document there: a list (empty when none),
+    or an Unresolved. Paths are compared as the engine reports them,
+    literally: the same directory spelled another way (a symlinked parent,
+    or /private/var for /var on macOS) is not matched, as read_status's
+    mount check is literal too. The router's lock keeps two routers from running at once,
     not one from running after another, so a stopped container that shares
     the directory may have left the document there. Read after the status
     document: a container created later cannot have written it."""
@@ -352,10 +356,16 @@ def state_sharers(docker: List[str], state_dir: str, own_id: Any,
                                  f"as sharing {state_dir}")
         for m in mounts:
             src = m.get("Source") if isinstance(m, dict) else None
-            if isinstance(src, str) and (src == state_dir or state_dir.startswith(src.rstrip("/") + "/")):
+            if isinstance(src, str) and _overlaps(src, state_dir):
                 sharers.append(doc.get("Id"))
                 break
     return sharers
+
+
+def _overlaps(a: str, b: str) -> bool:
+    """Whether one path is the other or lies under it (literal paths)."""
+    a, b = a.rstrip("/") or "/", b.rstrip("/") or "/"
+    return a == b or b.startswith(a.rstrip("/") + "/") or a.startswith(b.rstrip("/") + "/")
 
 
 def _read_nofollow(path: str) -> bytes:
@@ -373,7 +383,8 @@ def hop_plugin(role: str, container: str, before: Any, published: Any, after: An
     The status document outlives the container, so it is bound to this
     incarnation by `PROCESS_START`, the process's own start at full
     resolution, taken before the load, against a bound the engine records
-    BEFORE the current process can exist (same kernel clock): the
+    BEFORE the current process can exist (same kernel clock, which must not
+    step back between runs, as an operator or NTP fault could make it): the
     container's `Created` (create returns before start is called), and the
     previous run's `State.FinishedAt` (a restart follows the exit). A
     process of an earlier container started before that container was

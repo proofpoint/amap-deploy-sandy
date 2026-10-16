@@ -737,11 +737,31 @@ class InstallAndVerifyTest(unittest.TestCase):
                                 others=[self.sibling(lambda sd: os.path.dirname(sd))])
         self.assertEqual(c.result, rh.UNKNOWN)
 
+    def test_a_container_mounting_anything_below_the_state_directory_shares_it(self):
+        """A single-file bind of the status document itself (RE's probe), or
+        a directory under the state directory."""
+        for label, source in (("the status document", lambda sd: os.path.join(sd, bi.STATUS_NAME)),
+                              ("a subdirectory", lambda sd: os.path.join(sd, "sub"))):
+            with self.subTest(label):
+                self.fresh_state()
+                c, _ = self.hop_outcome(self.status_doc("2026-10-15T10:00:00.050000Z"),
+                                        others=[self.sibling(source, running=True)])
+                self.assertEqual(c.result, rh.UNKNOWN)
+                self.assertIn("another container shares", c.reason)
+
+    def fresh_state(self):
+        """A fresh state directory for the next hop_outcome in one test."""
+        sd = self.home / "state"
+        if sd.exists():
+            for f in sd.iterdir():
+                f.unlink()
+            sd.rmdir()
+
     def test_containers_mounting_elsewhere_do_not_share_it(self):
-        """Beside it, below it, or a path that only starts with the same
-        letters: none can write status.json in the state directory."""
+        """Beside it, or a path that only starts with the same letters:
+        neither can write status.json in the state directory."""
         others = [self.sibling(lambda sd: sd + "-other", cid="b" * 64),
-                  self.sibling(lambda sd: os.path.join(sd, "sub"), cid="e" * 64, running=True),
+                  self.sibling(lambda sd: sd + "x", cid="e" * 64, running=True),
                   self.sibling(lambda sd: sd[:-2], cid="f" * 64)]
         c, e = self.hop_outcome(self.status_doc("2026-10-15T10:00:00.050000Z"), others=others)
         self.assertEqual((c.result, e.get("observed_sha256")), (rh.PASS, "c" * 64))
