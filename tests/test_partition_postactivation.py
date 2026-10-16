@@ -110,15 +110,23 @@ class NoPassByPresenceTest(Host):
     whatever its verdicts, partition-check's six cells are exactly what they
     are without it, so its presence can never be read as a pass."""
 
-    def test_a_placed_failing_or_unknown_document_changes_no_cell(self):
-        self.seven_d()
-        without = self.check()[1]
-        for p01, p02 in (("FAIL", "PASS"), ("PASS", "FAIL"), ("UNKNOWN", "PASS"), ("PASS", "UNKNOWN")):
-            with self.subTest(P01=p01, P02=p02):
-                self.files[f"{self.ev}/{ppa.name('pa-1')}"] = doc(
-                    names_token=self.token, probes=[evidence_probe("P01", p01), evidence_probe("P02", p02)])
-                self.assertEqual(self.check()[1], without)
-        self.assertEqual({c["result"] for c in without.values()}, {rh.PASS})
+    def test_a_placed_document_changes_no_cell(self):
+        """Both directions: after 7d (six PASS), a failing or unknown document
+        cannot pull a cell down; before 7d (T1 FAIL, E1 and E2 UNKNOWN), a
+        passing one, or any other, cannot lift one up."""
+        verdicts = (("FAIL", "PASS"), ("PASS", "FAIL"), ("UNKNOWN", "PASS"), ("PASS", "UNKNOWN"), ("PASS", "PASS"))
+        for seven in (True, False):
+            self.setUp()
+            if seven:
+                self.seven_d()
+            without = self.check()[1]
+            for p01, p02 in verdicts:
+                with self.subTest(after_7d=seven, P01=p01, P02=p02):
+                    self.files[f"{self.ev}/{ppa.name('pa-1')}"] = doc(
+                        names_token=self.token, probes=[evidence_probe("P01", p01), evidence_probe("P02", p02)])
+                    self.assertEqual(self.check()[1], without)
+            want = {rh.PASS} if seven else {rh.PASS, rh.FAIL, rh.UNKNOWN}
+            self.assertEqual({c["result"] for c in without.values()}, want)
 
 
 class RefusalTest(Host):
