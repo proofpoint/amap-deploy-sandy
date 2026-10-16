@@ -100,10 +100,22 @@ def build(*, host: str, run_id: str, at: str, names_token: str, router: Dict[str
 
 def probe(plan: pp.Plan, runner: pp.Runner, run_argv: Callable, lstat_: Callable) -> Tuple[List[Dict[str, Any]], int, List[str]]:
     """P01 and P02 exactly as partition_probe.run makes them, with nothing
-    unmeasured: [1] runs its final identity. (probes, exit, report)."""
+    unmeasured: [1] runs its final identity. (probes, exit, report). Its
+    two preconditions are run's own, with run's refusal text: a running
+    email router that differs from its rendering, or is not running, refuses
+    the whole run (nothing it showed would stand for it), and so does a role
+    outside the evidence vocabulary. A refusal is ([], 2, [why])."""
     import os
+    drift = plan.email_drift
+    if isinstance(drift, rh.Unresolved) or drift:
+        why = drift.reason if isinstance(drift, rh.Unresolved) else "; ".join(drift)
+        return [], 2, [f"refused: the running email router is not its rendering: {why}"]
     roles = {"P01": [f"runtime:{p}" for p in sorted(plan.runtimes)],
              "P02": [f"marker:{s}/{n}" for n, s, _, _ in pp.MARKERS if s in plan.sides]}
+    for pid in PROBE_IDS:
+        bad = [r for r in roles[pid] if not pe.role_ok(r)]
+        if bad:
+            return [], 2, [f"refused: {pid}'s role {bad[0]!r} is outside the evidence vocabulary"]
     walks = {}
     for principal, (container, uid, gid) in sorted(plan.runtimes.items()):
         out = pp._out(runner(["exec", "-u", f"{uid}:{gid}", container, "python3", "-I", "-S", "-c", pp.P01_SCRIPT]))
@@ -207,6 +219,9 @@ def run(document_path: str, document_sha256: str, t_run_id: str, *, apply: bool,
     except ppl.PlanError as e:
         return refuse(f"no plan: {e}")
     probes, code, report = probe(plan, runner, ppl.run_argv_for(router), p.get("lstat", os.lstat))
+    if not probes:
+        why = report[0]
+        return refuse(why[len("refused: "):] if why.startswith("refused: ") else why)
     for line in report:
         out(f"  {line}")
     doc = build(host=host, run_id=run_id, at=at, names_token=token,

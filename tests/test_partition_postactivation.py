@@ -38,7 +38,7 @@ class GrammarTest(unittest.TestCase):
         raw = doc()
         self.assertEqual(ppa.parse(raw, host="alpha")["schema"], ppa.SCHEMA)
         self.assertNotIn(pe.TOKEN_MEMBER, json.loads(raw))
-        with self.assertRaises(pe.EvidenceError):
+        with self.assertRaises(pe.EvidenceError):           # refused at its members first, or its schema
             pe.parse(raw, host="alpha")
         self.assertFalse(ps.evidence_name_ok(ppa.name("pa-1")))
         self.assertTrue(ps.evidence_name_ok("partition-pa-1.json"))
@@ -99,8 +99,7 @@ class RefusalTest(Host):
             f.write(self.document_raw)
         real_load = hsu.load_spec
         import dataclasses
-        self.spec = dataclasses.replace(self.spec, secrets=__import__("types").SimpleNamespace(
-            run_dir=tmp, writer_dir="/opt/ex/libexec", volume="ex-secret"))
+        self.spec = dataclasses.replace(self.spec, secrets=dataclasses.replace(self.spec.secrets, run_dir=tmp))
         calls = []
         p = {"read": self.read, "read_live": lambda q: self.live_raw, "read_lanes": lambda q: b"{}",
              "runner": lambda argv: calls.append(argv) or rh.Unresolved("no engine in this row")}
@@ -113,6 +112,41 @@ class RefusalTest(Host):
         finally:
             hsu.load_spec = real_load
         return rc, said, sorted(os.listdir(tmp)), calls
+
+    def engine(self, email):
+        """docker as the verb asks it: [1] runs A1's spec; the email router is
+        `email` (None: no such container); its image's environment is empty."""
+        router = self.spec.runtime_of(self.spec.hops[0][1])["container"]
+
+        def answer(argv):
+            calls.append(argv)
+            if argv[:3] == ["inspect", "--type", "container"]:
+                doc = {router: self.live}.get(argv[3], email if argv[3] != router else None)
+                return rh.Proc(tuple(argv), 1, "", "") if doc is None else rh.Proc(tuple(argv), 0, json.dumps([doc]), "")
+            if argv[:2] == ["image", "inspect"]:
+                return rh.Proc(tuple(argv), 0, "[]", "")
+            return rh.Proc(tuple(argv), 1, "", "")
+        calls = []
+        return answer, calls
+
+    def test_the_email_router_must_be_its_running_rendering(self):
+        """partition_probe.run's own precondition: nothing a differing or
+        absent email router showed would stand for it."""
+        for label, email in (("not running", None), ("differs from its rendering", {"Config": {"Image": "other"}})):
+            with self.subTest(label):
+                self.setUp()
+                runner, calls = self.engine(email)
+                rc, said, written, _ = self.verb(runner=runner, read_lanes=lambda q: b'{"selected": []}',
+                                                 stat=lambda q: None)
+                self.assertEqual(rc, 2, said)
+                self.assertIn("the running email router is not its rendering", "\n".join(said))
+                self.assertEqual(written, ["document.json"])
+                self.assertFalse([c for c in calls if c[:1] in (["run"], ["exec"])])
+
+    def test_an_unresolved_lane_binding_writes_nothing(self):
+        runner, calls = self.engine(None)
+        rc, said, written, _ = self.verb(runner=runner, read_lanes=lambda q: b"not json")
+        self.assertEqual((rc, written), (2, ["document.json"]), said)
 
     def test_each_refusal(self):
         def unissued():
