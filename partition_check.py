@@ -22,6 +22,11 @@ each exactly {id, claim, result, reason, remedy}.
 
 The exit status means only "the object was written in full". `--ready`
 exits 0 only when all six are PASS: that is A5's acceptance.
+
+Every docker call goes through ss.docker(spec.secrets), with no -H: the
+local router and the hub-link router run on the one engine it reaches,
+and supervision.engine must be that engine. Another engine fails closed
+(its router reads as not running).
 """
 
 from __future__ import annotations
@@ -265,6 +270,13 @@ def document(*, host: str, at: str, inputs: Dict[str, Any], cells: List[Dict[str
     return pe.canonical({"schema": SCHEMA, "host": host, "at": at, "inputs": inputs, "checks": cells})
 
 
+def carries_delegation(live: Any) -> bool:
+    """Whether a parsed local-router config has a delegation block: A1's
+    de-activate note, read here so the renderer's module names no
+    delegation member."""
+    return isinstance(live, dict) and "delegation" in live
+
+
 def utc_now(now: float) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
 
@@ -385,10 +397,15 @@ def evaluate(spec: Any, *, document_raw: bytes, document_sha256: str, now: float
         if "status" in p:
             status = p["status"]
         else:
+            # The exec names the container V1 judged, by its Id: a recreate
+            # between the two calls cannot pair one container's spec with
+            # another's status.
             state_dir = json.loads(approved["staged"]).get("state_dir")
-            status = (ask_json(spec, ["exec", router_name, "python3", "-I", "-S", "-c", STATUS_SCRIPT, state_dir],
-                               "the router's status.json") if isinstance(state_dir, str)
-                      else rh.Unresolved("A1's staged config names no state_dir"))
+            cid = live.get("Id") if isinstance(live, dict) else None
+            status = (rh.Unresolved("A1's staged config names no state_dir") if not isinstance(state_dir, str)
+                      else rh.Unresolved("the local router is not running") if not isinstance(cid, str)
+                      else ask_json(spec, ["exec", cid, "python3", "-I", "-S", "-c", STATUS_SCRIPT, state_dir],
+                                    "the router's status.json"))
         v1 = cell("V1", checks[0])
         v2 = cell("V2", v2_check(checks[1], status))
 

@@ -734,6 +734,14 @@ when it starts.
 Activation is A1 to A5, then the weekly job's first manual run. Each step
 is required before the next, and each command prints the next step.
 
+Every Docker call the activation verbs make goes through the document's
+docker client (`docker`, or `sudo -n docker` where `docker_via_sudo` is
+set), with no `-H`. So the local router and the hub-link router must run on
+the one engine that client reaches, and `supervision.engine` must name that
+engine. Under sudo's default environment reset, `sudo -n` drops `DOCKER_HOST`. If
+the engines differ, the checks fail closed: a router on another engine
+reads as not running.
+
 0. **Before A1, on each host, in this order.** A2's evidence, the
    post-activation document and the key probe's record bind the approved
    document and the hub-link router's run spec. Anything that changes either

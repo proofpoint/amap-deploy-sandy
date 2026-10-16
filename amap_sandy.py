@@ -4347,7 +4347,8 @@ def run_prepare(args: argparse.Namespace, policy: Dict[str, Any], doc: Dict[str,
         live = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         live = None
-    if isinstance(live, dict) and "delegation" in live:
+    import partition_check as pcheck
+    if pcheck.carries_delegation(live):
         print("partition-activate: NOTE: the live config carries delegation. De-activate first (the back-out "
               "after the place, B1-B5), then A1")
     overlay = ha.overlay_path(getattr(args, "overlay", None))

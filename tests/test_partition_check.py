@@ -211,6 +211,23 @@ class SequenceTest(Host):
                 self.assertEqual(c["E2"]["reason"], pc.NO_CURRENT)
 
 
+class StatusExecTest(Host):
+    """V2's exec names the container V1 judged by its inspect Id, never by
+    name."""
+
+    def test_the_exec_targets_the_inspected_id(self):
+        seen = []
+        self.addCleanup(setattr, pc, "ask_json", pc.ask_json)
+        pc.ask_json = lambda spec, argv, what: seen.append(argv) or rh.Unresolved("recorded")
+        p = {"read": self.read, "read_live": lambda path: self.live_raw, "read_lanes": lambda path: LANES,
+             "inspect": lambda ref: self.inspects.get(ref), "image": lambda live: IMAGE,
+             "stat": self.stat, "lstat": self.lstat}
+        pc.evaluate(self.spec, document_raw=self.document_raw,
+                    document_sha256=hashlib.sha256(self.document_raw).hexdigest(), now=NOW, p=p)
+        execs = [a for a in seen if a[:1] == ["exec"]]
+        self.assertEqual([a[1] for a in execs], [CID])
+
+
 class NotRequiredTest(Host):
     """d2 §4.4's mapping: a live config without delegation and no gate makes
     verify_target's and verify_runs' PASS a not-required cell, emitted as
