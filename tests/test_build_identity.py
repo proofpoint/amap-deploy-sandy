@@ -561,6 +561,15 @@ class InstallAndVerifyTest(unittest.TestCase):
                                                                           "sha256": "c" * 64}}
         self.assertEqual(self.hop_outcome("zz-r1", doc).result, rh.PASS)
 
+    def test_a_document_read_before_a_restart_is_unknown(self):
+        """router_health's `status --json` is read before either inspect. A
+        restart in between: both inspects show the new start, and the cached
+        document's started_ts is the old incarnation's."""
+        doc = {"started_ts": "2026-10-15T09:58:00Z", "transport_plugin": {"path": "/zz/overlay/plugin.py",
+                                                                          "sha256": "c" * 64}}
+        c = self.hop_outcome("zz-r1", doc)
+        self.assertEqual((c.result, c.reason), (rh.UNKNOWN, "the status document is from an earlier run of [1] (zz-r1)"))
+
     def test_a_status_document_of_another_container_is_not_1s(self):
         doc = {"started_ts": "2026-10-15T10:00:00Z", "transport_plugin": {"path": "/x", "sha256": "c" * 64}}
         c = self.hop_outcome("zz-other", doc)

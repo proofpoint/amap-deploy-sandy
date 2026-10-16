@@ -290,12 +290,16 @@ def _ts(value: Any) -> Any:
 def hop_plugin(role: str, container: str, before: Any, published: Any, after: Any, pin_sha256: str) -> Claim:
     """The plugin the RUNNING router loaded, from its own status document:
     `published[PLUGIN_MEMBER]` is the sha256 the router's loader computed
-    from the bytes it read once and executed, written at activation. It is
-    bound to this incarnation by `started_ts` (written at process start, on
-    the engine's clock) not preceding State.StartedAt's second, read between
-    two inspects that show the same start, running and not restarting. The
-    status document outlives the container, so nothing else ties it to the
-    process. Nothing read host-side is evidence of what was loaded."""
+    from the bytes it read once and executed, written at activation. The
+    status document outlives the container, so it is bound to this
+    incarnation by `started_ts` (written at process start, on the engine's
+    clock): not before the second of the StartedAt that `before` and `after`
+    both show, each running and not restarting. The document may have been
+    read before either inspect (verify's [1] reuses router_health's earlier
+    `status --json`); a restart in between leaves a document whose
+    `started_ts` precedes the new start, which is refused. The residue is
+    an earlier incarnation started in the same second. Nothing read
+    host-side is evidence of what was loaded."""
     who = f"[{1 if role == ROLE_HOP else 2}] ({container})"
     claim = f"the transport plugin {who} loaded is the pinned overlay"
     remedy = ("place the overlay at its pin with host_steps.py place, then restart the router so it "
@@ -391,7 +395,9 @@ def collect(spec: Any, payload_dir: Path, *, hop_pin: Any, connector_pin: Any,
 
 def _plugin(role: str, name: str, before: Any, spec: Any, inspect: Callable[[str, str], Any],
             status: Callable[[str, str], Any]) -> Claim:
-    """The status document read between two inspects of the same container."""
+    """The plugin claim from `status(role, name)` and the inspects either
+    side of that call; the provider may return a document it read earlier,
+    which `started_ts` binds (hop_plugin)."""
     published = status(role, name)
     return hop_plugin(role, name, before, published, inspect(role, name), spec.overlay_pin["sha256"])
 
