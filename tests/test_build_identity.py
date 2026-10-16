@@ -229,7 +229,10 @@ class HopPluginTest(unittest.TestCase):
         before = self.live() if before is None else before
         after = self.live() if after is None else after
         published = self.published() if published is None else published
-        return bi.hop_plugin(bi.ROLE_HOP, "zz-r1", before, published, after, pin or self.SHA)
+        try:
+            return bi.hop_plugin(bi.ROLE_HOP, "zz-r1", before, published, after, pin or self.SHA)
+        except Exception as e:  # noqa: BLE001 -- the claim is total: nothing may escape it
+            self.fail(f"hop_plugin raised {type(e).__name__}: {e}")
 
     def assertUnknown(self, c, reason=None):
         self.assertEqual(c.check.result, rh.UNKNOWN)
@@ -319,7 +322,8 @@ class HopPluginTest(unittest.TestCase):
         """Whole seconds cannot separate a same-second predecessor."""
         reason = ("the router's status document has no full-resolution process start, so it cannot be "
                   "tied to the running container")
-        for began in ("2026-10-15T10:00:01Z", None, "", "yesterday", 1760522400.5):
+        for began in ("2026-10-15T10:00:01Z", None, "", "yesterday", 1760522400.5, "2026-10-32T10:00:00.050000Z",
+                      "2026-99-01T10:00:00.050000Z"):
             with self.subTest(began=began):
                 self.assertUnknown(self.claim(published=self.published(began=began)), reason)
 
@@ -503,7 +507,11 @@ class ReadStatusTest(unittest.TestCase):
                 first[0] = False
                 return real_read(path)
             self.patch_attr(bi, "_read_nofollow", slow)
-        return bi.read_progressing(self.live(), self.sd, "[1] (zz-r1)", budget), len(sleeps)
+        try:
+            got = bi.read_progressing(self.live(), self.sd, "[1] (zz-r1)", budget)
+        except Exception as e:  # noqa: BLE001 -- admission is total: nothing may escape it
+            self.fail(f"read_progressing raised {type(e).__name__}: {e}")
+        return got, len(sleeps)
 
     def patch_attr(self, obj, name, value):
         real = getattr(obj, name)
@@ -521,6 +529,7 @@ class ReadStatusTest(unittest.TestCase):
 
     def test_a_document_that_never_advances_is_unknown_at_its_deadline(self):
         got, sleeps = self.progressing([self.doc(3)])
+        self.assertIsInstance(got, rh.Unresolved)
         self.assertEqual(got.reason, "[1] (zz-r1)'s status document did not advance within its window, so it is "
                                      "not shown to be written by the running process")
         self.assertEqual(sleeps, int((2 * 5.0 + bi.PROGRESS_MARGIN_S) / bi.PROGRESS_STEP_S))
@@ -548,6 +557,8 @@ class ReadStatusTest(unittest.TestCase):
                  "interval a bool": dict(self.doc(9), interval_s=True),
                  "interval not finite": dict(self.doc(9), interval_s=float("inf")),
                  "interval changed": self.doc(9, interval=6.0),
+                 "interval too large for a float": self.doc(9, interval=10 ** 400),
+                 "an impossible start": self.doc(9, began="2026-10-32T10:00:00.050000Z"),
                  "polls a bool": dict(self.doc(9), polls=True),
                  "not an object": [1, 2]}
         for label, later in cases.items():
@@ -564,6 +575,9 @@ class ReadStatusTest(unittest.TestCase):
                  "interval a string": self.doc(3, interval="5"),
                  "no interval": {"polls": 3, bi.PROCESS_START: "2026-10-15T10:00:00.050000Z"},
                  "a whole-second start": self.doc(3, began="2026-10-15T10:00:00Z"),
+                 "an impossible start (October 32)": self.doc(3, began="2026-10-32T10:00:00.050000Z"),
+                 "an impossible start (month 99)": self.doc(3, began="2026-99-01T10:00:00.050000Z"),
+                 "an interval too large for a float": self.doc(3, interval=10 ** 400),
                  "polls a string": dict(self.doc(3), polls="3")}
         for label, first in cases.items():
             with self.subTest(label):
@@ -658,6 +672,34 @@ class HubReaderTest(unittest.TestCase):
         p, _ = self.run_reader()
         self.assertIsNone(json.loads(p.stdout)["taken"])
 
+    def test_a_read_that_completes_after_the_deadline_is_discarded(self):
+        """Opus 1 on #76: the one sleep (step 5.0, longer than the window)
+        ends at the deadline, so the only re-read completes after it; the
+        rise it sees is discarded. The row that kills "the reader counts a
+        read after its deadline"."""
+        Path(self.path).write_text(json.dumps(self.doc(3, interval=0.1)))
+        self.later(0.05, self.doc(4, interval=0.1))
+        p, _ = self.run_reader(step=5.0, margin=0.0)
+        self.assertEqual((p.returncode, json.loads(p.stdout)["taken"]), (0, None))
+
+    def test_the_reader_stops_at_a_drop_too(self):
+        """Opus R2: a lower count ends the reader's wait and is taken; the
+        host then refuses it."""
+        Path(self.path).write_text(json.dumps(self.doc(5)))
+        self.later(0.15, self.doc(4))
+        p, _ = self.run_reader()
+        out = json.loads(p.stdout)
+        self.assertEqual((p.returncode, out["taken"]), (0, self.doc(4)))
+        self.assertIsInstance(bi.judge_hub_output(out, "[2] (zz-hub)"), rh.Unresolved)
+
+    def test_the_margin_extends_the_window(self):
+        """Opus R5: a rise after 2 × interval_s but within the margin is
+        taken."""
+        Path(self.path).write_text(json.dumps(self.doc(3, interval=0.1)))
+        self.later(0.5, self.doc(4, interval=0.1))
+        p, _ = self.run_reader(margin=1.0)
+        self.assertEqual((p.returncode, json.loads(p.stdout)["taken"]), (0, self.doc(4, interval=0.1)))
+
     def test_a_first_document_not_admitted_exits_10_before_any_wait(self):
         """The string row is the one that kills "deadline before admission"
         (1e300 alone does not: min(2e300 + m, cap) is the cap) (Opus 3)."""
@@ -716,6 +758,80 @@ class HubReaderTest(unittest.TestCase):
         self.assertEqual((p.returncode, p.stdout), (9, ""))
 
 
+class StrictAdmissionTest(unittest.TestCase):
+    """Codex B1/B2 on #76: admission is total. An impossible instant is
+    refused, never rolled into another day, and an interval too large for a
+    float is refused, never an exception; on the host and in the reader."""
+
+    BAD_INSTANTS = ("2026-10-32T10:00:00.050000Z", "2026-99-01T10:00:00.050000Z", "2026-02-30T10:00:00.050000Z",
+                    "2026-10-15T24:00:00.050000Z", "2026-10-15T10:60:00.050000Z", "2026-10-15T10:00:61.050000Z")
+    GOOD = "2026-10-15T10:00:00.050000Z"
+
+    def host(self, call):
+        try:
+            return call()
+        except Exception as e:  # noqa: BLE001 -- the row is that nothing escapes
+            self.fail(f"admission raised {type(e).__name__}: {e}")
+
+    def test_an_impossible_instant_is_no_instant(self):
+        for v in self.BAD_INSTANTS:
+            with self.subTest(v=v):
+                self.assertIsNone(self.host(lambda: bi._ns(v, fraction=True)))
+        self.assertEqual(bi._ns("2024-02-29T00:00:00.5Z", fraction=True), 1709164800500000000)
+
+    def test_the_host_refuses_an_impossible_start_first_or_later(self):
+        doc = lambda n, began=self.GOOD: {"progress": n, "interval_s": 5.0, "process_started_ts": began}
+        for v in self.BAD_INSTANTS:
+            with self.subTest(v=v, where="first and taken"):
+                got = self.host(lambda: bi.judge_hub_output({"first": doc(3, v), "between": [], "taken": doc(4, v)},
+                                                            "[2] (zz-hub)"))
+                self.assertIsInstance(got, rh.Unresolved)
+
+    def test_an_interval_too_large_for_a_float_is_refused_not_raised(self):
+        for v in (10 ** 400, -(10 ** 400)):
+            with self.subTest(v=v):
+                self.assertFalse(self.host(lambda: bi._interval(v)))
+                doc = lambda n, iv=5.0: {"progress": n, "interval_s": iv, "process_started_ts": self.GOOD}
+                for first, taken in ((doc(3, v), doc(4, v)), (doc(3), doc(4, v))):
+                    got = self.host(lambda: bi.judge_hub_output({"first": first, "between": [], "taken": taken},
+                                                                "[2] (zz-hub)"))
+                    self.assertIsInstance(got, rh.Unresolved)
+        self.assertTrue(bi._interval(60))
+        self.assertFalse(bi._interval(61))
+
+    def run_reader(self, docs):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, bi.HUB_STATUS_NAME)
+            Path(path).write_text(json.dumps(docs[0]))
+            if len(docs) > 1:
+                timer = threading.Timer(0.1, lambda: Path(path).write_text(json.dumps(docs[1])))
+                timer.start()
+                self.addCleanup(timer.cancel)
+            p = subprocess.run([sys.executable, "-I", "-S", "-c", bi.HUB_READER, path, "0.05", "0.0", "5.0",
+                                repr(bi.INTERVAL_CAP_S), str(bi.MAX_STATUS_BYTES), str(bi.HUB_OBS_MAX),
+                                str(bi.HUB_CAPTURE_MAX)], capture_output=True, text=True, timeout=15)
+            if len(docs) > 1:
+                timer.join()
+            return p
+
+    def test_the_reader_exits_10_on_an_impossible_start_or_a_huge_interval(self):
+        good = {"progress": 3, "interval_s": 0.2, "process_started_ts": self.GOOD}
+        for v in self.BAD_INSTANTS:
+            with self.subTest(first=v):
+                p = self.run_reader([dict(good, process_started_ts=v)])
+                self.assertEqual((p.returncode, p.stdout), (10, ""))
+        for iv in (10 ** 400, -(10 ** 400)):
+            with self.subTest(first_interval=str(iv)[:8]):
+                p = self.run_reader([dict(good, interval_s=iv)])
+                self.assertEqual((p.returncode, p.stdout), (10, ""))
+            with self.subTest(later_interval=str(iv)[:8]):
+                p = self.run_reader([good, dict(good, progress=4, interval_s=iv)])
+                self.assertEqual((p.returncode, p.stdout), (10, ""))
+        with self.subTest(later="an impossible start"):
+            p = self.run_reader([good, dict(good, progress=4, process_started_ts="2026-10-32T10:00:00.050000Z")])
+            self.assertEqual((p.returncode, p.stdout), (10, ""))
+
+
 class HubJudgeTest(unittest.TestCase):
     """What the host makes of the reader's envelope."""
 
@@ -754,6 +870,18 @@ class HubJudgeTest(unittest.TestCase):
         for label, (first, between, taken) in cases.items():
             with self.subTest(label):
                 self.assertIsInstance(self.judge(first, between, taken), rh.Unresolved)
+
+    def test_an_observation_past_its_size_bound_is_unknown(self):
+        """Opus H1: an equal count of 300 digits is admissible but no
+        legitimate observation; its entry re-encodes past the bound."""
+        big = 10 ** 300
+        got = self.judge(self.doc(big), [self.entry(big)], self.doc(big + 1))
+        self.assertIsInstance(got, rh.Unresolved)
+        self.assertIn("malformed observation", got.reason)
+
+    def test_a_first_document_with_a_bool_count_is_unknown(self):
+        """Opus H3: True is an int to Python, and is still no count."""
+        self.assertIsInstance(self.judge(dict(self.doc(5), progress=True), [], self.doc(2)), rh.Unresolved)
 
     def test_an_interval_at_the_cap_is_admitted(self):
         self.assertIsInstance(self.judge(self.doc(5, 60), [], self.doc(6, 60)), bi.Progressed)
@@ -829,6 +957,11 @@ class OwnMountsTest(unittest.TestCase):
                 got = self.refusal(extra)
                 self.assertIsInstance(got, rh.Unresolved)
                 self.assertIn("mounts something else over /data/ledger/x", got.reason)
+
+    def test_a_leading_double_slash_destination_is_the_same_container_path(self):
+        """Opus H10: "//data/ledger" is /data/ledger to the container."""
+        self.assertIsInstance(self.refusal(self.m("//data/ledger")), rh.Unresolved)
+        self.assertIsNone(self.refusal(bind=self.m("//data", "/zz/h")))
 
     def test_rule_i_the_bind_at_c_exactly_once_as_a_bind_from_h(self):
         for label, kw in (("a duplicate at C", dict(extra=(self.m("/data", "/zz/h"),))),
@@ -911,7 +1044,8 @@ class BudgetTest(unittest.TestCase):
             def __init__(self, total=bi.PHASE_BUDGET_S):
                 super().__init__(total)
                 now[0] += total
-        for obj, name, value in ((bi, "Budget", Spent), (rh, "run", lambda argv, **k: calls.append(argv)),
+        for obj, name, value in ((bi, "Budget", Spent),
+                                 (rh, "run", lambda argv, **k: calls.append(argv) or rh.Proc(tuple(argv), 1, "", "")),
                                  (prov, "_builds_spec", lambda overlay: SimpleNamespace(
                                      router=router(), hub=None, secrets=None, overlay_path=None, overlay_pin=None)),
                                  (cpin, "pinned_commit", lambda *a, **k: PIN)):
@@ -923,6 +1057,25 @@ class BudgetTest(unittest.TestCase):
         [hop] = [c for e, c in zip(out.extras, out.checks) if e["id"] == bi.ID_HOP]
         self.assertEqual((hop.result, calls), (rh.UNKNOWN, []))
         self.assertIn("ran out of its time budget", hop.reason)
+
+
+class RunCaptureTest(unittest.TestCase):
+    """Opus 2 on #76: run() itself enforces max_output. Through the REAL run
+    (conftest keeps it as `__wrapped__` under pytest), a local python child
+    that prints past the bound and exits at once; nothing here starts
+    docker."""
+
+    def run_real(self, *a, **k):
+        return getattr(rh.run, "__wrapped__", rh.run)(*a, **k)
+
+    def test_output_past_the_bound_from_a_child_that_exits_at_once_is_refused(self):
+        with self.assertRaises(rh.CannotRun) as e:
+            self.run_real([sys.executable, "-I", "-S", "-c", "print('x' * 5000)"], timeout=10, max_output=100)
+        self.assertIn("printed more than 100 bytes", str(e.exception))
+
+    def test_output_within_the_bound_is_returned(self):
+        p = self.run_real([sys.executable, "-I", "-S", "-c", "print('ok')"], timeout=10, max_output=100)
+        self.assertEqual((p.rc, p.out), (0, "ok\n"))
 
 
 class CollectTest(unittest.TestCase):
@@ -1109,7 +1262,9 @@ class DockerReadersTest(unittest.TestCase):
                                  "/zz/home/state/status.json), so the status document may be its")
 
     def test_state_sharers_with_only_the_container_itself_is_empty(self):
-        run, calls = self.runner((0, "1" * 64 + "\n", ""))
+        # A second answer stands ready, so counting the container itself
+        # fails the call count rather than running out of answers.
+        run, calls = self.runner((0, "1" * 64 + "\n", ""), (0, json.dumps([{"Id": "1" * 64, "Mounts": []}]), ""))
         self.assertEqual(bi.state_sharers(["docker"], "/zz/state", "1" * 64, run), [])
         self.assertEqual(len(calls), 1)
 
@@ -1559,12 +1714,50 @@ class InstallAndVerifyTest(unittest.TestCase):
             "the ledger env twice": self.hub_live(env=["RELAY_LEDGER_DIR=/data/ledger"] * 2),
             "the ledger env elsewhere": self.hub_live(env=["RELAY_LEDGER_DIR=/data/other"]),
             "a non-string env entry": self.hub_live(env=["RELAY_LEDGER_DIR=/data/ledger", 7]),
+            "only a longer name": self.hub_live(env=["RELAY_LEDGER_DIRX=/data/ledger"]),
         }
         for label, live in cases.items():
             with self.subTest(label):
                 c, _, calls = self.hub_outcome(self.envelope(), live=live)
                 self.assertEqual(c.result, rh.UNKNOWN)
                 self.assertFalse(any("exec" in a for a in calls))
+
+    def test_a_config_that_is_not_an_object_is_unknown_not_a_crash(self):
+        """Opus 8: hardening; the engine never emits it."""
+        live = self.hub_live()
+        live["Config"] = "x"
+        self.assertIsInstance(bi.ledger_env_refusal(live, "/data/ledger", "[2] (zz-hub)"), rh.Unresolved)
+        self.assertEqual(bi.hub_router("zz-hub", COMMIT, live, {LABEL: COMMIT}).check.result, rh.PASS)
+
+    def test_a_hub_section_with_no_engine_makes_1s_claim_unknown(self):
+        """Opus H11: [1]'s state directory must also be listed on [2]'s
+        engine, and with none to name that listing cannot be made."""
+        import amap_sandy as prov
+        spec = self.hub_spec()
+        spec.supervision = None
+        spec.router = router()
+        spec.overlay_path, spec.overlay_pin = "/zz/overlay/plugin.py", {"sha256": "c" * 64}
+        with tempfile.TemporaryDirectory() as home:
+            sd = os.path.realpath(os.path.join(home, "state"))
+            os.makedirs(sd)
+            Path(sd, bi.STATUS_NAME).write_text(json.dumps({
+                "process_started_ts": "2026-10-15T10:00:00.050000Z", "polls": 4, "interval_s": 5.0,
+                "transport_plugin": {"path": "/zz/overlay/plugin.py", "sha256": "c" * 64}}))
+            r1 = container(mounts=[{"Type": "bind", "Source": sd, "Destination": sd, "RW": True}],
+                           finished="2026-10-15T09:59:59.950000000Z")
+
+            def run(argv, **k):
+                if "ps" in argv:
+                    return rh.Proc(tuple(argv), 0, r1["Id"] + "\n", "")
+                return rh.Proc(tuple(argv), 0, json.dumps([r1]), "")
+            self.patch(prov, "_builds_spec", lambda overlay: spec)
+            self.patch(rh, "run", run)
+            self.patch(self.cpin, "pinned_commit", lambda *a, **k: PIN)
+            self.patch(hp, "hop_pin", lambda *a, **k: PIN)
+            out = prov.build_identity_outcome(SimpleNamespace(overlay=None, state_dir=sd), Path(home))
+        [hop] = [c for e, c in zip(out.extras, out.checks) if e["id"] == bi.ID_PLUGIN and e["host_role"] == bi.ROLE_HOP]
+        self.assertEqual(hop.result, rh.UNKNOWN)
+        self.assertIn("names no engine for [2]", hop.reason)
 
     def test_a_paused_hub_or_one_without_a_full_id_is_refused_before_any_exec(self):
         paused = self.hub_live()
@@ -1609,7 +1802,8 @@ class BothRoutersTest(unittest.TestCase):
                            finished="2026-10-15T09:59:59.950000000Z")
             r2 = container(cid="2a" * 32, mounts=[{"Type": "bind", "Source": os.path.dirname(sd),
                                                    "Destination": "/data", "RW": True}])
-            secrets = SimpleNamespace(principal="zz-hub-principal", image_commit=COMMIT, docker_via_sudo=False,
+            secrets = SimpleNamespace(principal="zz-hub-principal", image="zz-hub:recorded", image_commit=COMMIT,
+                                      docker_via_sudo=False,
                                       tools={"docker": "/zz/docker"}, uid=2101, gid=2100)
             spec = SimpleNamespace(router=router(), hub=SimpleNamespace(dirs={"RELAY_LEDGER_DIR": "/zz/h/ledger"}),
                                    secrets=secrets, supervision=SimpleNamespace(engine=ENGINE),

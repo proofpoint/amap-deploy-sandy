@@ -290,7 +290,9 @@ def run(argv: Sequence[str], *, cwd: Optional[Path] = None,
     * FileNotFoundError is a NAMED failure, not a traceback: a missing
       docker CLI raises rather than exiting non-zero.
     * output is captured as bytes and decoded with replacement, so a child
-      that prints undecodable bytes never raises here.
+      that prints undecodable bytes never raises here. Newlines are passed
+      through as the child wrote them ("\\r\\n" stays "\\r\\n"); callers split
+      with splitlines() or strip().
     * with `max_output`, stdout and stderr together are bounded: past that
       many bytes the child is killed and CannotRun raised, so a child cannot
       make the caller read without limit.

@@ -1240,10 +1240,6 @@ class SharedProbeHazardsTest(unittest.TestCase):
             self.assertNotIn(verb, SRC)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class BoundedRunTest(unittest.TestCase):
     """run(max_output=...) and the byte capture. _run_bounded is exercised
     directly with a local python child: conftest replaces `run` itself for
@@ -1270,5 +1266,9 @@ class BoundedRunTest(unittest.TestCase):
     def test_undecodable_output_never_raises(self):
         p = rh._run_bounded(self.child("import sys; sys.stdout.buffer.write(b'\\xff\\xfe')"), None, 10.0,
                             dict(os.environ), 100)
-        self.assertEqual(p.out, "��")
-        self.assertEqual(rh._text(b"\xff"), "�")
+        self.assertEqual(p.out, "\ufffd\ufffd")
+        self.assertEqual(rh._text(b"\xff"), "\ufffd")
+
+
+if __name__ == "__main__":
+    unittest.main()

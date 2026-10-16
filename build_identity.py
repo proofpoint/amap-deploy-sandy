@@ -37,6 +37,7 @@ document must refuse, not read as "nothing deployed".
 """
 
 import calendar
+import datetime
 import errno
 import json
 import math
@@ -243,7 +244,9 @@ def hub_router(container: str, image_commit: Optional[str], live: Any, image_lab
             why = f"[2]'s image's {LABEL} label is not a full commit"
         return Claim(ID_HUB, rh.check(claim, want, rh.Unresolved(why), remedy))
     observed = {"observed_commit": label}
-    own = ((live.get("Config") or {}).get("Labels") or {}).get(LABEL)
+    config = live.get("Config") if isinstance(live, dict) else None
+    labels = config.get("Labels") if isinstance(config, dict) else None
+    own = labels.get(LABEL) if isinstance(labels, dict) else None
     if own is not None and own != label:
         override = rh.check(claim, _fact("container label", label, "the image's own label"), own,
                             f"start [2] without --label {LABEL}: a run-time label is not what was built",
@@ -320,7 +323,14 @@ def _ns(value: Any, *, fraction: bool = False) -> Optional[int]:
     if not m or (fraction and m.group(7) is None):
         return None
     y, mo, d, h, mi, se, frac = m.groups()
-    whole = calendar.timegm((int(y), int(mo), int(d), int(h), int(mi), int(se)))
+    # A real instant only: datetime refuses month 99, October 32 or hour 24,
+    # which calendar.timegm would quietly roll into another day.
+    try:
+        instant = datetime.datetime(int(y), int(mo), int(d), int(h), int(mi), int(se),
+                                    tzinfo=datetime.timezone.utc)
+    except ValueError:
+        return None
+    whole = calendar.timegm(instant.utctimetuple())
     return whole * 10 ** 9 + int((frac or "").ljust(9, "0"))
 
 
@@ -421,7 +431,13 @@ def _counter(v: Any) -> bool:
 
 
 def _interval(v: Any) -> bool:
-    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and 0 < v <= INTERVAL_CAP_S
+    """An interval in (0, INTERVAL_CAP_S], total over any JSON value: an int
+    is compared as an int, so one too large for a float never overflows."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return False
+    if isinstance(v, float) and not math.isfinite(v):
+        return False
+    return 0 < v <= INTERVAL_CAP_S
 
 
 def admission(doc: Any, counter: str, first: Any = None) -> Optional[str]:
@@ -575,6 +591,9 @@ def state_sharers(docker: List[str], state_dir: str, own_id: Any,
                              f"{state_dir} cannot be ruled out")
     sharers = []
     for doc in docs:
+        if not isinstance(doc, dict):
+            return rh.Unresolved(f"docker inspect answered with something other than a container, so the ones "
+                                 f"sharing {state_dir} cannot be ruled out")
         mounts = doc.get("Mounts")
         if not isinstance(mounts, list):
             return rh.Unresolved(f"docker inspect shows no mounts for a container, so it cannot be ruled out "
@@ -661,18 +680,33 @@ HUB_CAPTURE_MAX = 2 * (6 * MAX_STATUS_BYTES) + HUB_OBS_MAX * HUB_OBS_BYTES + 409
 #: Each read is O_NOFOLLOW|O_NONBLOCK, fstat S_ISREG, bounded, to EOF. It
 #: admits EVERY document as `admission` does (the first before it sets its
 #: deadline) and stops at the first that fails (exit 10). Its deadline is
-#: its own monotonic clock at the first read plus min(2 × interval_s +
-#: margin, the window cap); a read that completes after it is discarded, and
+#: its own monotonic clock once the first document is read and admitted,
+#: plus min(2 × interval_s + margin, the window cap); a read that completes after it is discarded, and
 #: no sleep runs past it, so it ends itself within the cap and one step,
 #: also when the exec client is killed. It writes nothing and takes no lock.
 #: It prints {"first", "between", "taken"} and exits 0, or exits with
 #: HUB_EXIT's code and nothing on stdout.
 HUB_READER = r"""
-import errno, json, math, os, re, stat, sys, time
+import datetime, errno, json, math, os, re, stat, sys, time
 path = sys.argv[1]
 step, margin, window, cap = (float(a) for a in sys.argv[2:6])
 limit, obs_max, capture = (int(a) for a in sys.argv[6:9])
-ts = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}[.][0-9]{1,9}Z")
+ts = re.compile(r"([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2})[.][0-9]{1,9}Z")
+def instant(v):
+    m = ts.fullmatch(v) if isinstance(v, str) else None
+    if not m:
+        return False
+    try:
+        datetime.datetime(*(int(g) for g in m.groups()))
+    except ValueError:
+        return False
+    return True
+def interval(v):
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return False
+    if isinstance(v, float) and not math.isfinite(v):
+        return False
+    return 0 < v <= cap
 def read():
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -700,11 +734,8 @@ def read():
 def count(v):
     return isinstance(v, int) and not isinstance(v, bool)
 def admit(doc, first):
-    if not isinstance(doc, dict) or not isinstance(doc.get("process_started_ts"), str) \
-            or not ts.fullmatch(doc["process_started_ts"]):
-        sys.exit(10)
-    iv = doc.get("interval_s")
-    if not isinstance(iv, (int, float)) or isinstance(iv, bool) or not math.isfinite(iv) or not 0 < iv <= cap:
+    if not isinstance(doc, dict) or not instant(doc.get("process_started_ts")) \
+            or not interval(doc.get("interval_s")):
         sys.exit(10)
     if not count(doc.get("progress")):
         sys.exit(10)
@@ -721,6 +752,7 @@ while time.monotonic() < deadline:
     if time.monotonic() > deadline:
         break
     admit(doc, first)
+    # A rise or a drop ends the wait and is taken; the host refuses a drop.
     if doc["progress"] != before:
         taken = doc
         break
@@ -831,7 +863,8 @@ def ledger_env_refusal(live: Any, ledger: str, who: str) -> Any:
     """None when [2]'s Config.Env (checked raw, before anything str()s it)
     is a list of strings with exactly one RELAY_LEDGER_DIR= entry whose
     value is `ledger` exactly; else an Unresolved."""
-    env = (live.get("Config") or {}).get("Env") if isinstance(live, dict) else None
+    config = live.get("Config") if isinstance(live, dict) else None
+    env = config.get("Env") if isinstance(config, dict) else None
     if not isinstance(env, list) or not all(isinstance(e, str) for e in env):
         return rh.Unresolved(f"docker inspect of {who} does not list its environment as strings")
     found = [e[len("RELAY_LEDGER_DIR="):] for e in env if e.startswith("RELAY_LEDGER_DIR=")]
