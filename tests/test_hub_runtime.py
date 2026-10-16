@@ -20,6 +20,7 @@ import os
 import stat
 import tempfile
 import unittest
+from types import SimpleNamespace
 
 import delivered_domains as dd
 import host_setup as hs
@@ -86,6 +87,49 @@ def full_doc(**hub_over):
 
 def spec(**over):
     return hs.load_spec(full_doc(**over))
+
+
+class MountHoldingTest(unittest.TestCase):
+    """mount_holding: the one choice the rendering and the build-identity
+    reader both make (DS-BUILD-ID-HUB-READER v2.2 §3)."""
+
+    @staticmethod
+    def of(mounts):
+        return SimpleNamespace(mounts=mounts)
+
+    def test_the_longest_prefix_of_the_principal_first_on_a_tie(self):
+        a = {"principal": "p", "host": "/srv/x", "container": "/a"}
+        b = {"principal": "p", "host": "/srv/x/deep", "container": "/b"}
+        tie = {"principal": "p", "host": "/srv/x/deep", "container": "/c"}
+        other = {"principal": "q", "host": "/srv/x/deep/er", "container": "/d"}
+        s = self.of([a, b, tie, other])
+        self.assertIs(hr.mount_holding(s, "p", "/srv/x/deep/er/f"), b)
+        self.assertIs(hr.mount_holding(s, "p", "/srv/x/z"), a)
+        self.assertIs(hr.mount_holding(s, "p", "/srv/x"), a)
+        self.assertIsNot(hr.mount_holding(s, "p", "/srv/x/deep/er/f"), other)
+
+    def test_a_path_only_sharing_letters_is_not_held(self):
+        with self.assertRaises(hr.HubSpecError):
+            hr.mount_holding(self.of([{"principal": "p", "host": "/srv/x", "container": "/a"}]), "p", "/srv/xy")
+
+    def test_a_root_of_slash_or_not_normalised_is_refused(self):
+        for host in ("/", "/srv/x/", "//srv/x"):
+            with self.subTest(host=host):
+                with self.assertRaises(hr.HubSpecError):
+                    hr.mount_holding(self.of([{"principal": "p", "host": host, "container": "/c"}]), "p", "/srv/x/a")
+
+    def test_in_container_is_the_chosen_mount_plus_the_suffix(self):
+        s = spec()
+        for key, host in s.hub.dirs.items():
+            with self.subTest(key=key):
+                m = hr.mount_holding(s, s.secrets.principal, host)
+                self.assertEqual(hr._in_container(s, s.secrets.principal, host), m["container"] + host[len(m["host"]):])
+
+    def test_the_rendered_ledger_directory_is_the_one_the_reader_computes(self):
+        s = spec()
+        ledger_host = s.hub.dirs["RELAY_LEDGER_DIR"]
+        m = hr.mount_holding(s, s.secrets.principal, ledger_host)
+        self.assertEqual(dict(hr.environment(s, s.hub))["RELAY_LEDGER_DIR"], m["container"] + ledger_host[len(m["host"]):])
 
 
 class LoadTest(unittest.TestCase):

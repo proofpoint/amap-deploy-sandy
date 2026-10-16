@@ -51,8 +51,10 @@ runs Docker or launches sandy, except the read-only `docker` queries
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
+import posixpath
 import re
 import shutil
 import stat
@@ -77,9 +79,15 @@ import verify_report as vr  # how verify prints: one row per condition, its work
 import host_setup as hsu    # a hop deployment's host plan: rendered and checked, never applied
 import host_adapter as ha   # the host registry's CLI, run as a subprocess, never imported
 import hop_router as hp     # the local router's hop keys, on a host with a hop link
+import activation_install as ai   # A3: the activation config, checked before anything is written
+import delegation_render as dr    # the delegation block's no-seed check
+import partition_setup as ps      # the harness gate A3 requires
+import hub_keys as hk             # the local router's container, named in the back-out
+import hub_supervise as hv        # the supervision kinds: A5's command on a launchd host
 import delivery_checks as dc  # delivery itself: lister mode, session posture, daemon build, backlog
 import connector_pin as cpin  # install refuses a connector checkout not at its siblings.json pin
 import build_identity as bi  # what each running runtime was built from: verify's "runtime builds" phase
+import hub_runtime as hr     # the hub-link router's rendering: where its ledger directory is seen
 
 # `fleet_policy.py` sits beside this module. Guarded rather than bare: this
 # module is imported by its tests and by its sibling tools, where HERE is not
@@ -3579,6 +3587,70 @@ def hop_router_keys(policy: Dict[str, Any], state_dir: Path, overlay: Optional[P
     return keys, problems
 
 
+def run_activation(args: argparse.Namespace, policy: Dict[str, Any], doc: Dict[str, Any], path: Path, *,
+                   apply: bool, spec: Any) -> int:
+    """A3 (activation_install): the activation config into the operator's
+    run directory under --apply, and root's place step printed. Exit 2 on any
+    refusal, which writes nothing; the live config is never written here."""
+    if not args.activate or not args.activation_sha256:
+        print("router config: --activate and --activation-sha256 go together: A3 names A2's run and A1's "
+              "printed digest, and neither is ever defaulted", file=sys.stderr)
+        return 2
+    link = hp.parse_hop_link(policy)
+    if spec is None or link is None or link.inbound is None:
+        print("router config: cannot activate — the policy's hop_link has no delegation member", file=sys.stderr)
+        return 2
+    checkout = hp.hop_checkout()
+    gate = ps.gate_problems(spec.gate, rl_sha=hp.hop_pin(),
+                            hop_sha=(spec.overlay_pin or {}).get("commit", rh.Unresolved("no plugin pin")),
+                            plugin_sha256=hp.PLUGIN_SHA256)
+    final, refused = ai.activate(
+        spec=spec, host=hsu.partition_host(spec), doc=doc, pre_activation=sibling_text(doc).encode("utf-8"),
+        fleet_domain=policy.get(fp.FLEET_DOMAIN_KEY), trusted=link.trusted, inbound=link.inbound,
+        run_id=args.activate, activation_sha256=args.activation_sha256, gate=gate,
+        validate=lambda d: dr.no_seed_problem(d, checkout),
+        validate_bytes=lambda b: dr.no_seed_problem_bytes(b, checkout))
+    for r in refused:
+        print(f"router config: cannot activate — {r}", file=sys.stderr)
+    if final is None:
+        return 2
+    source = Path(spec.secrets.run_dir) / ai.ACTIVATED_NAME
+    print(f"router config: activation {_write_file(source, final.decode('utf-8'), dry_run=not apply, label=ai.ACTIVATED_NAME)}")
+    print("  A3 to A5, in order, each step required before the next:")
+    for line in activation_sequence(spec, str(source), final, path, sibling_text(doc).encode("utf-8")):
+        print(f"    {line}")
+    return 0
+
+
+def activation_sequence(spec: Any, source: str, final: bytes, path: Path, pre_activation: bytes) -> List[str]:
+    """A3's printed steps after its write, through A5, and the back-out that
+    any failure from the root place on leads to. The back-out reads the HOST
+    file, the bind's source: a running single-file bind may still show the
+    inode it was started with."""
+    container = hk.local_container(spec, spec.keys)
+    final_sha = hashlib.sha256(final).hexdigest()
+    pre = hashlib.sha256(pre_activation).hexdigest()
+    return [
+        f"1. done: the activation config is {source} (sha256 {final_sha})",
+        f"2. as root: {ai.place_step(spec, source, final)}",
+        f"3. the host's {path} is byte for byte that file: sha256 {final_sha}",
+        f"4. A4: restart the local router: docker/run.sh --config {path} --detach, from the hop checkout",
+        ("5. A5: python3 amap-sandy.py verify --a5; every check must PASS except the signing check's UNKNOWN for "
+         "the VM file share, which --a5 excuses only by its exact reason"
+         if spec.supervision is not None and spec.supervision.kind == hv.KINDS[1] else
+         "5. A5: python3 amap-sandy.py verify; the signing check must PASS"),
+        f"if step 2, 3, 4 or 5 fails, back out in this order (pre-activation sha256 {pre}); stopping the "
+        f"router first (docker stop {container}) shortens the time it may sign:",
+        "B1. python3 amap-sandy.py install            (read the diff it prints)",
+        "B2. python3 amap-sandy.py install --apply    (it must exit 0; it renders no delegation)",
+        f"B3. read the host's {path}, not the container's view: it must parse as a JSON object with no "
+        "delegation member. If it carries one, or cannot be read or parsed, STOP: the activated config may "
+        "still be in place",
+        f"B4. its sha256 against {pre}: equal, or a difference install's diff explains",
+        f"B5. docker stop {container} if it runs, then docker start {container}",
+    ]
+
+
 def run_render_router(args: argparse.Namespace, home: Path, boxes: List[Dict[str, Any]],
                       policy: Dict[str, Any], *, apply: bool) -> int:
     """Render the sibling and write it (`apply`) or compare it (dry). Exit 0
@@ -3597,8 +3669,10 @@ def run_render_router(args: argparse.Namespace, home: Path, boxes: List[Dict[str
     doc = result["_doc"]
     for w in result["_warnings"]:
         print(f"router config warning: {w}", file=sys.stderr)
+    hop_spec: List[Any] = []
     keys, hop_problems = hop_router_keys(policy, state_dir, ha.overlay_path(getattr(args, "overlay", None)),
-                                         decommission=getattr(args, "decommission_hop", False), rendered=path)
+                                         decommission=getattr(args, "decommission_hop", False), rendered=path,
+                                         spec_out=hop_spec)
     for p in hop_problems:
         print(f"router config: cannot render — {p}", file=sys.stderr)
     if hop_problems:
@@ -3621,6 +3695,10 @@ def run_render_router(args: argparse.Namespace, home: Path, boxes: List[Dict[str
               f"rendering: {refused}", file=sys.stderr)
         return 2
     names = ", ".join(sorted(members))
+    if getattr(args, "prepare", False):
+        return run_prepare(args, policy, doc, path, apply=apply, spec=(hop_spec or [None])[0])
+    if getattr(args, "activate", None) is not None or getattr(args, "activation_sha256", None) is not None:
+        return run_activation(args, policy, doc, path, apply=apply, spec=(hop_spec or [None])[0])
     # The router cannot start without its state_dir, so it is created here —
     # only after the rendering (state_dir included) has passed the router's
     # own loader, so a placement the router refuses is never created.
@@ -3799,39 +3877,95 @@ def router_phases(args: argparse.Namespace, home: Path,
 
 def build_identity_outcome(args: argparse.Namespace, home: Path) -> rh.Outcome:
     """verify's "runtime builds" phase (build_identity): each runtime's build
-    against what the deployment recorded and siblings.json pins. [1]'s status
-    document is read fresh, inside the inspect bracket, from the state
-    directory the inspected container mounts, and then no other container,
-    in any state, may mount that directory; [2]'s router has no reader
-    here, so its plugin claim says the digest is not published."""
+    against what the deployment recorded and siblings.json pins, within one
+    PHASE_BUDGET_S (every engine call min(its own timeout, the time left)).
+
+    [1] is the local router, on the bare `docker`: its status document is
+    read host-side from the state directory its container binds by identity.
+    [2] is the hub-link router, on the hub's docker client with the
+    supervised engine named (`-H`; sudo -n drops DOCKER_HOST): its status
+    document is read by one `docker exec` of HUB_READER, which holds the
+    whole progress witness. Each is read inside its inspect bracket, then
+    every container sharing the directory is looked for on both engines
+    where both routers are deployed (DS-BUILD-ID-HUB-READER design v2.2,
+    v2.3)."""
     spec = _builds_spec(ha.overlay_path(getattr(args, "overlay", None)))
-    hub_docker = hsu.ss.docker(spec.secrets) if not isinstance(spec, rh.Unresolved) and spec is not None \
-        and spec.secrets is not None else ["docker"]
+    budget = bi.Budget()
+    aux = budget.runner(bi.AUX_TIMEOUT_S)
+    usable = spec is not None and not isinstance(spec, rh.Unresolved)
+    secrets = spec.secrets if usable else None
+    supervision = getattr(spec, "supervision", None) if usable else None
+    hub_docker = hsu.ss.docker(secrets) + ["-H", supervision.engine] \
+        if secrets is not None and supervision is not None else None
+    no_engine = rh.Unresolved("the host-setup document names no engine for [2] (no supervision section), so "
+                              "the container verify would read may be another engine's")
 
     def inspect(role: str, name: str) -> Any:
-        return bi.inspect_container(hub_docker if role == bi.ROLE_HUB else ["docker"], name)
+        if role == bi.ROLE_HUB:
+            return no_engine if hub_docker is None else bi.inspect_container(hub_docker, name, aux)
+        return bi.inspect_container(["docker"], name, aux)
+
+    def labels(image: str) -> Any:
+        return no_engine if hub_docker is None else bi.image_labels(hub_docker, image, aux)
+
+    def sharers(path: str, who: str, what: str, own_id: Any, engines: List[List[str]]) -> Any:
+        for docker in engines:
+            found = bi.state_sharers(docker, path, own_id, aux)
+            if isinstance(found, rh.Unresolved):
+                return found
+            if found:
+                return rh.Unresolved(bi.sharers_reason(who, what, path, found))
+        return None
 
     def status(role: str, name: str, live: Any) -> Any:
-        if role != bi.ROLE_HOP:
-            return None
+        # A container not settled, or without a full Id, is refused before
+        # anything is read or run against it.
+        unsettled = bi._settled(live, f"[{1 if role == bi.ROLE_HOP else 2}] ({name})")
+        if unsettled is not None:
+            return rh.Unresolved(unsettled)
+        return hub_status(name, live) if role == bi.ROLE_HUB else hop_status(name, live)
+
+    def hop_status(name: str, live: Any) -> Any:
         state_dir = str(sibling_state_dir(home, getattr(args, "state_dir", None)))
         who = f"[1] ({name})"
-        read = bi.read_progressing if bi.no_recorded_exit(live) else bi.read_status
-        doc = read(live, state_dir, who)
-        others = bi.state_sharers(["docker"], state_dir, live.get("Id"))
-        if isinstance(others, rh.Unresolved):
-            return others
-        if others:
-            return rh.Unresolved(f"another container shares {who}'s state directory {state_dir} "
-                                 f"({', '.join(str(i)[:12] for i in others)}), so the status document may be its")
-        return doc
+        if bi.no_recorded_exit(live):
+            doc = bi.read_progressing(live, state_dir, who, budget)
+        else:
+            doc = bi.read_status(live, state_dir, who)
+        engines = [["docker"]]
+        if usable and getattr(spec, "hub", None) is not None:
+            if hub_docker is None:
+                return no_engine
+            engines.append(hub_docker)
+        shared = sharers(state_dir, who, "state directory", live.get("Id"), engines)
+        return doc if shared is None else shared
+
+    def hub_status(name: str, live: Any) -> Any:
+        who = f"[2] ({name})"
+        if hub_docker is None:
+            return no_engine
+        try:
+            ledger_host = spec.hub.dirs["RELAY_LEDGER_DIR"]
+            m = hr.mount_holding(spec, secrets.principal, ledger_host)
+        except (hr.HubSpecError, KeyError, AttributeError) as e:
+            return rh.Unresolved(f"{who}'s ledger directory cannot be placed from the host-setup document: {e}")
+        ledger = m["container"] + ledger_host[len(m["host"]):]
+        refused = bi.own_mounts_refusal(live, m["host"], m["container"], ledger, who) \
+            or bi.ledger_env_refusal(live, ledger, who)
+        if refused is not None:
+            return refused
+        doc = bi.read_hub_status(hub_docker, live, posixpath.join(ledger, bi.HUB_STATUS_NAME),
+                                 f"{secrets.uid}:{secrets.gid}", who, budget.runner(bi.HUB_EXEC_TIMEOUT_S))
+        engines = [hub_docker] + ([["docker"]] if getattr(spec, "router", None) is not None else [])
+        shared = sharers(ledger_host, who, "ledger directory", live.get("Id"), engines)
+        return doc if shared is None else shared
 
     try:
         connector = cpin.pinned_commit()
     except (cpin.siblings.SiblingError, OSError, KeyError, ValueError) as e:
         connector = rh.Unresolved(f"siblings.json's connector pin cannot be read: {e}")
     phase = bi.collect(spec, feature_payload_dir(home), hop_pin=hp.hop_pin(), connector_pin=connector,
-                       inspect=inspect, labels=lambda image: bi.image_labels(hub_docker, image), status=status)
+                       inspect=inspect, labels=labels, status=status)
     return phase.outcome()
 
 
@@ -4156,6 +4290,8 @@ def run_sync(args: argparse.Namespace, home: Path, boxes_dir: Path) -> int:
       3. The router's config, a generated sibling of the manifest
          (`router_sibling_path`): written under --apply, compared otherwise.
     """
+    if getattr(args, "activate", None) is not None or getattr(args, "activation_sha256", None) is not None:
+        return run_activate_only(args, home)
     # Before anything is written: the connector checkout the payload is
     # copied from must be at its siblings.json pin (connector_pin).
     try:
@@ -4219,6 +4355,120 @@ def run_sync(args: argparse.Namespace, home: Path, boxes_dir: Path) -> int:
         print()
         prov_rc = max(prov_rc, run_install_identity(args, home, policy, boxes, states))
     return prov_rc
+
+
+def run_prepare(args: argparse.Namespace, policy: Dict[str, Any], doc: Dict[str, Any], path: Path, *,
+                apply: bool, spec: Any) -> int:
+    """A1 (`partition-activate`): from install's own rendering `doc`, after
+    every hop-host check install makes, the staged bytes (held to the
+    no-seed check), the prospective run spec for the final config path, and
+    A1's record. Under --apply the record is written into the operator's run
+    directory, and nothing else; the root place and the two weekly argv are
+    printed. Exit 2 on any refusal, which writes nothing."""
+    import shlex
+    import partition_activation as pa
+    import partition_job as pj
+    import fleet_keys as fk
+    import secret_setup as ss
+    link = hp.parse_hop_link(policy)
+    refusals = []
+    if spec is None or link is None or link.inbound is None:
+        refusals.append("the policy's hop_link has no delegation member")
+    elif spec.partition is None or spec.router is None or spec.secrets is None or spec.keys is None:
+        refusals.append("the host-setup document has no partition, router, secrets or keys section")
+    else:
+        gate = ps.gate_problems(spec.gate, rl_sha=hp.hop_pin(),
+                                hop_sha=(spec.overlay_pin or {}).get("commit", rh.Unresolved("no plugin pin")),
+                                plugin_sha256=hp.PLUGIN_SHA256)
+        refusals += [f"the harness gate does not hold: {g}" for g in gate]
+    if refusals:
+        for r in refusals:
+            print(f"partition-activate: cannot prepare A1 — {r}; nothing was written", file=sys.stderr)
+        return 2
+    checkout = hp.hop_checkout()
+    try:
+        staged = ai.render_staged(spec=spec, doc=doc, fleet_domain=policy.get(fp.FLEET_DOMAIN_KEY),
+                                  trusted=link.trusted, inbound=link.inbound,
+                                  validate=lambda d: dr.no_seed_problem(d, checkout), read_inventory=fk._read)
+        refused = dr.no_seed_problem_bytes(staged, checkout)
+        if refused:
+            raise ValueError(f"the staged bytes fail the no-seed check: {refused}")
+        aspec = pa.prospective_spec(checkout=checkout, final_path=spec.keys.local_config, staged=staged,
+                                    image=spec.router.image_digest, container=spec.router.container,
+                                    uid=spec.keys.uid, gid=spec.keys.gid, interval=pa.DEFAULT_INTERVAL)
+        record = pa.activation_record(host=hsu.partition_host(spec), spec=aspec, staged=staged,
+                                      final_config_path=spec.keys.local_config)
+    except (fk.FleetKeysError, pa.ActivationError, ValueError) as e:
+        print(f"partition-activate: cannot prepare A1 — {e}; nothing was written", file=sys.stderr)
+        return 2
+    try:
+        live = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        live = None
+    import partition_check as pcheck
+    if pcheck.carries_delegation(live):
+        print("partition-activate: NOTE: the live config carries delegation. De-activate first (the back-out "
+              "after the place, B1-B5), then A1")
+    overlay = ha.overlay_path(getattr(args, "overlay", None))
+    if overlay is None:
+        print("partition-activate: cannot prepare A1 — no deployment overlay names the approved document; "
+              "nothing was written", file=sys.stderr)
+        return 2
+    # Everything printed is computed before the record is written, so a
+    # failure here leaves nothing behind.
+    source = Path(spec.secrets.run_dir) / ps.ACTIVATION
+    writer = os.path.join(spec.secrets.writer_dir, ss.WRITER)
+    try:
+        steps = list(pj.activation_steps(spec.partition, writer=writer, source=str(source), activation_bytes=record))
+        argv = pj.job_argv(spec.partition, writer=writer, host=hsu.partition_host(spec), document=str(overlay),
+                           document_bytes=overlay.read_bytes(), activation_bytes=record)
+    except (OSError, ValueError) as e:
+        print(f"partition-activate: cannot prepare A1 — {e}; nothing was written", file=sys.stderr)
+        return 2
+    print(f"partition-activate: A1's record {_write_file(source, record.decode('utf-8'), dry_run=not apply, label=ps.ACTIVATION)}")
+    print(f"  its sha256, A3's --activation-sha256: {hashlib.sha256(record).hexdigest()}")
+    print(f"  the prospective spec's ROUTER_INTERVAL: {pa.DEFAULT_INTERVAL} (A4's docker/run.sh must use the same)")
+    for line in steps:
+        print(f"  {line}")
+    print("  # 7b, A2 (with the local router stopped):")
+    print(f"  /usr/bin/sudo {shlex.join(argv + ['--prospective'])}")
+    print("  # 7d, the manual weekly run (after A4):")
+    print(f"  /usr/bin/sudo {shlex.join(argv)}")
+    return 0
+
+
+def run_partition_activate(args: argparse.Namespace, home: Path) -> int:
+    """`partition-activate [--apply]` (A1): install's rendering path with
+    every hop-host check, then A1 (run_prepare). It writes nothing outside
+    the run directory, and nothing at all without --apply."""
+    policy_path = feature_manifest_path(home)
+    if not policy_path.is_file():
+        print(f"partition-activate: no {policy_path}: install the host first; nothing was written", file=sys.stderr)
+        return 2
+    args.prepare = True
+    policy = fp.load_policy(policy_path)
+    boxes = discover_sandboxes(args.sandy)
+    return run_render_router(args, home, boxes, policy, apply=args.apply)
+
+
+def run_activate_only(args: argparse.Namespace, home: Path) -> int:
+    """`install --activate RUN --activation-sha256 HEX` (A3): nothing but the
+    activation. Both arguments are checked first; the manifest, the payload,
+    the roster, the router's live config and the registry are never written
+    on this path. Its one write, A1 + T into the run directory under --apply,
+    comes only after every refusal has passed (activation_install)."""
+    if not getattr(args, "activate", None) or not getattr(args, "activation_sha256", None):
+        print("install: --activate and --activation-sha256 go together: A3 names A2's run and A1's printed "
+              "digest, and neither is ever defaulted; nothing was written", file=sys.stderr)
+        return 2
+    policy_path = feature_manifest_path(home)
+    if not policy_path.is_file():
+        print(f"install: cannot activate — no {policy_path}: install the host first; nothing was written",
+              file=sys.stderr)
+        return 2
+    policy = fp.load_policy(policy_path)
+    boxes = discover_sandboxes(args.sandy)
+    return run_render_router(args, home, boxes, policy, apply=args.apply)
 
 
 def run_cadence(args: argparse.Namespace, home: Path) -> int:
@@ -4921,6 +5171,13 @@ def build_parser() -> argparse.ArgumentParser:
                         "router's config beside the manifest — the whole install, once per "
                         "host; sandy applies it to each sandbox at its launch")
     install.add_argument("--apply", action="store_true", help="write (default: report only)")
+    install.add_argument("--activate", metavar="RUN_ID",
+                         help="A3: write the local router's activation config (A1's staged bytes with the token "
+                              "of A2's run RUN_ID) into the run directory and print root's place step; never "
+                              "the live config itself. Needs --activation-sha256")
+    install.add_argument("--activation-sha256", metavar="HEX",
+                         help="the sha256 A1 printed for its record; compared with the PLACED record, never "
+                              "taken from it")
     install.add_argument("--decommission-hop", action="store_true",
                          help="render router.json WITHOUT the hop keys although state_dir holds hop "
                               "state: the explicit removal of a hop link (then restart the router)")
@@ -4954,6 +5211,10 @@ def build_parser() -> argparse.ArgumentParser:
                              "JSON, for the router's operator console. Written atomically on "
                              "every exit, carrying its own generated_ts and this run's exit "
                              "status; cron-safe")
+    verify.add_argument("--a5", action="store_true",
+                        help="A5 after activation: on a host whose host-setup document declares launchd, "
+                             "the signing check's UNKNOWN with the exact VM-file-share reason under the live "
+                             "token is the one non-pass excused; every other check must pass")
     verify.add_argument("--container", default=rh.DEFAULT_CONTAINER,
                         help="the detached router's container name (default: $CONTAINER, as "
                              "the router's docker/run.sh reads it)")
@@ -5049,6 +5310,30 @@ def build_parser() -> argparse.ArgumentParser:
     hstart.add_argument("--spec", type=Path, default=None,
                         help="the host-setup document (default: the deployment overlay's host_setup section)")
 
+    pact = sub.add_parser(
+        "partition-activate", help="A1: from install's rendering, the staged delegation config, the prospective "
+                                   "run spec and A1's record into the run directory (with --apply), and the root "
+                                   "place and the weekly argv printed")
+    pact.add_argument("--apply", action="store_true", help="write A1's record into the run directory")
+
+    pprobe = sub.add_parser(
+        "partition-probe", help="A5's post-activation document: P01 and P02 against the local router's final "
+                                "running identity, into the run directory (with --apply); prints root's place")
+    pprobe.add_argument("--post-activation", required=True, metavar="T_RUN_ID",
+                        help="the run id of A2's evidence, the one the live token names")
+    pprobe.add_argument("--document", required=True, help="the approved host-setup document (the unit argv's)")
+    pprobe.add_argument("--document-sha256", required=True, help="that document's sha256")
+    pprobe.add_argument("--apply", action="store_true", help="write the document into the run directory")
+
+    pcheck = sub.add_parser(
+        "partition-check", help="A5's six claims about an activated local router (V1 V2 E1 E2 T1 R1), read-only, "
+                                "as one canonical JSON object (partition-check/2). Exit 0 means only that it was "
+                                "written; with --ready, exit 0 only when all six PASS")
+    pcheck.add_argument("--document", required=True,
+                        help="the approved host-setup document, the path the weekly unit's argv names")
+    pcheck.add_argument("--document-sha256", required=True, help="that document's sha256, as the unit's argv pins it")
+    pcheck.add_argument("--ready", action="store_true", help="exit 0 only when all six claims PASS (A5's acceptance)")
+
     teardown = sub.add_parser(
         "teardown", help="the fleet back to its pre-install state for a clean rebuild: "
                          "remove the payload, the router's config and router-state/ (held "
@@ -5093,7 +5378,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             return run_teardown(args, home, boxes_dir)
 
         if args.command == "host-setup":
-            return hsu.run(args.spec, production=args.production, overlay=ha.overlay_path(args.overlay))
+            return hsu.run(args.spec, production=args.production, overlay=ha.overlay_path(args.overlay),
+                           policy_on=delegation_policy(home))
 
         if args.command == "hub-render":
             return hsu.hub_render(args.spec, apply=args.apply, overlay=ha.overlay_path(args.overlay))
@@ -5105,7 +5391,19 @@ def main(argv: Optional[List[str]] = None) -> int:
             return hsu.hub_supervise(args.spec, apply=args.apply, overlay=ha.overlay_path(args.overlay))
 
         if args.command == "hub-start-check":
-            return hsu.hub_start_check(args.spec, overlay=ha.overlay_path(args.overlay))
+            return hsu.hub_start_check(args.spec, overlay=ha.overlay_path(args.overlay),
+                                       policy_on=delegation_policy(home))
+
+        if args.command == "partition-activate":
+            return run_partition_activate(args, home)
+
+        if args.command == "partition-probe":
+            import partition_postactivation as ppa
+            return ppa.run(args.document, args.document_sha256, args.post_activation, apply=args.apply)
+
+        if args.command == "partition-check":
+            import partition_check as pcheck
+            return pcheck.run(args.document, args.document_sha256, ready_only=args.ready)
 
         if args.command == "migrate-registry":
             return run_migrate_registry(args, home)
@@ -5127,7 +5425,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 2
 
 
-def run_verify_host_setup(args: argparse.Namespace) -> int:
+def delegation_policy(home: Path) -> Any:
+    """Whether this host's policy turns delegation on (its hop_link carries
+    `delegation`): True or False, or an Unresolved naming why the policy
+    could not be read. The signing check decides nothing on an Unresolved."""
+    try:
+        link = hp.parse_hop_link(fp.load_policy(feature_manifest_path(home)))
+    except (OSError, ValueError, fp.PolicyError) as e:
+        return rh.Unresolved(f"the fleet policy cannot be read: {e}")
+    return link is not None and link.inbound is not None
+
+
+def run_verify_host_setup(args: argparse.Namespace, home: Path) -> int:
     """verify's host-setup part: when the deployment overlay has a
     `host_setup` section, every `host-setup` check, with an UNKNOWN a
     problem like a FAIL. Silent without an overlay. `--host-facts` does not
@@ -5136,7 +5445,7 @@ def run_verify_host_setup(args: argparse.Namespace) -> int:
     if overlay is None:
         return 0
     print("\nverify: the hop deployment's host setup")
-    return hsu.verify_section(overlay)
+    return hsu.verify_section(overlay, a5=getattr(args, "a5", False), policy_on=delegation_policy(home))
 
 
 def run_verify_command(args: argparse.Namespace, home: Path, boxes_dir: Path) -> int:
@@ -5157,7 +5466,7 @@ def run_verify_command(args: argparse.Namespace, home: Path, boxes_dir: Path) ->
                                  notes_out=install_notes)
         print("\nverify (2/2): the checks the install cannot make")
         live_rc = run_verify(args, servers, home, boxes_dir, facts, install_notes=install_notes)
-        hop_rc = run_verify_host_setup(args)
+        hop_rc = run_verify_host_setup(args, home)
         rc = stale_rc or live_rc or hop_rc
         return rc
     finally:
