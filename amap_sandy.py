@@ -3693,6 +3693,8 @@ def run_render_router(args: argparse.Namespace, home: Path, boxes: List[Dict[str
               f"rendering: {refused}", file=sys.stderr)
         return 2
     names = ", ".join(sorted(members))
+    if getattr(args, "prepare", False):
+        return run_prepare(args, policy, doc, path, apply=apply, spec=(hop_spec or [None])[0])
     if getattr(args, "activate", None) is not None or getattr(args, "activation_sha256", None) is not None:
         return run_activation(args, policy, doc, path, apply=apply, spec=(hop_spec or [None])[0])
     # The router cannot start without its state_dir, so it is created here —
@@ -4295,6 +4297,100 @@ def run_sync(args: argparse.Namespace, home: Path, boxes_dir: Path) -> int:
         print()
         prov_rc = max(prov_rc, run_install_identity(args, home, policy, boxes, states))
     return prov_rc
+
+
+def run_prepare(args: argparse.Namespace, policy: Dict[str, Any], doc: Dict[str, Any], path: Path, *,
+                apply: bool, spec: Any) -> int:
+    """A1 (`partition-activate`): from install's own rendering `doc`, after
+    every hop-host check install makes, the staged bytes (held to the
+    no-seed check), the prospective run spec for the final config path, and
+    A1's record. Under --apply the record is written into the operator's run
+    directory, and nothing else; the root place and the two weekly argv are
+    printed. Exit 2 on any refusal, which writes nothing."""
+    import shlex
+    import partition_activation as pa
+    import partition_job as pj
+    import fleet_keys as fk
+    import secret_setup as ss
+    link = hp.parse_hop_link(policy)
+    refusals = []
+    if spec is None or link is None or link.inbound is None:
+        refusals.append("the policy's hop_link has no delegation member")
+    elif spec.partition is None or spec.router is None or spec.secrets is None or spec.keys is None:
+        refusals.append("the host-setup document has no partition, router, secrets or keys section")
+    else:
+        gate = ps.gate_problems(spec.gate, rl_sha=hp.hop_pin(),
+                                hop_sha=(spec.overlay_pin or {}).get("commit", rh.Unresolved("no plugin pin")),
+                                plugin_sha256=hp.PLUGIN_SHA256)
+        refusals += [f"the harness gate does not hold: {g}" for g in gate]
+    if refusals:
+        for r in refusals:
+            print(f"partition-activate: cannot prepare A1 — {r}; nothing was written", file=sys.stderr)
+        return 2
+    checkout = hp.hop_checkout()
+    try:
+        staged = ai.render_staged(spec=spec, doc=doc, fleet_domain=policy.get(fp.FLEET_DOMAIN_KEY),
+                                  trusted=link.trusted, inbound=link.inbound,
+                                  validate=lambda d: dr.no_seed_problem(d, checkout), read_inventory=fk._read)
+        refused = dr.no_seed_problem_bytes(staged, checkout)
+        if refused:
+            raise ValueError(f"the staged bytes fail the no-seed check: {refused}")
+        aspec = pa.prospective_spec(checkout=checkout, final_path=spec.keys.local_config, staged=staged,
+                                    image=spec.router.image_digest, container=spec.router.container,
+                                    uid=spec.keys.uid, gid=spec.keys.gid, interval=pa.DEFAULT_INTERVAL)
+        record = pa.activation_record(host=hsu.partition_host(spec), spec=aspec, staged=staged,
+                                      final_config_path=spec.keys.local_config)
+    except (fk.FleetKeysError, pa.ActivationError, ValueError) as e:
+        print(f"partition-activate: cannot prepare A1 — {e}; nothing was written", file=sys.stderr)
+        return 2
+    try:
+        live = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        live = None
+    import partition_check as pcheck
+    if pcheck.carries_delegation(live):
+        print("partition-activate: NOTE: the live config carries delegation. De-activate first (the back-out "
+              "after the place, B1-B5), then A1")
+    overlay = ha.overlay_path(getattr(args, "overlay", None))
+    if overlay is None:
+        print("partition-activate: cannot prepare A1 — no deployment overlay names the approved document; "
+              "nothing was written", file=sys.stderr)
+        return 2
+    # Everything printed is computed before the record is written, so a
+    # failure here leaves nothing behind.
+    source = Path(spec.secrets.run_dir) / ps.ACTIVATION
+    writer = os.path.join(spec.secrets.writer_dir, ss.WRITER)
+    try:
+        steps = list(pj.activation_steps(spec.partition, writer=writer, source=str(source), activation_bytes=record))
+        argv = pj.job_argv(spec.partition, writer=writer, host=hsu.partition_host(spec), document=str(overlay),
+                           document_bytes=overlay.read_bytes(), activation_bytes=record)
+    except (OSError, ValueError) as e:
+        print(f"partition-activate: cannot prepare A1 — {e}; nothing was written", file=sys.stderr)
+        return 2
+    print(f"partition-activate: A1's record {_write_file(source, record.decode('utf-8'), dry_run=not apply, label=ps.ACTIVATION)}")
+    print(f"  its sha256, A3's --activation-sha256: {hashlib.sha256(record).hexdigest()}")
+    print(f"  the prospective spec's ROUTER_INTERVAL: {pa.DEFAULT_INTERVAL} (A4's docker/run.sh must use the same)")
+    for line in steps:
+        print(f"  {line}")
+    print("  # 7b, A2 (with the local router stopped):")
+    print(f"  /usr/bin/sudo {shlex.join(argv + ['--prospective'])}")
+    print("  # 7d, the manual weekly run (after A4):")
+    print(f"  /usr/bin/sudo {shlex.join(argv)}")
+    return 0
+
+
+def run_partition_activate(args: argparse.Namespace, home: Path) -> int:
+    """`partition-activate [--apply]` (A1): install's rendering path with
+    every hop-host check, then A1 (run_prepare). It writes nothing outside
+    the run directory, and nothing at all without --apply."""
+    policy_path = feature_manifest_path(home)
+    if not policy_path.is_file():
+        print(f"partition-activate: no {policy_path}: install the host first; nothing was written", file=sys.stderr)
+        return 2
+    args.prepare = True
+    policy = fp.load_policy(policy_path)
+    boxes = discover_sandboxes(args.sandy)
+    return run_render_router(args, home, boxes, policy, apply=args.apply)
 
 
 def run_activate_only(args: argparse.Namespace, home: Path) -> int:
@@ -5156,6 +5252,30 @@ def build_parser() -> argparse.ArgumentParser:
     hstart.add_argument("--spec", type=Path, default=None,
                         help="the host-setup document (default: the deployment overlay's host_setup section)")
 
+    pact = sub.add_parser(
+        "partition-activate", help="A1: from install's rendering, the staged delegation config, the prospective "
+                                   "run spec and A1's record into the run directory (with --apply), and the root "
+                                   "place and the weekly argv printed")
+    pact.add_argument("--apply", action="store_true", help="write A1's record into the run directory")
+
+    pprobe = sub.add_parser(
+        "partition-probe", help="A5's post-activation document: P01 and P02 against the local router's final "
+                                "running identity, into the run directory (with --apply); prints root's place")
+    pprobe.add_argument("--post-activation", required=True, metavar="T_RUN_ID",
+                        help="the run id of A2's evidence, the one the live token names")
+    pprobe.add_argument("--document", required=True, help="the approved host-setup document (the unit argv's)")
+    pprobe.add_argument("--document-sha256", required=True, help="that document's sha256")
+    pprobe.add_argument("--apply", action="store_true", help="write the document into the run directory")
+
+    pcheck = sub.add_parser(
+        "partition-check", help="A5's six claims about an activated local router (V1 V2 E1 E2 T1 R1), read-only, "
+                                "as one canonical JSON object (partition-check/2). Exit 0 means only that it was "
+                                "written; with --ready, exit 0 only when all six PASS")
+    pcheck.add_argument("--document", required=True,
+                        help="the approved host-setup document, the path the weekly unit's argv names")
+    pcheck.add_argument("--document-sha256", required=True, help="that document's sha256, as the unit's argv pins it")
+    pcheck.add_argument("--ready", action="store_true", help="exit 0 only when all six claims PASS (A5's acceptance)")
+
     teardown = sub.add_parser(
         "teardown", help="the fleet back to its pre-install state for a clean rebuild: "
                          "remove the payload, the router's config and router-state/ (held "
@@ -5215,6 +5335,17 @@ def main(argv: Optional[List[str]] = None) -> int:
         if args.command == "hub-start-check":
             return hsu.hub_start_check(args.spec, overlay=ha.overlay_path(args.overlay),
                                        policy_on=delegation_policy(home))
+
+        if args.command == "partition-activate":
+            return run_partition_activate(args, home)
+
+        if args.command == "partition-probe":
+            import partition_postactivation as ppa
+            return ppa.run(args.document, args.document_sha256, args.post_activation, apply=args.apply)
+
+        if args.command == "partition-check":
+            import partition_check as pcheck
+            return pcheck.run(args.document, args.document_sha256, ready_only=args.ready)
 
         if args.command == "migrate-registry":
             return run_migrate_registry(args, home)
