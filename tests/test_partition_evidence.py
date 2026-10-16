@@ -419,3 +419,38 @@ class ReadProtectedTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NamedDocumentTest(unittest.TestCase):
+    """partition_evidence.named_document over documents the producer builds:
+    a token selects the document that ISSUED it. A document whose fail-stop
+    probes did not pass issued none, even though token_of computes one for
+    it, so that computed token never selects it."""
+
+    def named(self, raw, token):
+        def read(path):
+            if path == "/ev/partition-r1.json":
+                return raw
+            raise FileNotFoundError(path)
+        return pe.named_document(token, evidence_dir="/ev", host=HOST, read=read)
+
+    def test_the_issued_token_selects_its_document(self):
+        raw = build()
+        token = json.loads(raw)[pe.TOKEN_MEMBER]
+        doc, got, why = self.named(raw, token)
+        self.assertEqual((doc[pe.TOKEN_MEMBER], got, why), (token, raw, ""))
+
+    def test_a_failed_document_s_computed_token_selects_nothing(self):
+        for failing in ("P03", "P04"):
+            with self.subTest(failing=failing):
+                raw = build(verdicts={failing: "FAIL"})
+                doc = json.loads(raw)
+                self.assertIsNone(doc[pe.TOKEN_MEMBER])
+                unissued = pe.token_of(doc)
+                self.assertEqual(self.named(raw, unissued)[:2], (None, pe.NAMED_UNISSUED))
+
+    def test_another_token_and_no_run_are_refused(self):
+        raw = build()
+        self.assertEqual(self.named(raw, "r1:" + "0" * 64)[:2], (None, pe.NAMED_MISMATCH))
+        self.assertEqual(self.named(raw, "r9:" + "0" * 64)[:2], (None, pe.NAMED_MISSING))
+        self.assertEqual(self.named(raw, None)[:2], (None, pe.NAMED_NO_RUN))
