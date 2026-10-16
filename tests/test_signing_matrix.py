@@ -39,19 +39,31 @@ def fresh_status(**over):
     return doc
 
 
-def named(at=NOW - 3600, outcome=None):
+#: A1's run spec, in the shape prospective_spec and spec_from_running give.
+SPEC = {"name": "ex-up", "image": "sha256:" + "b" * 64, "user": "2101:2101", "network": "none",
+        "restart": "unless-stopped", "env": {"ROUTER_CONFIG": LOCAL},
+        "mounts": [{"type": "bind", "source": LOCAL, "target": LOCAL, "readonly": True}]}
+
+
+def named(at=NOW - 3600, outcome=None, binding=None):
+    """partition_evidence.named_document's answer: the evidence that issued
+    TOKEN, carrying `binding` as its local_router binding (A1's own by
+    default)."""
+    import partition_activation as pa
+
     def ask(token):
         if outcome is not None:
             return None, outcome, f"the document is {outcome}"
         if token != TOKEN:
             return None, "mismatch", "the token is not its document's"
-        return {"run_id": RID, "at": ts(at)}, b"raw", ""
+        bound = binding or pa.activation_binding(SPEC, approved()["staged"].encode())
+        return {"run_id": RID, "at": ts(at), "bindings": {"local_router": bound}}, b"raw", ""
     return ask
 
 
-def approved(block=BLOCK):
+def approved(block=BLOCK, spec=None):
     return {"staged": json.dumps({"instances": {}, "delegation": block}, indent=2) + "\n",
-            "final_config_path": LOCAL, "host": "alpha"}
+            "final_config_path": LOCAL, "host": "alpha", "spec": spec or SPEC}
 
 
 def live(block=None):
@@ -119,6 +131,17 @@ class Matrix(Base):
                 self.assertEqual(self.verdict(live(SIGNED), named=named(outcome=outcome)).result, rh.FAIL)
         wrong = dict(SIGNED, partition_verified=RID + ":" + "f" * 64)
         self.assertEqual(self.verdict(live(wrong)).result, rh.FAIL)
+
+    def test_evidence_bound_to_another_a1_fails(self):
+        """The same block, current passing evidence, but bound to another A1
+        run spec: the evidence is not this activation's."""
+        import partition_activation as pa
+        other = pa.activation_binding(dict(SPEC, user="2102:2102"), approved()["staged"].encode())
+        c = self.verdict(live(SIGNED), named=named(binding=other))
+        self.assertEqual(c.result, rh.FAIL)
+        self.assertIn("bound to another activation", str(c.actual))
+        self.assertEqual(self.verdict(live(SIGNED), approved=approved(spec=dict(SPEC, user="2102:2102"))).result,
+                         rh.FAIL)
 
     def test_a_stale_named_document_fails(self):
         c = self.verdict(live(SIGNED), named=named(at=NOW - 9 * 86400))
@@ -199,6 +222,45 @@ class StartGateTest(Base):
                 c = self.gate(raw, live_ok=False)
                 self.assertEqual(c.result, rh.UNKNOWN)
                 self.assertIn("not shown to read", c.reason)
+
+
+class RealEvidenceTest(Base):
+    """The start gate and the signing verdict over producer-built evidence
+    read through the real partition_evidence.named_document: only the token
+    the evidence ISSUED, bound to this A1, is admitted."""
+
+    def evidence(self, verdicts=None, spec=None):
+        import partition_activation as pa
+        import partition_evidence as pe
+        import test_partition_evidence as tpe
+        binding = pa.activation_binding(spec or SPEC, approved()["staged"].encode())
+        raw = tpe.build(host="alpha", run_id=RID, at=ts(NOW - 3600), verdicts=verdicts or {},
+                        bindings=dict(tpe.BINDINGS, local_router=binding))
+        doc = json.loads(raw)
+        token = doc[pe.TOKEN_MEMBER] or pe.token_of(doc)
+        named = lambda t: pe.named_document(t, evidence_dir="/ev", host="alpha",
+                                            read=lambda path: raw if path == f"/ev/partition-{RID}.json" else b"")
+        return live(dict(BLOCK, partition_verified=token)), named
+
+    def both(self, raw, named):
+        start = hk.verify_start_delegation(self.k, (self.k.local_config, hk._sha(raw)), lambda p: raw,
+                                           hk.Signing(policy_on=True, gate_ok=True, approved=approved(),
+                                                      approved_why="", named=named, now=NOW,
+                                                      status=rh.Unresolved("not read"),
+                                                      witness=lambda h: self.fail("witness asked")))[1]
+        return start.result, self.verdict(raw, named=named).result
+
+    def test_passing_evidence_bound_to_this_a1_is_admitted(self):
+        self.assertEqual(self.both(*self.evidence()), (rh.PASS, rh.PASS))
+
+    def test_failed_evidence_s_computed_token_is_refused(self):
+        for failing in ("P03", "P04"):
+            with self.subTest(failing=failing):
+                self.assertEqual(self.both(*self.evidence({failing: "FAIL"})), (rh.FAIL, rh.FAIL))
+
+    def test_passing_evidence_bound_to_another_a1_is_refused(self):
+        other = self.evidence(spec=dict(SPEC, user="2102:2102"))
+        self.assertEqual(self.both(*other), (rh.FAIL, rh.FAIL))
 
 
 class ConstantsTest(unittest.TestCase):

@@ -509,7 +509,9 @@ class Signing:
     Unresolved. `gate_ok`: the harness gate holds (gate_problems == []), or
     Unresolved. `approved`: A1's placed record, parsed; None when it is absent
     or invalid (`approved_why` says which); Unresolved when it cannot be read.
-    `named(token)`: partition_evidence.named_document for this host.
+    `named(token)`: partition_evidence.named_document for this host: the
+    evidence that ISSUED the token. Its local_router binding must be this
+    A1's activation binding.
     `status`: the local router's status.json document, or Unresolved.
     `witness(host_sha)`: `adoption` over the router's container, its result.
     `now`: epoch s."""
@@ -558,6 +560,14 @@ def _verdict(doc: Dict[str, Any], policy_on: bool, gate_ok: bool, sg: Signing) -
     named, raw, why = sg.named(token)
     if named is None:
         return rh.FAIL, f"its token's named document does not hold: {why}"
+    import partition_activation as pa
+    try:
+        this_a1 = pa.activation_binding(sg.approved["spec"], sg.approved["staged"].encode("utf-8"))
+    except (KeyError, TypeError, ValueError, AttributeError) as e:
+        return rh.FAIL, f"A1's record names no activation binding to hold the evidence to: {e!r}"
+    if (named.get("bindings") or {}).get("local_router") != this_a1:
+        return rh.FAIL, (f"its token's document ({named['run_id']}) is bound to another activation than A1's: "
+                         "re-run A2 to A5 for this A1, or un-render")
     age = sg.now - pe.at_seconds(named["at"])
     if age > pe.FRESH_FOR_S or age < -pe.CLOCK_TOLERANCE_S:
         return rh.FAIL, f"its token's document ({named['run_id']}) is not current: re-run A2 to A5, or un-render"

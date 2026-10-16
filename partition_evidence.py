@@ -313,8 +313,8 @@ def _read_fd(fd: int) -> bytes:
 
 #: The outcomes of `named_document`, besides a document: why no document is
 #: selected for a token. Each is its own answer, never a reason to search.
-NAMED_NO_RUN, NAMED_MISSING, NAMED_UNREADABLE, NAMED_MALFORMED, NAMED_MISMATCH = (
-    "no_run", "missing", "unreadable", "malformed", "mismatch")
+NAMED_NO_RUN, NAMED_MISSING, NAMED_UNREADABLE, NAMED_MALFORMED, NAMED_MISMATCH, NAMED_UNISSUED = (
+    "no_run", "missing", "unreadable", "malformed", "mismatch", "unissued")
 
 
 def named_document(token: Any, *, evidence_dir: str, host: str,
@@ -322,8 +322,10 @@ def named_document(token: Any, *, evidence_dir: str, host: str,
     """The evidence a token names, and only that one: (doc, raw, "") or
     (None, outcome, why). The token's run id gives exactly
     `partition-<run id>.json` in the evidence directory, read as placed,
-    parsed for this host, and its own token must be the token. Never the
-    newest document, and never a glob."""
+    parsed for this host, and the token it ISSUED must be the token: a
+    document whose fail-stop probes did not pass issued none, whatever
+    token_of would compute for it. Never the newest document, and never a
+    glob."""
     rid = token.partition(":")[0] if isinstance(token, str) else ""
     if not _RUN_ID.fullmatch(rid):
         return None, NAMED_NO_RUN, "the token names no run"
@@ -338,7 +340,9 @@ def named_document(token: Any, *, evidence_dir: str, host: str,
         doc = parse(raw, host=host)
     except ValueError as e:
         return None, NAMED_MALFORMED, f"{path} is not this host's evidence document: {e}"
-    if token_of(doc) != token:
+    if doc[TOKEN_MEMBER] is None:
+        return None, NAMED_UNISSUED, f"{path} issued no token: a fail-stop probe did not pass"
+    if doc[TOKEN_MEMBER] != token:
         return None, NAMED_MISMATCH, f"the token is not {path}'s own"
     return doc, raw, ""
 

@@ -171,6 +171,9 @@ M = [
     ('hk-container-prefix', 'hub_keys.py', '                       "fs=mount_fstype(real,read_mountinfo(),exact=True)\\n"', '                       "fs=mount_fstype(real,read_mountinfo())\\n"', 'test_signing_matrix.OpenResolvedTest'),
     ('hk-config-bound', 'hub_keys.py', '    "            if len(b) > CONFIG_MAX:\\n"', '    "            if False:\\n"', 'test_signing_matrix.OpenResolvedTest'),
     ('pr-unmeasured-subset', 'partition_run.py', '        and set(dispositions) - set(measured) == set(unmeasured) \\\n', '        and set(dispositions) - set(measured) <= set(unmeasured or {}) \\\n', 'test_partition_run.A2OutcomeTest'),
+    ('pe-issued-token', 'partition_evidence.py', '    if doc[TOKEN_MEMBER] is None:\n        return None, NAMED_UNISSUED, f"{path} issued no token: a fail-stop probe did not pass"\n    if doc[TOKEN_MEMBER] != token:', '    if token_of(doc) != token:', 'test_signing_matrix.RealEvidenceTest'),
+    ('pe-unissued-outcome', 'partition_evidence.py', '    if doc[TOKEN_MEMBER] is None:\n        return None, NAMED_UNISSUED', '    if False:\n        return None, NAMED_UNISSUED', 'test_partition_evidence.NamedDocumentTest'),
+    ('hk-a1-binding', 'hub_keys.py', '    if (named.get("bindings") or {}).get("local_router") != this_a1:', '    if False:', 'test_signing_matrix.RealEvidenceTest'),
 ]
 
 
