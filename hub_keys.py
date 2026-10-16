@@ -55,6 +55,7 @@ present at all, in any form, is a failure. This module never writes one.
 import copy
 import hashlib
 import json
+import math
 import os
 import posixpath
 import re
@@ -597,7 +598,7 @@ def verify_signing(ks: KeySpec, raw: Any, bind: rh.Check, sg: Signing) -> rh.Che
 #: after the " - " separator. Shared verbatim by the host step and the
 #: in-container script, so both sides answer by one rule.
 MOUNT_FSTYPE_SRC = (
-    "def mount_fstype(path, text):\n"
+    "def mount_fstype(path, text, exact=False):\n"
     "    best = None\n"
     "    for line in text.splitlines():\n"
     "        head, sep, tail = line.partition(' - ')\n"
@@ -605,7 +606,7 @@ MOUNT_FSTYPE_SRC = (
     "        if not sep or len(f) < 5 or not tail.split():\n"
     "            continue\n"
     "        mp = f[4].encode('latin-1').decode('unicode_escape')\n"
-    "        if path == mp or path.startswith(mp.rstrip('/') + '/'):\n"
+    "        if path == mp or (not exact and path.startswith(mp.rstrip('/') + '/')):\n"
     "            if best is None or len(mp) >= len(best[0]):\n"
     "                best = (mp, tail.split()[0])\n"
     "    return best[1] if best else None\n")
@@ -625,7 +626,7 @@ CONFIG_TUPLE_SCRIPT = ("import hashlib,json,os,time\n" + MOUNT_FSTYPE_SRC +
                        "    if not c: break\n"
                        "    b+=c\n"
                        "boot=open('/proc/sys/kernel/random/boot_id').read().strip()\n"
-                       "fs=mount_fstype(p,open('/proc/self/mountinfo').read())\n"
+                       "fs=mount_fstype(p,open('/proc/self/mountinfo').read(),exact=True)\n"
                        "print(json.dumps({'dev':st.st_dev,'ino':st.st_ino,'ctime_ns':st.st_ctime_ns,'size':st.st_size,"
                        "'sha256':hashlib.sha256(b).hexdigest(),'now':time.time(),'boot_id':boot,'fstype':fs}))\n")
 TUPLE_KEYS = ("dev", "ino", "ctime_ns", "size", "sha256", "boot_id", "fstype")
@@ -671,8 +672,15 @@ def platform_problem(host: Dict[str, Any], seen: Dict[str, Any]) -> str:
     if host.get("fstype") not in LOCAL_FS or host.get("fstype") != seen.get("fstype"):
         return (f"the config's filesystem is {host.get('fstype')!r} on the host and {seen.get('fstype')!r} in the "
                 f"container, not one local {'/'.join(LOCAL_FS)}")
+    return ""
+
+
+def inode_problem(host: Dict[str, Any], seen: Dict[str, Any]) -> str:
+    """On the supported platform, why the router does not read the host's
+    inode as the host sees it, or "": a replaced or changed bind."""
     if (host.get("dev"), host.get("ino"), host.get("ctime_ns")) != (seen["dev"], seen["ino"], seen["ctime_ns"]):
-        return "the container reads another inode, or one with another change time"
+        return ("the local router binds a replaced inode, or one changed since; recreate it with "
+                "docker/run.sh --detach (A4)")
     return ""
 
 
@@ -691,7 +699,8 @@ def adoption(read_tuple: Callable[[], Any], read_status: Callable[[], Any], host
     refused reload. 5: the same inode, change time, size and bytes: a write
     moved its ctime, which restoring the bytes cannot undo.
     `host_view()` gives the host's {kind, platform, boot_id, fstype, dev,
-    ino, ctime_ns, now} for the live config, read in one host step."""
+    ino, ctime_ns, now} for the live config, read in one host step; the one
+    read at T1 serves both the settle and the comparison."""
     t1 = read_tuple()
     if isinstance(t1, rh.Unresolved):
         return rh.UNKNOWN, f"the config the router reads cannot be identified: {t1.reason}"
@@ -703,6 +712,9 @@ def adoption(read_tuple: Callable[[], Any], read_status: Callable[[], Any], host
     why = platform_problem(h1, t1)
     if why:
         return rh.UNKNOWN, f"{UNSUPPORTED}; {why}"
+    why = inode_problem(h1, t1)
+    if why:
+        return rh.UNKNOWN, why
     if h1["now"] - h1["ctime_ns"] / 1e9 < CTIME_SETTLE_S:
         return rh.UNKNOWN, "the config changed moments ago; run verify again"
     s0 = read_status()
@@ -710,7 +722,7 @@ def adoption(read_tuple: Callable[[], Any], read_status: Callable[[], Any], host
         return rh.UNKNOWN, f"the router's status.json cannot be read: {s0.reason}"
     polls, started, interval = s0.get("polls"), s0.get("started_ts"), s0.get("interval_s")
     if not isinstance(polls, int) or isinstance(polls, bool) or not isinstance(started, str) \
-            or not isinstance(interval, (int, float)) or isinstance(interval, bool):
+            or not isinstance(interval, (int, float)) or isinstance(interval, bool) or not math.isfinite(interval):
         return rh.UNKNOWN, "status.json carries no polls, started_ts or interval_s"
     if interval < 1:
         return rh.UNKNOWN, f"the router polls every {interval}s; the witness needs an interval of at least 1s"
@@ -739,6 +751,9 @@ def adoption(read_tuple: Callable[[], Any], read_status: Callable[[], Any], host
     why = h5.reason if isinstance(h5, rh.Unresolved) else platform_problem(h5, t5)
     if why:
         return rh.UNKNOWN, f"{UNSUPPORTED}; at the end of the window: {why}"
+    why = inode_problem(h5, t5)
+    if why:
+        return rh.UNKNOWN, f"at the end of the window: {why}"
     return rh.PASS, "the router adopted the host's config: two polls on unchanged bytes"
 
 

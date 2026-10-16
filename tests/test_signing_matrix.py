@@ -211,8 +211,7 @@ class AdoptionTest(unittest.TestCase):
         """Another device or inode in the container than on the host: not one
         inode in one kernel, so no documented bound holds; UNKNOWN before any
         poll is waited for."""
-        for name, view in (("other device", self.view(dev=99)), ("other inode", self.view(ino=8)),
-                           ("other ctime", self.view(ctime_ns=self.C + 1)), ("not linux", self.view(platform="darwin")),
+        for name, view in (("not linux", self.view(platform="darwin")),
                            ("a launchd document", self.view(kind="launchd")),
                            ("another kernel", self.view(boot_id="boot-2")),
                            ("a fuse share", self.view(fstype="fuse.orbstack")), ("overlay", self.view(fstype="overlay")),
@@ -221,6 +220,34 @@ class AdoptionTest(unittest.TestCase):
                 result, why = self.run_it([self.a()], [], host=lambda v=view: v)
                 self.assertEqual(result, rh.UNKNOWN)
                 self.assertIn("native-Linux single-file bind", why)
+
+    def test_a_replaced_or_changed_bind_says_so_and_names_the_restart(self):
+        for name, view in (("other device", self.view(dev=99)), ("other inode", self.view(ino=8)),
+                           ("other ctime", self.view(ctime_ns=self.C + 1))):
+            with self.subTest(case=name):
+                result, why = self.run_it([self.a()], [], host=lambda v=view: v)
+                self.assertEqual(result, rh.UNKNOWN)
+                self.assertIn("binds a replaced inode", why)
+                self.assertNotIn("native-Linux", why)
+
+    def test_the_inode_is_compared_at_the_start_not_only_at_the_end(self):
+        """A mismatch seen only at T1 (it has resolved by T5) still refuses:
+        the window opened on a file the router was not reading."""
+        views = iter([self.view(ino=8), self.view()])
+        result, why = self.run_it([self.a(), self.a()], self.polls(10, 11, 12), host=lambda: next(views))
+        self.assertEqual(result, rh.UNKNOWN)
+        self.assertIn("binds a replaced inode", why)
+
+    def test_a_container_without_the_single_file_bind_entry_is_unknown(self):
+        result, why = self.run_it([dict(self.a(), fstype=None)], [])
+        self.assertEqual(result, rh.UNKNOWN)
+        self.assertIn("filesystem", why)
+
+    def test_the_interval_must_be_a_finite_number_of_at_least_one_second(self):
+        self.assertEqual(self.run_it([self.a(), self.a()], self.polls(10, 11, 12, interval=1.0))[0], rh.PASS)
+        for bad in (True, float("nan"), float("inf")):
+            with self.subTest(interval=bad):
+                self.assertEqual(self.run_it([self.a()], self.polls(10, interval=bad))[0], rh.UNKNOWN)
 
     def test_the_container_s_filesystem_must_be_the_host_s(self):
         result, why = self.run_it([dict(self.a(), fstype="xfs")], [])

@@ -1142,7 +1142,7 @@ def host_view(spec: Spec) -> Any:
     try:
         st = os.stat(spec.keys.local_config)
         boot = open("/proc/sys/kernel/random/boot_id").read().strip() if sys.platform == "linux" else None
-        fs = hk.mount_fstype(spec.keys.local_config, open("/proc/self/mountinfo").read()) \
+        fs = hk.mount_fstype(os.path.realpath(spec.keys.local_config), open("/proc/self/mountinfo").read()) \
             if sys.platform == "linux" else None
     except OSError as e:
         return rh.Unresolved(f"cannot inspect {spec.keys.local_config} or the host's kernel: {e}")
