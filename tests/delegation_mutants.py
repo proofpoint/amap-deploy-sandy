@@ -174,6 +174,10 @@ M = [
     ('pe-issued-token', 'partition_evidence.py', '    if doc[TOKEN_MEMBER] is None:\n        return None, NAMED_UNISSUED, f"{path} issued no token: a fail-stop probe did not pass"\n    if doc[TOKEN_MEMBER] != token:', '    if token_of(doc) != token:', 'test_signing_matrix.RealEvidenceTest'),
     ('pe-unissued-outcome', 'partition_evidence.py', '    if doc[TOKEN_MEMBER] is None:\n        return None, NAMED_UNISSUED', '    if False:\n        return None, NAMED_UNISSUED', 'test_partition_evidence.NamedDocumentTest'),
     ('hk-a1-binding', 'hub_keys.py', '    if (named.get("bindings") or {}).get("local_router") != this_a1:', '    if False:', 'test_signing_matrix.RealEvidenceTest'),
+    ('hs-a5-other-unknown', 'host_setup.py', '            rc = 0 if others and all(c.result == rh.PASS for c in others) else 1', '            rc = 0 if others and all(c.result != rh.FAIL for c in others) else 1', 'test_hub_supervise.A5OnLaunchdTest'),
+    ('hs-a5-hide-row', 'host_setup.py', '    rc = report(found, out)\n    if a5:', '    rc = report([c for c in found if not (a5 and c.claim == hk.SIGNING_CLAIM)], out)\n    if a5:', 'test_hub_supervise.A5OnLaunchdTest'),
+    ('hs-inputs-gate-open', 'host_setup.py', '    return hk.Signing(policy_on=policy_on, gate_ok=not bad,', '    return hk.Signing(policy_on=policy_on, gate_ok=True,', 'test_activation_install.StartInputsRealTest'),
+    ('hs-inputs-no-probes', 'host_setup.py', '    return signing_inputs(spec, policy_on, p, {', '    return signing_inputs(spec, policy_on, {}, {', 'test_activation_install.StartInputsRealTest'),
 ]
 
 

@@ -844,6 +844,21 @@ class ActivatedEnablementTest(unittest.TestCase):
                 self.over = over
                 self.assertEqual(self.labels(self.tsm.live(self.tsm.SIGNED), policy_on), [rh.FAIL, rh.FAIL])
 
+    def test_failed_or_foreign_evidence_fails_enablement(self):
+        """Producer-built evidence through the real named_document: a failed
+        P03 or P04 document's computed token, and passing evidence bound to
+        another A1, both refuse; this A1's passing evidence admits."""
+        tsm = self.tsm
+        body, named = tsm.real_evidence()
+        self.over = {"named": named}
+        self.assertEqual(self.labels(body), [rh.PASS, rh.PASS])
+        for label, args in (("P03 failed", ({"P03": "FAIL"},)), ("P04 failed", ({"P04": "FAIL"},)),
+                            ("another A1", (None, dict(tsm.SPEC, user="2102:2102")))):
+            with self.subTest(label):
+                body, named = tsm.real_evidence(*args)
+                self.over = {"named": named}
+                self.assertEqual(self.labels(body), [rh.FAIL, rh.FAIL])
+
     def test_unreadable_inputs_leave_enablement_unknown(self):
         self.assertEqual(self.labels(self.tsm.live(self.tsm.SIGNED), rh.Unresolved("no manifest")),
                          [rh.UNKNOWN, rh.UNKNOWN])
@@ -973,8 +988,20 @@ class A5OnLaunchdTest(unittest.TestCase):
         self.assertEqual(self.section([good, row], a5=False)[0], 1)
         self.assertEqual(self.section([bad, row], a5=True)[0], 1)
         rc, said = self.section([good, row], a5=True)
-        self.assertIn("UNKNOWN", said)                         # still printed as what it is
         self.assertIn("the one expected non-pass", said)
+
+    def test_any_other_unknown_still_fails_a5(self):
+        row, good = self.emitted(), rh.check("x", rh.Fact("x", True, "a test"), True, "x")
+        other = rh.unknown("z", rh.Fact("z", True, "a test"), "not asked", "ask it")
+        self.assertEqual(self.section([good, row, other], a5=True)[0], 1)
+
+    def test_the_excused_row_is_still_printed_as_unknown(self):
+        """The signing row's own printed line, not the A5 line's wording."""
+        row, good = self.emitted(), rh.check("x", rh.Fact("x", True, "a test"), True, "x")
+        rc, said = self.section([good, row], a5=True)
+        lines = [l for l in said.splitlines() if hs.hk.SIGNING_CLAIM in l and not l.lstrip().startswith("A5:")]
+        self.assertEqual(len(lines), 1, said)
+        self.assertEqual(lines[0].split()[0], rh.UNKNOWN)
 
 
 class VerifyA5FlagTest(unittest.TestCase):

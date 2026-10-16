@@ -169,6 +169,34 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class StartInputsRealTest(A3):
+    """host_setup.start_inputs over real records: the A1 record and the
+    evidence as placed, the gate from the document. This document has no
+    delegation_gate section, so the gate does not hold, and the start gate
+    refuses A1's own block under its own current evidence."""
+
+    def inputs(self):
+        return hs.start_inputs(self.spec, True, {"read_placed": self.read_placed, "read_evidence": self.read_placed,
+                                                 "rl_sha": "a" * 40})
+
+    def test_the_real_records_are_read_and_a_shut_gate_refuses(self):
+        import hub_keys as hk
+        import router_health as rh
+        sg = self.inputs()
+        self.assertIsInstance(sg.approved, dict, sg.approved_why)
+        self.assertEqual(pa.activation_record(host=HOST, spec=sg.approved["spec"], staged=self.staged,
+                                              final_config_path=self.spec.keys.local_config), self.record)
+        self.assertIs(sg.gate_ok, False)
+        token = json.loads(self.evidence)[pe.TOKEN_MEMBER]
+        doc, _, why = sg.named(token)
+        self.assertEqual((doc["run_id"], why), ("r1", ""))
+        final = pa.final_bytes(self.staged, token)
+        found = hk.verify_start_delegation(self.spec.keys, (self.spec.keys.local_config, hashlib.sha256(final).hexdigest()),
+                                           lambda p: final, hk.Signing(**dict(vars(sg), now=NOW)))
+        self.assertEqual(found[1].result, rh.FAIL)
+        self.assertIn("gate does not hold", str(found[1].actual))
+
+
 class CommandTest(unittest.TestCase):
     """`install --activate` through install's real entry (run_sync): both
     arguments are checked, and every refusal propagates, before ANY write.

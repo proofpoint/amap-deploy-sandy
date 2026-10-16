@@ -45,6 +45,9 @@ SPEC = {"name": "ex-up", "image": "sha256:" + "b" * 64, "user": "2101:2101", "ne
         "mounts": [{"type": "bind", "source": LOCAL, "target": LOCAL, "readonly": True}]}
 
 
+NO_BINDING = object()
+
+
 def named(at=NOW - 3600, outcome=None, binding=None):
     """partition_evidence.named_document's answer: the evidence that issued
     TOKEN, carrying `binding` as its local_router binding (A1's own by
@@ -56,6 +59,8 @@ def named(at=NOW - 3600, outcome=None, binding=None):
             return None, outcome, f"the document is {outcome}"
         if token != TOKEN:
             return None, "mismatch", "the token is not its document's"
+        if binding is NO_BINDING:
+            return {"run_id": RID, "at": ts(at), "bindings": {}}, b"raw", ""
         bound = binding or pa.activation_binding(SPEC, approved()["staged"].encode())
         return {"run_id": RID, "at": ts(at), "bindings": {"local_router": bound}}, b"raw", ""
     return ask
@@ -142,6 +147,8 @@ class Matrix(Base):
         self.assertIn("bound to another activation", str(c.actual))
         self.assertEqual(self.verdict(live(SIGNED), approved=approved(spec=dict(SPEC, user="2102:2102"))).result,
                          rh.FAIL)
+        self.assertEqual(self.verdict(live(SIGNED), named=named(binding=NO_BINDING)).result, rh.FAIL)
+        self.assertEqual(self.verdict(live(SIGNED)).result, rh.PASS)
 
     def test_a_stale_named_document_fails(self):
         c = self.verdict(live(SIGNED), named=named(at=NOW - 9 * 86400))
@@ -205,6 +212,12 @@ class StartGateTest(Base):
             with self.subTest(label):
                 self.assertEqual(self.gate(live(SIGNED), **over).result, rh.FAIL)
 
+    def test_evidence_not_bound_to_this_a1_fails(self):
+        import partition_activation as pa
+        other = pa.activation_binding(dict(SPEC, user="2102:2102"), approved()["staged"].encode())
+        self.assertEqual(self.gate(live(SIGNED), named=named(binding=other)).result, rh.FAIL)
+        self.assertEqual(self.gate(live(SIGNED), named=named(binding=NO_BINDING)).result, rh.FAIL)
+
     def test_inputs_that_cannot_be_read_are_unknown_never_pass(self):
         unread = rh.Unresolved("no manifest")
         for label, kw in (("policy unread", dict(policy_on=unread)), ("gate unread", dict(gate_ok=unread)),
@@ -224,23 +237,31 @@ class StartGateTest(Base):
                 self.assertIn("not shown to read", c.reason)
 
 
+def real_evidence(verdicts=None, spec=None):
+    """(the live config carrying the evidence's token, a named() reading
+    that evidence through the real named_document): a producer-built
+    document for RID bound to A1 built from `spec`. A failed document's
+    token is the one token_of computes for it, which it never issued."""
+    import partition_activation as pa
+    import partition_evidence as pe
+    import test_partition_evidence as tpe
+    binding = pa.activation_binding(spec or SPEC, approved()["staged"].encode())
+    raw = tpe.build(host="alpha", run_id=RID, at=ts(NOW - 3600), verdicts=verdicts or {},
+                    bindings=dict(tpe.BINDINGS, local_router=binding))
+    doc = json.loads(raw)
+    token = doc[pe.TOKEN_MEMBER] or pe.token_of(doc)
+    named_ = lambda t: pe.named_document(t, evidence_dir="/ev", host="alpha",
+                                         read=lambda path: raw if path == f"/ev/partition-{RID}.json" else b"")
+    return live(dict(BLOCK, partition_verified=token)), named_
+
+
 class RealEvidenceTest(Base):
     """The start gate and the signing verdict over producer-built evidence
     read through the real partition_evidence.named_document: only the token
     the evidence ISSUED, bound to this A1, is admitted."""
 
     def evidence(self, verdicts=None, spec=None):
-        import partition_activation as pa
-        import partition_evidence as pe
-        import test_partition_evidence as tpe
-        binding = pa.activation_binding(spec or SPEC, approved()["staged"].encode())
-        raw = tpe.build(host="alpha", run_id=RID, at=ts(NOW - 3600), verdicts=verdicts or {},
-                        bindings=dict(tpe.BINDINGS, local_router=binding))
-        doc = json.loads(raw)
-        token = doc[pe.TOKEN_MEMBER] or pe.token_of(doc)
-        named = lambda t: pe.named_document(t, evidence_dir="/ev", host="alpha",
-                                            read=lambda path: raw if path == f"/ev/partition-{RID}.json" else b"")
-        return live(dict(BLOCK, partition_verified=token)), named
+        return real_evidence(verdicts, spec)
 
     def both(self, raw, named):
         start = hk.verify_start_delegation(self.k, (self.k.local_config, hk._sha(raw)), lambda p: raw,
