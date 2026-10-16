@@ -97,6 +97,13 @@ DIR_KEYS = ("MAILBOX_ROOT_DIR", "RELAY_LEDGER_DIR", "HUB_INBOUND_STATE_DIR", "lo
 _LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
 _OWN = re.compile(rf"({_LABEL})\.internal")
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+_SHA256 = re.compile(r"[0-9a-f]{64}")
+_COMMIT = re.compile(r"[0-9a-f]{40}")
+#: A path inside the producer repository, safe to print in a shell recipe:
+#: segments of [A-Za-z0-9._-], each starting with a letter, digit or "_"
+#: (so no ".", "..", hidden or option-like segment), no space, no
+#: metacharacter, no control character.
+_REPO_PATH = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]*(/[A-Za-z0-9_][A-Za-z0-9._-]*)*")
 _LINK = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
 _DOMAIN = re.compile(rf"{_LABEL}(?:\.{_LABEL})*")
 #: The frozen login and probe names (the hub design): the login's local
@@ -132,7 +139,7 @@ class HubSpec:
     fleet_hosts: Tuple[str, ...]
     d7_dir: str
     d7_file: str
-    d7_source: str                    # relative to the producer clone
+    d7_source: str                    # relative to the producer clone, or an absolute file (the file form)
     env_file: str
     hop: str
     hop_root: str
@@ -144,6 +151,13 @@ class HubSpec:
     prefix_template: str
     config_uid: int
     log_driver: Optional[str]
+    #: The file form: the D7 source's pinned sha256, `d7_source` then being
+    #: the absolute path of that one file on this host. None: the clone form.
+    d7_source_sha256: Optional[str] = None
+    #: The file form: the D7 commit the file is taken from, and its path in
+    #: the producer repository (the runner's one-file copy names both).
+    d7_source_commit: Optional[str] = None
+    d7_source_from: Optional[str] = None
 
     @property
     def d7_path(self) -> str:
@@ -223,10 +237,24 @@ def load(sec: Any, spec: Any) -> HubSpec:
     d7 = _exact(sec["d7"], ("dir", "file", "source"), "d7")
     if not isinstance(d7["file"], str) or not _NAME.fullmatch(d7["file"]):
         raise HubSpecError("hub.d7.file must be one file name")
-    src = d7["source"]
-    if not isinstance(src, str) or src.startswith("/") or posixpath.normpath(src) != src \
+    src, src_sha, src_commit, src_from = d7["source"], None, None, None
+    if isinstance(src, dict):
+        # The file form: one pinned file, for a host that holds no producer clone.
+        f = _exact(src, ("path", "sha256", "commit", "from"), "d7.source")
+        src = _abs(f["path"], "d7.source.path")
+        if not isinstance(f["sha256"], str) or not _SHA256.fullmatch(f["sha256"]):
+            raise HubSpecError("hub.d7.source.sha256 must be 64 lower-case hex digits")
+        if not isinstance(f["commit"], str) or not _COMMIT.fullmatch(f["commit"]):
+            raise HubSpecError("hub.d7.source.commit must be the D7 commit, 40 lower-case hex")
+        fr = f["from"]
+        if not isinstance(fr, str) or not _REPO_PATH.fullmatch(fr):
+            raise HubSpecError("hub.d7.source.from must be the file's path inside the producer repository: "
+                               "segments of letters, digits, '.', '_' and '-', none starting with '.' or '-'")
+        src_sha, src_commit, src_from = f["sha256"], f["commit"], fr
+    elif not isinstance(src, str) or src.startswith("/") or posixpath.normpath(src) != src \
             or src.split("/")[0] == "..":
-        raise HubSpecError("hub.d7.source must be a path inside the producer clone")
+        raise HubSpecError("hub.d7.source must be a path inside the producer clone, or "
+                           "{path, sha256, commit, from}")
     hop = _exact(sec["hop"], ("name", "root", "registry_dir", "registry_uid", "link"), "hop")
     if hop["name"] not in {h[0] for h in spec.hops}:
         raise HubSpecError(f"hub.hop.name {hop['name']!r} is not one of the document's hops")
@@ -254,7 +282,8 @@ def load(sec: Any, spec: Any) -> HubSpec:
         host_label=sec["host_label"], own_domain=sec["own_domain"], login_local=login["local"],
         login_domain=login["domain"], excluded=excluded, statement=sec["statement"],
         fleet_hosts=tuple(sorted(fleet)), d7_dir=_abs(d7["dir"], "d7.dir"), d7_file=d7["file"],
-        d7_source=src, env_file=_abs(sec["env_file"], "env_file"), hop=hop["name"], hop_root=hop["root"],
+        d7_source=src, d7_source_sha256=src_sha, d7_source_commit=src_commit, d7_source_from=src_from,
+        env_file=_abs(sec["env_file"], "env_file"), hop=hop["name"], hop_root=hop["root"],
         registry_dir=_abs(hop["registry_dir"], "hop.registry_dir"),
         registry_uid=_uint(hop["registry_uid"], "hop.registry_uid"), link=hop["link"], dirs=paths,
         lock_file=dirs["lock_file"], prefix_template=_abs(sec["prefix_template"], "prefix_template"),
@@ -574,14 +603,23 @@ class Rendered:
 
 
 def source_path(spec: Any, hs: HubSpec) -> str:
+    if hs.d7_source_sha256 is not None:
+        return hs.d7_source
     return posixpath.join(spec.secrets.clones["producer"]["path"], hs.d7_source)
 
 
 def read_source(spec: Any, hs: HubSpec, read: Callable[[str], bytes] = dd.read_file) -> Any:
+    """The D7 source's bytes, or an Unresolved naming why not. The file form's
+    bytes are used only when they hash to the pin: a file that differs is no
+    source at all, never a source to render from."""
     try:
-        return read(source_path(spec, hs))
+        data = read(source_path(spec, hs))
     except OSError as e:
         return rh.Unresolved(f"cannot read the D7 source {source_path(spec, hs)}: {e}")
+    if hs.d7_source_sha256 is not None and _sha(data) != hs.d7_source_sha256:
+        return rh.Unresolved(f"the D7 source {source_path(spec, hs)} does not hash to its pin "
+                             f"{hs.d7_source_sha256}")
+    return data
 
 
 def render_all(spec: Any, hs: HubSpec, source: Any) -> Rendered:
@@ -605,6 +643,17 @@ def plan(spec: Any, hs: HubSpec, r: Rendered, q: Callable[[str], str], steps: st
     install = q(spec.secrets.tools.get("install", "install"))
     lines = ["# The hub-link router's files. First, as the operator: `amap-sandy.py hub-render --apply` writes "
              f"them into {run_dir}."]
+    if hs.d7_source_sha256 is not None:
+        staged = "<staging>"
+        lines += [f"# The D7 source: ONE file from the pinned commit {hs.d7_source_commit}, never the producer tree.",
+                  f"# On the runner: git -C <the runner's producer clone> show "
+                  f"{q(hs.d7_source_commit + ':' + hs.d7_source_from)} > {staged}",
+                  f"# On the runner: shasum -a 256 {staged}   # must print {hs.d7_source_sha256}",
+                  f"# Copy that one file to this host as {staged} (scp, or ssh with cat), never a directory.",
+                  f"# A later D7 commit leaves verify UNKNOWN until this document's pin moves to it.",
+                  f"{install} -d -o 0 -g 0 -m 0755 {q(posixpath.dirname(hs.d7_source))}",
+                  f"{steps} place {staged} {q(hs.d7_source)} --sha256 {hs.d7_source_sha256}",
+                  f"rm -f {staged}"]
     if isinstance(r.d7, (bytes, bytearray)):
         lines += [f"{install} -d -o 0 -g 0 -m 0755 {q(hs.d7_dir)}  # holds the D7 file and nothing else",
                   f"{steps} place {q(posixpath.join(run_dir, D7_RENDERED))} {q(hs.d7_path)} --sha256 {_sha(r.d7)}"]
@@ -684,6 +733,47 @@ def image_env(spec: Any) -> Any:
     except ValueError:
         return rh.Unresolved("docker image inspect printed no JSON")
     return env if isinstance(env, list) else []
+
+
+def verify_d7_source(hs: HubSpec, lstat: Callable, read: Callable[[str], bytes]) -> List[rh.Check]:
+    """The file form's D7 source: one root-owned, read-only file whose bytes
+    are the pinned ones. The clone form's source is the producer clone's,
+    checked as a clone (secret_setup)."""
+    if hs.d7_source_sha256 is None:
+        return []
+    out = []
+    path = hs.d7_source
+    why = "the D7 source the hub-link router's rendering is made from; only root may change it"
+    remedy = ("copy the pinned file from the runner's producer clone and place it as the plan does "
+              "(`place … --sha256 <the pin>`)")
+    try:
+        st = lstat(path)
+    except FileNotFoundError:
+        st = None
+    except OSError as e:
+        st = rh.Unresolved(f"cannot inspect {path}: {e}")
+    claim = f"the D7 source {path} is root:root 0444 with one link"
+    want = _fact("D7 source file", (0, 0, ENV_MODE, 1), why)
+    if isinstance(st, rh.Unresolved):
+        out.append(rh.unknown(claim, want, st.reason, remedy))
+    elif st is None or not stat.S_ISREG(st.st_mode):
+        out.append(rh.check(claim, want, "absent" if st is None else "not a regular file", remedy))
+    else:
+        out.append(rh.check(claim, want, (st.st_uid, st.st_gid, stat.S_IMODE(st.st_mode), st.st_nlink), remedy))
+    out.append(ss._owned_chain(f"every directory above {path} is root-owned and not group- or world-writable",
+                               path, (0,), why, lstat))
+    claim = f"the D7 source {path} hashes to its pin"
+    want = _fact("sha256", hs.d7_source_sha256, "the host-setup document's hub.d7.source.sha256")
+    try:
+        got: Any = _sha(read(path))
+    except FileNotFoundError:
+        got = "absent"
+    except OSError as e:
+        got = rh.Unresolved(f"cannot read {path}: {e}")
+    out.append(rh.unknown(claim, want, got.reason, remedy) if isinstance(got, rh.Unresolved)
+               else rh.check(claim, want, got, remedy,
+                             do_not="never re-pin to what the file hashes to now; the pin comes from NET's D7 commit"))
+    return out
 
 
 def verify_env_file(hs: HubSpec, r: Rendered, lstat: Callable, read: Callable[[str], bytes]) -> List[rh.Check]:
@@ -775,6 +865,7 @@ def checks(spec: Any, hs: HubSpec, *, lstat: Callable = os.lstat, listdir: Calla
     src = read_source(spec, hs, read) if source is ASK else source
     r = render_all(spec, hs, src)
     out = dd.verify(hs.d7_dir, hs.d7_file, hs.rules(), src, lstat=lstat, listdir=listdir, read=read)
+    out += verify_d7_source(hs, lstat, read)
     out += verify_env_file(hs, r, lstat, read)
     name = spec.runtime_of(spec.secrets.principal)["container"]
     st = ss.state(spec.secrets) if state is ASK else state

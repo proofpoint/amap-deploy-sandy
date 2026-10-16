@@ -375,7 +375,8 @@ def rule_overlap(c: Dict[str, Any], secret_roots: Sequence[str], integrity_roots
 
 
 def protected_roots(s: ss.SecretSpec, mountpoints: Iterable[str],
-                    realpath: Callable[[str], str] = os.path.realpath) -> Tuple[List[str], List[str]]:
+                    realpath: Callable[[str], str] = os.path.realpath,
+                    also: Iterable[str] = ()) -> Tuple[List[str], List[str]]:
     """(secret, integrity) roots. Engine sockets are protected as themselves:
     a bind of one, or of a directory above it, fails; their siblings do
     not."""
@@ -387,6 +388,9 @@ def protected_roots(s: ss.SecretSpec, mountpoints: Iterable[str],
     integrity += [c["path"] for c in s.clones.values()]
     integrity += [realpath(p) for p in s.tools.values()]
     integrity += list(s.extra["exposure"]["integrity_roots"])
+    # Further integrity roots from other sections: the D7 source file, where
+    # the hub pins one file instead of reading a producer clone.
+    integrity += list(also)
     return secret, list(dict.fromkeys(integrity))
 
 
@@ -466,7 +470,9 @@ def _sweep(spec: Any, s: ss.SecretSpec, runtime: str, lstat_: Callable, stat_: C
     want = _fact("engines", [], "a container on an engine nobody asked could hold the volume")
     out.append(rh.unknown(claim, want, "; ".join(unk_engines), "start the engine, or give it a context")
                if unk_engines else rh.check(claim, want, [], "nothing"))
-    secret_roots, integrity_roots = protected_roots(s, mountpoints, realpath)
+    hub = getattr(spec, "hub", None)
+    d7_file = [hub.d7_source] if hub is not None and hub.d7_source_sha256 is not None else []
+    secret_roots, integrity_roots = protected_roots(s, mountpoints, realpath, also=d7_file)
     found: Dict[str, Tuple[List[str], List[str]]] = {k: ([], []) for k in ("mounts", "overlap", "privileges",
                                                                           "routes")}
     for engine, cs in sorted(by_engine.items()):

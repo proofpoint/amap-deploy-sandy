@@ -269,6 +269,23 @@ class OverlapTest(Base):
         self.assertOnly(self.run_bind("/srv/op/clones/deploy", rw=True), "overlaps")
         self.assertOnly(self.run_bind("/srv/op/clones/deploy/tests", rw=True), "overlaps")
 
+    def test_the_hubs_pinned_d7_source_is_an_integrity_root(self):
+        """A host that pins the D7 source as one file (no producer clone):
+        that file is an integrity root, so a writable bind of it fails."""
+        import hashlib
+        import hub_runtime as hr
+        from test_hub_runtime import FILE, FIXTURE_PINS, file_form_doc
+        for name, value in FIXTURE_PINS.items():
+            self.addCleanup(setattr, hr, name, getattr(hr, name))
+            setattr(hr, name, hashlib.sha256(value.encode()).hexdigest())
+        d = file_form_doc()
+        d[ss.SECTION] = dict(exposure_sec(), probe=d[ss.SECTION]["probe"], clones=d[ss.SECTION]["clones"])
+        spec = hs.load_spec(d)
+        c = container("x", [bind(FILE, rw=True)])
+        on_disk = stat_of({"/opt": 120, "/opt/ex": 121, "/opt/ex/d7src": 122, FILE: 123})
+        self.assertOnly(self.sweep(engine(by_context={"default": [runtime(), c]}), s=(spec, spec.secrets),
+                                   stat_=on_disk), "overlaps")
+
     def test_any_bind_above_the_tooling_fails_read_only_too(self):
         self.assertOnly(self.run_bind("/srv/op/clones", rw=False), "overlaps")
 
