@@ -3790,16 +3790,19 @@ def router_phases(args: argparse.Namespace, home: Path,
     so an UNKNOWN build never leaves verify's exit clean."""
     rctx = rh.Ctx(args, home)
     outcomes = rh.run_sections(rctx)
-    builds = build_identity_outcome(args, home)
+    builds = build_identity_outcome(args, home, rctx)
     if facts is not None:
         facts.ctx, facts.outcomes = rctx, outcomes + [builds]
     lines = rh.problem_lines(outcomes) + rh.problem_lines([builds], prefix="runtime builds")
     return rctx, outcomes, lines
 
 
-def build_identity_outcome(args: argparse.Namespace, home: Path) -> rh.Outcome:
+def build_identity_outcome(args: argparse.Namespace, home: Path, rctx: Optional[rh.Ctx] = None) -> rh.Outcome:
     """verify's "runtime builds" phase (build_identity): each runtime's build
-    against what the deployment recorded and siblings.json pins."""
+    against what the deployment recorded and siblings.json pins. [1]'s status
+    document is the one router_health read (`rctx`), and only when that read
+    was of [1]'s container; [2]'s router has no reader here, so its plugin
+    claim says the digest is not published."""
     spec = _builds_spec(ha.overlay_path(getattr(args, "overlay", None)))
     hub_docker = hsu.ss.docker(spec.secrets) if not isinstance(spec, rh.Unresolved) and spec is not None \
         and spec.secrets is not None else ["docker"]
@@ -3811,8 +3814,18 @@ def build_identity_outcome(args: argparse.Namespace, home: Path) -> rh.Outcome:
         connector = cpin.pinned_commit()
     except (cpin.siblings.SiblingError, OSError, KeyError, ValueError) as e:
         connector = rh.Unresolved(f"siblings.json's connector pin cannot be read: {e}")
+    def status(role: str, name: str) -> Any:
+        if role != bi.ROLE_HOP:
+            return None
+        if rctx is None:
+            return rh.Unresolved("the router's status document was not read")
+        read_of = rctx.value("container")
+        if read_of != name:
+            return rh.Unresolved(f"verify read the status document of {read_of}, not of [1] ({name})")
+        return rctx.value("status_doc")
+
     phase = bi.collect(spec, feature_payload_dir(home), hop_pin=hp.hop_pin(), connector_pin=connector,
-                       inspect=inspect, labels=lambda image: bi.image_labels(hub_docker, image))
+                       inspect=inspect, labels=lambda image: bi.image_labels(hub_docker, image), status=status)
     return phase.outcome()
 
 

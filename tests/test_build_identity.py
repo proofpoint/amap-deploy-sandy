@@ -28,12 +28,14 @@ LABEL = bi.LABEL
 
 
 def container(image=DIGEST, mounts=(), started="2026-10-15T10:00:00.123456789Z", labels=None, running=True,
-              status="running"):
+              status="running", restarting=False):
     """A `docker inspect` container document. An exited container is still
     inspectable, with its image: State.Running false, Status "exited"."""
     state = {"StartedAt": started, "Status": status}
     if running is not None:
         state["Running"] = running
+    if restarting is not None:
+        state["Restarting"] = restarting
     return {"Image": image, "Mounts": list(mounts), "State": state, "Config": {"Labels": labels}}
 
 
@@ -192,120 +194,101 @@ class ConnectorTest(unittest.TestCase):
 
 
 class HopPluginTest(unittest.TestCase):
-    def setUp(self):
-        td = tempfile.TemporaryDirectory()
-        self.addCleanup(td.cleanup)
-        self.dir = os.path.realpath(td.name)
-        self.path = os.path.join(self.dir, "plugin.py")
-        Path(self.path).write_bytes(b"the plugin\n")
-        self.sha = hashlib.sha256(b"the plugin\n").hexdigest()
-        self.later = time.strftime("%Y-%m-%dT%H:%M:%S.5Z", time.gmtime(time.time() + 3600))
-        self.earlier = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 3600))
+    """The plugin claim reads the router's own status document. Its shape is
+    the hop router's status.json: `started_ts` as RFC 3339 UTC to the second,
+    written at process start, beside the activated plugin's member."""
 
-    def mount(self, source=None, dest=None, rw=False):
-        return {"Type": "bind", "Source": source or self.dir, "Destination": dest or self.dir, "RW": rw}
+    START = "2026-10-15T10:00:00.500000000Z"
+    SHA = "c" * 64
 
-    def claim(self, live=None, pin=None):
-        live = container(mounts=[self.mount()], started=self.later) if live is None else live
-        return bi.hop_plugin(bi.ROLE_HOP, "zz-r1", live, self.path, pin or self.sha)
+    def published(self, started_ts="2026-10-15T10:00:00Z", member=None, **extra):
+        doc = {bi.PROCESS_START: started_ts, "polls": 3,
+               bi.PLUGIN_MEMBER: {"path": "/zz/overlay/plugin.py", bi.PLUGIN_SHA256: self.SHA}
+               if member is None else member}
+        doc.update(extra)
+        return doc
 
-    def test_the_pinned_plugin_mounted_by_identity_passes(self):
+    def claim(self, published=None, before=None, after=None, pin=None):
+        before = container(started=self.START) if before is None else before
+        after = container(started=self.START) if after is None else after
+        published = self.published() if published is None else published
+        return bi.hop_plugin(bi.ROLE_HOP, "zz-r1", before, published, after, pin or self.SHA)
+
+    def assertUnknown(self, c, reason=None):
+        self.assertEqual(c.check.result, rh.UNKNOWN)
+        self.assertNotIn("observed_sha256", c.extras())
+        if reason is not None:
+            self.assertEqual(c.check.reason, reason)
+
+    def test_the_published_pinned_digest_of_this_incarnation_passes(self):
         c = self.claim()
         self.assertEqual(c.check.result, rh.PASS)
-        self.assertEqual(c.extras(), {"id": bi.ID_PLUGIN, "observed_sha256": self.sha,
-                                      "host_role": bi.ROLE_HOP})
+        self.assertEqual(c.extras(), {"id": bi.ID_PLUGIN, "observed_sha256": self.SHA, "host_role": bi.ROLE_HOP})
 
-    def test_other_bytes_fail(self):
+    def test_another_published_digest_fails(self):
         c = self.claim(pin="0" * 64)
         self.assertEqual(c.check.result, rh.FAIL)
-        self.assertEqual(c.extras()["observed_sha256"], self.sha)
+        self.assertEqual(c.extras()["observed_sha256"], self.SHA)
 
-    def test_the_directory_replaced_after_the_container_started_is_unknown(self):
-        c = self.claim(live=container(mounts=[self.mount()], started=self.earlier))
-        self.assertEqual(c.check.result, rh.UNKNOWN)
-        self.assertEqual(c.check.reason, "the overlay directory changed after the container started")
-        self.assertNotIn("observed_sha256", c.extras())
-
-    def test_a_mount_not_read_only_and_by_identity_is_unknown(self):
-        cases = {
-            "read-write": [self.mount(rw=True)],
-            "another source": [self.mount(source="/elsewhere")],
-            "absent": [],
-            "twice": [self.mount(), self.mount()],
-        }
-        for label, mounts in cases.items():
+    def test_no_published_digest_is_unknown_with_its_reason(self):
+        doc = self.published()
+        del doc[bi.PLUGIN_MEMBER]
+        null = self.published()
+        null[bi.PLUGIN_MEMBER] = None
+        for label, published in (("member absent", doc), ("member null", null), ("no reader", None)):
             with self.subTest(label):
-                c = self.claim(live=container(mounts=mounts, started=self.later))
-                self.assertEqual(c.check.result, rh.UNKNOWN)
-                self.assertNotIn("observed_sha256", c.extras())
+                c = bi.hop_plugin(bi.ROLE_HOP, "zz-r1", container(started=self.START), published,
+                                  container(started=self.START), self.SHA)
+                self.assertUnknown(c, "the router does not publish the plugin it loaded")
 
-    def test_an_unreadable_start_time_file_or_container_is_unknown(self):
-        os.chmod(self.path, 0)
-        self.addCleanup(os.chmod, self.path, 0o644)
-        for live in (container(mounts=[self.mount()], started="yesterday"),
-                     container(mounts=[self.mount()], started=self.later), None, rh.Unresolved("no docker")):
-            with self.subTest(live=live):
-                self.assertEqual(self.claim(live=live).check.result, rh.UNKNOWN)
+    def test_a_malformed_digest_is_unknown(self):
+        for member in ({bi.PLUGIN_SHA256: "C" * 64}, {bi.PLUGIN_SHA256: "c" * 63}, {}, "c" * 64,
+                       {bi.PLUGIN_SHA256: None}):
+            with self.subTest(member=member):
+                self.assertUnknown(self.claim(published=self.published(member=member)),
+                                   "the router's published plugin digest is malformed")
 
-    def test_a_stopped_container_is_unknown(self):
-        c = self.claim(live=container(mounts=[self.mount()], started=self.later, running=False, status="exited"))
-        self.assertEqual(c.check.result, rh.UNKNOWN)
-        self.assertNotIn("observed_sha256", c.extras())
+    def test_a_status_document_from_an_earlier_run_is_unknown(self):
+        """status.json outlives the container: a member written before this
+        incarnation's start second is not its own."""
+        c = self.claim(published=self.published(started_ts="2026-10-15T09:59:59Z"))
+        self.assertUnknown(c, "the status document is from an earlier run of [1] (zz-r1)")
 
-    def test_a_mount_over_the_plugin_inside_its_directory_is_unknown(self):
-        """A bind at the plugin file shadows the directory's: the host file
-        under the directory bind is not what the router loads."""
-        live = container(mounts=[self.mount(), {"Type": "bind", "Source": "/synthetic/wrong-plugin.py",
-                                                "Destination": self.path, "RW": False}], started=self.later)
-        c = bi.hop_plugin(bi.ROLE_HOP, "zz-r1", live, self.path, self.sha)
-        self.assertEqual(c.check.result, rh.UNKNOWN)
-        self.assertIn("over the plugin", c.check.reason)
-        self.assertNotIn("observed_sha256", c.extras())
+    def test_a_process_start_in_the_same_second_as_the_container_start_passes(self):
+        """started_ts has whole seconds; StartedAt has a fraction. The bound
+        is the start's second, so the router's own start is not refused."""
+        self.assertEqual(self.claim(published=self.published(started_ts="2026-10-15T10:00:00Z")).check.result,
+                         rh.PASS)
 
-    def test_a_mount_beside_the_plugin_is_not_a_shadow(self):
-        live = container(mounts=[self.mount(), {"Type": "bind", "Source": "/x", "Destination": self.dir + "-other",
-                                                "RW": False}], started=self.later)
-        self.assertEqual(self.claim(live=live).check.result, rh.PASS)
+    def test_no_readable_process_start_is_unknown(self):
+        for ts in (None, "", "yesterday", 1760522400):
+            with self.subTest(ts=ts):
+                self.assertUnknown(self.claim(published=self.published(started_ts=ts)))
 
-    def with_file_ctime(self, delta):
-        """The claim with the plugin file's ctime at `delta` seconds from the
-        container's start (`self.later`, which carries a .5 fraction)."""
-        start = bi.started_at(container(started=self.later))
-        real = os.lstat
+    def test_a_restart_between_the_inspects_is_unknown(self):
+        c = self.claim(after=container(started="2026-10-15T10:00:07.000000000Z"))
+        self.assertUnknown(c, "[1] (zz-r1) restarted while verify read it")
 
-        def lstat(p):
-            st = real(p)
-            if p == self.path:
-                return os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, st.st_uid, st.st_gid,
-                                       st.st_size, st.st_atime, st.st_mtime, start + delta))
-            return st
-        return bi.hop_plugin(bi.ROLE_HOP, "zz-r1", container(mounts=[self.mount()], started=self.later),
-                             self.path, self.sha, lstat=lstat)
+    def test_a_container_not_settled_on_either_inspect_is_unknown(self):
+        cases = {"stopped": container(started=self.START, running=False, status="exited"),
+                 "restarting": container(started=self.START, restarting=True),
+                 "restarting unsaid": container(started=self.START, restarting=None),
+                 "absent": None, "unreadable": rh.Unresolved("no docker")}
+        for label, live in cases.items():
+            for side in ("before", "after"):
+                with self.subTest(label, side=side):
+                    self.assertUnknown(self.claim(**{side: live}) if live is not None else
+                                       bi.hop_plugin(bi.ROLE_HOP, "zz-r1",
+                                                     None if side == "before" else container(started=self.START),
+                                                     self.published(),
+                                                     None if side == "after" else container(started=self.START),
+                                                     self.SHA))
 
-    def test_the_plugin_rewritten_in_place_after_the_start_is_unknown(self):
-        """An in-place overwrite leaves the directory's ctime alone; the
-        file's own ctime is what moves. A millisecond after a start with a
-        fraction counts: the comparison is not rounded to whole seconds."""
-        for delta in (10, 0.001):
-            with self.subTest(delta=delta):
-                c = self.with_file_ctime(delta)
-                self.assertEqual(c.check.result, rh.UNKNOWN)
-                self.assertEqual(c.check.reason, "the plugin file changed after the container started")
-                self.assertNotIn("observed_sha256", c.extras())
+    def test_an_unreadable_status_document_is_unknown_with_its_reason(self):
+        self.assertUnknown(self.claim(published=rh.Unresolved("no status.json")), "no status.json")
 
-    def test_the_plugin_changed_just_before_the_start_passes(self):
-        self.assertEqual(self.with_file_ctime(-0.001).check.result, rh.PASS)
-
-    def test_a_symlinked_plugin_is_unknown(self):
-        """The pinned bytes behind a symlink: the router's open follows a
-        link this host does not vouch for."""
-        target = os.path.join(self.dir, "real-plugin.py")
-        os.rename(self.path, target)
-        os.symlink(target, self.path)
-        c = self.claim()
-        self.assertEqual(c.check.result, rh.UNKNOWN)
-        self.assertEqual(c.check.reason, "the plugin file changed after the container started")
-        self.assertNotIn("observed_sha256", c.extras())
+    def test_a_published_digest_is_never_taken_from_a_document_that_is_not_an_object(self):
+        self.assertUnknown(self.claim(published=["not", "a", "document"]))
 
     def test_started_at_keeps_the_fraction(self):
         self.assertEqual(bi.started_at(container(started="1970-01-01T00:00:01.5Z")), 1.5)
@@ -325,9 +308,13 @@ class CollectTest(unittest.TestCase):
         self.asked.append((role, name))
         return container()
 
+    def status(self, role, name):
+        self.asked.append(("status", role, name))
+        return None
+
     def run_collect(self, spec):
         return bi.collect(spec, self.payload, hop_pin=PIN, connector_pin=PIN, inspect=self.inspect,
-                          labels=lambda image: {LABEL: COMMIT})
+                          labels=lambda image: {LABEL: COMMIT}, status=self.status)
 
     def spec(self, router_=True, hub=True, overlay=True):
         secrets = SimpleNamespace(principal="zz-hub", image_commit=COMMIT)
@@ -343,7 +330,10 @@ class CollectTest(unittest.TestCase):
                          [bi.ID_HOP, bi.ID_PLUGIN, bi.ID_HUB, bi.ID_PLUGIN, bi.ID_CONNECTOR])
         self.assertEqual([c.host_role for c in p.claims if c.id == bi.ID_PLUGIN], [bi.ROLE_HOP, bi.ROLE_HUB])
         self.assertEqual(sorted(p.deployed_roles), sorted([bi.ROLE_CONNECTOR, bi.ROLE_HUB, bi.ROLE_HOP]))
-        self.assertEqual(self.asked, [(bi.ROLE_HOP, "zz-r1"), (bi.ROLE_HUB, "zz-r2")])
+        # The status document is read between two inspects of the same container.
+        self.assertEqual(self.asked, [(bi.ROLE_HOP, "zz-r1"), ("status", bi.ROLE_HOP, "zz-r1"), (bi.ROLE_HOP, "zz-r1"),
+                                      (bi.ROLE_HUB, "zz-r2"), ("status", bi.ROLE_HUB, "zz-r2"),
+                                      (bi.ROLE_HUB, "zz-r2")])
 
     def test_an_id_is_present_exactly_when_its_role_is_deployed(self):
         for router_, hub in ((True, False), (False, True), (False, False)):
@@ -550,6 +540,49 @@ class InstallAndVerifyTest(unittest.TestCase):
                                  prefix + ["image", "inspect", "--format", "{{json .Config.Labels}}", OTHER]])
         self.assertEqual([(e["id"], c.result) for e, c in zip(out.extras, out.checks)], [(bi.ID_HUB, rh.PASS)])
 
+    def hop_spec(self):
+        """A hop host: [1] with the overlay pin, no hub."""
+        return SimpleNamespace(router=router(), hub=None, secrets=None, overlay_path="/zz/overlay/plugin.py",
+                               overlay_pin={"sha256": "c" * 64})
+
+    def hop_outcome(self, read_of, status_doc):
+        def run(argv, **k):
+            return rh.Proc(tuple(argv), 0, json.dumps([container()]), "")
+        self.patch(self.prov, "_builds_spec", lambda overlay: self.hop_spec())
+        self.patch(rh, "run", run)
+        self.patch(self.cpin, "pinned_commit", lambda *a, **k: PIN)
+        rctx = SimpleNamespace(value=lambda name: {"container": read_of, "status_doc": status_doc}[name])
+        out = self.prov.build_identity_outcome(SimpleNamespace(overlay=None), self.home, rctx)
+        [plugin] = [c for e, c in zip(out.extras, out.checks) if e["id"] == bi.ID_PLUGIN]
+        return plugin
+
+    def test_the_plugin_digest_is_read_from_the_status_document_router_health_read_of_1(self):
+        doc = {"started_ts": "2026-10-15T10:00:00Z", "transport_plugin": {"path": "/zz/overlay/plugin.py",
+                                                                          "sha256": "c" * 64}}
+        self.assertEqual(self.hop_outcome("zz-r1", doc).result, rh.PASS)
+
+    def test_a_status_document_of_another_container_is_not_1s(self):
+        doc = {"started_ts": "2026-10-15T10:00:00Z", "transport_plugin": {"path": "/x", "sha256": "c" * 64}}
+        c = self.hop_outcome("zz-other", doc)
+        self.assertEqual(c.result, rh.UNKNOWN)
+        self.assertEqual(c.reason, "verify read the status document of zz-other, not of [1] (zz-r1)")
+
+    def test_the_hub_router_has_no_status_reader_so_its_plugin_is_not_published(self):
+        spec = self.hub_spec()
+        spec.overlay_path, spec.overlay_pin = "/zz/overlay/plugin.py", {"sha256": "c" * 64}
+
+        def run(argv, **k):
+            if "image" in argv:
+                return rh.Proc(tuple(argv), 0, json.dumps({LABEL: COMMIT}), "")
+            return rh.Proc(tuple(argv), 0, json.dumps([container()]), "")
+        self.patch(self.prov, "_builds_spec", lambda overlay: spec)
+        self.patch(rh, "run", run)
+        self.patch(self.cpin, "pinned_commit", lambda *a, **k: PIN)
+        out = self.prov.build_identity_outcome(SimpleNamespace(overlay=None), self.home)
+        [plugin] = [c for e, c in zip(out.extras, out.checks) if e["id"] == bi.ID_PLUGIN]
+        self.assertEqual((plugin.result, plugin.reason),
+                         (rh.UNKNOWN, "the router does not publish the plugin it loaded"))
+
 
 class VerifyTailTest(unittest.TestCase):
     """run_verify's last read (router_phases): the runtime-builds phase
@@ -562,7 +595,7 @@ class VerifyTailTest(unittest.TestCase):
         self.builds = bi.Phase([bi.hub_router("zz-hub", COMMIT, None, {})], [bi.ROLE_HUB]).outcome()
         for obj, name, value in ((rh, "Ctx", lambda args, home: SimpleNamespace(warnings=[])),
                                  (rh, "run_sections", lambda ctx: []),
-                                 (prov, "build_identity_outcome", lambda args, home: self.builds)):
+                                 (prov, "build_identity_outcome", lambda args, home, rctx: self.builds)):
             real = getattr(obj, name)
             setattr(obj, name, value)
             self.addCleanup(setattr, obj, name, real)
