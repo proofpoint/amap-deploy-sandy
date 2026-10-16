@@ -379,6 +379,13 @@ def load_spec(doc: Any) -> Spec:
             spec = dataclasses.replace(spec, hub=hr.load(doc[hr.SECTION], spec))
         except hr.HubSpecError as e:
             raise SpecError(str(e)) from None
+    if secrets is not None and ss.OPTIONAL_CLONE_ROLE not in secrets.clones \
+            and (spec.hub is None or spec.hub.d7_source_sha256 is None):
+        # The producer clone may be left out ONLY by the host whose hub pins
+        # the D7 source as one file; every other host, the runner included,
+        # holds it.
+        raise SpecError("secrets.clones has no producer, and no hub pins the D7 source as one file "
+                        "({path, sha256, commit, from}): only that host may leave the clone out")
     if hk.SECTION in doc:
         try:
             spec = dataclasses.replace(spec, keys=hk.load(doc[hk.SECTION], spec))
