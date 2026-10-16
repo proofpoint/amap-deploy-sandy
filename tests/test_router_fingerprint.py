@@ -216,6 +216,8 @@ class DomainRows(Outcome):
         got = gate(capture(trees[C[1]]), history(trees))
         self.assertGate(got, rf.MEASURED, "measured")
         self.assertIn(f"{C[1]}, {C[2]}", got[3])
+        d = capture(trees[C[1]])
+        self.assertIn(f"capture step 2 at {d['at']}", got[3])
 
 
 class MapHelperRows(unittest.TestCase):
@@ -319,6 +321,11 @@ class CaptureRows(Outcome):
                 d = self.good()
                 change(d)
                 self.assertGate(gate(d), rf.UNKNOWN, "time_format")
+
+    def test_digits_of_another_script_are_time_format(self):
+        d = self.good()
+        d["at"] = d["at"].replace("1", "\u0661", 1)
+        self.assertGate(gate(d), rf.UNKNOWN, "time_format")
 
     def test_at_before_after_at_is_time_format_with_its_own_message(self):
         d = capture(TREE[C[1]], at_before="110.2")
@@ -523,6 +530,11 @@ class ClockRows(Outcome):
         endpoint offsets during an edit; the edit's ctime reads before T."""
         self.assertGate(self.run_gate(ctime="96.8"), rf.MEASURED, "measured")
 
+    def test_the_microsecond_lower_bound(self):
+        """T - est of -0.06 s is refused; -0.04 s passes."""
+        self.assertGate(self.run_gate(pst="100.8", est="100.86"), rf.UNKNOWN, "pid1_age")
+        self.assertGate(self.run_gate(pst="100.8", est="100.84"), rf.MEASURED, "measured")
+
     def test_healthy_starts(self):
         self.assertGate(self.run_gate(pst="100.8", est="100.5"), rf.MEASURED, "measured")
         self.assertGate(self.run_gate(pst=None, started_ts=100, est="100.6"), rf.MEASURED, "measured")
@@ -551,6 +563,11 @@ class StaleStatusRows(Outcome):
     def test_an_earlier_process_t(self):
         self.assertGate(self.run_gate(sa="101.9", pst="98", lp=104, ctime="90", est="97.9"),
                         rf.UNKNOWN, "stale_status")
+
+    def test_the_two_second_edge(self):
+        """last_poll_ts one second after floor(StartedAt) is refused; two passes."""
+        self.assertGate(self.run_gate(sa="100.7", lp=101), rf.UNKNOWN, "stale_status")
+        self.assertGate(self.run_gate(sa="100.7", lp=102), rf.MEASURED, "measured")
 
     def test_no_start_time_at_all(self):
         self.assertGate(self.run_gate(pst=None, started_ts=None), rf.UNKNOWN, "stale_status")
@@ -708,6 +725,13 @@ class VerifyImageRows(Outcome):
         h = self.hist()
         h.update(types={C[1]: None}, first_parent=[], trees={})
         self.assertGate(self.check(self.image(), h), rf.UNKNOWN, "commit_absent")
+
+    def test_shallow_and_promisor(self):
+        for key in ("shallow", "promisor"):
+            with self.subTest(key=key):
+                h = self.hist()
+                h[key] = True
+                self.assertGate(self.check(self.image(), h), rf.UNKNOWN, key)
 
     def test_a_second_types_key_is_history_keys(self):
         """SYNTHETIC."""
@@ -927,6 +951,16 @@ class HistoryRows(unittest.TestCase):
         with self.assertRaises(rf.HistoryReadError):
             self.read_raw(repo, repo.head())
 
+    def test_a_promisor_lookup_exit_other_than_0_or_1_raises(self):
+        """Isolated: a git that answers everything but `config --get-regexp`,
+        which exits 3."""
+        repo = Repo(self.base, n=2)
+        wrapper = self.base / "git-config-fails"
+        wrapper.write_text(f"#!/bin/sh\ncase \" $* \" in *' config --get-regexp '*) exit 3 ;; esac\nexec '{GIT}' \"$@\"\n")
+        wrapper.chmod(0o755)
+        with self.assertRaises(rf.HistoryReadError):
+            rf.read_history(str(repo.path), repo.head(), repo.head(), git=str(wrapper))
+
     def test_the_shallow_clone_takes_the_early_marker(self):
         """`git clone --no-local --depth 2` of a fixture with three or more
         ancestors below the target: shallow, with no walk."""
@@ -986,6 +1020,16 @@ class HistoryRows(unittest.TestCase):
         c = repo.commit_obj(self.header(repo, extra=sig + b"parent %s\n" % repo.commits[1].encode()))
         with self.assertRaises(rf.HistoryReadError):
             self.read_raw(repo, c)
+
+    def test_a_bare_or_tab_parent_after_the_tree_raises(self):
+        repo = Repo(self.base, n=2)
+        tree = repo.tree_of(repo.commits[1]).encode()
+        for line in (b"parent", b"parent\t" + repo.commits[0].encode(), b"tree\t" + tree):
+            with self.subTest(line=line):
+                c = repo.commit_obj(b"tree " + tree + b"\n" + line + b"\n"
+                                    b"author t <t@example.org> 1 +0000\ncommitter t <t@example.org> 1 +0000\n")
+                with self.assertRaises(rf.HistoryReadError):
+                    self.read_raw(repo, c)
 
     def test_a_malformed_tree_line_raises(self):
         repo = Repo(self.base, n=2)
@@ -1171,6 +1215,12 @@ def program():
 
 @unittest.skipUnless(os.path.isdir("/proc/self"), "PROGRAM reads /proc")
 class ProgramRows(unittest.TestCase):
+    """PROGRAM against real files, FIFOs and spawned children. Three parts of
+    the config's `stable` are defence in depth with no isolating row here:
+    the same-path stat after the read, the size check, and the realpath after
+    the read. The rename row sees `stable` false through the old inode's
+    ctime, and an unprivileged test cannot swap a bind mount; they stay
+    residue."""
 
     def setUp(self):
         self.base = Path(tempfile.mkdtemp())
@@ -1388,6 +1438,25 @@ class ProgramRows(unittest.TestCase):
         self.assertTrue(p["user_site"]({"HOME": str(home)}))
         self.assertEqual({k: os.environ.get(k) for k in saved}, saved)
 
+    def test_a_symlinked_router_reads_as_a_link_and_is_refused(self):
+        """No link is followed: /app/router as a symlink reads as `link`,
+        and the gate refuses the layout."""
+        p = program()
+        app = self.app()
+        real = self.base / "elsewhere"
+        (app / "router").rename(real)
+        (app / "router").symlink_to(real)
+        self.assertEqual(p["read_app"](str(app))["app"]["router"], "link")
+        d = capture(TREE[C[1]])
+        d["result"]["app"]["router"] = "link"
+        self.assertEqual(rf.match(b(d), bases(), H, TARGET, PLUGIN)[2], "layout")
+
+    def test_a_name_set_twice_in_the_environ_is_an_error(self):
+        p = program()
+        env = p["parse_environ"](b"A=1\0PYTHONDONTWRITEBYTECODE=\0PYTHONDONTWRITEBYTECODE=1\0", "/proc/1")
+        self.assertEqual(env["A"], "1")
+        self.assertTrue(any("PYTHONDONTWRITEBYTECODE more than once" in e for e in p["ERRORS"]))
+
     def test_an_image_run_has_no_pid_1_members(self):
         p = program()
         got = p["collect"]("image", app=str(self.app()))
@@ -1509,6 +1578,7 @@ class CaptureVerb(unittest.TestCase):
         self.assertEqual(verbs, [["inspect"], ["image", "inspect"], ["exec"], ["inspect"]])
         self.assertEqual(eng.calls[2][2:8], ["f" * 64, "python3", "-I", "-S", "-c", rf.PROGRAM])
         self.assertEqual(eng.calls[2][8], "running")
+        self.assertEqual(eng.calls[3][1:], ["inspect", "f" * 64])
         files = list(self.run_dir.iterdir())
         self.assertEqual(len(files), 1)
         self.assertTrue(files[0].name.startswith("router-fingerprint-2-"))
@@ -1578,16 +1648,6 @@ class MatchVerb(Outcome):
         self.assertEqual(lines[-1], f"{want[0]} {want[2]}: {want[3]}")
         self.assertEqual(want[0], rf.MEASURED)
 
-    def test_a_bases_schema_defect_runs_no_git(self):
-        rec = RecordingGit(self.base)
-        d = capture(self.h["trees"][REAL_TARGET])
-        doc = json.loads(rf.BASES_PATH.read_bytes())
-        doc["schema"] = 2
-        code, lines = self.cli(d, json.dumps(doc).encode(), git=str(rec.path))
-        self.assertEqual(code, 2)
-        self.assertIn("bases_schema", lines[-1])
-        self.assertEqual(rec.calls(), [])
-
     def test_a_dirty_bases_file(self):
         rf.bases_dirty = lambda *a, **k: "router-upgrade-bases.json is modified in the deploy checkout"
         code, lines = self.cli(capture(self.h["trees"][REAL_TARGET]))
@@ -1607,15 +1667,6 @@ class MatchVerb(Outcome):
         code, lines = self.cli(capture(self.h["trees"][fp[2]]), json.dumps(doc).encode())
         self.assertEqual((code, lines[-1].split(":")[0]), (2, "UNKNOWN pin"))
 
-    def test_verify_image_refuses_a_malformed_commit_with_no_git(self):
-        rec = RecordingGit(self.base)
-        lines = []
-        args = SimpleNamespace(verify_image=str(self.base / "x.json"), match=None, image=None, step=None,
-                               apply=False, commit="main", spec=None, overlay=None)
-        self.assertEqual(rf.run(args, out=lines.append, git=str(rec.path)), 2)
-        self.assertIn("commit_format", lines[-1])
-        self.assertEqual(rec.calls(), [])
-
     def test_verify_image_end_to_end_is_exact(self):
         f = self.base / "img.json"
         f.write_bytes(b(capture(self.h["trees"][REAL_TARGET], source="image")))
@@ -1626,19 +1677,120 @@ class MatchVerb(Outcome):
         self.assertTrue(lines[-1].startswith("EXACT exact"))
 
 
-class BasesDirty(unittest.TestCase):
+class MatchVerbNoHop(Outcome):
+    """The CLI rows that must refuse before any git command: they need no
+    hop checkout, so the precheck's kill does not depend on one."""
 
-    def test_a_modified_bases_file_is_dirty(self):
-        base = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, base, ignore_errors=True)
-        _git(base, "init", "-q")
-        f = base / rf.BASES_NAME
-        f.write_text("{}\n")
-        _git(base, "add", "-A")
-        _git(base, "commit", "-q", "-m", "b")
-        self.assertIsNone(rf.bases_dirty(f))
-        f.write_text("{} \n")
-        self.assertIsNotNone(rf.bases_dirty(f))
+    def setUp(self):
+        self.base = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.base, ignore_errors=True)
+        real = rf._load_spec
+        self.addCleanup(setattr, rf, "_load_spec", real)
+        rf._load_spec = lambda *a, **k: SimpleNamespace(secrets=None, router=SimpleNamespace(container="amap-rl"))
+        real_dirty = rf.bases_dirty
+        self.addCleanup(setattr, rf, "bases_dirty", real_dirty)
+        rf.bases_dirty = lambda *a, **k: None
+
+    def test_a_bases_schema_defect_runs_no_git(self):
+        rec = RecordingGit(self.base)
+        real_bases = rf.BASES_PATH
+        self.addCleanup(setattr, rf, "BASES_PATH", real_bases)
+        doc = json.loads(rf.BASES_PATH.read_bytes())
+        doc["schema"] = 2
+        rf.BASES_PATH = self.base / "bases.json"
+        rf.BASES_PATH.write_text(json.dumps(doc))
+        f = self.base / "cap.json"
+        f.write_bytes(b(capture(TREE[C[1]])))
+        lines = []
+        args = SimpleNamespace(verify_image=None, match=str(f), image=None, step=None, apply=False, commit=None,
+                               spec=None, overlay=None)
+        self.assertEqual(rf.run(args, out=lines.append, git=str(rec.path)), 2)
+        self.assertIn("bases_schema", lines[-1])
+        self.assertEqual(rec.calls(), [])
+
+    def test_verify_image_refuses_a_malformed_commit_with_no_git(self):
+        rec = RecordingGit(self.base)
+        lines = []
+        args = SimpleNamespace(verify_image=str(self.base / "x.json"), match=None, image=None, step=None,
+                               apply=False, commit="main", spec=None, overlay=None)
+        self.assertEqual(rf.run(args, out=lines.append, git=str(rec.path)), 2)
+        self.assertIn("commit_format", lines[-1])
+        self.assertEqual(rec.calls(), [])
+
+    def test_an_unexpected_failure_is_unknown_never_a_traceback(self):
+        real = rf._run
+        self.addCleanup(setattr, rf, "_run", real)
+
+        def boom(*a, **k):
+            raise FileExistsError("router-fingerprint-2-x.json")
+        rf._run = boom
+        lines = []
+        args = SimpleNamespace(verify_image=None, match=None, image=None, step=2, apply=True, commit=None,
+                               spec=None, overlay=None)
+        try:
+            code = rf.run(args, out=lines.append)
+        except Exception as e:     # noqa: BLE001
+            self.fail(f"an exception escaped run(): {type(e).__name__}")
+        self.assertEqual(code, 2)
+        self.assertIn("UNKNOWN internal", lines[-1])
+
+
+class BasesDirty(unittest.TestCase):
+    """The bases file's provenance on a real repository: the bytes given to
+    the matcher must equal the committed bytes, and the index must hold that
+    blob, whatever the index's flags hide from `git status`."""
+
+    def setUp(self):
+        self.base = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.base, ignore_errors=True)
+        _git(self.base, "init", "-q")
+        self.f = self.base / rf.BASES_NAME
+        self.committed = b'{"measured_from": "a"}\n'
+        self.f.write_bytes(self.committed)
+        _git(self.base, "add", "-A")
+        _git(self.base, "commit", "-q", "-m", "b")
+
+    def test_the_committed_file_is_clean(self):
+        self.assertIsNone(rf.bases_dirty(self.f))
+        self.assertIsNone(rf.bases_dirty(self.f, self.committed))
+
+    def test_a_visible_edit(self):
+        self.f.write_bytes(b'{"measured_from": "b"}\n')
+        self.assertIsNotNone(rf.bases_dirty(self.f))
+
+    def test_an_edit_under_skip_worktree(self):
+        _git(self.base, "update-index", "--skip-worktree", rf.BASES_NAME)
+        self.f.write_bytes(b'{"measured_from": "b"}\n')
+        self.assertEqual(_git(self.base, "status", "--porcelain"), b"")
+        self.assertIsNotNone(rf.bases_dirty(self.f))
+
+    def test_an_edit_under_assume_unchanged(self):
+        _git(self.base, "update-index", "--assume-unchanged", rf.BASES_NAME)
+        self.f.write_bytes(b'{"measured_from": "b"}\n')
+        self.assertEqual(_git(self.base, "status", "--porcelain"), b"")
+        self.assertIsNotNone(rf.bases_dirty(self.f))
+
+    def test_an_untracked_or_ignored_file(self):
+        other = Path(tempfile.mkdtemp(dir=self.base))
+        _git(other, "init", "-q")
+        (other / ".gitignore").write_text(rf.BASES_NAME + "\n")
+        _git(other, "add", "-A")
+        _git(other, "commit", "-q", "-m", "i")
+        g = other / rf.BASES_NAME
+        g.write_bytes(self.committed)
+        self.assertEqual(_git(other, "status", "--porcelain"), b"")
+        self.assertIsNotNone(rf.bases_dirty(g))
+        (other / ".gitignore").unlink()
+        self.assertIsNotNone(rf.bases_dirty(g))
+
+    def test_a_staged_change_with_the_file_restored(self):
+        self.f.write_bytes(b'{"measured_from": "b"}\n')
+        _git(self.base, "add", rf.BASES_NAME)
+        self.f.write_bytes(self.committed)
+        self.assertIsNotNone(rf.bases_dirty(self.f))
+
+    def test_the_bytes_given_are_what_is_compared(self):
+        self.assertIsNotNone(rf.bases_dirty(self.f, b'{"measured_from": "b"}\n'))
 
 
 class Pins(unittest.TestCase):
@@ -1658,7 +1810,7 @@ class Pins(unittest.TestCase):
         self.assertEqual(hp.PLUGIN_SHA256, "f15855c974df021c2ae5c551aff2448d934725a6796fb03434e573305d24fe93")
 
     def test_the_program_sha256(self):
-        self.assertEqual(rf.PROGRAM_SHA256, "d8c4f0d7d29b64eaf1777522726a94af95cd80b6835c5a8825b906f652b6b58d")
+        self.assertEqual(rf.PROGRAM_SHA256, "e808f20f8a59a2dec9716c35d3a4206cee07489beb848c1906765c48052d6186")
 
 
 if __name__ == "__main__":

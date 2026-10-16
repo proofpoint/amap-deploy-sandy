@@ -64,9 +64,10 @@ _HEX40 = re.compile(r"[0-9a-f]{40}")
 _HEX64 = re.compile(r"[0-9a-f]{64}")
 _IMAGE_ID = re.compile(r"sha256:[0-9a-f]{64}")
 _UMASK = re.compile(r"[0-7]{4}")
-_AT = re.compile(r"(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)\.(\d{6})Z")
-_WHOLE = re.compile(r"(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)Z")
-_DOCKER_TS = re.compile(r"(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)(?:\.(\d{1,9}))?Z")
+#: The time grammars match ASCII digits only: `\d` in a str pattern also matches other scripts' digits.
+_AT = re.compile(r"([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2})\.([0-9]{6})Z")
+_WHOLE = re.compile(r"([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2})Z")
+_DOCKER_TS = re.compile(r"([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2})(?:\.([0-9]{1,9}))?Z")
 _PY_ENV_NAME = re.compile(r"PYTHON[A-Z]")
 
 ENTRY_TYPES = ("file", "dir", "link", "other")
@@ -188,6 +189,20 @@ def read_app(app):
     return out
 
 
+def parse_environ(raw, where):
+    """An environ block as {name: value}. A name set twice is an error: the
+    interpreter reads the first, so the block is not one answer."""
+    env = {}
+    for item in raw.split(b"\0"):
+        if b"=" in item:
+            k, _, v = item.partition(b"=")
+            name = os.fsdecode(k)
+            if name in env:
+                err(where + "/environ names " + name + " more than once")
+            env[name] = os.fsdecode(v)
+    return env
+
+
 def read_process(pid):
     """PID `pid`'s argv, cwd, ROUTER_CONFIG, PYTHON* entries, LD_* names and
     umask; and its whole environment, for the user-site lookup."""
@@ -197,11 +212,7 @@ def read_process(pid):
     if raw and raw[-1] == b"":
         raw.pop()
     with open(proc + "/environ", "rb") as f:
-        env = {}
-        for item in f.read().split(b"\0"):
-            if b"=" in item:
-                k, _, v = item.partition(b"=")
-                env[os.fsdecode(k)] = os.fsdecode(v)
+        env = parse_environ(f.read(), proc)
     umask = None
     with open(proc + "/status") as f:
         for line in f:
@@ -902,7 +913,8 @@ def _match(capture_bytes: bytes, bases_bytes: bytes, history: Any, pin: str,
             return _out(UNMEASURED, "plugin", "the running transport plugin is not the pinned plugin")
     elif c["transport_plugin"]["present"] and c["transport_plugin"]["sha256"] != plugin_sha256:
         return _out(UNMEASURED, "plugin", "the configured transport plugin is not the pinned plugin")
-    return _out(MEASURED, "measured", "the running router's base was measured: " + ", ".join(m))
+    return _out(MEASURED, "measured", f"the running router's base was measured (capture step {doc['step']} at "
+                f"{doc['at']}): " + ", ".join(m))
 
 
 def verify_image(capture_bytes: bytes, history: Any, commit: str) -> Tuple[str, int, str, str]:
@@ -950,6 +962,11 @@ def _verify_image(capture_bytes: bytes, history: Any, commit: str) -> Tuple[str,
 # --- The history ------------------------------------------------------------------
 
 
+#: A header line whose key is `tree` or `parent`, however it continues: a bare
+#: key, a tab, or a space. Only the exact `parent <40-hex>` form is a parent.
+_STRUCTURAL = re.compile(rb"(?:tree|parent)(?:[ \t]|$)")
+
+
 def _parse_commit(body: bytes) -> Tuple[str, Optional[str]]:
     """The root tree and the first parent, from a verified commit's header."""
     end = body.find(b"\n\n")
@@ -962,7 +979,7 @@ def _parse_commit(body: bytes) -> Tuple[str, Optional[str]]:
     tree = m.group(1).decode("ascii")
     parents = []
     i = 1
-    while i < len(lines) and lines[i].startswith(b"parent "):
+    while i < len(lines) and _STRUCTURAL.match(lines[i]) and lines[i].startswith(b"parent"):
         p = re.fullmatch(rb"parent ([0-9a-f]{40})", lines[i])
         if p is None:
             raise HistoryReadError("a commit has a malformed parent line")
@@ -971,8 +988,9 @@ def _parse_commit(body: bytes) -> Tuple[str, Optional[str]]:
     for line in lines[i:]:
         if line.startswith(b" "):
             continue    # a continuation (gpgsig, mergetag), never a parent
-        if line.startswith(b"parent ") or line.startswith(b"tree "):
-            raise HistoryReadError("a commit has a tree or parent header after its parent block")
+        if _STRUCTURAL.match(line):
+            raise HistoryReadError("a commit has a tree or parent header after its parent block, or a "
+                                   "malformed one")
     return tree, (parents[0] if parents else None)
 
 
@@ -1155,7 +1173,7 @@ def capture_running(docker: List[str], container: str, step: int, *, run: Runner
     raw = _engine(run, docker + ["exec", str(cid), "python3", "-I", "-S", "-c", PROGRAM, "running"])
     at = clock()
     result = _program_result(raw)
-    c2 = _inspect_one(_engine(run, docker + ["inspect", container]), container)
+    c2 = _inspect_one(_engine(run, docker + ["inspect", str(cid)]), container)
     if (c2.get("Id"), c2.get("Image"), (c2.get("State") or {}).get("StartedAt")) != (cid, image, started):
         raise CaptureError(f"{container} changed during the capture (Id, Image or StartedAt); capture again")
     return {"schema": SCHEMA, "source": "running", "step": step, "at_before": utc_at(at_before), "at": utc_at(at),
@@ -1192,15 +1210,28 @@ def write_capture(run_dir: str, label: str, doc: Dict[str, Any]) -> str:
 # --- The verb ---------------------------------------------------------------------
 
 
-def bases_dirty(path: Path = BASES_PATH) -> Optional[str]:
-    """None when the bases file is committed and unmodified in the deploy
-    checkout; otherwise why not."""
+def bases_dirty(path: Path = BASES_PATH, data: Optional[bytes] = None) -> Optional[str]:
+    """None when `data` (the bytes the matcher is given; by default the
+    file's) equals the bases file's committed bytes at HEAD and the index
+    holds that same blob; otherwise why not. It reads only: `git status`
+    is never consulted, because skip-worktree and assume-unchanged hide an
+    edit from it, and an ignored or untracked file is not in it at all."""
+    repo, rel = str(path.parent), "HEAD:./" + path.name
     try:
-        out = hg.git(str(path.parent), "status", "--porcelain", "--", path.name)
-    except hg.CannotRun as e:
+        data = path.read_bytes() if data is None else data
+        head_blob = hg.git(repo, "rev-parse", "--verify", "--quiet", "--end-of-options", rel,
+                           ok=(0, 1)).decode("ascii", "replace").strip()
+        if not head_blob or hg.git(repo, "cat-file", "-t", "--end-of-options", head_blob).strip() != b"blob":
+            return f"{path.name} is not committed in the deploy checkout"
+        committed = hg.git(repo, "cat-file", "blob", "--end-of-options", head_blob)
+        staged = hg.git(repo, "ls-files", "--stage", "-z", "--", path.name).decode("ascii", "replace")
+    except (OSError, hg.CannotRun) as e:
         return f"the deploy checkout cannot be read: {e}"
-    if out.strip():
-        return f"{path.name} is modified in the deploy checkout"
+    if data != committed:
+        return f"{path.name} differs from its committed bytes in the deploy checkout"
+    fields = staged.split("\0")[0].split()
+    if len(fields) < 2 or fields[1] != head_blob:
+        return f"{path.name} has a staged change, or is not in the deploy checkout's index"
     return None
 
 
@@ -1212,7 +1243,17 @@ def _show(outcome: Tuple[str, int, str, str], out: Callable[[str], None]) -> int
 
 def run(args: Any, *, out: Callable[[str], None] = print, git: Optional[str] = None,
         runner: Runner = subprocess.run) -> int:
-    """`router-fingerprint`: one of --step, --image, --match or --verify-image."""
+    """`router-fingerprint`: one of --step, --image, --match or --verify-image.
+    An unexpected failure is UNKNOWN (exit 2), never a traceback's exit 1,
+    which is UNMEASURED's and DIFFERS'."""
+    try:
+        return _run(args, out=out, git=git, runner=runner)
+    except Exception as e:     # noqa: BLE001
+        out(f"router-fingerprint: UNKNOWN internal: {type(e).__name__}: {e}")
+        return EXIT[UNKNOWN]
+
+
+def _run(args: Any, *, out: Callable[[str], None], git: Optional[str], runner: Runner) -> int:
     import hop_router as hp
     git = git or shutil.which("git") or "git"
     if args.verify_image is not None:
@@ -1298,7 +1339,7 @@ def _run_match(args: Any, spec: Any, out: Callable[[str], None], git: str, hp: A
     bad = precheck(capture, bases, pin)
     if bad:
         return _show(bad, out)
-    dirty = bases_dirty()
+    dirty = bases_dirty(BASES_PATH, bases)
     if dirty:
         return _show(_unknown("bases_dirty", dirty), out)
     name = json.loads(capture)["container"]["name"]
