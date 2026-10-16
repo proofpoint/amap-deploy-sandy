@@ -164,10 +164,15 @@ def gate(doc, hist=None, *, pin=TARGET, bases_bytes=None, plugin=PLUGIN):
                     pin, plugin)
 
 
+#: The exit each outcome must give, stated here rather than read from the
+#: module, so a change to the module's exit map shows.
+EXITS = {"MEASURED": 0, "UNMEASURED": 1, "UNKNOWN": 2, "EXACT": 0, "DIFFERS": 1}
+
+
 class Outcome(unittest.TestCase):
 
     def assertGate(self, got, outcome, reason):
-        self.assertEqual((got[0], got[1], got[2]), (outcome, rf.EXIT[outcome], reason), got[3])
+        self.assertEqual((got[0], got[1], got[2]), (outcome, EXITS[outcome], reason), got[3])
 
 
 # --- The match: the domains ---------------------------------------------------------
