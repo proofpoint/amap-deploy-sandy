@@ -322,10 +322,32 @@ class CaptureRows(Outcome):
                 change(d)
                 self.assertGate(gate(d), rf.UNKNOWN, "time_format")
 
-    def test_digits_of_another_script_are_time_format(self):
-        d = self.good()
-        d["at"] = d["at"].replace("1", "\u0661", 1)
-        self.assertGate(gate(d), rf.UNKNOWN, "time_format")
+    #: Each field's character positions in `YYYY-MM-DDTHH:MM:SS[.f…]Z`.
+    FIELDS = {"year": 0, "month": 5, "day": 8, "hour": 11, "minute": 14, "second": 17, "fraction": 20}
+
+    def other_script(self, value, pos):
+        """`value` with the ASCII digit at `pos` replaced by the same digit in
+        Arabic-Indic, which int() still reads: only the grammar can refuse it."""
+        self.assertTrue(value[pos].isdigit() and value[pos].isascii(), (value, pos))
+        return value[:pos] + chr(0x660 + int(value[pos])) + value[pos + 1:]
+
+    def test_digits_of_another_script_are_time_format_in_every_field(self):
+        """One subTest per field of each grammar: _AT (at), _WHOLE
+        (last_poll_ts) and _DOCKER_TS (StartedAt)."""
+        grammars = {
+            "_AT at": (lambda d: d["at"], lambda d, v: d.update(at=v), self.FIELDS),
+            "_WHOLE last_poll_ts": (lambda d: d["result"]["status"]["last_poll_ts"]["value"],
+                                    lambda d, v: d["result"]["status"]["last_poll_ts"].update(value=v),
+                                    {k: v for k, v in self.FIELDS.items() if k != "fraction"}),
+            "_DOCKER_TS started_at": (lambda d: d["container"]["started_at"],
+                                      lambda d, v: d["container"].update(started_at=v), self.FIELDS),
+        }
+        for grammar, (get, put, fields) in grammars.items():
+            for field, pos in fields.items():
+                with self.subTest(grammar=grammar, field=field):
+                    d = self.good()
+                    put(d, self.other_script(get(d), pos))
+                    self.assertGate(gate(d), rf.UNKNOWN, "time_format")
 
     def test_at_before_after_at_is_time_format_with_its_own_message(self):
         d = capture(TREE[C[1]], at_before="110.2")
@@ -1789,8 +1811,62 @@ class BasesDirty(unittest.TestCase):
         self.f.write_bytes(self.committed)
         self.assertIsNotNone(rf.bases_dirty(self.f))
 
+    def test_a_committed_file_missing_from_the_index(self):
+        _git(self.base, "rm", "-q", "--cached", rf.BASES_NAME)
+        self.assertEqual(self.f.read_bytes(), self.committed)
+        self.assertIsNotNone(rf.bases_dirty(self.f))
+
     def test_the_bytes_given_are_what_is_compared(self):
         self.assertIsNotNone(rf.bases_dirty(self.f, b'{"measured_from": "b"}\n'))
+
+    def blob(self):
+        return _git(self.base, "rev-parse", "HEAD:" + rf.BASES_NAME).decode().strip()
+
+    def test_a_staged_executable_mode_with_the_same_blob(self):
+        _git(self.base, "update-index", "--chmod=+x", rf.BASES_NAME)
+        self.assertEqual(self.f.read_bytes(), self.committed)
+        self.assertIsNotNone(rf.bases_dirty(self.f))
+
+    def test_a_staged_symlink_entry_with_the_same_blob(self):
+        _git(self.base, "update-index", "--cacheinfo", f"120000,{self.blob()},{rf.BASES_NAME}")
+        self.assertIsNotNone(rf.bases_dirty(self.f))
+
+    def test_unmerged_stages_on_the_same_blob(self):
+        z = "0" * 40
+        info = f"0 {z}\t{rf.BASES_NAME}\n" + "".join(f"100644 {self.blob()} {n}\t{rf.BASES_NAME}\n" for n in (1, 2, 3))
+        _git(self.base, "update-index", "--index-info", data=info.encode())
+        self.assertEqual(len(_git(self.base, "ls-files", "--stage", "--", rf.BASES_NAME).splitlines()), 3)
+        self.assertIsNotNone(rf.bases_dirty(self.f))
+
+    def test_a_committed_executable_mode(self):
+        _git(self.base, "update-index", "--chmod=+x", rf.BASES_NAME)
+        _git(self.base, "commit", "-q", "-m", "x")
+        self.assertIsNotNone(rf.bases_dirty(self.f))
+
+    def test_the_cli_answers_unknown_bases_dirty(self):
+        """The real check through the verb: a staged mode change refuses
+        before any history is read."""
+        repo = Path(tempfile.mkdtemp(dir=self.base))
+        _git(repo, "init", "-q")
+        f = repo / rf.BASES_NAME
+        f.write_bytes(rf.BASES_PATH.read_bytes())
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-q", "-m", "b")
+        _git(repo, "update-index", "--chmod=+x", rf.BASES_NAME)
+        for attr, value in (("BASES_PATH", f),
+                            ("_load_spec", lambda *a, **k: SimpleNamespace(secrets=None,
+                                                                         router=SimpleNamespace(container="amap-rl")))):
+            self.addCleanup(setattr, rf, attr, getattr(rf, attr))
+            setattr(rf, attr, value)
+        rec = RecordingGit(self.base)
+        cap = self.base / "cap.json"
+        cap.write_bytes(b(capture(TREE[C[1]])))
+        lines = []
+        args = SimpleNamespace(verify_image=None, match=str(cap), image=None, step=None, apply=False, commit=None,
+                               spec=None, overlay=None)
+        self.assertEqual(rf.run(args, out=lines.append, git=str(rec.path)), 2)
+        self.assertTrue(lines[-1].startswith("UNKNOWN bases_dirty"), lines[-1])
+        self.assertEqual(rec.calls(), [])
 
 
 class Pins(unittest.TestCase):

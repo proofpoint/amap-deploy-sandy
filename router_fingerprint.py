@@ -1210,30 +1210,51 @@ def write_capture(run_dir: str, label: str, doc: Dict[str, Any]) -> str:
 # --- The verb ---------------------------------------------------------------------
 
 
+#: The one mode the bases file may have, at HEAD and in the index: a regular, non-executable file.
+BASES_MODE = "100644"
+
+
+def _records(raw: bytes) -> List[Tuple[List[str], str]]:
+    """`git ls-tree -z` / `ls-files --stage -z` output: each record's fields and its path."""
+    out = []
+    for rec in raw.decode("utf-8", "replace").split("\0"):
+        if rec:
+            meta, _, name = rec.partition("\t")
+            out.append((meta.split(), name))
+    return out
+
+
 def bases_dirty(path: Path = BASES_PATH, data: Optional[bytes] = None) -> Optional[str]:
     """None when `data` (the bytes the matcher is given; by default the
-    file's) equals the bases file's committed bytes at HEAD and the index
-    holds that same blob; otherwise why not. It reads only: `git status`
-    is never consulted, because skip-worktree and assume-unchanged hide an
-    edit from it, and an ignored or untracked file is not in it at all."""
-    repo, rel = str(path.parent), "HEAD:./" + path.name
+    file's) equals the bases file's committed bytes at HEAD, where it is ONE
+    regular file of mode 100644, and the index holds exactly one stage-0
+    entry for it with that same mode and blob; otherwise why not. It reads
+    only: `git status` is never consulted, because skip-worktree and
+    assume-unchanged hide an edit from it, and an ignored or untracked file
+    is not in it at all. A blob's type cannot tell a file from a symlink, so
+    the modes are compared, and an unmerged path is refused."""
+    repo = str(path.parent)
     try:
         data = path.read_bytes() if data is None else data
-        head_blob = hg.git(repo, "rev-parse", "--verify", "--quiet", "--end-of-options", rel,
-                           ok=(0, 1)).decode("ascii", "replace").strip()
-        if not head_blob or hg.git(repo, "cat-file", "-t", "--end-of-options", head_blob).strip() != b"blob":
-            return f"{path.name} is not committed in the deploy checkout"
-        committed = hg.git(repo, "cat-file", "blob", "--end-of-options", head_blob)
-        staged = hg.git(repo, "ls-files", "--stage", "-z", "--", path.name).decode("ascii", "replace")
+        head = _records(hg.git(repo, "ls-tree", "-z", "HEAD", "--", path.name))
+        staged = _records(hg.git(repo, "ls-files", "--stage", "-z", "--", path.name))
     except (OSError, hg.CannotRun) as e:
+        return f"the deploy checkout cannot be read: {e}"
+    if len(head) != 1 or head[0][1] != path.name or len(head[0][0]) != 3 or head[0][0][1] != "blob":
+        return f"{path.name} is not committed in the deploy checkout as one file"
+    mode, _, blob = head[0][0]
+    if mode != BASES_MODE:
+        return f"{path.name} is committed with mode {mode}, not {BASES_MODE}"
+    try:
+        committed = hg.git(repo, "cat-file", "blob", "--end-of-options", blob)
+    except hg.CannotRun as e:
         return f"the deploy checkout cannot be read: {e}"
     if data != committed:
         return f"{path.name} differs from its committed bytes in the deploy checkout"
-    fields = staged.split("\0")[0].split()
-    if len(fields) < 2 or fields[1] != head_blob:
-        return f"{path.name} has a staged change, or is not in the deploy checkout's index"
+    if len(staged) != 1 or staged[0][1] != path.name or staged[0][0] != [mode, blob, "0"]:
+        return (f"{path.name}'s index entry is not exactly its committed one (mode {mode}, its blob, stage 0): "
+                "a staged change, a mode or type change, an unmerged path, or no entry")
     return None
-
 
 def _show(outcome: Tuple[str, int, str, str], out: Callable[[str], None]) -> int:
     o, code, reason, text = outcome
