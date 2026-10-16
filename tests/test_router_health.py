@@ -1242,3 +1242,33 @@ class SharedProbeHazardsTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BoundedRunTest(unittest.TestCase):
+    """run(max_output=...) and the byte capture. _run_bounded is exercised
+    directly with a local python child: conftest replaces `run` itself for
+    the whole session, and nothing here starts docker."""
+
+    def child(self, code):
+        return [sys.executable, "-I", "-S", "-c", code]
+
+    def test_output_within_the_bound_is_returned(self):
+        p = rh._run_bounded(self.child("print('ok')"), None, 10.0, dict(os.environ), 100)
+        self.assertEqual((p.rc, p.out), (0, "ok\n"))
+
+    def test_output_past_the_bound_kills_the_child(self):
+        with self.assertRaises(rh.CannotRun) as e:
+            rh._run_bounded(self.child("import sys, time\nsys.stdout.write('x' * 10000); sys.stdout.flush()\n"
+                                       "time.sleep(30)"), None, 20.0, dict(os.environ), 100)
+        self.assertIn("printed more than 100 bytes", str(e.exception))
+
+    def test_a_child_past_its_timeout_is_killed(self):
+        with self.assertRaises(rh.CannotRun) as e:
+            rh._run_bounded(self.child("import time; time.sleep(30)"), None, 0.3, dict(os.environ), 100)
+        self.assertIn("did not finish within 0.3s", str(e.exception))
+
+    def test_undecodable_output_never_raises(self):
+        p = rh._run_bounded(self.child("import sys; sys.stdout.buffer.write(b'\\xff\\xfe')"), None, 10.0,
+                            dict(os.environ), 100)
+        self.assertEqual(p.out, "��")
+        self.assertEqual(rh._text(b"\xff"), "�")

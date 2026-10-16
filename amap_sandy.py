@@ -53,6 +53,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import posixpath
 import re
 import shutil
 import stat
@@ -80,6 +81,7 @@ import hop_router as hp     # the local router's hop keys, on a host with a hop 
 import delivery_checks as dc  # delivery itself: lister mode, session posture, daemon build, backlog
 import connector_pin as cpin  # install refuses a connector checkout not at its siblings.json pin
 import build_identity as bi  # what each running runtime was built from: verify's "runtime builds" phase
+import hub_runtime as hr     # the hub-link router's rendering: where its ledger directory is seen
 
 # `fleet_policy.py` sits beside this module. Guarded rather than bare: this
 # module is imported by its tests and by its sibling tools, where HERE is not
@@ -3799,39 +3801,95 @@ def router_phases(args: argparse.Namespace, home: Path,
 
 def build_identity_outcome(args: argparse.Namespace, home: Path) -> rh.Outcome:
     """verify's "runtime builds" phase (build_identity): each runtime's build
-    against what the deployment recorded and siblings.json pins. [1]'s status
-    document is read fresh, inside the inspect bracket, from the state
-    directory the inspected container mounts, and then no other container,
-    in any state, may mount that directory; [2]'s router has no reader
-    here, so its plugin claim says the digest is not published."""
+    against what the deployment recorded and siblings.json pins, within one
+    PHASE_BUDGET_S (every engine call min(its own timeout, the time left)).
+
+    [1] is the local router, on the bare `docker`: its status document is
+    read host-side from the state directory its container binds by identity.
+    [2] is the hub-link router, on the hub's docker client with the
+    supervised engine named (`-H`; sudo -n drops DOCKER_HOST): its status
+    document is read by one `docker exec` of HUB_READER, which holds the
+    whole progress witness. Each is read inside its inspect bracket, then
+    every container sharing the directory is looked for on both engines
+    where both routers are deployed (DS-BUILD-ID-HUB-READER design v2.2,
+    v2.3)."""
     spec = _builds_spec(ha.overlay_path(getattr(args, "overlay", None)))
-    hub_docker = hsu.ss.docker(spec.secrets) if not isinstance(spec, rh.Unresolved) and spec is not None \
-        and spec.secrets is not None else ["docker"]
+    budget = bi.Budget()
+    aux = budget.runner(bi.AUX_TIMEOUT_S)
+    usable = spec is not None and not isinstance(spec, rh.Unresolved)
+    secrets = spec.secrets if usable else None
+    supervision = getattr(spec, "supervision", None) if usable else None
+    hub_docker = hsu.ss.docker(secrets) + ["-H", supervision.engine] \
+        if secrets is not None and supervision is not None else None
+    no_engine = rh.Unresolved("the host-setup document names no engine for [2] (no supervision section), so "
+                              "the container verify would read may be another engine's")
 
     def inspect(role: str, name: str) -> Any:
-        return bi.inspect_container(hub_docker if role == bi.ROLE_HUB else ["docker"], name)
+        if role == bi.ROLE_HUB:
+            return no_engine if hub_docker is None else bi.inspect_container(hub_docker, name, aux)
+        return bi.inspect_container(["docker"], name, aux)
+
+    def labels(image: str) -> Any:
+        return no_engine if hub_docker is None else bi.image_labels(hub_docker, image, aux)
+
+    def sharers(path: str, who: str, what: str, own_id: Any, engines: List[List[str]]) -> Any:
+        for docker in engines:
+            found = bi.state_sharers(docker, path, own_id, aux)
+            if isinstance(found, rh.Unresolved):
+                return found
+            if found:
+                return rh.Unresolved(bi.sharers_reason(who, what, path, found))
+        return None
 
     def status(role: str, name: str, live: Any) -> Any:
-        if role != bi.ROLE_HOP:
-            return None
+        # A container not settled, or without a full Id, is refused before
+        # anything is read or run against it.
+        unsettled = bi._settled(live, f"[{1 if role == bi.ROLE_HOP else 2}] ({name})")
+        if unsettled is not None:
+            return rh.Unresolved(unsettled)
+        return hub_status(name, live) if role == bi.ROLE_HUB else hop_status(name, live)
+
+    def hop_status(name: str, live: Any) -> Any:
         state_dir = str(sibling_state_dir(home, getattr(args, "state_dir", None)))
         who = f"[1] ({name})"
-        read = bi.read_progressing if bi.no_recorded_exit(live) else bi.read_status
-        doc = read(live, state_dir, who)
-        others = bi.state_sharers(["docker"], state_dir, live.get("Id"))
-        if isinstance(others, rh.Unresolved):
-            return others
-        if others:
-            return rh.Unresolved(f"another container shares {who}'s state directory {state_dir} "
-                                 f"({', '.join(str(i)[:12] for i in others)}), so the status document may be its")
-        return doc
+        if bi.no_recorded_exit(live):
+            doc = bi.read_progressing(live, state_dir, who, budget)
+        else:
+            doc = bi.read_status(live, state_dir, who)
+        engines = [["docker"]]
+        if usable and getattr(spec, "hub", None) is not None:
+            if hub_docker is None:
+                return no_engine
+            engines.append(hub_docker)
+        shared = sharers(state_dir, who, "state directory", live.get("Id"), engines)
+        return doc if shared is None else shared
+
+    def hub_status(name: str, live: Any) -> Any:
+        who = f"[2] ({name})"
+        if hub_docker is None:
+            return no_engine
+        try:
+            ledger_host = spec.hub.dirs["RELAY_LEDGER_DIR"]
+            m = hr.mount_holding(spec, secrets.principal, ledger_host)
+        except (hr.HubSpecError, KeyError, AttributeError) as e:
+            return rh.Unresolved(f"{who}'s ledger directory cannot be placed from the host-setup document: {e}")
+        ledger = m["container"] + ledger_host[len(m["host"]):]
+        refused = bi.own_mounts_refusal(live, m["host"], m["container"], ledger, who) \
+            or bi.ledger_env_refusal(live, ledger, who)
+        if refused is not None:
+            return refused
+        doc = bi.read_hub_status(hub_docker, live, posixpath.join(ledger, bi.HUB_STATUS_NAME),
+                                 f"{secrets.uid}:{secrets.gid}", who, budget.runner(bi.HUB_EXEC_TIMEOUT_S))
+        engines = [hub_docker] + ([["docker"]] if getattr(spec, "router", None) is not None else [])
+        shared = sharers(ledger_host, who, "ledger directory", live.get("Id"), engines)
+        return doc if shared is None else shared
 
     try:
         connector = cpin.pinned_commit()
     except (cpin.siblings.SiblingError, OSError, KeyError, ValueError) as e:
         connector = rh.Unresolved(f"siblings.json's connector pin cannot be read: {e}")
     phase = bi.collect(spec, feature_payload_dir(home), hop_pin=hp.hop_pin(), connector_pin=connector,
-                       inspect=inspect, labels=lambda image: bi.image_labels(hub_docker, image), status=status)
+                       inspect=inspect, labels=labels, status=status)
     return phase.outcome()
 
 
