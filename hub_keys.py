@@ -598,6 +598,17 @@ def verify_signing(ks: KeySpec, raw: Any, bind: rh.Check, sg: Signing) -> rh.Che
 #: after the " - " separator. Shared verbatim by the host step and the
 #: in-container script, so both sides answer by one rule.
 MOUNT_FSTYPE_SRC = (
+    "def unescape_mount(s):\n"
+    "    out, i = [], 0\n"
+    "    while i < len(s):\n"
+    "        o = s[i + 1:i + 4]\n"
+    "        if s[i] == '\\\\' and len(o) == 3 and all(c in '01234567' for c in o):\n"
+    "            out.append(chr(int(o, 8)))\n"
+    "            i += 4\n"
+    "        else:\n"
+    "            out.append(s[i])\n"
+    "            i += 1\n"
+    "    return ''.join(out)\n"
     "def mount_fstype(path, text, exact=False):\n"
     "    best = None\n"
     "    for line in text.splitlines():\n"
@@ -605,7 +616,7 @@ MOUNT_FSTYPE_SRC = (
     "        f = head.split()\n"
     "        if not sep or len(f) < 5 or not tail.split():\n"
     "            continue\n"
-    "        mp = f[4].encode('latin-1').decode('unicode_escape')\n"
+    "        mp = unescape_mount(f[4])\n"
     "        if path == mp or (not exact and path.startswith(mp.rstrip('/') + '/')):\n"
     "            if best is None or len(mp) >= len(best[0]):\n"
     "                best = (mp, tail.split()[0])\n"
@@ -613,6 +624,13 @@ MOUNT_FSTYPE_SRC = (
 _ns: Dict[str, Any] = {}
 exec(MOUNT_FSTYPE_SRC, _ns)  # noqa: S102 -- this module's own constant, so the host and container rule is one text
 mount_fstype = _ns["mount_fstype"]
+
+
+def host_fstype(path: str, mountinfo: str) -> Any:
+    """The filesystem type of the file the host actually opens at `path`:
+    its real path, never the lexical one, so an alias names its target's
+    filesystem."""
+    return mount_fstype(os.path.realpath(path), mountinfo)
 #: Filesystems whose inode timestamps Linux stamps from its coarse clock with
 #: 1 ns granularity, and that hold the inode locally: the supported set.
 LOCAL_FS = ("ext4", "xfs", "btrfs")
@@ -626,7 +644,7 @@ CONFIG_TUPLE_SCRIPT = ("import hashlib,json,os,time\n" + MOUNT_FSTYPE_SRC +
                        "    if not c: break\n"
                        "    b+=c\n"
                        "boot=open('/proc/sys/kernel/random/boot_id').read().strip()\n"
-                       "fs=mount_fstype(p,open('/proc/self/mountinfo').read(),exact=True)\n"
+                       "fs=mount_fstype(os.path.realpath(p),open('/proc/self/mountinfo').read(),exact=True)\n"
                        "print(json.dumps({'dev':st.st_dev,'ino':st.st_ino,'ctime_ns':st.st_ctime_ns,'size':st.st_size,"
                        "'sha256':hashlib.sha256(b).hexdigest(),'now':time.time(),'boot_id':boot,'fstype':fs}))\n")
 TUPLE_KEYS = ("dev", "ino", "ctime_ns", "size", "sha256", "boot_id", "fstype")

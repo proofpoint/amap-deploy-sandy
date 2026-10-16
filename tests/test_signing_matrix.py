@@ -287,6 +287,46 @@ class AdoptionTest(unittest.TestCase):
         self.assertGreaterEqual(hk.CTIME_SETTLE_S, 2 * 0.010)
 
 
+class MountinfoTest(unittest.TestCase):
+    """hub_keys.mount_fstype and host_fstype, the one rule both sides read
+    mountinfo by: the opened file's real path, whole path components, the
+    topmost of equal mount points, and mountinfo's octal escapes decoded
+    without narrowing any other character."""
+
+    TEXT = ("1 0 8:1 / / rw - ext4 /dev/a rw\n"
+            "2 1 0:41 / {fuse} rw - fuse.example f rw\n"
+            "3 1 8:2 / /mnt/\u6587\u4ef6 rw - xfs b rw\n"
+            "4 1 8:3 / /my\\040dir rw - btrfs c rw\n"
+            "5 1 8:4 / /back\\134slash rw - ext4 d rw\n")
+
+    def setUp(self):
+        import os
+        import tempfile
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        self.fuse = os.path.join(os.path.realpath(td.name), "fuse")
+        os.makedirs(self.fuse)
+        with open(os.path.join(self.fuse, "router.json"), "w") as f:
+            f.write("{}")
+        self.alias = os.path.join(os.path.realpath(td.name), "alias.json")
+        os.symlink(os.path.join(self.fuse, "router.json"), self.alias)
+        self.text = self.TEXT.format(fuse=self.fuse)
+
+    def test_an_alias_names_its_target_s_filesystem(self):
+        self.assertEqual(hk.host_fstype(self.alias, self.text), "fuse.example")
+        self.assertEqual(hk.mount_fstype(self.alias, self.text), "ext4")   # the lexical path would lie
+
+    def test_unicode_escapes_and_boundaries(self):
+        self.assertEqual(hk.mount_fstype("/mnt/\u6587\u4ef6/r.json", self.text), "xfs")
+        self.assertEqual(hk.mount_fstype("/my dir/r.json", self.text), "btrfs")
+        self.assertEqual(hk.mount_fstype("/back\\slash/r.json", self.text), "ext4")
+        self.assertEqual(hk.mount_fstype("/mnt/\u6587\u4ef6x/r.json", self.text), "ext4")    # not a component of it
+
+    def test_the_container_counts_only_the_entry_at_the_path_itself(self):
+        self.assertEqual(hk.mount_fstype("/mnt/\u6587\u4ef6", self.text, exact=True), "xfs")
+        self.assertIsNone(hk.mount_fstype("/mnt/\u6587\u4ef6/r.json", self.text, exact=True))
+
+
 class PolicyTest(unittest.TestCase):
     """amap_sandy.delegation_policy: the manifest's hop_link decides, and a
     policy that cannot be read is an Unresolved, never False."""

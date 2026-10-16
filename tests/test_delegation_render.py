@@ -37,6 +37,7 @@ _m = _u.module_from_spec(_s)
 _s.loader.exec_module(_m)
 _m.SMALL_ORDER.add(bytes.fromhex({small!r}))
 _m.NON_CANONICAL.add(bytes.fromhex({noncanon!r}))
+{codec_patch}
 globals().update(_m.namespace(api=(3, 4)))
 PLUGIN_API = (3, 4)
 OPTIONAL_FACTORIES = {{"make_peer_codec": (3, 3), "make_peer_errors": (3, 3)}}
@@ -74,8 +75,7 @@ class Fixture(unittest.TestCase):
         self.t = Path(td.name)
         self.plugin = self.t / "plugin" / "amap_hop_plugin.py"
         self.plugin.parent.mkdir(mode=0o755)
-        self.plugin.write_text(PLUGIN.format(standin=str(HOP_ROUTER_ROOT / "router" / "tests" / "peer_standin.py"),
-                                             small=SMALL.hex(), noncanon=NON_CANONICAL.hex()))
+        self.write_plugin()
         self.plugin.chmod(0o444)
         domains = ["beta.internal"]
         text = "".join(d + "\n" for d in domains)
@@ -85,6 +85,13 @@ class Fixture(unittest.TestCase):
         self.d7.chmod(0o444)
         self.key = self.t / "keys" / "signing.key"     # never created unless a row says so
         self.uids = (0, os.getuid())
+
+    def write_plugin(self, codec_patch=""):
+        if self.plugin.exists():
+            self.plugin.chmod(0o644)
+        self.plugin.write_text(PLUGIN.format(standin=str(HOP_ROUTER_ROOT / "router" / "tests" / "peer_standin.py"),
+                                             small=SMALL.hex(), noncanon=NON_CANONICAL.hex(), codec_patch=codec_patch))
+        self.plugin.chmod(0o444)
 
     def config(self, hosts, *, inbound=False):
         keys = hp.hop_keys(spec(), link(), FLEET_DOMAIN)
@@ -165,6 +172,11 @@ class NoSeedTest(Fixture):
             with self.subTest(reason=reason):
                 why = self.check(self.config(inventory(GOOD[0], peer)))
                 self.assertTrue(why and why.startswith(reason + ":"), why)
+
+    def test_a_codec_with_the_wrong_candidate_vocabulary_refuses_as_activate_does(self):
+        self.write_plugin('_m.PeerCodec.CANDIDATE_REASONS = frozenset({"not_the_set"})')
+        why = self.check(self.config(inventory(*GOOD)))
+        self.assertTrue(why and why.startswith("codec:") and "CANDIDATE_REASONS" in why, why)
 
     def test_the_signing_key_id_among_the_peers_refuses(self):
         doc = self.config(inventory(*GOOD))

@@ -21,8 +21,9 @@ its path, as `hop_router.validate_with_hop_router` does:
    object), then the router's `config.load_obj`;
 2. the plugin's key gate, called as the router's `peerlane.activate` calls
    it, up to and never including the seed: `transport.load_plugin` on the
-   pinned plugin, `check_delegation`, `make_peer_codec({})`, the codec's
-   methods and reason sets, `load_key_table` on the peers and on this host's
+   pinned plugin with the agent-reachable roots the router's start passes,
+   `check_delegation`, `make_peer_codec({})`, the codec's methods, reason
+   sets and candidate view, `load_key_table` on the peers and on this host's
    own entry (built as activate builds it), the signing key_id among the
    peers', and the own key's selection and length.
 `read_seed`, `make_signer` and `make_verifier` are never called. An audit
@@ -101,7 +102,9 @@ if dc is None or cfg.transport_plugin is None:
     refused("config", "the rendering carries no delegation block and plugin")
 kw = {} if args["trusted_uids"] is None else {"trusted_uids": tuple(args["trusted_uids"])}
 try:
-    plugin = T.load_plugin(cfg.transport_plugin.path, cfg.transport_plugin.sha256, **kw)
+    # The roots the router's own start passes: no plugin may sit where an agent reaches.
+    plugin = T.load_plugin(cfg.transport_plugin.path, cfg.transport_plugin.sha256,
+                           forbidden_roots=C.agent_reachable_roots(cfg.instances), **kw)
     caps = T.check_delegation(plugin)
 except T.PluginRefused as e:
     refused(e.reason, str(e))
@@ -117,6 +120,7 @@ for m in P._CODEC_METHODS:
 try:
     reasons = P._reason_set(getattr(codec, "REASONS", None), "REASONS")
     kcr = P._reason_set(getattr(codec, "KEY_CONFIG_REASONS", None), "KEY_CONFIG_REASONS")
+    P.candidate_view_of(codec, tuple(plugin.api))
 except P.DelegationRefused as e:
     refused(e.reason, e.detail)
 probe = P.Delegation(config=dc, signer=None, verifier=None, codec=codec, errors=caps.errors,
