@@ -11,6 +11,7 @@ runs.
 
 import contextlib
 import dataclasses
+import hashlib
 import json
 import os
 import plistlib
@@ -426,6 +427,9 @@ class StartGateTest(unittest.TestCase):
                 self.assertNotIn("systemctl", said)
 
 
+UNPATCHED = object()
+
+
 @contextlib.contextmanager
 def free_lock(_s=None):
     yield None
@@ -449,7 +453,7 @@ class StartChecksCompositionTest(unittest.TestCase):
         hs.checks = lambda *a, **k: self.fail("start_checks must never call checks (it calls start_gate back)")
         patches = {(hs.ss, "checks"): "secret", (hs.se, "checks"): "exposure",
                    (hs.hr, "checks"): "hub", (hs, "verify_overlay"): "overlay",
-                   (hs.hk, "verify_placement"): "placement", (hs.hk, "verify_no_delegation"): "delegation",
+                   (hs.hk, "verify_placement"): "placement", (hs.hk, "verify_unsigned_start"): "delegation",
                    (hs.hk, "verify_evidence_dir"): "evidence_dir", (hs.hk, "verify_evidence_binds"): "binds",
                    (hs.hk, "verify_evidence"): "evidence", (hs.hv, "checks"): "supervision",
                    (hs.hk, "verify_d7_live"): "d7_live"}
@@ -495,10 +499,12 @@ class StartSweepTest(unittest.TestCase):
         patches = [(hs, "read_spec", lambda *a, **k: None), (hs, "load_spec", lambda doc: built),
                    (hs.ss, "checks", secrets_checks or same), (hs.se, "checks", lambda *a, **k: exposure_found),
                    (hs.hr, "checks", same), (hs, "verify_overlay", same), (hs.hk, "verify_placement", same),
-                   (hs.hk, "verify_no_delegation", no_delegation or same), (hs.hk, "verify_evidence_dir", same),
+                   (hs.hk, "verify_unsigned_start", no_delegation or same), (hs.hk, "verify_evidence_dir", same),
                    (hs.hk, "verify_evidence_binds", same), (hs.hk, "verify_evidence", same), (hs.hv, "checks", same),
                    (hs, "verify_recovery_horizon", horizon or same)]
         for mod, name, value in patches:
+            if value is UNPATCHED:
+                continue
             self.addCleanup(setattr, mod, name, getattr(mod, name))
             setattr(mod, name, value)
         said = []
@@ -514,6 +520,22 @@ class StartSweepTest(unittest.TestCase):
         self.gate([], no_delegation=lambda ks, live, rb: seen.append(live) or [],
                   keys={"containers": [], "live": answer})
         self.assertEqual(seen, [answer])
+
+    def test_a_bound_delegation_free_config_passes_the_real_gate(self):
+        """hub_keys.verify_unsigned_start unstubbed, with every other group
+        passing: a delegation-free config the router is shown to read lets
+        the hub-link router start, with no policy, gate, record or status
+        read; the same file with a delegation block refuses it."""
+        path = spec().keys.local_config
+        for body, rc_want, verdict in ((b'{"state_dir": "/s"}\n', 0, rh.PASS),
+                                       (b'{"state_dir": "/s", "delegation": {}}\n', 1, rh.FAIL)):
+            with self.subTest(body=body):
+                sha = hashlib.sha256(body).hexdigest()
+                found = hs.hk.verify_unsigned_start(spec().keys, (path, sha), lambda p, b=body: b)
+                self.assertEqual([c.result for c in found], [rh.PASS, verdict])
+                rc, said = self.gate([], no_delegation=UNPATCHED,
+                                     keys={"containers": [], "live": (path, sha), "read_bytes_": lambda p, b=body: b})
+                self.assertEqual(rc, rc_want, said)
 
     def test_the_recovery_window_is_part_of_the_start_check(self):
         bad = [rh.check("the recovery window is below the horizon", rh.Fact("h", 30, "a test"), 30, "lower it",

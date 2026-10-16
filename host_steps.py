@@ -2196,16 +2196,34 @@ def _approved_name_of(raw):
     return name if isinstance(name, str) and _NAME.fullmatch(name) else None
 
 
-def _back_out(name, kept, pre_sha=None):
+#: The post-place back-out, in order: the start is gated on the HOST file
+#: carrying no delegation, never on its sha256 alone.
+POST_PLACE_BACK_OUT = ("install (read its diff); install --apply, which must exit 0; the host's live config file, "
+                       "not the container's view, must parse as a JSON object with no delegation member (if it "
+                       "carries one, or cannot be read or parsed, stop: the activated config may still be in "
+                       "place); compare its sha256 with the pre-activation one; then docker stop and docker start "
+                       "the local router")
+
+
+def _back_out(name, kept, pre_sha=None, live_delegation=False):
     """What brings the local router back after a prospective run that did
-    not pass: it was stopped for A2, and its live config is the unchanged
-    pre-activation one. A kept run's remedy comes first."""
+    not pass. A start is named only when THIS run's G1 read the live config
+    and found no delegation (`pre_sha` set): it was stopped for A2 on that
+    config. G1 finding a delegation is the state after A3's place, whose
+    back-out is install's, never a start; a run refused before G1 read
+    nothing, so it names no start either. A kept run's remedy comes first."""
+    if live_delegation:
+        return ("back-out: the live config carries delegation, so do not start the local router on it; this is "
+                f"the state after A3's place, and its back-out is, in order: {POST_PLACE_BACK_OUT}")
+    if not pre_sha:
+        return ("back-out: this run did not read the live config, so it names no start; before starting the "
+                "local router, read the host's live config: it must parse as a JSON object with no delegation "
+                f"member, else back out in order: {POST_PLACE_BACK_OUT}")
     start = f"docker start {name}" if name else "docker start <the local router's container>"
-    sha = f" (its sha256 {pre_sha})" if pre_sha else ""
     if kept:
         return (f"back-out: first follow the remedy printed for {', '.join(kept)} (kept: an effect is not shown "
                 f"done), then {start}")
-    return f"back-out: the local router was stopped for A2 and its live config is unchanged{sha}: {start}"
+    return f"back-out: the local router was stopped for A2 and its live config is unchanged (its sha256 {pre_sha}): {start}"
 
 
 def _prospective_refusal(efd, host, values, approved, recovery, docker, exec_root, seen):
@@ -2236,7 +2254,10 @@ def _prospective_refusal(efd, host, values, approved, recovery, docker, exec_roo
             os.close(cfd)
     except (OSError, ValueError, UnicodeDecodeError, Tooling) as e:
         return f"the live config cannot be read: {e}", False
-    if not isinstance(doc, dict) or "delegation" in doc:
+    if not isinstance(doc, dict):
+        return "the live config is not a JSON object", False
+    if "delegation" in doc:
+        seen["live_delegation"] = True
         return "A2 is pre-activation: the live config already carries delegation", False
     seen["pre_activation_sha256"] = hashlib.sha256(raw).hexdigest()
     engine = _Engine(docker, values["engine"], exec_root)
@@ -2404,11 +2425,7 @@ def partition_weekly(exec_root, host, document, sha256, activation, activation_s
                 said.append(f"{rid}: A2 passed; its evidence carries the token for A3 "
                             f"({passed['why']}); no stop target is recorded before activation")
                 said.append(f"pre-activation live config sha256 {rec['pre_activation_sha256']}: keep it beside A3's "
-                            "place. After that place the back-out is, in order: install (read its diff); install "
-                            "--apply, which must exit 0; the host's live config file, not the container's view, must "
-                            "parse as a JSON object with no delegation member (if it carries one, or cannot be read "
-                            "or parsed, stop: the activated config may still be in place); compare its sha256 with "
-                            "this one; then docker stop and docker start the local router")
+                            f"place. After that place the back-out is, in order: {POST_PLACE_BACK_OUT}")
             elif code == EXIT_PASS:
                 why = _verified_target(_Engine(docker, values["engine"], run_dir), passed, values)
                 if why:
@@ -2493,7 +2510,8 @@ def partition_weekly(exec_root, host, document, sha256, activation, activation_s
             publish()
         final = _status(code) if rec["status"] else code
         if prospective and final != EXIT_PASS and not rec.get("router_up"):
-            said.append(_back_out(rec.get("router_name"), sorted(rec["kept"]), rec.get("pre_activation_sha256")))
+            said.append(_back_out(rec.get("router_name"), sorted(rec["kept"]), rec.get("pre_activation_sha256"),
+                                  rec.get("live_delegation", False)))
         return final
     finally:
         for s in said:

@@ -1145,7 +1145,7 @@ def host_view(spec: Spec) -> Any:
         real, st, raw = hk.open_resolved(spec.keys.local_config)
         boot = open("/proc/sys/kernel/random/boot_id").read().strip() if sys.platform == "linux" else None
         fs = hk.mount_fstype(real, hk.read_mountinfo()) if sys.platform == "linux" else None
-    except OSError as e:
+    except (OSError, ValueError) as e:
         return rh.Unresolved(f"cannot inspect {spec.keys.local_config} or the host's kernel: {e}")
     return {"kind": spec.supervision.kind if spec.supervision is not None else None, "platform": sys.platform,
             "boot_id": boot, "fstype": fs, "dev": st.st_dev, "ino": st.st_ino, "ctime_ns": st.st_ctime_ns,
@@ -1449,7 +1449,7 @@ def start_checks(spec: Spec, *, lstat: Callable = os.lstat, digest: Callable[[st
         live = k.get("live", hk.ASK)
         if live is hk.ASK:
             live = hk.ask_live_config(spec, hk.local_container(spec, spec.keys))
-        out += hk.verify_no_delegation(spec.keys, live, k.get("read_bytes_", hk.read_bytes))
+        out += hk.verify_unsigned_start(spec.keys, live, k.get("read_bytes_", hk.read_bytes))
         out += hk.verify_evidence_dir(spec.keys, lstat)
         out += hk.verify_evidence_binds(spec.keys, hk.ask_containers(spec) if k.get("containers", hr.ASK)
                                         is hr.ASK else k["containers"])

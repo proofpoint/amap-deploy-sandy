@@ -1,8 +1,8 @@
 """The local router's signing key on a hub-link host, kept out of the email
-router's reach; the guard that keeps any `delegation` block out of the local
-router's config; and the D7 file as each running router sees it. NOTHING
-HERE GENERATES, READS OR COPIES KEY MATERIAL: the key is generated on the
-host by the operator, and every check of it is `lstat`.
+router's reach; the checks on the local router's `delegation` block; and
+the D7 file as each running router sees it. NOTHING HERE GENERATES, READS
+OR COPIES KEY MATERIAL: the key is generated on the host by the operator,
+and every check of it is `lstat`.
 
 The host-setup document's `keys` section (it needs a `hub` section) names:
 - `dir` and `file`: where the key lives. The directory is the local
@@ -20,9 +20,11 @@ The host-setup document's `keys` section (it needs a `hub` section) names:
 - `local_config`: the file the local router reads its config from. On a hop
   host, install refuses any path but the router.json it renders, and verify
   asks the running local router, from inside its container, which file its
-  `ROUTER_CONFIG` names and that file's sha256. A delegation block here
-  fails; its absence passes only when the router reads this file, byte for
-  byte.
+  `ROUTER_CONFIG` names and that file's sha256. verify holds a delegation
+  block to the policy, the harness gate and the activation
+  (`verify_signing`); the hub-link router's start gate refuses any block
+  (`verify_unsigned_start`). Either passes only when the router reads this
+  file, byte for byte.
 
 The key-read probe runs the email router's own rendered run spec with only
 these changes: removed after `run`, no network, its own name and labels, no
@@ -836,14 +838,10 @@ def ask_status(spec: Any, container: str) -> Any:
     return doc if isinstance(doc, dict) else rh.Unresolved(f"{container}'s status.json is not an object")
 
 
-def verify_no_delegation(ks: KeySpec, live: Any = None,
-                         read_bytes_: Callable[[str], bytes] = read_bytes, signing: Optional[Signing] = None
-                         ) -> List[rh.Check]:
-    """The local router reads `local_config`, byte for byte (`live`, from
-    inside its container), and signs exactly as the policy and the gate
-    allow (`verify_signing`). One read of the file is both hashed and
-    judged, so the decision is about the bytes the binding compared."""
-    out: List[rh.Check] = []
+def _bind(ks: KeySpec, live: Any, read_bytes_: Callable[[str], bytes]) -> Tuple[Any, rh.Check]:
+    """One read of `local_config` (its bytes, or an Unresolved) and the
+    check that the running local router reads it byte for byte (`live`,
+    from inside its container)."""
     bind_claim = f"the local router reads {ks.local_config}, byte for byte the host's copy"
     try:
         raw: Any = read_bytes_(ks.local_config)
@@ -858,13 +856,50 @@ def verify_no_delegation(ks: KeySpec, live: Any = None,
     bind_remedy = (f"start the local router with docker/run.sh --config {ks.local_config}, the file install "
                    "renders, and never a copy")
     if isinstance(host_sha, rh.Unresolved):
-        bind = rh.unknown(bind_claim, bind_want, host_sha.reason, "render and place the local router's config")
-    elif live is None or isinstance(live, rh.Unresolved):
-        bind = rh.unknown(bind_claim, bind_want, live.reason if live is not None else "the local router was "
-                          "not asked", "start the local router, or make the engine answer")
-    else:
-        bind = rh.check(bind_claim, bind_want, tuple(live), bind_remedy,
-                        do_not="never point keys.local_config at the file the router happens to read")
+        return raw, rh.unknown(bind_claim, bind_want, host_sha.reason, "render and place the local router's config")
+    if live is None or isinstance(live, rh.Unresolved):
+        return raw, rh.unknown(bind_claim, bind_want, live.reason if live is not None else "the local router was "
+                               "not asked", "start the local router, or make the engine answer")
+    return raw, rh.check(bind_claim, bind_want, tuple(live), bind_remedy,
+                         do_not="never point keys.local_config at the file the router happens to read")
+
+
+def verify_unsigned_start(ks: KeySpec, live: Any = None,
+                          read_bytes_: Callable[[str], bytes] = read_bytes) -> List[rh.Check]:
+    """The hub-link router's start gate: the local router reads
+    `local_config`, byte for byte, and that file carries no delegation
+    block. It reads no policy, gate, record or status, so it decides on a
+    host where none is readable; a delegation block, whatever approved it,
+    refuses the start."""
+    raw, bind = _bind(ks, live, read_bytes_)
+    claim = f"the local router's config {ks.local_config} has no {DELEGATION_KEY} block"
+    want = _fact("delegation", False, "the hub-link router starts only beside a local router that signs nothing")
+    remedy = f"render the config again with install --apply, which renders no {DELEGATION_KEY} member"
+    if isinstance(raw, rh.Unresolved):
+        return [bind, rh.unknown(claim, want, raw.reason, "render and place the local router's config")]
+    try:
+        doc = parse_json(raw)
+    except ValueError as e:
+        return [bind, rh.unknown(claim, want, f"{ks.local_config} is not readable JSON: {e}", "render it again")]
+    if not isinstance(doc, dict):
+        return [bind, rh.unknown(claim, want, f"{ks.local_config} is not a JSON object", "render it again")]
+    if DELEGATION_KEY in doc:
+        return [bind, rh.check(claim, want, True, remedy, do_not="never add the block by hand to test signing")]
+    if bind.result is not rh.PASS:
+        return [bind, rh.unknown(claim, want, f"the file has none, but the local router is not shown to read it: "
+                                              f"{bind.reason or 'it reads another file'}", "make the binding above pass")]
+    return [bind, rh.check(claim, want, False, remedy)]
+
+
+def verify_no_delegation(ks: KeySpec, live: Any = None,
+                         read_bytes_: Callable[[str], bytes] = read_bytes, signing: Optional[Signing] = None
+                         ) -> List[rh.Check]:
+    """The local router reads `local_config`, byte for byte (`live`, from
+    inside its container), and signs exactly as the policy and the gate
+    allow (`verify_signing`). One read of the file is both hashed and
+    judged, so the decision is about the bytes the binding compared."""
+    out: List[rh.Check] = []
+    raw, bind = _bind(ks, live, read_bytes_)
     out.append(bind)
     sg = signing or Signing(policy_on=rh.Unresolved("the policy was not read"),
                             gate_ok=rh.Unresolved("the harness gate was not read"),

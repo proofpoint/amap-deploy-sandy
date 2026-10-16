@@ -543,6 +543,14 @@ class ProspectiveActTest(unittest.TestCase):
         self.act()
         self.assertEqual(self.kinds()[-1], "stop_not_attempted")
 
+    def test_an_engine_that_cannot_say_about_the_certified_target_is_never_stop_not_required(self):
+        """The certified identity cannot be inspected while nothing runs
+        under the local router's name: the stop is still owed."""
+        self.router.inspect_error = "no engine"
+        self.act(identity=ID)
+        self.assertEqual(self.kinds(), ["rewrite_ok", "stop_not_attempted"])
+        self.assertEqual(self.incident().pending(), ["stop"])
+
     def test_a_live_removal_anywhere_in_the_history_keeps_the_stop_pending(self):
         """The child removed a live delegation (a bare rewrite_ok);
         the next act observes none, and still may not call the stop needless."""

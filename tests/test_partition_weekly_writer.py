@@ -408,7 +408,7 @@ class Host:
             f.write(data)
         os.chmod(p, 0o444)
 
-    def abandoned(self, rid, verdicts=None, target=TARGET, engine=None, docker=None, expect=True):
+    def abandoned(self, rid, verdicts=None, target=TARGET, engine=None, docker=None, expect=True, mode="weekly"):
         """A run a dead writer and child left: its records as they wrote
         them, started a minute ago, and its evidence if `verdicts`."""
         run = f"{self.exec}/run-{rid}"
@@ -417,7 +417,7 @@ class Host:
         records = {"context.json": {"schema": pr.CONTEXT_SCHEMA, "run_id": rid, "host": "alpha", "started_at": at,
                                     "evidence_dir": self.ev, "live_config_path": self.conf,
                                     "router_container_id": target, "engine": engine or "unix://" + self.sock_path,
-                                    "docker": docker or self.docker, "mode": "weekly"}}
+                                    "docker": docker or self.docker, "mode": mode}}
         if expect:
             records["expect.json"] = {"schema": pr.EXPECT_SCHEMA, "run_id": rid, "host": "alpha", "bindings": B}
         for n, doc in records.items():
@@ -1251,6 +1251,103 @@ class ActTest(InProcess):
                     self.assertEqual(json.loads(f.read().splitlines()[-1])["event"], "stop_failed")
 
 
+class ModeActTest(InProcess):
+    """_act's eligibility for stop_not_required: a prospective run's only,
+    and only when the engine AFFIRMS that neither the certified target nor
+    anything under the local router's name runs."""
+
+    def setUp(self):
+        super().setUp()
+        self.ev, self.conf = f"{self.d}/ev", f"{self.d}/conf/router.json"
+        os.mkdir(self.ev, 0o755)
+        os.chmod(self.ev, 0o755)
+        os.mkdir(f"{self.d}/conf", 0o755)
+        with open(self.conf, "w") as f:
+            f.write('{"state_dir": "/s"}\n')                       # observed: no delegation
+
+    def kinds(self, target, states, mode, named):
+        said = []
+        hs._act(self.ev, self.conf, target, "r1", "2026-10-15T03:00:00Z", ["P03"], Engine(states), said, mode=mode,
+                router_running=lambda: named)
+        with open(f"{self.ev}/incident-r1/events.jsonl") as f:
+            return [json.loads(l) for l in f]
+
+    def test_a_weekly_act_never_records_stop_not_required(self):
+        """The config observed clean, no target, nothing under the name:
+        still a weekly run's stop that was not attempted."""
+        events = self.kinds(None, [], hs.MODES[0], False)
+        self.assertEqual([e["event"] for e in events], ["rewrite_ok", "stop_not_attempted"])
+        self.assertEqual(events[0].get("observed"), hs.NO_DELEGATION)
+
+    def test_an_engine_that_cannot_say_about_the_local_router_is_never_not_required(self):
+        events = self.kinds(None, [], hs.MODES[1], None)
+        self.assertEqual([e["event"] for e in events], ["rewrite_ok", "stop_not_attempted"])
+        self.assertIn("cannot say whether the local router runs", events[-1]["reason"])
+
+    def test_an_engine_that_cannot_say_about_the_target_is_never_not_required(self):
+        events = self.kinds(TARGET, [None], hs.MODES[1], False)
+        self.assertEqual([e["event"] for e in events], ["rewrite_ok", "stop_not_attempted"])
+        self.assertIn("cannot say whether it runs", events[-1]["reason"])
+
+    def test_affirmed_absence_on_both_is_not_required(self):
+        events = self.kinds(TARGET, [False], hs.MODES[1], False)
+        self.assertEqual([e["event"] for e in events], ["rewrite_ok", "stop_not_required"])
+
+
+class DecideModeTest(InProcess):
+    """The parent's decision for an abandoned run reads ITS context's mode:
+    stop_not_required closes a prospective run's incident only, and only
+    over a history whose every rewrite observed no delegation."""
+
+    RID = "wold"
+
+    def setUp(self):
+        super().setUp()
+        self.h = Host(self.d)
+        self.addCleanup(self.h.sock.close)
+        with open(self.h.conf, "w") as f:
+            f.write('{"state_dir": "/s"}\n')
+        self.h.containers({TARGET: True})
+
+    def decide(self, mode, history):
+        self.h.abandoned(self.RID, FAIL3, mode=mode)
+        d = f"{self.h.ev}/incident-{self.RID}"
+        os.mkdir(d, 0o755)
+        det = {"run_id": self.RID, "at": "x", "failing": ["P03"], "pending": ["rewrite", "stop"]}
+        with open(f"{d}/detected.json", "wb") as f:
+            f.write(pe.canonical(dict(det, **({"mode": mode} if mode == hs.MODES[1] else {}))))
+        with open(f"{d}/events.jsonl", "w") as f:
+            f.write("".join(json.dumps(dict(e, at="x")) + "\n" for e in history))
+        said = []
+        efd = os.open(self.h.exec, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            got = hs._decide(efd, f"run-{self.RID}",
+                             {"engine": "unix://" + self.h.sock_path, "docker": self.h.docker, "exec_root": self.h.exec},
+                             said)
+        finally:
+            os.close(efd)
+        return got, "\n".join(said)
+
+    OBSERVED = {"event": "rewrite_ok", "observed": hs.NO_DELEGATION}
+    NOT_REQUIRED = {"event": "stop_not_required", "reason": "r"}
+
+    def test_a_prospective_run_s_closed_incident_is_done_for_an_ordinary_run_too(self):
+        got, said = self.decide(hs.MODES[1], [self.OBSERVED, self.NOT_REQUIRED])
+        self.assertEqual(got, (hs.EXIT_INCIDENT, None, False), said)
+        self.assertIn("already shows every effect done", said)
+        self.assertEqual(self.h.stops(), [])
+
+    def test_stop_not_required_never_closes_a_weekly_run_s_incident(self):
+        got, said = self.decide(hs.MODES[0], [self.OBSERVED, self.NOT_REQUIRED])
+        self.assertNotIn("already shows every effect done", said)
+        self.assertEqual(self.h.stops(), [TARGET])
+
+    def test_a_history_with_a_live_removal_is_never_closed_by_stop_not_required(self):
+        got, said = self.decide(hs.MODES[1], [{"event": "rewrite_ok"}, self.OBSERVED, self.NOT_REQUIRED])
+        self.assertNotIn("already shows every effect done", said)
+        self.assertEqual(self.h.stops(), [TARGET])
+
+
 class EngineTest(unittest.TestCase):
     """_Engine.running against a recorded docker: an answer only when the
     engine affirms one."""
@@ -1762,6 +1859,45 @@ class ProspectiveWriterTest(unittest.TestCase):
         sha = hashlib.sha256(open(self.h.conf, "rb").read()).hexdigest()
         self.assertIn(f"back-out: the local router was stopped for A2 and its live config is unchanged "
                       f"(its sha256 {sha}): docker start {self.NAME}", p.stdout + p.stderr)
+
+    def test_g1_refusing_a_live_delegation_names_no_start_on_it(self):
+        """[1] stopped and the live config carrying delegation is the state
+        after A3's place: the back-out is install's, gated on the host file,
+        and never "unchanged: docker start"."""
+        with open(self.h.conf, "w") as f:
+            f.write(json.dumps({"state_dir": "/s", "delegation": {}}, indent=2) + "\n")
+        p = self.run_a2()
+        out = p.stdout + p.stderr
+        self.assertEqual(p.returncode, hs.EXIT_HANDOFF, out)
+        self.assertNotIn("unchanged", out)
+        self.assertNotIn(f"docker start {self.NAME}", out)
+        self.assertIn("do not start the local router on it", out)
+        self.assertIn("must parse as a JSON object with no delegation member", out)
+
+    def test_a_refusal_before_g1_read_the_config_names_no_start(self):
+        """A1's record for another host, a live config that is not an
+        object, or a refusal before the guards: nothing showed the live
+        config is pre-activation, so nothing says it is unchanged."""
+        def other_host():
+            self.h.activation(pe.canonical({"spec": {"name": self.NAME}, "host": "beta",
+                                            "final_config_path": self.h.conf}))
+
+        def not_an_object():
+            with open(self.h.conf, "w") as f:
+                f.write("[]\n")
+        for label, arrange, argv in (("another host's A1", other_host, None),
+                                     ("not an object", not_an_object, None),
+                                     ("A1's digest wrong", lambda: None, dict(activation_digest="0" * 64))):
+            with self.subTest(label):
+                self.setUp()
+                arrange()
+                p = subprocess.run(self.h.argv(**(argv or {})) + ["--prospective"], capture_output=True, text=True,
+                                   timeout=120)
+                out = p.stdout + p.stderr
+                self.assertNotEqual(p.returncode, hs.EXIT_PASS, out)
+                self.assertNotIn("unchanged", out)
+                self.assertNotIn(f"docker start {self.NAME}", out)
+                self.assertIn("did not read the live config, so it names no start", out)
 
     def test_a_refusal_with_the_router_running_prints_no_start(self):
         self.h.containers({self.NAME: True})

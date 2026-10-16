@@ -256,6 +256,20 @@ class AdoptionTest(unittest.TestCase):
         self.assertEqual(result, rh.UNKNOWN)
         self.assertIn("replaced inode, or one changed", why)
 
+    def test_the_same_unlisted_filesystem_on_both_sides_is_unknown(self):
+        """A VM share reports one type on both sides (virtiofs, measured on
+        a sandbox's own config path); agreement never qualifies a type."""
+        for fs in ("virtiofs", "tmpfs", "overlay", "fuse.example", "nfs", "9p", "zfs"):
+            with self.subTest(fstype=fs):
+                result, why = self.run_it([dict(self.a(), fstype=fs)], [], host=lambda fs=fs: self.view(fstype=fs))
+                self.assertEqual(result, rh.UNKNOWN)
+                self.assertIn(f"{fs!r} on the host and {fs!r} in the container", why)
+        for fs in hk.LOCAL_FS:
+            with self.subTest(fstype=fs):
+                tuples = [dict(self.a(), fstype=fs), dict(self.a(), fstype=fs)]
+                self.assertEqual(self.run_it(tuples, self.polls(10, 11, 12),
+                                             host=lambda fs=fs: self.view(fstype=fs))[0], rh.PASS)
+
     def test_the_container_s_filesystem_must_be_the_host_s(self):
         result, why = self.run_it([dict(self.a(), fstype="xfs")], [])
         self.assertEqual(result, rh.UNKNOWN)
@@ -329,6 +343,16 @@ class MountinfoTest(unittest.TestCase):
         self.assertEqual(hk.mount_fstype("/my dir/r.json", self.text), "btrfs")
         self.assertEqual(hk.mount_fstype("/back\\slash/r.json", self.text), "ext4")
         self.assertEqual(hk.mount_fstype("/mnt/\u6587\u4ef6x/r.json", self.text), "ext4")    # not a component of it
+
+    def test_of_equal_mount_points_the_last_listed_is_the_one_on_top(self):
+        text = ("1 0 8:1 / / rw - ext4 a rw\n"
+                "2 1 8:2 / /srv rw - xfs b rw\n"
+                "3 2 0:9 / /srv rw - tmpfs c rw\n")
+        self.assertEqual(hk.mount_fstype("/srv/r.json", text), "tmpfs")
+        self.assertEqual(hk.mount_fstype("/srv", text, exact=True), "tmpfs")
+
+    def test_an_unescaped_mount_point_never_matches_its_escaped_spelling(self):
+        self.assertEqual(hk.mount_fstype("/my\\040dir/r.json", self.text), "ext4")
 
     def test_escaped_bytes_decode_as_a_file_name_not_as_latin_1(self):
         """mountinfo escapes bytes; two escaped bytes that are one UTF-8
