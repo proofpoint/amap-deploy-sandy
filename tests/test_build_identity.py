@@ -27,9 +27,14 @@ COMMIT = "2" * 40
 LABEL = bi.LABEL
 
 
-def container(image=DIGEST, mounts=(), started="2026-10-15T10:00:00.123456789Z", labels=None):
-    return {"Image": image, "Mounts": list(mounts), "State": {"StartedAt": started},
-            "Config": {"Labels": labels}}
+def container(image=DIGEST, mounts=(), started="2026-10-15T10:00:00.123456789Z", labels=None, running=True,
+              status="running"):
+    """A `docker inspect` container document. An exited container is still
+    inspectable, with its image: State.Running false, Status "exited"."""
+    state = {"StartedAt": started, "Status": status}
+    if running is not None:
+        state["Running"] = running
+    return {"Image": image, "Mounts": list(mounts), "State": state, "Config": {"Labels": labels}}
 
 
 def router(digest=DIGEST, commit=PIN):
@@ -62,6 +67,35 @@ class HopRouterTest(unittest.TestCase):
                 c = bi.hop_router(router(), pin, live)
                 self.assertEqual(c.check.result, rh.UNKNOWN)
         self.assertEqual(observed(bi.hop_router(router(), PIN, None)), {})
+
+
+class RunningStateTest(unittest.TestCase):
+    """docker inspect answers for an EXITED container, with its image: only
+    an affirmative State.Running says a build is running."""
+
+    def cases(self):
+        return {"exited": container(running=False, status="exited"),
+                "running unsaid": container(running=None),
+                "running not a bool": container(running="true")}
+
+    def test_a_stopped_or_unsaid_hop_router_is_unknown_with_nothing_observed(self):
+        for label, live in self.cases().items():
+            with self.subTest(label):
+                c = bi.hop_router(router(), PIN, live)
+                self.assertEqual(c.check.result, rh.UNKNOWN)
+                self.assertEqual(observed(c), {})
+        self.assertIn("exited", bi.hop_router(router(), PIN, self.cases()["exited"]).check.reason)
+
+    def test_a_stopped_or_unsaid_hub_router_is_unknown_with_nothing_observed(self):
+        for label, live in self.cases().items():
+            with self.subTest(label):
+                c = bi.hub_router("zz-hub", COMMIT, live, {LABEL: COMMIT})
+                self.assertEqual(c.check.result, rh.UNKNOWN)
+                self.assertEqual(observed(c), {})
+
+    def test_a_running_container_is_read(self):
+        self.assertEqual(bi.hop_router(router(), PIN, container()).check.result, rh.PASS)
+        self.assertEqual(bi.hub_router("zz-hub", COMMIT, container(), {LABEL: COMMIT}).check.result, rh.PASS)
 
 
 class HubRouterTest(unittest.TestCase):
@@ -212,6 +246,44 @@ class HopPluginTest(unittest.TestCase):
                      container(mounts=[self.mount()], started=self.later), None, rh.Unresolved("no docker")):
             with self.subTest(live=live):
                 self.assertEqual(self.claim(live=live).check.result, rh.UNKNOWN)
+
+    def test_a_stopped_container_is_unknown(self):
+        c = self.claim(live=container(mounts=[self.mount()], started=self.later, running=False, status="exited"))
+        self.assertEqual(c.check.result, rh.UNKNOWN)
+        self.assertNotIn("observed_sha256", c.extras())
+
+    def test_a_mount_over_the_plugin_inside_its_directory_is_unknown(self):
+        """A bind at the plugin file shadows the directory's: the host file
+        under the directory bind is not what the router loads."""
+        live = container(mounts=[self.mount(), {"Type": "bind", "Source": "/synthetic/wrong-plugin.py",
+                                                "Destination": self.path, "RW": False}], started=self.later)
+        c = bi.hop_plugin(bi.ROLE_HOP, "zz-r1", live, self.path, self.sha)
+        self.assertEqual(c.check.result, rh.UNKNOWN)
+        self.assertIn("over the plugin", c.check.reason)
+        self.assertNotIn("observed_sha256", c.extras())
+
+    def test_a_mount_beside_the_plugin_is_not_a_shadow(self):
+        live = container(mounts=[self.mount(), {"Type": "bind", "Source": "/x", "Destination": self.dir + "-other",
+                                                "RW": False}], started=self.later)
+        self.assertEqual(self.claim(live=live).check.result, rh.PASS)
+
+    def test_the_plugin_rewritten_in_place_after_the_start_is_unknown(self):
+        """An in-place overwrite leaves the directory's ctime alone; the
+        file's own ctime is what moves."""
+        start = bi.started_at(container(started=self.later))
+        real = os.lstat
+
+        def lstat(p):
+            st = real(p)
+            if p == self.path:
+                return os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, st.st_uid, st.st_gid,
+                                       st.st_size, st.st_atime, st.st_mtime, start + 10))
+            return st
+        c = bi.hop_plugin(bi.ROLE_HOP, "zz-r1", container(mounts=[self.mount()], started=self.later),
+                          self.path, self.sha, lstat=lstat)
+        self.assertEqual(c.check.result, rh.UNKNOWN)
+        self.assertEqual(c.check.reason, "the plugin file changed after the container started")
+        self.assertNotIn("observed_sha256", c.extras())
 
     def test_started_at_keeps_the_fraction(self):
         self.assertEqual(bi.started_at(container(started="1970-01-01T00:00:01.5Z")), 1.5)
@@ -425,6 +497,60 @@ class InstallAndVerifyTest(unittest.TestCase):
         out = self.prov.build_identity_outcome(SimpleNamespace(overlay=bad), self.home)
         self.assertEqual(out.phase_extras["deployed_roles"], [bi.ROLE_HOP, bi.ROLE_HUB])
         self.assertEqual([c.result for c in out.checks], [rh.UNKNOWN, rh.UNKNOWN])
+
+    def hub_spec(self):
+        """A host whose hub is reached through `sudo -n docker`: the shape
+        build_identity_outcome reads (no hop router, no plugin pin)."""
+        secrets = SimpleNamespace(principal="zz-hub-principal", image="zz-hub:recorded", image_commit=COMMIT,
+                                  docker_via_sudo=True, tools={"sudo": "/zz/sudo", "docker": "/zz/docker"})
+        return SimpleNamespace(router=None, hub=object(), secrets=secrets, overlay_path=None, overlay_pin=None,
+                               runtime_of=lambda principal: {"container": "zz-hub"})
+
+    def patch(self, obj, name, value):
+        real = getattr(obj, name)
+        setattr(obj, name, value)
+        self.addCleanup(setattr, obj, name, real)
+
+    def test_the_hub_image_is_asked_by_the_running_image_id_through_the_hub_docker(self):
+        calls = []
+
+        def run(argv, **k):
+            calls.append(list(argv))
+            if "image" in argv:
+                return rh.Proc(tuple(argv), 0, json.dumps({LABEL: COMMIT}), "")
+            return rh.Proc(tuple(argv), 0, json.dumps([container(image=OTHER)]), "")
+        self.patch(self.prov, "_builds_spec", lambda overlay: self.hub_spec())
+        self.patch(rh, "run", run)
+        self.patch(self.cpin, "pinned_commit", lambda *a, **k: PIN)
+        out = self.prov.build_identity_outcome(SimpleNamespace(overlay=None), self.home)
+        prefix = ["/zz/sudo", "-n", "/zz/docker"]
+        self.assertEqual(calls, [prefix + ["inspect", "--type", "container", "zz-hub"],
+                                 prefix + ["image", "inspect", "--format", "{{json .Config.Labels}}", OTHER]])
+        self.assertEqual([(e["id"], c.result) for e, c in zip(out.extras, out.checks)], [(bi.ID_HUB, rh.PASS)])
+
+
+class VerifyTailTest(unittest.TestCase):
+    """run_verify's last read (router_phases): the runtime-builds phase
+    reaches both the --host-facts outcomes and verify's problem lines, the
+    one surface its exit code is computed from."""
+
+    def setUp(self):
+        import amap_sandy as prov
+        self.prov = prov
+        self.builds = bi.Phase([bi.hub_router("zz-hub", COMMIT, None, {})], [bi.ROLE_HUB]).outcome()
+        for obj, name, value in ((rh, "Ctx", lambda args, home: SimpleNamespace(warnings=[])),
+                                 (rh, "run_sections", lambda ctx: []),
+                                 (prov, "build_identity_outcome", lambda args, home: self.builds)):
+            real = getattr(obj, name)
+            setattr(obj, name, value)
+            self.addCleanup(setattr, obj, name, real)
+
+    def test_an_unknown_build_is_a_runtime_builds_problem_and_in_the_document(self):
+        facts = self.prov.HostFacts()
+        _ctx, _outcomes, lines = self.prov.router_phases(SimpleNamespace(), Path("."), facts)
+        self.assertEqual(facts.outcomes, [self.builds])
+        self.assertTrue(lines)
+        self.assertTrue(all(line.startswith("runtime builds") for line in lines), lines)
 
 
 if __name__ == "__main__":

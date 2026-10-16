@@ -82,22 +82,40 @@ def _fact(name: str, value: Any, provenance: str) -> rh.Fact:
     return rh.Fact(name, value, provenance)
 
 
+def _not_running(live: Any, who: str) -> Optional[str]:
+    """Why `live` is not an affirmatively RUNNING container, or None. docker
+    inspect answers for an exited container too, with its image; only
+    State.Running true says a build is running now."""
+    state = live.get("State") if isinstance(live, dict) else None
+    running = state.get("Running") if isinstance(state, dict) else None
+    if running is True:
+        return None
+    if running is False:
+        status = state.get("Status") if isinstance(state, dict) else None
+        return f"{who} is not running (docker reports it {status or 'stopped'}), so no build of it is running"
+    return f"docker inspect of {who} does not say whether it is running"
+
+
 def _running_image(live: Any, who: str) -> Any:
-    """The container's image id, or an Unresolved saying why not."""
+    """The RUNNING container's image id, or an Unresolved saying why not."""
     if isinstance(live, rh.Unresolved):
         return live
     if live is None:
         return rh.Unresolved(f"{who} is not running, so the image it runs cannot be read")
+    stopped = _not_running(live, who)
+    if stopped is not None:
+        return rh.Unresolved(stopped)
     image = live.get("Image") if isinstance(live, dict) else None
     if not isinstance(image, str) or not _DIGEST.fullmatch(image):
         return rh.Unresolved(f"docker inspect of {who} shows no image id")
     return image
 
 
-def inspect_container(docker: List[str], name: str, run: Callable[..., rh.Proc] = rh.run) -> Any:
+def inspect_container(docker: List[str], name: str, run: Optional[Callable[..., rh.Proc]] = None) -> Any:
     """The container's inspect document; None when `docker ps -a` lists no
     container by that name (absence is decided by a listing that succeeds
     and is empty, never by a daemon's error prose); else an Unresolved."""
+    run = run or rh.run       # looked up at the call, so the one run the process uses is the one asked
     try:
         p = run(docker + ["inspect", "--type", "container", name])
     except rh.CannotRun as e:
@@ -118,9 +136,10 @@ def inspect_container(docker: List[str], name: str, run: Callable[..., rh.Proc] 
         rh.Unresolved(f"docker inspect {name} printed no container")
 
 
-def image_labels(docker: List[str], image_id: str, run: Callable[..., rh.Proc] = rh.run) -> Any:
+def image_labels(docker: List[str], image_id: str, run: Optional[Callable[..., rh.Proc]] = None) -> Any:
     """The image's own Config.Labels (a dict, {} when it has none), asked by
     its id, or an Unresolved."""
+    run = run or rh.run
     try:
         p = run(docker + ["image", "inspect", "--format", "{{json .Config.Labels}}", image_id])
     except rh.CannotRun as e:
@@ -141,7 +160,10 @@ def image_labels(docker: List[str], image_id: str, run: Callable[..., rh.Proc] =
 
 def hop_router(router: Any, pin: Any, live: Any) -> Claim:
     """`router` is the document's RouterSpec; `pin` the hop pin (or an
-    Unresolved); `live` [1]'s inspect document, None, or an Unresolved."""
+    Unresolved); `live` [1]'s inspect document, None, or an Unresolved.
+    observed_commit is DIGEST-BOUND: the commit the document records for the
+    digest [1] is running, reported only when the running digest is the
+    recorded one; it is not read from the image."""
     who = f"[1] ({router.container})"
     claim = f"{who} runs its recorded image, built from the hop pin"
     remedy = ("build [1]'s image from the hop pin's commit, record its digest and that commit in the "
@@ -267,9 +289,18 @@ def hop_plugin(role: str, container: str, live: Any, overlay_path: str, pin_sha2
         return unknown(live.reason)
     if live is None:
         return unknown(f"{who} is not running, so what it mounts cannot be read")
-    hits = [m for m in live.get("Mounts") or [] if isinstance(m, dict) and m.get("Destination") == d]
+    stopped = _not_running(live, who)
+    if stopped is not None:
+        return unknown(stopped)
+    mounts = [m for m in live.get("Mounts") or [] if isinstance(m, dict)]
+    hits = [m for m in mounts if m.get("Destination") == d]
     if len(hits) != 1 or hits[0].get("Source") != d or hits[0].get("RW") is not False:
         return unknown(f"{who} does not mount {d} once, read-only and by identity, so the host's file "
+                       "is not the one it loads")
+    # The plugin sits directly in d, so the one mount that can shadow it is
+    # a bind at the file itself.
+    if any(m.get("Destination") == overlay_path for m in mounts):
+        return unknown(f"{who} mounts {overlay_path} itself, over the plugin, so the host's file under {d} "
                        "is not the one it loads")
     start = started_at(live)
     if isinstance(start, rh.Unresolved):
@@ -280,6 +311,14 @@ def hop_plugin(role: str, container: str, live: Any, overlay_path: str, pin_sha2
         return unknown(f"{d} cannot be examined: {e.strerror}")
     if not stat.S_ISDIR(st.st_mode) or st.st_ctime > start:
         return unknown("the overlay directory changed after the container started")
+    # The file itself: rewritten in place after the start, the directory's
+    # ctime does not move, and the bytes hashed now are not the ones loaded.
+    try:
+        fst = lstat(overlay_path)
+    except OSError as e:
+        return unknown(f"{overlay_path} cannot be examined: {e.strerror}")
+    if not stat.S_ISREG(fst.st_mode) or fst.st_ctime > start:
+        return unknown("the plugin file changed after the container started")
     try:
         sha = hashlib.sha256(read(overlay_path)).hexdigest()
     except OSError as e:

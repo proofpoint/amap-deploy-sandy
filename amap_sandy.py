@@ -3782,6 +3782,21 @@ def _builds_spec(overlay: Optional[Path]) -> Any:
         return rh.Unresolved(f"the host-setup document cannot be read: {e}")
 
 
+def router_phases(args: argparse.Namespace, home: Path,
+                  facts: Optional["HostFacts"]) -> Tuple[rh.Ctx, List[rh.Outcome], List[str]]:
+    """verify's last read: the router's sections and the runtime-builds
+    phase. Every outcome goes into --host-facts, and every non-passing check
+    of either is a problem line (the build phase's prefixed "runtime builds"),
+    so an UNKNOWN build never leaves verify's exit clean."""
+    rctx = rh.Ctx(args, home)
+    outcomes = rh.run_sections(rctx)
+    builds = build_identity_outcome(args, home)
+    if facts is not None:
+        facts.ctx, facts.outcomes = rctx, outcomes + [builds]
+    lines = rh.problem_lines(outcomes) + rh.problem_lines([builds], prefix="runtime builds")
+    return rctx, outcomes, lines
+
+
 def build_identity_outcome(args: argparse.Namespace, home: Path) -> rh.Outcome:
     """verify's "runtime builds" phase (build_identity): each runtime's build
     against what the deployment recorded and siblings.json pins."""
@@ -3973,13 +3988,8 @@ def run_verify(args: argparse.Namespace, servers: Dict[str, dict], home: Path,
     # THE ROUTER PROCESS, last: its container and its health, three-valued
     # (router_health). Nothing here starts it — the remedy names the
     # router's own docker/run.sh — and every UNKNOWN is a problem by name.
-    rctx = rh.Ctx(args, home)
-    outcomes = rh.run_sections(rctx)
-    builds = build_identity_outcome(args, home)
-    if facts is not None:
-        facts.ctx, facts.outcomes = rctx, outcomes + [builds]
-    problems += rh.problem_lines(outcomes)
-    problems += rh.problem_lines([builds], prefix="runtime builds")
+    rctx, outcomes, router_problems = router_phases(args, home, facts)
+    problems += router_problems
     notes += [f"router: {w}" for w in rctx.warnings]
     passed = sum(1 for o in outcomes for c in o.checks if c.result is rh.PASS)
     total = sum(len(o.checks) for o in outcomes)
