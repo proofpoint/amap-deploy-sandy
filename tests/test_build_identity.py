@@ -40,7 +40,8 @@ def container(image=DIGEST, mounts=(), started="2026-10-15T10:00:00.123456789Z",
         state["Running"] = running
     if restarting is not None:
         state["Restarting"] = restarting
-    doc = {"Id": cid, "Image": image, "Mounts": list(mounts), "State": state, "Config": {"Labels": labels}}
+    doc = {"Id": cid, "Image": image, "Mounts": list(mounts), "State": state, "Config": {"Labels": labels},
+           "HostConfig": {}}
     if created is not None:
         doc["Created"] = created
     return doc
@@ -391,6 +392,40 @@ class ReadStatusTest(unittest.TestCase):
                 self.assertIsInstance(got, rh.Unresolved)
                 self.assertIn("mounts something else at or below its state directory", got.reason)
 
+    def test_its_own_mounts_not_in_the_engines_shape_are_unknown(self):
+        Path(self.path).write_text(json.dumps({"polls": 1}))
+        ident = {"Type": "bind", "Source": self.sd, "Destination": self.sd, "RW": True}
+        for label, change in (("a row not an object", lambda c: c["Mounts"].append("x")),
+                              ("a row without a source", lambda c: c["Mounts"].append({"Destination": "/x"})),
+                              ("no HostConfig", lambda c: c.pop("HostConfig")),
+                              ("Tmpfs not an object", lambda c: c["HostConfig"].update(Tmpfs=["/x"])),
+                              ("Mounts not a list", lambda c: c.update(Mounts=None))):
+            with self.subTest(label):
+                live = container(mounts=[ident])
+                change(live)
+                got = bi.read_status(live, self.sd, "[1] (zz-r1)")
+                self.assertIsInstance(got, rh.Unresolved)
+
+    def test_a_tmpfs_at_or_below_the_state_directory_is_unknown(self):
+        """`--tmpfs` is listed in HostConfig.Tmpfs, not in Mounts."""
+        Path(self.path).write_text(json.dumps({"polls": 1}))
+        ident = {"Type": "bind", "Source": self.sd, "Destination": self.sd, "RW": True}
+        for label, path, refused in (("at it", self.sd, True), ("below it", os.path.join(self.sd, "x"), True),
+                                     ("respelled", self.sd + "/", True), ("elsewhere", "/run", False)):
+            with self.subTest(label):
+                live = container(mounts=[ident])
+                live["HostConfig"]["Tmpfs"] = {path: "rw,size=1m"}
+                got = bi.read_status(live, self.sd, "[1] (zz-r1)")
+                self.assertEqual(isinstance(got, rh.Unresolved), refused, got)
+
+    def test_a_status_document_read_in_short_chunks_is_read_whole(self):
+        doc = {"polls": 1, "pad": "x" * 50}
+        Path(self.path).write_text(json.dumps(doc))
+        real = os.read
+        os.read = lambda fd, n: real(fd, min(n, 3))
+        self.addCleanup(setattr, os, "read", real)
+        self.assertEqual(bi.read_status(self.live(), self.sd, "[1] (zz-r1)"), doc)
+
     def test_its_own_mounts_beside_or_above_the_state_directory_do_not_matter(self):
         Path(self.path).write_text(json.dumps({"polls": 1}))
         ident = {"Type": "bind", "Source": self.sd, "Destination": self.sd, "RW": True}
@@ -464,7 +499,14 @@ class ReadStatusTest(unittest.TestCase):
         got, sleeps = self.progressing([self.doc(3)])
         self.assertEqual(got.reason, "[1] (zz-r1)'s status document did not advance within 2 poll intervals, so "
                                      "it is not shown to be written by the running process")
-        self.assertEqual(sleeps, int(5.0 * bi.PROGRESS_INTERVALS / bi.PROGRESS_STEP_S))
+        self.assertEqual(sleeps, int((5.0 * bi.PROGRESS_INTERVALS + bi.PROGRESS_MARGIN_S) / bi.PROGRESS_STEP_S))
+
+    def test_polls_falling_under_the_same_start_is_unknown(self):
+        got, sleeps = self.progressing([self.doc(5), self.doc(4), self.doc(6)])
+        self.assertIsInstance(got, rh.Unresolved)
+        self.assertEqual(got.reason, "[1] (zz-r1)'s status document went back from 5 polls to 4 under the same "
+                                     "process start, so it is not one process's progress")
+        self.assertEqual(sleeps, 1)
 
     def test_an_advance_under_another_process_start_is_not_progress(self):
         got, _ = self.progressing([self.doc(3), self.doc(9, began="2026-10-15T10:00:01.000000Z")])

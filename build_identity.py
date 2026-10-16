@@ -63,10 +63,12 @@ STATUS_NAME = "status.json"
 MAX_STATUS_BYTES = 16 * 2 ** 20
 #: When the engine records no exit for a container, its status document is
 #: taken only after the reader has seen it advance: `polls` rising under the
-#: same process start, within this many of the document's own poll
-#: intervals, re-read every PROGRESS_STEP_S. A document whose interval would
-#: make that wait longer than MAX_PROGRESS_WAIT_S is not waited for.
+#: same process start, within PROGRESS_INTERVALS of the document's own poll
+#: intervals plus PROGRESS_MARGIN_S (a poll's own duration and the reader's
+#: step), re-read every PROGRESS_STEP_S. A document whose window would be
+#: longer than MAX_PROGRESS_WAIT_S is not waited for.
 PROGRESS_INTERVALS = 2
+PROGRESS_MARGIN_S = 2.0
 PROGRESS_STEP_S = 0.5
 MAX_PROGRESS_WAIT_S = 120.0
 
@@ -312,17 +314,28 @@ def read_status(live: Any, state_dir: str, who: str,
     docker/run.sh mounts it): the document, or an Unresolved. A second mount
     of the container's own at or below the state directory is refused; one
     whose Destination reaches the state directory only through a symlink
-    inside the container's image is not seen (residue)."""
-    mounts = [m for m in (live.get("Mounts") or []) if isinstance(m, dict)] if isinstance(live, dict) else []
-    hits = [m for m in mounts if m.get("Destination") == state_dir]
+    inside the container's image is not seen (residue). Every mount row must
+    carry a string Source and Destination, and a tmpfs from `--tmpfs`, which
+    the engine lists in HostConfig.Tmpfs and not in Mounts, counts as a
+    mount at its path."""
+    mounts = live.get("Mounts") if isinstance(live, dict) else None
+    host = live.get("HostConfig") if isinstance(live, dict) else None
+    tmpfs = host.get("Tmpfs") if isinstance(host, dict) else None
+    if not isinstance(mounts, list) or not isinstance(host, dict) or not isinstance(tmpfs, (dict, type(None))) \
+            or not all(isinstance(m, dict) and isinstance(m.get("Source"), str)
+                       and isinstance(m.get("Destination"), str) for m in mounts) \
+            or not all(isinstance(t, str) for t in (tmpfs or {})):
+        return rh.Unresolved(f"docker inspect of {who} does not list its mounts in the engine's shape, so "
+                             "its state directory cannot be shown to be the host's")
+    hits = [m for m in mounts if m["Destination"] == state_dir]
     if len(hits) != 1 or hits[0].get("Source") != state_dir:
         return rh.Unresolved(f"{who} does not mount its state directory {state_dir} once and by identity, "
                              "so its status document cannot be read")
     # A second mount at or below the state directory (a bind over the status
     # document itself, or a subdirectory) would send the router's writes
     # elsewhere, while the host's file under the identity mount never changes.
-    if any(m is not hits[0] and isinstance(m.get("Destination"), str) and _within(m["Destination"], state_dir)
-           for m in mounts):
+    if any(m is not hits[0] and _within(m["Destination"], state_dir) for m in mounts) \
+            or any(_within(t, state_dir) for t in (tmpfs or {})):
         return rh.Unresolved(f"{who} mounts something else at or below its state directory {state_dir}, so "
                              "the host's status document may not be the one it writes")
     path = posixpath.join(state_dir, STATUS_NAME)
@@ -353,26 +366,32 @@ def no_recorded_exit(live: Any) -> bool:
 
 def read_progressing(live: Any, state_dir: str, who: str) -> Any:
     """read_status, then again every PROGRESS_STEP_S until `polls` rises under
-    the same PROCESS_START, for at most PROGRESS_INTERVALS of the document's
-    own `interval_s`: the later document as Progressed, or an Unresolved."""
+    the same PROCESS_START, within the document's own progress window
+    (PROGRESS_INTERVALS × `interval_s` + PROGRESS_MARGIN_S): the later
+    document as Progressed, or an Unresolved. Under that start `polls` never
+    falls; a read where it does is UNKNOWN at once."""
     first = read_status(live, state_dir, who)
     if not isinstance(first, dict):
         return first
     interval, polls, began = first.get("interval_s"), first.get("polls"), first.get(PROCESS_START)
     if not isinstance(interval, (int, float)) or isinstance(interval, bool) or not 0 < interval \
-            or interval * PROGRESS_INTERVALS > MAX_PROGRESS_WAIT_S or not isinstance(polls, int) \
-            or isinstance(polls, bool):
+            or interval * PROGRESS_INTERVALS + PROGRESS_MARGIN_S > MAX_PROGRESS_WAIT_S \
+            or not isinstance(polls, int) or isinstance(polls, bool):
         return rh.Unresolved(f"{who}'s status document has no usable interval_s and polls, so its writer "
                              "cannot be seen to advance it")
-    deadline = _monotonic() + interval * PROGRESS_INTERVALS
+    deadline = _monotonic() + interval * PROGRESS_INTERVALS + PROGRESS_MARGIN_S
     while _monotonic() < deadline:
         _sleep(PROGRESS_STEP_S)
         doc = read_status(live, state_dir, who)
         if not isinstance(doc, dict):
             return doc
         later = doc.get("polls")
-        if doc.get(PROCESS_START) == began and isinstance(later, int) and not isinstance(later, bool) \
-                and later > polls:
+        if doc.get(PROCESS_START) != began or not isinstance(later, int) or isinstance(later, bool):
+            continue
+        if later < polls:
+            return rh.Unresolved(f"{who}'s status document went back from {polls} polls to {later} under the "
+                                 "same process start, so it is not one process's progress")
+        if later > polls:
             return Progressed(doc)
     return rh.Unresolved(f"{who}'s status document did not advance within {PROGRESS_INTERVALS} poll "
                          "intervals, so it is not shown to be written by the running process")
@@ -488,7 +507,12 @@ def _read_nofollow(path: str) -> bytes:
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise OSError(errno.EINVAL, "not a regular file")
-        data = os.read(fd, MAX_STATUS_BYTES + 1)
+        data = b""
+        while len(data) <= MAX_STATUS_BYTES:
+            chunk = os.read(fd, MAX_STATUS_BYTES + 1 - len(data))
+            if not chunk:
+                break
+            data += chunk
     finally:
         os.close(fd)
     if len(data) > MAX_STATUS_BYTES:
