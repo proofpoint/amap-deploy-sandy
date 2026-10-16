@@ -679,9 +679,21 @@ router.json `install` renders. Two inputs turn them on, and both are needed:
 
 Build the local router's image from the hop checkout (`siblings.json`'s
 `amap-router-local-hop` entry), under a name other than the factory
-default. Record its image ID as the `digest` (`docker image inspect
---format '{{.Id}}' <name>`: a local build has no registry digest), and the
-commit it was built from. Then:
+default. Build the image from a clean export of the pinned commit (`git -c
+core.attributesFile=/dev/null archive <pin> | tar -x -C <an empty
+directory>`, from a clone with no `$GIT_DIR/info/attributes`), never from a
+tree in which Python or the tests have run. The build copies router/ whole,
+so a stale `__pycache__` would be copied and could run in place of the
+source. Then, before A1:
+
+```sh
+python3 amap-sandy.py router-fingerprint --image <the image> --apply
+python3 amap-sandy.py router-fingerprint --verify-image <the file it wrote> --commit <the pin>
+```
+
+The check must print `EXACT`. Record the image ID as the `digest` (`docker
+image inspect --format '{{.Id}}' <name>`: a local build has no registry
+digest), and the commit it was built from. Then:
 
 ```sh
 python3 amap-sandy.py install --apply
@@ -745,7 +757,8 @@ reads as not running.
 0. **Before A1, on each host, in this order.** A2's evidence, the
    post-activation document and the key probe's record bind the approved
    document and the hub-link router's run spec. Anything that changes either
-   after activation makes them stale.
+   after activation makes them stale. The local router's image is the clean,
+   checked build above (the local router's hop link).
    1. Generate the signing key as the operator (below). The one root command
       installs the 32-byte seed. If keys.dir does not exist yet, create it
       first with the plan's own step (`install -d -o <uid> -g <gid> -m 0700
@@ -764,10 +777,13 @@ reads as not running.
    6. Run the hub key probe, and start the hub-link router on that image.
    7. Provision the weekly job's bundle once, at that deploy commit (its PIN
       is that commit, so the weekly job hands off until it is provisioned).
-   8. Make the operator a member of the hop tree's group before A1, and check
+   8. Take an early fingerprint of the running local router and match it (the
+      two commands in step 2, with `--step 0`), so that an unmeasured base
+      shows before the window.
+   9. Make the operator a member of the hop tree's group before A1, and check
       it with `id -Gn` after a fresh login: step 7's P02 reads the hop tree as
       the operator. Never chmod the hop tree.
-   9. Only then begin A1.
+   10. Only then begin A1.
 
    `secrets.writer.commit` stays at its reviewed commit. The writer's pin is
    the sha256 of `host_steps.py`, not the deploy commit: a deploy commit that
@@ -820,9 +836,52 @@ reads as not running.
    weekly argv, 7b and 7d. Run the place as root. If the live config already
    carries delegation, de-activate first (the back-out after the place,
    below).
-2. **The outage window opens.** Record `sha256sum <the live config>`, then
-   `docker stop <the local router's container>` (never a restart-policy
-   change).
+2. **The outage window opens.** First, before recording the live config's
+   sha256 and before `docker stop`, fingerprint the running local router and
+   match it:
+
+   ```sh
+   python3 amap-sandy.py router-fingerprint --step 2 --apply
+   python3 amap-sandy.py router-fingerprint --match <the file it wrote>
+   ```
+
+   - The match must print `MEASURED` and exit 0. That means:
+     - the running router's source, its process and its transport plugin are
+       what the upgrade to the pinned router was measured from
+       (`router-upgrade-bases.json`);
+     - its live config is unchanged since it started (under the clock
+       premises the tool documents);
+     - its state directory holds no peer-lane state.
+   - Then record `sha256sum <the live config>`, and stop exactly the
+     container the file names: `docker stop <its container Id>` (never a
+     restart-policy change). Do this at once: a restart in between is not
+     detected.
+   - On `UNMEASURED` or `UNKNOWN`, do not stop the router, and do not
+     continue the activation. A1's record stays inert until A3.
+     - If the reason is that the status is not yet this process's
+       (`stale_status`), wait until the router has written a poll at least
+       3 s after it started (at most 3 s plus one poll interval), then
+       fingerprint again.
+     - If the reason is that the live config changed since the router
+       started (`config_changed`), restart the router (before activation
+       that loses nothing), wait as above, and fingerprint again.
+     - If the host and the router disagree on the time (`clock_skew`), wait
+       until their clocks agree and fingerprint again. A router restart does
+       not help, because the skew is not the router's.
+     - If the router's start and the clock disagree (`pid1_age`), let the
+       host clock settle, restart the router, wait as above, and fingerprint
+       again. A healthy router whose interpreter took more than 5 s to start
+       is also refused here, and the same restart is its remedy.
+     - If the live config is not one regular file at its own path
+       (`config_identity`), relaunch the router with the config bound at its
+       own real path, as `docker/run.sh` does.
+     - Only for `no_match`, `unmeasured`, `mixed` or `peer_lane` does the
+       upgrade wait until its base is measured and recorded in
+       `router-upgrade-bases.json` in a reviewed change. That moves the
+       deploy commit, so the activation starts again at step 0. Every other
+       refusal names its own remedy.
+   - A router that is not running is `UNKNOWN`.
+   - An image capture never satisfies this step.
 3. **A2.** Immediately, as root, the printed 7b argv
    (`partition-weekly ... --prospective`). Never interrupt it: wait for its
    process to EXIT. It passes only when both fail-stop probes pass, the

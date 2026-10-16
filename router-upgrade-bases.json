@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "target": "99329945edd20adb4b8b83f025ea1ef6382456ff",
+  "measured_from": "6479a05c164b11e2ff38df08b3f93e9e0079d779",
+  "property": "for a state_dir that holds no peer-lane state (no entry named peer-* under it), no persisted-state write outside the peer lane changes between each first-parent commit in [measured_from, target] and target, so target reads all state the base wrote",
+  "peer_lane": "not measured",
+  "premises": "amap-router-local's measured property over the first-parent range [6479a05c, 99329945] (no persisted-state write is added or changed outside the peer lane, between any commit in the range and 99329945) is a property of the router package's source alone. Any image whose /app/router top-level *.py {name: git blob} map equals that of some commit C in the range behaves as C does for this property, under these premises:\n  P1. The image runs the router as amap-router-local's docker/ entrypoint does: PID 1 is `python3 -m router … run`, from WORKDIR /app, with no PYTHONPATH, PYTHONHOME or PYTHONUSERBASE, so the code executed is /app/router/*.py and the standard library (the package has no third-party dependencies);\n  P2. Under /app/router, the only subdirectory the runtime imports is none: router/tests is never imported by the runtime, and there is NO __pycache__ directory (a cached .pyc may run in place of the source);\n  P3. The transport plugin is outside this property; the stop gate checks it separately against the pinned plugin digest;\n  P4. The interpreter is CPython 3 from the image's base. The state formats depend on the package's own json/os calls, not on the interpreter's version.",
+  "measured_by": "amap-router-local's maintainers, in the review of the pull request that adds this file"
+}
