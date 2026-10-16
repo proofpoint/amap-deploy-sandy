@@ -757,6 +757,30 @@ class InstallAndVerifyTest(unittest.TestCase):
                 f.unlink()
             sd.rmdir()
 
+    def test_a_state_directory_spelled_another_way_is_still_shared(self):
+        """The engine may report a bind Source uncleaned (HAR's probe), or
+        through a symlink this host resolves."""
+        alias = str(self.home / "alias")
+
+        def symlinked(sd):
+            if not os.path.lexists(alias):
+                os.symlink(sd, alias)
+            return alias
+        spellings = {
+            "trailing slash": lambda sd: sd + "/",
+            "doubled slash": lambda sd: os.path.dirname(sd) + "//" + os.path.basename(sd),
+            "dot segment": lambda sd: os.path.dirname(sd) + "/./" + os.path.basename(sd),
+            "leading //": lambda sd: "/" + sd,
+            "symlink alias": symlinked,
+        }
+        for label, source in spellings.items():
+            with self.subTest(label):
+                self.fresh_state()
+                c, _ = self.hop_outcome(self.status_doc("2026-10-15T10:00:00.050000Z"),
+                                        others=[self.sibling(source)])
+                self.assertEqual(c.result, rh.UNKNOWN)
+                self.assertIn("another container shares", c.reason)
+
     def test_containers_mounting_elsewhere_do_not_share_it(self):
         """Beside it, or a path that only starts with the same letters:
         neither can write status.json in the state directory."""

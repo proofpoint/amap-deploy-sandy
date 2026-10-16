@@ -39,7 +39,7 @@ import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Set
 
 import router_health as rh
 
@@ -320,10 +320,20 @@ def state_sharers(docker: List[str], state_dir: str, own_id: Any,
     source is `state_dir`, a directory above it, or anything below it (a
     single-file bind of the status document itself included), so that it
     could have written the status document there: a list (empty when none),
-    or an Unresolved. Paths are compared as the engine reports them,
-    literally: the same directory spelled another way (a symlinked parent,
-    or /private/var for /var on macOS) is not matched, as read_status's
-    mount check is literal too. The router's lock keeps two routers from running at once,
+    or an Unresolved. The engine does not clean every bind Source the same
+    way (-v against --mount, and across versions), so both sides are
+    normalised ("/a/", "/a//b", "/a/./b", a leading "//") and also compared
+    with their symlinks resolved on this host. An alias this host cannot
+    resolve (a path that exists only inside the engine's VM, such as the
+    VM's own view of a shared folder) is not matched.
+
+    A sharer REMOVED before verify runs leaves no record in the engine and
+    is not found. Its document can pass only until the current process's
+    first write replaces it, within one poll interval of its start; the
+    conformance harness reads this claim at preflight and again at collect,
+    hours apart, requires both to equal its bundle and refuses a preflight
+    digest that is not the bundle's, so that window yields the same digest
+    or a void run, never a wrong pass. The router's lock keeps two routers from running at once,
     not one from running after another, so a stopped container that shares
     the directory may have left the document there. Read after the status
     document: a container created later cannot have written it."""
@@ -362,10 +372,20 @@ def state_sharers(docker: List[str], state_dir: str, own_id: Any,
     return sharers
 
 
+def _spellings(p: str) -> Set[str]:
+    """`p` normalised, and with its symlinks resolved on this host. normpath
+    keeps a leading "//"; realpath folds it, so the second spelling covers
+    it whether or not the path exists here."""
+    n = posixpath.normpath(p)
+    return {n, os.path.realpath(n)}
+
+
 def _overlaps(a: str, b: str) -> bool:
-    """Whether one path is the other or lies under it (literal paths)."""
-    a, b = a.rstrip("/") or "/", b.rstrip("/") or "/"
-    return a == b or b.startswith(a.rstrip("/") + "/") or a.startswith(b.rstrip("/") + "/")
+    """Whether one path is the other or lies under it, under any spelling
+    _spellings gives either."""
+    def under(x: str, y: str) -> bool:
+        return x == y or x.startswith(y.rstrip("/") + "/")
+    return any(under(x, y) or under(y, x) for x in _spellings(a) for y in _spellings(b))
 
 
 def _read_nofollow(path: str) -> bytes:
