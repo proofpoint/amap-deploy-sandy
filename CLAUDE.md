@@ -72,6 +72,12 @@ container that is not there is UNKNOWN, not FALSE. Absence is decided by a
 `docker ps` that succeeds and lists nothing, never by matching a daemon's
 error prose.
 
+**One exception, and only one: `verify --a5`** (A5 on a launchd host) excuses
+exactly one row, the signing check's UNKNOWN, and only when its reason equals
+`hub_keys.a5_launchd_reason(<the live token's run id>)` as a whole string
+(`host_setup.a5_expected`). That row still prints UNKNOWN, every other check
+must pass, and plain `verify` is unchanged.
+
 Absent and empty are different answers. In the host-facts document,
 `not_enrolled` is **omitted** when the lookup could not be made, and `[]`
 only when sandy genuinely excluded nothing. Merging the two turns a failed
