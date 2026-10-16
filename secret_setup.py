@@ -73,6 +73,8 @@ LOCK_FILE = "oneshot.lock"
 #: Every tool the checks run; the runbook's own tools are the document's too.
 REQUIRED_TOOLS = ("git", "docker", "python3", "ssh", "ssh-keygen")
 CLONE_ROLES = ("deploy", "overlay", "producer", "runtime")
+OPTIONAL_CLONE_ROLE = "producer"
+REQUIRED_CLONE_ROLES = set(CLONE_ROLES) - {OPTIONAL_CLONE_ROLE}
 #: The weekly probe's status: older than this is a job that did not run, and
 #: a last pass older than the second is a problem whatever the last class.
 STATUS_MAX_AGE_S = 8 * 86400
@@ -185,8 +187,12 @@ def load(sec: Any, principals: Dict[str, Any], runtimes: Sequence[Dict[str, Any]
     if not isinstance(w["commit"], str) or not _HEX40.fullmatch(w["commit"]):
         raise SecretSpecError("secrets.writer.commit must be a full commit sha")
     clones = {}
-    if not isinstance(sec["clones"], dict) or set(sec["clones"]) != set(CLONE_ROLES):
-        raise SecretSpecError(f"secrets.clones must name exactly {', '.join(CLONE_ROLES)}")
+    # The producer clone is needed only where the D7 source is read from it;
+    # a host that pins the one file instead (hub.d7.source as {path, sha256})
+    # holds no producer tree, whose commit carries secrets.
+    if not isinstance(sec["clones"], dict) or set(sec["clones"]) not in (set(CLONE_ROLES), REQUIRED_CLONE_ROLES):
+        raise SecretSpecError(f"secrets.clones must name exactly {', '.join(CLONE_ROLES)}, or all but "
+                              f"{OPTIONAL_CLONE_ROLE}")
     for role, c in sec["clones"].items():
         if role == "overlay":
             c = _exact(c, ("path",), f"clones.{role}")
@@ -523,7 +529,7 @@ def verify_clones(s: SecretSpec, lstat: Callable, read: Callable[[str], Any],
                   listdir: Callable[[str], List[str]] = os.listdir) -> List[rh.Check]:
     out = []
     anchored = anchor_sha(s, read)
-    for role in CLONE_ROLES:
+    for role in (r for r in CLONE_ROLES if r in s.clones):
         path = s.clones[role]["path"]
         why = f"the {role} clone: code or pins the operator runs with docker or root authority"
         st = _lst(path, lstat)
