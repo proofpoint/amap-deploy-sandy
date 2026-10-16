@@ -32,6 +32,16 @@ ENGINE = "unix:///zz/run/docker.sock"
 LABEL = bi.LABEL
 
 
+def write_atomically(path, text):
+    """The way the routers write their status documents: a sibling temporary
+    file, then os.replace, so a reader never sees a truncated file. The
+    reader rows' delayed writes use it, so a read between a truncation and a
+    write cannot fail them."""
+    tmp = path + ".tmp"
+    Path(tmp).write_text(text)
+    os.replace(tmp, path)
+
+
 def container(image=DIGEST, mounts=(), started="2026-10-15T10:00:00.123456789Z", labels=None, running=True,
               status="running", restarting=False, cid="1d" * 32, created="2026-10-15T09:59:59.900000000Z",
               finished="0001-01-01T00:00:00Z"):
@@ -647,18 +657,21 @@ class HubReaderTest(unittest.TestCase):
         return {"progress": progress, "interval_s": interval, "process_started_ts": began}
 
     def later(self, delay, doc):
-        timer = threading.Timer(delay, lambda: Path(self.path).write_text(json.dumps(doc)))
+        timer = threading.Timer(delay, lambda: write_atomically(self.path, json.dumps(doc)))
         timer.start()
         self.addCleanup(timer.cancel)
 
     def test_an_advance_is_taken_with_the_observations_before_it(self):
-        Path(self.path).write_text(json.dumps(self.doc(3)))
-        self.later(0.15, self.doc(4))
+        # Every delayed write below lands at the middle of a two-second
+        # window (a one-second interval), so the reader's start-up and its
+        # deadline each have about a second of slack, under load too.
+        Path(self.path).write_text(json.dumps(self.doc(3, interval=1.0)))
+        self.later(1.0, self.doc(4, interval=1.0))
         p, _ = self.run_reader()
         self.assertEqual(p.returncode, 0, p.stderr)
         out = json.loads(p.stdout)
-        self.assertEqual((out["first"], out["taken"]), (self.doc(3), self.doc(4)))
-        self.assertTrue(all(e == ["2026-10-15T10:00:00.050000Z", 0.2, 3] for e in out["between"]))
+        self.assertEqual((out["first"], out["taken"]), (self.doc(3, interval=1.0), self.doc(4, interval=1.0)))
+        self.assertTrue(all(e == ["2026-10-15T10:00:00.050000Z", 1.0, 3] for e in out["between"]))
 
     def test_a_document_that_never_rises_ends_within_its_window_and_one_step(self):
         """The window is shrunk through the reader's literal argument; the
@@ -680,18 +693,19 @@ class HubReaderTest(unittest.TestCase):
         ends at the deadline, so the only re-read completes after it; the
         rise it sees is discarded. The row that kills "the reader counts a
         read after its deadline"."""
-        Path(self.path).write_text(json.dumps(self.doc(3, interval=0.1)))
-        self.later(0.05, self.doc(4, interval=0.1))
+        Path(self.path).write_text(json.dumps(self.doc(3, interval=1.0)))
+        self.later(1.0, self.doc(4, interval=1.0))
         p, _ = self.run_reader(step=5.0, margin=0.0)
         self.assertEqual((p.returncode, json.loads(p.stdout)["taken"]), (0, None))
 
     def test_the_reader_stops_at_a_drop_too(self):
         """Opus R2: a lower count ends the reader's wait and is taken; the
         host then refuses it."""
-        # A one-second interval gives a two-second window, far wider than
-        # the 0.3 s before the drop is written, so the row does not race.
+        # A one-second interval gives a two-second window; the drop is
+        # written at its middle, so the reader's start-up and its deadline
+        # each have about a second of slack.
         Path(self.path).write_text(json.dumps(self.doc(5, interval=1.0)))
-        self.later(0.3, self.doc(4, interval=1.0))
+        self.later(1.0, self.doc(4, interval=1.0))
         p, _ = self.run_reader()
         out = json.loads(p.stdout)
         self.assertEqual((p.returncode, out["taken"]), (0, self.doc(4, interval=1.0)))
@@ -701,8 +715,8 @@ class HubReaderTest(unittest.TestCase):
         """Opus R5: a rise after 2 × interval_s but within the margin is
         taken."""
         Path(self.path).write_text(json.dumps(self.doc(3, interval=0.1)))
-        self.later(0.5, self.doc(4, interval=0.1))
-        p, _ = self.run_reader(margin=1.0)
+        self.later(1.0, self.doc(4, interval=0.1))
+        p, _ = self.run_reader(margin=2.0)
         self.assertEqual((p.returncode, json.loads(p.stdout)["taken"]), (0, self.doc(4, interval=0.1)))
 
     def test_a_first_document_not_admitted_exits_10_before_any_wait(self):
@@ -731,12 +745,13 @@ class HubReaderTest(unittest.TestCase):
 
     def test_a_later_document_not_admitted_exits_10(self):
         cases = {"not an object": [4], "no interval": {"progress": 4, "process_started_ts": "2026-10-15T10:00:00.05Z"},
-                 "progress a bool": dict(self.doc(4), progress=True), "interval changed": self.doc(4, interval=0.3),
-                 "another start": self.doc(4, began="2026-10-15T10:00:01.000000Z")}
+                 "progress a bool": dict(self.doc(4, interval=1.0), progress=True),
+                 "interval changed": self.doc(4, interval=0.3),
+                 "another start": self.doc(4, interval=1.0, began="2026-10-15T10:00:01.000000Z")}
         for label, later in cases.items():
             with self.subTest(label):
-                Path(self.path).write_text(json.dumps(self.doc(3)))
-                self.later(0.1, later)
+                Path(self.path).write_text(json.dumps(self.doc(3, interval=1.0)))
+                self.later(1.0, later)
                 p, _ = self.run_reader()
                 self.assertEqual((p.returncode, p.stdout), (10, ""))
 
@@ -818,7 +833,7 @@ class StrictAdmissionTest(unittest.TestCase):
             path = os.path.join(d, bi.HUB_STATUS_NAME)
             Path(path).write_text(json.dumps(docs[0]))
             if len(docs) > 1:
-                timer = threading.Timer(0.1, lambda: Path(path).write_text(json.dumps(docs[1])))
+                timer = threading.Timer(1.0, lambda: write_atomically(path, json.dumps(docs[1])))
                 timer.start()
                 self.addCleanup(timer.cancel)
             p = subprocess.run([sys.executable, "-I", "-S", "-c", bi.HUB_READER, path, "0.05", "0.0", "5.0",
@@ -829,7 +844,7 @@ class StrictAdmissionTest(unittest.TestCase):
             return p
 
     def test_the_reader_exits_10_on_an_impossible_start_or_a_huge_interval(self):
-        good = {"progress": 3, "interval_s": 0.2, "process_started_ts": self.GOOD}
+        good = {"progress": 3, "interval_s": 1.0, "process_started_ts": self.GOOD}
         for v in self.BAD_INSTANTS:
             with self.subTest(first=v):
                 p = self.run_reader([dict(good, process_started_ts=v)])
