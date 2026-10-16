@@ -5250,6 +5250,15 @@ def build_parser() -> argparse.ArgumentParser:
                                    "place and the weekly argv printed")
     pact.add_argument("--apply", action="store_true", help="write A1's record into the run directory")
 
+    pprobe = sub.add_parser(
+        "partition-probe", help="A5's post-activation document: P01 and P02 against the local router's final "
+                                "running identity, into the run directory (with --apply); prints root's place")
+    pprobe.add_argument("--post-activation", required=True, metavar="T_RUN_ID",
+                        help="the run id of A2's evidence, the one the live token names")
+    pprobe.add_argument("--document", required=True, help="the approved host-setup document (the unit argv's)")
+    pprobe.add_argument("--document-sha256", required=True, help="that document's sha256")
+    pprobe.add_argument("--apply", action="store_true", help="write the document into the run directory")
+
     pcheck = sub.add_parser(
         "partition-check", help="A5's six claims about an activated local router (V1 V2 E1 E2 T1 R1), read-only, "
                                 "as one canonical JSON object (partition-check/2). Exit 0 means only that it was "
@@ -5321,6 +5330,10 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         if args.command == "partition-activate":
             return run_partition_activate(args, home)
+
+        if args.command == "partition-probe":
+            import partition_postactivation as ppa
+            return ppa.run(args.document, args.document_sha256, args.post_activation, apply=args.apply)
 
         if args.command == "partition-check":
             import partition_check as pcheck
