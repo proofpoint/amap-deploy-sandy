@@ -54,7 +54,6 @@ M = [
     ("hk-one-poll", "hub_keys.py", '        if isinstance(s.get("polls"), int) and s["polls"] >= polls + 2:',
      '        if isinstance(s.get("polls"), int) and s["polls"] >= polls + 1:', "test_signing_matrix"),
     ("hk-interval", "hub_keys.py", "    if interval < 1:", "    if False:", "test_signing_matrix"),
-    ('hk-realpath', 'hub_keys.py', '    return mount_fstype(os.path.realpath(path), mountinfo)', '    return mount_fstype(path, mountinfo)', 'test_signing_matrix.MountinfoTest'),
     ('hk-latin1', 'hub_keys.py', '    "        mp = unescape_mount(f[4])\\n"', '    "        mp = f[4].encode(\'latin-1\').decode(\'unicode_escape\')\\n"', 'test_signing_matrix.MountinfoTest'),
     ('hk-boundary', 'hub_keys.py', '    "        if path == mp or (not exact and path.startswith(mp.rstrip(\'/\') + \'/\')):\\n"', '    "        if path == mp or (not exact and path.startswith(mp)):\\n"', 'test_signing_matrix.MountinfoTest'),
     ("hk-finite", "hub_keys.py", " or isinstance(interval, bool) or not math.isfinite(interval):",
@@ -129,7 +128,7 @@ M = [
     ('hk-regular', 'hub_keys.py', '    "        if st.st_mode & 0o170000 != 0o100000:\\n"', '    "        if False:\\n"', 'test_signing_matrix.OpenResolvedTest'),
     ('hk-host-sha', 'hub_keys.py', 'host.get("ctime_ns"), host.get("sha256")) \\\n', 'host.get("ctime_ns"), seen["sha256"]) \\\n', 'test_signing_matrix.AdoptionTest'),
     ('hs-host-view-once', 'host_setup.py', '        fs = hk.mount_fstype(real, hk.read_mountinfo())', '        fs = hk.mount_fstype(os.path.realpath(spec.keys.local_config), hk.read_mountinfo())', 'test_signing_matrix.OpenResolvedTest'),
-    ('hs-backout-unread', 'host_steps.py', '    if not pre_sha:\n        return ("back-out: this run did not read', '    if False:\n        return ("back-out: this run did not read', 'test_partition_weekly_writer.ProspectiveWriterTest'),
+    ('hs-backout-unread', 'host_steps.py', '    if not pre_sha:\n        return ("back-out: this run did not show', '    if False:\n        return ("back-out: this run did not show', 'test_partition_weekly_writer.ProspectiveWriterTest'),
     ('hs-backout-delegation', 'host_steps.py', '    if live_delegation:\n', '    if False:\n', 'test_partition_weekly_writer.ProspectiveWriterTest'),
     ('hs-g1-seen', 'host_steps.py', '        seen["live_delegation"] = True\n', '', 'test_partition_weekly_writer.ProspectiveWriterTest'),
     ('hk-start-gate', 'host_setup.py', '        out += hk.verify_start_delegation(spec.keys, live,', '        out += hk.verify_no_delegation(spec.keys, live,', 'test_hub_supervise.StartSweepTest'),
@@ -166,6 +165,12 @@ M = [
     ('hs-a5-others', 'host_setup.py', '            rc = 0 if others and all(c.result == rh.PASS for c in others) else 1', '            rc = 0', 'test_hub_supervise.A5OnLaunchdTest'),
     ('as-a5-flag', 'amap_sandy.py', 'verify_section(overlay, a5=getattr(args, "a5", False), policy_on=', 'verify_section(overlay, policy_on=', 'test_hub_supervise.VerifyA5FlagTest'),
     ('as-a5-step', 'amap_sandy.py', '         if spec.supervision is not None and spec.supervision.kind == hv.KINDS[1] else', '         if False else', 'test_activation_install.CommandTest'),
+    ('hk-end-inode', 'hub_keys.py', '    why = inode_problem(h5, t5)\n    if why:', "    why = ''\n    if why:", 'test_signing_matrix.AdoptionTest'),
+    ('hk-end-fstype', 'hub_keys.py', '    why = h5.reason if isinstance(h5, rh.Unresolved) else platform_problem(h5, t5)', "    why = h5.reason if isinstance(h5, rh.Unresolved) else platform_problem(dict(h5, fstype=t5['fstype']), t5)", 'test_signing_matrix.AdoptionTest'),
+    ('hs-view-lexical', 'host_setup.py', '        fs = hk.mount_fstype(real, hk.read_mountinfo())', '        fs = hk.mount_fstype(spec.keys.local_config, hk.read_mountinfo())', 'test_signing_matrix.MountinfoTest'),
+    ('hk-container-prefix', 'hub_keys.py', '                       "fs=mount_fstype(real,read_mountinfo(),exact=True)\\n"', '                       "fs=mount_fstype(real,read_mountinfo())\\n"', 'test_signing_matrix.OpenResolvedTest'),
+    ('hk-config-bound', 'hub_keys.py', '    "            if len(b) > CONFIG_MAX:\\n"', '    "            if False:\\n"', 'test_signing_matrix.OpenResolvedTest'),
+    ('pr-unmeasured-subset', 'partition_run.py', '        and set(dispositions) - set(measured) == set(unmeasured) \\\n', '        and set(dispositions) - set(measured) <= set(unmeasured or {}) \\\n', 'test_partition_run.A2OutcomeTest'),
 ]
 
 

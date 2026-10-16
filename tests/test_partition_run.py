@@ -578,6 +578,9 @@ class A2OutcomeTest(unittest.TestCase):
                            ("P01 another principal unmeasured", dict(doc=self.doc(P01="UNKNOWN"), p01=[{
                                "verdict": "UNKNOWN", "principals": {"upstream": pp.UNMEASURED, "other": pp.UNMEASURED,
                                                                     "downstream": "PASS"}}])),
+                           ("P01 the stopped router measured, its unknown aggregate kept", dict(
+                               doc=self.doc(P01="UNKNOWN"), p01=[{"verdict": "UNKNOWN", "principals": {
+                                   "upstream": "PASS", "downstream": "PASS"}}])),
                            ("P01 a principal unmeasured in the stopped router's place", dict(
                                doc=self.doc(P01="UNKNOWN"), p01=[{"verdict": "UNKNOWN", "principals": {
                                    "upstream": "PASS", "downstream": pp.UNMEASURED}}]))):

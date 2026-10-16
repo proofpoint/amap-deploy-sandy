@@ -321,6 +321,25 @@ class AdoptionTest(unittest.TestCase):
         self.assertEqual(result, rh.UNKNOWN)
         self.assertIn("binds a replaced inode", why)
 
+    def test_the_host_file_replaced_during_the_window_is_unknown(self):
+        """A host-side install --apply during verify's window replaces the
+        live file by rename: the container still reads the old inode, which
+        T1 and T5 agree on, and only the host's view at T5 differs."""
+        for label, over in (("ino", dict(ino=8)), ("dev", dict(dev=2)), ("ctime", dict(ctime_ns=self.C + 1)),
+                            ("bytes", dict(sha256="b" * 64))):
+            with self.subTest(label):
+                views = iter([self.view(), self.view(**over)])
+                result, why = self.run_it([self.a(), self.a()], self.polls(10, 11, 12), host=lambda: next(views))
+                self.assertEqual(result, rh.UNKNOWN)
+                self.assertIn("at the end of the window: the local router binds a replaced inode", why)
+
+    def test_the_filesystem_is_compared_again_at_the_end_of_the_window(self):
+        views = iter([self.view(), self.view(fstype="xfs")])
+        result, why = self.run_it([self.a(), self.a()], self.polls(10, 11, 12), host=lambda: next(views))
+        self.assertEqual(result, rh.UNKNOWN)
+        self.assertIn("at the end of the window", why)
+        self.assertIn("'xfs' on the host", why)
+
     def test_a_container_without_the_single_file_bind_entry_is_unknown(self):
         result, why = self.run_it([dict(self.a(), fstype=None)], [])
         self.assertEqual(result, rh.UNKNOWN)
@@ -392,8 +411,8 @@ class AdoptionTest(unittest.TestCase):
 
 
 class MountinfoTest(unittest.TestCase):
-    """hub_keys.mount_fstype and host_fstype, the one rule both sides read
-    mountinfo by: the opened file's real path, whole path components, the
+    """hub_keys.mount_fstype, the one rule both sides read mountinfo by:
+    the opened file's real path (host_view), whole path components, the
     topmost of equal mount points, and mountinfo's octal escapes decoded
     without narrowing any other character."""
 
@@ -404,9 +423,9 @@ class MountinfoTest(unittest.TestCase):
             "5 1 8:4 / /back\\134slash rw - ext4 d rw\n"
             "6 1 8:5 / /esc\\303\\251 rw - xfs e rw\n")
 
-    def fstype(self, *a, host=False, **k):
+    def fstype(self, *a, **k):
         try:
-            return (hk.host_fstype if host else hk.mount_fstype)(*a, **k)
+            return hk.mount_fstype(*a, **k)
         except Exception as e:  # a crash is not an outcome
             self.fail(f"mount_fstype raised {e!r}")
 
@@ -424,7 +443,16 @@ class MountinfoTest(unittest.TestCase):
         self.text = self.TEXT.format(fuse=self.fuse)
 
     def test_an_alias_names_its_target_s_filesystem(self):
-        self.assertEqual(self.fstype(self.alias, self.text, host=True), "fuse.example")
+        """host_view, as production calls it: an alias into a listed fuse
+        mount gives the target's type, never the lexical path's."""
+        from types import SimpleNamespace
+        import host_setup as hsu
+        self.addCleanup(setattr, hk, "read_mountinfo", hk.read_mountinfo)
+        hk.read_mountinfo = lambda: self.text
+        v = hsu.host_view(SimpleNamespace(keys=SimpleNamespace(local_config=self.alias),
+                                          supervision=SimpleNamespace(kind="systemd")))
+        if sys.platform == "linux":
+            self.assertEqual(v["fstype"], "fuse.example")
         self.assertEqual(self.fstype(self.alias, self.text), "ext4")   # the lexical path would lie
 
     def test_unicode_escapes_and_boundaries(self):
@@ -563,6 +591,16 @@ class OpenResolvedTest(unittest.TestCase):
             self.skipTest("no /proc/sys/kernel/random/boot_id here")
         doc = json.loads(p.stdout)
         self.assertEqual((doc["ino"], doc["sha256"]), (os.stat(self.target).st_ino, hashlib.sha256(b"{}").hexdigest()))
+        self.assertIsNone(doc["fstype"], "a file that is not itself a mount point has no exact entry")
+
+    def test_a_config_past_the_bound_is_refused(self):
+        with open(self.target, "wb") as f:
+            f.write(b" " * (hk.CONFIG_MAX + 1))
+        with self.assertRaisesRegex(OSError, "larger than"):
+            hk.open_resolved(self.alias)
+        with open(self.target, "wb") as f:
+            f.write(b" " * hk.CONFIG_MAX)
+        self.assertEqual(len(hk.open_resolved(self.alias)[2]), hk.CONFIG_MAX)
 
 
 class PolicyTest(unittest.TestCase):

@@ -616,8 +616,8 @@ def verify_signing(ks: KeySpec, raw: Any, bind: rh.Check, sg: Signing) -> rh.Che
 #: sides answer by one rule:
 #: - `open_resolved`: the config's real path, resolved once, and the file at
 #:   that path opened without following a link, stat'ed and read through one
-#:   descriptor; a path that resolves elsewhere afterwards is an error, never
-#:   an answer;
+#:   descriptor, at most CONFIG_MAX bytes; a path that resolves elsewhere
+#:   afterwards is an error, never an answer;
 #: - `mount_fstype`: the filesystem type of the mount holding a path, from
 #:   mountinfo's text: the longest mount point at or above it, on a whole
 #:   path component, the type after the " - " separator. Octal escapes are
@@ -639,6 +639,7 @@ MOUNT_FSTYPE_SRC = (
     "def read_mountinfo():\n"
     "    with open('/proc/self/mountinfo', 'rb') as f:\n"
     "        return os.fsdecode(f.read())\n"
+    "CONFIG_MAX = 1 << 20\n"
     "def open_resolved(path):\n"
     "    real = os.path.realpath(path)\n"
     "    fd = os.open(real, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)\n"
@@ -652,6 +653,8 @@ MOUNT_FSTYPE_SRC = (
     "            if not c:\n"
     "                break\n"
     "            b += c\n"
+    "            if len(b) > CONFIG_MAX:\n"
+    "                raise OSError(f'{real} is larger than {CONFIG_MAX} bytes')\n"
     "    finally:\n"
     "        os.close(fd)\n"
     "    again = os.stat(real, follow_symlinks=False)\n"
@@ -675,13 +678,9 @@ exec(MOUNT_FSTYPE_SRC, _ns)  # noqa: S102 -- this module's own constant, so the 
 mount_fstype = _ns["mount_fstype"]
 read_mountinfo = _ns["read_mountinfo"]
 open_resolved = _ns["open_resolved"]
+CONFIG_MAX = _ns["CONFIG_MAX"]
 
 
-def host_fstype(path: str, mountinfo: str) -> Any:
-    """The filesystem type of the file the host actually opens at `path`:
-    its real path, never the lexical one, so an alias names its target's
-    filesystem."""
-    return mount_fstype(os.path.realpath(path), mountinfo)
 #: Filesystems whose inode timestamps Linux stamps from its coarse clock with
 #: 1 ns granularity, and that hold the inode locally: the supported set.
 LOCAL_FS = ("ext4", "xfs", "btrfs")

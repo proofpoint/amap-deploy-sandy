@@ -2210,13 +2210,15 @@ def _back_out(name, kept, pre_sha=None, live_delegation=False):
     not pass. A start is named only when THIS run's G1 read the live config
     and found no delegation (`pre_sha` set): it was stopped for A2 on that
     config. G1 finding a delegation is the state after A3's place, whose
-    back-out is install's, never a start; a run refused before G1 read
-    nothing, so it names no start either. A kept run's remedy comes first."""
+    back-out is install's, never a start; a run that did not show the
+    config pre-activation (refused before G1, or G1 found no object) names
+    no start either. A kept run's remedy comes first."""
     if live_delegation:
         return ("back-out: the live config carries delegation, so do not start the local router on it; this is "
                 f"the state after A3's place, and its back-out is, in order: {POST_PLACE_BACK_OUT}")
     if not pre_sha:
-        return ("back-out: this run did not read the live config, so it names no start; before starting the "
+        return ("back-out: this run did not show the live config is pre-activation, so it names no start; before "
+                "starting the "
                 "local router, read the host's live config: it must parse as a JSON object with no delegation "
                 f"member, else back out in order: {POST_PLACE_BACK_OUT}")
     start = f"docker start {name}" if name else "docker start <the local router's container>"

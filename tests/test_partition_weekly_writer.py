@@ -1897,7 +1897,7 @@ class ProspectiveWriterTest(unittest.TestCase):
                 self.assertNotEqual(p.returncode, hs.EXIT_PASS, out)
                 self.assertNotIn("unchanged", out)
                 self.assertNotIn(f"docker start {self.NAME}", out)
-                self.assertIn("did not read the live config, so it names no start", out)
+                self.assertIn("did not show the live config is pre-activation, so it names no start", out)
 
     def test_a_refusal_with_the_router_running_prints_no_start(self):
         self.h.containers({self.NAME: True})
