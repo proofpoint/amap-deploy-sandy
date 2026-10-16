@@ -72,6 +72,11 @@ IN_VOLUME = "/v"
 LOCK_FILE = "oneshot.lock"
 #: Every tool the checks run; the runbook's own tools are the document's too.
 REQUIRED_TOOLS = ("git", "docker", "python3", "ssh", "ssh-keygen")
+#: The tools root executes: docker (the hub's supervisor, the weekly probe and
+#: the one-shots), python3 (the pinned writer's steps) and sudo (the operator's
+#: door to root when docker_via_sudo). Each must be root's alone; every other
+#: tool may also be the operator's.
+ROOT_EXEC_TOOLS = ("docker", "python3", "sudo")
 CLONE_ROLES = ("deploy", "overlay", "producer", "runtime")
 OPTIONAL_CLONE_ROLE = "producer"
 REQUIRED_CLONE_ROLES = set(CLONE_ROLES) - {OPTIONAL_CLONE_ROLE}
@@ -628,15 +633,23 @@ def verify_overlay_source(s: SecretSpec, overlay: Optional[str], stat_: Callable
 
 def verify_tools(s: SecretSpec, lstat: Callable,
                  realpath: Callable[[str], str] = os.path.realpath) -> List[rh.Check]:
+    """Each tool's real path a regular executable no one else can write, under
+    directories no one else can write. A tool root executes (ROOT_EXEC_TOOLS)
+    must be root's: its real path and every directory above it, and above the
+    recorded path too, so no one else can repoint a link. Any other tool may
+    also be the operator's."""
     out = []
-    owners = (0, s.operator_uid)
     every = dict(s.tools)
     every.setdefault("uv", s.uv["binary"])
     for name, path in sorted(every.items()):
-        why = f"{name} runs with docker or root authority in the runbook or verify"
+        if name in ROOT_EXEC_TOOLS:
+            owners, whose, why = (0,), "root", f"root executes {name}"
+        else:
+            owners, whose = (0, s.operator_uid), "root or the operator"
+            why = f"{name} runs with docker or root authority in the runbook or verify"
         real = realpath(path)
         st = _lst(real, lstat)
-        claim = f"the {name} tool {path} is a regular executable file owned by root or the operator"
+        claim = f"the {name} tool {path} is a regular executable file owned by {whose}"
         want = _fact("tool", True, why)
         remedy = f"record a {name} owned by root (a system one), or fix {real}'s owner and mode"
         if isinstance(st, rh.Unresolved):
@@ -645,8 +658,12 @@ def verify_tools(s: SecretSpec, lstat: Callable,
         ok = st is not None and stat.S_ISREG(st.st_mode) and bool(st.st_mode & 0o111) \
             and st.st_uid in owners and _no_write_by_others(st)
         out.append(rh.check(claim, want, ok, remedy, do_not="never record a tool that an agent could write"))
-        out.append(_owned_chain(f"every directory above {real} is owned by root or the operator and "
+        out.append(_owned_chain(f"every directory above {real} is owned by {whose} and "
                                 f"not group- or world-writable", real, owners, why, lstat))
+        if name in ROOT_EXEC_TOOLS and real != path:
+            out.append(_owned_chain(f"every directory above the recorded {path} is owned by root and not group- "
+                                    f"or world-writable, so no one else can point it elsewhere", path, owners, why,
+                                    lstat))
     return out
 
 

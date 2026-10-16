@@ -124,9 +124,27 @@ class SystemdTest(unittest.TestCase):
     def test_it_runs_the_rendered_spec_and_never_force_removes(self):
         s = spec()
         self.assertEqual(self.line("ExecStart").split(), hv.run_argv(s))
-        self.assertTrue(self.line("ExecStartPre").startswith("-"))
-        self.assertNotIn("-f", self.line("ExecStartPre").split())
+        rm = self.pre()[1]
+        self.assertTrue(rm.startswith("-"))
+        self.assertNotIn("-f", rm.split())
         self.assertEqual(self.line("Environment"), "DOCKER_HOST=unix:///var/run/docker.sock")
+
+    def pre(self):
+        return [l.split("=", 1)[1] for l in self.unit().splitlines() if l.startswith("ExecStartPre=")]
+
+    def test_the_writers_trust_check_runs_first_and_its_failure_stops_the_start(self):
+        """Every docker call in the unit (the rm, the run, the stop) comes
+        after the writer's trusted-tools check, which has no "-": its
+        failure is the unit's failure, so root never runs an untrusted docker."""
+        s = spec()
+        pre = self.pre()
+        self.assertEqual(pre[0].split(), hv.trust_argv(s))
+        self.assertFalse(pre[0].startswith("-"))
+        self.assertEqual(hv.trust_argv(s), [s.secrets.tools["python3"], "-I", "-S", s.secrets.writer,
+                                            "trusted-tools", s.secrets.tools["python3"], s.secrets.tools["docker"]])
+        lines = self.unit().splitlines()
+        first_docker = min(i for i, l in enumerate(lines) if s.secrets.tools["docker"] in l and "trusted-tools" not in l)
+        self.assertLess(lines.index("ExecStartPre=" + pre[0]), first_docker)
 
     def test_it_can_be_enabled_and_enabling_is_not_placing(self):
         self.assertIn("[Install]\nWantedBy=multi-user.target", self.unit())
@@ -164,6 +182,15 @@ class LaunchdTest(unittest.TestCase):
         self.assertEqual(doc["ProgramArguments"], hv.weekly_argv(spec("launchd")))
 
 
+#: The recorded python3, stubbed: it logs the writer's trusted-tools call and
+#: answers 4 (the writer's Tooling exit) when $STUB/untrusted exists.
+STUB_PYTHON = r"""#!/bin/sh
+printf 'python3 %s\n' "$*" >> "$STUB/log"
+[ -f "$STUB/untrusted" ] && exit 4
+exit 0
+"""
+
+
 STUB_DOCKER = r"""#!/bin/sh
 printf '%s\n' "$*" >> "$STUB/log"
 case "$1" in
@@ -196,14 +223,18 @@ class WrapperTest(unittest.TestCase):
         docker = self.t / "docker"
         docker.write_text(STUB_DOCKER)
         docker.chmod(0o755)
+        python = self.t / "python3"
+        python.write_text(STUB_PYTHON)
+        python.chmod(0o755)
         s = spec("launchd")
-        sec = dataclasses.replace(s.secrets, tools=dict(s.secrets.tools, docker=str(docker)))
+        sec = dataclasses.replace(s.secrets, tools=dict(s.secrets.tools, docker=str(docker), python3=str(python)))
+        self.spec_ = dataclasses.replace(s, secrets=sec)
         sup = dataclasses.replace(s.supervision, hub=dict(s.supervision.hub, status=str(self.t / "status")))
         self.script = self.t / "hub-link-run"
         self.script.write_bytes(hv.wrapper(dataclasses.replace(s, secrets=sec, supervision=sup)))
 
     def run_it(self, shell, code=None, state=None):
-        for f in ("log", "state", "code", "stopped", "running", "hold", "ps_fail"):
+        for f in ("log", "state", "code", "stopped", "running", "hold", "ps_fail", "untrusted"):
             (self.stub / f).unlink(missing_ok=True)
         (self.t / "status").unlink(missing_ok=True)
         if state is not None:
@@ -232,6 +263,31 @@ class WrapperTest(unittest.TestCase):
                     else:
                         self.assertEqual((rc, status), (code, None))
                     self.assertTrue(any(l.startswith("run --name") for l in log), log)
+
+    def test_the_writer_checks_the_tools_before_any_docker_call(self):
+        for shell in self.SHELLS:
+            with self.subTest(shell=shell):
+                rc, log, status = self.run_it(shell, code=0, state="exited")
+                self.assertEqual(rc, 0)
+                self.assertEqual(log[0].split(), ["python3"] + hv.trust_argv(self.spec_)[1:])
+                self.assertTrue(all(l.split()[0] != "python3" for l in log[1:]), log)
+
+    def test_untrusted_tools_run_no_docker_and_end_without_a_restart(self):
+        for shell in self.SHELLS:
+            for state in (None, "exited", "running"):
+                with self.subTest(shell=shell, state=state):
+                    for f in ("log", "state", "code"):
+                        (self.stub / f).unlink(missing_ok=True)
+                    (self.t / "status").unlink(missing_ok=True)
+                    if state is not None:
+                        (self.stub / "state").write_text(state + "\n")
+                    (self.stub / "code").write_text("0")
+                    (self.stub / "untrusted").touch()
+                    r = subprocess.run(shell + [str(self.script)], env={"STUB": str(self.stub), "PATH": "/usr/bin:/bin"},
+                                       capture_output=True, text=True, timeout=30)
+                    (self.stub / "untrusted").unlink()
+                    self.assertEqual((r.returncode, self.status()), (0, hv.UNTRUSTED), r.stderr)
+                    self.assertEqual([l.split()[0] for l in self.log()], ["python3"], "docker ran")
 
     def test_a_stopped_leftover_is_removed_without_force_then_run(self):
         for shell in self.SHELLS:

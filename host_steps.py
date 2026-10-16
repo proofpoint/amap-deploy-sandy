@@ -22,7 +22,9 @@ A runtime's secret file, in a directory that only that runtime's uid can open:
   python3 -I -S host_steps.py stat-secret DIR              its entries' metadata, as one JSON line
   python3 -I -S host_steps.py lock RUN_DIR -- ARGV...      ARGV run under RUN_DIR/oneshot.lock
   python3 -I -S host_steps.py probe-weekly STATUS RUN_ID [--engine unix:///SOCK] [--docker ABS] -- ARGV...
-                                                  ARGV's one-line result kept in STATUS
+                                                  ARGV's one-line result kept in STATUS, refused
+                                                  unless this interpreter, the docker client and
+                                                  ARGV's program are root's alone
 
 The weekly partition job's root half (see its section below):
 
@@ -30,6 +32,12 @@ The weekly partition job's root half (see its section below):
                                                   one run of the provisioned bundle, under the job's lock
   python3 -I -S -B host_steps.py partition-provision DIR
                                                   DIR/bundle.new swapped in as the bundle, under the lock
+
+A supervisor's own check before it runs docker as root:
+
+  python3 -I -S host_steps.py trusted-tools PYTHON3 DOCKER
+                                                  exit 0 when both, and their startup closure, are
+                                                  root's alone; 4 (and why, on stderr) otherwise
 
 Every path is walked from `/` one component at a time, each opened with
 O_NOFOLLOW | O_DIRECTORY, so a symbolic link anywhere on the way, or a
@@ -589,7 +597,7 @@ def _remove_run(docker, run_id):
         pass
 
 
-def probe_weekly(status_path, run_id, argv, now=None, engine=None, docker=None):
+def probe_weekly(status_path, run_id, argv, now=None, engine=None, docker=None, verify=None):
     """Run the probe command and keep its result in `status_path`: the class,
     its SMTP code, the time, this run's id, the previous run's class, and
     when the probe last passed. With `engine`, a stopped engine is recorded
@@ -598,10 +606,17 @@ def probe_weekly(status_path, run_id, argv, now=None, engine=None, docker=None):
     containers removed by this run's label, and is recorded as timeout.
     Exits with the probe's
     status. Run it under `lock`, never the reverse: a busy lock is the
-    wrapper's refusal, not a probe result."""
+    wrapper's refusal, not a probe result. Root runs it, so before anything
+    runs, `verify` (by default `_verify_probe_tools`) must find this
+    interpreter, the docker client and ARGV's program root's alone; when it
+    does not, the step is refused and nothing is run or recorded."""
     if not argv or not os.path.isabs(argv[0]) or not RUN_ID.fullmatch(run_id) \
             or (docker is not None and not (docker and os.path.isabs(docker[0]))):
         raise Refused("probe")
+    try:
+        (verify or _verify_probe_tools)(argv[0], docker)
+    except Tooling:
+        raise Refused("tools") from None
     at = int(now if now is not None else time.time())
     if engine is not None and not engine_answers(engine):
         cls, code, rc = "engine_unavailable", "-", REFUSED
@@ -654,6 +669,23 @@ def probe_weekly(status_path, run_id, argv, now=None, engine=None, docker=None):
     finally:
         os.close(dfd)
     return rc
+
+
+def _verify_probe_tools(program, docker):
+    """What probe-weekly will run as root, as partition-weekly verifies its
+    own: the interpreter running this step, the docker client (`docker`, else
+    the program), and the program, each a root-owned executable under
+    root-owned directories, with the startup closure root's alone. Tooling
+    otherwise."""
+    python = sys.executable
+    if not python or not os.path.isabs(python):
+        raise Tooling("the running interpreter has no absolute path")
+    client = docker[0] if docker else program
+    py, dock = _trusted_tool(python), _trusted_tool(client)
+    _trusted_tool(program)
+    bad = closure_problems(startup_closure(py, dock, (python, client, program)))
+    if bad:
+        raise Tooling("the startup closure is not root's alone: " + "; ".join(bad[:5]))
 
 
 def _probe_weekly_main(argv):
@@ -2634,6 +2666,9 @@ def main(argv):
                                     opts["--activation"], opts["--activation-sha256"], prospective=len(argv) == 14)
         elif len(argv) == 2 and argv[0] == "partition-provision":
             return partition_provision(argv[1])
+        elif len(argv) == 3 and argv[0] == "trusted-tools":
+            _verified_tools(argv[1], argv[2])
+            return 0
         else:
             print(__doc__.split("\n\n")[1], file=sys.stderr)
             return 2

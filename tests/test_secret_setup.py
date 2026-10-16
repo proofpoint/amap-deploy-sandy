@@ -82,7 +82,7 @@ def fs():
               "/opt/ex/libexec/host_steps.py": fl(0o444), "/opt/ex/etc/overlay.sha": fl(0o444),
               "/opt/ex/etc/state": fl(0o444),
               "/usr": dr(0o755), "/usr/bin": dr(0o755), "/usr/local": dr(0o755),
-              "/usr/local/bin": dr(0o755, OP),
+              "/usr/local/bin": dr(0o755),
               "/srv/op": dr(0o700, OP), "/srv/op/clones": dr(0o700, OP),
               "/srv/op/uv-cache": dr(0o700, OP), "/srv/op/uv-python": dr(0o700, OP),
               "/srv/op/run": dr(0o700, OP), "/srv/op/run/oneshot.lock": fl(0o600, OP),
@@ -393,9 +393,8 @@ class ToolsTest(Base):
         found = self.run_checks(f=f, realpath=lambda p: "/srv/agent-writable/bin/python3"
                                 if p == "/usr/bin/python3" else p)
         bad = {c.claim for c in found if c.result != rh.PASS}
-        self.assertIn("the python3 tool /usr/bin/python3 is a regular executable file owned by root or "
-                      "the operator", bad)
-        self.assertIn("every directory above /srv/agent-writable/bin/python3 is owned by root or the operator and "
+        self.assertIn("the python3 tool /usr/bin/python3 is a regular executable file owned by root", bad)
+        self.assertIn("every directory above /srv/agent-writable/bin/python3 is owned by root and "
                       "not group- or world-writable", bad)
 
     def test_a_world_writable_directory_above_a_tool_fails(self):
@@ -404,10 +403,64 @@ class ToolsTest(Base):
         found = self.run_checks(f=f)
         bad = {c.claim for c in found if c.result != rh.PASS}
         self.assertEqual(bad, {
-            "every directory above /usr/local/bin/docker is owned by root or the operator and not "
-            "group- or world-writable",
+            "every directory above /usr/local/bin/docker is owned by root and not group- or world-writable",
             "every directory above /usr/local/bin/uv is owned by root or the operator and not "
             "group- or world-writable"})
+
+
+class RootExecToolsTest(Base):
+    """docker, python3 and sudo are executed by root (the hub's supervisor, the
+    weekly probe, the writer's steps), so each must be root's alone: its real
+    path, every directory above it, and every directory above the recorded
+    path. Any other tool may also be the operator's."""
+
+    def bad(self, **kw):
+        return {c.claim for c in self.run_checks(**kw) if c.result != rh.PASS}
+
+    def test_a_root_owned_chain_passes(self):
+        self.assertEqual(self.bad(), set())
+
+    def test_an_operator_owned_root_exec_tool_fails_and_an_operator_tool_does_not(self):
+        for name in ss.ROOT_EXEC_TOOLS:
+            with self.subTest(name=name):
+                f = fs()
+                path = sec()["tools"][name]
+                f[path] = fl(0o755, OP)
+                self.assertEqual(self.bad(f=f), {f"the {name} tool {path} is a regular executable file owned by "
+                                                 "root"})
+        f = fs()
+        f["/usr/bin/git"] = fl(0o755, OP)
+        self.assertEqual(self.bad(f=f), set(), "git may be the operator's")
+
+    def test_a_group_writable_directory_above_a_root_exec_tool_fails(self):
+        f = fs()
+        f["/usr/local/bin"] = dr(0o775)
+        self.assertIn("every directory above /usr/local/bin/docker is owned by root and not group- or world-writable",
+                      self.bad(f=f))
+
+    def test_an_operator_owned_directory_above_a_root_exec_tool_fails(self):
+        f = fs()
+        f["/usr/local/bin"] = dr(0o755, OP)
+        self.assertEqual(self.bad(f=f), {"every directory above /usr/local/bin/docker is owned by root and not "
+                                         "group- or world-writable"}, "uv, the operator's, still passes")
+
+    def test_a_link_is_judged_by_its_target_and_both_chains(self):
+        """The OrbStack shape: a root-owned link into an operator-owned bundle."""
+        f = fs()
+        f.update({"/Applications": dr(0o755), "/Applications/Orb.app": dr(0o755, OP),
+                  "/Applications/Orb.app/xbin": dr(0o755, OP), "/Applications/Orb.app/xbin/docker-tools": fl(0o755, OP)})
+        link = {"/usr/local/bin/docker": "/Applications/Orb.app/xbin/docker-tools"}
+        self.assertEqual(self.bad(f=f, realpath=lambda p: link.get(p, p)), {
+            "the docker tool /usr/local/bin/docker is a regular executable file owned by root",
+            "every directory above /Applications/Orb.app/xbin/docker-tools is owned by root and not group- or "
+            "world-writable"})
+        f.update({"/Applications/Orb.app": dr(0o755), "/Applications/Orb.app/xbin": dr(0o755),
+                  "/Applications/Orb.app/xbin/docker-tools": fl(0o755)})
+        self.assertEqual(self.bad(f=f, realpath=lambda p: link.get(p, p)), set(), "a root-owned target and chain")
+        f["/usr/local/bin"] = dr(0o755, OP)
+        self.assertEqual(self.bad(f=f, realpath=lambda p: link.get(p, p)), {
+            "every directory above the recorded /usr/local/bin/docker is owned by root and not group- or "
+            "world-writable, so no one else can point it elsewhere"}, "the link's own directory is judged too")
 
 
 class DirsAndSshTest(Base):

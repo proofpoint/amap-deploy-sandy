@@ -502,7 +502,11 @@ root, the lock file and the state, and checks, without reading the secret:
   git configuration ignored;
 - each tool is a regular executable whose real path, and every directory
   above it, is owned by root or the operator and not group- or
-  world-writable;
+  world-writable. docker, python3 and sudo, which root executes, must be
+  root's alone: the real path, every directory above it, and every
+  directory above the recorded path, so no one else can repoint a link.
+  A docker inside an operator-owned application bundle (OrbStack's), or a
+  python3 under the operator's home, fails here: record root-owned ones;
 - the hub ssh key is pinned in a 0400 known_hosts, and ssh's effective
   host-key checking is strict in the producer's own option order;
 - the volume holds exactly what the state says, read by `stat-secret` in a
@@ -564,7 +568,10 @@ wrapper's refusal rather than a probe result. `probe-weekly` keeps a class
 only when the probe's exit is that class's own; a stopped engine is
 recorded as `engine_unavailable` without running anything, and a probe that
 outruns its time has its containers removed by the run's label and is
-recorded as `timeout`.
+recorded as `timeout`. Before anything runs, `probe-weekly` checks that its
+interpreter, the docker client and the probe's program are root's alone,
+with their startup closure, as the weekly partition job checks its own; when
+they are not it refuses (`refused: tools`), runs nothing and records nothing.
 
 ### The hub-link router's files
 
@@ -982,6 +989,12 @@ the local router signs. A crash or boot restart of the hub-link router is
 its supervisor's (systemd `Restart=on-failure`, launchd `KeepAlive`) and is
 not gated: the check governs the start step it prints and launchd's
 enablement.
+
+Every start of the hub-link router, the gated one and each restart, first
+runs the pinned writer's `trusted-tools <python3> <docker>` as root:
+systemd's first `ExecStartPre`, whose failure fails the start, and the
+launchd wrapper, which then records `untrusted_tools` and exits 0, so
+launchd does not restart it. Root runs no docker that is not root's alone.
 
 
 ### The weekly partition job's tools

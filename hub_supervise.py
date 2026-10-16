@@ -42,7 +42,11 @@ commit, makes it exit 0. Without the handler a planned stop runs out the
 macOS a wrapper maps the codes for a LaunchDaemon whose KeepAlive restarts
 only on a non-zero wrapper exit; it passes 143 on, so launchd restarts it.
 The wrapper is placed root 0444 by the plan's `place --sha256` and run as
-`/bin/sh <wrapper>`, never directly. It starts `docker run` in the
+`/bin/sh <wrapper>`, never directly. Before any docker call, both supervisors
+run the pinned writer's `trusted-tools <python3> <docker>` (`trust_argv`): on
+Linux the unit's first ExecStartPre, whose failure fails the start; on macOS
+the wrapper, which records UNTRUSTED and exits 0, so launchd does not restart
+it. Root runs no docker that is not root's alone. It starts `docker run` in the
 background and blocks in `wait`, because a POSIX shell defers a trap while a
 foreground command runs.
 """
@@ -88,6 +92,8 @@ QUIT_S = 5
 #: TimeoutStopSec (90 s) and launchd's default ExitTimeOut (20 s) are below it.
 SUPERVISOR_STOP_S = 120
 ORPHAN = "orphan_running"
+#: The wrapper's record when the writer finds docker or python3 not root's alone: nothing ran.
+UNTRUSTED = "untrusted_tools"
 LAUNCHCTL = "/bin/launchctl"
 WEEKLY_RUN_ID = "weekly"
 REVISION_LABEL = "org.opencontainers.image.revision"
@@ -233,6 +239,13 @@ def _sd_line(argv: Sequence[str]) -> str:
 HEADER = "# Rendered by amap-deploy-sandy hub-supervise from the anchored overlay. Place it; never edit it.\n"
 
 
+def trust_argv(spec: Any) -> List[str]:
+    """The writer's check, run as root before any docker call: the recorded
+    python3 and docker, and their startup closure, root's alone."""
+    s = spec.secrets
+    return [s.tools["python3"], "-I", "-S", s.writer, "trusted-tools", s.tools["python3"], s.tools["docker"]]
+
+
 def systemd_unit(spec: Any) -> bytes:
     sup = spec.supervision
     docker, name = spec.secrets.tools["docker"], hub_name(spec)
@@ -242,6 +255,7 @@ def systemd_unit(spec: Any) -> bytes:
             f"StartLimitIntervalSec={START_LIMIT_INTERVAL_S}\nStartLimitBurst={START_LIMIT_BURST}\n\n"
             "[Service]\nType=exec\n"
             f"Environment={_sd('DOCKER_HOST=' + sup.engine)}\n"
+            f"ExecStartPre={_sd_line(trust_argv(spec))}\n"
             f"ExecStartPre=-{_sd_line([docker, 'rm', name])}\n"
             f"ExecStart={_sd_line(run_argv(spec))}\n"
             f"ExecStop={_sd_line([docker, 'stop', '-t', str(STOP_TIMEOUT_S), name])}\n"
@@ -272,6 +286,7 @@ def wrapper(spec: Any) -> bytes:
     q = shlex.quote
     keep = "|".join(map(str, (0,) + NO_RESTART))
     run = " ".join(q(a) for a in run_argv(spec))
+    trust = " ".join(q(a) for a in trust_argv(spec))
     return f"""#!/bin/sh
 # hub-link-run. Rendered by amap-deploy-sandy hub-supervise from the anchored
 # overlay; placed root 0444 by the pinned writer and run by its LaunchDaemon as
@@ -286,6 +301,14 @@ say() {{ printf 'hub-link-run: %s\\n' "$1" >&2; }}
 record() {{
     printf '%s %s\\n' "$1" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$STATUS.tmp" && mv -f "$STATUS.tmp" "$STATUS"
 }}
+
+# 0. Root runs docker only when the pinned writer finds it, and python3, root's
+#    alone; otherwise nothing runs, and the refusal is final (no restart).
+if ! {trust} >/dev/null; then
+    record {UNTRUSTED}
+    say "docker or python3 is not root's alone: nothing was run"
+    exit 0
+fi
 
 # 1. A container left by the last run: a stopped one is removed (never -f);
 #    a running one is an orphan, left alone, and this run ends cleanly.
