@@ -301,6 +301,10 @@ class DocumentTest(unittest.TestCase):
             pc.document(host="alpha", at="x", inputs={}, cells=cells)
         self.assertTrue(pc.ready(doc))
         self.assertFalse(pc.ready(dict(doc, checks=cells[:5])))
+        for bad in (rh.FAIL, rh.UNKNOWN):
+            with self.subTest(result=bad):
+                one = [dict(c, result=bad) if c["id"] == "T1" else c for c in cells]
+                self.assertFalse(pc.ready(dict(doc, checks=one)))
 
     def test_e1_literal(self):
         self.assertEqual(pc.E1_CLAIM, "the partition evidence {path} is well-formed and passing, with the key "
