@@ -3816,7 +3816,8 @@ def build_identity_outcome(args: argparse.Namespace, home: Path) -> rh.Outcome:
             return None
         state_dir = str(sibling_state_dir(home, getattr(args, "state_dir", None)))
         who = f"[1] ({name})"
-        doc = bi.read_status(live, state_dir, who)
+        read = bi.read_progressing if bi.no_recorded_exit(live) else bi.read_status
+        doc = read(live, state_dir, who)
         others = bi.state_sharers(["docker"], state_dir, live.get("Id"))
         if isinstance(others, rh.Unresolved):
             return others

@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -217,7 +218,7 @@ class HopPluginTest(unittest.TestCase):
                bi.PLUGIN_MEMBER: {"path": "/zz/overlay/plugin.py", bi.PLUGIN_SHA256: self.SHA}
                if member is None else member}
         doc.update(extra)
-        return doc
+        return bi.Progressed(doc)
 
     def claim(self, published=None, before=None, after=None, pin=None):
         before = self.live() if before is None else before
@@ -252,6 +253,23 @@ class HopPluginTest(unittest.TestCase):
         current = self.claim(published=self.published(began="2026-10-15T10:00:00.480000Z"), before=before,
                              after=after)
         self.assertEqual(current.check.result, rh.PASS)
+
+    def test_no_recorded_exit_takes_only_a_document_seen_to_advance(self):
+        """FinishedAt zero leaves Created as the only bound, which holds only
+        for a first run; an engine that cleared FinishedAt on a restart would
+        look the same. Codex's witness: an earlier run's document, published
+        after Created, read without seeing it advance, is UNKNOWN."""
+        plain = dict(self.published(began="2026-10-15T10:00:00.400000Z"))
+        self.assertUnknown(self.claim(published=plain),
+                           "the engine shows no previous exit for [1] (zz-r1), and its status document was not "
+                           "seen to advance, so an earlier run's document cannot be excluded")
+        self.assertEqual(self.claim(published=bi.Progressed(plain)).check.result, rh.PASS)
+
+    def test_a_recorded_exit_needs_no_progress_witness(self):
+        restarted = dict(created="2026-10-15T09:00:00.000000000Z", finished="2026-10-15T10:00:00.450000000Z")
+        c = self.claim(published=dict(self.published(began="2026-10-15T10:00:00.480000Z")),
+                       before=self.live(**restarted), after=self.live(**restarted))
+        self.assertEqual(c.check.result, rh.PASS)
 
     def test_no_creation_or_exit_time_is_unknown(self):
         for k in ({"created": None}, {"finished": None}, {"created": "soon"}):
@@ -381,6 +399,105 @@ class ReadStatusTest(unittest.TestCase):
                 other = {"Type": "bind", "Source": "/zz/elsewhere", "Destination": dest, "RW": False}
                 self.assertEqual(bi.read_status(container(mounts=[ident, other]), self.sd, "[1] (zz-r1)"),
                                  {"polls": 1})
+
+    def test_a_status_document_that_is_a_fifo_is_unknown_without_blocking(self):
+        """Opened O_NONBLOCK and fstat'd before any read. A read that blocks
+        is released after 5 s by opening the write end, and fails the row."""
+        os.mkfifo(self.path)
+        got = []
+        t = threading.Thread(target=lambda: got.append(bi.read_status(self.live(), self.sd, "[1] (zz-r1)")),
+                             daemon=True)
+        t.start()
+        t.join(5)
+        if t.is_alive():
+            os.close(os.open(self.path, os.O_WRONLY | os.O_NONBLOCK))
+            t.join(5)
+            self.fail("read_status blocked on a FIFO")
+        self.assertIsInstance(got[0], rh.Unresolved)
+        self.assertIn("not a regular file", got[0].reason)
+
+    def test_a_status_document_larger_than_the_bound_is_unknown(self):
+        real = bi.MAX_STATUS_BYTES
+        bi.MAX_STATUS_BYTES = 8
+        self.addCleanup(setattr, bi, "MAX_STATUS_BYTES", real)
+        Path(self.path).write_text(json.dumps({"polls": 12345}))
+        got = bi.read_status(self.live(), self.sd, "[1] (zz-r1)")
+        self.assertIsInstance(got, rh.Unresolved)
+        self.assertIn("larger than 8 bytes", got.reason)
+        Path(self.path).write_text("{}")
+        self.assertEqual(bi.read_status(self.live(), self.sd, "[1] (zz-r1)"), {})
+
+    def test_a_status_document_that_is_a_directory_is_unknown(self):
+        os.mkdir(self.path)
+        got = bi.read_status(self.live(), self.sd, "[1] (zz-r1)")
+        self.assertIsInstance(got, rh.Unresolved)
+        self.assertIn("not a regular file", got.reason)
+
+    def progressing(self, docs):
+        """read_progressing on a fake clock: the first of `docs` is on disk,
+        and each sleep writes the next (the last stays). Returns the result
+        and the number of sleeps."""
+        now, sleeps, queue = [0.0], [], list(docs)
+        Path(self.path).write_text(json.dumps(queue.pop(0)))
+
+        def sleep(s):
+            sleeps.append(s)
+            now[0] += s
+            if queue:
+                Path(self.path).write_text(json.dumps(queue.pop(0)))
+        for name, fn in (("_sleep", sleep), ("_monotonic", lambda: now[0])):
+            real = getattr(bi, name)
+            setattr(bi, name, fn)
+            self.addCleanup(setattr, bi, name, real)
+        return bi.read_progressing(self.live(), self.sd, "[1] (zz-r1)"), len(sleeps)
+
+    @staticmethod
+    def doc(polls, began="2026-10-15T10:00:00.050000Z", interval=5.0):
+        return {"polls": polls, "interval_s": interval, bi.PROCESS_START: began}
+
+    def test_a_document_seen_to_advance_is_progressed(self):
+        got, _ = self.progressing([self.doc(3), self.doc(3), self.doc(4)])
+        self.assertIsInstance(got, bi.Progressed)
+        self.assertEqual(got["polls"], 4)
+
+    def test_a_document_that_never_advances_is_unknown_after_two_intervals(self):
+        got, sleeps = self.progressing([self.doc(3)])
+        self.assertEqual(got.reason, "[1] (zz-r1)'s status document did not advance within 2 poll intervals, so "
+                                     "it is not shown to be written by the running process")
+        self.assertEqual(sleeps, int(5.0 * bi.PROGRESS_INTERVALS / bi.PROGRESS_STEP_S))
+
+    def test_an_advance_under_another_process_start_is_not_progress(self):
+        got, _ = self.progressing([self.doc(3), self.doc(9, began="2026-10-15T10:00:01.000000Z")])
+        self.assertIsInstance(got, rh.Unresolved)
+
+    def test_no_usable_interval_or_polls_is_unknown_without_waiting(self):
+        for label, first in (("no interval", {"polls": 3, bi.PROCESS_START: "2026-10-15T10:00:00.05Z"}),
+                             ("interval too long", self.doc(3, interval=bi.MAX_PROGRESS_WAIT_S)),
+                             ("interval zero", self.doc(3, interval=0)),
+                             ("polls not a number", dict(self.doc(3), polls="3"))):
+            with self.subTest(label):
+                self.fresh()
+                got, sleeps = self.progressing([first, self.doc(4)])
+                self.assertIsInstance(got, rh.Unresolved)
+                self.assertEqual(sleeps, 0)
+
+    def test_a_document_that_disappears_while_waiting_is_unknown(self):
+        now = [0.0]
+
+        def sleep(s):
+            now[0] += s
+            os.unlink(self.path)
+        Path(self.path).write_text(json.dumps(self.doc(3)))
+        for name, fn in (("_sleep", sleep), ("_monotonic", lambda: now[0])):
+            real = getattr(bi, name)
+            setattr(bi, name, fn)
+            self.addCleanup(setattr, bi, name, real)
+        got = bi.read_progressing(self.live(), self.sd, "[1] (zz-r1)")
+        self.assertEqual(got.reason, "[1] (zz-r1) has written no status document yet")
+
+    def fresh(self):
+        if os.path.lexists(self.path):
+            os.unlink(self.path)
 
     def test_no_document_a_bad_document_or_a_symlink_is_unknown(self):
         self.assertEqual(bi.read_status(self.live(), self.sd, "[1] (zz-r1)").reason,
@@ -577,9 +694,32 @@ class DockerReadersTest(unittest.TestCase):
 
     def test_state_sharers_that_cannot_all_be_inspected_are_unknown(self):
         for second in ((1, "", "No such container"), (0, "[]", ""), (0, "not json", ""),
-                       (0, json.dumps([{"Id": "2" * 64, "Mounts": "x"}]), "")):
+                       (0, json.dumps([{"Id": "2" * 64, "Mounts": "x"}]), ""),
+                       (0, json.dumps([{}]), ""),
+                       (0, json.dumps([{"Id": "2" * 64}]), ""),
+                       (0, json.dumps([{"Mounts": []}]), ""),
+                       (0, json.dumps([{"Id": "3" * 64, "Mounts": []}]), "")):
             with self.subTest(second=second):
                 run, _ = self.runner((0, "2" * 64 + "\n", ""), second)
+                self.assertIsInstance(bi.state_sharers(["docker"], "/zz/state", "1" * 64, run), rh.Unresolved)
+
+    def test_state_sharers_with_a_genuine_empty_mount_list_is_empty(self):
+        run, _ = self.runner((0, "2" * 64 + "\n", ""), (0, json.dumps([{"Id": "2" * 64, "Mounts": []}]), ""))
+        self.assertEqual(bi.state_sharers(["docker"], "/zz/state", "1" * 64, run), [])
+
+    def test_state_sharers_with_a_malformed_mount_row_is_unknown(self):
+        for row in ("x", {}, {"Source": "/a"}, {"Destination": "/a"}, {"Source": None, "Destination": "/a"},
+                    {"Source": "/a", "Destination": 1}):
+            with self.subTest(row=row):
+                docs = [{"Id": "2" * 64, "Mounts": [row]}]
+                run, _ = self.runner((0, "2" * 64 + "\n", ""), (0, json.dumps(docs), ""))
+                self.assertIsInstance(bi.state_sharers(["docker"], "/zz/state", "1" * 64, run), rh.Unresolved)
+
+    def test_state_sharers_with_two_answers_one_without_an_id_is_unknown(self):
+        listing = (0, "2" * 64 + "\n" + "3" * 64 + "\n", "")
+        for docs in ([{"Mounts": []}, {"Id": "3" * 64, "Mounts": []}], [None, {"Id": "3" * 64, "Mounts": []}]):
+            with self.subTest(docs=docs):
+                run, _ = self.runner(listing, (0, json.dumps(docs), ""))
                 self.assertIsInstance(bi.state_sharers(["docker"], "/zz/state", "1" * 64, run), rh.Unresolved)
 
     def test_an_image_without_labels_has_none(self):
@@ -666,11 +806,31 @@ class InstallAndVerifyTest(unittest.TestCase):
         return SimpleNamespace(router=router(), hub=None, secrets=None, overlay_path="/zz/overlay/plugin.py",
                                overlay_pin={"sha256": "c" * 64})
 
-    def status_doc(self, began, sha="c" * 64):
-        return json.dumps({"started_ts": began[:19] + "Z", "process_started_ts": began, "polls": 4,
-                           "transport_plugin": {"path": "/zz/overlay/plugin.py", "sha256": sha}})
+    def status_doc(self, began, sha="c" * 64, polls=4):
+        return json.dumps({"started_ts": began[:19] + "Z", "process_started_ts": began, "polls": polls,
+                           "interval_s": 5.0, "transport_plugin": {"path": "/zz/overlay/plugin.py", "sha256": sha}})
 
-    def hop_outcome(self, on_disk, written_on_first_inspect=None, others=(), ps_rc=0):
+    def test_a_fresh_container_is_read_until_its_document_advances(self):
+        """No exit recorded: verify waits for the running router's next
+        poll. The document advances on the first sleep, and the claim
+        reports it."""
+        advanced = self.status_doc("2026-10-15T10:00:00.050000Z", polls=5)
+        c, e = self.hop_outcome(self.status_doc("2026-10-15T10:00:00.050000Z"), finished="0001-01-01T00:00:00Z",
+                                on_sleep=lambda path: Path(path).write_text(advanced))
+        self.assertEqual((c.result, e.get("observed_sha256")), (rh.PASS, "c" * 64))
+        self.assertEqual(self.events, ["inspect", "read", "sleep", "read", "ps", "inspect"])
+
+    def test_a_fresh_container_whose_document_never_advances_is_unknown(self):
+        """Codex's witness at the verify level: an earlier run's document,
+        published after Created, and nothing running writes it."""
+        c, e = self.hop_outcome(self.status_doc("2026-10-15T10:00:00.050000Z", sha="a" * 64),
+                                finished="0001-01-01T00:00:00Z")
+        self.assertEqual(c.result, rh.UNKNOWN)
+        self.assertIn("did not advance", c.reason)
+        self.assertNotIn("observed_sha256", e)
+
+    def hop_outcome(self, on_disk, written_on_first_inspect=None, others=(), ps_rc=0,
+                    finished="2026-10-15T09:59:59.950000000Z", on_sleep=None):
         """build_identity_outcome on a hop host whose [1] mounts its state
         directory by identity; `on_disk` is status.json when verify starts,
         and the router rewrites it with `written_on_first_inspect` as the
@@ -682,8 +842,17 @@ class InstallAndVerifyTest(unittest.TestCase):
         os.makedirs(sd)
         status = os.path.join(sd, bi.STATUS_NAME)
         Path(status).write_text(on_disk)
-        live = container(mounts=[{"Type": "bind", "Source": sd, "Destination": sd, "RW": True}])
+        live = container(mounts=[{"Type": "bind", "Source": sd, "Destination": sd, "RW": True}], finished=finished)
         other_docs = [o(sd) for o in others]
+        now = [0.0]
+
+        def sleep(seconds):
+            self.events.append("sleep")
+            now[0] += seconds
+            if on_sleep is not None:
+                on_sleep(status)
+        self.patch(bi, "_sleep", sleep)
+        self.patch(bi, "_monotonic", lambda: now[0])
         self.events = []
 
         def run(argv, **k):

@@ -33,10 +33,13 @@ document must refuse, not read as "nothing deployed".
 """
 
 import calendar
+import errno
+import json
 import os
 import posixpath
-import json
 import re
+import stat
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set
@@ -56,6 +59,16 @@ ID_HOP, ID_HUB, ID_CONNECTOR, ID_PLUGIN = "build.hop_router", "build.hub_router"
 #: member, its digest key, and the process start that binds it.
 PLUGIN_MEMBER, PLUGIN_SHA256, PROCESS_START = "transport_plugin", "sha256", "process_started_ts"
 STATUS_NAME = "status.json"
+#: The most of a status document verify reads.
+MAX_STATUS_BYTES = 16 * 2 ** 20
+#: When the engine records no exit for a container, its status document is
+#: taken only after the reader has seen it advance: `polls` rising under the
+#: same process start, within this many of the document's own poll
+#: intervals, re-read every PROGRESS_STEP_S. A document whose interval would
+#: make that wait longer than MAX_PROGRESS_WAIT_S is not waited for.
+PROGRESS_INTERVALS = 2
+PROGRESS_STEP_S = 0.5
+MAX_PROGRESS_WAIT_S = 120.0
 
 _HEX40 = re.compile(r"[0-9a-f]{40}")
 _HEX64 = re.compile(r"[0-9a-f]{64}")
@@ -296,7 +309,10 @@ def read_status(live: Any, state_dir: str, who: str,
                 read: Callable[[str], bytes] = lambda p: _read_nofollow(p)) -> Any:
     """The router's status document, read now from the state directory the
     inspected container `live` itself mounts (by identity, as the router's
-    docker/run.sh mounts it): the document, or an Unresolved."""
+    docker/run.sh mounts it): the document, or an Unresolved. A second mount
+    of the container's own at or below the state directory is refused; one
+    whose Destination reaches the state directory only through a symlink
+    inside the container's image is not seen (residue)."""
     mounts = [m for m in (live.get("Mounts") or []) if isinstance(m, dict)] if isinstance(live, dict) else []
     hits = [m for m in mounts if m.get("Destination") == state_dir]
     if len(hits) != 1 or hits[0].get("Source") != state_dir:
@@ -319,6 +335,55 @@ def read_status(live: Any, state_dir: str, who: str,
     except ValueError:
         return rh.Unresolved(f"{path} is not a JSON document")
     return doc
+
+
+class Progressed(dict):
+    """A status document the reader saw advance: `polls` rose under the same
+    process start between two of its reads."""
+
+
+def no_recorded_exit(live: Any) -> bool:
+    """Whether the engine records no exit for `live` since its creation (a
+    zero FinishedAt), or does not say."""
+    created = _ns(live.get("Created")) if isinstance(live, dict) else None
+    state = live.get("State") if isinstance(live, dict) else None
+    finished = _ns(state.get("FinishedAt")) if isinstance(state, dict) else None
+    return created is None or finished is None or finished < created
+
+
+def read_progressing(live: Any, state_dir: str, who: str) -> Any:
+    """read_status, then again every PROGRESS_STEP_S until `polls` rises under
+    the same PROCESS_START, for at most PROGRESS_INTERVALS of the document's
+    own `interval_s`: the later document as Progressed, or an Unresolved."""
+    first = read_status(live, state_dir, who)
+    if not isinstance(first, dict):
+        return first
+    interval, polls, began = first.get("interval_s"), first.get("polls"), first.get(PROCESS_START)
+    if not isinstance(interval, (int, float)) or isinstance(interval, bool) or not 0 < interval \
+            or interval * PROGRESS_INTERVALS > MAX_PROGRESS_WAIT_S or not isinstance(polls, int) \
+            or isinstance(polls, bool):
+        return rh.Unresolved(f"{who}'s status document has no usable interval_s and polls, so its writer "
+                             "cannot be seen to advance it")
+    deadline = _monotonic() + interval * PROGRESS_INTERVALS
+    while _monotonic() < deadline:
+        _sleep(PROGRESS_STEP_S)
+        doc = read_status(live, state_dir, who)
+        if not isinstance(doc, dict):
+            return doc
+        later = doc.get("polls")
+        if doc.get(PROCESS_START) == began and isinstance(later, int) and not isinstance(later, bool) \
+                and later > polls:
+            return Progressed(doc)
+    return rh.Unresolved(f"{who}'s status document did not advance within {PROGRESS_INTERVALS} poll "
+                         "intervals, so it is not shown to be written by the running process")
+
+
+def _sleep(seconds: float) -> None:
+    time.sleep(seconds)
+
+
+def _monotonic() -> float:
+    return time.monotonic()
 
 
 def state_sharers(docker: List[str], state_dir: str, own_id: Any,
@@ -372,18 +437,25 @@ def state_sharers(docker: List[str], state_dir: str, own_id: Any,
         docs = json.loads(q.out) if q.rc == 0 else None
     except ValueError:
         docs = None
-    if not isinstance(docs, list) or len(docs) != len(ids):
+    if not isinstance(docs, list):
         return rh.Unresolved(f"the other containers cannot all be inspected, so the ones sharing {state_dir} "
                              "cannot be ruled out")
+    if sorted(str(d.get("Id")) if isinstance(d, dict) else "" for d in docs) != sorted(ids):
+        return rh.Unresolved(f"docker inspect did not answer for every other container, so the ones sharing "
+                             f"{state_dir} cannot be ruled out")
     sharers = []
     for doc in docs:
-        mounts = (doc.get("Mounts") or []) if isinstance(doc, dict) else None
+        mounts = doc.get("Mounts")
         if not isinstance(mounts, list):
             return rh.Unresolved(f"docker inspect shows no mounts for a container, so it cannot be ruled out "
                                  f"as sharing {state_dir}")
+        if not all(isinstance(m, dict) and isinstance(m.get("Source"), str)
+                   and isinstance(m.get("Destination"), str) for m in mounts):
+            return rh.Unresolved(f"docker inspect shows a mount without its source and destination, so a "
+                                 f"container cannot be ruled out as sharing {state_dir}")
         for m in mounts:
-            src = m.get("Source") if isinstance(m, dict) else None
-            if isinstance(src, str) and src.startswith("/") and _overlaps(src, state_dir):
+            src = m["Source"]
+            if src.startswith("/") and _overlaps(src, state_dir):
                 sharers.append(doc.get("Id"))
                 break
     return sharers
@@ -409,9 +481,19 @@ def _overlaps(a: str, b: str) -> bool:
 
 
 def _read_nofollow(path: str) -> bytes:
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-    with os.fdopen(fd, "rb") as f:
-        return f.read()
+    """A regular file's bytes, at most MAX_STATUS_BYTES: never through a
+    symlink, and never blocking on a FIFO or a device (O_NONBLOCK, then
+    fstat before any read)."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(errno.EINVAL, "not a regular file")
+        data = os.read(fd, MAX_STATUS_BYTES + 1)
+    finally:
+        os.close(fd)
+    if len(data) > MAX_STATUS_BYTES:
+        raise OSError(errno.EFBIG, f"larger than {MAX_STATUS_BYTES} bytes")
+    return data
 
 
 def hop_plugin(role: str, container: str, before: Any, published: Any, after: Any, pin_sha256: str) -> Claim:
@@ -475,6 +557,16 @@ def hop_plugin(role: str, container: str, before: Any, published: Any, after: An
     if created is None or finished is None:
         return unknown(f"docker inspect of {who} does not say when it was created and last exited, so "
                        "an earlier run's document cannot be excluded")
+    # No exit recorded since creation: the bound is Created alone, which
+    # holds only for a first run. Docker Engine 29.8.1 keeps FinishedAt
+    # across a stop and start, but an engine that cleared it would make a
+    # container that has run before look the same. So a document is taken
+    # only when the reader saw it advance (read_progressing): its writer is
+    # running now, and the sharing and own-mount checks leave [1]'s current
+    # process as the only running writer of that file.
+    if finished < created and not isinstance(published, Progressed):
+        return unknown(f"the engine shows no previous exit for {who}, and its status document was not seen "
+                       "to advance, so an earlier run's document cannot be excluded")
     if began < max(created, finished):
         return unknown(f"the status document is from an earlier run of {who}")
     return Claim(ID_PLUGIN, rh.check(claim, want, sha, remedy), {"observed_sha256": sha}, role)
