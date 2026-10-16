@@ -657,7 +657,7 @@ class InstallRenderTest(unittest.TestCase):
         return rc, out.getvalue() + err.getvalue()
 
     def test_plain_install_never_renders_delegation_whatever_the_policy(self):
-        """d2.7 §AB: only A1's staged bytes and A3's A1 + T carry the block;
+        """Only A1's staged bytes and A3's A1 + T carry the block;
         plain install --apply is delegation-free with the policy turning it
         on, so it is the back-out after A3's place."""
         import argparse, contextlib, io

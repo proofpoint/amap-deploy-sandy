@@ -520,7 +520,7 @@ class ProspectiveActTest(unittest.TestCase):
         self.assertEqual(self.incident().pending(), [])
 
     def test_a_running_local_router_by_name_is_never_stop_not_required(self):
-        """(viii-c): delegation placed, [1] restarted on it, then removed
+        """Delegation placed, [1] restarted on it, then removed
         from the file without a restart."""
         self.named_running = True
         self.act()
@@ -544,7 +544,7 @@ class ProspectiveActTest(unittest.TestCase):
         self.assertEqual(self.kinds()[-1], "stop_not_attempted")
 
     def test_a_live_removal_anywhere_in_the_history_keeps_the_stop_pending(self):
-        """(viii-b): the child removed a live delegation (a bare rewrite_ok);
+        """The child removed a live delegation (a bare rewrite_ok);
         the next act observes none, and still may not call the stop needless."""
         self.router.delegation = True
         self.act()
