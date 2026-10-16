@@ -1136,13 +1136,18 @@ def partition_host(spec: Spec) -> Any:
 
 
 def host_view(spec: Spec) -> Any:
-    """The host's platform, and the live config's device, inode and ctime
+    """The document's declared supervision, the host's platform, kernel
+    boot_id and the live config's filesystem type, device, inode and ctime
     with the host's clock, read together: the host stamps that ctime."""
     try:
         st = os.stat(spec.keys.local_config)
+        boot = open("/proc/sys/kernel/random/boot_id").read().strip() if sys.platform == "linux" else None
+        fs = hk.mount_fstype(spec.keys.local_config, open("/proc/self/mountinfo").read()) \
+            if sys.platform == "linux" else None
     except OSError as e:
-        return rh.Unresolved(f"cannot inspect {spec.keys.local_config}: {e}")
-    return {"platform": sys.platform, "dev": st.st_dev, "ino": st.st_ino, "ctime_ns": st.st_ctime_ns,
+        return rh.Unresolved(f"cannot inspect {spec.keys.local_config} or the host's kernel: {e}")
+    return {"kind": spec.supervision.kind if spec.supervision is not None else None, "platform": sys.platform,
+            "boot_id": boot, "fstype": fs, "dev": st.st_dev, "ino": st.st_ino, "ctime_ns": st.st_ctime_ns,
             "now": time.time()}
 
 

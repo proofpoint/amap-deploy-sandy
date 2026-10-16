@@ -592,7 +592,30 @@ def verify_signing(ks: KeySpec, raw: Any, bind: rh.Check, sg: Signing) -> rh.Che
 #: The config the local router reads, read from inside its container in one
 #: exec: its identity, its change time, its size, its bytes' sha256, and the
 #: container's own clock.
-CONFIG_TUPLE_SCRIPT = ("import hashlib,json,os,time\n"
+#: The filesystem type of the mount holding `path`, from mountinfo's text:
+#: the longest mount point at or above it (its escapes decoded), the type
+#: after the " - " separator. Shared verbatim by the host step and the
+#: in-container script, so both sides answer by one rule.
+MOUNT_FSTYPE_SRC = (
+    "def mount_fstype(path, text):\n"
+    "    best = None\n"
+    "    for line in text.splitlines():\n"
+    "        head, sep, tail = line.partition(' - ')\n"
+    "        f = head.split()\n"
+    "        if not sep or len(f) < 5 or not tail.split():\n"
+    "            continue\n"
+    "        mp = f[4].encode('latin-1').decode('unicode_escape')\n"
+    "        if path == mp or path.startswith(mp.rstrip('/') + '/'):\n"
+    "            if best is None or len(mp) >= len(best[0]):\n"
+    "                best = (mp, tail.split()[0])\n"
+    "    return best[1] if best else None\n")
+_ns: Dict[str, Any] = {}
+exec(MOUNT_FSTYPE_SRC, _ns)  # noqa: S102 -- this module's own constant, so the host and container rule is one text
+mount_fstype = _ns["mount_fstype"]
+#: Filesystems whose inode timestamps Linux stamps from its coarse clock with
+#: 1 ns granularity, and that hold the inode locally: the supported set.
+LOCAL_FS = ("ext4", "xfs", "btrfs")
+CONFIG_TUPLE_SCRIPT = ("import hashlib,json,os,time\n" + MOUNT_FSTYPE_SRC +
                        "p=os.environ['ROUTER_CONFIG']\n"
                        "fd=os.open(p,os.O_RDONLY)\n"
                        "st=os.fstat(fd)\n"
@@ -601,9 +624,11 @@ CONFIG_TUPLE_SCRIPT = ("import hashlib,json,os,time\n"
                        "    c=os.read(fd,65536)\n"
                        "    if not c: break\n"
                        "    b+=c\n"
+                       "boot=open('/proc/sys/kernel/random/boot_id').read().strip()\n"
+                       "fs=mount_fstype(p,open('/proc/self/mountinfo').read())\n"
                        "print(json.dumps({'dev':st.st_dev,'ino':st.st_ino,'ctime_ns':st.st_ctime_ns,'size':st.st_size,"
-                       "'sha256':hashlib.sha256(b).hexdigest(),'now':time.time()}))\n")
-TUPLE_KEYS = ("dev", "ino", "ctime_ns", "size", "sha256")
+                       "'sha256':hashlib.sha256(b).hexdigest(),'now':time.time(),'boot_id':boot,'fstype':fs}))\n")
+TUPLE_KEYS = ("dev", "ino", "ctime_ns", "size", "sha256", "boot_id", "fstype")
 #: How long the config must have been quiet before the window opens, on the
 #: host's clock: far beyond the kernel's ctime tick (its coarse clock, 1/HZ
 #: with HZ >= 100, at most 10 ms), the only tick the supported platform has.
@@ -626,8 +651,29 @@ def ask_config_tuple(spec: Any, container: str) -> Any:
     ok = isinstance(doc, dict) and all(isinstance(doc.get(k), int) and not isinstance(doc.get(k), bool)
                                        for k in ("dev", "ino", "ctime_ns", "size")) \
         and isinstance(doc.get("sha256"), str) and _HEX64.fullmatch(doc["sha256"]) \
-        and isinstance(doc.get("now"), (int, float))
+        and isinstance(doc.get("now"), (int, float)) and isinstance(doc.get("boot_id"), str) and doc["boot_id"] \
+        and (doc.get("fstype") is None or isinstance(doc.get("fstype"), str))
     return doc if ok else rh.Unresolved(f"{container} printed a malformed config identity")
+
+
+def platform_problem(host: Dict[str, Any], seen: Dict[str, Any]) -> str:
+    """Why the host and the router's view of its config are not the
+    supported platform, or "": the document declares a Linux host
+    (systemd), verify runs on Linux, one kernel (the same boot_id), one
+    inode (device, inode and ctime), on a local ext4, xfs or btrfs as both
+    sides' mountinfo shows it."""
+    if host.get("kind") != "systemd":
+        return "the host-setup document declares no Linux host (its supervision is not systemd)"
+    if host.get("platform") != "linux":
+        return "verify does not run on Linux"
+    if host.get("boot_id") != seen.get("boot_id"):
+        return "the router's container runs on another kernel (its boot_id differs)"
+    if host.get("fstype") not in LOCAL_FS or host.get("fstype") != seen.get("fstype"):
+        return (f"the config's filesystem is {host.get('fstype')!r} on the host and {seen.get('fstype')!r} in the "
+                f"container, not one local {'/'.join(LOCAL_FS)}")
+    if (host.get("dev"), host.get("ino"), host.get("ctime_ns")) != (seen["dev"], seen["ino"], seen["ctime_ns"]):
+        return "the container reads another inode, or one with another change time"
+    return ""
 
 
 def adoption(read_tuple: Callable[[], Any], read_status: Callable[[], Any], host_sha: str, *,
@@ -644,8 +690,8 @@ def adoption(read_tuple: Callable[[], Any], read_status: Callable[[], Any], host
     process (the second's reload began after step 1), the last with no
     refused reload. 5: the same inode, change time, size and bytes: a write
     moved its ctime, which restoring the bytes cannot undo.
-    `host_view()` gives the host's {platform, dev, ino, ctime_ns, now} for
-    the live config, read in one host step."""
+    `host_view()` gives the host's {kind, platform, boot_id, fstype, dev,
+    ino, ctime_ns, now} for the live config, read in one host step."""
     t1 = read_tuple()
     if isinstance(t1, rh.Unresolved):
         return rh.UNKNOWN, f"the config the router reads cannot be identified: {t1.reason}"
@@ -654,8 +700,9 @@ def adoption(read_tuple: Callable[[], Any], read_status: Callable[[], Any], host
     h1 = host_view()
     if isinstance(h1, rh.Unresolved):
         return rh.UNKNOWN, f"the host's view of the live config cannot be read: {h1.reason}"
-    if h1["platform"] != "linux" or (h1["dev"], h1["ino"], h1["ctime_ns"]) != (t1["dev"], t1["ino"], t1["ctime_ns"]):
-        return rh.UNKNOWN, UNSUPPORTED + "; this host is not one"
+    why = platform_problem(h1, t1)
+    if why:
+        return rh.UNKNOWN, f"{UNSUPPORTED}; {why}"
     if h1["now"] - h1["ctime_ns"] / 1e9 < CTIME_SETTLE_S:
         return rh.UNKNOWN, "the config changed moments ago; run verify again"
     s0 = read_status()
@@ -688,6 +735,10 @@ def adoption(read_tuple: Callable[[], Any], read_status: Callable[[], Any], host
         return rh.UNKNOWN, f"the config the router reads cannot be identified again: {t5.reason}"
     if any(t5[k] != t1[k] for k in TUPLE_KEYS) or t5["sha256"] != host_sha:
         return rh.UNKNOWN, "the config the router reads changed while verify watched it; run verify again"
+    h5 = host_view()
+    why = h5.reason if isinstance(h5, rh.Unresolved) else platform_problem(h5, t5)
+    if why:
+        return rh.UNKNOWN, f"{UNSUPPORTED}; at the end of the window: {why}"
     return rh.PASS, "the router adopted the host's config: two polls on unchanged bytes"
 
 

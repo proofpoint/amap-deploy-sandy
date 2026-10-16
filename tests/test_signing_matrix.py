@@ -182,10 +182,11 @@ class AdoptionTest(unittest.TestCase):
 
     def a(self, ctime=None, sha=None, ino=7, dev=1):
         return {"dev": dev, "ino": ino, "ctime_ns": ctime or self.C, "size": 10, "sha256": sha or self.HOST,
-                "now": 0.0}
+                "now": 0.0, "boot_id": "boot-1", "fstype": "ext4"}
 
     def view(self, **over):
-        v = {"platform": "linux", "dev": 1, "ino": 7, "ctime_ns": self.C, "now": self.C / 1e9 + 60}
+        v = {"kind": "systemd", "platform": "linux", "boot_id": "boot-1", "fstype": "ext4", "dev": 1, "ino": 7,
+             "ctime_ns": self.C, "now": self.C / 1e9 + 60}
         v.update(over)
         return v
 
@@ -211,11 +212,26 @@ class AdoptionTest(unittest.TestCase):
         inode in one kernel, so no documented bound holds; UNKNOWN before any
         poll is waited for."""
         for name, view in (("other device", self.view(dev=99)), ("other inode", self.view(ino=8)),
-                           ("other ctime", self.view(ctime_ns=self.C + 1)), ("not linux", self.view(platform="darwin"))):
+                           ("other ctime", self.view(ctime_ns=self.C + 1)), ("not linux", self.view(platform="darwin")),
+                           ("a launchd document", self.view(kind="launchd")),
+                           ("another kernel", self.view(boot_id="boot-2")),
+                           ("a fuse share", self.view(fstype="fuse.orbstack")), ("overlay", self.view(fstype="overlay")),
+                           ("tmpfs", self.view(fstype="tmpfs")), ("unreadable mountinfo", self.view(fstype=None))):
             with self.subTest(case=name):
                 result, why = self.run_it([self.a()], [], host=lambda v=view: v)
                 self.assertEqual(result, rh.UNKNOWN)
                 self.assertIn("native-Linux single-file bind", why)
+
+    def test_the_container_s_filesystem_must_be_the_host_s(self):
+        result, why = self.run_it([dict(self.a(), fstype="xfs")], [])
+        self.assertEqual(result, rh.UNKNOWN)
+        self.assertIn("filesystem", why)
+
+    def test_the_platform_is_checked_again_at_the_end_of_the_window(self):
+        views = iter([self.view(), self.view(boot_id="boot-2")])
+        result, why = self.run_it([self.a(), self.a()], self.polls(10, 11, 12), host=lambda: next(views))
+        self.assertEqual(result, rh.UNKNOWN)
+        self.assertIn("at the end of the window", why)
 
     def test_a_config_changed_moments_ago_on_the_host_s_clock_is_unknown(self):
         young = lambda: self.view(now=self.C / 1e9 + 1)
