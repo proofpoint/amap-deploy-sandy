@@ -754,7 +754,7 @@ is required before the next, and each command prints the next step.
    tail -c 32 "$T/pub.der" > "$T/pub.raw"
    printf 'public_key '; od -An -tx1 "$T/pub.raw" | tr -d ' \n'; echo
    printf 'key_id     '; "$OPENSSL" dgst -sha256 -r "$T/pub.raw" | cut -c1-64
-   /usr/bin/sudo /usr/bin/install -o <[1]'s uid> -g <[1]'s gid> -m 0400 "$T/seed" <keys.dir>/<keys.file>
+   /usr/bin/sudo /usr/bin/install -o <the local router's uid> -g <its gid> -m 0400 "$T/seed" <keys.dir>/<keys.file>
    rm -rf "$T"
    ```
 
@@ -841,10 +841,12 @@ restart of the hub-link router after activation goes through
 window, or after the weekly run renews it.
 
 **What the outage window does to the local router.** In the local router's
-own words, two labels aside: "the local router" where it named itself, and
-"(below)" for the back-out it cited.
+own words, with only these changes to its text: "the local router" where it
+named itself or this router by a label; "(above)" for the back-out it cited;
+and two parentheses that named this deployment's internal plan reworded or
+removed.
 
-> While the local router [1] is stopped (docker stop, then A4's restart):
+> While the local router is stopped (docker stop, then A4's restart):
 >
 > WAITS ON DISK, nothing lost:
 > - agents' outbox requests, which stay in their outboxes, unconsumed;
@@ -869,15 +871,15 @@ own words, two labels aside: "the local router" where it named itself, and
 > - Outbound: a signed task this router had SIGNED but not yet HANDED OVER when it stopped, and handed after ts + P + F, will be demoted by the receiver in the same way. `python3 -m router --config C peer-request show <id>` shows its window end.
 > - Reverse-edge replies (no forward edge) must be drained within peer_reply_window_seconds of the record (default 604800 s, 7 days), and mail replies within mail_reply_window_seconds (default 7 days). Irrelevant for a planned outage of minutes.
 >
-> C3 (revised). For the FIRST activation of a router (the M1 case; G1 requires that the live config carries no delegation):
+> C3 (revised). For the FIRST activation of a router (before activation, the live config carries no delegation):
 > - C2's OUTBOUND clause cannot apply. A router without delegation never signed anything, so no signed task is waiting to be handed over.
 > - C2's INBOUND clause applies only where this host's rendering turns `inbound` on, and only to signed statements that peers address to this router during the window.
 >   - While the router has no delegation (or inbound is off) it takes no signed candidates at all: they wait in the hop intake untouched (peerjournal.poll returns before reading them).
 >   - After A4 starts it with delegation and inbound, each waiting statement is judged against the window: ts below (now - P) is DEMOTED (quarantined, plus a "demoted" control notice to its sender), never dropped.
-> - A2 is NEVER interrupted. The operator starts A2 immediately after `docker stop <router>`, with no other step between them, and waits until A2's process is OBSERVED to exit. Neither number below replaces that observation: CHILD_TIMEOUT_S (3600 s) bounds only A2's wait for its child, and the writer treats a run older than STALE_AFTER_S (5320 s) as overdue, a conservative threshold and not proof that the run stopped. [1] is not started while A2's process lives. On a non-zero exit the operator takes the before-place back-out (below), after any kept incident's remedy.
+> - A2 is NEVER interrupted. The operator starts A2 immediately after `docker stop <router>`, with no other step between them, and waits until A2's process is OBSERVED to exit. Neither number below replaces that observation: CHILD_TIMEOUT_S (3600 s) bounds only A2's wait for its child, and the writer treats a run older than STALE_AFTER_S (5320 s) as overdue, a conservative threshold and not proof that the run stopped. The local router is not started while A2's process lives. On a non-zero exit the operator takes the before-place back-out (above), after any kept incident's remedy.
 > - Plan target, NOT a cancellation point: the whole window, from `docker stop <router>` to A4's start of the router on the activated config (or the back-out's start on the unchanged config), is planned to close within 30 minutes. That is half of P's default 3600 s, leaving margin for clock skew and the first poll. Missing the target cancels nothing.
 > - Worst case: the window lasts until A2 exits plus the steps after it. No figure here caps it, and it can exceed P (P's default is 3600 s). However long it lasts, the only effect on the local router past P is the inbound clause above: waiting signed statements older than now - P are demoted, each with a notice to its sender, and none is dropped. Local delivery and hand-over simply wait, as C1 says. Nothing on disk is lost, and the restart drains with no operator step. The 7-day reply windows are the only later limit, and only an outage measured in days would reach them.
-> - If no peer signs tasks to this router before its own activation (the canary's order), the inbound clause has nothing to act on, and the window only bounds the local-delivery and hand-over outage C1 describes, however long A2 runs.
+> - If no peer signs tasks to this router before its own activation, the inbound clause has nothing to act on, and the window only bounds the local-delivery and hand-over outage C1 describes, however long A2 runs.
 
 `verify` passes the signing check only when the router
 signs exactly as the policy and the gate allow, under the token of current
