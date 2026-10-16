@@ -414,7 +414,10 @@ class ReadStatusTest(unittest.TestCase):
             with self.subTest(label):
                 live = container(mounts=[ident])
                 change(live)
-                got = bi.read_status(live, self.sd, "[1] (zz-r1)")
+                try:
+                    got = bi.read_status(live, self.sd, "[1] (zz-r1)")
+                except Exception as e:  # noqa: BLE001 -- the shape check is total: nothing may escape it
+                    self.fail(f"read_status raised {type(e).__name__}: {e}")
                 self.assertIsInstance(got, rh.Unresolved)
 
     def test_a_tmpfs_at_or_below_the_state_directory_is_unknown(self):
@@ -685,11 +688,13 @@ class HubReaderTest(unittest.TestCase):
     def test_the_reader_stops_at_a_drop_too(self):
         """Opus R2: a lower count ends the reader's wait and is taken; the
         host then refuses it."""
-        Path(self.path).write_text(json.dumps(self.doc(5)))
-        self.later(0.15, self.doc(4))
+        # A one-second interval gives a two-second window, far wider than
+        # the 0.3 s before the drop is written, so the row does not race.
+        Path(self.path).write_text(json.dumps(self.doc(5, interval=1.0)))
+        self.later(0.3, self.doc(4, interval=1.0))
         p, _ = self.run_reader()
         out = json.loads(p.stdout)
-        self.assertEqual((p.returncode, out["taken"]), (0, self.doc(4)))
+        self.assertEqual((p.returncode, out["taken"]), (0, self.doc(4, interval=1.0)))
         self.assertIsInstance(bi.judge_hub_output(out, "[2] (zz-hub)"), rh.Unresolved)
 
     def test_the_margin_extends_the_window(self):
@@ -714,6 +719,15 @@ class HubReaderTest(unittest.TestCase):
                 p, took = self.run_reader()
                 self.assertEqual((p.returncode, p.stdout), (10, ""))
                 self.assertLess(took, 5.0)
+
+    def test_a_start_that_is_not_a_string_exits_10(self):
+        """Opus X10: the reader's instant() refuses a non-string, never
+        raising (rc 1)."""
+        for began in (1792058400.05, None, ["2026-10-15T10:00:00.050000Z"]):
+            with self.subTest(began=began):
+                Path(self.path).write_text(json.dumps(self.doc(3, began=began)))
+                p, _ = self.run_reader()
+                self.assertEqual((p.returncode, p.stdout), (10, ""))
 
     def test_a_later_document_not_admitted_exits_10(self):
         cases = {"not an object": [4], "no interval": {"progress": 4, "process_started_ts": "2026-10-15T10:00:00.05Z"},
@@ -878,6 +892,11 @@ class HubJudgeTest(unittest.TestCase):
         got = self.judge(self.doc(big), [self.entry(big)], self.doc(big + 1))
         self.assertIsInstance(got, rh.Unresolved)
         self.assertIn("malformed observation", got.reason)
+
+    def test_an_interval_that_is_a_bool_is_unknown(self):
+        """Opus X7: True is an int to Python, and is still no interval."""
+        self.assertIsInstance(self.judge(self.doc(5, True), [], self.doc(6, True)), rh.Unresolved)
+        self.assertFalse(bi._interval(True))
 
     def test_a_first_document_with_a_bool_count_is_unknown(self):
         """Opus H3: True is an int to Python, and is still no count."""
@@ -1072,6 +1091,17 @@ class RunCaptureTest(unittest.TestCase):
         with self.assertRaises(rh.CannotRun) as e:
             self.run_real([sys.executable, "-I", "-S", "-c", "print('x' * 5000)"], timeout=10, max_output=100)
         self.assertIn("printed more than 100 bytes", str(e.exception))
+
+    def test_a_child_that_prints_past_the_bound_and_keeps_running_is_killed_at_once(self):
+        """The in-loop check: without it the child would run to its timeout
+        and be refused as unfinished, not as printing too much."""
+        started = time.monotonic()
+        with self.assertRaises(rh.CannotRun) as e:
+            self.run_real([sys.executable, "-I", "-S", "-c",
+                           "import sys, time\nsys.stdout.write('x' * 5000); sys.stdout.flush()\ntime.sleep(30)"],
+                          timeout=10, max_output=100)
+        self.assertIn("printed more than 100 bytes", str(e.exception))
+        self.assertLess(time.monotonic() - started, 9)
 
     def test_output_within_the_bound_is_returned(self):
         p = self.run_real([sys.executable, "-I", "-S", "-c", "print('ok')"], timeout=10, max_output=100)
@@ -1726,8 +1756,13 @@ class InstallAndVerifyTest(unittest.TestCase):
         """Opus 8: hardening; the engine never emits it."""
         live = self.hub_live()
         live["Config"] = "x"
-        self.assertIsInstance(bi.ledger_env_refusal(live, "/data/ledger", "[2] (zz-hub)"), rh.Unresolved)
-        self.assertEqual(bi.hub_router("zz-hub", COMMIT, live, {LABEL: COMMIT}).check.result, rh.PASS)
+        try:
+            env = bi.ledger_env_refusal(live, "/data/ledger", "[2] (zz-hub)")
+            hub = bi.hub_router("zz-hub", COMMIT, live, {LABEL: COMMIT}).check.result
+        except Exception as e:  # noqa: BLE001 -- both are total: nothing may escape them
+            self.fail(f"a non-object Config raised {type(e).__name__}: {e}")
+        self.assertIsInstance(env, rh.Unresolved)
+        self.assertEqual(hub, rh.PASS)
 
     def test_a_hub_section_with_no_engine_makes_1s_claim_unknown(self):
         """Opus H11: [1]'s state directory must also be listed on [2]'s
