@@ -475,3 +475,116 @@ class LifecycleTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ProspectiveActTest(unittest.TestCase):
+    """A2's incident: observe first, and stop_not_required only when nothing
+    in the incident's history, and nothing running, could be signing. The
+    history is read back through the library's own strict reader."""
+
+    def setUp(self):
+        t = tempfile.TemporaryDirectory()
+        self.addCleanup(t.cleanup)
+        self.dir = t.name
+        self.router = Router()
+        self.router.delegation = False          # pre-activation: the live config has none
+        self.router.running = {}                # no certified target exists
+        self.named_running = False              # the plan's [1] is stopped for A2
+        self.rewrites = []
+
+    def effects(self):
+        fx = self.router.effects()
+        real = fx.rewrite
+        fx.rewrite = lambda: (self.rewrites.append(1), real())[1]
+        fx.router_running = lambda: self.named_running
+        return fx
+
+    def act(self, identity=None):
+        return called(self, pi.act, pi.Store(), self.effects(), evidence_dir=self.dir, run_id="r1", at=AT,
+                      failing=["P04"], token=None, identity=identity, evidence_persisted=True,
+                      emit=lambda s: None, mode="prospective")
+
+    def incident(self):
+        found = pi.read_all(pi.Store(), self.dir)
+        self.assertEqual(len(found), 1)
+        return found[0]
+
+    def kinds(self):
+        return [e["event"] for e in self.incident().events]
+
+    def test_nothing_live_and_nothing_running_needs_no_stop(self):
+        self.act()
+        self.assertEqual(self.kinds(), ["rewrite_ok", "stop_not_required"])
+        self.assertEqual(self.rewrites, [])                      # the live config was never replaced
+        self.assertEqual(self.incident().detected["mode"], "prospective")
+        self.assertEqual(self.incident().pending(), [])
+
+    def test_a_running_local_router_by_name_is_never_stop_not_required(self):
+        """Delegation placed, [1] restarted on it, then removed
+        from the file without a restart."""
+        self.named_running = True
+        self.act()
+        self.assertEqual(self.kinds(), ["rewrite_ok", "stop_not_attempted"])
+        self.assertEqual(self.incident().pending(), ["stop"])
+
+    def test_the_remedy_follows_the_history(self):
+        self.named_running = True
+        self.act()
+        self.assertIn("then run the ordinary partition-weekly", self.incident().events[-1]["reason"])
+        self.router.delegation = True
+        t = tempfile.TemporaryDirectory()
+        self.addCleanup(t.cleanup)
+        self.dir = t.name
+        self.act()
+        self.assertIn("record resolved", self.incident().events[-1]["reason"])
+
+    def test_an_engine_that_cannot_say_is_never_stop_not_required(self):
+        self.named_running = rh.Unresolved("no engine")
+        self.act()
+        self.assertEqual(self.kinds()[-1], "stop_not_attempted")
+
+    def test_an_engine_that_cannot_say_about_the_certified_target_is_never_stop_not_required(self):
+        """The certified identity cannot be inspected while nothing runs
+        under the local router's name: the stop is still owed."""
+        self.router.inspect_error = "no engine"
+        self.act(identity=ID)
+        self.assertEqual(self.kinds(), ["rewrite_ok", "stop_not_attempted"])
+        self.assertEqual(self.incident().pending(), ["stop"])
+
+    def test_a_live_removal_anywhere_in_the_history_keeps_the_stop_pending(self):
+        """The child removed a live delegation (a bare rewrite_ok);
+        the next act observes none, and still may not call the stop needless."""
+        self.router.delegation = True
+        self.act()
+        self.assertEqual(self.kinds(), ["rewrite_ok", "stop_not_attempted"])
+        self.act()
+        kinds = self.kinds()
+        self.assertEqual(kinds, ["rewrite_ok", "stop_not_attempted", "rewrite_ok", "stop_not_attempted"])
+        self.assertNotIn("stop_not_required", kinds)
+        self.assertEqual(self.incident().pending(), ["stop"])
+
+    def test_a_running_certified_target_is_stopped_as_the_weekly_job_stops_it(self):
+        self.router.running = {ID: True}
+        self.act(identity=ID)
+        self.assertEqual(self.kinds(), ["rewrite_ok", "stop_ok"])
+        self.assertEqual(self.router.stops, [ID])
+
+    def test_a_weekly_incident_never_closes_on_stop_not_required(self):
+        inc = pi.Incident("r1", {"run_id": "r1"}, [{"event": "rewrite_ok", "observed": pi.NO_DELEGATION},
+                                                   {"event": "stop_not_required", "reason": "x"}])
+        self.assertEqual(inc.pending(), ["stop"])
+
+
+class ProspectivePendingTest(unittest.TestCase):
+
+    def test_stop_not_required_closes_nothing_after_a_live_removal(self):
+        """The reader holds the history-wide rule itself: a history in which a
+        live delegation was removed, whoever then wrote stop_not_required,
+        keeps its stop pending."""
+        detected = {"run_id": "r1", "mode": "prospective"}
+        tail = [{"event": "rewrite_ok", "observed": pi.NO_DELEGATION}, {"event": "stop_not_required", "reason": "x"}]
+        self.assertEqual(pi.Incident("r1", detected, tail).pending(), [])
+        for head in ({"event": "rewrite_ok"}, {"event": "rewrite_failed", "reason": "EIO"}):
+            with self.subTest(head=head["event"]):
+                history = [head, {"event": "stop_not_attempted", "reason": "x"}] + tail
+                self.assertEqual(pi.Incident("r1", detected, history).pending(), ["stop"])
