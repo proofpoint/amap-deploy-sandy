@@ -219,8 +219,11 @@ difference.
 
 `verify` has three outcomes: PASS, FAIL and **UNKNOWN**. UNKNOWN is reported
 as a problem, never as a pass: a router that cannot be read is not a router
-that is fine. `--host-facts PATH` writes the router sections as JSON for the
-router's operator console, on every exit.
+that is fine. `--host-facts PATH` writes the router sections, and the
+"runtime builds" phase (what each running runtime was built from: the local
+router's image and pin, the hub-link router's revision label, the connector
+payload's stamp, the transport plugin), as JSON for the router's operator
+console, on every exit.
 
 ## Everyday tasks
 

@@ -1119,9 +1119,9 @@ class HostFactsDocumentTest(FleetTestCase):
         c3 = rh.unknown(claim="c", expected=f, reason="no docker", remedy="fix docker")
         return [rh.Outcome(rh.SECTIONS[0], [c1, c2]), rh.Outcome(rh.SECTIONS[1], [c3])]
 
-    def test_schema_two_from_verify_with_the_two_section_ids(self):
+    def test_schema_three_from_verify_with_the_router_section_ids(self):
         doc = rh.host_facts_doc(self._outcomes(), rh.EXIT_FAILED)
-        self.assertEqual(doc["schema"], 2)
+        self.assertEqual(doc["schema"], 3)
         self.assertEqual(doc["generated_by"], "amap-sandy.py verify")
         self.assertEqual([p["id"] for p in doc["phases"]], ["router-container", "router-health"])
         self.assertEqual(doc["exit_status"], 1)
@@ -1150,7 +1150,7 @@ class HostFactsDocumentTest(FleetTestCase):
     def test_it_is_written_atomically_and_leaves_no_temp_file(self):
         path = self.tmp / "facts" / "host.json"
         rh.write_host_facts(path, self._outcomes(), rh.EXIT_OK)
-        self.assertEqual(json.loads(path.read_text())["schema"], 2)
+        self.assertEqual(json.loads(path.read_text())["schema"], 3)
         self.assertEqual(sorted(p.name for p in path.parent.iterdir()), ["host.json"])
         src = ast.get_source_segment(SRC, next(
             n for n in ast.walk(TREE)

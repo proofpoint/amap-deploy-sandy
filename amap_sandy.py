@@ -79,6 +79,7 @@ import host_adapter as ha   # the host registry's CLI, run as a subprocess, neve
 import hop_router as hp     # the local router's hop keys, on a host with a hop link
 import delivery_checks as dc  # delivery itself: lister mode, session posture, daemon build, backlog
 import connector_pin as cpin  # install refuses a connector checkout not at its siblings.json pin
+import build_identity as bi  # what each running runtime was built from: verify's "runtime builds" phase
 
 # `fleet_policy.py` sits beside this module. Guarded rather than bare: this
 # module is imported by its tests and by its sibling tools, where HERE is not
@@ -1154,10 +1155,14 @@ def codex_payload_sources(codex_src: Path) -> Tuple[Tuple[str, Path, bool], ...]
 
 def install_feature_payload(home: Path, connector_src: Path, *, dry_run: bool,
                             servers_path: Path = DEFAULT_SERVERS,
-                            codex_src: Optional[Path] = None) -> str:
+                            codex_src: Optional[Path] = None,
+                            pin: Optional[cpin.PinCheck] = None) -> str:
     """Install the payload ONCE, at `$SANDY_HOME/features/amap/payload/`: the
     copied chain and binaries. Nothing rendered lives here — the fleet domain
-    reaches the wrapper as the manifest's `expose` export.
+    reaches the wrapper as the manifest's `expose` export. With the connector
+    checkout's pin check, it also writes the stamp verify's runtime-builds
+    phase reads: the commit the connector files were copied from, whether
+    that checkout was dirty, and the pin (build_identity).
 
     REAL FILES, NEVER SYMLINKS, byte-compared so an unchanged install writes
     nothing. `inbox-delivery` locates its module with `realpath(__file__)`,
@@ -1173,6 +1178,9 @@ def install_feature_payload(home: Path, connector_src: Path, *, dry_run: bool,
             raise ProvisionError(f"payload source missing or unreadable: {src_file}: {e}")
         parts.append(_write_file(dest / rel, data, dry_run=dry_run, label=rel,
                                  executable=executable))
+    if pin is not None:
+        parts.append(_write_file(dest / bi.STAMP_NAME, bi.stamp_text(pin.found, pin.dirty, pin.pinned),
+                                 dry_run=dry_run, label=bi.STAMP_NAME, executable=False))
     return "; ".join(parts)
 
 
@@ -1878,7 +1886,8 @@ def run_provision(
     try:
         report = install_feature_payload(home, args.connector_src, dry_run=dry,
                                          servers_path=args.servers,
-                                         codex_src=args.codex_connector_src)
+                                         codex_src=args.codex_connector_src,
+                                         pin=getattr(args, "connector_pin", None))
         if not codex_payload_sources(args.codex_connector_src):
             print(f"  note  no Codex connector at {args.codex_connector_src}: the payload "
                   f"has no {CODEX_PAYLOAD_SUBDIR}/, so a Codex sandbox gets no supervisor")
@@ -3760,6 +3769,72 @@ def verify_lane_sources(home: Path, slug: str) -> List[str]:
     return problems
 
 
+def _builds_spec(overlay: Optional[Path]) -> Any:
+    """The host-setup Spec for the runtime-builds phase: None when this host
+    has no host-setup document, an Unresolved when it has one that cannot be
+    read (which must refuse, never read as "nothing deployed")."""
+    if overlay is None:
+        return None
+    try:
+        sec = hsu.overlay_section(overlay)
+        return None if sec is None else hsu.load_spec(sec)
+    except ValueError as e:
+        return rh.Unresolved(f"the host-setup document cannot be read: {e}")
+
+
+def router_phases(args: argparse.Namespace, home: Path,
+                  facts: Optional["HostFacts"]) -> Tuple[rh.Ctx, List[rh.Outcome], List[str]]:
+    """verify's last read: the router's sections and the runtime-builds
+    phase. Every outcome goes into --host-facts, and every non-passing check
+    of either is a problem line (the build phase's prefixed "runtime builds"),
+    so an UNKNOWN build never leaves verify's exit clean."""
+    rctx = rh.Ctx(args, home)
+    outcomes = rh.run_sections(rctx)
+    builds = build_identity_outcome(args, home)
+    if facts is not None:
+        facts.ctx, facts.outcomes = rctx, outcomes + [builds]
+    lines = rh.problem_lines(outcomes) + rh.problem_lines([builds], prefix="runtime builds")
+    return rctx, outcomes, lines
+
+
+def build_identity_outcome(args: argparse.Namespace, home: Path) -> rh.Outcome:
+    """verify's "runtime builds" phase (build_identity): each runtime's build
+    against what the deployment recorded and siblings.json pins. [1]'s status
+    document is read fresh, inside the inspect bracket, from the state
+    directory the inspected container mounts, and then no other container,
+    in any state, may mount that directory; [2]'s router has no reader
+    here, so its plugin claim says the digest is not published."""
+    spec = _builds_spec(ha.overlay_path(getattr(args, "overlay", None)))
+    hub_docker = hsu.ss.docker(spec.secrets) if not isinstance(spec, rh.Unresolved) and spec is not None \
+        and spec.secrets is not None else ["docker"]
+
+    def inspect(role: str, name: str) -> Any:
+        return bi.inspect_container(hub_docker if role == bi.ROLE_HUB else ["docker"], name)
+
+    def status(role: str, name: str, live: Any) -> Any:
+        if role != bi.ROLE_HOP:
+            return None
+        state_dir = str(sibling_state_dir(home, getattr(args, "state_dir", None)))
+        who = f"[1] ({name})"
+        read = bi.read_progressing if bi.no_recorded_exit(live) else bi.read_status
+        doc = read(live, state_dir, who)
+        others = bi.state_sharers(["docker"], state_dir, live.get("Id"))
+        if isinstance(others, rh.Unresolved):
+            return others
+        if others:
+            return rh.Unresolved(f"another container shares {who}'s state directory {state_dir} "
+                                 f"({', '.join(str(i)[:12] for i in others)}), so the status document may be its")
+        return doc
+
+    try:
+        connector = cpin.pinned_commit()
+    except (cpin.siblings.SiblingError, OSError, KeyError, ValueError) as e:
+        connector = rh.Unresolved(f"siblings.json's connector pin cannot be read: {e}")
+    phase = bi.collect(spec, feature_payload_dir(home), hop_pin=hp.hop_pin(), connector_pin=connector,
+                       inspect=inspect, labels=lambda image: bi.image_labels(hub_docker, image), status=status)
+    return phase.outcome()
+
+
 class HostFacts:
     """What `verify --host-facts` writes, collected as the run goes so the
     document can be written on EVERY exit — including one that failed
@@ -3932,11 +4007,8 @@ def run_verify(args: argparse.Namespace, servers: Dict[str, dict], home: Path,
     # THE ROUTER PROCESS, last: its container and its health, three-valued
     # (router_health). Nothing here starts it — the remedy names the
     # router's own docker/run.sh — and every UNKNOWN is a problem by name.
-    rctx = rh.Ctx(args, home)
-    outcomes = rh.run_sections(rctx)
-    if facts is not None:
-        facts.ctx, facts.outcomes = rctx, outcomes
-    problems += rh.problem_lines(outcomes)
+    rctx, outcomes, router_problems = router_phases(args, home, facts)
+    problems += router_problems
     notes += [f"router: {w}" for w in rctx.warnings]
     passed = sum(1 for o in outcomes for c in o.checks if c.result is rh.PASS)
     total = sum(len(o.checks) for o in outcomes)
@@ -4087,9 +4159,10 @@ def run_sync(args: argparse.Namespace, home: Path, boxes_dir: Path) -> int:
     # Before anything is written: the connector checkout the payload is
     # copied from must be at its siblings.json pin (connector_pin).
     try:
-        cpin.guard(args.connector_src, override=getattr(args, "allow_unpinned_connector", None),
-                   apply=args.apply, log_dir=feature_root(home),
-                   files=(DELIVERY_DAEMON_NAME, DELIVERY_SUPPORT_NAME) + CONNECTOR_BINARIES)
+        args.connector_pin = cpin.guard(args.connector_src,
+                                        override=getattr(args, "allow_unpinned_connector", None),
+                                        apply=args.apply, log_dir=feature_root(home),
+                                        files=(DELIVERY_DAEMON_NAME, DELIVERY_SUPPORT_NAME) + CONNECTOR_BINARIES)
     except cpin.PinRefused as e:
         raise ProvisionError(str(e)) from None
     policy_path = feature_manifest_path(home)

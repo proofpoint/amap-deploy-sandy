@@ -787,6 +787,9 @@ class LoadTest(unittest.TestCase):
             "the one-shots' lock as a pipeline lock": dict(sec(), pipeline_locks=["oneshot.lock"]),
             "a probe without its port": dict(sec(), probe={"network": "n", "smtp_host": "h", "username": "u"}),
             "a zsh without its tool": dict(sec(), zsh={"version": "5.9", "module_path": "/usr/lib/zsh/5.9"}),
+            "a short image commit": dict(sec(), image_commit="c" * 12),
+            "an upper-case image commit": dict(sec(), image_commit="C" * 40),
+            "an image commit that is not a string": dict(sec(), image_commit=1),
         }
         for what, s in cases.items():
             with self.subTest(what=what):
@@ -797,6 +800,12 @@ class LoadTest(unittest.TestCase):
 
     def test_a_document_without_the_section_has_none(self):
         self.assertIsNone(hs.load_spec(host_doc()).secrets)
+
+    def test_the_image_commit_is_optional_and_kept_when_recorded(self):
+        """The commit the runtime image was built from (verify's runtime
+        builds phase); absent, the build claim is UNKNOWN, never refused."""
+        self.assertIsNone(hs.load_spec(full_doc()).secrets.image_commit)
+        self.assertEqual(hs.load_spec(full_doc(image_commit="c" * 40)).secrets.image_commit, "c" * 40)
 
 
 class PlanTest(unittest.TestCase):
