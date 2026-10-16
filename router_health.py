@@ -50,7 +50,7 @@ import re
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
@@ -88,7 +88,7 @@ DEFAULT_IMAGE = os.environ.get("IMAGE", "amap-router-local")
 # router. Generated in one place so the collision cannot be reintroduced.
 ONESHOT_PREFIX = "amap-sandy-verify"
 
-HOST_FACTS_SCHEMA = 2
+HOST_FACTS_SCHEMA = 3
 SECTION_CONTAINER = "router-container"
 SECTION_HEALTH = "router-health"
 
@@ -1354,6 +1354,11 @@ SECTIONS: Tuple[Section, ...] = (
 class Outcome:
     section: Section
     checks: List[Check]
+    #: Per check, the members the host-facts document adds beside it (an id,
+    #: observed values), aligned with `checks`; empty for a section without.
+    extras: List[Dict[str, Any]] = field(default_factory=list)
+    #: Members the host-facts document adds to the phase itself.
+    phase_extras: Dict[str, Any] = field(default_factory=dict)
 
 
 def run_sections(ctx: Ctx) -> List[Outcome]:
@@ -1362,7 +1367,7 @@ def run_sections(ctx: Ctx) -> List[Outcome]:
     return [Outcome(s, list(s.verify(ctx))) for s in SECTIONS]
 
 
-def problem_lines(outcomes: Sequence[Outcome]) -> List[str]:
+def problem_lines(outcomes: Sequence[Outcome], prefix: str = "router") -> List[str]:
     """Every non-passing check as one line for `verify`'s problem list. A
     FAIL leads with the claim's negation; an UNKNOWN says it could not tell
     and why, because an UNKNOWN printed as a bare claim reads as a fact."""
@@ -1372,9 +1377,9 @@ def problem_lines(outcomes: Sequence[Outcome]) -> List[str]:
             if c.result is PASS:
                 continue
             if c.result is FAIL:
-                line = f"router: NOT {c.claim} — {c.remedy}"
+                line = f"{prefix}: NOT {c.claim} — {c.remedy}"
             else:
-                line = f"router: UNKNOWN whether {c.claim}: {c.reason} — {c.remedy}"
+                line = f"{prefix}: UNKNOWN whether {c.claim}: {c.reason} — {c.remedy}"
             if c.do_not:
                 line += f" ({c.do_not})"
             out.append(line)
@@ -1387,8 +1392,12 @@ def problem_lines(outcomes: Sequence[Outcome]) -> List[str]:
 def host_facts_doc(outcomes: Sequence[Outcome], rc: int,
                    ctx: Optional[Ctx] = None) -> Dict[str, Any]:
     """The host-level facts only this side can see, as a document for
-    amap-router-local's operator console (schema 2: section ids
-    `router-container` / `router-health`, from `amap-sandy.py verify`).
+    amap-router-local's operator console (schema 3: section ids
+    `router-container` / `router-health` and `runtime-builds`, from
+    `amap-sandy.py verify`). A phase may add members of its own
+    (`Outcome.phase_extras`, e.g. `deployed_roles`), and a check members
+    beside its claim (`Outcome.extras`: a stable `id`, `observed_*` values
+    that are omitted, never null, when they were not read).
 
     WHY IT CARRIES ITS OWN TIMESTAMP: the lesson the health section encodes
     about `status.json`. That file outlives the container, so freshness is
@@ -1428,10 +1437,12 @@ def host_facts_doc(outcomes: Sequence[Outcome], rc: int,
             {
                 "id": o.section.id,
                 "title": o.section.title,
+                **o.phase_extras,
                 "checks": [
-                    {"claim": c.claim, "result": c.result, "remedy": c.remedy,
+                    {**(o.extras[i] if i < len(o.extras) else {}),
+                     "claim": c.claim, "result": c.result, "remedy": c.remedy,
                      **({"reason": c.reason} if c.result is UNKNOWN else {})}
-                    for c in o.checks
+                    for i, c in enumerate(o.checks)
                 ],
             }
             for o in outcomes
