@@ -360,6 +360,28 @@ class ReadStatusTest(unittest.TestCase):
             with self.subTest(label):
                 self.assertIsInstance(bi.read_status(live, self.sd, "[1] (zz-r1)"), rh.Unresolved)
 
+    def test_a_second_mount_of_its_own_at_or_below_the_state_directory_is_unknown(self):
+        """The router would write through the other mount; the host's file
+        under the identity mount never changes (Opus's case)."""
+        Path(self.path).write_text(json.dumps({"polls": 1}))
+        ident = {"Type": "bind", "Source": self.sd, "Destination": self.sd, "RW": True}
+        for label, dest in (("the status document", self.path), ("a subdirectory", os.path.join(self.sd, "sub")),
+                            ("the directory, respelled", self.sd + "/./")):
+            with self.subTest(label):
+                other = {"Type": "bind", "Source": "/zz/elsewhere", "Destination": dest, "RW": True}
+                got = bi.read_status(container(mounts=[ident, other]), self.sd, "[1] (zz-r1)")
+                self.assertIsInstance(got, rh.Unresolved)
+                self.assertIn("mounts something else at or below its state directory", got.reason)
+
+    def test_its_own_mounts_beside_or_above_the_state_directory_do_not_matter(self):
+        Path(self.path).write_text(json.dumps({"polls": 1}))
+        ident = {"Type": "bind", "Source": self.sd, "Destination": self.sd, "RW": True}
+        for dest in (self.sd + "-other", os.path.dirname(self.sd)):
+            with self.subTest(dest=dest):
+                other = {"Type": "bind", "Source": "/zz/elsewhere", "Destination": dest, "RW": False}
+                self.assertEqual(bi.read_status(container(mounts=[ident, other]), self.sd, "[1] (zz-r1)"),
+                                 {"polls": 1})
+
     def test_no_document_a_bad_document_or_a_symlink_is_unknown(self):
         self.assertEqual(bi.read_status(self.live(), self.sd, "[1] (zz-r1)").reason,
                          "[1] (zz-r1) has written no status document yet")
@@ -788,6 +810,20 @@ class InstallAndVerifyTest(unittest.TestCase):
                   self.sibling(lambda sd: sd + "x", cid="e" * 64, running=True),
                   self.sibling(lambda sd: sd[:-2], cid="f" * 64)]
         c, e = self.hop_outcome(self.status_doc("2026-10-15T10:00:00.050000Z"), others=others)
+        self.assertEqual((c.result, e.get("observed_sha256")), (rh.PASS, "c" * 64))
+
+    def test_a_mount_with_no_host_source_does_not_share_it(self):
+        """A tmpfs mount reports an empty Source. Resolved against verify's
+        working directory it would name that directory; run from inside the
+        state directory, it must still not count."""
+        cwd = os.getcwd()
+        self.addCleanup(os.chdir, cwd)
+
+        def tmpfs(sd):
+            os.chdir(sd)
+            return container(cid="b" * 64, running=True,
+                             mounts=[{"Type": "tmpfs", "Source": "", "Destination": "/run", "RW": True}])
+        c, e = self.hop_outcome(self.status_doc("2026-10-15T10:00:00.050000Z"), others=[tmpfs])
         self.assertEqual((c.result, e.get("observed_sha256")), (rh.PASS, "c" * 64))
 
     def test_containers_that_cannot_be_listed_are_unknown(self):

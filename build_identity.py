@@ -302,6 +302,13 @@ def read_status(live: Any, state_dir: str, who: str,
     if len(hits) != 1 or hits[0].get("Source") != state_dir:
         return rh.Unresolved(f"{who} does not mount its state directory {state_dir} once and by identity, "
                              "so its status document cannot be read")
+    # A second mount at or below the state directory (a bind over the status
+    # document itself, or a subdirectory) would send the router's writes
+    # elsewhere, while the host's file under the identity mount never changes.
+    if any(m is not hits[0] and isinstance(m.get("Destination"), str) and _within(m["Destination"], state_dir)
+           for m in mounts):
+        return rh.Unresolved(f"{who} mounts something else at or below its state directory {state_dir}, so "
+                             "the host's status document may not be the one it writes")
     path = posixpath.join(state_dir, STATUS_NAME)
     try:
         doc = json.loads(read(path))
@@ -320,23 +327,33 @@ def state_sharers(docker: List[str], state_dir: str, own_id: Any,
     source is `state_dir`, a directory above it, or anything below it (a
     single-file bind of the status document itself included), so that it
     could have written the status document there: a list (empty when none),
-    or an Unresolved. The engine does not clean every bind Source the same
-    way (-v against --mount, and across versions), so both sides are
-    normalised ("/a/", "/a//b", "/a/./b", a leading "//") and also compared
-    with their symlinks resolved on this host. An alias this host cannot
-    resolve (a path that exists only inside the engine's VM, such as the
-    VM's own view of a shared folder) is not matched.
+    or an Unresolved. The router's lock keeps two routers from running at
+    once, not one from running after another, so a stopped container that
+    shares the directory may have left the document there. Read after the
+    status document: a container created later cannot have written it.
 
-    A sharer REMOVED before verify runs leaves no record in the engine and
-    is not found. Its document can pass only until the current process's
-    first write replaces it, within one poll interval of its start; the
-    conformance harness reads this claim at preflight and again at collect,
-    hours apart, requires both to equal its bundle and refuses a preflight
-    digest that is not the bundle's, so that window yields the same digest
-    or a void run, never a wrong pass. The router's lock keeps two routers from running at once,
-    not one from running after another, so a stopped container that shares
-    the directory may have left the document there. Read after the status
-    document: a container created later cannot have written it."""
+    The engine does not clean every bind Source the same way (-v against
+    --mount, and across versions), so both sides are normalised ("/a/",
+    "/a//b", "/a/./b", a leading "//") and also compared with their
+    symlinks resolved on this host. A Source that is not an absolute path
+    (a tmpfs mount's empty one) names nothing on the host and is skipped.
+
+    Not found, and so residue:
+    - an alias this host cannot resolve (a path that exists only inside the
+      engine's VM, such as the VM's own view of a shared folder);
+    - a named volume whose driver binds the state directory (local, with
+      o=bind and device=<state_dir>): its Source is the engine's volume
+      path, not the device;
+    - a symlink on a parent component re-pointed after [1] started: the
+      host's directory tree is trusted to the operator;
+    - a router run on the host itself, not in a container;
+    - a sharer REMOVED before verify runs, which leaves no record in the
+      engine. Its document can pass only until [1]'s first status write
+      replaces it (start-up plus the first poll). The conformance harness
+      reads this claim at preflight and again at collect, hours apart,
+      requires both to equal its bundle and refuses a preflight digest that
+      is not the bundle's, so that window yields the same digest or a void
+      run, never a wrong pass."""
     run = run or rh.run
     try:
         p = run(docker + ["ps", "-a", "-q", "--no-trunc"])
@@ -366,7 +383,7 @@ def state_sharers(docker: List[str], state_dir: str, own_id: Any,
                                  f"as sharing {state_dir}")
         for m in mounts:
             src = m.get("Source") if isinstance(m, dict) else None
-            if isinstance(src, str) and _overlaps(src, state_dir):
+            if isinstance(src, str) and src.startswith("/") and _overlaps(src, state_dir):
                 sharers.append(doc.get("Id"))
                 break
     return sharers
@@ -380,12 +397,15 @@ def _spellings(p: str) -> Set[str]:
     return {n, os.path.realpath(n)}
 
 
+def _within(a: str, b: str) -> bool:
+    """Whether `a` is `b` or lies under it, under any spelling _spellings
+    gives either."""
+    return any(x == y or x.startswith(y.rstrip("/") + "/") for x in _spellings(a) for y in _spellings(b))
+
+
 def _overlaps(a: str, b: str) -> bool:
-    """Whether one path is the other or lies under it, under any spelling
-    _spellings gives either."""
-    def under(x: str, y: str) -> bool:
-        return x == y or x.startswith(y.rstrip("/") + "/")
-    return any(under(x, y) or under(y, x) for x in _spellings(a) for y in _spellings(b))
+    """Whether one path is the other or lies under it, either way round."""
+    return _within(a, b) or _within(b, a)
 
 
 def _read_nofollow(path: str) -> bytes:
