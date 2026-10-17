@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -21,6 +22,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+import _workspace
 import amap_sandy
 import router_migrate as rm
 
@@ -54,12 +56,13 @@ def plan(name, lid, *, local=1, root=("/inst/alice", 41, 9), **legacy):
 class FakeRouter:
     """Answers each run.sh call as the pinned router's code would."""
 
-    def __init__(self, maps=None, plans=None, n=None, adopt_rc=0, answer_lid=None):
+    def __init__(self, maps=None, plans=None, n=None, adopt_rc=0, answer_lid=None, noop=()):
         self.maps = list(maps) if maps is not None else []
         self.plans = plans or {}
         self.n = n or {}
         self.adopt_rc = adopt_rc
         self.answer_lid = answer_lid or {}
+        self.noop = set(noop)
         self.calls = []
 
     def __call__(self, argv, input=b"", **kw):
@@ -79,6 +82,9 @@ class FakeRouter:
             lid = self.answer_lid.get(name, the_map()["instances"].get(name, entry(LID_C))["logical_id"])
             return self.done(self.adopt_rc, json.dumps({"name": name, "verb": "adopt", "logical_id": lid}),
                              "" if self.adopt_rc == 0 else "router: generation adopt: refused: no\n")
+        if name in self.noop:
+            return self.done(0, json.dumps({"name": name, "verb": "adopt", "noop": True,
+                                            "logical_id": the_map()["instances"][name]["logical_id"]}))
         cfg = json.loads(Path(inner[inner.index("--config") + 1]).read_text())
         self.seen_state = cfg["state_dir"]
         return self.done(0, json.dumps(self.plans[name]))
@@ -241,6 +247,76 @@ class LayoutRows(Base):
         self.assertEqual(rm.classify(self.state, the_map()), {})
         rm.cover(self.state, {}, moved=False)
 
+    def test_a_finished_adopt_beside_a_new_need_is_not_mistaken_for_one_begun(self):
+        """A finished adopt leaves migration.json (phase done) beside
+        generations.json: that instance is done, not mid-adopt, so a later
+        plan skips it and plans the new need."""
+        self.name_dir(LID_A)
+        (self.state / LID_A / "generations.json").write_text("{}")
+        (self.state / LID_A / "migration.json").write_text('{"phase": "done"}')
+        self.name_dir("bob")
+        got = rm.classify(self.state, the_map())
+        self.assertEqual({n: p["source"] for n, p in got.items()}, {"bob": rm.BY_NAME})
+
+    def test_state_with_no_pre_generation_entry_needs_no_adopt(self):
+        """Opus's note 3: the pin refuses to adopt a directory with no
+        GEN_SCOPED entry ("no pre-generation state") and begins its first
+        generation there itself. Under the logical_id it is not planned; under
+        the name it is renamed but not adopted."""
+        (self.state / LID_A / "delivered").mkdir(parents=True)
+        self.assertEqual(rm.classify(self.state, the_map()), {})
+        self.assertEqual(rm.layout_needs(self.state), (set(), set()))
+        shutil.rmtree(self.state / LID_A)
+        (self.state / "alice" / "delivered").mkdir(parents=True)
+        got = rm.classify(self.state, the_map())
+        self.assertEqual((got["alice"]["source"], got["alice"]["adopt"]), (rm.BY_NAME, False))
+
+    def test_a_rename_only_instance_is_moved_and_never_adopted(self):
+        (self.state / "alice" / "delivered").mkdir(parents=True)
+        pre, fake = self.preview(plans={})
+        self.assertEqual(fake.calls[1:], [])
+        self.move(pre)
+        self.assertTrue((self.state / LID_A / "delivered").is_dir())
+        check = self.check(pre, plans={})
+        self.assertEqual(json.loads(check.read_text())["instances"], {})
+
+    def test_gen_scoped_is_the_pins(self):
+        src = subprocess.run(["git", "-C", str(_workspace.HOP_ROUTER_ROOT), "show",
+                              "99329945edd20adb4b8b83f025ea1ef6382456ff:router/generations.py"],
+                             capture_output=True, text=True, check=True).stdout
+        self.assertIn('GEN_SCOPED = ("results", "inflight", "transport", "pending", "quarantine", "held",\n'
+                      '              "first-seen.json", "approval.json")', src)
+        self.assertEqual(rm.GEN_SCOPED, ("results", "inflight", "transport", "pending", "quarantine", "held",
+                                         "first-seen.json", "approval.json"))
+
+    def test_a_generations_file_that_is_not_regular_stops(self):
+        """Codex's type rule: a directory, a dangling link or a FIFO at
+        generations.json is neither generated nor pre-generation."""
+        for make in (lambda p: p.mkdir(), lambda p: os.symlink("/nowhere", str(p)), lambda p: os.mkfifo(str(p))):
+            with self.subTest(make=make):
+                d = self.base / "s"
+                if d.exists():
+                    shutil.rmtree(d)
+                self.state = d
+                d.mkdir()
+                self.name_dir(LID_A)
+                make(self.state / LID_A / "generations.json")
+                with self.assertRaises(rm.Stop):
+                    rm.classify(self.state, the_map())
+                with self.assertRaises(rm.Stop):
+                    rm.layout_needs(self.state)
+
+    def test_a_generations_file_changed_after_the_preview_stops_the_move(self):
+        self.name_dir("alice")
+        self.name_dir(LID_B)
+        (self.state / LID_B / "generations.json").write_text("{}")
+        pre, _ = self.preview()
+        (self.state / LID_B / "generations.json").unlink()
+        (self.state / LID_B / "generations.json").mkdir()
+        with self.assertRaises(rm.Stop):
+            self.move(pre)
+        self.assertTrue((self.state / "alice").is_dir())
+
     def test_what_the_router_would_not_guess_stops(self):
         cases = {
             "a file under a name": lambda: (self.state / "alice").write_text("x"),
@@ -310,7 +386,7 @@ class PlanRows(Base):
         self.assertEqual(journal["moves"], [])
         check = self.check(pre)
         self.assertEqual(json.loads(check.read_text())["instances"]["alice"]["logical_id"], LID_A)
-        fake = FakeRouter()
+        fake = FakeRouter(plans={"alice": plan("alice", LID_A)})
         rm.do_adopt(CHECKOUT, IMAGE, str(self.config), str(check), REASON, self.run_dir, fake)
         self.assertTrue(any("adopt" in c[0] and "--dry-run" not in c[0] for c in fake.calls))
 
@@ -343,12 +419,14 @@ class PlanRows(Base):
         pre, _ = self.preview(n={"alice": 2}, plans={"alice": plan("alice", LID_A, local=2)})
         self.move(pre)
         check = self.check(pre, plans={"alice": plan("alice", LID_A, local=2)}, n={"alice": 2})
-        fake = FakeRouter(n={"alice": 2})
+        p2 = {"alice": plan("alice", LID_A, local=2)}
+        fake = FakeRouter(plans=p2, n={"alice": 2})
         rm.do_adopt(CHECKOUT, IMAGE, str(self.config), str(check), REASON, self.run_dir, fake)
         argv = fake.calls[-1][0]
         self.assertIn("--no-transport-history=2", argv)
         self.assertNotIn("--dry-run", argv)
-        for runner in (FakeRouter(n={"alice": 2}, adopt_rc=1), FakeRouter(n={"alice": 2}, answer_lid={"alice": LID_C})):
+        for runner in (FakeRouter(plans=p2, n={"alice": 2}, adopt_rc=1),
+                       FakeRouter(plans=p2, n={"alice": 2}, answer_lid={"alice": LID_C})):
             with self.subTest(runner=runner.adopt_rc):
                 with self.assertRaises(rm.Stop):
                     rm.do_adopt(CHECKOUT, IMAGE, str(self.config), str(check), REASON, self.run_dir, runner)
@@ -397,10 +475,49 @@ class BindingRows(Base):
         self.move(self.pre)
         check = self.check(self.pre)
         self.write_config(extra=1)
-        fake = FakeRouter()
+        fake = FakeRouter(plans={"alice": plan("alice", LID_A)})
         with self.assertRaises(rm.Stop):
             rm.do_adopt(CHECKOUT, IMAGE, str(self.config), str(check), REASON, self.run_dir, fake)
         self.assertFalse(any("adopt" in c[0] for c in fake.calls))
+
+    def test_a_root_recreated_after_the_check_refuses_before_the_real_adopt(self):
+        """Codex's checked root: the fresh read-only plan's root must be the
+        checked one; the pin's own plan would accept the new inode."""
+        self.move(self.pre)
+        check = self.check(self.pre)
+        fake = FakeRouter(plans={"alice": plan("alice", LID_A, root=("/inst/alice", 41, 10))})
+        with self.assertRaises(rm.Stop):
+            rm.do_adopt(CHECKOUT, IMAGE, str(self.config), str(check), REASON, self.run_dir, fake)
+        self.assertFalse(any("adopt" in c[0] and "--dry-run" not in c[0] for c in fake.calls))
+
+    def test_replaced_instance_state_refuses_at_check_and_at_adopt(self):
+        """Codex's identity: the state under the logical_id must be the
+        directory the plan recorded, at check and again at adopt."""
+        self.move(self.pre)
+        shutil.copytree(self.state / LID_A, self.base / "copy")
+        shutil.rmtree(self.state / LID_A)
+        os.rename(self.base / "copy", self.state / LID_A)
+        with self.assertRaises(rm.Stop):
+            self.check(self.pre)
+
+    def test_replaced_instance_state_after_the_check_refuses_the_adopt(self):
+        self.move(self.pre)
+        check = self.check(self.pre)
+        shutil.copytree(self.state / LID_A, self.base / "copy")
+        shutil.rmtree(self.state / LID_A)
+        os.rename(self.base / "copy", self.state / LID_A)
+        fake = FakeRouter(plans={"alice": plan("alice", LID_A)})
+        with self.assertRaises(rm.Stop):
+            rm.do_adopt(CHECKOUT, IMAGE, str(self.config), str(check), REASON, self.run_dir, fake)
+        self.assertEqual(fake.calls, [c for c in fake.calls if "adopt" not in c[0]])
+
+    def test_a_resumed_adopt_already_done_is_recorded_not_repeated(self):
+        self.move(self.pre)
+        check = self.check(self.pre)
+        fake = FakeRouter(noop={"alice"})
+        out = rm.do_adopt(CHECKOUT, IMAGE, str(self.config), str(check), REASON, self.run_dir, fake)
+        self.assertEqual(json.loads(out.read_text())["done"]["alice"]["noop"], True)
+        self.assertFalse(any("adopt" in c[0] and "--dry-run" not in c[0] for c in fake.calls))
 
 
 class MoveRows(Base):
@@ -436,9 +553,27 @@ class MoveRows(Base):
         self.assertIn("the journal is", str(cm.exception))
         journal = str(cm.exception).rsplit("the journal is ", 1)[1]
         self.assertEqual([m["state"] for m in self.journal(journal)["moves"]], ["done", "not_applied"])
-        rm.do_reverse(str(self.config), journal)
+        try:
+            rm.do_reverse(str(self.config), journal)
+        except rm.Stop as e:
+            self.fail(f"the reverse stopped on the entry never moved: {e}")
         self.assertTrue((self.state / "alice").is_dir() and (self.state / "bob").is_dir())
         self.assertFalse((self.state / LID_A).exists() or (self.state / LID_B).exists())
+
+    def test_a_failed_journal_write_after_a_rename_names_the_journal(self):
+        real = rm._publish
+        calls = []
+
+        def full(path, doc):
+            calls.append(path)
+            if len(calls) == 2:
+                raise OSError(28, "No space left on device", str(path))
+            real(path, doc)
+        with mock.patch.object(rm, "_publish", full):
+            with self.assertRaises(rm.Stop) as cm:
+                self.move(self.pre)
+        self.assertIn("the journal is", str(cm.exception))
+        self.assertIn("OSError", str(cm.exception))
 
     def test_an_interrupted_reverse_resumes(self):
         out = self.move(self.pre)
@@ -451,7 +586,7 @@ class MoveRows(Base):
                 raise OSError(5, "Input/output error", str(dst))
             real(src, dst)
         with mock.patch.object(rm, "rename_noreplace", once_then_crash):
-            with self.assertRaises(OSError):
+            with self.assertRaises(rm.Stop):
                 rm.do_reverse(str(self.config), str(out))
         rm.do_reverse(str(self.config), str(out))
         rm.do_reverse(str(self.config), str(out))
@@ -490,6 +625,30 @@ class MoveRows(Base):
                     rm.rename_noreplace(self.state / "alice", dst)
                 self.assertTrue((self.state / "alice").is_dir())
                 dst.unlink() if dst.is_symlink() or dst.is_file() else dst.rmdir()
+
+    def test_the_reverse_refuses_once_an_adopt_has_begun_and_moves_nothing(self):
+        """Opus's blocker: state an adopt has touched is never handed back to
+        the old router; that is back-out D, forward only."""
+        out = self.move(self.pre)
+        for marker in ("migration.json", "generations.json"):
+            with self.subTest(marker=marker):
+                (self.state / LID_B / marker).write_text("{}")
+                with self.assertRaises(rm.Stop) as cm:
+                    rm.do_reverse(str(self.config), str(out))
+                self.assertIn("back-out D", str(cm.exception))
+                self.assertTrue((self.state / LID_A).is_dir() and (self.state / LID_B).is_dir())
+                self.assertFalse((self.state / "alice").exists() or (self.state / "bob").exists())
+                (self.state / LID_B / marker).unlink()
+
+    def test_a_failed_reverse_rename_names_the_journal(self):
+        out = self.move(self.pre)
+
+        def fails(src, dst):
+            raise OSError(5, "Input/output error", str(dst))
+        with mock.patch.object(rm, "rename_noreplace", fails):
+            with self.assertRaises(rm.Stop) as cm:
+                rm.do_reverse(str(self.config), str(out))
+        self.assertIn(str(out), str(cm.exception))
 
     def test_reverse_refuses_another_state_dir_and_an_ambiguous_entry(self):
         out = self.move(self.pre)
@@ -586,7 +745,8 @@ class RenderToRows(unittest.TestCase):
         """Opus's 3: install --render-to is its own path. It never reaches
         the connector guard, the provision, or the identity step, and its
         exit code is the render's."""
-        args = SimpleNamespace(render_to=str(self.base / "r.json"), apply=True, sandy="sandy")
+        args = SimpleNamespace(render_to=str(self.base / "r.json"), apply=True, sandy="sandy",
+                               connector_src=str(self.base), allow_unpinned_connector=None, fleet_domain_base=None)
         home = self.base / "home"
         seen = []
         with mock.patch.object(amap_sandy, "feature_manifest_path", lambda h: self.live), \
@@ -596,8 +756,11 @@ class RenderToRows(unittest.TestCase):
                 mock.patch.object(amap_sandy, "run_install_identity", lambda *a, **k: seen.append("identity")), \
                 mock.patch.object(amap_sandy.cpin, "guard", lambda *a, **k: seen.append("guard")), \
                 mock.patch.object(amap_sandy, "run_render_router", lambda *a, **k: 2):
-            self.assertEqual(amap_sandy.run_sync(args, home, self.base), 2)
-        self.assertEqual(seen, [])
+            try:
+                rc = amap_sandy.run_sync(args, home, self.base)
+            except Exception:     # noqa: BLE001 — the full install path, reached wrongly
+                rc = None
+        self.assertEqual((seen, rc), ([], 2))
 
 
 if __name__ == "__main__":

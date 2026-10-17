@@ -775,7 +775,9 @@ marker and reply ledger carry over, and it drains on the first poll.
    router's container is not yet `router.container`. The match must print
    `MIGRATE` and exit 3 (`pre_registry_base` or `migration_required`).
    `MEASURED` means no migration is needed. Any other result names its own
-   remedy, and R2 does not start.
+   remedy, and R2 does not start. A `state_layout` refusal naming a file
+   that is a temporary of the router's own (it writes its status by
+   rename) clears when you fingerprint again.
 2. **Render.** `python3 amap-sandy.py install --render-to <run_dir>/r2-config.json
    --apply`.
    - This path renders and nothing else: the manifest, the payload, the
@@ -797,7 +799,11 @@ marker and reply ledger carry over, and it drains on the first poll.
    <run_dir>/r2-config.json --reason "<text>" --apply`.
    - It plans every instance whose state is pre-generation: under its name
      (to be moved, then adopted), or already under its logical id (adopted
-     where it is).
+     where it is). State holding no pre-generation entry (results,
+     inflight, transport, pending, quarantine, held, first-seen.json or
+     approval.json) needs no adopt: the pinned router begins its first
+     generation there on its own first poll. Under a name it is moved and
+     not adopted; under a logical id it is left as it is.
    - It STOPs unless the plan covers exactly what the state directory's
      layout needs: a name-keyed directory of an instance that is not
      configured, a logical id the registry does not map, or a file named
@@ -812,10 +818,10 @@ marker and reply ledger carry over, and it drains on the first poll.
    with no other step between them:
    - `sha256sum <the live config>`, recorded;
    - `cp -p <the live config> <run_dir>/r2-pre-migration-config.json`;
-   - `docker inspect -f '{{.Name}} {{.HostConfig.RestartPolicy.Name}}'
-     <the container Id the file records>`, recorded: the old container's
-     name (without its leading `/`) and its restart policy, which back-out
-     B restores exactly;
+   - `docker inspect -f '{{.Name}} {{.HostConfig.RestartPolicy.Name}}
+     {{.HostConfig.RestartPolicy.MaximumRetryCount}}' <the container Id the
+     file records>`, recorded: the old container's name (without its leading
+     `/`) and its whole restart policy, which back-out B restores exactly;
    - `docker stop <that Id>`;
    - `docker update --restart no <that Id>`, so that a daemon restart cannot
      start it beside the new router;
@@ -878,14 +884,17 @@ old container is never started except through back-out C, then B.
      config>`, and check that `sha256sum` equals step 5's record.
   2. `docker rename <that Id> <its old name, as step 5 recorded it>`.
   3. `docker update --restart <its restart policy, as step 5 recorded it>
-     <that Id>`.
+     <that Id>`: the policy's name, or `on-failure:<count>` when step 5
+     recorded `on-failure` with a count above 0.
   4. `docker start <that Id>`.
 - C. After a move, before step 9:
   1. `python3 amap-sandy.py router-migrate move --config <the live config>
      --reverse <step 7's journal> --apply`. It moves each journaled
      directory back, newest first; an entry never moved, or already moved
      back, is left as it is, so the reverse can be run again until it
-     completes.
+     completes. It refuses, and moves nothing, once any journaled directory
+     holds a migration.json or a generations.json: an adopt has begun, and
+     back-out D applies.
   2. Then back-out B.
 - D. Once step 9 has begun: forward only. The adopted state is in the
   generation layout under the registry, which the old router never reads.

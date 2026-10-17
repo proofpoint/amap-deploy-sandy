@@ -68,6 +68,11 @@ STEP_CONTAINER = "amap-router-migrate"
 LOGICAL_ID = re.compile(r"[0-9a-f]{32}")
 #: The files that make a logical_id directory generation-keyed, or mid-adopt.
 GEN_FILE, MIGRATION_FILE = "generations.json", "migration.json"
+#: The pinned router's pre-generation entries (router/generations.py
+#: GEN_SCOPED): a directory holding none of them needs no adopt, because the
+#: router begins its first generation there on its own first poll.
+GEN_SCOPED = ("results", "inflight", "transport", "pending", "quarantine", "held", "first-seen.json",
+              "approval.json")
 #: The refusal that names N: `attest it with --no-transport-history=N`.
 ATTEST = re.compile(r"attest it with --no-transport-history=([0-9]+)\s*$")
 #: The dry-run summary fields compared between the preview and the binding run.
@@ -247,6 +252,31 @@ def _ident(st: os.stat_result) -> List[int]:
     return [st.st_dev, st.st_ino]
 
 
+def _file_state(p: Path) -> bool:
+    """The stop gate's rule for generations.json (and here migration.json):
+    a regular file is present, no entry is absent, and anything else (a
+    directory, a link, a FIFO) STOPs, as the gate reports it UNKNOWN."""
+    st = _lstat(p)
+    if st is None:
+        return False
+    if not stat.S_ISREG(st.st_mode):
+        raise Stop(f"{p} is not a regular file: the router's state there cannot be judged")
+    return True
+
+
+def _legacy(d: Path) -> bool:
+    """Whether `d` holds a pre-generation entry, of any type, as the pinned
+    router's legacy_entries counts them."""
+    return any(os.path.lexists(d / n) for n in GEN_SCOPED)
+
+
+def _at(state_dir: Path, lid: str, ident: List[int]) -> None:
+    """The planned instance's state is the recorded directory, under its logical_id."""
+    st = _lstat(state_dir / lid)
+    if st is None or not stat.S_ISDIR(st.st_mode) or _ident(st) != ident:
+        raise Stop(f"{state_dir / lid} is not the instance state the plan recorded")
+
+
 def classify(state_dir: Path, the_map: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     """Each mapped instance with pre-generation state: how it is found (by
     name, to be renamed; or by logical_id, adopted in place), and that
@@ -268,13 +298,16 @@ def classify(state_dir: Path, the_map: Dict[str, Any]) -> Dict[str, Dict[str, An
         if dst is not None and not stat.S_ISDIR(dst.st_mode):
             raise Stop(f"{state_dir / lid} is not a directory")
         if src is not None:
-            out[name] = {"logical_id": lid, "source": BY_NAME, "ident": _ident(src)}
+            out[name] = {"logical_id": lid, "source": BY_NAME, "ident": _ident(src),
+                         "adopt": _legacy(state_dir / name)}
         elif dst is not None:
-            if _lstat(state_dir / lid / MIGRATION_FILE) is not None:
-                raise Stop(f"{state_dir / lid / MIGRATION_FILE} exists: an adopt has begun; resume it with the "
-                           "adopt step, never with a new plan")
-            if _lstat(state_dir / lid / GEN_FILE) is None:
-                out[name] = {"logical_id": lid, "source": BY_ID, "ident": _ident(dst)}
+            if _file_state(state_dir / lid / GEN_FILE):
+                continue
+            if _file_state(state_dir / lid / MIGRATION_FILE):
+                raise Stop(f"{state_dir / lid / MIGRATION_FILE} exists without {GEN_FILE}: an adopt has begun; "
+                           "resume it with the adopt step, never with a new plan")
+            if _legacy(state_dir / lid):
+                out[name] = {"logical_id": lid, "source": BY_ID, "ident": _ident(dst), "adopt": True}
     return out
 
 
@@ -302,7 +335,7 @@ def layout_needs(state_dir: Path) -> Tuple[set, set]:
                            "instance, and this step does not guess")
             continue
         if LOGICAL_ID.fullmatch(n):
-            if _lstat(state_dir / n / GEN_FILE) is None:
+            if not _file_state(state_dir / n / GEN_FILE) and _legacy(state_dir / n):
                 ids.add(n)
         elif hexish or rfp.INSTANCE_NAME.fullmatch(n) is None:
             raise Stop(f"{state_dir / n} is neither the router's own entry nor an instance's")
@@ -319,7 +352,7 @@ def cover(state_dir: Path, planned: Dict[str, Dict[str, Any]], *, moved: bool) -
     logical_id, a name that appeared since the plan) STOPs."""
     names, ids = layout_needs(state_dir)
     want_names = set() if moved else {n for n, p in planned.items() if p["source"] == BY_NAME}
-    want_ids = {p["logical_id"] for p in planned.values()} if moved else \
+    want_ids = {p["logical_id"] for p in planned.values() if p["adopt"]} if moved else \
         {p["logical_id"] for p in planned.values() if p["source"] == BY_ID}
     if names != want_names or ids != want_ids:
         extra = sorted((names - want_names) | (ids - want_ids))
@@ -346,10 +379,17 @@ def drain_lock(state_dir: Path) -> Any:
         os.close(fd)
 
 
+def _sync(fd: int) -> None:
+    """fsync, and on darwin F_FULLFSYNC, which also flushes the drive's cache."""
+    os.fsync(fd)
+    if sys.platform == "darwin" and hasattr(fcntl, "F_FULLFSYNC"):
+        fcntl.fcntl(fd, fcntl.F_FULLFSYNC)
+
+
 def _fsync_dir(d: Path) -> None:
     fd = os.open(d, os.O_RDONLY)
     try:
-        os.fsync(fd)
+        _sync(fd)
     finally:
         os.close(fd)
 
@@ -359,7 +399,7 @@ def _write_new(path: Path, doc: Any) -> None:
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(json.dumps(doc, sort_keys=True, indent=2) + "\n")
         f.flush()
-        os.fsync(f.fileno())
+        _sync(f.fileno())
     _fsync_dir(path.parent)
 
 
@@ -372,9 +412,18 @@ def _publish(path: Path, doc: Any) -> None:
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(json.dumps(doc, sort_keys=True, indent=2) + "\n")
         f.flush()
-        os.fsync(f.fileno())
+        _sync(f.fileno())
     os.replace(tmp, path)
     _fsync_dir(path.parent)
+
+
+def _noreplace_supported() -> None:
+    """Probe for the atomic no-replace rename before any journal is written,
+    so an unsupported platform refuses before anything is recorded."""
+    libc = ctypes.CDLL(ctypes.util.find_library("c") or None, use_errno=True)
+    if not ((sys.platform.startswith("linux") and hasattr(libc, "renameat2"))
+            or (sys.platform == "darwin" and hasattr(libc, "renamex_np"))):
+        raise Cannot("this platform has no atomic no-replace rename")
 
 
 def rename_noreplace(src: Path, dst: Path) -> None:
@@ -384,11 +433,17 @@ def rename_noreplace(src: Path, dst: Path) -> None:
     libc = ctypes.CDLL(ctypes.util.find_library("c") or None, use_errno=True)
     s, d = os.fsencode(str(src)), os.fsencode(str(dst))
     if sys.platform.startswith("linux") and hasattr(libc, "renameat2"):
+        fn = libc.renameat2
+        fn.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+        fn.restype = ctypes.c_int
         at_fdcwd, rename_noreplace_flag = -100, 1
-        rc = libc.renameat2(at_fdcwd, s, at_fdcwd, d, rename_noreplace_flag)
+        rc = fn(at_fdcwd, s, at_fdcwd, d, rename_noreplace_flag)
     elif sys.platform == "darwin" and hasattr(libc, "renamex_np"):
+        fn = libc.renamex_np
+        fn.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+        fn.restype = ctypes.c_int
         rename_excl = 0x4
-        rc = libc.renamex_np(s, d, rename_excl)
+        rc = fn(s, d, rename_excl)
     else:
         raise Cannot("this platform has no atomic no-replace rename")
     if rc != 0:
@@ -472,27 +527,36 @@ def do_preview(checkout: str, image: str, config: str, reason: str, run_dir: Pat
     try:
         state = scratch / "state"
         os.mkdir(state, 0o700)
-        for name, p in planned.items():
+        adopting = {n: p for n, p in planned.items() if p["adopt"]}
+        for name, p in adopting.items():
             src = state_dir / (name if p["source"] == BY_NAME else p["logical_id"])
             shutil.copytree(src, state / p["logical_id"], symlinks=True)
         scfg = scratch / "config.json"
         _write_new(scfg, dict(cfg["doc"], state_dir=str(state)))
-        for name, p in planned.items():
+        for name, p in adopting.items():
             plan, n = dry_run(checkout, image, str(scfg), name, reason, runner)
             if plan.get("logical_id") != p["logical_id"]:
                 raise Stop(f"{name!r}'s preview is for {plan.get('logical_id')!r}, not the map's "
                            f"{p['logical_id']}")
             p.update(advisory_n=n, plan=plan)
-    finally:
-        failed: List[str] = []
-        shutil.rmtree(scratch, onerror=lambda fn, path, exc: failed.append(path))
-        if failed:
-            raise Stop(f"the scratch copy of the state at {scratch} could not be removed ({failed[0]}): remove it "
-                       "by hand; it is a copy of the router's private state")
+    except BaseException as e:
+        _remove_scratch(scratch, cause=e)
+        raise
+    _remove_scratch(scratch)
     live = bindings(the_map)
     _write_new(out, {"schema": SCHEMA, "step": "preview", "context": _context(cfg, checkout, image),
                      "binding": {n: live[n] for n in planned}, "instances": planned})
     return out
+
+
+def _remove_scratch(scratch: Path, cause: Optional[BaseException] = None) -> None:
+    """The scratch copy is a copy of the router's private state: a removal
+    that fails is reported, chained to any failure already in flight."""
+    failed: List[str] = []
+    shutil.rmtree(scratch, onerror=lambda fn, path, exc: failed.append(path))
+    if failed:
+        raise Stop(f"the scratch copy of the state at {scratch} could not be removed ({failed[0]}): remove it by "
+                   "hand; it is a copy of the router's private state") from cause
 
 
 def do_move(checkout: str, image: str, config: str, preview_path: str, run_dir: Path, runner: Runner) -> Path:
@@ -506,6 +570,7 @@ def do_move(checkout: str, image: str, config: str, preview_path: str, run_dir: 
     bind_context(preview["context"], cfg, checkout, image)
     compare_bindings(preview["binding"], read_map(checkout, image, config, runner))
     state_dir = Path(cfg["state_dir"])
+    _noreplace_supported()
     with drain_lock(state_dir):
         cover(state_dir, preview["instances"], moved=False)
         return _moves(state_dir, preview, run_dir)
@@ -540,6 +605,9 @@ def _moves(state_dir: Path, preview: Dict[str, Any], run_dir: Path) -> Path:
             _fsync_dir(state_dir)
     except Stop as e:
         raise Stop(f"{e}; the journal is {out}") from None
+    except (OSError, Cannot) as e:
+        raise Stop(f"the move failed after its journal was created ({type(e).__name__}: {e}); the journal is "
+                   f"{out}") from None
     return out
 
 
@@ -555,8 +623,18 @@ def do_reverse(config: str, journal_path: str) -> Path:
         if cfg[k] != want[k]:
             raise Stop(f"this config's {k} is {cfg[k]!r}, not the journal's {want[k]!r}")
     state_dir = Path(want["state_dir"])
+    _noreplace_supported()
     with drain_lock(state_dir):
-        _reverse(state_dir, journal, journal_path)
+        adopted = [e["logical_id"] for e in journal["moves"]
+                   if any(os.path.lexists(state_dir / e["logical_id"] / f) for f in (MIGRATION_FILE, GEN_FILE))]
+        if adopted:
+            raise Stop(f"an adopt has begun or finished under {', '.join(adopted)}: the old router cannot read that "
+                       "state, so nothing is moved back; R2 only goes forward from here (back-out D)")
+        try:
+            _reverse(state_dir, journal, journal_path)
+        except OSError as e:
+            raise Stop(f"the reverse failed ({e.strerror}: {e.filename}); the journal is {journal_path}, and the "
+                       "reverse can be run again") from None
     return Path(journal_path)
 
 
@@ -585,12 +663,16 @@ def do_check(checkout: str, image: str, config: str, preview_path: str, reason: 
     cfg = _config(config)
     bind_context(preview["context"], cfg, checkout, image)
     compare_bindings(preview["binding"], read_map(checkout, image, config, runner))
-    cover(Path(cfg["state_dir"]), preview["instances"], moved=True)
+    state_dir = Path(cfg["state_dir"])
+    cover(state_dir, preview["instances"], moved=True)
     plans = {}
     for name, p in sorted(preview["instances"].items()):
+        _at(state_dir, p["logical_id"], p["ident"])
+        if not p["adopt"]:
+            continue
         plan, n = dry_run(checkout, image, config, name, reason, runner)
         compare_plans(name, p["plan"], plan)
-        plans[name] = {"logical_id": p["logical_id"], "n": n, "root": plan["root"]}
+        plans[name] = {"logical_id": p["logical_id"], "n": n, "root": plan["root"], "ident": p["ident"]}
     out = _record(run_dir, "check")
     _write_new(out, {"schema": SCHEMA, "step": "check", "context": preview["context"],
                      "binding": preview["binding"], "instances": plans})
@@ -607,9 +689,14 @@ def do_adopt(checkout: str, image: str, config: str, check_path: str, reason: st
     cfg = _config(config)
     bind_context(check["context"], cfg, checkout, image)
     compare_bindings(check["binding"], read_map(checkout, image, config, runner))
+    state_dir = Path(cfg["state_dir"])
     done: Dict[str, Any] = {}
     out = _record(run_dir, "adopt")
     for name, rec in sorted(check["instances"].items()):
+        _at(state_dir, rec["logical_id"], rec["ident"])
+        if _preflight(checkout, image, config, name, reason, rec, runner):
+            done[name] = {"noop": True, "logical_id": rec["logical_id"]}
+            continue
         rc, stdout, err = _call(adopt_argv(checkout, image, config, name, reason, dry_run=False, n=rec["n"]),
                                 runner)
         try:
@@ -623,6 +710,33 @@ def do_adopt(checkout: str, image: str, config: str, check_path: str, reason: st
         done[name] = result
     _write_new(out, {"schema": SCHEMA, "step": "adopt", "done": done, "failed": None})
     return out
+
+
+def _preflight(checkout: str, image: str, config: str, name: str, reason: str, rec: Dict[str, Any],
+               runner: Runner) -> bool:
+    """Immediately before the real adopt, a fresh read-only plan with the
+    checked N: it must be for the checked logical_id and root (path, st_dev,
+    st_ino), so a root recreated since the check refuses here. True when the
+    router answers that the adopt is already done (a resumed step)."""
+    rc, out, err = _call(adopt_argv(checkout, image, config, name, reason, dry_run=True, n=rec["n"]), runner)
+    if rc != 0:
+        raise (Stop if rc == 1 else Cannot)(f"the adopt's fresh plan for {name!r} exited {rc}: "
+                                            f"{err.strip()[-400:]}")
+    try:
+        plan = json.loads(out)
+    except ValueError:
+        raise Cannot(f"the adopt's fresh plan for {name!r} printed no JSON") from None
+    if not isinstance(plan, dict) or plan.get("logical_id") != rec["logical_id"]:
+        raise Stop(f"the adopt's fresh plan for {name!r} is not for {rec['logical_id']}")
+    if plan.get("noop") is True:
+        return True
+    if plan.get("dry_run") is not True:
+        raise Cannot(f"the adopt's fresh plan for {name!r} printed no dry-run plan")
+    root = plan.get("root")
+    if not isinstance(root, dict) or any(root.get(k) != rec["root"].get(k) for k in ROOT_COMPARED):
+        raise Stop(f"{name!r}'s root is {root!r} now, {rec['root']!r} when checked: it changed since the check")
+    zero_problems(name, plan)
+    return False
 
 
 def run(args: Any, *, out: Callable[[str], None] = print, runner: Runner = subprocess.run) -> int:
