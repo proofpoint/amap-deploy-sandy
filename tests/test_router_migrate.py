@@ -344,7 +344,10 @@ class LayoutRows(Base):
                 with mock.patch.object(rm.sys, "platform", "darwin"), \
                         mock.patch.object(rm.fcntl, "F_FULLFSYNC", 51, create=True), \
                         mock.patch.object(rm.fcntl, "fcntl", refuse):
-                    rm._sync(fd)
+                    try:
+                        rm._sync(fd)
+                    except OSError as e:
+                        self.fail(f"a refused F_FULLFSYNC ({e.errno}) was not tolerated")
         def other(*a):
             raise OSError(errno_mod.EIO, "I/O error")
         with mock.patch.object(rm.sys, "platform", "darwin"), \
