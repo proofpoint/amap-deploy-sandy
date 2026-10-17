@@ -457,6 +457,25 @@ class FullCompareTest(unittest.TestCase):
         self.assertIn("its Image differs from the rendering",
                       self.differ(lambda c: c["Config"].__setitem__("Image", "other@sha256:" + "0" * 64)))
 
+    def test_a_local_image_by_its_id_is_rendered_and_compared_verbatim(self):
+        """secrets.image as a bare Id reaches the run argv and the rendered
+        Config.Image unchanged, and compare holds a live Config.Image to it."""
+        image = "sha256:" + "b" * 64
+        d = full_doc()
+        d[ss.SECTION]["image"] = image
+        try:
+            s = hs.load_spec(d)
+        except hs.SpecError as e:
+            self.fail(f"{image} was refused: {e}")
+        doc = hr.run_spec(s, s.hub)
+        self.assertIn(image, hr.argv(doc))
+        rendered = view_of(s)
+        self.assertEqual(rendered["Config"]["Image"], image)
+        self.assertEqual(hr.compare(copy.deepcopy(rendered), rendered, []), [])
+        other = copy.deepcopy(rendered)
+        other["Config"]["Image"] = "sha256:" + "c" * 64
+        self.assertIn("its Image differs from the rendering", hr.compare(other, rendered, []))
+
     def test_an_added_capability_differs(self):
         self.assertIn("its CapAdd differs from the rendering",
                       self.differ(lambda c: c["HostConfig"].__setitem__("CapAdd", ["NET_RAW"])))

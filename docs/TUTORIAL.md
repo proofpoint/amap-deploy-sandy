@@ -698,9 +698,11 @@ python3 amap-sandy.py router-fingerprint --image <the image> --apply
 python3 amap-sandy.py router-fingerprint --verify-image <the file it wrote> --commit <the pin>
 ```
 
-The check must print `EXACT`. Record the image ID as the `digest` (`docker
-image inspect --format '{{.Id}}' <name>`: a local build has no registry
-digest), and the commit it was built from. Then:
+The check must print `EXACT`. Record its image ID as the `digest` (`docker
+image inspect --format '{{.Id}}' <name>`, the engine's content-addressed
+image Id: the config digest on the classic image store, the manifest (list)
+digest on the containerd store), and
+the commit it was built from. Then:
 
 ```sh
 python3 amap-sandy.py install --apply

@@ -93,7 +93,13 @@ PROBE_CLASSES_NOT_FAILURES = ("ok", "engine_unavailable", "hub_unreachable", "tl
                               "connect_failed", "temporary")
 _HEX40 = re.compile(r"[0-9a-f]{40}")
 _HEX64 = re.compile(r"[0-9a-f]{64}")
-_IMAGE = re.compile(r"[a-z0-9][a-z0-9._/:-]*@sha256:[0-9a-f]{64}")
+#: The runtime image, content-addressed: a name by its manifest digest, or a
+#: locally built image by its Id as `docker image inspect` prints it, the
+#: engine's content-addressed image Id: the config digest on the classic image
+#: store, the manifest (list) digest on the containerd store. Either is passed
+#: to docker verbatim, and hub_runtime.compare holds the container's
+#: Config.Image to the same string.
+_IMAGE = re.compile(r"[a-z0-9][a-z0-9._/:-]*@sha256:[0-9a-f]{64}|sha256:[0-9a-f]{64}")
 _LABEL = re.compile(r"[a-z0-9][a-z0-9._-]*=[A-Za-z0-9._-]+")
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 _ALIAS = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
@@ -187,7 +193,8 @@ def load(sec: Any, principals: Dict[str, Any], runtimes: Sequence[Dict[str, Any]
     if not isinstance(sec["file"], str) or not _NAME.fullmatch(sec["file"]):
         raise SecretSpecError("secrets.file must be one file name")
     if not isinstance(sec["image"], str) or not _IMAGE.fullmatch(sec["image"]):
-        raise SecretSpecError("secrets.image must be the runtime image by digest (name@sha256:...)")
+        raise SecretSpecError("secrets.image must be the runtime image by digest (name@sha256:<64 hex>) or, for a "
+                              "locally built image, by its Id (sha256:<64 hex>)")
     image_commit = sec.get("image_commit")
     if image_commit is not None and (not isinstance(image_commit, str) or not _HEX40.fullmatch(image_commit)):
         raise SecretSpecError("secrets.image_commit must be a full commit sha")
