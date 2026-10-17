@@ -556,10 +556,8 @@ MUTANTS = [
      "        lids = sorted(set(journal.get(\"planned\", [])) | {e[\"logical_id\"] for e in journal[\"moves\"]})",
      "        lids = sorted({e[\"logical_id\"] for e in journal[\"moves\"]})"),
     ("the adopted root not verified", RM,
-     "    for name, rec in sorted(check[\"instances\"].items()):\n"
-     "        _adopted_root(checkout, image, config, state_dir, name, rec, runner)\n"
-     "    _write_new(out, {\"schema\": SCHEMA, \"step\": \"adopt\"",
-     "    _write_new(out, {\"schema\": SCHEMA, \"step\": \"adopt\""),
+     "            _adopted_root(checkout, image, config, state_dir, name, rec, runner)\n        except Stop:",
+     "            pass\n        except Stop:"),
     ("a root record skipped in the four-way check", RM,
      "    for what, root in ((\"the adopt's journal\", from_journal), (\"the adopted generation\", from_gens),",
      "    for what, root in ((\"the adopted generation\", from_gens),"),
@@ -586,6 +584,23 @@ MUTANTS = [
      "                or not isinstance(root, dict) or any(root.get(k) != rec[\"root\"].get(k) "
      "for k in ROOT_COMPARED)):",
      "                ):"),
+    ("verify does not re-read the binding", RM,
+     "    bind_context(check[\"context\"], cfg, checkout, image)\n"
+     "    compare_bindings(check[\"binding\"], read_map(checkout, image, config, runner))\n"
+     "    state_dir = Path(cfg[\"state_dir\"])\n    for name, rec in sorted(check[\"instances\"].items()):\n"
+     "        _at(",
+     "    bind_context(check[\"context\"], cfg, checkout, image)\n"
+     "    state_dir = Path(cfg[\"state_dir\"])\n    for name, rec in sorted(check[\"instances\"].items()):\n"
+     "        _at("),
+    ("verify does not check the state identity", RM,
+     "        _at(state_dir, rec[\"logical_id\"], rec[\"ident\"])\n"
+     "        _adopted_root(checkout, image, config, state_dir, name, rec, runner)\n"
+     "    out = _record(run_dir, \"verify\")",
+     "        _adopted_root(checkout, image, config, state_dir, name, rec, runner)\n"
+     "    out = _record(run_dir, \"verify\")"),
+    ("F_FULLFSYNC refusals not tolerated", RM,
+     "            if e.errno not in (errno.ENOTSUP, errno.EOPNOTSUPP, errno.EINVAL, errno.ENOTTY):",
+     "            if True:"),
 ]
 TESTS = {RF: "test_router_fingerprint", "hygiene_gate.py": "test_router_fingerprint",
          RM: "test_router_migrate", AS: "test_router_migrate"}

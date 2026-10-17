@@ -323,6 +323,36 @@ class LayoutRows(Base):
         self.assertEqual(rm.GEN_SCOPED, ("results", "inflight", "transport", "pending", "quarantine", "held",
                                          "first-seen.json", "approval.json"))
 
+    def test_an_adopt_begun_says_resume_even_beside_generation_dirs(self):
+        """Opus's N1: migration.json is judged before gen-*, so a directory
+        caught mid-adopt names its remedy."""
+        (self.state / LID_A / "gen-1").mkdir(parents=True)
+        (self.state / LID_A / "migration.json").write_text("{}")
+        with self.assertRaises(rm.Stop) as cm:
+            rm.classify(self.state, the_map())
+        self.assertIn("resume it with the adopt step", str(cm.exception))
+
+    def test_a_refused_full_fsync_falls_back_to_fsync(self):
+        """Opus's N3: a filesystem that refuses F_FULLFSYNC keeps the fsync."""
+        import errno as errno_mod
+        fd = os.open(self.base, os.O_RDONLY)
+        self.addCleanup(os.close, fd)
+        for code in (errno_mod.ENOTSUP, errno_mod.EOPNOTSUPP, errno_mod.EINVAL, errno_mod.ENOTTY):
+            with self.subTest(errno=code):
+                def refuse(*a, code=code):
+                    raise OSError(code, os.strerror(code))
+                with mock.patch.object(rm.sys, "platform", "darwin"), \
+                        mock.patch.object(rm.fcntl, "F_FULLFSYNC", 51, create=True), \
+                        mock.patch.object(rm.fcntl, "fcntl", refuse):
+                    rm._sync(fd)
+        def other(*a):
+            raise OSError(errno_mod.EIO, "I/O error")
+        with mock.patch.object(rm.sys, "platform", "darwin"), \
+                mock.patch.object(rm.fcntl, "F_FULLFSYNC", 51, create=True), \
+                mock.patch.object(rm.fcntl, "fcntl", other):
+            with self.assertRaises(OSError):
+                rm._sync(fd)
+
     def test_generation_dirs_alone_stop_too(self):
         """Opus's p11: gen-* and no generations.json and no pre-generation
         entry is still the pin's state_layout_conflict, never a fresh start."""
@@ -617,6 +647,8 @@ class BindingRows(Base):
         with self.assertRaises(rm.Stop) as cm:
             rm.do_adopt(CHECKOUT, IMAGE, str(self.config), str(check), REASON, self.run_dir, fake)
         self.assertIn("back-out D", str(cm.exception))
+        records = [json.loads(p.read_text()) for p in self.run_dir.glob("router-migrate-adopt-*.json")]
+        self.assertTrue(records, "no adopt record was written before the STOP")
 
     def test_each_of_the_four_root_records_must_agree(self):
         """The adopt's journal, the adopted generation, the checked root and
@@ -652,6 +684,24 @@ class BindingRows(Base):
         self.write_config(extra=1)
         with self.assertRaises(rm.Stop):
             rm.do_verify(CHECKOUT, IMAGE, str(self.config), str(check), self.run_dir, FakeRouter())
+
+    def test_verify_rereads_the_binding_and_the_state_identity(self):
+        """Codex: verify refuses a changed registry binding and a copied
+        state directory, as adopt does."""
+        self.move(self.pre)
+        check = self.check(self.pre)
+        rm.do_adopt(CHECKOUT, IMAGE, str(self.config), str(check), REASON, self.run_dir,
+                    FakeRouter(plans={"alice": plan("alice", LID_A)}))
+        now = the_map()
+        now["instances"]["alice"]["binding_seq"] = 2
+        with self.assertRaises(rm.Stop):
+            rm.do_verify(CHECKOUT, IMAGE, str(self.config), str(check), self.run_dir, FakeRouter(maps=[now]))
+        shutil.copytree(self.state / LID_A, self.base / "copy")
+        shutil.rmtree(self.state / LID_A)
+        os.rename(self.base / "copy", self.state / LID_A)
+        with self.assertRaises(rm.Stop) as cm:
+            rm.do_verify(CHECKOUT, IMAGE, str(self.config), str(check), self.run_dir, FakeRouter())
+        self.assertIn("is not the instance state the plan recorded", str(cm.exception))
 
     def test_the_root_program_reads_as_the_router_does(self):
         self.assertIn("O_NOFOLLOW", rm.ROOT_PROGRAM)

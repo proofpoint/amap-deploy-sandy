@@ -336,10 +336,10 @@ def classify(state_dir: Path, the_map: Dict[str, Any]) -> Dict[str, Dict[str, An
         elif dst is not None:
             if _file_state(state_dir / lid / GEN_FILE):
                 continue
-            _unlisted(state_dir / lid)
             if _file_state(state_dir / lid / MIGRATION_FILE):
                 raise Stop(f"{state_dir / lid / MIGRATION_FILE} exists without {GEN_FILE}: an adopt has begun; "
                            "resume it with the adopt step, never with a new plan")
+            _unlisted(state_dir / lid)
             if _legacy(state_dir / lid):
                 out[name] = {"logical_id": lid, "source": BY_ID, "ident": _ident(dst), "adopt": True}
     return out
@@ -424,7 +424,7 @@ def _sync(fd: int) -> None:
             fcntl.fcntl(fd, fcntl.F_FULLFSYNC)
         except OSError as e:
             # A filesystem that refuses it keeps the fsync above, as SQLite does.
-            if e.errno not in (errno.ENOTSUP, errno.EINVAL):
+            if e.errno not in (errno.ENOTSUP, errno.EOPNOTSUPP, errno.EINVAL, errno.ENOTTY):
                 raise
 
 
@@ -755,19 +755,27 @@ def do_adopt(checkout: str, image: str, config: str, check_path: str, reason: st
                        "for another root is the maintainers' call (back-out D)")
         done[name] = result
     for name, rec in sorted(check["instances"].items()):
-        _adopted_root(checkout, image, config, state_dir, name, rec, runner)
+        try:
+            _adopted_root(checkout, image, config, state_dir, name, rec, runner)
+        except Stop:
+            _write_new(out, {"schema": SCHEMA, "step": "adopt", "done": done, "failed": None,
+                             "root_mismatch": name})
+            raise
     _write_new(out, {"schema": SCHEMA, "step": "adopt", "done": done, "failed": None})
     return out
 
 
 def do_verify(checkout: str, image: str, config: str, check_path: str, run_dir: Path, runner: Runner) -> Path:
-    """Read-only, immediately before the start: the context is still the
-    checked one, and every adopted root's four records agree."""
+    """Read-only, immediately before the start: the context and the
+    registry binding are still the checked ones, each instance's state is
+    the recorded directory, and every adopted root's four records agree."""
     check = _read_doc(check_path, "check")
     cfg = _config(config)
     bind_context(check["context"], cfg, checkout, image)
+    compare_bindings(check["binding"], read_map(checkout, image, config, runner))
     state_dir = Path(cfg["state_dir"])
     for name, rec in sorted(check["instances"].items()):
+        _at(state_dir, rec["logical_id"], rec["ident"])
         _adopted_root(checkout, image, config, state_dir, name, rec, runner)
     out = _record(run_dir, "verify")
     _write_new(out, {"schema": SCHEMA, "step": "verify", "verified": sorted(check["instances"])})

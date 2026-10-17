@@ -763,27 +763,40 @@ hop checkout, the image, and each instance's binding and state directory.
 Each later step re-reads the registry through the pinned code, and refuses
 before it changes anything unless all of these are still the plan's.
 
-**The stable window.** From step 5's stop until step 10's start, no
-instance root may be recreated.
-- An instance root is the router's `instances/<slug>` directory on the
-  host. Sandy creates it when it launches a selected sandbox, and removes it
-  with the sandbox (`--remove-sandbox`).
-- A sandbox mounts only that directory's lanes, never the directory itself
-  or any ancestor of it (the manifest's `mounts`, which `install` renders).
-  The only container that mounts `instances/` whole is the local router's
-  own, which is stopped here. So no agent can recreate a root, and running
-  agents stay up.
-- So, for every instance being migrated: no sandbox lifecycle action
-  (launch, relaunch, remove or recreate), and no host-side change under its
-  `instances/<slug>`. Before step 5, pause the scheduled container
-  recreation, the job the policy's `container_recreate_interval_hours`
-  drives, and resume it after step 11.
-- Steps 8, 9 and 10 check each root against the one recorded, so a root
-  recreated anyway stops R2 before step 10's start, on back-out D. The one
+**The stable window.** From step 5's stop until step 11's acceptance has
+passed, no instance root may be recreated. Only after step 11 passes do
+sandbox lifecycle actions, host changes and the scheduled recreation
+resume.
+- An instance root is `$SANDY_HOME/features/amap/instances/<slug>` on the
+  host. The router's config names `$SANDY_HOME/features/amap/instances` as
+  its `instances_dir`, and the pinned router takes each `<slug>` under it as
+  that instance's `handoff_dir`, its root. Sandy creates the directory when
+  it launches a selected sandbox, and removes it with the sandbox
+  (`--remove-sandbox`).
+- The manifest this repository renders mounts into a sandbox only that
+  directory's lanes, never the directory itself or any ancestor of it, so
+  an agent in a sandbox cannot recreate a root, and running agents stay up.
+  That covers this feature's own mounts, not every container on the host.
+  So, before step 5, check that no other container (anything but the local
+  router's containers: its own, stopped here, and R2's one-shot steps) has
+  a writable bind of an instance root or of any ancestor of one, and stop
+  any that does for the window.
+- For every instance being migrated, until step 11 passes:
+  - no sandbox lifecycle action (launch, relaunch, remove or recreate);
+  - no host-side change under its `instances/<slug>`;
+  - no enrolment or rebind of it in the host registry (a rebind makes the
+    router begin a new generation, as a recreated root does);
+  - no edit of the live config. Before step 5, pause the scheduled
+  container recreation, the job the policy's
+  `container_recreate_interval_hours` drives.
+- Steps 8, 9 and 10 check each root, and the registry binding, against the
+  ones recorded, so a change made anyway stops R2 before step 10's start,
+  on the back-out for that point (D once any adopt has begun; before that,
+  C then B). The one
   gap left is between step 10's verify and the router's first poll, which
   only this premise covers. A root recreated there would make the router
   begin a new generation, with a fresh first sight that quarantines that
-  instance's waiting requests.
+  instance's waiting requests. Step 11's acceptance would then fail.
 
 While R2's window is open, everything waits on disk and nothing is lost:
 - agents' outbox requests stay in their outboxes;
@@ -899,7 +912,8 @@ marker and reply ledger carry over, and it drains on the first poll.
      image. On a mismatch it STOPs: do not start the router.
 10. **Start.** First, `python3 amap-sandy.py router-migrate verify --config
     <the live config> --check <step 8's file> --apply`, which repeats step
-    9's four-way root check and the context check, and changes nothing. Then
+    9's four-way root check and the context, binding and state checks, and
+    changes nothing. Then
     at once, with no other step between them, `docker/run.sh --config <the
     live config> --image <router.image.digest> --name <router.container>
     --detach`, from the hop checkout.
