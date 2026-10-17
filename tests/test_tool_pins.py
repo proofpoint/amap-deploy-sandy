@@ -448,6 +448,47 @@ class VerifyRowTest(Tmp):
         self.assertIsNone(ss.live_refusal(s, digest=hs._sha256, closure=lambda s_: None))
 
 
+class LiveGateReReadTest(Tmp):
+    """Codex at 5b4911f6: live_refusal reads the client's pin first, then the
+    writer, then _operator_closure, whose _verified_tools reads the pin
+    again before any closure discovery. A client that matched at the first
+    read and was replaced before the second is refused there, and no closure
+    is computed; without a replacement both reads pass and the closure runs."""
+
+    def gate(self, replace):
+        import dataclasses
+        sec = dataclasses.replace(load(document("launchd")).secrets,
+                                  tools={"docker": self.client, "python3": sys.executable},
+                                  tool_sha256={"docker": self.good}, docker_via_sudo=False)
+        ok = [rh.check("inert", rh.Fact("tool", True, "inert"), True, "inert")]
+        closures = []
+
+        def writer_rows(*a, **k):
+            if replace:
+                os.chmod(self.client, 0o755)
+                with open(self.client, "wb") as f:
+                    f.write(b"replacement client bytes")
+            return ok
+        for mod, name, value in ((ss, "_tool_rows", lambda *a, **k: ok), (ss, "_writer_rows", writer_rows),
+                                 (st, "_trusted_tool", os.path.realpath),
+                                 (st, "startup_closure", lambda *a, **k: closures.append(a) or {}),
+                                 (st, "closure_problems", lambda *a, **k: [])):
+            self.addCleanup(setattr, mod, name, getattr(mod, name))
+            setattr(mod, name, value)
+        return ss.live_refusal(sec, digest=lambda p: "unused"), closures
+
+    def test_a_client_replaced_after_the_first_read_is_refused_before_any_closure(self):
+        refusal, closures = self.gate(replace=True)
+        self.assertIsNotNone(refusal)
+        self.assertIn("not the client the document pins", refusal)
+        self.assertEqual(closures, [], "no closure is discovered for the replaced client")
+
+    def test_an_unchanged_client_passes_both_reads_and_reaches_the_closure(self):
+        refusal, closures = self.gate(replace=False)
+        self.assertIsNone(refusal)
+        self.assertEqual(len(closures), 1)
+
+
 class RepinOrderTest(unittest.TestCase):
     """RE: the four steps, in their one order, with step 1's stop through the
     supervisor and never a bare docker stop."""
