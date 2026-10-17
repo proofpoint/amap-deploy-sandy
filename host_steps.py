@@ -1363,22 +1363,47 @@ def _ask_closure(python):
     return [stdlib, platstdlib, _dynload_dir(stdlib, platstdlib, path, ctypes_dir, destshared)], zips, prefix
 
 
-def startup_closure(python, docker, spelled=()):
+def _modules(dynload):
+    """The extension modules in `dynload`, sorted; none when it is not a directory."""
+    return sorted(os.path.join(dynload, n) for n in os.listdir(dynload) if n.endswith(".so")) \
+        if os.path.isdir(dynload) else []
+
+
+def _closure_images(python, tools, modules, prefix, platform=None):
+    """(binaries, libraries, searched): the executables judged, what they and
+    `modules` link, and the directories a loader searches. On macOS a
+    framework build's launcher re-execs Python.app's binary, dyld's real main
+    image, so it is judged too; each executable is its own @executable_path,
+    and the modules load under the process's main, Python.app's binary where
+    it exists."""
+    binaries = [python] + list(tools)
+    if (platform or sys.platform) != "darwin":
+        libraries, searched = _elf_closure(binaries + modules)
+        return binaries, libraries, searched
+    app = os.path.join(prefix, *DARWIN_APP_MAIN)
+    if os.path.lexists(app):
+        binaries.append(app)
+    libs, opt = set(), set()
+    for main, images in [(b, [b]) for b in binaries] + [(app if app in binaries else python, modules)]:
+        got, searched_ = _macho_closure(images, main)
+        libs.update(got)
+        opt.update(searched_)
+    return binaries, sorted(libs), sorted(opt)
+
+
+def startup_closure(python, docker, spelled=(), platform=None):
     """Every path root's runs of `python` and `docker` load from, by part:
-    REQUIRED, the binaries (their realpaths, and `spelled`, the approved
-    document's spellings, whose routes the unit execs), the interpreter's standard library and its
-    extension modules, and on macOS the developer directory xcode-select
-    chose; LIBRARIES, what both binaries and every extension module link;
-    OPTIONAL, each zip on the interpreter's path."""
-    lib, zips, _ = _ask_closure(python)
-    paths = lib + [python, docker] + list(spelled)
-    optional = zips
-    dynload = lib[2]
-    modules = []
-    if os.path.isdir(dynload):
-        modules = [os.path.join(dynload, n) for n in os.listdir(dynload) if n.endswith(".so")]
-    libraries = _linked_libraries([python, docker] + modules)
-    if sys.platform == "darwin" and os.path.exists(XCODE_SELECT):
+    REQUIRED, the binaries (their realpaths, on macOS Python.app's binary,
+    and `spelled`, the approved document's spellings, whose routes the unit
+    execs), the interpreter's standard library and its extension modules,
+    and on macOS the developer directory xcode-select chose; LIBRARIES, what
+    the binaries and every extension module link; OPTIONAL, each zip on the
+    interpreter's path and the directories the loader searches."""
+    lib, zips, prefix = _ask_closure(python)
+    binaries, libraries, searched = _closure_images(python, [docker], _modules(lib[2]), prefix, platform)
+    paths = lib + binaries + list(spelled)
+    optional = zips + searched
+    if (platform or sys.platform) == "darwin" and os.path.exists(XCODE_SELECT):
         try:
             dev = subprocess.run([XCODE_SELECT, "-p"], shell=False, close_fds=True, stdin=subprocess.DEVNULL, env={},
                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=30).stdout.decode().strip()
@@ -1567,11 +1592,11 @@ def _docker_closure(docker, spelled=None):
             OPTIONAL: []}
 
 
-def _verified_tools(python3, docker):
+def _verified_tools(python3, docker, platform=None):
     """The interpreter's and docker's realpaths once they and their startup
     closure are root's alone; Tooling otherwise."""
     python, dock = _trusted_tool(python3), _trusted_tool(docker)
-    bad = closure_problems(startup_closure(python, dock, (python3, docker)))
+    bad = closure_problems(startup_closure(python, dock, (python3, docker), platform=platform))
     if bad:
         raise Tooling("the startup closure is not root's alone: " + "; ".join(bad[:5]))
     return python, dock
@@ -1950,25 +1975,7 @@ def exec_closure(python, tools, spelled, platform=None):
     the Mach-O load commands, never through /usr/bin/otool (an xcrun stub),
     and the rpath directories dyld searches are optional paths."""
     paths, zips, prefix = _ask_closure(python)
-    dynload = paths[2]
-    modules = sorted(os.path.join(dynload, n) for n in os.listdir(dynload) if n.endswith(".so")) \
-        if os.path.isdir(dynload) else []
-    binaries = [python] + list(tools)
-    if (platform or sys.platform) == "darwin":
-        # A framework build's launcher re-execs Python.app's binary: dyld's real main image, so
-        # judged too. Each executable is its own @executable_path; the modules load under the
-        # process's main, Python.app's binary where it exists.
-        app = os.path.join(prefix, *DARWIN_APP_MAIN)
-        if os.path.lexists(app):
-            binaries.append(app)
-        libs, opt = set(), set()
-        for main, images in [(b, [b]) for b in binaries] + [(app if app in binaries else python, modules)]:
-            got, searched_ = _macho_closure(images, main)
-            libs.update(got)
-            opt.update(searched_)
-        libraries, searched = sorted(libs), sorted(opt)
-    else:
-        libraries, searched = _elf_closure(binaries + modules)
+    binaries, libraries, searched = _closure_images(python, tools, _modules(paths[2]), prefix, platform)
     return {REQUIRED: sorted(set(paths + binaries + list(spelled))), LIBRARIES: libraries,
             OPTIONAL: sorted(set(zips + searched))}
 

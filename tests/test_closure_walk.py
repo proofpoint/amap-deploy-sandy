@@ -173,13 +173,13 @@ class SpellingsTest(unittest.TestCase):
     def test_the_approved_spellings_are_closure_paths(self):
         calls = []
         for name, value in (("_trusted_tool", lambda p: "/real" + p),
-                            ("startup_closure", lambda *a: calls.append(a) or {}),
+                            ("startup_closure", lambda *a, **k: calls.append((a, k)) or {}),
                             ("closure_problems", lambda c: [])):
             self.addCleanup(setattr, hs, name, getattr(hs, name))
             setattr(hs, name, value)
         hs._verified_tools("/usr/bin/python3", "/usr/bin/docker")
-        self.assertEqual(calls, [("/real/usr/bin/python3", "/real/usr/bin/docker",
-                                  ("/usr/bin/python3", "/usr/bin/docker"))])
+        self.assertEqual(calls, [(("/real/usr/bin/python3", "/real/usr/bin/docker",
+                                   ("/usr/bin/python3", "/usr/bin/docker")), {"platform": None})])
 
     def test_the_fallback_docker_closure_carries_the_spelling_when_known(self):
         self.addCleanup(setattr, hs, "_linked_libraries", hs._linked_libraries)
