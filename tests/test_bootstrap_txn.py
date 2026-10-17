@@ -800,6 +800,48 @@ class GateRows(Tree):
                 subprocess.run(["setfacl", "-b", p], check=True)
 
 
+class AclStubRows(Tree):
+    """G's and GATE0's ACL refusal on any host: a stub for the listing tool
+    they call reports a recorded ACL for one path, in each form the rule
+    reads (Linux: `+` after the mode; macOS `ls -le`: an entry line), and
+    passes every other listing through unchanged."""
+    FORMS = {"plus": "sed '1s/^\\(..........\\)./\\1+/'",
+             "entry": "sed '1a\\\n 0: user:nobody allow write'"}
+
+    def stub(self, target, form):
+        ls = os.path.join(self.bin, f"ls-{form}")
+        self.write(ls, (f"#!/bin/sh\nlast=\nfor a in \"$@\"; do last=$a; done\n"
+                        f"if [ \"$last\" = {shlex.quote(target)} ] && [ \"$1\" != -a1 ]; then\n"
+                        f"  /bin/ls \"$@\" | {self.FORMS[form]}\nelse\n  exec /bin/ls \"$@\"\nfi\n").encode(), 0o755)
+        return ls
+
+    def test_g_refuses_a_recorded_acl_in_either_form_and_passes_without_one(self):
+        self.installed()
+        clean = self.gate(ls=self.stub("/nonexistent", "plus"))
+        self.assertEqual(clean.returncode, 0, clean.stderr)
+        for target in (self.writer, self.rt, os.path.join(self.top, "opt")):
+            for form in self.FORMS:
+                with self.subTest(target=target, form=form):
+                    g = self.gate(ls=self.stub(target, form))
+                    self.assertEqual(g.returncode, 1, g.stdout + g.stderr)
+                    self.assertIn("carries an ACL", g.stderr)
+                    self.assertNotIn("BOOTSTRAP-OK", g.stdout)
+
+    def test_gate0_refuses_a_recorded_acl_on_an_ancestor_or_a_leaf(self):
+        for target, rc in ((os.path.join(self.top, "opt"), 1), (self.writer, 3)):
+            for form in self.FORMS:
+                with self.subTest(target=target, form=form):
+                    if os.path.exists(self.wd):
+                        shutil.rmtree(self.wd)
+                    if os.path.exists(self.log("sudo")):
+                        os.unlink(self.log("sudo"))
+                    self.installed()
+                    p = self.run_txn(ls=self.stub(target, form))
+                    self.assertEqual(p.returncode, rc, p.stdout + p.stderr)
+                    self.assertIn("carries an ACL", p.stderr)
+                    self.assertEqual(self.calls("sudo"), [])
+
+
 class RenderRows(unittest.TestCase):
     """The plan's bootstrap: its order, its values, its operands."""
 

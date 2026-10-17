@@ -57,10 +57,12 @@ foreground command runs.
 
 import json
 import math
+import os
 import plistlib
 import posixpath
 import re
 import shlex
+import stat
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -619,16 +621,274 @@ def plan(spec: Any, q: Callable[[str], str], steps: str) -> List[str]:
 
 
 def start_commands(spec: Any) -> List[str]:
-    """The gated start step: printed only after every start check passes."""
+    """The gated first start: printed only after every start check passes,
+    each a typed line through the writer's service verb."""
     sup = spec.supervision
     if sup.kind == "systemd":
-        return ["systemctl daemon-reload",
-                f"systemctl enable --now {posixpath.basename(sup.weekly['timer'])}",
-                f"systemctl enable --now {posixpath.basename(sup.hub['unit'])}"]
-    return [f"{LAUNCHCTL} enable system/{sup.weekly['label']}",
-            f"{LAUNCHCTL} bootstrap system {sup.weekly['plist']}",
-            f"{LAUNCHCTL} enable system/{sup.hub['label']}",
-            f"{LAUNCHCTL} bootstrap system {sup.hub['plist']}"]
+        return [service_line(spec, "daemon-reload"),
+                service_line(spec, "enable-now", posixpath.basename(sup.weekly["timer"])),
+                service_line(spec, "enable-now", posixpath.basename(sup.hub["unit"]))]
+    return [service_line(spec, "enable", sup.weekly["label"]),
+            service_line(spec, "bootstrap", sup.weekly["label"], sup.weekly["plist"]),
+            service_line(spec, "enable", sup.hub["label"]),
+            service_line(spec, "bootstrap", sup.hub["label"], sup.hub["plist"])]
+
+
+# --- The planned restart: each unit's or label's state, read as the operator ----
+
+RUNNING, STOPPED, FAILED, LOADED, NOT_LOADED, IN_PROGRESS = (
+    "running", "not running", "failed", "loaded", "not loaded", "a weekly run in progress")
+#: is-active's answer while a unit restarts or starts: neither running nor stopped yet.
+ACTIVATING = ("a restart loop or a start in progress; re-run hub-start-check after it settles, at most about "
+              "StartLimitBurst × RestartSec")
+
+
+def active_state(answer: Any) -> Any:
+    """One unit's `systemctl is-active` (rc, stdout), by its exact pairs:
+    running, not running, failed, or an Unresolved (activating named)."""
+    if isinstance(answer, rh.Unresolved):
+        return answer
+    rc, out = answer
+    if (rc, out) in ((0, "active"), (0, "reloading")):
+        return RUNNING
+    if (rc, out) == (3, "inactive"):
+        return STOPPED
+    if (rc, out) == (3, "failed"):
+        return FAILED
+    if out == "activating" and rc in (0, 3):
+        return rh.Unresolved(ACTIVATING)
+    return rh.Unresolved(f"systemctl is-active answered ({rc}, {out!r})")
+
+
+def ask_active(spec: Any, unit: str) -> Any:
+    """`systemctl --no-pager is-active <unit>`, by the recorded manager, for one unit alone."""
+    try:
+        p = rh.run([manager(spec), "--no-pager", "is-active", unit])
+    except rh.CannotRun as e:
+        return rh.Unresolved(str(e))
+    return p.rc, p.out.strip()
+
+
+def ask_print(label: str) -> Any:
+    """`launchctl print system/<label>`: (rc, its output)."""
+    try:
+        p = rh.run([LAUNCHCTL, "print", f"system/{label}"])
+    except rh.CannotRun as e:
+        return rh.Unresolved(str(e))
+    return p.rc, p.out + p.err
+
+
+def weekly_state(answer: Any) -> Any:
+    """The weekly label: loaded and idle, a run in progress, not loaded, or
+    an Unresolved. Running and idle are told apart only by print's measured
+    lines (root_trust.LAUNCHD_STATE_RUNNING and _IDLE); until they are
+    measured a loaded label is unknown."""
+    if isinstance(answer, rh.Unresolved):
+        return answer
+    rc, out = answer
+    if rc == 0:
+        lines = out.split("\n")
+        if rt.LAUNCHD_STATE_RUNNING is not None and rt.LAUNCHD_STATE_RUNNING in lines:
+            return IN_PROGRESS
+        if rt.LAUNCHD_STATE_IDLE is not None and rt.LAUNCHD_STATE_IDLE in lines:
+            return LOADED
+        return rh.Unresolved("launchctl print's wording for a loaded weekly label is not measured here")
+    if "could not find service" in out.lower():
+        return NOT_LOADED
+    return rh.Unresolved(f"launchctl print system/<weekly label> exited {rc}")
+
+
+def until_stopped_line(spec: Any, document: Optional[Tuple[str, str]] = None) -> str:
+    """The NOT-RUNNING check as the operator runs it, from the deploy clone."""
+    s = spec.secrets
+    head = [s.tools["python3"], posixpath.join(s.clones["deploy"]["path"], "amap-sandy.py")]
+    if document is not None and document[0] == "overlay":
+        argv = head + ["--overlay", document[1], "hub-start-check", "--until-stopped"]
+    else:
+        argv = head + ["hub-start-check", "--until-stopped"] + (["--spec", document[1]] if document else [])
+    return " ".join(shlex.quote(a) for a in argv)
+
+
+def restart_commands(spec: Any, states: Dict[str, Any], document: Optional[Tuple[str, str]] = None) -> List[str]:
+    """The start step for the states read now (d3.3 §5(d) §4.3). systemd:
+    the hub not running gets its first start, failed gets reset-failed
+    first, running is restarted. launchd, weekly label first: a label not
+    loaded is enabled and bootstrapped; a loaded one is booted out first
+    (the hub then waits for NOT-RUNNING), because a loaded job keeps its
+    registered arguments; a weekly run in progress gets nothing."""
+    sup = spec.supervision
+    if sup.kind == "systemd":
+        hub, timer = posixpath.basename(sup.hub["unit"]), posixpath.basename(sup.weekly["timer"])
+        lines = [service_line(spec, "daemon-reload")]
+        if states["hub"] == FAILED:
+            lines.append(service_line(spec, "reset-failed", hub))
+        lines.append(service_line(spec, "enable-now", timer))
+        lines.append(service_line(spec, "restart", hub) if states["hub"] == RUNNING
+                     else service_line(spec, "enable-now", hub))
+        return lines
+    lines: List[str] = []
+    for key, conf in (("weekly", sup.weekly), ("hub", sup.hub)):
+        label, state = conf["label"], states[key]
+        if state == IN_PROGRESS:
+            lines.append("# A weekly run is in progress: nothing for its label; re-run hub-start-check after it ends.")
+            continue
+        if state == LOADED or state is True:
+            lines.append(service_line(spec, "bootout", label))
+            if key == "hub":
+                lines.append("# Do not go on until this prints NOT-RUNNING:")
+                lines.append(until_stopped_line(spec, document))
+        lines += [service_line(spec, "enable", label), service_line(spec, "bootstrap", label, conf["plist"])]
+    return lines
+
+
+# --- The old context, and NOT-RUNNING -------------------------------------------
+
+#: The named stop when the placed writer's own install record cannot be used.
+NO_OLD_CONTEXT = "no approved old context for the placed writer: the update cannot observe the old hub; the maintainers' call"
+#: What an engine that cannot be read is told.
+ENGINE_UNREAD = ("the engine could not be read (on a sudo-route host, run `sudo -v` first so the barriered read has "
+                 "a ticket), then re-run")
+_CONTEXT_MEMBERS = {"schema": str, "writer_sha256": str, "root_trust_sha256": str, "host": str, "engine": str,
+                    "hub_container": str, "hub": str, "weekly": list, "overlay_sha256": str}
+_HEX64 = re.compile(r"[0-9a-f]{64}")
+
+
+def _no_duplicates(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for k, v in pairs:
+        if k in out:
+            raise ValueError(f"a duplicate key {k!r}")
+        out[k] = v
+    return out
+
+
+def read_old_context(spec: Any, *, lstat: Callable = os.lstat, digest: Optional[Callable[[str], Any]] = None,
+                     acl: Optional[Callable[[List[str]], List[str]]] = None, root_uid: int = 0) -> Any:
+    """The deployed context the placed writer's install published, read
+    strictly, or an Unresolved naming why not: its route root's alone,
+    searchable, no ACL; the file regular, one link, exactly root:root 0444;
+    one JSON object within CONTEXT_MAX, strict UTF-8, no duplicate keys,
+    exactly its members and schema; its pins the placed bytes' own; its
+    identities the new document's. The measured hashes are never adopted:
+    they must merely equal the pins the root-placed record names."""
+    path = context_path(spec)
+    if digest is None:
+        import host_setup
+        digest = host_setup._sha256
+    if acl is None:
+        import host_steps  # operator side: the ACL rule the barrier itself uses
+        acl = host_steps.acl_problems
+    route = [path]
+    while route[0] != "/":
+        route.insert(0, posixpath.dirname(route[0]))
+    try:
+        sts = [lstat(p) for p in route]
+    except OSError as e:
+        return rh.Unresolved(f"{e.filename or path}: {e.strerror or e}")
+    for p, st in zip(route[:-1], sts[:-1]):
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != root_uid or st.st_mode & 0o022 or not st.st_mode & 0o001:
+            return rh.Unresolved(f"{p} is not a root-owned directory others can search and no one else can write")
+    st = sts[-1]
+    if not stat.S_ISREG(st.st_mode) or (st.st_uid, st.st_gid) != (root_uid, 0) or stat.S_IMODE(st.st_mode) != 0o444 \
+            or st.st_nlink != 1:
+        return rh.Unresolved(f"{path} is not exactly root:root 0444, one link")
+    bad = acl(route)
+    if bad:
+        return rh.Unresolved("; ".join(bad))
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))
+    except OSError as e:
+        return rh.Unresolved(f"{path}: {e.strerror}")
+    try:
+        f = os.fstat(fd)
+        if (f.st_dev, f.st_ino) != (st.st_dev, st.st_ino):
+            return rh.Unresolved(f"{path} changed while it was read")
+        raw = os.read(fd, CONTEXT_MAX + 1)
+    finally:
+        os.close(fd)
+    if len(raw) > CONTEXT_MAX:
+        return rh.Unresolved(f"{path} is larger than {CONTEXT_MAX} bytes")
+    try:
+        doc = json.loads(raw.decode("utf-8"), object_pairs_hook=_no_duplicates)
+    except (UnicodeDecodeError, ValueError) as e:
+        return rh.Unresolved(f"{path} is not one strict JSON object ({e})")
+    if not isinstance(doc, dict) or set(doc) != set(_CONTEXT_MEMBERS) or \
+            any(not isinstance(doc[k], t) for k, t in _CONTEXT_MEMBERS.items()) or \
+            not all(isinstance(x, str) for x in doc["weekly"]):
+        return rh.Unresolved(f"{path} does not hold exactly the context's members")
+    if doc["schema"] != CONTEXT_SCHEMA:
+        return rh.Unresolved(f"{path} is schema {doc['schema']!r}, not {CONTEXT_SCHEMA}")
+    if not all(_HEX64.fullmatch(doc[k]) for k in ("writer_sha256", "root_trust_sha256", "overlay_sha256")):
+        return rh.Unresolved(f"{path} names a pin that is not 64 lowercase hex")
+    s = spec.secrets
+    if digest(s.writer) != doc["writer_sha256"] or digest(rt_path(spec)) != doc["root_trust_sha256"]:
+        return rh.Unresolved("its pins are not the placed writer's and root-trust.sh's bytes")
+    new = context_doc(spec, doc["overlay_sha256"])
+    for k in ("host", "engine", "hub_container", "hub", "weekly"):
+        if doc[k] != new[k]:
+            return rh.Unresolved(f"its {k} {doc[k]!r} is not the new document's {new[k]!r}")
+    return doc
+
+
+def under_context(spec: Any, doc: Dict[str, Any]) -> Any:
+    """The new document with only the writer's pin replaced by the old
+    context's, so the real pin gate admits the placed, old writer."""
+    import dataclasses
+    return dataclasses.replace(spec, secrets=dataclasses.replace(spec.secrets, writer_sha256=doc["writer_sha256"]))
+
+
+def ask_running_container(spec: Any) -> Any:
+    """Whether the engine lists a RUNNING container named the hub container,
+    through verify's gated live route: True, False, or an Unresolved."""
+    name = hub_name(spec)
+    try:
+        with ss.trust_gate(spec.secrets, engine=spec.supervision.engine):
+            p = rh.run(ss.live_docker(spec.secrets) + ["ps", "-q", "--no-trunc", "--filter", f"name=^/{name}$"])
+    except rh.CannotRun as e:
+        return rh.Unresolved(str(e))
+    if p.rc != 0:
+        return rh.Unresolved(f"docker ps exited {p.rc}")
+    return bool(p.out.strip())
+
+
+def not_running(spec: Any, *, old_context: bool, active: Optional[Callable[[str], Any]] = None,
+                loaded: Callable[[str], Any] = None, container: Optional[Callable[[Any], Any]] = None,
+                context: Optional[Callable[[Any], Any]] = None) -> str:
+    """The NOT-RUNNING check's last line: `NOT-RUNNING` only when the hub
+    (and on systemd the weekly service and timer) are stopped by their
+    exact answers AND the engine lists no running hub container; otherwise
+    the first unmet condition, `running: …`, `running container: …` or
+    `unknown: …`. Under old_context the engine is read through the old
+    context's pin, and a context that cannot be used is the named stop."""
+    sup = spec.supervision
+    read = spec
+    if old_context:
+        doc = (context or read_old_context)(spec)
+        if isinstance(doc, rh.Unresolved):
+            return f"unknown: {NO_OLD_CONTEXT} ({doc.reason})"
+        read = under_context(spec, doc)
+    if sup.kind == "systemd":
+        units = [(posixpath.basename(sup.hub["unit"]), (STOPPED, FAILED)),
+                 (posixpath.basename(sup.weekly["service"]), (STOPPED, FAILED)),
+                 (posixpath.basename(sup.weekly["timer"]), (STOPPED,))]
+        for unit, ok in units:
+            state = active_state((active or (lambda u: ask_active(spec, u)))(unit))
+            if isinstance(state, rh.Unresolved):
+                return f"unknown: {unit}: {state.reason}"
+            if state not in ok:
+                return f"running: {unit}"
+    else:
+        up = (loaded or ask_loaded)(sup.hub["label"])
+        if isinstance(up, rh.Unresolved):
+            return f"unknown: {sup.hub['label']}: {up.reason}"
+        if up:
+            return f"running: {sup.hub['label']}"
+    there = (container or ask_running_container)(read)
+    if isinstance(there, rh.Unresolved):
+        return f"unknown: {ENGINE_UNREAD} ({there.reason})"
+    if there:
+        return f"running container: {hub_name(spec)}"
+    return "NOT-RUNNING"
 
 
 _BLOCK_OPEN = re.compile(r"[A-Za-z][A-Za-z ]* = \{")

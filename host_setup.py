@@ -1617,17 +1617,50 @@ def hub_supervise(spec_path: Optional[Path], *, apply: bool, overlay: Optional[P
                           overlay_sha256=document_sha256(document_source(spec_path, overlay)))
 
 
+def unit_states(spec: Spec, active: Optional[Callable[[str], Any]] = None,
+                print_: Optional[Callable[[str], Any]] = None, loaded: Optional[Callable[[str], Any]] = None) -> Any:
+    """Each unit's or label's state, read separately (d3.3 §5(d) §4.3): the
+    states restart_commands takes, or the first Unresolved."""
+    sup = spec.supervision
+    if sup.kind == "systemd":
+        ask = active or (lambda u: hv.ask_active(spec, u))
+        states = {"hub": hv.active_state(ask(posixpath.basename(sup.hub["unit"]))),
+                  "timer": hv.active_state(ask(posixpath.basename(sup.weekly["timer"])))}
+    else:
+        states = {"weekly": hv.weekly_state((print_ or hv.ask_print)(sup.weekly["label"])),
+                  "hub": (loaded or hv.ask_loaded)(sup.hub["label"])}
+        if states["hub"] is True:
+            states["hub"] = hv.LOADED
+        elif states["hub"] is False:
+            states["hub"] = hv.NOT_LOADED
+    for v in states.values():
+        if isinstance(v, rh.Unresolved):
+            return v
+    return states
+
+
 def hub_start_check(spec_path: Optional[Path], *, overlay: Optional[Path] = None, out=print,
-                    **probes: Any) -> int:
+                    until_stopped: bool = False, old_context: bool = False,
+                    states: Optional[Dict[str, Callable[..., Any]]] = None, **probes: Any) -> int:
     """The `hub-start-check` verb: every start check, printed; on a pass, and
-    only then, the start step for the operator to run."""
+    only then, the start step for the states read now. With until_stopped,
+    only the NOT-RUNNING check: read-only, its last line NOT-RUNNING or the
+    first unmet condition (old_context reads the engine under the deployed
+    context's pin)."""
     try:
         spec = load_spec(read_spec(spec_path, overlay))
     except ValueError as e:     # SpecError included
         out(f"hub-start-check: {e}")
         return 2
-    if spec.supervision is None or spec.hub is None:
-        out("hub-start-check: the host-setup document has no hub and supervision sections")
+    if spec.supervision is None or spec.hub is None or spec.secrets is None:
+        out("hub-start-check: the host-setup document has no hub, secrets and supervision sections")
+        return 2
+    if until_stopped:
+        last = hv.not_running(spec, old_context=old_context, **(states or {}))
+        out(last)
+        return 0 if last == "NOT-RUNNING" else 1
+    if old_context:
+        out("hub-start-check: --old-context reads only with --until-stopped")
         return 2
     # The document's provenance, as `run` gives it: a --spec document is never
     # checked as though it were read from the anchored overlay.
@@ -1635,8 +1668,12 @@ def hub_start_check(spec_path: Optional[Path], *, overlay: Optional[Path] = None
     if rc != 0:
         out("hub-start-check: REFUSED. The hub-link router may not start; nothing to run.")
         return rc
+    found = unit_states(spec, **(states or {}))
+    if isinstance(found, rh.Unresolved):
+        out(f"hub-start-check: no start line: {found.reason}")
+        return 1
     out("hub-start-check: every check passed. `host-setup` (verify) must ALSO pass for this host before "
         "the start: it checks the whole host, which this does not. The start step, as root:")
-    for line in hv.start_commands(spec):
+    for line in hv.restart_commands(spec, found, document_source(spec_path, overlay)):
         out(f"  {line}")
     return 0

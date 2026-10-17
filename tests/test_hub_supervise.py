@@ -187,7 +187,8 @@ class SystemdTest(unittest.TestCase):
         plan = "\n".join(hv.plan(spec(), lambda x: x, "steps"))
         self.assertNotIn("systemctl", plan)
         self.assertNotIn("launchctl", hv.plan(spec("launchd"), lambda x: x, "steps")[-1])
-        self.assertIn("systemctl enable --now hub-link.service", hv.start_commands(spec()))
+        self.assertTrue(hv.start_commands(spec())[-1].endswith(
+            "service --manager /usr/bin/systemctl systemd enable-now hub-link.service"))
 
     def test_the_weekly_job_runs_the_probe_under_the_lock(self):
         s = spec()
@@ -845,13 +846,13 @@ class StartGateTest(unittest.TestCase):
         hs.load_spec = lambda doc: built
         hs.start_checks = lambda s, **k: [self.check(r) for r in results]
         said = []
-        rc = hs.hub_start_check(None, out=said.append)
+        rc = hs.hub_start_check(None, out=said.append, states={"active": lambda u: (3, "inactive")})
         return rc, "\n".join(said)
 
     def test_a_pass_prints_the_start_step(self):
         rc, said = self.run_gate([rh.PASS, rh.PASS])
         self.assertEqual(rc, 0)
-        self.assertIn("systemctl enable --now hub-link.service", said)
+        self.assertIn("service --manager /usr/bin/systemctl systemd enable-now hub-link.service", said)
 
     def test_any_fail_or_unknown_refuses_and_prints_no_start_step(self):
         for bad in (rh.FAIL, rh.UNKNOWN):
@@ -947,6 +948,7 @@ class StartSweepTest(unittest.TestCase):
             setattr(mod, name, value)
         said = []
         rc = hs.hub_start_check(spec_path, overlay=overlay, out=said.append, state="active",
+                                states={"active": lambda u: (3, "inactive")},
                                 keys=keys or {"containers": []}, secret_lock=free_lock)
         return rc, "\n".join(said)
 
@@ -1021,7 +1023,7 @@ class StartSweepTest(unittest.TestCase):
         rc, said = self.gate([rh.check("y", rh.Fact("y", True, "a test"), True, "x")])
         self.assertEqual(rc, 0, said)
         self.assertIn("`host-setup` (verify) must ALSO pass", said)
-        self.assertIn("systemctl enable --now hub-link.service", said)
+        self.assertIn("service --manager /usr/bin/systemctl systemd enable-now hub-link.service", said)
 
 
 class LaunchdEnablementTest(unittest.TestCase):
@@ -1051,11 +1053,12 @@ class LaunchdEnablementTest(unittest.TestCase):
         self.assertFalse(any("launchctl" in l for l in hv.plan(spec(), lambda x: x, "STEPS")))
 
     def test_the_start_step_enables_each_label_then_bootstraps_it(self):
-        self.assertEqual(hv.start_commands(spec("launchd")), [
-            f"{hv.LAUNCHCTL} enable system/org.example.hub-probe",
-            f"{hv.LAUNCHCTL} bootstrap system /Library/LaunchDaemons/org.example.hub-probe.plist",
-            f"{hv.LAUNCHCTL} enable system/org.example.hub",
-            f"{hv.LAUNCHCTL} bootstrap system /Library/LaunchDaemons/org.example.hub.plist"])
+        s = spec("launchd")
+        self.assertEqual(hv.start_commands(s), [
+            hv.service_line(s, "enable", "org.example.hub-probe"),
+            hv.service_line(s, "bootstrap", "org.example.hub-probe", "/Library/LaunchDaemons/org.example.hub-probe.plist"),
+            hv.service_line(s, "enable", "org.example.hub"),
+            hv.service_line(s, "bootstrap", "org.example.hub", "/Library/LaunchDaemons/org.example.hub.plist")])
 
     def test_print_disabled_is_read_in_both_spellings(self):
         """The two spellings `launchctl print-disabled system` is documented to
