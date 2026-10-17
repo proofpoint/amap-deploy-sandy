@@ -886,7 +886,9 @@ def quarantined(results: Path) -> List[str]:
     """The req_ids of the private results under `results` that record a
     first sight's rejection. An absent directory has none. Every
     `<req_id>.json` must be a private result as the pin's _finish writes it
-    (`{"digest", "result": {"req_id", "outcome", "reason_code", "ts"}}`),
+    (`{"digest", "result": {"req_id", "outcome", "reason_code", "ts"}}`;
+    digest is null for a request the router could not read, and other
+    members are tolerated),
     with its req_id the file's own name and its reason_code a non-empty
     string; anything else STOPs, and never counts as clean. An entry not
     ending in `.json` is not a result: the pin's atomic writes stage under
@@ -906,7 +908,9 @@ def quarantined(results: Path) -> List[str]:
         except ValueError:
             raise Stop(f"{results / entry} is not a private result for {req_id!r}: not one JSON object") from None
         result = doc.get("result") if isinstance(doc, dict) else None
-        if (not isinstance(doc, dict) or not isinstance(doc.get("digest"), str) or not isinstance(result, dict)
+        if (not isinstance(doc, dict) or "digest" not in doc
+                or not (doc["digest"] is None or isinstance(doc["digest"], str))
+                or not isinstance(result, dict)
                 or result.get("req_id") != req_id or not isinstance(result.get("outcome"), str)
                 or not isinstance(result.get("reason_code"), str) or not result["reason_code"]):
             raise Stop(f"{results / entry} is not a private result for {req_id!r}")
@@ -938,8 +942,10 @@ def do_baseline(preview_path: str, run_dir: Path) -> Path:
             marker = _regular_bytes(d / MARKER)
             if marker is None:
                 raise Stop(f"{name!r}'s legacy state has no {MARKER}: R2 does not migrate approval-only state, and "
-                           "nothing has moved. Take back-out B, let the old router poll the instance once (its "
-                           f"first sight writes {MARKER} from approval.json), then run R2 again from step 1")
+                           "nothing has moved. Take back-out B. If its approval.json carries a valid approved_ts, "
+                           f"let the old router poll the instance once (its first sight writes {MARKER} from it), then "
+                           "run R2 again from step 1; otherwise the state cannot be adopted, and it is the "
+                           "maintainers' call")
             instances[name] = {"logical_id": p["logical_id"],
                                "marker_sha256": hashlib.sha256(marker).hexdigest(),
                                "quarantined": quarantined(d / "results")}

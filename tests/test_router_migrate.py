@@ -1073,6 +1073,21 @@ class AcceptRows(Base):
                 self.refused("is not a private result")
         os.remove(self.gen / "results" / "x.json")
 
+    def test_an_unreadable_request_s_result_with_a_null_digest_is_valid(self):
+        """RL at 8302db87: _finish writes digest null when the request could
+        not be read (too large, or an OSError from the pinned read). Such a
+        result is legitimate and is not a first-sight rejection; extra
+        members are tolerated."""
+        (self.gen / "results" / "big.json").write_text(json.dumps(
+            {"digest": None, "transport_req_id": "t", "result": {"req_id": "big", "outcome": "rejected",
+                                                                  "reason_code": "malformed_request", "ts": "t"}}))
+        try:
+            out = self.accept()
+        except rm.Stop as e:
+            self.fail(f"a legitimate null-digest result stopped acceptance: {e}")
+        self.assertEqual(json.loads(out.read_text())["accepted"]["alice"]["carried"], ["old"])
+        self.assertEqual(rm.quarantined(self.gen / "results"), ["old"])
+
     def test_a_name_not_ending_in_json_is_not_a_result(self):
         """The pin's atomic writes stage under other names (RL), so such an
         entry is not read as a result, and a clean migration still passes."""
