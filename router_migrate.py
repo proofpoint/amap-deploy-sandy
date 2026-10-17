@@ -842,9 +842,14 @@ QUARANTINED = "quarantined_pre_approval"
 MARKER = "first-seen.json"
 #: A private result or a marker is small; anything larger is not one.
 RECORD_MAX = 1 << 20
+#: The pin's own records (generations.json, migration.json) are read by the
+#: pin with no cap, and the adopt journal lists every legacy local anchor,
+#: one line each: this bound is far above what a real journal reaches
+#: (about a million anchors), so it only stops a runaway file.
+ROUTER_RECORD_MAX = 64 << 20
 
 
-def _regular_bytes(p: Path) -> Optional[bytes]:
+def _regular_bytes(p: Path, cap: int = RECORD_MAX) -> Optional[bytes]:
     """A regular file's bytes, opened without following a link; None when
     no entry is there. Anything else, or anything unreadable, STOPs."""
     try:
@@ -857,16 +862,16 @@ def _regular_bytes(p: Path) -> Optional[bytes]:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
             raise Stop(f"{p} is not a regular file")
-        if st.st_size > RECORD_MAX:
+        if st.st_size > cap:
             raise Stop(f"{p} is larger than a record")
         chunks, total = [], 0
         while True:     # a short read is not the end: read the same fd to EOF, within the bound
-            chunk = os.read(fd, RECORD_MAX + 1 - total)
+            chunk = os.read(fd, cap + 1 - total)
             if not chunk:
                 break
             chunks.append(chunk)
             total += len(chunk)
-            if total > RECORD_MAX:
+            if total > cap:
                 raise Stop(f"{p} is larger than a record")
     except OSError as e:
         raise Stop(f"{p} cannot be read: {e.strerror}") from None
@@ -1048,11 +1053,11 @@ def do_accept(checkout: str, image: str, config: str, check_path: str, baseline_
 
 
 def _read_json(path: Path) -> Any:
-    """A router record, regular and within RECORD_MAX, or None when absent."""
+    """A record of the pin's own, regular and within ROUTER_RECORD_MAX, or None when absent."""
     if not _file_state(path):
         return None
     try:
-        return json.loads(_regular_bytes(path) or b"")
+        return json.loads(_regular_bytes(path, ROUTER_RECORD_MAX) or b"")
     except ValueError as e:
         raise Stop(f"{path} cannot be read: {e}") from None
 

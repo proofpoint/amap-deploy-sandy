@@ -1155,8 +1155,27 @@ class AcceptRows(Base):
         self.refused("is not the instance state the plan recorded")
 
     def test_an_oversized_generations_file_is_refused(self):
-        (self.state / LID_A / "generations.json").write_bytes(b" " * (rm.RECORD_MAX + 1))
-        self.refused("larger than a record")
+        """The pin's records have their own bound, far above a real journal;
+        a file over it still STOPs (the bound lowered here for the row)."""
+        (self.state / LID_A / "generations.json").write_bytes(b" " * 4097)
+        with mock.patch.object(rm, "ROUTER_RECORD_MAX", 4096):
+            self.refused("larger than a record")
+
+    def test_a_large_adopt_journal_is_read_whole(self):
+        """Opus at 8302db87: the adopt journal lists every legacy local
+        anchor, one line each, so a real migration.json can pass RECORD_MAX
+        (about 13,300 anchors); the pin reads it uncapped, and accept and
+        verify must too."""
+        d = self.state / LID_A
+        m = json.loads((d / "migration.json").read_text())
+        m["legacy"] = {"manifest": [f"results/{n:08d}.json" for n in range(50000)]}
+        (d / "migration.json").write_text(json.dumps(m, indent=1))
+        self.assertGreater((d / "migration.json").stat().st_size, rm.RECORD_MAX)
+        try:
+            self.accept()
+        except rm.Stop as e:
+            self.fail(f"a large adopt journal stopped acceptance: {e}")
+        rm.do_verify(CHECKOUT, IMAGE, str(self.config), str(self.check_path), self.run_dir, FakeRouter())
 
     def test_each_unreadable_result_is_refused(self):
         """The reader's guards (Opus's Z4-Z8, Z14): a link, an oversized
