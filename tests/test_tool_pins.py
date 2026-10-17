@@ -53,9 +53,15 @@ def load(d):
 
 class LoadTest(unittest.TestCase):
     def refuses(self, d, words):
-        with self.assertRaises(hs.SpecError) as e:
+        """Refused by name: a SpecError carrying `words`. Any other exception,
+        a crash where a refusal belongs, is a failure here, not an error."""
+        try:
             load(d)
-        self.assertIn(words, str(e.exception))
+        except Exception as e:     # noqa: BLE001 -- the type is the assertion
+            self.assertIsInstance(e, hs.SpecError, f"refused by a crash, not by name: {e!r}")
+            self.assertIn(words, str(e))
+        else:
+            self.fail(f"loaded; expected a refusal naming {words!r}")
 
     def test_a_section_pin_is_64_lower_case_hex_for_a_tool_it_records(self):
         for name in ("secrets", "partition"):
@@ -256,17 +262,41 @@ class WalkTest(unittest.TestCase):
         job = [o for w, o, a in invocations(spec) if w == "job"]
         self.assertEqual([parsed(o)[2] for o in job], [[f"/opt/other/bin/docker={OTHER}"]])
 
+    def test_the_sudo_route_carries_the_pin(self):
+        """The sudo route stays unavailable under its notice, but its argv,
+        where rendered, carries docker's pin once like every other line."""
+        import dataclasses
+        sec = load(document("launchd")).secrets
+        sec = dataclasses.replace(sec, tools=dict(sec.tools, sudo="/usr/bin/sudo"))
+        argv = ss.sudo_route(sec, "unix:///x.sock")
+        [(opts, run)] = _te(argv)
+        self.assertEqual(run, [sec.tools["docker"]])
+        self.assertEqual(parsed(opts)[2], [f"{sec.tools['docker']}={DOCKER_PIN}"])
+
+    def test_a_typed_line_with_another_sections_tools_carries_that_sections_pins(self):
+        d = document("launchd")
+        d["partition"]["tools"]["docker"] = "/opt/other/bin/docker"
+        d["partition"][rt.TOOL_SHA256] = {"docker": OTHER}
+        spec = load(d)
+        p = spec.partition
+        line = ss.typed_root(spec.secrets, [p.tools["docker"], "version"], shlex.quote,
+                             tools=list(p.tools.values()), pins=p.pins)
+        [(opts, run)] = _te(shlex.split(line))
+        self.assertEqual(parsed(opts)[2], [f"/opt/other/bin/docker={OTHER}"], "the partition client's own pin")
+
     def test_the_inner_checks_get_the_pin(self):
         spec = load(document("launchd"))
         weekly = hv.weekly_argv(spec)
         inner = shlex.split(weekly[-1])
         i = inner.index("probe-weekly")
+        self.assertIn("--docker-sha256", inner[i:], "probe-weekly is handed the pin")
         self.assertEqual(inner[inner.index("--docker-sha256", i) + 1], DOCKER_PIN)
         judge = [l for l in pj.validation_steps(spec.partition, writer=spec.secrets.writer,
                                                 writer_sha256=spec.secrets.writer_sha256,
                                                 tools=list(spec.partition.tools.values()))
                  if "partition-judge" in l and not l.startswith("#")]
         self.assertEqual(shlex.split(judge[0])[-2:], ["--docker-sha256", DOCKER_PIN])
+        self.assertEqual(len(judge), 1)
 
 
 class Tmp(unittest.TestCase):
