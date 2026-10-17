@@ -938,10 +938,18 @@ class CliParseRows(unittest.TestCase):
         self.assertEqual((args.step, args.label, args.apply), (2, "r2", True))
 
 
-def result(req_id, reason="delivered"):
-    """A private result as the pin's _finish writes it (outbound.py:2179-2190, measured by RL)."""
-    return json.dumps({"digest": "0" * 64, "result": {"outcome": "rejected" if reason != "delivered" else "ok",
-                                                      "reason_code": reason, "req_id": req_id, "ts": "t"}})
+def result(req_id, reason="delivered", digest="0" * 64):
+    """A private result as the pin's _finish and _write_anchor write it
+    (outbound.py:2179-2222 at 99329945): digest null for a request the
+    router could not read."""
+    return json.dumps({"digest": digest, "result": {
+        "contract_version": 2, "req_id": req_id, "outcome": "rejected" if reason != "delivered" else "ok",
+        "detail": None, "reason_code": reason, "ts": "2026-10-17T00:00:00Z", "message_id": None, "job_id": None}})
+
+
+#: An approval.json the pin's legacy_marker can adopt from.
+DATED_APPROVAL = json.dumps({"approved_ts": "2026-01-02T03:04:05Z", "declared_root": "/inst/alice",
+                             "outbox_snapshot": []})
 
 
 class AcceptRows(Base):
@@ -1072,6 +1080,21 @@ class AcceptRows(Base):
                 (self.gen / "results" / "x.json").write_text(text)
                 self.refused("is not a private result")
         os.remove(self.gen / "results" / "x.json")
+
+    def test_a_wrong_type_digest_is_refused(self):
+        (self.gen / "results" / "x.json").write_text(result("x", digest=7))
+        self.refused("is not a private result")
+
+    def test_null_and_string_digests_are_valid_at_the_baseline_too(self):
+        """Codex at 8302db87: the baseline reads the legacy ledger with the
+        same rule, so a null-digest result there neither stops it nor
+        counts as a rejection."""
+        legacy = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, legacy, ignore_errors=True)
+        (legacy / "s.json").write_text(result("s"))
+        (legacy / "n.json").write_text(result("n", reason="malformed_request", digest=None))
+        (legacy / "q.json").write_text(result("q", reason=rm.QUARANTINED, digest=None))
+        self.assertEqual(rm.quarantined(legacy), ["q"])
 
     def test_an_unreadable_request_s_result_with_a_null_digest_is_valid(self):
         """RL at 8302db87: _finish writes digest null when the request could
@@ -1380,6 +1403,42 @@ class EarlyRefusalRows(Base):
         self.assertTrue((self.state / "alice").is_dir())
         self.assertFalse((self.state / LID_A).exists())
         self.assertEqual(list(self.run_dir.glob("router-migrate-baseline-*")), [])
+
+    def no_marker(self, name="alice"):
+        try:
+            rm.do_baseline(str(self.pre), self.run_dir)
+        except rm.Stop as e:
+            return str(e)
+        self.fail("the baseline accepted state with no first-seen.json")
+
+    def test_a_by_name_instance_with_a_dated_approval_gets_the_poll_remedy(self):
+        (self.state / "alice" / "approval.json").write_text(DATED_APPROVAL)
+        why = self.no_marker()
+        self.assertIn("let the old router poll the instance once", why)
+        self.assertNotIn("fence-legacy", why)
+
+    def test_a_by_name_instance_without_approved_ts_is_fenced(self):
+        (self.state / "alice" / "approval.json").write_text(json.dumps({"declared_root": "/inst/alice",
+                                                                        "outbox_snapshot": []}))
+        why = self.no_marker()
+        self.assertIn("fence-legacy", why)
+        self.assertNotIn("poll", why)
+
+    def test_a_by_id_approval_only_instance_gets_no_start_instruction(self):
+        """Codex at 8302db87: a name-keyed old router never reads the
+        logical-id directory, so nothing tells the operator to start or
+        poll it, whatever its approval says."""
+        shutil.rmtree(self.state / "alice")
+        d = self.state / LID_A
+        (d / "results").mkdir(parents=True)
+        (d / "results" / "r1.json").write_text(result("r1"))
+        (d / "approval.json").write_text(DATED_APPROVAL)
+        self.pre, _ = self.preview()
+        why = self.no_marker()
+        self.assertIn("unsupported by R2", why)
+        self.assertIn(str(d), why)
+        self.assertNotIn("poll", why)
+        self.assertNotIn("let the old router", why)
 
     def test_an_unusable_check_record_makes_no_adopt_call(self):
         (self.state / "alice" / "first-seen.json").write_text("{}")

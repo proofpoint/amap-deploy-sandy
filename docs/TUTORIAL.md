@@ -898,11 +898,18 @@ marker and reply ledger carry over, and it drains on the first poll.
    still the ones step 4 recorded, so it runs only here, before any move.
    R2 does not migrate approval-only state: an instance to be adopted whose
    legacy state has no `first-seen.json` STOPs the baseline, before
-   anything has moved. Then take back-out B. If its `approval.json` carries
-   a valid `approved_ts`, let the old router poll that instance once (its
-   first sight writes `first-seen.json` from it), and run R2 again from
-   step 1; otherwise the state cannot be adopted, and it is the
-   maintainers' call.
+   anything has moved. Take back-out B, and then, by the layout the
+   baseline names:
+   - under the instance's name, with an `approval.json` that carries a
+     valid `approved_ts`: let the old router poll that instance once (an
+     ordinary drain; its first sight writes `first-seen.json` from the
+     approval), and run R2 again from step 1;
+   - under the instance's name, with no valid `approved_ts`: R2 cannot
+     adopt it; it is the maintainers' call (fence-legacy);
+   - under its logical id: R2 does not support it, and it is the
+     maintainers' call. Start nothing for it: a name-keyed old router never
+     reads the logical-id directory, so a poll would take a fresh first
+     sight beside it.
 6. **The live config.** `python3 amap-sandy.py install --apply`. Then
    `sha256sum <the live config>` must equal the sha256 step 2 printed.
    Every later step refuses a config whose sha256 is not the plan's.

@@ -919,6 +919,41 @@ def quarantined(results: Path) -> List[str]:
     return sorted(out)
 
 
+#: A UTC timestamp as the pin's parse_utc_ts reads an approval's approved_ts.
+UTC_TS = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?Z")
+
+
+def approval_dated(d: Path) -> bool:
+    """The pin's own test for an approval.json first sight can adopt
+    (generations.legacy_marker): an object with a UTC approved_ts, a string
+    declared_root and a list outbox_snapshot. Anything unreadable is not."""
+    try:
+        doc = json.loads(_regular_bytes(d / "approval.json") or b"")
+    except (Stop, ValueError):
+        return False
+    return (isinstance(doc, dict) and isinstance(doc.get("approved_ts"), str)
+            and UTC_TS.fullmatch(doc["approved_ts"]) is not None and isinstance(doc.get("declared_root"), str)
+            and isinstance(doc.get("outbox_snapshot"), list))
+
+
+def no_marker(name: str, d: Path, source: str) -> str:
+    """Why an instance with no legacy first-seen.json stops the baseline,
+    and the one remedy that is safe for its layout. R2 migrates no
+    approval-only state. A name-keyed old router reads only <name>/, so it
+    may prepare a BY_NAME instance with a dated approval by one ordinary
+    poll, and nothing else."""
+    head = (f"{name!r}'s legacy state at {d} has no {MARKER}: R2 does not migrate approval-only state, and "
+            "nothing has moved")
+    if source != BY_NAME:
+        return (f"{head}. It is under its logical id, which a name-keyed old router never reads, so it is "
+                "unsupported by R2: the maintainers' call. Take back-out B and start nothing for it")
+    if approval_dated(d):
+        return (f"{head}. Take back-out B, let the old router poll the instance once (its first sight writes "
+                f"{MARKER} from approval.json), then run R2 again from step 1")
+    return (f"{head}, and its approval.json carries no valid approved_ts: not adoptable by R2, the maintainers' "
+            "call (fence-legacy). Take back-out B")
+
+
 def do_baseline(preview_path: str, run_dir: Path) -> Path:
     """Step 5, after the stop and before any move: each adopted instance's
     legacy first-sight marker (its sha256) and the first-sight rejections
@@ -941,11 +976,7 @@ def do_baseline(preview_path: str, run_dir: Path) -> Path:
                            "any move")
             marker = _regular_bytes(d / MARKER)
             if marker is None:
-                raise Stop(f"{name!r}'s legacy state has no {MARKER}: R2 does not migrate approval-only state, and "
-                           "nothing has moved. Take back-out B. If its approval.json carries a valid approved_ts, "
-                           f"let the old router poll the instance once (its first sight writes {MARKER} from it), then "
-                           "run R2 again from step 1; otherwise the state cannot be adopted, and it is the "
-                           "maintainers' call")
+                raise Stop(no_marker(name, d, p["source"]))
             instances[name] = {"logical_id": p["logical_id"],
                                "marker_sha256": hashlib.sha256(marker).hexdigest(),
                                "quarantined": quarantined(d / "results")}
