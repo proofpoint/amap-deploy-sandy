@@ -310,14 +310,17 @@ def run_probe(spec: Any, ks: KeySpec, *, apply: bool, run_id: Optional[str] = No
     if bad:
         out(f"hub-keyprobe: refused: the probe would differ from the email router: {'; '.join(bad)}")
         return 2
-    argv = ss.docker(spec.secrets) + ["run"] + probe_argv(probe)
+    tail = ["run"] + probe_argv(probe)
     if not apply:
+        argv = ss.docker(spec.secrets) + tail
         out("hub-keyprobe: would run (nothing ran; run again with --apply):")
         out("  " + " ".join(argv[:-len(probe["command"])]) + f" <the probe script> {len(candidates(base, ks))} path(s)")
         return 0
     try:
-        if runner is None:
-            ss.live_docker(spec.secrets)
+        # The client live_docker returns IS the barrier (d3.3 §5(c)): it is what runs. No outer
+        # gate holds the engine here, so the document's is passed.
+        engine = spec.supervision.engine if getattr(spec, "supervision", None) else None
+        argv = ss.live_docker(spec.secrets, engine=engine) + tail
         p = (runner or rh.run)(argv)
     except rh.CannotRun as e:
         out(f"hub-keyprobe: could not run: {e}")

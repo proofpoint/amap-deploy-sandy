@@ -754,12 +754,14 @@ Activation is A1 to A5, then the weekly job's first manual run. Each step
 is required before the next, and each command prints the next step.
 
 Every Docker call the activation verbs make goes through the document's
-docker client (`docker`, or `sudo -n docker` where `docker_via_sudo` is
-set), with no `-H`. So the local router and the hub-link router must run on
-the one engine that client reaches, and `supervision.engine` must name that
-engine. Under sudo's default environment reset, `sudo -n` drops `DOCKER_HOST`. If
-the engines differ, the checks fail closed: a router on another engine
-reads as not running.
+docker client, with no `-H`. That client is `docker` itself, or, where
+`docker_via_sudo` is set, `sudo -n` followed by the root barrier line
+(`/usr/bin/env -i …`, then root-trust.sh's root_exec and trusted-exec, then
+docker). Outside `verify`'s own run that line names no `DOCKER_HOST`, so
+docker reaches its default engine. The local router and the hub-link router
+must therefore run on that one engine, and `supervision.engine` must name
+it. If the engines differ, the checks fail closed: a router on another
+engine reads as not running.
 
 0. **Before A1, on each host, in this order.** A2's evidence, the
    post-activation document and the key probe's record bind the approved
@@ -1069,7 +1071,9 @@ names the hub-link router after a stop, find out why the barrier refused
 before you stop the container by hand.
 
 On macOS the wrapper's error stream goes to `hub-link-run.err`, beside its
-status in the root-owned status directory. `verify` reads both. A missing
+status in the root-owned status directory. It holds only the wrapper's own
+lines: the router's output goes to the engine's log (`docker logs`).
+`verify` reads both files. A missing
 status is a failure, not "never started", because a refusal that cannot
 record itself removes the last one. A refusal is a failure whether or not it
 was recorded.
@@ -1077,8 +1081,21 @@ was recorded.
 `verify`'s own live engine calls go through the same barrier. Each runs
 only when the interpreter, the pinned writer, docker's startup closure
 (computed as you) and sudo all pass. On the sudo route each call is
-`sudo -n /usr/bin/env -i … /bin/sh -c '… root_exec …'`, so your sudo must
-let you run `/usr/bin/env` as root without a password, not just docker.
+`sudo -n /usr/bin/env -i PATH=… LC_ALL=C DOCKER_HOST=<engine> /bin/sh -c
+'<the fixed source line> root_exec "$@"' sh <writer sha256> <python3> <writer>
+trusted-exec --tool … -- <docker> …`. So sudo must permit THIS generated
+invocation without a password: `env -i` with that fixed PATH, LC_ALL and
+DOCKER_HOST, the fixed shell line, the pinned sha256, the interpreter, the
+writer, trusted-exec and docker. A rule that allows only docker no longer
+matches. Never grant `/usr/bin/env` with any arguments: that lets the caller
+run any command as root. The host-setup plan prints the narrow rules
+(commented): one for `verify`, with the engine, and one for the activation
+verbs, without it. Each is that prefix, escaped for sudoers, followed only by
+docker's own arguments. They change with the writer pin, the engine and the
+tools, so copy them from the plan rather than writing them by hand. Install
+them with `visudo` and check them with `visudo -c`. sudoers matches the
+arguments as one string, not argument by argument. A root-owned,
+fixed-purpose launcher would be a separate, reviewed change.
 
 
 ### The weekly partition job's tools

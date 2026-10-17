@@ -1864,6 +1864,11 @@ def _trace_form(confstr=getattr(os, "confstr", None)):
     return (major, minor) < (2, 33)
 
 
+#: The one run-path token judged, as glibc reads it: `${ORIGIN}`, or `$ORIGIN` ending at a
+#: character that cannot continue an identifier.
+_ORIGIN = re.compile(r"\$\{ORIGIN\}|\$ORIGIN(?![A-Za-z0-9_])")
+
+
 def _elf_closure(binaries, run=subprocess.run, trace=None):
     """Every library `binaries` link, as the anchor's own loader lists them in
     its list mode (which maps them and runs none of their code; never ldd, a
@@ -1891,10 +1896,15 @@ def _elf_closure(binaries, run=subprocess.run, trace=None):
     for obj in sorted(set(binaries) | libs):
         _, runpaths = elf_dynamic(obj)
         for r in runpaths:
-            if "$" in r.replace("$ORIGIN", "").replace("${ORIGIN}", ""):
+            # glibc's token rule (is_dst): `$ORIGIN` only where the next character is not a letter,
+            # digit or `_`; `$ORIGINX/lib` is a literal, working-directory-relative path (Opus B3).
+            if "$" in _ORIGIN.sub("", r):
                 raise Tooling(f"{obj} names a run path this check does not judge: {r}")
             # Textual, as the loader joins it: a `..` after a link is the kernel's (Codex d3 A2).
-            searched.add(r.replace("${ORIGIN}", "$ORIGIN").replace("$ORIGIN", os.path.dirname(obj)))
+            place = _ORIGIN.sub(lambda m: os.path.dirname(obj), r)
+            if not place.startswith("/"):
+                raise Tooling(f"{obj}'s run path {r} is not absolute once $ORIGIN is placed")
+            searched.add(place)
     return sorted(libs), sorted(searched)
 
 
@@ -1997,12 +2007,13 @@ def loader_dirs(platform=None, read=None, glob_=None):
             if not line:
                 continue
             if line.startswith("include "):
-                pattern = line[len("include "):].strip()
-                if not pattern.startswith("/"):
-                    pattern = os.path.join(os.path.dirname(conf), pattern)
-                for f in sorted(glob_(pattern)):
-                    out.append(f)
-                    todo.append(f)
+                # every blank-separated pattern, each relative one joined to this file's directory
+                for pattern in line[len("include "):].split():
+                    if not pattern.startswith("/"):
+                        pattern = os.path.join(os.path.dirname(conf), pattern)
+                    for f in sorted(glob_(pattern)):
+                        out.append(f)
+                        todo.append(f)
             elif line.startswith("/"):
                 out.append(line)
             else:

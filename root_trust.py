@@ -242,7 +242,7 @@ _rt_under() {
     || _rt_fail "$1" "holds a link whose route is not root's alone"
 }
 _rt_conf() {
-  local f line pat
+  local f line pats pat
   f=$1
   _rt_has "conf:$f" && return 0
   _rt_add "conf:$f"
@@ -255,11 +255,14 @@ _rt_conf() {
     case $line in
       '') ;;
       include\ *)
-        pat=${line#include }
-        pat=${pat#"${pat%%[![:space:]]*}"}
-        case $pat in /*) ;; *) _rt_dir "$f"; _rt_join "$_rt_d" "$pat"; pat=$_rt_j ;; esac
-        _rt_print "$pat"
-        _rt_include "$pat" ;;
+        # every blank-separated pattern, each relative one joined to this file's directory (ldconfig's rule)
+        pats=${line#include }
+        set -f
+        for pat in $pats; do
+          case $pat in /*) ;; *) _rt_dir "$f"; _rt_join "$_rt_d" "$pat"; pat=$_rt_j ;; esac
+          _rt_print "$pat"
+          _rt_include "$pat"
+        done ;;
       /*)
         _rt_print "$line"
         _rt_up "$line"

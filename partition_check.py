@@ -366,7 +366,7 @@ def evaluate(spec: Any, *, document_raw: bytes, document_sha256: str, now: float
     argv's `--document`. `p` may supply `read` (placed files), `read_live`,
     `read_lanes` (sandy's selected set), `inspect`, `image`, `status`, `stat`
     and `lstat`; the defaults read the host and ask the engine through
-    ss.docker(spec.secrets)."""
+    ss.live_docker(spec.secrets)."""
     import os
     import host_setup as hsu
     import hub_runtime as hr

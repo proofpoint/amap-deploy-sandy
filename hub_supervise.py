@@ -103,10 +103,15 @@ SUPERVISOR_STOP_S = 120
 #: declared bound, and the supervisors' bound must cover it plus the stop.
 BARRIER_S = 10
 ORPHAN = "orphan_running"
+#: The wrapper's record once the barrier passed and the run is next; the run's own end replaces it.
+STARTED = "started"
 #: The wrapper's record when the writer finds docker or python3 not root's alone: nothing ran.
 UNTRUSTED = "untrusted_tools"
 #: The wrapper's error stream, launchd's StandardErrorPath (d3.3 §5 B3): beside
-#: its status, in the root-owned status directory. Its own lines start SAY.
+#: its status, in the root-owned status directory. Its own lines start SAY. The
+#: run's output goes to the engine's log, so this holds only the wrapper's lines
+#: and docker's own errors: a few per start, at most one start per
+#: ThrottleInterval when launchd restarts it (RE N6).
 ERR_NAME = "hub-link-run.err"
 SAY = "hub-link-run: "
 #: What the wrapper says when a refusal could not be recorded: the one line
@@ -385,6 +390,11 @@ else
     [ -z "$ids" ] || {{ say "$NAME exists but cannot be inspected"; exit 125; }}
 fi
 
+# 1b. The barrier passed and the run is next: recorded and said, so a healthy start's status
+#     is not missing and its last line is not an earlier refusal (Opus N1).
+record {STARTED} || say "the start could not be recorded"
+say "started: the barrier passed"
+
 # 2. A stop request becomes a docker stop; the run continues to its exit. A stop the barrier
 #    refuses never reaches docker: the container keeps running, and launchd's ExitTimeOut
 #    then kills this wrapper and the client, not the container (RE N2).
@@ -396,8 +406,10 @@ stop_it() {{
 }}
 trap stop_it TERM INT
 
-# 3. The run, in the background, so a signal is handled while it runs.
-root_docker {run} &
+# 3. The run, in the background, so a signal is handled while it runs. Its own output
+#    (the router's lines) goes to the engine's log, not to the error stream, which
+#    holds this wrapper's lines alone (RE N6).
+root_docker {run} >/dev/null 2>&1 &
 child=$!
 wait "$child"
 code=$?
@@ -415,6 +427,9 @@ case "$code" in
         record "$code"
         say "exit $code: recorded, not restarted"
         exit 0 ;;
+    {rt.EXIT})
+        say "exit $code: the barrier refused the run (its own words went with the run's output); passed on, and the next start's step 0 records why"
+        exit "$code" ;;
     *)
         say "exit $code: passed on"
         exit "$code" ;;

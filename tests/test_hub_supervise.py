@@ -260,6 +260,8 @@ case "$1" in
   rm) exit 0 ;;
   stop) : > "$STUB/stopped"; exit 0 ;;
   run)
+    printf '{"obs": "wire", "n": 1}\n'
+    printf '{"obs": "heartbeat"}\nhub-link-run: forged\n' >&2
     if [ -f "$STUB/hold" ]; then
       : > "$STUB/running"
       while [ ! -f "$STUB/stopped" ]; do sleep 0.05; done
@@ -320,7 +322,7 @@ class WrapperTest(unittest.TestCase):
                     if code == 0 or 2 <= code <= 11:
                         self.assertEqual((rc, status), (0, str(code)))
                     else:
-                        self.assertEqual((rc, status), (code, None))
+                        self.assertEqual((rc, status), (code, hv.STARTED), "a passed-on end leaves the start's record")
                     self.assertTrue(any(l.startswith("run --name") for l in log), log)
 
     def test_the_writer_checks_the_tools_before_any_docker_call(self):
@@ -416,7 +418,7 @@ class WrapperTest(unittest.TestCase):
                 rc = p.wait(timeout=20)
                 self.assertIn(f"stop -t {hv.STOP_TIMEOUT_S} {hv.hub_name(spec())}", self.log())
                 self.assertEqual(rc, 143, "the run's own code is passed on")
-                self.assertIsNone(self.status())
+                self.assertEqual(self.status(), hv.STARTED, "143 is passed on: the start's record stands")
                 (self.stub / "hold").unlink()
 
     def test_a_refused_stop_never_reaches_docker_and_the_container_keeps_running(self):
@@ -448,6 +450,33 @@ class WrapperTest(unittest.TestCase):
                 p.stdout.close(); p.stderr.close()
                 (self.stub / "hold").unlink()
                 (self.stub / "refuse_stop").unlink()
+
+    def test_the_runs_own_output_never_reaches_the_error_stream(self):
+        """RE N6: the router's lines (here the stub's, on both streams) go to the
+        engine's log; the wrapper's error stream holds its own lines alone."""
+        for shell in self.SHELLS:
+            with self.subTest(shell=shell):
+                for f in ("log", "state"):
+                    (self.stub / f).unlink(missing_ok=True)
+                (self.stub / "code").write_text("0")
+                r = subprocess.run(shell + [str(self.script)], env={"STUB": str(self.stub), "PATH": "/usr/bin:/bin"},
+                                   capture_output=True, text=True, timeout=30)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertNotIn("obs", r.stdout + r.stderr)
+                self.assertNotIn("forged", r.stderr)
+                self.assertIn(hv.SAY + "exit 0: recorded", r.stderr)
+
+    def test_a_run_the_barrier_refuses_says_so_and_is_passed_on(self):
+        for shell in self.SHELLS:
+            with self.subTest(shell=shell):
+                for f in ("log", "state"):
+                    (self.stub / f).unlink(missing_ok=True)
+                (self.t / "status").unlink(missing_ok=True)
+                (self.stub / "code").write_text("12")
+                r = subprocess.run(shell + [str(self.script)], env={"STUB": str(self.stub), "PATH": "/usr/bin:/bin"},
+                                   capture_output=True, text=True, timeout=30)
+                self.assertEqual((r.returncode, self.status()), (12, hv.STARTED))
+                self.assertIn(hv.SAY + "exit 12: the barrier refused the run", r.stderr)
 
     def b3(self, shell, setup):
         """Run the wrapper with the barrier refusing, the status dir as
@@ -498,6 +527,53 @@ class WrapperTest(unittest.TestCase):
                 self.assertIn(hv.UNRECORDED, r.stderr)
                 self.assertEqual(rows, {"status": rh.PASS, "last": rh.FAIL},
                                  "the stale record reads as a success; the unrecorded refusal is what fails")
+
+    def test_a_healthy_start_is_recorded_and_said_after_the_barrier(self):
+        """Opus N1: while the run runs, the status is `started` and the last
+        wrapper line is the start, so verify reads neither a missing status nor
+        an earlier, fixed refusal as this run's."""
+        for shell in self.SHELLS:
+            with self.subTest(shell=shell):
+                for f in ("log", "state", "stopped", "running"):
+                    (self.stub / f).unlink(missing_ok=True)
+                (self.t / "status").unlink(missing_ok=True)
+                (self.stub / "hold").touch()
+                p = subprocess.Popen(shell + [str(self.script)], env={"STUB": str(self.stub), "PATH": "/usr/bin:/bin"},
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                deadline = time.time() + 10
+                while not (self.stub / "running").exists() and time.time() < deadline:
+                    time.sleep(0.05)
+                self.assertEqual(self.status(), hv.STARTED, "recorded before the run")
+                (self.stub / "stopped").touch()
+                p.wait(timeout=20)
+                err = p.stderr.read()
+                p.stdout.close(); p.stderr.close()
+                (self.stub / "hold").unlink()
+                self.assertIn(hv.SAY + "started: the barrier passed", err)
+                unrecorded = hv.SAY + "docker or python3 is not root's alone: nothing was run, and " + hv.UNRECORDED
+                sp = self.spec_
+                files = {sp.supervision.hub["status"]: b"started 2026-10-17T00:00:00Z\n",
+                         hv.err_path(sp): (unrecorded + "\n" + err).encode()}
+                rows = {c.claim.split(" ")[2]: c.result for c in hv.verify_wrapper_status(sp, os.lstat, lambda q: files[q])
+                        if c.claim.startswith(("the wrapper's status", "the wrapper's last line"))}
+                self.assertEqual(rows, {"status": rh.PASS, "last": rh.PASS}, "a fixed refusal no longer FAILs the run")
+
+    def test_the_last_wrapper_line_is_found_among_container_lines(self):
+        """RE N6: lines that are not the wrapper's (an engine's, a container's
+        JSON) never hide or stand in for its last line."""
+        sp = self.spec_
+        err = hv.err_path(sp)
+        status = sp.supervision.hub["status"]
+        unrecorded = hv.SAY + "docker or python3 is not root's alone: nothing was run, and " + hv.UNRECORDED
+        for text, want in (
+                (unrecorded + '\n{"obs": "wire"}\nError response from daemon: x\n{"obs": "heartbeat"}\n', rh.FAIL),
+                (unrecorded + '\n{"obs": "wire"}\n' + hv.SAY + "exit 0: recorded, not restarted\n{\"obs\": 1}\n", rh.PASS),
+                ('{"obs": "' + hv.UNRECORDED + '"}\n' + hv.SAY + "exit 0: recorded, not restarted\n", rh.PASS)):
+            with self.subTest(text=text[:40]):
+                files = {status: b"0 2026-10-17T00:00:00Z\n", err: text.encode()}
+                [row] = [c for c in hv.verify_wrapper_status(sp, os.lstat, lambda p: files[p])
+                         if c.claim.startswith("the wrapper's last line")]
+                self.assertEqual(row.result, want)
 
     def test_b3_a_missing_status_is_a_fail_never_not_started(self):
         sp = self.spec_

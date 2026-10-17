@@ -674,6 +674,48 @@ class LoaderConfTest(Fixture):
         self.assertEqual(r.returncode, rt.EXIT, r.stderr)
         self.assertIn(self.p("open"), r.stderr)
 
+    def two_patterns(self):
+        """`include one/*.conf two/*.conf`: glibc's ldconfig reads both, each
+        relative to the conf's own directory (Opus B4, measured with ldconfig)."""
+        self.one = self.p("lib/three")
+        os.makedirs(self.one, mode=0o755)
+        self.file("etc/one/x.conf", 0o644, f"{self.one}\n")
+        self.file("etc/two/y.conf", 0o644, f"{self.incdir}\n")
+        self.conf("include one/*.conf two/*.conf\n")
+
+    def test_every_pattern_of_a_multi_pattern_include_is_followed(self):
+        self.two_patterns()
+        r = self.go()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        for d in (self.one, self.incdir):
+            with self.subTest(dir=d):
+                os.chmod(d, 0o777)
+                r = self.go()
+                self.assertEqual(r.returncode, rt.EXIT, r.stderr)
+                self.assertIn(d, r.stderr)
+                os.chmod(d, 0o755)
+
+    def test_an_unreadable_ld_so_conf_fails(self):
+        """Opus N2: the file rule passes (mode 0400 kept from others' write),
+        and reading it is what fails."""
+        os.chmod(self.p("etc/ld.so.conf"), 0o000)
+        r = self.go()
+        self.assertEqual(r.returncode, rt.EXIT, r.stderr)
+        self.assertIn("cannot be read", r.stderr)
+
+    def test_a_writable_conf_file_fails_and_so_does_an_included_one_outside_conf_d(self):
+        """Opus N2: each conf file by the file rule, not only the conf.d tree."""
+        os.chmod(self.p("etc/ld.so.conf"), 0o666)
+        r = self.go()
+        self.assertEqual(r.returncode, rt.EXIT, r.stderr)
+        self.assertIn(self.p("etc/ld.so.conf"), r.stderr)
+        os.chmod(self.p("etc/ld.so.conf"), 0o644)
+        self.two_patterns()
+        os.chmod(self.p("etc/one/x.conf"), 0o666)
+        r = self.go()
+        self.assertEqual(r.returncode, rt.EXIT, r.stderr)
+        self.assertIn(self.p("etc/one/x.conf"), r.stderr)
+
     def test_an_entry_this_check_does_not_read_refuses(self):
         for line in ("hwcap 1 nosegneg", "relative/lib", "include"):
             with self.subTest(line=line):

@@ -776,10 +776,45 @@ def live_docker(s: SecretSpec, *, engine: Optional[str] = None) -> List[str]:
         raise rh.CannotRun(gate.refusal)
     if not s.docker_via_sudo:
         return [s.tools["docker"]]
+    return sudo_route(s, engine or gate.engine)
+
+
+def sudo_route(s: SecretSpec, engine: Optional[str]) -> List[str]:
+    """`sudo -n` and the §3 grammar up to `-- <docker>`, the one prefix of
+    every live call on the sudo route: what live_docker returns and what
+    sudoers_lines renders, from the same values."""
     tools = [x for t in sorted(set(s.tools.values())) if posixpath.basename(t) != "sudo" for x in ("--tool", t)]
     return [s.tools["sudo"], "-n"] + rt.root_argv_positional(
         posixpath.join(s.writer_dir, rt.NAME), s.writer_sha256, s.tools["python3"], s.writer,
-        ["trusted-exec"] + tools + ["--", s.tools["docker"]], engine=engine or gate.engine)
+        ["trusted-exec"] + tools + ["--", s.tools["docker"]], engine=engine)
+
+
+def _sudoers_arg(a: str) -> str:
+    """One argument, escaped for a sudoers Cmnd (sudoers(5)): the backslash,
+    `,` `:` `=` and the wildcard characters, so each matches only itself."""
+    out = a.replace("\\", "\\\\")
+    for c in ",:=*?[]":
+        out = out.replace(c, "\\" + c)
+    return out
+
+
+def sudoers_lines(s: SecretSpec, engine: Optional[str]) -> List[str]:
+    """The narrow sudo rule the sudo route needs (Opus B5 at 184acedf), as
+    plan comments the operator installs with visudo: the operator's uid may
+    run exactly the prefix sudo_route builds, with the document's engine
+    (verify's run) and with none (the activation verbs, outside a gate), and
+    nothing after `-- <docker>` but docker's own arguments. It changes with
+    every writer pin, engine and tool set, so it is rendered, never written
+    by hand. sudoers matches the arguments as one string, not argv by argv."""
+    rules = []
+    for e in ([engine] if engine else []) + [None]:
+        route = sudo_route(s, e)
+        rules.append(f"# #{s.operator_uid} ALL=(root) NOPASSWD: {route[2]} "
+                     + " ".join(_sudoers_arg(a) for a in route[3:]) + " *")
+    return ["# The operator's sudo, for the live engine route (docker_via_sudo): these rules and no "
+            "broader one. Never grant /usr/bin/env with any arguments: that is a root shell. Install with "
+            "visudo and check with `visudo -c`; they change with the writer pin, the engine and the tools."] + rules
+
 
 
 def _dir(claim: str, path: str, owner: Sequence[int], mode: Optional[int], why: str,

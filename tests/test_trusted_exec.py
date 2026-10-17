@@ -271,6 +271,22 @@ class ElfDiscoveryTest(Tmp):
         p = self.put("app/bin/y", elf64(runpath="$ORIGIN/../lib:/opt/rp:${ORIGIN}/x"))
         self.assertEqual(hs.elf_dynamic(p)[1], ["$ORIGIN/../lib", "/opt/rp", "${ORIGIN}/x"], "kept whole, in order")
 
+    def test_origin_is_a_token_only_at_glibcs_boundary(self):
+        """Opus B3 at 184acedf: `$ORIGINX/lib` and `$ORIGIN_x/lib` stay literal
+        (glibc 2.41, LD_DEBUG=libs), relative to the working directory, so
+        they refuse; `${ORIGIN}x/lib` and `$ORIGIN/lib` are placed."""
+        loader, _ = hs.elf_dynamic(hs.ANCHOR_SHELL)
+        ok = subprocess.CompletedProcess([], 0, b"\t" + loader.encode() + b" (0x2)\n", b"")
+        for rp in ("$ORIGINX/lib", "$ORIGIN_x/lib", "$ORIGIN9", "/opt/a:$ORIGINx"):
+            with self.subTest(runpath=rp):
+                p = self.put("app/bin/x", elf64(runpath=rp, interp=loader))
+                with self.assertRaisesRegex(hs.Tooling, "does not judge"):
+                    hs._elf_closure([p], run=lambda *a, **k: ok)
+        p = self.put("app/bin/y", elf64(runpath="${ORIGIN}x/lib:$ORIGIN/lib:$ORIGIN", interp=loader))
+        _, searched = hs._elf_closure([p], run=lambda *a, **k: ok)
+        d = os.path.join(self.d, "app/bin")
+        self.assertEqual(searched, sorted([d + "x/lib", d + "/lib", d]))
+
     def test_a_runpath_with_another_token_refuses(self):
         loader, _ = hs.elf_dynamic(hs.ANCHOR_SHELL)
         p = self.put("bin/x", elf64(runpath="$LIB/x", interp=loader))
@@ -652,6 +668,21 @@ class LoaderConfigTest(unittest.TestCase):
             raise FileNotFoundError(2, "No such file or directory")
         self.assertEqual(hs.loader_dirs("linux", read=absent, glob_=lambda p: []),
                          sorted([hs.LD_SO_CACHE, hs.LD_SO_CONF, hs.LD_SO_CONF_D]))
+
+    def test_every_pattern_of_a_multi_pattern_include_is_followed(self):
+        """Opus B4: each blank-separated pattern, each relative one joined to
+        the conf's own directory, as ldconfig does."""
+        files = {hs.LD_SO_CONF: "include one/*.conf /abs/*.conf two/*.conf\n",
+                 "/etc/one/x.conf": "/lib/a\n", "/abs/z.conf": "/lib/c\n", "/etc/two/y.conf": "/lib/b\n"}
+        globs = []
+
+        def glob_(p):
+            globs.append(p)
+            return [f for f in files if f.startswith(p.split("*")[0]) and f.endswith(".conf") and f != hs.LD_SO_CONF]
+        out = hs.loader_dirs("linux", read=lambda p: files[p], glob_=glob_)
+        self.assertEqual(globs[:3], ["/etc/one/*.conf", "/abs/*.conf", "/etc/two/*.conf"])
+        for d in ("/lib/a", "/lib/b", "/lib/c"):
+            self.assertIn(d, out)
 
     def test_darwin_names_the_dyld_fallbacks(self):
         self.assertEqual(set(hs.loader_dirs("darwin")), set(hs.DYLD_FALLBACK_DIRS))
