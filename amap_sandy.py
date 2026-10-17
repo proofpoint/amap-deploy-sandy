@@ -5423,12 +5423,14 @@ def build_parser() -> argparse.ArgumentParser:
     rmig = sub.add_parser(
         "router-migrate", help="the runbook's R2: a local router whose state is keyed by instance name, moved to "
                                "the pinned router's registry layout, each step through the pinned router's own "
-                               "code (map, preview, move, check, adopt, verify). Exit 0 done, 1 STOP, 2 cannot run")
-    rmig.add_argument("step", choices=("map", "preview", "move", "check", "adopt", "verify"))
+                               "code (map, preview, baseline, move, check, adopt, verify, accept). Exit 0 done, 1 "
+                               "STOP, 2 cannot run")
+    rmig.add_argument("step", choices=("map", "preview", "baseline", "move", "check", "adopt", "verify", "accept"))
     rmig.add_argument("--config", help="the migration config: install --render-to's file before the stop, the "
                                        "live config after it")
     rmig.add_argument("--preview", help="the preview step's file, the plan (move and check)")
-    rmig.add_argument("--check", help="the check step's file (adopt and verify)")
+    rmig.add_argument("--check", help="the check step's file (adopt, verify and accept)")
+    rmig.add_argument("--baseline", help="the baseline step's file (accept)")
     rmig.add_argument("--reverse", metavar="JOURNAL", help="move: undo that move journal's renames, newest first; "
                                                           "run again until it completes")
     rmig.add_argument("--reason", help="why, written to each instance's audit log by the router")

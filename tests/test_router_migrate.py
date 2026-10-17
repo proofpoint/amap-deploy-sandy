@@ -157,8 +157,14 @@ class FakeRouter:
 def write_adopted(d, root, journal_root=None):
     """What the pinned router's adopt leaves: migration.json (its journal,
     phase done, source.root) and generations.json (the current entry's root)."""
-    (d / "migration.json").write_text(json.dumps({"phase": "done", "source": {"binding": {},
-                                                                              "root": journal_root or root}}))
+    (d / "migration.json").write_text(json.dumps({"phase": "done", "gen": "f" * 32,
+                                                  "source": {"binding": {}, "root": journal_root or root}}))
+    # As the pin's adopt does: the legacy marker and results move into the generation it mints.
+    gen = d / ("gen-" + "f" * 32)
+    gen.mkdir(exist_ok=True)
+    for entry in ("first-seen.json", "results"):
+        if (d / entry).exists() and not (gen / entry).exists():
+            os.rename(d / entry, gen / entry)
     (d / "generations.json").write_text(json.dumps(
         {"schema": 1, "gens": [{"gen": "f" * 32, "binding": {}, "root": root}], "current": "f" * 32}))
 
@@ -929,6 +935,110 @@ class CliParseRows(unittest.TestCase):
         except SystemExit as e:
             self.fail(f"the CLI refused the runbook's own line (exit {e.code}): {argv}")
         self.assertEqual((args.step, args.label, args.apply), (2, "r2", True))
+
+
+def result(req_id, reason="delivered"):
+    """A private result as the pin's _finish writes it (outbound.py:2179-2190, measured by RL)."""
+    return json.dumps({"digest": "0" * 64, "result": {"outcome": "rejected" if reason != "delivered" else "ok",
+                                                      "reason_code": reason, "req_id": req_id, "ts": "t"}})
+
+
+class AcceptRows(Base):
+    """Step 11 (RL's ruling at 99329945): the adopted generation is still
+    current and last, its marker is the legacy marker's bytes, and its
+    private results hold no first-sight rejection the baseline did not."""
+
+    def setUp(self):
+        super().setUp()
+        d = self.state / "alice"
+        (d / "results").mkdir(parents=True)
+        (d / "results" / "r1.json").write_text(result("r1"))
+        (d / "results" / "old.json").write_text(result("old", rm.QUARANTINED))
+        (d / "first-seen.json").write_text('{"first_seen_ts": "2026-01-01T00:00:00Z"}')
+        self.pre, _ = self.preview()
+        self.baseline = rm.do_baseline(str(self.pre), self.run_dir)
+        self.move(self.pre)
+        self.check_path = self.check(self.pre)
+        rm.do_adopt(CHECKOUT, IMAGE, str(self.config), str(self.check_path), REASON, self.run_dir,
+                    FakeRouter(plans={"alice": plan("alice", LID_A)}))
+        self.gen = self.state / LID_A / ("gen-" + "f" * 32)
+
+    def accept(self):
+        return rm.do_accept(CHECKOUT, IMAGE, str(self.config), str(self.check_path), str(self.baseline),
+                            self.run_dir, FakeRouter())
+
+    def refused(self, why):
+        try:
+            self.accept()
+        except rm.Stop as e:
+            self.assertIn(why, str(e))
+        except Exception as e:     # noqa: BLE001 — anything but a Stop is the failure
+            self.fail(f"accept raised {type(e).__name__}, not Stop: {e}")
+        else:
+            self.fail(f"accepted, though: {why}")
+
+    def test_the_baseline_records_the_marker_and_the_old_rejection(self):
+        doc = json.loads(self.baseline.read_text())["instances"]["alice"]
+        self.assertEqual(doc["quarantined"], ["old"])
+        self.assertEqual(doc["marker_sha256"],
+                         hashlib.sha256(b'{"first_seen_ts": "2026-01-01T00:00:00Z"}').hexdigest())
+
+    def test_a_clean_migration_with_a_carried_rejection_is_accepted(self):
+        try:
+            out = self.accept()
+        except rm.Stop as e:
+            self.fail(f"a clean migration was refused: {e}")
+        self.assertEqual(json.loads(out.read_text())["accepted"]["alice"]["carried"], ["old"])
+
+    def test_a_fresh_first_sight_generation_is_refused(self):
+        g = json.loads((self.state / LID_A / "generations.json").read_text())
+        g["gens"].append({"gen": "e" * 32, "binding": {}, "root": g["gens"][0]["root"]})
+        g["current"] = "e" * 32
+        (self.state / LID_A / "generations.json").write_text(json.dumps(g))
+        self.refused("a new generation took a fresh first sight")
+
+    def test_a_generation_appended_after_the_current_is_refused(self):
+        g = json.loads((self.state / LID_A / "generations.json").read_text())
+        g["gens"].append({"gen": "e" * 32, "binding": {}, "root": g["gens"][0]["root"]})
+        (self.state / LID_A / "generations.json").write_text(json.dumps(g))
+        self.refused("a new generation took a fresh first sight")
+
+    def test_a_changed_marker_is_refused(self):
+        (self.gen / "first-seen.json").write_text('{"first_seen_ts": "2026-10-17T00:00:00Z"}')
+        self.refused("is not the legacy marker's bytes")
+
+    def test_a_missing_marker_is_refused(self):
+        os.remove(self.gen / "first-seen.json")
+        self.refused("is not the legacy marker's bytes")
+
+    def test_a_new_first_sight_rejection_is_refused(self):
+        (self.gen / "results" / "new.json").write_text(result("new", rm.QUARANTINED))
+        self.refused("first-sight rejections the baseline did not: new")
+
+    def test_an_unreadable_result_is_refused_not_clean(self):
+        (self.gen / "results" / "bad.json").mkdir()
+        self.refused("is not a regular file")
+
+    def test_a_baseline_without_a_marker_is_refused(self):
+        doc = json.loads(self.baseline.read_text())
+        doc["instances"]["alice"]["marker_sha256"] = None
+        self.baseline.chmod(0o600)
+        self.baseline.write_text(json.dumps(doc))
+        self.refused("had no first-sight marker")
+
+    def test_a_baseline_of_another_state_directory_is_refused(self):
+        doc = json.loads(self.baseline.read_text())
+        doc["context"]["state_ident"] = [0, 0]
+        self.baseline.chmod(0o600)
+        self.baseline.write_text(json.dumps(doc))
+        self.refused("the baseline's state_ident is not the check's")
+
+    def test_a_held_participant_after_the_poll_is_refused(self):
+        collided = the_map()
+        collided["instances"]["alice"]["held"] = "skeleton_collision"
+        with self.assertRaises(rm.Stop):
+            rm.do_accept(CHECKOUT, IMAGE, str(self.config), str(self.check_path), str(self.baseline),
+                         self.run_dir, FakeRouter(maps=[collided]))
 
 
 class ParticipantRows(Base):

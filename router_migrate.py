@@ -824,6 +824,143 @@ def do_verify(checkout: str, image: str, config: str, check_path: str, run_dir: 
     return out
 
 
+# --- The acceptance (step 11) ----------------------------------------------------------------
+#
+# A fresh first sight quarantines an instance's waiting requests, and at the
+# pin it needs a new generation: within one, the marker persists and first
+# sight is never retaken. So acceptance is the adopted generation still
+# current, its marker the legacy marker's bytes, and no private result of a
+# first-sight rejection that the baseline did not already hold (adopt carries
+# old results into the generation). The private result is the record:
+# quarantine/ is best-effort, and outbox results may be deleted once read.
+
+#: outbound.REASON_QUARANTINED at the pin: a first sight's rejection.
+QUARANTINED = "quarantined_pre_approval"
+MARKER = "first-seen.json"
+#: A private result or a marker is small; anything larger is not one.
+RECORD_MAX = 1 << 20
+
+
+def _regular_bytes(p: Path) -> Optional[bytes]:
+    """A regular file's bytes, opened without following a link; None when
+    no entry is there. Anything else, or anything unreadable, STOPs."""
+    try:
+        fd = os.open(p, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0))
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        raise Stop(f"{p} cannot be read: {e.strerror}") from None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise Stop(f"{p} is not a regular file")
+        data = os.read(fd, RECORD_MAX + 1)
+    finally:
+        os.close(fd)
+    if len(data) > RECORD_MAX:
+        raise Stop(f"{p} is larger than a record")
+    return data
+
+
+def quarantined(results: Path) -> List[str]:
+    """The req_ids of the private results under `results` that record a
+    first sight's rejection. An absent directory has none; an entry that
+    cannot be read as a result STOPs, never counts as clean."""
+    st = _lstat(results)
+    if st is None:
+        return []
+    if not stat.S_ISDIR(st.st_mode):
+        raise Stop(f"{results} is not a directory")
+    out = []
+    for entry in sorted(os.listdir(results)):
+        if not entry.endswith(".json"):
+            continue
+        try:
+            doc = json.loads(_regular_bytes(results / entry) or b"")
+        except ValueError:
+            raise Stop(f"{results / entry} is not a result") from None
+        result = doc.get("result") if isinstance(doc, dict) else None
+        if not isinstance(result, dict):
+            raise Stop(f"{results / entry} is not a result")
+        if result.get("reason_code") == QUARANTINED:
+            out.append(result.get("req_id") if isinstance(result.get("req_id"), str) else entry[:-len(".json")])
+    return sorted(out)
+
+
+def do_baseline(preview_path: str, run_dir: Path) -> Path:
+    """Step 5, after the stop and before any move: each adopted instance's
+    legacy first-sight marker (its sha256) and the first-sight rejections
+    its private results already hold, read-only, under the drain lock."""
+    preview = _read_doc(preview_path, "preview")
+    state_dir = Path(preview["context"]["state_dir"])
+    instances = {}
+    with drain_lock(state_dir):
+        for name, p in sorted(preview["instances"].items()):
+            if not p["adopt"]:
+                continue
+            d = state_dir / (name if p["source"] == BY_NAME else p["logical_id"])
+            marker = _regular_bytes(d / MARKER)
+            instances[name] = {"logical_id": p["logical_id"],
+                               "marker_sha256": hashlib.sha256(marker).hexdigest() if marker is not None else None,
+                               "quarantined": quarantined(d / "results")}
+    out = _record(run_dir, "baseline")
+    _write_new(out, {"schema": SCHEMA, "step": "baseline", "context": preview["context"], "instances": instances})
+    return out
+
+
+def accept_instance(state_dir: Path, name: str, lid: str, base: Dict[str, Any]) -> Dict[str, Any]:
+    """One adopted instance after the acceptance poll: the adopted
+    generation is still the current and last one, its marker is the legacy
+    marker's bytes, and its private results hold no first-sight rejection
+    the baseline did not."""
+    d = state_dir / lid
+    gens, mig = _read_json(d / GEN_FILE), _read_json(d / MIGRATION_FILE)
+    if not isinstance(gens, dict) or not isinstance(gens.get("gens"), list) or not isinstance(mig, dict):
+        raise Stop(f"{name!r} has no readable {GEN_FILE} and {MIGRATION_FILE} under {d}")
+    cur = gens.get("current")
+    order = [g.get("gen") if isinstance(g, dict) else None for g in gens["gens"]]
+    if not isinstance(cur, str) or LOGICAL_ID.fullmatch(cur) is None or mig.get("gen") != cur or order[-1:] != [cur]:
+        raise Stop(f"{name!r}'s current generation is {cur!r}, not the adopted {mig.get('gen')!r} as the last one: "
+                   "a new generation took a fresh first sight")
+    gen = d / f"gen-{cur}"
+    marker = _regular_bytes(gen / MARKER)
+    want = base.get("marker_sha256")
+    if want is None:
+        raise Stop(f"{name!r}'s legacy state had no first-sight marker at the baseline")
+    if marker is None or hashlib.sha256(marker).hexdigest() != want:
+        raise Stop(f"{name!r}'s first-sight marker in {gen} is not the legacy marker's bytes")
+    new = sorted(set(quarantined(gen / "results")) - set(base.get("quarantined", [])))
+    if new:
+        raise Stop(f"{name!r} has first-sight rejections the baseline did not: {', '.join(new)}")
+    q = gen / "quarantine"
+    corroboration = sorted(os.listdir(q)) if _lstat(q) is not None and stat.S_ISDIR(os.lstat(q).st_mode) else []
+    return {"generation": cur, "marker_sha256": want, "carried": base.get("quarantined", []),
+            "quarantine_entries": corroboration}
+
+
+def do_accept(checkout: str, image: str, config: str, check_path: str, baseline_path: str, run_dir: Path,
+              runner: Runner) -> Path:
+    """Step 11, read-only, after the acceptance poll: the registry still
+    resolves every participant, and each adopted instance passes
+    accept_instance against step 5's baseline."""
+    check, base = _read_doc(check_path, "check"), _read_doc(baseline_path, "baseline")
+    cfg = _config(config)
+    bind_context(check["context"], cfg, checkout, image)
+    for key in ("state_dir", "state_ident"):
+        if base["context"][key] != check["context"][key]:
+            raise Stop(f"the baseline's {key} is not the check's")
+    resolved(participants(check), read_map(checkout, image, config, runner))
+    state_dir = Path(cfg["state_dir"])
+    facts = {}
+    for name, rec in sorted(check["instances"].items()):
+        b = base["instances"].get(name)
+        if not isinstance(b, dict) or b.get("logical_id") != rec["logical_id"]:
+            raise Stop(f"the baseline has no record of {name!r} under {rec['logical_id']}")
+        facts[name] = accept_instance(state_dir, name, rec["logical_id"], b)
+    out = _record(run_dir, "accept")
+    _write_new(out, {"schema": SCHEMA, "step": "accept", "accepted": facts})
+    return out
+
+
 def _read_json(path: Path) -> Any:
     try:
         return json.loads(path.read_bytes()) if _file_state(path) else None
@@ -926,7 +1063,7 @@ def _run(args: Any, out: Callable[[str], None], runner: Runner) -> int:
         args.config = os.path.abspath(args.config)
     need = {"map": ("config",), "preview": ("config", "reason"), "move": ("config",),
             "check": ("config", "preview", "reason"), "adopt": ("config", "check", "reason"),
-            "verify": ("config", "check")}[step]
+            "verify": ("config", "check"), "baseline": ("preview",), "accept": ("config", "check", "baseline")}[step]
     missing = [k for k in need if getattr(args, k, None) is None]
     if step == "move" and (args.preview is None) == (args.reverse is None):
         missing.append("preview or --reverse, exactly one")
@@ -948,6 +1085,12 @@ def _run(args: Any, out: Callable[[str], None], runner: Runner) -> int:
         path = do_check(checkout, image, args.config, args.preview, args.reason, run_dir, runner)
     elif step == "adopt":
         path = do_adopt(checkout, image, args.config, args.check, args.reason, run_dir, runner)
+    elif step == "baseline":
+        path = do_baseline(args.preview, run_dir)
+    elif step == "accept":
+        path = do_accept(checkout, image, args.config, args.check, args.baseline, run_dir, runner)
+        out(f"router-migrate accept: ACCEPT: {path}")
+        return 0
     else:
         path = do_verify(checkout, image, args.config, args.check, run_dir, runner)
     out(f"router-migrate {step}: done: {path}")

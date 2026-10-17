@@ -887,6 +887,13 @@ marker and reply ledger carry over, and it drains on the first poll.
    - `docker rename <that Id> <router.container>-pre-registry`, so that
      step 10 can start the new router under `router.container`. The rename
      fails if that name is taken, and then R2 stops here (back-out B).
+
+   Then `python3 amap-sandy.py router-migrate baseline --preview <step 4's
+   file> --apply`. It is read-only and takes the drain lock. For each
+   instance to be adopted it records, in `<run_dir>/router-migrate-baseline-
+   <at>.json`, the sha256 of its legacy `first-seen.json` and the private
+   results that already record a first sight's rejection
+   (`quarantined_pre_approval`). Step 11 compares against this file.
 6. **The live config.** `python3 amap-sandy.py install --apply`. Then
    `sha256sum <the live config>` must equal the sha256 step 2 printed.
    Every later step refuses a config whose sha256 is not the plan's.
@@ -943,6 +950,26 @@ marker and reply ledger carry over, and it drains on the first poll.
       and its `--match` must print `MEASURED` (`measured`): the pinned
       router, on its registry configuration, with every instance's state in
       the generation layout under the registry;
+    - `python3 amap-sandy.py router-migrate accept --config <the live
+      config> --check <step 8's file> --baseline <step 5's baseline file>
+      --apply` must exit 0 and print `router-migrate accept: ACCEPT: <its
+      record>`. It is read-only. It re-reads the registry, which must still
+      resolve every instance R2 moved or adopted, and for each adopted
+      instance it checks, under `state_dir/<logical_id>/`:
+      - the generation the adopt made (`migration.json`'s `gen`) is still
+        `generations.json`'s current and last one. A fresh first sight,
+        which quarantines waiting requests, needs a new generation;
+      - `gen-<current>/first-seen.json` has the sha256 the baseline
+        recorded for the legacy marker: the adopt moved it, byte for byte;
+      - `gen-<current>/results/` holds no private result recording a first
+        sight's rejection (`quarantined_pre_approval`) beyond those the
+        baseline recorded, which the adopt carried over. The private result
+        is the record: `gen-<current>/quarantine/` is written best-effort,
+        and the agent may delete a result in its outbox once read, so
+        neither proves an absence. The accept record lists the quarantine
+        directory's entries as corroboration only;
+    - as corroboration only (logs are not durable), `docker logs
+      <router.container> 2>&1 | grep -F "': FIRST SIGHT"` prints nothing;
     - for each migrated instance, `docker/run.sh --config <the live config>
       --image <router.image.digest> --name amap-router-migrate -- shell
       python3 -m router --config <the live config> quarantine list <name>`,
