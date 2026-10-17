@@ -79,6 +79,9 @@ _DOCKER_TS = re.compile(r"([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2})
 _PY_ENV_NAME = re.compile(r"PYTHON[A-Z]")
 #: Docker's container-name grammar, so a --container value never reaches docker as an option.
 CONTAINER_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
+#: A --label for a capture file's name (the runbook's R2 uses `r2`), kept apart
+#: from the activation's router-fingerprint-<step>-* files.
+LABEL = re.compile(r"[a-z][a-z0-9]{0,15}")
 
 #: The pinned router's own vocabulary for its state_dir's top level
 #: (router/config.py, router/registry.py and router/generations.py at the pin;
@@ -1473,6 +1476,10 @@ def _run(args: Any, *, out: Callable[[str], None], git: Optional[str], runner: R
         if CONTAINER_NAME.fullmatch(container) is None:
             out("router-fingerprint: --container is not a container name ([A-Za-z0-9][A-Za-z0-9_.-]*)")
             return EXIT[UNKNOWN]
+    label = getattr(args, "label", None)
+    if label is not None and (args.step is None or LABEL.fullmatch(label) is None):
+        out("router-fingerprint: --label goes only with --step, and is [a-z][a-z0-9]{0,15}")
+        return EXIT[UNKNOWN]
     if args.verify_image is not None:
         commit = args.commit
         if not isinstance(commit, str) or _HEX40.fullmatch(commit) is None:
@@ -1515,14 +1522,15 @@ def _run(args: Any, *, out: Callable[[str], None], git: Optional[str], runner: R
     if not args.apply:
         out(f"would run: {' '.join(docker)} inspect {name}; image inspect <its Image>; exec "
             f"<its Id> python3 -I -S -c PROGRAM running; inspect again; and write "
-            f"router-fingerprint-{args.step}-<at>.json into {spec.secrets.run_dir} (dry run; --apply to capture)")
+            f"router-fingerprint-{(label + '-') if label else ''}{args.step}-<at>.json into {spec.secrets.run_dir} "
+            "(dry run; --apply to capture)")
         return 0
     try:
         doc = capture_running(docker, name, args.step, run=runner)
     except CaptureError as e:
         out(f"router-fingerprint: {e}")
         return EXIT[UNKNOWN]
-    out(write_capture(spec.secrets.run_dir, str(args.step), doc))
+    out(write_capture(spec.secrets.run_dir, f"{label}-{args.step}" if label else str(args.step), doc))
     return 0
 
 

@@ -186,6 +186,16 @@ def bindings(the_map: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     return {n: {k: e[k] for k in BINDING} for n, e in the_map["instances"].items()}
 
 
+def resolved(names: List[str], now: Dict[str, Any]) -> None:
+    """After the adopt, every adopted instance must be what the router's
+    poll drains: resolved by the registry, with no hold (`held` null)."""
+    for name in sorted(names):
+        held = now["instances"].get(name, {}).get("held")
+        if name not in now["instances"] or held is not None:
+            raise Stop(f"{name!r} is held by the registry ({held!r}) after the adopt: its first poll would not "
+                       "drain it; do not start the router (back-out D)")
+
+
 def compare_bindings(plan: Dict[str, Any], now: Dict[str, Any]) -> None:
     """The live registry's binding of every planned instance is the plan's."""
     live = bindings(now)
@@ -761,6 +771,7 @@ def do_adopt(checkout: str, image: str, config: str, check_path: str, reason: st
             _write_new(out, {"schema": SCHEMA, "step": "adopt", "done": done, "failed": None,
                              "root_mismatch": name})
             raise
+    resolved(list(check["instances"]), read_map(checkout, image, config, runner))
     _write_new(out, {"schema": SCHEMA, "step": "adopt", "done": done, "failed": None})
     return out
 
@@ -772,7 +783,9 @@ def do_verify(checkout: str, image: str, config: str, check_path: str, run_dir: 
     check = _read_doc(check_path, "check")
     cfg = _config(config)
     bind_context(check["context"], cfg, checkout, image)
-    compare_bindings(check["binding"], read_map(checkout, image, config, runner))
+    now = read_map(checkout, image, config, runner)
+    compare_bindings(check["binding"], now)
+    resolved(list(check["instances"]), now)
     state_dir = Path(cfg["state_dir"])
     for name, rec in sorted(check["instances"].items()):
         _at(state_dir, rec["logical_id"], rec["ident"])

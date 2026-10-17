@@ -5409,6 +5409,8 @@ def build_parser() -> argparse.ArgumentParser:
     rfp.add_argument("--container", help="with --step or --match: the running local router's container name, when it "
                                          "is not yet the host-setup document's router.container (a router started "
                                          "before activation)")
+    rfp.add_argument("--label", help="with --step: a word in the capture file's name, so the runbook's R2 "
+                                     "(--label r2) never shares the activation's file names")
     rfp.add_argument("--spec", type=Path, default=None,
                      help="the host-setup document (default: the deployment overlay's host_setup section)")
     rfp.add_argument("--apply", action="store_true", help="capture and write the file (default: show)")

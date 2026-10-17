@@ -585,13 +585,8 @@ MUTANTS = [
      "for k in ROOT_COMPARED)):",
      "                ):"),
     ("verify does not re-read the binding", RM,
-     "    bind_context(check[\"context\"], cfg, checkout, image)\n"
-     "    compare_bindings(check[\"binding\"], read_map(checkout, image, config, runner))\n"
-     "    state_dir = Path(cfg[\"state_dir\"])\n    for name, rec in sorted(check[\"instances\"].items()):\n"
-     "        _at(",
-     "    bind_context(check[\"context\"], cfg, checkout, image)\n"
-     "    state_dir = Path(cfg[\"state_dir\"])\n    for name, rec in sorted(check[\"instances\"].items()):\n"
-     "        _at("),
+     "    compare_bindings(check[\"binding\"], now)\n",
+     ""),
     ("verify does not check the state identity", RM,
      "        _at(state_dir, rec[\"logical_id\"], rec[\"ident\"])\n"
      "        _adopted_root(checkout, image, config, state_dir, name, rec, runner)\n"
@@ -609,6 +604,15 @@ MUTANTS = [
     ("a root mismatch recorded without its instance", RM,
      "                             \"root_mismatch\": name})",
      "                             \"root_mismatch\": None})"),
+    ("a held instance taken as resolved", RM,
+     "        if name not in now[\"instances\"] or held is not None:",
+     "        if name not in now[\"instances\"]:"),
+    ("a capture label of any shape", RF,
+     "    if label is not None and (args.step is None or LABEL.fullmatch(label) is None):",
+     "    if label is not None and args.step is None:"),
+    ("a capture label left out of the file name", RF,
+     "    out(write_capture(spec.secrets.run_dir, f\"{label}-{args.step}\" if label else str(args.step), doc))",
+     "    out(write_capture(spec.secrets.run_dir, str(args.step), doc))"),
 ]
 TESTS = {RF: "test_router_fingerprint", "hygiene_gate.py": "test_router_fingerprint",
          RM: "test_router_migrate", AS: "test_router_migrate"}

@@ -2180,7 +2180,7 @@ class ContainerOptionRows(unittest.TestCase):
 
     def args(self, **kw):
         base = dict(verify_image=None, match=None, image=None, step=None, apply=False, commit=None, spec=None,
-                    overlay=None, container=None)
+                    overlay=None, container=None, label=None)
         base.update(kw)
         return SimpleNamespace(**base)
 
@@ -2197,6 +2197,18 @@ class ContainerOptionRows(unittest.TestCase):
                 lines = []
                 self.assertEqual(rf.run(self.args(container="amap-router-local", **kw), out=lines.append), 2)
                 self.assertIn("applies only to --step and --match", lines[-1])
+
+    def test_a_label_names_the_capture_file_and_nothing_else(self):
+        """HAR: R2's captures (--label r2) never share the activation's
+        router-fingerprint-<step>-* names."""
+        lines = []
+        self.assertEqual(rf.run(self.args(step=2, label="r2"), out=lines.append), 0)
+        self.assertIn("router-fingerprint-r2-2-<at>.json", lines[-1])
+        for bad, kw in (("R2", dict(step=2)), ("r-2", dict(step=2)), ("r2", dict(match="/x"))):
+            with self.subTest(label=bad, mode=kw):
+                lines = []
+                self.assertEqual(rf.run(self.args(label=bad, **kw), out=lines.append), 2)
+                self.assertIn("--label goes only with --step", lines[-1])
 
     def test_the_dry_run_names_the_given_container(self):
         lines = []

@@ -57,7 +57,7 @@ class FakeRouter:
     """Answers each run.sh call as the pinned router's code would."""
 
     def __init__(self, maps=None, plans=None, n=None, adopt_rc=0, answer_lid=None, noop=(), adopted_root=None,
-                 live=None, journal_root=None):
+                 live=None, journal_root=None, keep_held=False):
         self.maps = list(maps) if maps is not None else []
         self.plans = plans or {}
         self.n = n or {}
@@ -67,6 +67,7 @@ class FakeRouter:
         self.adopted_root = adopted_root or {}
         self.live = live
         self.journal_root = journal_root or {}
+        self.keep_held = keep_held
         self.calls = []
 
     def __call__(self, argv, input=b"", **kw):
@@ -77,6 +78,16 @@ class FakeRouter:
             return self.done(0, json.dumps(root))
         if inner[:4] == ["python3", "-I", "-S", "-"]:
             m = self.maps.pop(0) if len(self.maps) > 1 else (self.maps[0] if self.maps else the_map())
+            m = json.loads(json.dumps(m))
+            try:
+                state = Path(json.loads(Path(inner[4]).read_text())["state_dir"])
+            except (OSError, ValueError, KeyError):
+                state = None
+            if state is not None and not self.keep_held:
+                # As the pin resolves it: an instance whose state is generation-keyed is no longer held.
+                for e in m["instances"].values():
+                    if (state / e["logical_id"] / "generations.json").is_file():
+                        e["held"] = None
             return self.done(0, json.dumps(m))
         name = inner[inner.index("adopt") + 1]
         given = next((int(a.split("=", 1)[1]) for a in inner if a.startswith("--no-transport-history=")), None)
@@ -722,6 +733,18 @@ class BindingRows(Base):
         with self.assertRaises(rm.Stop) as cm:
             rm.do_verify(CHECKOUT, IMAGE, str(self.config), str(check), self.run_dir, FakeRouter())
         self.assertIn("is not the instance state the plan recorded", str(cm.exception))
+
+    def test_a_held_instance_after_the_adopt_stops_adopt_and_verify(self):
+        """RL: after the adopt, the poll drains only a resolved instance;
+        one the registry still holds stops R2 before the start."""
+        self.move(self.pre)
+        check = self.check(self.pre)
+        with self.assertRaises(rm.Stop) as cm:
+            rm.do_adopt(CHECKOUT, IMAGE, str(self.config), str(check), REASON, self.run_dir,
+                        FakeRouter(plans={"alice": plan("alice", LID_A)}, keep_held=True))
+        self.assertIn("held by the registry", str(cm.exception))
+        with self.assertRaises(rm.Stop):
+            rm.do_verify(CHECKOUT, IMAGE, str(self.config), str(check), self.run_dir, FakeRouter(keep_held=True))
 
     def test_the_root_program_reads_as_the_router_does(self):
         self.assertIn("O_NOFOLLOW", rm.ROOT_PROGRAM)
