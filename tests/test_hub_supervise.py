@@ -258,6 +258,7 @@ case "$1" in
   inspect) [ -f "$STUB/state" ] || exit 1; cat "$STUB/state" ;;
   ps) [ -f "$STUB/ps_fail" ] && exit 1; [ -f "$STUB/state" ] && echo abc; exit 0 ;;
   rm) exit 0 ;;
+  image) [ -f "$STUB/no_image" ] && { echo "Error: No such image" >&2; exit 1; }; echo sha256:abc ;;
   stop) : > "$STUB/stopped"; exit 0 ;;
   run)
     printf '{"obs": "wire", "n": 1}\n'
@@ -465,6 +466,67 @@ class WrapperTest(unittest.TestCase):
                 self.assertNotIn("obs", r.stdout + r.stderr)
                 self.assertNotIn("forged", r.stderr)
                 self.assertIn(hv.SAY + "exit 0: recorded", r.stderr)
+
+    def test_a_run_that_never_started_says_what_the_engine_finds_and_is_passed_on(self):
+        """RE N7: exit 125 (no container) with its own words gone to /dev/null;
+        the wrapper asks the engine about the image and the name, says what it
+        finds, and passes 125 on."""
+        for shell in self.SHELLS:
+            for no_image, leftover in ((False, False), (True, False), (False, True)):
+                with self.subTest(shell=shell, no_image=no_image, leftover=leftover):
+                    for f in ("log", "state", "no_image"):
+                        (self.stub / f).unlink(missing_ok=True)
+                    if no_image:
+                        (self.stub / "no_image").touch()
+                    if leftover:
+                        (self.stub / "state").write_text("exited\n")   # removed in step 1; still listed by the stub
+                    (self.stub / "code").write_text("125")
+                    r = subprocess.run(shell + [str(self.script)], env={"STUB": str(self.stub), "PATH": "/usr/bin:/bin"},
+                                       capture_output=True, text=True, timeout=30)
+                    self.assertEqual((r.returncode, self.status()), (125, hv.STARTED))
+                    image = hs.hr.run_spec(self.spec_, self.spec_.hub)["image"]
+                    if no_image:
+                        self.assertIn(hv.SAY + f"exit 125: the image {image} cannot be inspected: Error: No such image",
+                                      r.stderr)
+                    else:
+                        self.assertIn(hv.SAY + "exit 125: the image is present (sha256:abc)", r.stderr)
+                    self.assertIn(hv.SAY + f"exit 125: a container named {hv.hub_name(spec())}: "
+                                  + ("abc" if leftover else "none"), r.stderr)
+                    self.assertIn(hv.SAY + "exit 125: passed on", r.stderr)
+                    log = self.log()
+                    self.assertTrue(any(l.startswith("image inspect --format {{.Id}} " + image) for l in log), log)
+                    self.assertTrue(any(l.startswith("ps -a -q --filter") for l in log), log)
+        (self.stub / "no_image").unlink(missing_ok=True)
+
+    def test_no_start_is_recorded_when_step_1_itself_ends_with_125(self):
+        """Opus T3: `started` comes after the leftover handling; an engine that
+        does not answer there leaves no `started` and says no start."""
+        for shell in self.SHELLS:
+            with self.subTest(shell=shell):
+                for f in ("log", "state"):
+                    (self.stub / f).unlink(missing_ok=True)
+                (self.t / "status").unlink(missing_ok=True)
+                (self.stub / "ps_fail").touch()
+                try:
+                    r = subprocess.run(shell + [str(self.script)], env={"STUB": str(self.stub), "PATH": "/usr/bin:/bin"},
+                                       capture_output=True, text=True, timeout=30)
+                finally:
+                    (self.stub / "ps_fail").unlink()
+                self.assertEqual((r.returncode, self.status()), (125, None))
+                self.assertNotIn("started:", r.stderr)
+
+    def test_a_run_the_barrier_refused_fails_the_last_line_row_while_status_says_started(self):
+        """Opus (iv): after an exit-12 run the status stays `started`; the last
+        wrapper line, the refusal, makes verify FAIL rather than read PASS."""
+        sp = self.spec_
+        said = hv.SAY + "exit 12: " + hv.REFUSED_RUN + " (its own words went with the run's output); passed on"
+        for last, want in ((said, rh.FAIL), (hv.SAY + "started: the barrier passed", rh.PASS)):
+            with self.subTest(last=last[:40]):
+                files = {sp.supervision.hub["status"]: b"started 2026-10-17T00:00:00Z\n",
+                         hv.err_path(sp): (hv.SAY + "started: the barrier passed\n" + last + "\n").encode()}
+                [row] = [c for c in hv.verify_wrapper_status(sp, os.lstat, lambda q: files[q])
+                         if c.claim.startswith("the wrapper's last line")]
+                self.assertEqual(row.result, want)
 
     def test_a_run_the_barrier_refuses_says_so_and_is_passed_on(self):
         for shell in self.SHELLS:

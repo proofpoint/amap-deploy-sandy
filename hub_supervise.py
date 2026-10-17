@@ -105,18 +105,26 @@ BARRIER_S = 10
 ORPHAN = "orphan_running"
 #: The wrapper's record once the barrier passed and the run is next; the run's own end replaces it.
 STARTED = "started"
+#: `docker run`'s own exit when the container never started (no image, a name conflict, a
+#: missing bind source, an unreadable env file, an engine that does not answer).
+ENGINE_EXIT = 125
 #: The wrapper's record when the writer finds docker or python3 not root's alone: nothing ran.
 UNTRUSTED = "untrusted_tools"
 #: The wrapper's error stream, launchd's StandardErrorPath (d3.3 §5 B3): beside
 #: its status, in the root-owned status directory. Its own lines start SAY. The
-#: run's output goes to the engine's log, so this holds only the wrapper's lines
-#: and docker's own errors: a few per start, at most one start per
-#: ThrottleInterval when launchd restarts it (RE N6).
+#: run line's output, docker's own errors for it included, goes to /dev/null
+#: (the container's to the engine's log), so this holds the wrapper's lines and
+#: the other docker calls' errors: a few per start, at most one start per
+#: ThrottleInterval when launchd restarts it (RE N6). A run that exits 125 is
+#: followed by what the engine says about its image and its name (RE N7).
 ERR_NAME = "hub-link-run.err"
 SAY = "hub-link-run: "
 #: What the wrapper says when a refusal could not be recorded: the one line
 #: that tells verify the status beside it may be a stale, earlier one.
 UNRECORDED = "the refusal could not be recorded"
+#: What the wrapper says when the barrier refused the run line itself (exit 12, which the
+#: router never uses): the last line of a start whose `started` record is not this run's health.
+REFUSED_RUN = "the barrier refused the run"
 LAUNCHCTL = "/bin/launchctl"
 WEEKLY_RUN_ID = "weekly"
 REVISION_LABEL = "org.opencontainers.image.revision"
@@ -337,6 +345,7 @@ def wrapper(spec: Any) -> bytes:
     keep = "|".join(map(str, (0,) + NO_RESTART))
     run = " ".join(q(a) for a in run_argv(spec)[1:])
     tools = " ".join(q(a) for a in tool_args(spec))
+    image = q(hr.run_spec(spec, spec.hub)["image"])
     s = spec.secrets
     return f"""#!/bin/sh
 # hub-link-run. Rendered by amap-deploy-sandy hub-supervise from the anchored
@@ -427,8 +436,23 @@ case "$code" in
         record "$code"
         say "exit $code: recorded, not restarted"
         exit 0 ;;
+    {ENGINE_EXIT})
+        # docker's own "the container never started" (RE N7): its words went with the run's output,
+        # so say what the engine can still tell about the two likeliest causes, then pass it on
+        if found=$(root_docker image inspect --format '{{{{.Id}}}}' {image} 2>&1); then
+            say "exit $code: the image is present ($found)"
+        else
+            say "exit $code: the image {image} cannot be inspected: $found"
+        fi
+        if found=$(root_docker ps -a -q --filter "name=^/$NAME\\$" 2>&1); then
+            say "exit $code: a container named $NAME: ${{found:-none}}"
+        else
+            say "exit $code: the engine does not answer: $found"
+        fi
+        say "exit $code: passed on"
+        exit "$code" ;;
     {rt.EXIT})
-        say "exit $code: the barrier refused the run (its own words went with the run's output); passed on, and the next start's step 0 records why"
+        say "exit $code: {REFUSED_RUN} (its own words went with the run's output); passed on, and the next start's step 0 records why"
         exit "$code" ;;
     *)
         say "exit $code: passed on"
@@ -850,13 +874,14 @@ def verify_wrapper_status(spec: Any, lstat: Callable, read: Callable[[str], byte
         lines = []
     except OSError as e:
         lines = rh.Unresolved(f"cannot read {err}: {e}")
-    claim = f"the wrapper's last line in {err} is not an unrecorded refusal"
-    want = _fact("unrecorded refusal", False, f"the wrapper says \"{UNRECORDED}\" when it could not record one")
+    claim = f"the wrapper's last line in {err} is not a refusal the status does not show"
+    want = _fact("unrecorded refusal", False, f"the wrapper says \"{UNRECORDED}\" when it could not record one, "
+                                               f"and \"{REFUSED_RUN}\" when the run line itself was refused")
     if isinstance(lines, rh.Unresolved):
         out.append(rh.unknown(claim, want, lines.reason, remedy))
     else:
         mine = [l for l in lines if l.startswith(SAY)]
-        out.append(rh.check(claim, want, bool(mine) and UNRECORDED in mine[-1], remedy))
+        out.append(rh.check(claim, want, bool(mine) and (UNRECORDED in mine[-1] or REFUSED_RUN in mine[-1]), remedy))
     return out
 
 

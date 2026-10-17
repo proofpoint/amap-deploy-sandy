@@ -516,8 +516,7 @@ def render_plan(spec: Spec, overlay_source: Optional[Path] = None,
                      f"launcher before it execs")
     if spec.secrets is not None:
         lines += ss.render(spec.secrets, q)
-        if spec.secrets.docker_via_sudo:
-            lines += ss.sudoers_lines(spec.secrets, spec.supervision.engine if spec.supervision else None)
+        lines += ss.sudo_route_notice(spec.secrets)
     if spec.hub is not None and hub is not None:
         lines += hr.plan(spec, spec.hub, hub, q, steps)
     if spec.keys is not None:

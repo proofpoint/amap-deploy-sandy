@@ -695,6 +695,23 @@ class LoaderConfTest(Fixture):
                 self.assertIn(d, r.stderr)
                 os.chmod(d, 0o755)
 
+    def test_a_relative_include_pattern_is_never_globbed_from_the_working_directory(self):
+        """Opus I6: `include rel/*.conf` means <conf dir>/rel/*.conf. A working
+        directory with a rel/ of its own must not stand in for it: here the
+        conf's rel/ names a writable directory, and the cwd's does not."""
+        bad = self.p("lib/bad")
+        os.makedirs(bad, mode=0o755)
+        os.chmod(bad, 0o777)
+        self.file("etc/rel/evil.conf", 0o644, f"{bad}\n")
+        self.file("cwd/rel/other.conf", 0o644, "")
+        self.conf("include rel/*.conf\n")
+        with open(self.rtfile, "w") as f:
+            f.write(rt.render("systemd", self.rtfile, self.root, self.top, etc=self.p("etc"), loader="/lib/ld.so"))
+        r = subprocess.run(["/bin/sh", "-c", f". {self.rtfile} && _rt_loader_config"], env=ENV, capture_output=True,
+                           text=True, timeout=60, cwd=self.p("cwd"))
+        self.assertEqual(r.returncode, rt.EXIT, r.stderr)
+        self.assertIn(bad, r.stderr)
+
     def test_an_unreadable_ld_so_conf_fails(self):
         """Opus N2: the file rule passes (mode 0400 kept from others' write),
         and reading it is what fails."""

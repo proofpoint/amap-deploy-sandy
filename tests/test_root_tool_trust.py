@@ -156,57 +156,41 @@ class ProbeToolsTest(unittest.TestCase):
             self.assertFalse(os.path.exists(status))
 
 
-class SudoersRuleTest(unittest.TestCase):
-    """Opus B5 at 184acedf: the narrow rule the sudo route needs is rendered,
-    from the very prefix live_docker runs, never written by hand."""
+class SudoRouteNoticeTest(unittest.TestCase):
+    """Codex P1 at 0aa3e39e: no sudoers rule is safe for the sudo route
+    (sudoers compares the joined argument string, which cannot keep env's
+    assignments apart from the command), so the plan prints none, and says
+    the route is unavailable until a reviewed entry point exists."""
 
     def setUp(self):
         import test_secret_setup as tss
+        self.tss = tss
         self.s = tss.spec(docker_via_sudo=True)
 
-    @staticmethod
-    def unescape(arg):
-        out, i = "", 0
-        while i < len(arg):
-            if arg[i] == "\\":
-                i += 1
-            out += arg[i]
-            i += 1
-        return out
+    def test_the_plan_prints_no_installable_rule_on_either_route(self):
+        import host_setup as hs
+        for via in (True, False):
+            with self.subTest(via=via):
+                spec = hs.load_spec(self.tss.full_doc(docker_via_sudo=via) if via else self.tss.full_doc())
+                text = "\n".join(hs.render_plan(spec))
+                self.assertNotIn("NOPASSWD:", text)
+                self.assertNotIn("ALL=(", text)
+                self.assertEqual("NO sudoers rule is safe" in text, via)
 
-    def test_each_rule_is_exactly_the_live_prefix_and_then_dockers_own_arguments(self):
+    def test_the_joined_strings_of_the_two_argvs_are_the_same(self):
+        """Codex's witness, as data: the intended argv and one whose PATH
+        assignment swallows the rest join identically, so no joined-string
+        rule can tell them apart. Nothing is executed."""
         import secret_setup as ss
-        lines = ss.sudoers_lines(self.s, "unix:///var/run/docker.sock")
-        rules = [l[2:] for l in lines if l.startswith("# #")]
-        self.assertEqual(len(rules), 2, "the engine's (verify) and none (the activation verbs)")
-        for rule, engine in zip(rules, ("unix:///var/run/docker.sock", None)):
-            with self.subTest(engine=engine):
-                head, cmd = rule.split(" NOPASSWD: ", 1)
-                self.assertEqual(head, f"#{self.s.operator_uid} ALL=(root)")
-                self.assertTrue(cmd.endswith(" *"))
-                want = ss.sudo_route(self.s, engine)[2:]
-                body = cmd[:-2]
-                self.assertEqual(self.unescape(body), " ".join(want))
-                bare = body.replace("\\\\", "").replace("\\,", "").replace("\\:", "").replace("\\=", "")
-                for c in ",:=*?[]":
-                    self.assertNotIn(c, bare.replace("\\" + c, ""), f"an unescaped {c!r}")
+        a = ss.sudo_route(self.s, "unix:///var/run/docker.sock")[3:]
+        evil = ["-i", " ".join(a[1:]), "/opt/op/anything"]
+        self.assertEqual(" ".join(a + ["/opt/op/anything"]), " ".join(evil))
 
-    def test_the_live_route_and_the_rule_share_one_builder(self):
+    def test_the_live_route_is_unchanged(self):
         import secret_setup as ss
         with ss.trust_gate(self.s, engine="unix:///e.sock", closure=lambda s_: None, digest=lambda p: "b" * 64,
-                           lstat=__import__("test_secret_setup").lstat_of(__import__("test_secret_setup").fs()),
-                           realpath=lambda p: p):
+                           lstat=self.tss.lstat_of(self.tss.fs()), realpath=lambda p: p):
             self.assertEqual(ss.live_docker(self.s), ss.sudo_route(self.s, "unix:///e.sock"))
-
-    def test_the_plan_carries_the_rules_on_the_sudo_route_only(self):
-        import host_setup as hs
-        import test_secret_setup as tss
-        for via, want in ((True, True), (False, False)):
-            with self.subTest(via=via):
-                spec = hs.load_spec(tss.full_doc(docker_via_sudo=via) if via else tss.full_doc())
-                text = "\n".join(hs.render_plan(spec))
-                self.assertEqual("NOPASSWD: /usr/bin/env -i" in text, want)
-                self.assertNotIn("NOPASSWD: /usr/bin/env\n", text)
 
 
 class LiveEngineGateTest(unittest.TestCase):

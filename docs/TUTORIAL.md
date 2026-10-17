@@ -1328,7 +1328,16 @@ before you stop the container by hand.
 On macOS the wrapper's error stream goes to `hub-link-run.err`, beside its
 status in the root-owned status directory. It holds only the wrapper's own
 lines: the router's output goes to the engine's log (`docker logs`).
-`verify` reads both files. A missing
+`verify` reads both files. Two consequences follow from where the router's
+output goes:
+- With `hub.log_driver` set to `none`, the hub-link router's observation
+  lines are not kept anywhere on macOS.
+- The `json-file` driver does not rotate unless the daemon sets `log-opts`;
+  the `local` driver does.
+
+If a start ends in exit 125 (docker never started the container), the
+wrapper says what the engine reports about the image and about a container
+of that name before passing the code on. A missing
 status is a failure, not "never started", because a refusal that cannot
 record itself removes the last one. A refusal is a failure whether or not it
 was recorded.
@@ -1338,19 +1347,22 @@ only when the interpreter, the pinned writer, docker's startup closure
 (computed as you) and sudo all pass. On the sudo route each call is
 `sudo -n /usr/bin/env -i PATH=… LC_ALL=C DOCKER_HOST=<engine> /bin/sh -c
 '<the fixed source line> root_exec "$@"' sh <writer sha256> <python3> <writer>
-trusted-exec --tool … -- <docker> …`. So sudo must permit THIS generated
-invocation without a password: `env -i` with that fixed PATH, LC_ALL and
-DOCKER_HOST, the fixed shell line, the pinned sha256, the interpreter, the
-writer, trusted-exec and docker. A rule that allows only docker no longer
-matches. Never grant `/usr/bin/env` with any arguments: that lets the caller
-run any command as root. The host-setup plan prints the narrow rules
-(commented): one for `verify`, with the engine, and one for the activation
-verbs, without it. Each is that prefix, escaped for sudoers, followed only by
-docker's own arguments. They change with the writer pin, the engine and the
-tools, so copy them from the plan rather than writing them by hand. Install
-them with `visudo` and check them with `visudo -c`. sudoers matches the
-arguments as one string, not argument by argument. A root-owned,
-fixed-purpose launcher would be a separate, reviewed change.
+trusted-exec --tool … -- <docker> …`.
+
+No sudoers rule is safe for that invocation yet, so the sudo route is
+unavailable. sudoers compares the arguments as one space-joined string, so
+it cannot keep `env`'s assignments apart from the command it runs. The
+arguments `-i`, then one `PATH=<everything else>`, then any program join
+to the same string as the intended ones, and `env` would run that program
+as root, skipping `/bin/sh`, `root_exec` and `trusted-exec`. Do NOT install
+a `NOPASSWD` rule for `/usr/bin/env`, however narrow it looks. Any grant
+that lets this invocation run is root-equivalent, the same class as the old
+docker grant (root through the engine's socket), so a narrow one needs that
+entry point. Without one,
+`sudo -n` refuses, and no live check on that route can read the engine.
+The route needs a fixed-purpose, root-owned entry point that
+enforces the argument boundary before running anything the caller chose.
+That is a separate, reviewed change, not part of this setup.
 
 
 ### The weekly partition job's tools
