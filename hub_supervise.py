@@ -608,6 +608,7 @@ def service_line(spec: Any, action: str, *args: str, q: Callable[[str], str] = s
 
 #: The four steps of replacing a pinned docker client, in their one order (RE): a pin
 #: moved without the re-render leaves every [2] line refused with root_trust.EXIT.
+#: The plan prints them as comments: replacing the client is not part of a plan run.
 REPIN_STEPS = (
     "# 1. Stop [2] through its supervisor, never with a bare `docker stop`:",
     "# 2. Replace {path} with the reviewed client: root-owned, no one else can write it.",
@@ -615,13 +616,17 @@ REPIN_STEPS = (
     "section records {path}; then render and place everything this plan places again.",
     "# 4. Start [2] through hub-start-check's planned path: run hub-start-check, and type only the lines it prints.",
 )
+#: The re-pin block's heading, and the prefix of each of its own lines: none of it is run with the plan.
+REPIN_HEADING = "# To replace the pinned docker client {path} (not part of this plan run), in this order and no other:"
+REPIN_LINE = "#   "
 
 
 def repin_steps(spec: Any, q: Callable[[str], str] = shlex.quote,
                 document: Optional[Tuple[str, str]] = None) -> List[str]:
     """Where the secrets section pins docker (d3.3 §4 C3), how that client is
-    replaced: REPIN_STEPS, with step 1's stop through the writer's service
-    verb (launchd: bootout, then NOT-RUNNING)."""
+    replaced, all of it comments (RE): REPIN_STEPS, with step 1's stop through
+    the writer's service verb (launchd: bootout, then NOT-RUNNING), each of
+    its lines behind REPIN_LINE, so no plan run stops [2]."""
     s, sup = spec.secrets, spec.supervision
     path = s.tools["docker"]
     if path not in s.pins:
@@ -629,11 +634,10 @@ def repin_steps(spec: Any, q: Callable[[str], str] = shlex.quote,
     if sup.kind == "systemd":
         stop = [service_line(spec, "stop", posixpath.basename(sup.hub["unit"]), q=q)]
     else:
-        stop = [service_line(spec, "bootout", sup.hub["label"], q=q), "# Do not go on until this prints NOT-RUNNING:",
+        stop = [service_line(spec, "bootout", sup.hub["label"], q=q), "Do not go on until this prints NOT-RUNNING:",
                 until_stopped_line(spec, document)]
     first, *rest = (line.format(path=path) for line in REPIN_STEPS)
-    return [f"# The docker client {path} is pinned (d3.3 §4 C3). To replace it, in this order and no other:",
-            first, *stop, *rest]
+    return [REPIN_HEADING.format(path=path), first, *(REPIN_LINE + line for line in stop), *rest]
 
 
 def plan(spec: Any, q: Callable[[str], str], steps: str) -> List[str]:

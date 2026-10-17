@@ -832,10 +832,10 @@ def live_refusal(s: SecretSpec, lstat: Callable = os.lstat,
            if any(c.result != rh.PASS for c in _tool_rows(s, n, s.tools[n], lstat, realpath))]
     if bad:
         return f"not run: {' and '.join(bad)} not root's alone"
-    unpinned = [n for n in names if n in s.tool_sha256
-                and tool_pin_row(SECTION, n, s.tools[n], s.tool_sha256[n], lstat, digest).result != rh.PASS]
-    if unpinned:
-        return f"not run: {' and '.join(unpinned)} not the client the document pins"
+    not_pinned_client = [n for n in names if n in s.tool_sha256
+                         and tool_pin_row(SECTION, n, s.tools[n], s.tool_sha256[n], lstat, digest).result != rh.PASS]
+    if not_pinned_client:
+        return f"not run: {' and '.join(not_pinned_client)} not the client the document pins"
     if any(c.result != rh.PASS for c in _writer_rows(s, lstat, digest)):
         return f"not run: the writer {s.writer} is not the pinned one, root's alone"
     why = (closure or _operator_closure)(s)

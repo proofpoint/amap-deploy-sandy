@@ -1048,7 +1048,7 @@ class LaunchdEnablementTest(unittest.TestCase):
         repin = hv.repin_steps(s)
         self.assertTrue(repin, "a launchd document pins docker, so the plan ends with the re-pin order")
         self.assertEqual(lines[-len(repin):], repin)
-        lines = lines[:-len(repin)]     # the re-pin order's own stop is a later, separate procedure
+        self.assertTrue(all(l.startswith("#") for l in repin), "the re-pin order is comments: nothing in it runs")
         dis = [i for i, l in enumerate(lines) if " service --manager " in l and not l.startswith("#")]
         place = [i for i, l in enumerate(lines) if l.startswith("STEPS place ")]
         argvs = [shlex.split(lines[i]) for i in dis]

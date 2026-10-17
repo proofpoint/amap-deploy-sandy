@@ -408,7 +408,10 @@ class RepinOrderTest(unittest.TestCase):
                 at = [lines.index(step.format(path=path)) for step in hv.REPIN_STEPS]
                 self.assertEqual(at, sorted(at), "1, 2, 3, 4 in that order")
                 self.assertEqual(at[1:], [at[1], at[1] + 1, at[1] + 2], "2, 3 and 4 follow one another")
+                self.assertEqual(lines[at[0] - 1], hv.REPIN_HEADING.format(path=path))
                 stop = lines[at[0] + 1:at[1]]
+                self.assertTrue(all(l.startswith(hv.REPIN_LINE) for l in stop), "step 1's lines are comments")
+                stop = [l[len(hv.REPIN_LINE):] for l in stop]
                 sup = spec.supervision
                 if kind == "launchd":
                     self.assertEqual(stop[0], hv.service_line(spec, "bootout", sup.hub["label"]))
@@ -417,9 +420,28 @@ class RepinOrderTest(unittest.TestCase):
                     self.assertEqual(stop, [hv.service_line(spec, "stop", os.path.basename(sup.hub["unit"]))])
                 self.assertFalse([l for l in stop if " docker stop" in l or l.endswith("docker stop")])
 
+    def test_no_runnable_plan_line_stops_the_hub(self):
+        """RE B1 at b6f809b7: the re-pin order is not part of a plan run, so no
+        non-comment line of plan() or render_plan stops or boots out [2]."""
+        for kind in ("launchd", "systemd"):
+            pins = {"docker": OTHER} if kind == "systemd" else None
+            spec = load(document(kind, secrets_pin=pins, partition_pin=pins))
+            sup = spec.supervision
+            hub = sup.hub["label"] if kind == "launchd" else os.path.basename(sup.hub["unit"])
+            stops = {hv.service_line(spec, "bootout", hub) if kind == "launchd" else hv.service_line(spec, "stop", hub),
+                     hv.until_stopped_line(spec)}
+            for where, lines in (("plan", hv.plan(spec, shlex.quote, "STEPS")),
+                                 ("render_plan", hs.render_plan(spec, document=("spec", "/srv/op/host-setup.json")))):
+                with self.subTest(kind=kind, where=where):
+                    self.assertTrue([l for l in lines if l.startswith(hv.REPIN_LINE)], "the block is there, as comments")
+                    runnable = [l for l in lines if l and not l.startswith("#")]
+                    self.assertFalse(stops & set(runnable), "a plan run never stops the hub")
+                    block = {l[len(hv.REPIN_LINE):] for l in lines if l.startswith(hv.REPIN_LINE)}
+                    self.assertFalse(block & set(runnable), "no line of the re-pin block is runnable anywhere")
+
     def test_no_repin_steps_without_a_pin(self):
         lines = hs.render_plan(load(document("systemd")), document=("spec", "/srv/op/host-setup.json"))
-        self.assertFalse([l for l in lines if l in hv.REPIN_STEPS or "is pinned (d3.3" in l])
+        self.assertFalse([l for l in lines if l in hv.REPIN_STEPS or "To replace the pinned docker client" in l])
 
 
 if __name__ == "__main__":

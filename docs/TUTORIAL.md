@@ -1520,8 +1520,8 @@ takes no pin, so its updates need no document change. A Linux host whose
 client was placed by hand is not covered by this rule: it is pinned only if
 its document says so.
 
-To replace a pinned client, keep this order. The plan prints it with this
-host's lines:
+To replace a pinned client, keep this order. The plan prints it at its end
+with this host's lines, as comments, because it is not part of a plan run:
 
 1. Stop [2] through its supervisor, with the writer's service verb
    (`bootout` on launchd, then `hub-start-check --until-stopped` until it
