@@ -763,6 +763,28 @@ hop checkout, the image, and each instance's binding and state directory.
 Each later step re-reads the registry through the pinned code, and refuses
 before it changes anything unless all of these are still the plan's.
 
+**The stable window.** From step 5's stop until step 10's start, no
+instance root may be recreated.
+- An instance root is the router's `instances/<slug>` directory on the
+  host. Sandy creates it when it launches a selected sandbox, and removes it
+  with the sandbox (`--remove-sandbox`).
+- A sandbox mounts only that directory's lanes, never the directory itself
+  or any ancestor of it (the manifest's `mounts`, which `install` renders).
+  The only container that mounts `instances/` whole is the local router's
+  own, which is stopped here. So no agent can recreate a root, and running
+  agents stay up.
+- So, for every instance being migrated: no sandbox lifecycle action
+  (launch, relaunch, remove or recreate), and no host-side change under its
+  `instances/<slug>`. Before step 5, pause the scheduled container
+  recreation, the job the policy's `container_recreate_interval_hours`
+  drives, and resume it after step 11.
+- Steps 8, 9 and 10 check each root against the one recorded, so a root
+  recreated anyway stops R2 before step 10's start, on back-out D. The one
+  gap left is between step 10's verify and the router's first poll, which
+  only this premise covers. A root recreated there would make the router
+  begin a new generation, with a fresh first sight that quarantines that
+  instance's waiting requests.
+
 While R2's window is open, everything waits on disk and nothing is lost:
 - agents' outbox requests stay in their outboxes;
 - the router's state stays where step 7 moves it.
@@ -802,8 +824,13 @@ marker and reply ledger carry over, and it drains on the first poll.
      where it is). State holding no pre-generation entry (results,
      inflight, transport, pending, quarantine, held, first-seen.json or
      approval.json) needs no adopt: the pinned router begins its first
-     generation there on its own first poll. Under a name it is moved and
-     not adopted; under a logical id it is left as it is.
+     generation there on its own first poll, unless it also holds a
+     generation directory (`gen-*`) with no generations.json, which the
+     pinned router holds as `state_layout_conflict`; step 4 STOPs on that. Under a name it is moved and
+     not adopted; under a logical id it is left as it is. Such state has no
+     first-sight marker, so that first poll takes a fresh first sight and
+     quarantines the instance's waiting requests, as the old router would
+     have done too: the migration does not cause it.
    - It STOPs unless the plan covers exactly what the state directory's
      layout needs: a name-keyed directory of an instance that is not
      configured, a logical id the registry does not map, or a file named
@@ -857,15 +884,25 @@ marker and reply ledger carry over, and it drains on the first poll.
      transport verdicts or malformed anchors.
    - The count of local anchors may differ from the preview's, because the
      running router went on delivering. `--no-transport-history=N` attests
-     that an instance never had a transport route, and N is its exact count
-     of local anchors. The check takes N only from this dry run's own
-     refusal text, and records it.
+     that an instance never had a transport route, covering the N local
+     anchors that remain at this dry run. The check takes N only from this
+     dry run's own refusal text, and records it.
 9. **Adopt.** `python3 amap-sandy.py router-migrate adopt --config <the live
    config> --check <step 8's file> --reason "<text>" --apply`. From here R2
    only goes forward (back-out D).
-10. **Start.** `docker/run.sh --config <the live config> --image
-    <router.image.digest> --name <router.container> --detach`, from the hop
-    checkout.
+   - Before each adopt it takes a fresh read-only plan, which must name the
+     checked root, and it checks each instance's state is the recorded one.
+   - After the adopts, four records of each root must be one (path,
+     device and inode): the adopt's own journal (`migration.json`), the
+     generation it made (`generations.json`), the root recorded at step 8,
+     and the root as the router opens it now, read inside the router's
+     image. On a mismatch it STOPs: do not start the router.
+10. **Start.** First, `python3 amap-sandy.py router-migrate verify --config
+    <the live config> --check <step 8's file> --apply`, which repeats step
+    9's four-way root check and the context check, and changes nothing. Then
+    at once, with no other step between them, `docker/run.sh --config <the
+    live config> --image <router.image.digest> --name <router.container>
+    --detach`, from the hop checkout.
 11. **Accept.** Wait for a poll at least 3 s after the start. Then
     `python3 amap-sandy.py router-fingerprint --step 0 --apply` and its
     `--match` must print `MEASURED` (`measured`): the pinned router, on its

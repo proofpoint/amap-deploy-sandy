@@ -33,6 +33,7 @@ refused (STOP), and 2 when it could not run.
 
 import contextlib
 import ctypes
+import errno
 import ctypes.util
 import fcntl
 import hashlib
@@ -61,6 +62,14 @@ MAP_PROGRAM = (
     '"held": r.held.get(n)} for n, lid in sorted(r.known.items())}, "unknown": sorted(set(c.instances) - '
     'set(r.known))}, sort_keys=True))\n')
 MAP_PROGRAM_SHA256 = hashlib.sha256(MAP_PROGRAM.encode("utf-8")).hexdigest()
+
+#: Reads an instance root's identity as the router itself does (root_identity:
+#: an O_NOFOLLOW|O_DIRECTORY open, then fstat), inside the pinned image, so the
+#: identity is the container's view of the path, as the router recorded it.
+#: Run as `python3 -I -S - <path>`.
+ROOT_PROGRAM = ('import json,os,sys; p=sys.argv[1]; fd=os.open(p, os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW); '
+                'st=os.fstat(fd); os.close(fd); print(json.dumps({"path": p, "st_dev": st.st_dev, '
+                '"st_ino": st.st_ino}, sort_keys=True))\n')
 
 #: The container name every one-shot step runs under; `docker run --rm` frees it.
 STEP_CONTAINER = "amap-router-migrate"
@@ -264,10 +273,33 @@ def _file_state(p: Path) -> bool:
     return True
 
 
+def _present(p: Path) -> bool:
+    """An entry of any type, as the pinned router counts one: an entry that
+    cannot be examined (EACCES and the like) counts as present."""
+    try:
+        os.lstat(p)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
 def _legacy(d: Path) -> bool:
     """Whether `d` holds a pre-generation entry, of any type, as the pinned
     router's legacy_entries counts them."""
-    return any(os.path.lexists(d / n) for n in GEN_SCOPED)
+    return any(_present(d / n) for n in GEN_SCOPED)
+
+
+def _unlisted(d: Path) -> None:
+    """A logical_id directory with no generations file and a gen-* entry is
+    the pinned router's state_layout_conflict (check_unlisted): the
+    generations file was lost, and no plan guesses past that."""
+    with os.scandir(d) as it:
+        strays = sorted(e.name for e in it if e.name.startswith("gen-"))
+    if strays:
+        raise Stop(f"{d} holds {', '.join(strays)} but no {GEN_FILE}: the router holds it as "
+                   "state_layout_conflict, and so does this step")
 
 
 def _at(state_dir: Path, lid: str, ident: List[int]) -> None:
@@ -298,11 +330,13 @@ def classify(state_dir: Path, the_map: Dict[str, Any]) -> Dict[str, Dict[str, An
         if dst is not None and not stat.S_ISDIR(dst.st_mode):
             raise Stop(f"{state_dir / lid} is not a directory")
         if src is not None:
+            _unlisted(state_dir / name)
             out[name] = {"logical_id": lid, "source": BY_NAME, "ident": _ident(src),
                          "adopt": _legacy(state_dir / name)}
         elif dst is not None:
             if _file_state(state_dir / lid / GEN_FILE):
                 continue
+            _unlisted(state_dir / lid)
             if _file_state(state_dir / lid / MIGRATION_FILE):
                 raise Stop(f"{state_dir / lid / MIGRATION_FILE} exists without {GEN_FILE}: an adopt has begun; "
                            "resume it with the adopt step, never with a new plan")
@@ -335,8 +369,10 @@ def layout_needs(state_dir: Path) -> Tuple[set, set]:
                            "instance, and this step does not guess")
             continue
         if LOGICAL_ID.fullmatch(n):
-            if not _file_state(state_dir / n / GEN_FILE) and _legacy(state_dir / n):
-                ids.add(n)
+            if not _file_state(state_dir / n / GEN_FILE):
+                _unlisted(state_dir / n)
+                if _legacy(state_dir / n):
+                    ids.add(n)
         elif hexish or rfp.INSTANCE_NAME.fullmatch(n) is None:
             raise Stop(f"{state_dir / n} is neither the router's own entry nor an instance's")
         else:
@@ -360,7 +396,8 @@ def cover(state_dir: Path, planned: Dict[str, Dict[str, Any]], *, moved: bool) -
         raise Stop("the state directory's layout is not the plan's: "
                    + (f"not planned: {', '.join(extra)}" if extra else "")
                    + ("; " if extra and missing else "")
-                   + (f"planned but absent: {', '.join(missing)}" if missing else ""))
+                   + (f"planned but absent: {', '.join(missing)}" if missing else "")
+                   + "; the state changed since the preview: take the back-out for this point, then a new preview")
 
 
 @contextlib.contextmanager
@@ -383,7 +420,12 @@ def _sync(fd: int) -> None:
     """fsync, and on darwin F_FULLFSYNC, which also flushes the drive's cache."""
     os.fsync(fd)
     if sys.platform == "darwin" and hasattr(fcntl, "F_FULLFSYNC"):
-        fcntl.fcntl(fd, fcntl.F_FULLFSYNC)
+        try:
+            fcntl.fcntl(fd, fcntl.F_FULLFSYNC)
+        except OSError as e:
+            # A filesystem that refuses it keeps the fsync above, as SQLite does.
+            if e.errno not in (errno.ENOTSUP, errno.EINVAL):
+                raise
 
 
 def _fsync_dir(d: Path) -> None:
@@ -578,7 +620,8 @@ def do_move(checkout: str, image: str, config: str, preview_path: str, run_dir: 
 
 def _moves(state_dir: Path, preview: Dict[str, Any], run_dir: Path) -> Path:
     out = _record(run_dir, "moves")
-    journal: Dict[str, Any] = {"schema": SCHEMA, "step": "moves", "context": preview["context"], "moves": []}
+    journal: Dict[str, Any] = {"schema": SCHEMA, "step": "moves", "context": preview["context"], "moves": [],
+                               "planned": sorted(p["logical_id"] for p in preview["instances"].values())}
     _write_new(out, journal)
     try:
         for name, p in sorted(preview["instances"].items()):
@@ -625,8 +668,8 @@ def do_reverse(config: str, journal_path: str) -> Path:
     state_dir = Path(want["state_dir"])
     _noreplace_supported()
     with drain_lock(state_dir):
-        adopted = [e["logical_id"] for e in journal["moves"]
-                   if any(os.path.lexists(state_dir / e["logical_id"] / f) for f in (MIGRATION_FILE, GEN_FILE))]
+        lids = sorted(set(journal.get("planned", [])) | {e["logical_id"] for e in journal["moves"]})
+        adopted = [lid for lid in lids if any(_present(state_dir / lid / f) for f in (MIGRATION_FILE, GEN_FILE))]
         if adopted:
             raise Stop(f"an adopt has begun or finished under {', '.join(adopted)}: the old router cannot read that "
                        "state, so nothing is moved back; R2 only goes forward from here (back-out D)")
@@ -703,13 +746,78 @@ def do_adopt(checkout: str, image: str, config: str, check_path: str, reason: st
             result = json.loads(stdout) if rc == 0 else None
         except ValueError:
             result = None
-        if rc != 0 or not isinstance(result, dict) or result.get("logical_id") != rec["logical_id"]:
+        root = result.get("root") if isinstance(result, dict) else None
+        if (rc != 0 or not isinstance(result, dict) or result.get("logical_id") != rec["logical_id"]
+                or not isinstance(root, dict) or any(root.get(k) != rec["root"].get(k) for k in ROOT_COMPARED)):
             _write_new(out, {"schema": SCHEMA, "step": "adopt", "done": done, "failed": name})
-            raise Stop(f"adopt for {name!r} exited {rc}, or answered for another identity: "
-                       f"{err.strip()[-400:]}; re-running the same step resumes it")
+            raise Stop(f"adopt for {name!r} exited {rc}, or answered for another identity or root: "
+                       f"{err.strip()[-400:]}; re-running the same step resumes it, and an adopt that answered "
+                       "for another root is the maintainers' call (back-out D)")
         done[name] = result
+    for name, rec in sorted(check["instances"].items()):
+        _adopted_root(checkout, image, config, state_dir, name, rec, runner)
     _write_new(out, {"schema": SCHEMA, "step": "adopt", "done": done, "failed": None})
     return out
+
+
+def do_verify(checkout: str, image: str, config: str, check_path: str, run_dir: Path, runner: Runner) -> Path:
+    """Read-only, immediately before the start: the context is still the
+    checked one, and every adopted root's four records agree."""
+    check = _read_doc(check_path, "check")
+    cfg = _config(config)
+    bind_context(check["context"], cfg, checkout, image)
+    state_dir = Path(cfg["state_dir"])
+    for name, rec in sorted(check["instances"].items()):
+        _adopted_root(checkout, image, config, state_dir, name, rec, runner)
+    out = _record(run_dir, "verify")
+    _write_new(out, {"schema": SCHEMA, "step": "verify", "verified": sorted(check["instances"])})
+    return out
+
+
+def _read_json(path: Path) -> Any:
+    try:
+        return json.loads(path.read_bytes()) if _file_state(path) else None
+    except (OSError, ValueError) as e:
+        raise Stop(f"{path} cannot be read: {e}") from None
+
+
+def live_root(checkout: str, image: str, config: str, path: str, runner: Runner) -> Dict[str, Any]:
+    rc, out, err = _call(step_argv(checkout, image, config, ["python3", "-I", "-S", "-", path]), runner,
+                         stdin=ROOT_PROGRAM.encode("utf-8"))
+    if rc != 0:
+        raise Stop(f"the instance root {path} cannot be opened as the router opens it: {err.strip()[-400:]}")
+    try:
+        got = json.loads(out)
+    except ValueError:
+        raise Cannot(f"the root program printed no JSON for {path}") from None
+    if not isinstance(got, dict) or set(got) != {"path", "st_dev", "st_ino"}:
+        raise Cannot(f"the root program's answer for {path} is not {{path, st_dev, st_ino}}")
+    return got
+
+
+def _adopted_root(checkout: str, image: str, config: str, state_dir: Path, name: str, rec: Dict[str, Any],
+                  runner: Runner) -> None:
+    """After the adopt, and again immediately before the start, four records
+    of the instance root must be one (path, st_dev, st_ino): the adopt's own
+    journal (migration.json source.root), the generation it made
+    (generations.json, the current entry), the root recorded at check, and
+    the root as the router would open it now. Otherwise STOP: do not start
+    the router, because it would begin a new generation (root_changed), take
+    a fresh first sight and quarantine waiting requests."""
+    d = state_dir / rec["logical_id"]
+    journal, gens = _read_json(d / MIGRATION_FILE), _read_json(d / GEN_FILE)
+    source = journal.get("source") if isinstance(journal, dict) else None
+    from_journal = source.get("root") if isinstance(source, dict) else None
+    entries = gens.get("gens") if isinstance(gens, dict) else None
+    cur = next((g for g in entries if isinstance(g, dict) and g.get("gen") == gens.get("current")), None) \
+        if isinstance(entries, list) else None
+    from_gens = cur.get("root") if isinstance(cur, dict) else None
+    now = live_root(checkout, image, config, rec["root"]["path"], runner)
+    for what, root in (("the adopt's journal", from_journal), ("the adopted generation", from_gens),
+                       ("the path now", now)):
+        if not isinstance(root, dict) or any(root.get(k) != rec["root"].get(k) for k in ROOT_COMPARED):
+            raise Stop(f"{name!r}'s root in {what} is {root!r}, not the checked {rec['root']!r}: do not start the "
+                       "router; R2 only goes forward from here (back-out D)")
 
 
 def _preflight(checkout: str, image: str, config: str, name: str, reason: str, rec: Dict[str, Any],
@@ -767,7 +875,8 @@ def _run(args: Any, out: Callable[[str], None], runner: Runner) -> int:
     if getattr(args, "config", None) is not None:
         args.config = os.path.abspath(args.config)
     need = {"map": ("config",), "preview": ("config", "reason"), "move": ("config",),
-            "check": ("config", "preview", "reason"), "adopt": ("config", "check", "reason")}[step]
+            "check": ("config", "preview", "reason"), "adopt": ("config", "check", "reason"),
+            "verify": ("config", "check")}[step]
     missing = [k for k in need if getattr(args, k, None) is None]
     if step == "move" and (args.preview is None) == (args.reverse is None):
         missing.append("preview or --reverse, exactly one")
@@ -787,7 +896,9 @@ def _run(args: Any, out: Callable[[str], None], runner: Runner) -> int:
         path = do_move(checkout, image, args.config, args.preview, run_dir, runner)
     elif step == "check":
         path = do_check(checkout, image, args.config, args.preview, args.reason, run_dir, runner)
-    else:
+    elif step == "adopt":
         path = do_adopt(checkout, image, args.config, args.check, args.reason, run_dir, runner)
+    else:
+        path = do_verify(checkout, image, args.config, args.check, run_dir, runner)
     out(f"router-migrate {step}: done: {path}")
     return 0
