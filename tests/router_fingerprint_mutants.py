@@ -601,6 +601,14 @@ MUTANTS = [
     ("F_FULLFSYNC refusals not tolerated", RM,
      "            if e.errno not in (errno.ENOTSUP, errno.EOPNOTSUPP, errno.EINVAL, errno.ENOTTY):",
      "            if True:"),
+    ("a root mismatch leaves no adopt record", RM,
+     "        except Stop:\n"
+     "            _write_new(out, {\"schema\": SCHEMA, \"step\": \"adopt\", \"done\": done, \"failed\": None,\n"
+     "                             \"root_mismatch\": name})\n            raise",
+     "        except Stop:\n            raise"),
+    ("a root mismatch recorded without its instance", RM,
+     "                             \"root_mismatch\": name})",
+     "                             \"root_mismatch\": None})"),
 ]
 TESTS = {RF: "test_router_fingerprint", "hygiene_gate.py": "test_router_fingerprint",
          RM: "test_router_migrate", AS: "test_router_migrate"}

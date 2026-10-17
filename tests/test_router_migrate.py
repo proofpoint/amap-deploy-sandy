@@ -674,6 +674,23 @@ class BindingRows(Base):
                     rm.do_adopt(CHECKOUT, IMAGE, str(self.config), str(check), REASON, self.run_dir,
                                 FakeRouter(plans={"alice": plan("alice", LID_A)}, **kw))
 
+    def test_a_root_mismatch_after_the_adopts_is_recorded(self):
+        """Opus's N2: the adopts succeeded and answered the checked root, but
+        the adopt's own journal names another; ONE adopt record names the
+        instance as root_mismatch, with nothing failed."""
+        self.move(self.pre)
+        check = self.check(self.pre)
+        other = {"path": "/inst/alice", "st_dev": 41, "st_ino": 10}
+        try:
+            rm.do_adopt(CHECKOUT, IMAGE, str(self.config), str(check), REASON, self.run_dir,
+                        FakeRouter(plans={"alice": plan("alice", LID_A)}, journal_root={"alice": other}))
+            got = None
+        except Exception as e:     # noqa: BLE001 — the type is the assertion
+            got = e
+        self.assertIsInstance(got, rm.Stop)
+        records = [json.loads(p.read_text()) for p in sorted(self.run_dir.glob("router-migrate-adopt-*.json"))]
+        self.assertEqual([(r["root_mismatch"], r["failed"]) for r in records], [("alice", None)])
+
     def test_verify_before_the_start(self):
         self.move(self.pre)
         check = self.check(self.pre)
