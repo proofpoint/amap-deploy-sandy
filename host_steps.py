@@ -3777,8 +3777,10 @@ MANAGER_NAMES = {"systemd": "systemctl", "launchd": "launchctl"}
 #: launchctl bootout's "Operation now in progress": the job is still going away.
 BOOTOUT_IN_PROGRESS = 36
 #: `launchctl print system/<label>`'s (exit status, output) once the label is
-#: gone, exactly. A Mac fact not yet measured: while it is None, every print
-#: answer is unknown and a bootout is never confirmed.
+#: gone, exactly: stdout and stderr as one stream, trailing newlines dropped,
+#: as TXN captures it (root_trust.LAUNCHD_NOT_FOUND, the same value). A Mac
+#: fact not yet measured: while it is None, every print answer is unknown and
+#: a bootout is never confirmed.
 LAUNCHD_NOT_FOUND = None
 #: (kind, action): (the argument kinds, the argv after the manager).
 SERVICE_TABLE = {
@@ -3886,10 +3888,10 @@ def service(manager, kind, action, args, run=subprocess.run, out=print, platform
             return _timed_out(argv, out)
         try:
             q = run(probe, shell=False, close_fds=True, stdin=subprocess.DEVNULL, env=env, timeout=left,
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         except subprocess.TimeoutExpired:
             return _timed_out(argv, out)
-        said = ((q.stdout or b"") + (q.stderr or b"")).decode("utf-8", "replace").strip()
+        said = (q.stdout or b"").decode("utf-8", "replace").rstrip("\n")
         if LAUNCHD_NOT_FOUND is not None and (q.returncode, said) == LAUNCHD_NOT_FOUND:
             return 0
         if q.returncode == 0 and p.returncode not in (0, BOOTOUT_IN_PROGRESS):

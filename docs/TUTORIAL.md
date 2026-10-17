@@ -366,15 +366,45 @@ runtimes; a deployment must not pre-create or chown them. Each level is
 checked by the runtime that makes it and never repaired, so one made or
 re-owned by anyone else stops that runtime's admission of the link.
 
-Run the printed steps as root, in order, **before any hop runtime starts**,
-from a checkout that no sandbox mounts read-write: a fresh clone at the
-recorded deploy commit, never an agent's workspace checkout. The steps run
-that checkout's `host_steps.py` as root.
+Run the printed steps in order, **before any hop runtime starts**. Print
+the plan on the host it is for, from a checkout that no sandbox mounts
+read-write: a fresh clone at the recorded deploy commit, never an agent's
+workspace checkout. That clone is only the writer's source: root runs the
+placed, pinned copy, through the barrier the bootstrap below places.
 Each step goes through `host_steps.py`, which reaches every path from `/`
 without following a symbolic link and stops at one. Every root is created
 with its owner, group and mode, then it and every ancestor are fsynced, so a
 runtime never opens a root that is not durable. The steps are safe to run
 again.
+
+**The bootstrap.** With a secrets and a supervision section, the plan
+starts with four steps, all as you, before any other root line:
+
+0. `amap-sandy.py hub-supervise --apply` stages every supervision file in
+   the run directory, root-trust.sh and the deployed context among them.
+1. The recorded sha256 tool over the clone's `host_steps.py`. It must print
+   the writer's pin. This is advisory: G binds the bytes.
+2. One transaction, `/usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C /bin/sh -c
+   '<TXN>' sh …`. It decides everything once, from the state before any byte
+   is replaced: whether the writer's directory and each placed file are
+   root's alone, and which of the writer and root-trust.sh are already at
+   their pins. A fresh host copies both. A writer-only update first reads
+   the old hub through the deployed context the last install published,
+   and goes on only when that check prints `NOT-RUNNING`. Nothing new
+   copies nothing. A running or enabled job, an answer it cannot classify,
+   both files differing, or a partial pair each stops it before any sudo.
+   Only then does sudo run, at most three times, as `install` reading the
+   file your own shell opened. Go on only when it ends with `TXN-OK`.
+3. G, `/usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C /bin/sh -c '<G>' sh …`:
+   the placed route and bytes, before anything sources root-trust.sh. Go on
+   only when it prints exactly `G-ROUTE-OK`, `G-BYTES-OK` and
+   `BOOTSTRAP-OK`.
+
+Every later root line runs through the barrier, and the plan's last one
+publishes the deployed context with the new pins. A document without a
+secrets or a supervision section has no pinned writer and no
+root-trust.sh, so the plan prints each root line behind a placeholder
+that names what is missing, and none of them can run.
 
 Start each hop runtime under the umask the plan names for it: `UMask=0027`
 in its service unit, or `umask 0027` in its launcher before it execs. 0027
@@ -491,8 +521,9 @@ principal that owns it, the runtime image by digest, the pinned writer, a
 root-owned anchor holding the reviewed overlay's sha, a root-owned state
 file (`pending_b5`, `active` or `retired`), the fresh clones the tooling
 runs from, and the absolute path of every tool. `host-setup` then prints the
-steps that create the anchor, install the writer, create the volume and its
-root, the lock file and the state, and checks, without reading the secret:
+bootstrap that places the writer, then the steps that create the anchor,
+the volume and its root, the lock file and the state, and checks, without
+reading the secret:
 - the document itself was read from the anchored overlay clone, as a file
   that clone tracks, never from a copy or a working checkout;
 - the writer, the anchor and the state file are root-owned 0444 with one
@@ -1129,7 +1160,7 @@ engine reads as not running.
      tail -c 32 "$T/pub.der" > "$T/pub.raw"
      printf 'public_key '; od -An -tx1 "$T/pub.raw" | tr -d ' \n'; echo
      printf 'key_id     '; "$OPENSSL" dgst -sha256 -r "$T/pub.raw" | cut -c1-64
-     /usr/bin/sudo /usr/bin/install -o <the local router's uid> -g <its gid> -m 0400 "$T/seed" <keys.dir>/<keys.file>
+     /usr/bin/sudo /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin LC_ALL=C /bin/sh -c '<root-trust.sh's root_exec>' sh <the writer's pin> <python3> <writer> trusted-exec <the secrets tools> -- <install> -o <the local router's uid> -g <its gid> -m 0400 "$T/seed" <keys.dir>/<keys.file>
    ); echo "exit $? (anything but 0: STOP, nothing was installed)"
    ```
 

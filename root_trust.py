@@ -37,7 +37,7 @@ import os
 import posixpath
 import shlex
 import struct
-from typing import List, Optional, Sequence
+from typing import List, Optional, Sequence, Tuple
 
 #: The check's exit: outside PROBE_EXITS, REFUSED, the partition job's codes,
 #: the hub's NO_RESTART (0-11), the engine's 125, the shell's 126-127 and 143.
@@ -476,3 +476,368 @@ def root_argv(rt: str, sha256: str, python3: str, writer: str, args: List[str],
               engine: Optional[str] = None) -> List[str]:
     """The whole argv of a root command under the anchor."""
     return anchor(engine) + ["/bin/sh", "-c", root_line(rt, sha256, python3, writer, args)]
+
+
+# --- The bootstrap: TXN and G, as the operator (d3.3 §5(d) §3) ------------------
+#
+# Nothing root runs before the barrier exists can be judged by it, so the
+# bootstrap is two operator shells around three anchor-only root lines.
+# TXN decides everything once, from the state before any byte is replaced
+# (GATE0, SAME, the classification, U0), then copies only what its class
+# names (B1-B3). G then judges the placed route and bytes before any barrier
+# line sources root-trust.sh.
+
+#: The bootstrap's advisory bound on a copied source, at check time only.
+SOURCE_MAX = 4194304
+#: The reader's capture is refused after it exits when it is larger than this.
+CAPTURE_MAX = 65536
+CONTEXT_NAME = "deployed-context.json"
+#: The operator shell both run in: the system sh, under a pinned PATH.
+OPERATOR_ENV = ["/usr/bin/env", "-i", "PATH=/usr/bin:/bin", "LC_ALL=C", ANCHOR_SHELL, "-c"]
+#: Per kind: how the anchor's stat prints a size, and the hash command.
+SIZE = {"systemd": "/usr/bin/stat -L -c %s", "launchd": "/usr/bin/stat -L -f %z"}
+HASHWORD = {"systemd": "sha256sum", "launchd": "shasum"}
+#: Facts a host must measure, None until it has (the design's §6). Each
+#: unmeasured answer is unknown, and an unknown answer refuses.
+#: `launchctl print system/<label>` for a label that is not loaded: (status, output).
+LAUNCHD_NOT_FOUND: Optional[Tuple[int, str]] = None
+#: Its line for a weekly run in progress, and for a loaded, idle label.
+LAUNCHD_STATE_RUNNING: Optional[str] = None
+LAUNCHD_STATE_IDLE: Optional[str] = None
+#: `systemctl is-enabled <timer>` for a timer that does not exist: (status, stdout, stderr), either text None.
+SYSTEMD_TIMER_MISSING: Optional[Tuple[int, Optional[str], Optional[str]]] = None
+
+GATE = r"""
+_g_nl='
+'
+_g_fail() { printf 'G: %s: %s\n' "$1" "$2" >&2; exit 1; }
+_g_judge() {
+  _g_p=$1 _g_t=$2
+  _g_l=$(@LS@ -l@E@dn -- "$_g_p" && printf .) || _g_fail "$_g_p" "cannot be read"
+  _g_l=${_g_l%.}
+  _g_l=${_g_l%"$_g_nl"}
+  case $_g_l in *"$_g_nl"*) _g_fail "$_g_p" "carries an ACL" ;; esac
+  _g_m=${_g_l%% *}
+  case $_g_m in ''|\?*) _g_fail "$_g_p" "cannot be read" ;; ??????????+*) _g_fail "$_g_p" "carries an ACL" ;; esac
+  case $_g_t$_g_m in dd*|f-*) ;; *) _g_fail "$_g_p" "is not of its type" ;; esac
+  case $_g_m in ?????w*|????????w*) _g_fail "$_g_p" "is writable by others" ;; esac
+  set -f
+  set -- $_g_l
+  set +f
+  [ "$3" = @ROOT@ ] || _g_fail "$_g_p" "is not root-owned"
+  [ "$_g_t" = d ] || [ "$2" = 1 ] || _g_fail "$_g_p" "has more than one link"
+}
+_g_hw=$1 _g_wpin=$2 _g_rpin=$3 _g_writer=$4 _g_rt=$5
+shift 5
+[ $# -ge 2 ] || _g_fail route "names no directory"
+for _g_d in "$@"; do _g_judge "$_g_d" d; done
+_g_judge "$_g_writer" f
+_g_judge "$_g_rt" f
+echo G-ROUTE-OK
+for _g_w in "$_g_wpin" "$_g_rpin"; do
+  case $_g_w in *[!0-9a-f]*|"") _g_fail pin "not 64 lowercase hex" ;; esac
+  [ ${#_g_w} -eq 64 ] || _g_fail pin "not 64 lowercase hex"
+done
+case $_g_hw in
+  sha256sum) set -- @SHA256SUM@ --strict --status -c - ;;
+  shasum) set -- @SHASUM@ -a 256 @STRICT@ --status -c - ;;
+  *) _g_fail hashword "neither sha256sum nor shasum" ;;
+esac
+printf '%s  %s\n' "$_g_wpin" "$_g_writer" "$_g_rpin" "$_g_rt" | "$@" || _g_fail bytes "not the pinned bytes"
+echo G-BYTES-OK
+echo BOOTSTRAP-OK
+"""
+
+TXN = r"""
+_t_nl='
+'
+trap 'printf "TXN: interrupted\n" >&2; exit 3' INT TERM HUP
+_t_fail() { printf 'GATE0: %s: %s\n' "$1" "$2" >&2; exit 1; }
+_t_stop() { printf 'TXN: %s\n' "$1" >&2; exit "${2:-1}"; }
+case ${10-} in
+  systemd) [ $# -eq 17 ] || _t_stop "wrong operand count for systemd" ;;
+  launchd) [ $# -eq 18 ] || _t_stop "wrong operand count for launchd" ;;
+  *) _t_stop "wrong operand count for ${10-?}" ;;
+esac
+[ "${10}" = @KIND@ ] || _t_stop "this TXN is rendered for @KIND@, not ${10}"
+writer_dir=$1 writer=$2 rt=$3 context=$4 wpin=$5 rpin=$6 hashword=$7 writer_src=$8 rt_src=$9 kind=${10}
+shift 10
+if [ "$kind" = systemd ]; then hub=$1 wsvc=$2 wtimer=$3; shift 3; else hub=$1 wlabel=$2; shift 2; fi
+py=$1 amap=$2 docsource=$3 docpath=$4
+shift 4
+staged= placed=
+[ "$kind" = launchd ] && staged=$1 placed=$2
+run_dir=${rt_src%/*}
+
+# The same-count role check: each operand in its own slot.
+_t_name() {
+  case $1 in [A-Za-z0-9]*) ;; *) return 1 ;; esac
+  case $1 in *[!A-Za-z0-9$2._-]*) return 1 ;; esac
+}
+_t_unit() { _t_name "$1" @ && case $1 in ?*"$2") return 0 ;; esac; return 1; }
+_t_path() {
+  case $1 in /*) ;; *) return 1 ;; esac
+  case "$1/" in *//*|*/./*|*/../*) return 1 ;; esac
+}
+_t_path "$writer_dir" && [ "$writer_dir" != / ] || _t_stop "the writer's directory is not an absolute, normal path"
+[ "$writer" = "$writer_dir/${writer##*/}" ] && [ "$rt" = "$writer_dir/@RTNAME@" ] \
+  && [ "$context" = "$writer_dir/@CONTEXT@" ] || _t_stop "the writer, root-trust.sh and the context are not in the writer's directory"
+_t_path "$run_dir" && [ "$run_dir" != "" ] || _t_stop "the staged root-trust.sh is not in an absolute, normal run directory"
+_t_path "$writer_src" || _t_stop "the writer's source is not an absolute, normal path"
+if [ "$kind" = systemd ]; then
+  _t_unit "$hub" .service && _t_unit "$wsvc" .service && _t_unit "$wtimer" .timer \
+    || _t_stop "the units are not a hub .service, a weekly .service and a weekly .timer, in that order"
+else
+  _t_name "$hub" "" && _t_name "$wlabel" "" || _t_stop "the labels are not launchd labels"
+  [ "$placed" = "@LAUNCHD_DIR@/$wlabel.plist" ] || _t_stop "the placed weekly plist is not @LAUNCHD_DIR@/<weekly label>.plist"
+  case $staged in *.plist) ;; *) _t_stop "the staged weekly plist is not a .plist" ;; esac
+  _t_path "$staged" || _t_stop "the staged weekly plist is not an absolute, normal path"
+  case $staged in "$run_dir"/?*) ;; *) _t_stop "the staged weekly plist is not under the run directory" ;; esac
+fi
+case $docsource in spec|overlay) ;; *) _t_stop "the document source is neither spec nor overlay" ;; esac
+_t_path "$docpath" || _t_stop "the document is not an absolute, normal path"
+for _t_w in "$wpin" "$rpin"; do
+  case $_t_w in *[!0-9a-f]*|"") _t_fail pin "not 64 lowercase hex" ;; esac
+  [ ${#_t_w} -eq 64 ] || _t_fail pin "not 64 lowercase hex"
+done
+case $hashword in sha256sum|shasum) ;; *) _t_fail hashword "neither sha256sum nor shasum" ;; esac
+
+# GATE0's rules, as the operator.
+_t_meta() {
+  _t_l=$(@LS@ -l@E@dn -- "$1" 2>/dev/null && printf .) || { _t_why="cannot be read"; return 1; }
+  _t_l=${_t_l%.}
+  _t_l=${_t_l%"$_t_nl"}
+  case $_t_l in *"$_t_nl"*) _t_why="carries an ACL"; return 2 ;; esac
+  _t_mode=${_t_l%% *}
+  case $_t_mode in ''|\?*) _t_why="cannot be read"; return 2 ;; ??????????+*) _t_why="carries an ACL"; return 2 ;; esac
+  set -f
+  set -- $_t_l
+  set +f
+  _t_links=$2 _t_uid=$3
+}
+_t_searchdir() {
+  _t_meta "$1" || _t_fail "$1" "$_t_why"
+  case $_t_mode in d*) ;; *) _t_fail "$1" "is not a directory" ;; esac
+  [ "$_t_uid" = @ROOT@ ] || _t_fail "$1" "is not root-owned"
+  case $_t_mode in ?????w*|????????w*) _t_fail "$1" "is writable by others" ;; esac
+  case $_t_mode in ?????????[xt]*) ;; *) _t_fail "$1" "is not searchable by others" ;; esac
+}
+_t_ancestors() {
+  _t_cur= _t_rest=${1#/} _t_on=yes
+  [ -n "@TOP@" ] && _t_on=no
+  [ "$_t_on" = yes ] && _t_searchdir /
+  while :; do
+    case $_t_rest in */*) _t_c=${_t_rest%%/*}; _t_rest=${_t_rest#*/} ;; *) break ;; esac
+    _t_cur=$_t_cur/$_t_c
+    if [ "$_t_on" = no ]; then [ "$_t_cur" = "@TOP@" ] && _t_on=yes; continue; fi
+    _t_searchdir "$_t_cur"
+  done
+  _t_parent=${_t_cur:-/}
+}
+_t_listed() {
+  _t_ls=$(@LS@ -a1 -- "$1" 2>/dev/null && printf .) || _t_fail "$1" "cannot be listed"
+  _t_ls=${_t_ls%.}
+  printf '%s' "$_t_ls" | grep -Fxq -- "$2"
+  case $? in 0) return 0 ;; 1) return 1 ;; esac
+  _t_fail "$1" "cannot be searched for $2"
+}
+_t_hash() {
+  case $hashword in
+    sha256sum) _t_h=$(@SHA256SUM@ -- "$1" 2>/dev/null) || return 1 ;;
+    *) _t_h=$(@SHASUM@ -a 256 -- "$1" 2>/dev/null) || return 1 ;;
+  esac
+  _t_h=${_t_h%% *}
+  case $_t_h in *[!0-9a-f]*|"") return 1 ;; esac
+  [ ${#_t_h} -eq 64 ]
+}
+# SAME: 0 the leaf is root's alone and the pin's bytes, 1 proven absent, 2 read and different, 3 anything else.
+_t_same() {
+  _t_s=3 _t_sh= _t_sw=
+  if [ "$_t_wd" = absent ]; then _t_s=1; return 0; fi
+  _t_listed "$writer_dir" "${1##*/}" || { _t_s=1; return 0; }
+  _t_meta "$1" || { _t_sw="$1: $_t_why"; return 0; }
+  case $_t_mode in -*) ;; *) _t_sw="$1: is not a regular file"; return 0 ;; esac
+  [ "$_t_uid" = @ROOT@ ] && [ "$_t_links" = 1 ] || { _t_sw="$1: is not root's alone with one link"; return 0; }
+  case $_t_mode in ?????w*|????????w*) _t_sw="$1: is writable by others"; return 0 ;; esac
+  _t_hash "$1" || { _t_sw="$1: cannot be hashed"; return 0; }
+  _t_sh=$_t_h
+  if [ "$_t_h" = "$2" ]; then _t_s=0; else _t_s=2; fi
+}
+
+_t_ancestors "$writer_dir"
+if _t_listed "$_t_parent" "${writer_dir##*/}"; then _t_searchdir "$writer_dir"; _t_wd=present; else _t_wd=absent; fi
+_t_same "$writer" "$wpin"; ws=$_t_s wsw=${_t_sw-} wh=$_t_sh
+_t_same "$rt" "$rpin"; rs=$_t_s rsw=${_t_sw-} rh=$_t_sh
+ctx=absent
+if [ "$_t_wd" = present ] && _t_listed "$writer_dir" "@CONTEXT@"; then
+  ctx=present
+  _t_hash "$context" && ctx="present, sha256 $_t_h"
+fi
+plist=none
+if [ "$kind" = launchd ]; then
+  _t_ancestors "$placed"
+  _t_searchdir "$_t_parent"
+  if _t_listed "$_t_parent" "${placed##*/}"; then
+    @CMP@ -s -- "$staged" "$placed"
+    case $? in 0) plist=same ;; 1) plist=differs ;; *) _t_stop "the weekly plists cannot be compared ($staged, $placed)" 3 ;; esac
+  fi
+fi
+[ "$ws" -lt 3 ] || _t_stop "SAME failed for the writer ($wsw): nothing is written" 3
+[ "$rs" -lt 3 ] || _t_stop "SAME failed for root-trust.sh ($rsw): nothing is written" 3
+
+_t_state() { case $1 in 0) printf 'sha256 %s (the pin)' "$3" ;; 1) printf absent ;; *) printf 'sha256 %s' "$2" ;; esac; }
+if [ "$ws" = 1 ] && [ "$rs" = 1 ] && [ "$ctx" = absent ]; then class=FRESH
+elif [ "$ws" = 2 ] && [ "$rs" = 0 ]; then class=WRITER-ONLY
+elif [ "$ws" = 0 ] && [ "$rs" = 0 ]; then class=NOTHING
+elif [ "$ws" = 2 ] && [ "$rs" = 2 ]; then class=BOTH
+elif [ "$ws" = 0 ] && [ "$rs" = 2 ]; then class=RT-ONLY
+else class=PARTIAL
+fi
+case $class in
+  BOTH) _t_stop "a two-leaf update is not supported yet (post-M1, §5b)" ;;
+  RT-ONLY) _t_stop "root-trust.sh's render changed (deploy pin or host loader); an image-only update with the deploy pin unchanged is not affected (on launchd an image-only update re-registers the weekly job, see U0)" ;;
+  PARTIAL) _t_stop "a partial bootstrap pair: the maintainers' call. The writer: $(_t_state "$ws" "$wh" "$wpin"), expected sha256 $wpin; root-trust.sh: $(_t_state "$rs" "$rh" "$rpin"), expected sha256 $rpin; the context: $ctx" ;;
+esac
+
+# U0, the update guard: read-only and tri-state; every unknown answer refuses.
+_t_held() { _t_stop "U0: $1. A running or enabled job holds the old pin. The remedies are: none needed if nothing is running or enabled; otherwise a one-time operator-typed quiescence, a trust-model exception (§6, N5). Run nothing else."; }
+_t_unknown() { _t_stop "U0: $1 answered ($_t_rc, $_t_out): unknown. Measure the state and fix the observation; nothing is assumed absent."; }
+_t_active() { _t_out=$(@SYSTEMCTL@ --no-pager is-active "$1" 2>/dev/null); _t_rc=$?; }
+_t_print() { _t_out=$(@LAUNCHCTL@ print "system/$1" 2>&1); _t_rc=$?; }
+_t_notfound() { [ -n "@LDNF_RC@" ] && [ "$_t_rc" = "@LDNF_RC@" ] && [ "$_t_out" = @LDNF_TEXT@ ]; }
+_t_units() {
+  if [ "$kind" = systemd ]; then
+    for _t_u in "$hub" "$wsvc"; do
+      _t_active "$_t_u"
+      case "$_t_rc:$_t_out" in 3:inactive|3:failed) ;; 0:active|0:reloading|0:activating|3:activating) _t_held "$_t_u is $_t_out" ;; *) _t_unknown "is-active $_t_u" ;; esac
+    done
+    _t_active "$wtimer"
+    case "$_t_rc:$_t_out" in 3:inactive) ;; 0:active|0:reloading|0:activating|3:activating) _t_held "$wtimer is $_t_out" ;; *) _t_unknown "is-active $wtimer" ;; esac
+    _t_out=$(@SYSTEMCTL@ --no-pager is-enabled "$wtimer" 2>/dev/null); _t_rc=$?
+    case "$_t_rc:$_t_out" in
+      1:disabled|1:masked) return 0 ;;
+      0:enabled|0:enabled-runtime) _t_held "$wtimer is $_t_out" ;;
+    esac
+    if [ -n "@SDM_RC@" ] && [ "$_t_rc" = "@SDM_RC@" ]; then
+      [ -n "@SDM_OUT@" ] && [ "$_t_out" = @SDM_OUT@ ] && return 0
+      if [ -n "@SDM_ERR@" ]; then
+        _t_err=$(@SYSTEMCTL@ --no-pager is-enabled "$wtimer" 2>&1 >/dev/null)
+        [ "$_t_err" = @SDM_ERR@ ] && return 0
+      fi
+    fi
+    _t_unknown "is-enabled $wtimer"
+  else
+    for _t_u in "$hub" "$wlabel"; do
+      _t_print "$_t_u"
+      [ "$_t_rc" = 0 ] && _t_held "$_t_u is loaded"
+      _t_notfound || _t_unknown "print system/$_t_u"
+    done
+  fi
+}
+_t_weekly() {
+  _t_print "$wlabel"
+  if [ "$_t_rc" = 0 ]; then
+    if [ -n "@LD_RUNNING@" ] && printf '%s\n' "$_t_out" | grep -Fxq -- @LD_RUNNING@; then
+      _t_stop "a weekly run is in progress; re-run after it ends"
+    fi
+    [ -n "@LD_IDLE@" ] && printf '%s\n' "$_t_out" | grep -Fxq -- @LD_IDLE@ && return 0
+    _t_unknown "print system/$wlabel"
+  fi
+  _t_notfound || _t_unknown "print system/$wlabel"
+}
+_t_reader() {
+  _t_at=$(@DATE@ -u +%Y%m%dT%H%M%SZ) || _t_stop "no time for the capture's name"
+  _t_d=$run_dir/hsc.$_t_at _t_i=0
+  while [ -e "$_t_d" ] || [ -h "$_t_d" ]; do
+    _t_i=$((_t_i + 1))
+    [ "$_t_i" -lt 1000 ] || _t_stop "no free capture name in $run_dir"
+    _t_d=$run_dir/hsc.$_t_at-$_t_i
+  done
+  @MKDIR@ -m 0700 "$_t_d" || _t_stop "the capture directory $_t_d cannot be made: nothing was read"
+  if [ "$docsource" = spec ]; then
+    "$py" "$amap" hub-start-check --until-stopped --old-context --spec "$docpath" > "$_t_d/out"
+  else
+    "$py" "$amap" --overlay "$docpath" hub-start-check --until-stopped --old-context > "$_t_d/out"
+  fi
+  _t_rrc=$?
+  _t_last="(no regular capture of at most @CAPMAX@ bytes)"
+  if [ -f "$_t_d/out" ] && [ ! -h "$_t_d/out" ]; then
+    _t_sz=$(@SIZE@ "$_t_d/out") || _t_sz=
+    case $_t_sz in ""|*[!0-9]*) _t_sz=@CAPMAX@1 ;; esac
+    if [ "$_t_sz" -le @CAPMAX@ ]; then
+      _t_last=$(@TAIL@ -n 1 -- "$_t_d/out" && printf .) || _t_stop "the capture cannot be read"
+      _t_last=${_t_last%.}
+      _t_last=${_t_last%"$_t_nl"}
+      [ "$_t_rrc" = 0 ] && [ "$_t_last" = NOT-RUNNING ] && return 0
+    fi
+  fi
+  _t_stop "the old hub is not shown stopped (the old-context check exited $_t_rrc): $_t_last"
+}
+case $class in
+  FRESH) _t_units ;;
+  WRITER-ONLY) _t_reader; _t_units ;;
+  NOTHING) [ "$plist" = differs ] && _t_weekly ;;
+esac
+echo GATE0-OK
+
+# B1-B3: anchor-only, only as the class says. Root opens no source by path.
+if [ "$_t_wd" = absent ]; then
+  @SUDO@ /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin LC_ALL=C /usr/bin/install -d -o 0 -g 0 -m 0755 "$writer_dir" \
+    || _t_stop "B1 failed: the writer's directory was not made"
+fi
+case $class in FRESH|WRITER-ONLY)
+  { test -f /dev/stdin && [ "$(@SIZE@ /dev/stdin)" -le @SRCMAX@ ] \
+    && @SUDO@ /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin LC_ALL=C /usr/bin/install -o 0 -g 0 -m 0444 /dev/stdin "$writer"; } < "$writer_src" \
+    || _t_stop "B2 failed: the writer was not copied" ;;
+esac
+if [ "$class" = FRESH ]; then
+  { test -f /dev/stdin && [ "$(@SIZE@ /dev/stdin)" -le @SRCMAX@ ] \
+    && @SUDO@ /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin LC_ALL=C /usr/bin/install -o 0 -g 0 -m 0444 /dev/stdin "$rt"; } < "$rt_src" \
+    || _t_stop "B3 failed: root-trust.sh was not copied"
+fi
+echo "TXN-OK $class"
+"""
+
+
+def _measured(v: Optional[str]) -> str:
+    return shlex.quote(v) if v is not None else "''"
+
+
+def render_gate(kind: str, root: int = 0, ls: str = "/bin/ls", lsopt: Optional[str] = None,
+                sha256sum: str = "/usr/bin/sha256sum", shasum: str = "/usr/bin/shasum", strict: str = "--strict") -> str:
+    """G for a host whose supervision is `kind`. The rest exist for tests,
+    which map them into a fixture; every rendered plan uses the defaults."""
+    e = ("e" if kind == "launchd" else "") if lsopt is None else lsopt
+    return (GATE.replace("@LS@", ls).replace("@E@", e).replace("@ROOT@", str(int(root)))
+            .replace("@SHA256SUM@", sha256sum).replace("@SHASUM@", shasum).replace("@STRICT@", strict))
+
+
+def render_txn(kind: str, systemctl: str, root: int = 0, top: str = "", sudo: str = SUDO, ls: str = "/bin/ls",
+               lsopt: Optional[str] = None, size: Optional[str] = None, launchctl: str = "/bin/launchctl",
+               launchd_dir: str = "/Library/LaunchDaemons", sha256sum: str = "/usr/bin/sha256sum",
+               shasum: str = "/usr/bin/shasum", cmp: str = "/usr/bin/cmp", tail: str = "/usr/bin/tail",
+               mkdir: str = "/bin/mkdir", date: str = "/bin/date",
+               measured: Optional[dict] = None) -> str:
+    """TXN for a host whose supervision is `kind`, with the host's recorded
+    systemctl. The rest exist for tests, which map them into a fixture (and
+    may supply measured facts); every rendered plan uses the defaults."""
+    kind = "launchd" if kind == "launchd" else "systemd"
+    m = {"LAUNCHD_NOT_FOUND": LAUNCHD_NOT_FOUND, "LAUNCHD_STATE_RUNNING": LAUNCHD_STATE_RUNNING,
+         "LAUNCHD_STATE_IDLE": LAUNCHD_STATE_IDLE, "SYSTEMD_TIMER_MISSING": SYSTEMD_TIMER_MISSING}
+    m.update(measured or {})
+    nf, sdm = m["LAUNCHD_NOT_FOUND"], m["SYSTEMD_TIMER_MISSING"]
+    e = ("e" if kind == "launchd" else "") if lsopt is None else lsopt
+    subs = {"@KIND@": kind, "@ROOT@": str(int(root)), "@TOP@": top, "@SUDO@": sudo, "@LS@": ls, "@E@": e,
+            "@SIZE@": size or SIZE[kind], "@SYSTEMCTL@": shlex.quote(systemctl), "@LAUNCHCTL@": launchctl,
+            "@LAUNCHD_DIR@": launchd_dir, "@SHA256SUM@": sha256sum, "@SHASUM@": shasum, "@CMP@": cmp,
+            "@TAIL@": tail, "@MKDIR@": mkdir, "@DATE@": date, "@RTNAME@": NAME, "@CONTEXT@": CONTEXT_NAME,
+            "@SRCMAX@": str(SOURCE_MAX), "@CAPMAX@": str(CAPTURE_MAX),
+            "@LDNF_RC@": "" if nf is None else str(int(nf[0])), "@LDNF_TEXT@": _measured(None if nf is None else nf[1]),
+            "@LD_RUNNING@": _measured(m["LAUNCHD_STATE_RUNNING"]), "@LD_IDLE@": _measured(m["LAUNCHD_STATE_IDLE"]),
+            "@SDM_RC@": "" if sdm is None else str(int(sdm[0])),
+            "@SDM_OUT@": _measured(None if sdm is None else sdm[1]),
+            "@SDM_ERR@": _measured(None if sdm is None else sdm[2])}
+    out = TXN
+    for k, v in subs.items():
+        out = out.replace(k, v)
+    return out

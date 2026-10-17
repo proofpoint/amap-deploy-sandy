@@ -513,14 +513,54 @@ def rendered(spec: Any) -> List[Tuple[str, bytes]]:
                     (sup.weekly["plist"], weekly_plist(spec))]
 
 
+def rt_sha256(spec: Any) -> str:
+    """sha256 of root-trust.sh as this host's render gives it: what G and
+    the deployed context pin."""
+    return hr._sha(rt.render(spec.supervision.kind, rt_path(spec)).encode("utf-8"))
+
+
+#: The deployed context's bound, for the reader; its schema, which a reader refuses unless it knows it.
+CONTEXT_MAX = 65536
+CONTEXT_SCHEMA = "amap-deploy.deployed-context/1"
+
+
+def context_path(spec: Any) -> str:
+    return posixpath.join(spec.secrets.writer_dir, rt.CONTEXT_NAME)
+
+
+def context_doc(spec: Any, overlay_sha256: str) -> Dict[str, Any]:
+    """What an install publishes last, through the barrier, under the pins
+    it names: the identities a later update's U0 compares with the new
+    document, and the pins it reads the old hub under. overlay_sha256, the
+    approved document's own digest, is informational and never compared."""
+    sup = spec.supervision
+    if sup.kind == "systemd":
+        hub, weekly = posixpath.basename(sup.hub["unit"]), [posixpath.basename(sup.weekly["service"]),
+                                                            posixpath.basename(sup.weekly["timer"])]
+    else:
+        hub, weekly = sup.hub["label"], [sup.weekly["label"]]
+    return {"schema": CONTEXT_SCHEMA, "writer_sha256": spec.secrets.writer_sha256,
+            "root_trust_sha256": rt_sha256(spec), "host": spec.hub.host_label, "engine": sup.engine,
+            "hub_container": hub_name(spec), "hub": hub, "weekly": weekly, "overlay_sha256": overlay_sha256}
+
+
+def context_bytes(spec: Any, overlay_sha256: str) -> bytes:
+    return (json.dumps(context_doc(spec, overlay_sha256), indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+
 def staged(path: str) -> str:
     """The name a file is written under in the run directory."""
     return "supervise-" + posixpath.basename(path)
 
 
-def write_files(spec: Any, *, apply: bool, out=print) -> int:
+def write_files(spec: Any, *, apply: bool, out=print, overlay_sha256: Optional[str] = None) -> int:
+    """Every supervision file into the run directory, and the deployed
+    context when the document's digest is known."""
     run_dir = spec.secrets.run_dir
-    for path, data in rendered(spec):
+    files = rendered(spec)
+    if overlay_sha256 is not None:
+        files = files + [(context_path(spec), context_bytes(spec, overlay_sha256))]
+    for path, data in files:
         dest = posixpath.join(run_dir, staged(path))
         if apply:
             hr.dd.write_atomically(dest, data)
@@ -567,8 +607,7 @@ def plan(spec: Any, q: Callable[[str], str], steps: str) -> List[str]:
     macOS both labels are disabled BEFORE their plists are placed, because
     launchd loads every placed plist at boot."""
     run_dir = spec.secrets.run_dir
-    lines = ["# The hub-link router's supervision. First, as the operator: `amap-sandy.py hub-supervise "
-             f"--apply` writes the files into {run_dir}. Placing them enables nothing."]
+    lines = [f"# The hub-link router's supervision, staged in {run_dir} by step 0. Placing it enables nothing."]
     for label in labels(spec):
         lines.append("# Before placing: launchd would load it at the next boot.")
         lines.append(service_line(spec, "disable", label, q=q))

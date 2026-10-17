@@ -937,7 +937,9 @@ class PlanTest(unittest.TestCase):
     def test_the_plan_creates_the_volume_root_lock_and_state_in_order(self):
         lines = hs.render_plan(hs.load_spec(full_doc()))
         text = "\n".join(lines)
-        order = ["/opt/ex/etc/overlay.sha", "/opt/ex/libexec/host_steps.py", "/srv/op/run/oneshot.lock",
+        # No supervision section: no bootstrap, so no line places the writer (d3.3 §5(d) §3.7).
+        self.assertFalse([l for l in lines if "/opt/ex/libexec/host_steps.py" in l and "install" in l])
+        order = ["/opt/ex/etc/overlay.sha", "/srv/op/run/oneshot.lock",
                  "volume create --label org.example.role=secret ex-secret",
                  f"root /v {DOWN} {DOWNGRP} 0700 --exclusive", "pending_b5"]
         at = [text.index(x) for x in order]
