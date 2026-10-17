@@ -787,23 +787,34 @@ resume.
   So, before step 5, check that no other container (anything but the local
   router's containers: its own, stopped here, and R2's one-shot steps) has
   a writable bind of an instance root or of any ancestor of one, and stop
-  any that does for the window.
+  any that does for the window. If that is the hub-link router, stop and
+  start it through its supervisor (`systemctl stop` and `start` of its
+  unit, or launchd's `bootout system/<label>` and then `bootstrap system
+  <its plist path>`), never with a bare `docker stop`: its default 10 s
+  timeout is shorter than the router's own stop budget, so it can kill the
+  router in the middle of a send, and the supervisor then restarts it (exit
+  137). The supervisor's stop waits for the router's own clean exit.
 - For every instance being migrated, until step 11 passes:
   - no sandbox lifecycle action (launch, relaunch, remove or recreate);
   - no host-side change under its `instances/<slug>`;
-  - no enrolment or rebind of it in the host registry (a rebind makes the
-    router begin a new generation, as a recreated root does);
-  - no edit of the live config. Before step 5, pause the scheduled
-  container recreation, the job the policy's
-  `container_recreate_interval_hours` drives.
-- Steps 8, 9 and 10 check each root, and the registry binding, against the
-  ones recorded, so a change made anyway stops R2 before step 10's start,
-  on the back-out for that point (D once any adopt has begun; before that,
-  C then B). The one
-  gap left is between step 10's verify and the router's first poll, which
-  only this premise covers. A root recreated there would make the router
+  - no registry change for it: a rebind makes the router begin a new
+    generation, as a recreated root does, and a retirement, removal,
+    rename, collision, unreadable snapshot or rollback holds the instance,
+    so its first poll would not drain it;
+  - no `reset` and no `generation new` of it, each of which begins a new
+    generation;
+  - no edit of the live config.
+- Before step 5, pause the scheduled container recreation, the job the
+  policy's `container_recreate_interval_hours` drives.
+- Steps 8, 9 and 10 detect a change of an instance root, of the registry
+  binding, of the config, or of an instance's state directory, and stop R2
+  before step 10's start, on the back-out for that point: D once any
+  migrated directory holds an adopt's files (`migration.json` or
+  `generations.json`), and C then B before that. The premise covers every
+  other change. The one gap left is between step 10's verify and the
+  router's first poll, which only this premise covers. A root recreated there would make the router
   begin a new generation, with a fresh first sight that quarantines that
-  instance's waiting requests. Step 11's acceptance would then fail.
+  instance's waiting requests.
 
 While R2's window is open, everything waits on disk and nothing is lost:
 - agents' outbox requests stay in their outboxes;
@@ -812,9 +823,10 @@ After step 9's adopt and step 10's start, each instance's first-sight
 marker and reply ledger carry over, and it drains on the first poll.
 
 1. **Fingerprint.** `python3 amap-sandy.py router-fingerprint --step 0
-   --apply`, then `python3 amap-sandy.py router-fingerprint --match <the
-   file it wrote>`, each with `--container <its current name>` while the
-   router's container is not yet `router.container`. The match must print
+   --label r2 --apply`, then `python3 amap-sandy.py router-fingerprint
+   --match <the file it wrote>`, each with `--container <its current name>`
+   while the router's container is not yet `router.container`. `--label r2`
+   keeps R2's capture files apart from an activation's. The match must print
    `MIGRATE` and exit 3 (`pre_registry_base` or `migration_required`).
    `MEASURED` means no migration is needed. Any other result names its own
    remedy, and R2 does not start. A `state_layout` refusal naming a file
@@ -861,7 +873,7 @@ marker and reply ledger carry over, and it drains on the first poll.
    - A copy of a running router's state is only a preview: the binding dry
      run is step 8's.
 5. **The window opens.** Fingerprint and match again, as in step 1, with
-   `--step 2`. It must print `MIGRATE` with the same reason. Then, at once,
+   `--step 2 --label r2`. It must print `MIGRATE` with the same reason. Then, at once,
    with no other step between them:
    - `sha256sum <the live config>`, recorded;
    - `cp -p <the live config> <run_dir>/r2-pre-migration-config.json`;
@@ -875,6 +887,29 @@ marker and reply ledger carry over, and it drains on the first poll.
    - `docker rename <that Id> <router.container>-pre-registry`, so that
      step 10 can start the new router under `router.container`. The rename
      fails if that name is taken, and then R2 stops here (back-out B).
+
+   Then `python3 amap-sandy.py router-migrate baseline --preview <step 4's
+   file> --apply`. It is read-only and takes the drain lock. For each
+   instance to be adopted it records, in `<run_dir>/router-migrate-baseline-
+   <at>.json`, the sha256 of its legacy `first-seen.json` and the private
+   results that already record a first sight's rejection
+   (`quarantined_pre_approval`). Step 11 compares against this file.
+   It STOPs unless the state directory and each instance's directory are
+   still the ones step 4 recorded, so it runs only here, before any move.
+   R2 does not migrate approval-only state: an instance to be adopted whose
+   legacy state has no `first-seen.json` STOPs the baseline, before
+   anything has moved. Take back-out B, and then, by the layout the
+   baseline names:
+   - under the instance's name, with an `approval.json` that carries a
+     valid `approved_ts`: let the old router poll that instance once (an
+     ordinary drain; its first sight writes `first-seen.json` from the
+     approval), and run R2 again from step 1;
+   - under the instance's name, with no valid `approved_ts`: R2 cannot
+     adopt it; it is the maintainers' call (fence-legacy);
+   - under its logical id: R2 does not support it, and it is the
+     maintainers' call. Start nothing for it: a name-keyed old router never
+     reads the logical-id directory, so a poll would take a fresh first
+     sight beside it.
 6. **The live config.** `python3 amap-sandy.py install --apply`. Then
    `sha256sum <the live config>` must equal the sha256 step 2 printed.
    Every later step refuses a config whose sha256 is not the plan's.
@@ -908,8 +943,10 @@ marker and reply ledger carry over, and it drains on the first poll.
      anchors that remain at this dry run. The check takes N only from this
      dry run's own refusal text, and records it.
 9. **Adopt.** `python3 amap-sandy.py router-migrate adopt --config <the live
-   config> --check <step 8's file> --reason "<text>" --apply`. From here R2
-   only goes forward (back-out D).
+   config> --check <step 8's file> --reason "<text>" --apply`. Once its
+   first adopt has written its files, R2 only goes forward (back-out D); a
+   STOP before that, at the fresh plan or the state check, still has C then
+   B.
    - Before each adopt it takes a fresh read-only plan, which must name the
      checked root, and it checks each instance's state is the recorded one.
    - After the adopts, four records of each root must be one (path,
@@ -924,11 +961,43 @@ marker and reply ledger carry over, and it drains on the first poll.
     at once, with no other step between them, `docker/run.sh --config <the
     live config> --image <router.image.digest> --name <router.container>
     --detach`, from the hop checkout.
-11. **Accept.** Wait for a poll at least 3 s after the start. Then
-    `python3 amap-sandy.py router-fingerprint --step 0 --apply` and its
-    `--match` must print `MEASURED` (`measured`): the pinned router, on its
-    registry configuration, with every instance's state in the generation
-    layout under the registry. `python3 amap-sandy.py verify` must pass.
+11. **Accept.** Wait for a poll at least 3 s after the start. Then:
+    - `python3 amap-sandy.py router-fingerprint --step 0 --label r2 --apply`
+      and its `--match` must print `MEASURED` (`measured`): the pinned
+      router, on its registry configuration, with every instance's state in
+      the generation layout under the registry;
+    - `python3 amap-sandy.py router-migrate accept --config <the live
+      config> --check <step 8's file> --baseline <step 5's baseline file>
+      --apply` must exit 0 and print `router-migrate accept: ACCEPT: <its
+      record>`. It is read-only. It re-reads the registry, which must still
+      resolve every instance R2 moved or adopted, and for each adopted
+      instance it checks, under `state_dir/<logical_id>/`:
+      - the generation the adopt made (`migration.json`'s `gen`) is still
+        `generations.json`'s current and last one. A fresh first sight,
+        which quarantines waiting requests, needs a new generation;
+      - `gen-<current>/first-seen.json` has the sha256 the baseline
+        recorded for the legacy marker: the adopt moved it, byte for byte;
+      - `gen-<current>/results/` holds no private result recording a first
+        sight's rejection (`quarantined_pre_approval`) beyond those the
+        baseline recorded, which the adopt carried over. The private result
+        is the record: `gen-<current>/quarantine/` is written best-effort,
+        and the agent may delete a result in its outbox once read, so
+        neither proves an absence. The accept record lists the quarantine
+        directory's entries as corroboration only;
+    - as corroboration only (logs are not durable), `docker logs
+      <router.container> 2>&1 | grep -F "': FIRST SIGHT"` prints nothing;
+    - for each migrated instance, `docker/run.sh --config <the live config>
+      --image <router.image.digest> --name amap-router-migrate -- shell
+      python3 -m router --config <the live config> quarantine list <name> >
+      <run_dir>/r2-ingress-<name>.txt`, from the hop checkout, as
+      corroboration only: it must exit 0 with nothing on stderr (the read
+      worked), and its listing is kept, not judged. It reads the INGRESS
+      quarantine (inbound cross-host items a first poll may legitimately
+      quarantine), plus the host's own intakes whatever the name, so an
+      entry there is not an R2 failure, and it says nothing about the
+      waiting outbox requests. It is read-only and takes no lock, so the
+      listing is a snapshot, not a barrier;
+    - `python3 amap-sandy.py verify` must pass.
 12. **Only then**, `docker rm <the old container's Id>`, by the Id step 5's
     file records.
 
@@ -954,7 +1023,8 @@ old container is never started except through back-out C, then B.
      holds a migration.json or a generations.json: an adopt has begun, and
      back-out D applies.
   2. Then back-out B.
-- D. Once step 9 has begun: forward only. The adopted state is in the
+- D. Once any migrated directory holds a `migration.json` or a
+  `generations.json` (an adopt has begun): forward only. The adopted state is in the
   generation layout under the registry, which the old router never reads.
   Starting the old container now would take a fresh first sight and
   quarantine every waiting request, and leave state under both the name

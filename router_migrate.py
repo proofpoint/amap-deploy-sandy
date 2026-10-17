@@ -33,6 +33,7 @@ refused (STOP), and 2 when it could not run.
 
 import contextlib
 import ctypes
+import datetime
 import errno
 import ctypes.util
 import fcntl
@@ -184,6 +185,42 @@ def read_map(checkout: str, image: str, config: str, runner: Runner) -> Dict[str
 
 def bindings(the_map: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     return {n: {k: e[k] for k in BINDING} for n, e in the_map["instances"].items()}
+
+
+def holds(names: List[str], now: Dict[str, Any]) -> Dict[str, str]:
+    """Each of `names` the registry does not resolve, and why: its `held`
+    reason, or "not in the map" for a name the registry does not know."""
+    out = {}
+    for name in sorted(names):
+        e = now["instances"].get(name)
+        if e is None:
+            out[name] = "not in the map"
+        elif e["held"] is not None:
+            out[name] = e["held"]
+    return out
+
+
+def resolved(names: List[str], now: Dict[str, Any]) -> None:
+    """The REGISTRY stage only: every R2 participant is resolved by the
+    registry, with no hold. It is necessary, not sufficient: the router's
+    generation stage can still hold an instance at its poll, which step
+    11's acceptance checks."""
+    held = holds(names, now)
+    if held:
+        name = min(held)
+        raise Stop(f"the registry does not resolve {name!r} ({held[name]}): do not start the router (back-out "
+                   "D)")
+
+
+def participants(check: Dict[str, Any]) -> List[str]:
+    """Every instance R2 moved or adopts, as the check recorded them: a
+    rename-only instance is one, though it needs no adopt. They are the
+    plan's whole binding set, and include every instance to adopt."""
+    names = check.get("participants")
+    if (not isinstance(names, list) or not all(isinstance(n, str) for n in names)
+            or set(names) != set(check.get("binding", {})) or not set(check["instances"]) <= set(names)):
+        raise Stop("the check record does not name the plan's participants: run the check step again")
+    return names
 
 
 def compare_bindings(plan: Dict[str, Any], now: Dict[str, Any]) -> None:
@@ -718,7 +755,8 @@ def do_check(checkout: str, image: str, config: str, preview_path: str, reason: 
         plans[name] = {"logical_id": p["logical_id"], "n": n, "root": plan["root"], "ident": p["ident"]}
     out = _record(run_dir, "check")
     _write_new(out, {"schema": SCHEMA, "step": "check", "context": preview["context"],
-                     "binding": preview["binding"], "instances": plans})
+                     "binding": preview["binding"], "instances": plans,
+                     "participants": sorted(preview["instances"])})
     return out
 
 
@@ -729,6 +767,7 @@ def do_adopt(checkout: str, image: str, config: str, check_path: str, reason: st
     checked ones. The router itself re-verifies the root and binding it is
     given; a failure leaves its journal, and re-running this step resumes."""
     check = _read_doc(check_path, "check")
+    names = participants(check)
     cfg = _config(config)
     bind_context(check["context"], cfg, checkout, image)
     compare_bindings(check["binding"], read_map(checkout, image, config, runner))
@@ -761,6 +800,11 @@ def do_adopt(checkout: str, image: str, config: str, check_path: str, reason: st
             _write_new(out, {"schema": SCHEMA, "step": "adopt", "done": done, "failed": None,
                              "root_mismatch": name})
             raise
+    now = read_map(checkout, image, config, runner)
+    held = holds(names, now)
+    if held:
+        _write_new(out, {"schema": SCHEMA, "step": "adopt", "done": done, "failed": None, "held": held})
+        resolved(names, now)
     _write_new(out, {"schema": SCHEMA, "step": "adopt", "done": done, "failed": None})
     return out
 
@@ -772,7 +816,9 @@ def do_verify(checkout: str, image: str, config: str, check_path: str, run_dir: 
     check = _read_doc(check_path, "check")
     cfg = _config(config)
     bind_context(check["context"], cfg, checkout, image)
-    compare_bindings(check["binding"], read_map(checkout, image, config, runner))
+    now = read_map(checkout, image, config, runner)
+    compare_bindings(check["binding"], now)
+    resolved(participants(check), now)
     state_dir = Path(cfg["state_dir"])
     for name, rec in sorted(check["instances"].items()):
         _at(state_dir, rec["logical_id"], rec["ident"])
@@ -782,10 +828,249 @@ def do_verify(checkout: str, image: str, config: str, check_path: str, run_dir: 
     return out
 
 
-def _read_json(path: Path) -> Any:
+# --- The acceptance (step 11) ----------------------------------------------------------------
+#
+# A fresh first sight quarantines an instance's waiting requests, and at the
+# pin it needs a new generation: within one, the marker persists and first
+# sight is never retaken. So acceptance is the adopted generation still
+# current, its marker the legacy marker's bytes, and no private result of a
+# first-sight rejection that the baseline did not already hold (adopt carries
+# old results into the generation). The private result is the record:
+# quarantine/ is best-effort, and outbox results may be deleted once read.
+
+#: outbound.REASON_QUARANTINED at the pin: a first sight's rejection.
+QUARANTINED = "quarantined_pre_approval"
+MARKER = "first-seen.json"
+#: A private result or a marker is small; anything larger is not one.
+RECORD_MAX = 1 << 20
+#: The pin's own records (generations.json, migration.json) are read by the
+#: pin with no cap, and the adopt journal lists every legacy local anchor,
+#: one line each: this bound is far above what a real journal reaches
+#: (about a million anchors), so it only stops a runaway file.
+ROUTER_RECORD_MAX = 64 << 20
+
+
+def _regular_bytes(p: Path, cap: int = RECORD_MAX) -> Optional[bytes]:
+    """A regular file's bytes, opened without following a link; None when
+    no entry is there. Anything else, or anything unreadable, STOPs."""
     try:
-        return json.loads(path.read_bytes()) if _file_state(path) else None
-    except (OSError, ValueError) as e:
+        fd = os.open(p, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0))
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        raise Stop(f"{p} cannot be read: {e.strerror}") from None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise Stop(f"{p} is not a regular file")
+        if st.st_size > cap:
+            raise Stop(f"{p} is larger than a record")
+        chunks, total = [], 0
+        while True:     # a short read is not the end: read the same fd to EOF, within the bound
+            chunk = os.read(fd, cap + 1 - total)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > cap:
+                raise Stop(f"{p} is larger than a record")
+    except OSError as e:
+        raise Stop(f"{p} cannot be read: {e.strerror}") from None
+    finally:
+        os.close(fd)
+    return b"".join(chunks)
+
+
+def _no_duplicates(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
+    keys = [k for k, _ in pairs]
+    if len(set(keys)) != len(keys):
+        raise ValueError("a duplicate key")
+    return dict(pairs)
+
+
+def quarantined(results: Path) -> List[str]:
+    """The req_ids of the private results under `results` that record a
+    first sight's rejection. An absent directory has none. Every
+    `<req_id>.json` must be a private result as the pin's _finish writes it
+    (`{"digest", "result": {"req_id", "outcome", "reason_code", "ts"}}`;
+    digest is null for a request the router could not read, and other
+    members are tolerated),
+    with its req_id the file's own name and its reason_code a non-empty
+    string; anything else STOPs, and never counts as clean. An entry not
+    ending in `.json` is not a result: the pin's atomic writes stage under
+    other names and rename into `<req_id>.json`."""
+    st = _lstat(results)
+    if st is None:
+        return []
+    if not stat.S_ISDIR(st.st_mode):
+        raise Stop(f"{results} is not a directory")
+    out = []
+    for entry in sorted(os.listdir(results)):
+        if not entry.endswith(".json"):
+            continue
+        req_id = entry[:-len(".json")]
+        try:
+            doc = json.loads(_regular_bytes(results / entry) or b"", object_pairs_hook=_no_duplicates)
+        except ValueError:
+            raise Stop(f"{results / entry} is not a private result for {req_id!r}: not one JSON object") from None
+        result = doc.get("result") if isinstance(doc, dict) else None
+        if (not isinstance(doc, dict) or "digest" not in doc
+                or not (doc["digest"] is None or isinstance(doc["digest"], str))
+                or not isinstance(result, dict)
+                or result.get("req_id") != req_id or not isinstance(result.get("outcome"), str)
+                or not isinstance(result.get("reason_code"), str) or not result["reason_code"]):
+            raise Stop(f"{results / entry} is not a private result for {req_id!r}")
+        if result["reason_code"] == QUARANTINED:
+            out.append(req_id)
+    return sorted(out)
+
+
+#: The pin's parse_utc_ts format for an approval's approved_ts (util.py at 99329945).
+UTC_TS_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+
+
+def _utc_ts(v: str) -> bool:
+    """The pin's parse_utc_ts: strptime with its one format, nothing looser."""
+    try:
+        datetime.datetime.strptime(v, UTC_TS_FORMAT)
+    except ValueError:
+        return False
+    return True
+
+
+def approval_dated(d: Path) -> bool:
+    """The pin's own test for an approval.json first sight can adopt
+    (generations.legacy_marker): an object with a UTC approved_ts, a string
+    declared_root and a list outbox_snapshot, read as the pin's strict_json
+    reads it (strict UTF-8, no duplicate keys). Anything unreadable is not."""
+    try:
+        text = (_regular_bytes(d / "approval.json") or b"").decode("utf-8")
+        doc = json.loads(text, object_pairs_hook=_no_duplicates)
+    except (Stop, ValueError):     # UnicodeDecodeError is a ValueError
+        return False
+    return (isinstance(doc, dict) and isinstance(doc.get("approved_ts"), str)
+            and _utc_ts(doc["approved_ts"]) and isinstance(doc.get("declared_root"), str)
+            and isinstance(doc.get("outbox_snapshot"), list))
+
+
+def no_marker(name: str, d: Path, source: str) -> str:
+    """Why an instance with no legacy first-seen.json stops the baseline,
+    and the one remedy that is safe for its layout. R2 migrates no
+    approval-only state. A name-keyed old router reads only <name>/, so it
+    may prepare a BY_NAME instance with a dated approval by one ordinary
+    poll, and nothing else."""
+    head = (f"{name!r}'s legacy state at {d} has no {MARKER}: R2 does not migrate approval-only state, and "
+            "nothing has moved")
+    if source != BY_NAME:
+        return (f"{head}. It is under its logical id, which a name-keyed old router never reads, so it is "
+                "unsupported by R2: the maintainers' call. Take back-out B and start nothing for it")
+    if approval_dated(d):
+        return (f"{head}. Take back-out B, let the old router poll the instance once (its first sight writes "
+                f"{MARKER} from approval.json), then run R2 again from step 1")
+    return (f"{head}, and its approval.json carries no valid approved_ts: not adoptable by R2, the maintainers' "
+            "call (fence-legacy). Take back-out B")
+
+
+def do_baseline(preview_path: str, run_dir: Path) -> Path:
+    """Step 5, after the stop and before any move: each adopted instance's
+    legacy first-sight marker (its sha256) and the first-sight rejections
+    its private results already hold, read-only, under the drain lock."""
+    preview = _read_doc(preview_path, "preview")
+    state_dir = Path(preview["context"]["state_dir"])
+    st = _lstat(state_dir)
+    if st is None or not stat.S_ISDIR(st.st_mode) or _ident(st) != preview["context"]["state_ident"]:
+        raise Stop(f"{state_dir} is not the state directory the preview recorded")
+    instances = {}
+    with drain_lock(state_dir):
+        cover(state_dir, preview["instances"], moved=False)
+        for name, p in sorted(preview["instances"].items()):
+            if not p["adopt"]:
+                continue
+            d = state_dir / (name if p["source"] == BY_NAME else p["logical_id"])
+            src = _lstat(d)
+            if src is None or not stat.S_ISDIR(src.st_mode) or _ident(src) != p["ident"]:
+                raise Stop(f"{d} is not the directory the preview recorded: the baseline runs at step 5, before "
+                           "any move")
+            marker = _regular_bytes(d / MARKER)
+            if marker is None:
+                raise Stop(no_marker(name, d, p["source"]))
+            instances[name] = {"logical_id": p["logical_id"],
+                               "marker_sha256": hashlib.sha256(marker).hexdigest(),
+                               "quarantined": quarantined(d / "results")}
+    out = _record(run_dir, "baseline")
+    _write_new(out, {"schema": SCHEMA, "step": "baseline", "context": preview["context"], "instances": instances})
+    return out
+
+
+def accept_instance(state_dir: Path, name: str, lid: str, ident: List[int], base: Dict[str, Any]) -> Dict[str, Any]:
+    """One adopted instance after the acceptance poll: the adopted
+    generation is still the current and last one, its marker is the legacy
+    marker's bytes, and its private results hold no first-sight rejection
+    the baseline did not. Its directory is still the one the check recorded,
+    and its current generation is a directory, not a link."""
+    d = state_dir / lid
+    _at(state_dir, lid, ident)
+    gens, mig = _read_json(d / GEN_FILE), _read_json(d / MIGRATION_FILE)
+    if not isinstance(gens, dict) or not isinstance(gens.get("gens"), list) or not isinstance(mig, dict):
+        raise Stop(f"{name!r} has no readable {GEN_FILE} and {MIGRATION_FILE} under {d}")
+    cur = gens.get("current")
+    order = [g.get("gen") if isinstance(g, dict) else None for g in gens["gens"]]
+    if not isinstance(cur, str) or LOGICAL_ID.fullmatch(cur) is None or mig.get("gen") != cur or order[-1:] != [cur]:
+        raise Stop(f"{name!r}'s current generation is {cur!r}, not the adopted {mig.get('gen')!r} as the last one: "
+                   "a new generation took a fresh first sight")
+    gen = d / f"gen-{cur}"
+    gst = _lstat(gen)
+    if gst is None or not stat.S_ISDIR(gst.st_mode):
+        raise Stop(f"{gen} is not a directory: the pinned router holds a linked or missing current generation")
+    marker = _regular_bytes(gen / MARKER)
+    want = base.get("marker_sha256")
+    if want is None:
+        raise Stop(f"{name!r}'s legacy state had no first-sight marker at the baseline")
+    if marker is None or hashlib.sha256(marker).hexdigest() != want:
+        raise Stop(f"{name!r}'s first-sight marker in {gen} is not the legacy marker's bytes")
+    new = sorted(set(quarantined(gen / "results")) - set(base.get("quarantined", [])))
+    if new:
+        raise Stop(f"{name!r} has first-sight rejections the baseline did not: {', '.join(new)}")
+    q = gen / "quarantine"
+    try:
+        corroboration = sorted(os.listdir(q)) if _lstat(q) is not None and stat.S_ISDIR(os.lstat(q).st_mode) else []
+    except OSError as e:
+        corroboration = [f"unreadable: {e.strerror}"]     # corroboration only: it never decides
+    return {"generation": cur, "marker_sha256": want, "carried": base.get("quarantined", []),
+            "quarantine_entries": corroboration}
+
+
+def do_accept(checkout: str, image: str, config: str, check_path: str, baseline_path: str, run_dir: Path,
+              runner: Runner) -> Path:
+    """Step 11, read-only, after the acceptance poll: the registry still
+    resolves every participant, and each adopted instance passes
+    accept_instance against step 5's baseline."""
+    check, base = _read_doc(check_path, "check"), _read_doc(baseline_path, "baseline")
+    cfg = _config(config)
+    bind_context(check["context"], cfg, checkout, image)
+    for key in ("state_dir", "state_ident"):
+        if base["context"][key] != check["context"][key]:
+            raise Stop(f"the baseline's {key} is not the check's")
+    resolved(participants(check), read_map(checkout, image, config, runner))
+    state_dir = Path(cfg["state_dir"])
+    facts = {}
+    for name, rec in sorted(check["instances"].items()):
+        b = base["instances"].get(name)
+        if not isinstance(b, dict) or b.get("logical_id") != rec["logical_id"]:
+            raise Stop(f"the baseline has no record of {name!r} under {rec['logical_id']}")
+        facts[name] = accept_instance(state_dir, name, rec["logical_id"], rec["ident"], b)
+    out = _record(run_dir, "accept")
+    _write_new(out, {"schema": SCHEMA, "step": "accept", "accepted": facts})
+    return out
+
+
+def _read_json(path: Path) -> Any:
+    """A record of the pin's own, regular and within ROUTER_RECORD_MAX, or None when absent."""
+    if not _file_state(path):
+        return None
+    try:
+        return json.loads(_regular_bytes(path, ROUTER_RECORD_MAX) or b"")
+    except ValueError as e:
         raise Stop(f"{path} cannot be read: {e}") from None
 
 
@@ -884,7 +1169,7 @@ def _run(args: Any, out: Callable[[str], None], runner: Runner) -> int:
         args.config = os.path.abspath(args.config)
     need = {"map": ("config",), "preview": ("config", "reason"), "move": ("config",),
             "check": ("config", "preview", "reason"), "adopt": ("config", "check", "reason"),
-            "verify": ("config", "check")}[step]
+            "verify": ("config", "check"), "baseline": ("preview",), "accept": ("config", "check", "baseline")}[step]
     missing = [k for k in need if getattr(args, k, None) is None]
     if step == "move" and (args.preview is None) == (args.reverse is None):
         missing.append("preview or --reverse, exactly one")
@@ -906,6 +1191,12 @@ def _run(args: Any, out: Callable[[str], None], runner: Runner) -> int:
         path = do_check(checkout, image, args.config, args.preview, args.reason, run_dir, runner)
     elif step == "adopt":
         path = do_adopt(checkout, image, args.config, args.check, args.reason, run_dir, runner)
+    elif step == "baseline":
+        path = do_baseline(args.preview, run_dir)
+    elif step == "accept":
+        path = do_accept(checkout, image, args.config, args.check, args.baseline, run_dir, runner)
+        out(f"router-migrate accept: ACCEPT: {path}")
+        return 0
     else:
         path = do_verify(checkout, image, args.config, args.check, run_dir, runner)
     out(f"router-migrate {step}: done: {path}")

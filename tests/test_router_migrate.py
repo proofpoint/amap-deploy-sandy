@@ -9,9 +9,11 @@ Q5 and Q6. The renames, the journal and the drain lock run on real files in
 a scratch directory.
 """
 
+import errno
 import fcntl
 import hashlib
 import json
+import re
 import os
 import shutil
 import subprocess
@@ -53,6 +55,37 @@ def plan(name, lid, *, local=1, root=("/inst/alice", 41, 9), **legacy):
             "paths": [], "converted": {}, "legacy": facts}
 
 
+#: The pinned registry's own state entries (registry.py:359, _OWN_STATE_ENTRIES at 99329945).
+OWN_STATE_ENTRIES = frozenset({"registry", "status.json", "aliases"})
+
+
+def _present(p):
+    """registry._present at the pin: lstat sees something, any shape; an
+    error other than "no such entry" counts as present."""
+    try:
+        os.lstat(p)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def registry_hold(state, name, e):
+    """The pinned registry.report_for's hold for a known name (registry.py:
+    376-384 and 455-473 at 99329945): a skeleton collision, injected by the
+    map, holds whatever the state is; otherwise registry._state_hold over
+    the real state directory. generations.json is never consulted: the
+    registry stage clears at the move, not at the adopt."""
+    if e.get("held") == "skeleton_collision":
+        return "skeleton_collision"
+    if re.fullmatch(r"[0-9a-fA-F]{32}", name) or name.casefold() in OWN_STATE_ENTRIES:
+        return "name_shape"
+    if not _present(state / name):
+        return None
+    return "state_conflict" if _present(state / e["logical_id"]) else "state_not_migrated"
+
+
 class FakeRouter:
     """Answers each run.sh call as the pinned router's code would."""
 
@@ -77,6 +110,14 @@ class FakeRouter:
             return self.done(0, json.dumps(root))
         if inner[:4] == ["python3", "-I", "-S", "-"]:
             m = self.maps.pop(0) if len(self.maps) > 1 else (self.maps[0] if self.maps else the_map())
+            m = json.loads(json.dumps(m))
+            try:
+                state = Path(json.loads(Path(inner[4]).read_text())["state_dir"])
+            except (OSError, ValueError, KeyError):
+                state = None
+            if state is not None:
+                for n, e in m["instances"].items():
+                    e["held"] = registry_hold(state, n, e)
             return self.done(0, json.dumps(m))
         name = inner[inner.index("adopt") + 1]
         given = next((int(a.split("=", 1)[1]) for a in inner if a.startswith("--no-transport-history=")), None)
@@ -117,8 +158,14 @@ class FakeRouter:
 def write_adopted(d, root, journal_root=None):
     """What the pinned router's adopt leaves: migration.json (its journal,
     phase done, source.root) and generations.json (the current entry's root)."""
-    (d / "migration.json").write_text(json.dumps({"phase": "done", "source": {"binding": {},
-                                                                              "root": journal_root or root}}))
+    (d / "migration.json").write_text(json.dumps({"phase": "done", "gen": "f" * 32,
+                                                  "source": {"binding": {}, "root": journal_root or root}}))
+    # As the pin's adopt does: the legacy marker and results move into the generation it mints.
+    gen = d / ("gen-" + "f" * 32)
+    gen.mkdir(exist_ok=True)
+    for entry in ("first-seen.json", "results"):
+        if (d / entry).exists() and not (gen / entry).exists():
+            os.rename(d / entry, gen / entry)
     (d / "generations.json").write_text(json.dumps(
         {"schema": 1, "gens": [{"gen": "f" * 32, "binding": {}, "root": root}], "current": "f" * 32}))
 
@@ -331,6 +378,16 @@ class LayoutRows(Base):
         with self.assertRaises(rm.Stop) as cm:
             rm.classify(self.state, the_map())
         self.assertIn("resume it with the adopt step", str(cm.exception))
+
+    def test_a_sync_always_fsyncs(self):
+        """Opus's note 6: every sync is an fsync of that descriptor, before
+        any F_FULLFSYNC."""
+        fd = os.open(self.base, os.O_RDONLY)
+        self.addCleanup(os.close, fd)
+        seen = []
+        with mock.patch.object(rm.os, "fsync", lambda f: seen.append(f)):
+            rm._sync(fd)
+        self.assertEqual(seen, [fd])
 
     def test_a_refused_full_fsync_falls_back_to_fsync(self):
         """Opus's N3: a filesystem that refuses F_FULLFSYNC keeps the fsync."""
@@ -689,7 +746,7 @@ class BindingRows(Base):
             got = e
         self.assertIsInstance(got, rm.Stop)
         records = [json.loads(p.read_text()) for p in sorted(self.run_dir.glob("router-migrate-adopt-*.json"))]
-        self.assertEqual([(r["root_mismatch"], r["failed"]) for r in records], [("alice", None)])
+        self.assertEqual([(r.get("root_mismatch"), r.get("failed")) for r in records], [("alice", None)])
 
     def test_verify_before_the_start(self):
         self.move(self.pre)
@@ -722,6 +779,52 @@ class BindingRows(Base):
         with self.assertRaises(rm.Stop) as cm:
             rm.do_verify(CHECKOUT, IMAGE, str(self.config), str(check), self.run_dir, FakeRouter())
         self.assertIn("is not the instance state the plan recorded", str(cm.exception))
+
+    def adopt(self, check, **fake):
+        return rm.do_adopt(CHECKOUT, IMAGE, str(self.config), str(check), REASON, self.run_dir,
+                           FakeRouter(plans={"alice": plan("alice", LID_A)}, **fake))
+
+    def verify(self, check, **fake):
+        return rm.do_verify(CHECKOUT, IMAGE, str(self.config), str(check), self.run_dir, FakeRouter(**fake))
+
+    def test_a_skeleton_collision_stays_held_after_the_adopt_and_is_recorded(self):
+        """RL and Codex at ce087971: a skeleton collision holds the name whether or
+        not the adopt wrote generations.json. The adopt STOPs after its loop
+        and records what it did and what is held; verify STOPs too."""
+        self.move(self.pre)
+        check = self.check(self.pre)
+        collided = the_map()
+        collided["instances"]["alice"]["held"] = "skeleton_collision"
+        with self.assertRaises(rm.Stop) as cm:
+            self.adopt(check, maps=[collided])
+        self.assertIn("does not resolve 'alice' (skeleton_collision)", str(cm.exception))
+        self.assertTrue((self.state / LID_A / "generations.json").is_file())
+        records = [json.loads(p.read_text()) for p in sorted(self.run_dir.glob("router-migrate-adopt-*.json"))]
+        self.assertEqual([(sorted(r["done"]), r["failed"], r.get("held")) for r in records],
+                         [(["alice"], None, {"alice": "skeleton_collision"})])
+        with self.assertRaises(rm.Stop) as cm:
+            self.verify(check, maps=[collided])
+        self.assertIn("skeleton_collision", str(cm.exception))
+
+    def test_the_old_name_recreated_after_the_adopt_stops_verify(self):
+        """RL's row: the old container started by mistake after the move
+        recreates state_dir/<name>; the pinned registry then holds
+        state_conflict, generations.json or not, and verify STOPs."""
+        self.move(self.pre)
+        check = self.check(self.pre)
+        self.adopt(check)
+        self.verify(check)
+        (self.state / "alice").mkdir()
+        with self.assertRaises(rm.Stop) as cm:
+            self.verify(check)
+        self.assertIn("does not resolve 'alice' (state_conflict)", str(cm.exception))
+
+    def test_a_completed_migration_is_resolved_and_records_no_hold(self):
+        self.move(self.pre)
+        check = self.check(self.pre)
+        out = self.adopt(check)
+        self.assertNotIn("held", json.loads(out.read_text()))
+        self.verify(check)
 
     def test_the_root_program_reads_as_the_router_does(self):
         self.assertIn("O_NOFOLLOW", rm.ROOT_PROGRAM)
@@ -791,6 +894,697 @@ class BindingRows(Base):
         out = rm.do_adopt(CHECKOUT, IMAGE, str(self.config), str(check), REASON, self.run_dir, fake)
         self.assertEqual(json.loads(out.read_text())["done"]["alice"]["noop"], True)
         self.assertFalse(any("adopt" in c[0] and "--dry-run" not in c[0] for c in fake.calls))
+
+
+class ResolvedRows(unittest.TestCase):
+    """resolved() over several names (Opus note 4): every hold counts, not
+    only the state ones, and every name is checked, not only the first."""
+
+    def now(self, **held):
+        m = {"instances": {"alice": dict(entry(LID_A), held=None), "bob": dict(entry(LID_B), held=None)}}
+        for n, why in held.items():
+            m["instances"][n]["held"] = why
+        return m
+
+    def test_a_hold_on_the_second_name_of_any_reason_stops(self):
+        for why in ("skeleton_collision", "state_conflict", "name_shape", "state_not_migrated"):
+            with self.subTest(held=why):
+                try:
+                    rm.resolved(["alice", "bob"], self.now(bob=why))
+                except rm.Stop as e:
+                    self.assertIn(f"does not resolve 'bob' ({why})", str(e))
+                except Exception as e:     # noqa: BLE001 — anything but a Stop is the failure
+                    self.fail(f"resolved() raised {type(e).__name__}, not Stop: {e}")
+                else:
+                    self.fail(f"a {why} hold on the second name passed")
+
+    def test_every_hold_is_named_and_none_passes(self):
+        self.assertEqual(rm.holds(["alice", "bob"], self.now(alice="name_shape", bob="skeleton_collision")),
+                         {"alice": "name_shape", "bob": "skeleton_collision"})
+        self.assertIsNone(rm.resolved(["alice", "bob"], self.now()))
+
+
+class CliParseRows(unittest.TestCase):
+    """The runbook's own command lines parse (Opus note 5): `--label r2`
+    reaches router-fingerprint's arguments."""
+
+    def test_router_fingerprint_takes_a_label(self):
+        import amap_sandy
+        argv = ["router-fingerprint", "--step", "2", "--label", "r2", "--apply"]
+        try:
+            args = amap_sandy.build_parser().parse_args(argv)
+        except SystemExit as e:
+            self.fail(f"the CLI refused the runbook's own line (exit {e.code}): {argv}")
+        self.assertEqual((args.step, args.label, args.apply), (2, "r2", True))
+
+
+def result(req_id, reason="delivered", digest="0" * 64):
+    """A private result as the pin's _finish and _write_anchor write it
+    (outbound.py:2179-2222 at 99329945): digest null for a request the
+    router could not read."""
+    return json.dumps({"digest": digest, "result": {
+        "contract_version": "2", "req_id": req_id, "outcome": "rejected" if reason != "delivered" else "ok",
+        "detail": None, "reason_code": reason, "ts": "2026-10-17T00:00:00Z", "message_id": None, "job_id": None}})
+
+
+#: An approval.json the pin's legacy_marker can adopt from.
+DATED_APPROVAL = json.dumps({"approved_ts": "2026-01-02T03:04:05Z", "declared_root": "/inst/alice",
+                             "outbox_snapshot": []})
+
+
+class AcceptRows(Base):
+    """Step 11 (RL's ruling at 99329945): the adopted generation is still
+    current and last, its marker is the legacy marker's bytes, and its
+    private results hold no first-sight rejection the baseline did not."""
+
+    def setUp(self):
+        super().setUp()
+        d = self.state / "alice"
+        (d / "results").mkdir(parents=True)
+        (d / "results" / "r1.json").write_text(result("r1"))
+        (d / "results" / "old.json").write_text(result("old", rm.QUARANTINED))
+        (d / "first-seen.json").write_text('{"first_seen_ts": "2026-01-01T00:00:00Z"}')
+        self.pre, _ = self.preview()
+        self.baseline = rm.do_baseline(str(self.pre), self.run_dir)
+        self.move(self.pre)
+        self.check_path = self.check(self.pre)
+        rm.do_adopt(CHECKOUT, IMAGE, str(self.config), str(self.check_path), REASON, self.run_dir,
+                    FakeRouter(plans={"alice": plan("alice", LID_A)}))
+        self.gen = self.state / LID_A / ("gen-" + "f" * 32)
+
+    def accept(self):
+        return rm.do_accept(CHECKOUT, IMAGE, str(self.config), str(self.check_path), str(self.baseline),
+                            self.run_dir, FakeRouter())
+
+    def refused(self, why):
+        try:
+            self.accept()
+        except rm.Stop as e:
+            self.assertIn(why, str(e))
+        except Exception as e:     # noqa: BLE001 — anything but a Stop is the failure
+            self.fail(f"accept raised {type(e).__name__}, not Stop: {e}")
+        else:
+            self.fail(f"accepted, though: {why}")
+
+    def test_the_baseline_records_the_marker_and_the_old_rejection(self):
+        doc = json.loads(self.baseline.read_text())["instances"]["alice"]
+        self.assertEqual(doc["quarantined"], ["old"])
+        self.assertEqual(doc["marker_sha256"],
+                         hashlib.sha256(b'{"first_seen_ts": "2026-01-01T00:00:00Z"}').hexdigest())
+
+    def test_a_clean_migration_with_a_carried_rejection_is_accepted(self):
+        try:
+            out = self.accept()
+        except rm.Stop as e:
+            self.fail(f"a clean migration was refused: {e}")
+        self.assertEqual(json.loads(out.read_text())["accepted"]["alice"]["carried"], ["old"])
+
+    def test_a_fresh_first_sight_generation_is_refused(self):
+        g = json.loads((self.state / LID_A / "generations.json").read_text())
+        g["gens"].append({"gen": "e" * 32, "binding": {}, "root": g["gens"][0]["root"]})
+        g["current"] = "e" * 32
+        (self.state / LID_A / "generations.json").write_text(json.dumps(g))
+        self.refused("a new generation took a fresh first sight")
+
+    def test_a_generation_appended_after_the_current_is_refused(self):
+        g = json.loads((self.state / LID_A / "generations.json").read_text())
+        g["gens"].append({"gen": "e" * 32, "binding": {}, "root": g["gens"][0]["root"]})
+        (self.state / LID_A / "generations.json").write_text(json.dumps(g))
+        self.refused("a new generation took a fresh first sight")
+
+    def test_a_changed_marker_is_refused(self):
+        (self.gen / "first-seen.json").write_text('{"first_seen_ts": "2026-10-17T00:00:00Z"}')
+        self.refused("is not the legacy marker's bytes")
+
+    def test_a_missing_marker_is_refused(self):
+        os.remove(self.gen / "first-seen.json")
+        self.refused("is not the legacy marker's bytes")
+
+    def test_a_new_first_sight_rejection_is_refused(self):
+        (self.gen / "results" / "new.json").write_text(result("new", rm.QUARANTINED))
+        self.refused("first-sight rejections the baseline did not: new")
+
+    def test_an_unreadable_result_is_refused_not_clean(self):
+        (self.gen / "results" / "bad.json").mkdir()
+        self.refused("is not a regular file")
+
+    def test_a_baseline_without_a_marker_is_refused(self):
+        doc = json.loads(self.baseline.read_text())
+        doc["instances"]["alice"]["marker_sha256"] = None
+        self.baseline.chmod(0o600)
+        self.baseline.write_text(json.dumps(doc))
+        self.refused("had no first-sight marker")
+
+    def test_a_baseline_of_another_state_directory_is_refused(self):
+        doc = json.loads(self.baseline.read_text())
+        doc["context"]["state_ident"] = [0, 0]
+        self.baseline.chmod(0o600)
+        self.baseline.write_text(json.dumps(doc))
+        self.refused("the baseline's state_ident is not the check's")
+
+    def test_a_changed_suffix_behind_short_reads_is_refused(self):
+        """Codex at a87d3a7e: under reads of three bytes at a time, a marker that
+        shares the legacy marker's prefix and differs after it is refused:
+        the whole file is hashed, never its first chunk."""
+        legacy = (self.gen / "first-seen.json").read_bytes()
+        (self.gen / "first-seen.json").write_bytes(legacy[:-2] + b"X}")
+        real = os.read
+        with mock.patch.object(rm.os, "read", lambda fd, n: real(fd, min(n, 3))):
+            self.refused("is not the legacy marker's bytes")
+
+    def test_a_clean_migration_under_short_reads_is_accepted(self):
+        real = os.read
+        with mock.patch.object(rm.os, "read", lambda fd, n: real(fd, min(n, 3))):
+            try:
+                self.accept()
+            except rm.Stop as e:
+                self.fail(f"short reads made a clean migration fail: {e}")
+
+    def test_each_malformed_private_result_is_refused_never_clean(self):
+        """Codex at a87d3a7e: a result the pin's _finish would not write is not
+        evidence of no loss."""
+        cases = {
+            "empty-result": '{"digest": "0", "result": {}}',
+            "null-reason": json.dumps({"digest": "0", "result": {"req_id": "x", "outcome": "ok", "reason_code": None}}),
+            "integer-reason": json.dumps({"digest": "0", "result": {"req_id": "x", "outcome": "ok", "reason_code": 7}}),
+            "empty-reason": json.dumps({"digest": "0", "result": {"req_id": "x", "outcome": "ok", "reason_code": ""}}),
+            "another-id": json.dumps({"digest": "0", "result": {"req_id": "old", "outcome": "rejected",
+                                                                 "reason_code": rm.QUARANTINED}}),
+            "no-digest": json.dumps({"result": {"req_id": "x", "outcome": "ok", "reason_code": "delivered"}}),
+            "duplicate-key": '{"digest": "0", "result": {"req_id": "x", "outcome": "ok", "reason_code": "'
+                             + rm.QUARANTINED + '", "reason_code": "delivered"}}',
+            "not-an-object": "[]",
+        }
+        for why, text in cases.items():
+            with self.subTest(case=why):
+                (self.gen / "results" / "x.json").write_text(text)
+                self.refused("is not a private result")
+        os.remove(self.gen / "results" / "x.json")
+
+    def test_a_wrong_type_digest_is_refused(self):
+        (self.gen / "results" / "x.json").write_text(result("x", digest=7))
+        self.refused("is not a private result")
+
+    def test_null_and_string_digests_are_valid_at_the_baseline_too(self):
+        """Codex at 8302db87: the baseline reads the legacy ledger with the
+        same rule, so a null-digest result there neither stops it nor
+        counts as a rejection."""
+        legacy = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, legacy, ignore_errors=True)
+        (legacy / "s.json").write_text(result("s"))
+        (legacy / "n.json").write_text(result("n", reason="malformed_request", digest=None))
+        (legacy / "q.json").write_text(result("q", reason=rm.QUARANTINED, digest=None))
+        self.assertEqual(rm.quarantined(legacy), ["q"])
+
+    def test_an_unreadable_request_s_result_with_a_null_digest_is_valid(self):
+        """RL at 8302db87: _finish writes digest null when the request could
+        not be read (too large, or an OSError from the pinned read). Such a
+        result is legitimate and is not a first-sight rejection; extra
+        members are tolerated."""
+        (self.gen / "results" / "big.json").write_text(json.dumps(
+            {"digest": None, "transport_req_id": "t", "result": {"req_id": "big", "outcome": "rejected",
+                                                                  "reason_code": "malformed_request", "ts": "t"}}))
+        try:
+            out = self.accept()
+        except rm.Stop as e:
+            self.fail(f"a legitimate null-digest result stopped acceptance: {e}")
+        self.assertEqual(json.loads(out.read_text())["accepted"]["alice"]["carried"], ["old"])
+        self.assertEqual(rm.quarantined(self.gen / "results"), ["old"])
+
+    def test_a_name_not_ending_in_json_is_not_a_result(self):
+        """The pin's atomic writes stage under other names (RL), so such an
+        entry is not read as a result, and a clean migration still passes."""
+        (self.gen / "results" / ".x.json.tmp").write_text("partial")
+        try:
+            self.accept()
+        except rm.Stop as e:
+            self.fail(f"a staging name was read as a result: {e}")
+
+    def test_a_baseline_for_another_logical_id_is_refused(self):
+        doc = json.loads(self.baseline.read_text())
+        doc["instances"]["alice"]["logical_id"] = LID_B
+        self.baseline.chmod(0o600)
+        self.baseline.write_text(json.dumps(doc))
+        self.refused("the baseline has no record of 'alice'")
+
+    def test_a_current_generation_that_is_not_an_id_is_refused(self):
+        """Opus's Z11: the generation id is held to the pin's shape before it
+        names a path, even when the two records agree on it."""
+        d = self.state / LID_A
+        g = json.loads((d / "generations.json").read_text())
+        g["gens"][-1]["gen"] = g["current"] = "x" * 32
+        (d / "generations.json").write_text(json.dumps(g))
+        m = json.loads((d / "migration.json").read_text())
+        m["gen"] = "x" * 32
+        (d / "migration.json").write_text(json.dumps(m))
+        os.rename(self.gen, d / ("gen-" + "x" * 32))
+        self.refused("a new generation took a fresh first sight")
+
+    def test_a_linked_current_generation_is_refused(self):
+        """Opus at a87d3a7e: the pin holds a linked current generation as a
+        layout conflict; accept refuses it rather than following it."""
+        real = self.state / LID_A / "real-gen"
+        os.rename(self.gen, real)
+        os.symlink(real, self.gen)
+        self.refused("is not a directory")
+
+    def test_a_replaced_instance_directory_is_refused(self):
+        shutil.copytree(self.state / LID_A, self.base / "copy", symlinks=True)
+        shutil.rmtree(self.state / LID_A)
+        os.rename(self.base / "copy", self.state / LID_A)
+        self.refused("is not the instance state the plan recorded")
+
+    def test_an_oversized_generations_file_is_refused(self):
+        """The pin's records have their own bound, far above a real journal;
+        a file over it still STOPs (the bound lowered here for the row)."""
+        (self.state / LID_A / "generations.json").write_bytes(b" " * 4097)
+        with mock.patch.object(rm, "ROUTER_RECORD_MAX", 4096):
+            self.refused("larger than a record")
+
+    def test_a_large_adopt_journal_is_read_whole(self):
+        """Opus at 8302db87: the adopt journal lists every legacy local
+        anchor, one line each, so a real migration.json can pass RECORD_MAX
+        (about 13,300 anchors); the pin reads it uncapped, and accept and
+        verify must too."""
+        d = self.state / LID_A
+        m = json.loads((d / "migration.json").read_text())
+        m["legacy"] = {"manifest": [f"results/{n:08d}.json" for n in range(50000)]}
+        (d / "migration.json").write_text(json.dumps(m, indent=1))
+        self.assertGreater((d / "migration.json").stat().st_size, rm.RECORD_MAX)
+        try:
+            self.accept()
+        except rm.Stop as e:
+            self.fail(f"a large adopt journal stopped acceptance: {e}")
+        rm.do_verify(CHECKOUT, IMAGE, str(self.config), str(self.check_path), self.run_dir, FakeRouter())
+
+    def test_each_unreadable_result_is_refused(self):
+        """The reader's guards (Opus's Z4-Z8, Z14): a link, an oversized
+        file, malformed JSON, an unreadable file, and results that are not
+        a directory each STOP; none reads as clean."""
+        r = self.gen / "results"
+        os.symlink(r / "r1.json", r / "link.json")
+        self.refused("cannot be read")
+        os.remove(r / "link.json")
+        (r / "big.json").write_bytes(b" " * (rm.RECORD_MAX + 1))
+        self.refused("larger than a record")
+        os.remove(r / "big.json")
+        (r / "bad.json").write_text("{not json")
+        self.refused("is not a private result")
+        os.remove(r / "bad.json")
+        if os.geteuid() != 0:
+            (r / "locked.json").write_text(result("locked"))
+            os.chmod(r / "locked.json", 0)
+            self.refused("cannot be read")
+            os.remove(r / "locked.json")
+        shutil.rmtree(r)
+        r.write_text("not a directory")
+        self.refused("is not a directory")
+
+    def test_a_held_participant_after_the_poll_is_refused(self):
+        collided = the_map()
+        collided["instances"]["alice"]["held"] = "skeleton_collision"
+        with self.assertRaises(rm.Stop):
+            rm.do_accept(CHECKOUT, IMAGE, str(self.config), str(self.check_path), str(self.baseline),
+                         self.run_dir, FakeRouter(maps=[collided]))
+
+
+class BaselineRows(Base):
+    """Opus at a87d3a7e: the baseline runs at step 5, before any move, on
+    the preview's own state directory; a BY_ID instance is read where it
+    is."""
+
+    def setUp(self):
+        super().setUp()
+        d = self.state / "alice"
+        (d / "results").mkdir(parents=True)
+        (d / "results" / "r1.json").write_text(result("r1"))
+        (d / "first-seen.json").write_text('{"m": "alice"}')
+        self.pre, _ = self.preview()
+
+    def stopped(self, why):
+        try:
+            rm.do_baseline(str(self.pre), self.run_dir)
+        except rm.Stop as e:
+            self.assertIn(why, str(e))
+        except Exception as e:     # noqa: BLE001 — anything but a Stop is the failure
+            self.fail(f"baseline raised {type(e).__name__}, not Stop: {e}")
+        else:
+            self.fail(f"the baseline ran, though: {why}")
+        self.assertEqual(list(self.run_dir.glob("router-migrate-baseline-*")), [])
+
+    def test_a_baseline_after_the_move_is_refused(self):
+        self.move(self.pre)
+        self.stopped("")
+
+    def test_a_replaced_state_directory_is_refused(self):
+        os.rename(self.state, self.base / "old-state")
+        shutil.copytree(self.base / "old-state", self.state, symlinks=True)
+        self.stopped("is not the state directory the preview recorded")
+
+    def test_a_held_drain_lock_refuses_the_baseline(self):
+        """Opus's Z3: the baseline reads under the router's drain lock."""
+        fd = os.open(self.state / ".router.lock", os.O_RDWR)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if os.fork() == 0:     # a second open file description: flock is per description
+            try:
+                rm.do_baseline(str(self.pre), self.run_dir)
+                os._exit(0)
+            except rm.Stop as e:
+                os._exit(3 if "is held" in str(e) else 4)
+            except BaseException:     # noqa: BLE001
+                os._exit(5)
+        _, status = os.wait()
+        self.assertEqual(os.WEXITSTATUS(status), 3)
+        self.assertEqual(list(self.run_dir.glob("router-migrate-baseline-*")), [])
+
+    def test_a_replaced_source_directory_is_refused(self):
+        shutil.copytree(self.state / "alice", self.base / "copy")
+        shutil.rmtree(self.state / "alice")
+        os.rename(self.base / "copy", self.state / "alice")
+        self.stopped("is not the directory the preview recorded")
+
+
+class ByIdRows(Base):
+    """Opus's Z2/Z15: an instance already under its logical id is adopted
+    in place, and its baseline reads <state_dir>/<logical_id>."""
+
+    def test_a_by_id_instance_is_baselined_and_accepted_where_it_is(self):
+        d = self.state / LID_A
+        (d / "results").mkdir(parents=True)
+        (d / "results" / "r1.json").write_text(result("r1"))
+        (d / "first-seen.json").write_text('{"m": "by-id"}')
+        pre, _ = self.preview()
+        self.assertEqual(json.loads(pre.read_text())["instances"]["alice"]["source"], rm.BY_ID)
+        try:
+            base = rm.do_baseline(str(pre), self.run_dir)
+        except rm.Stop as e:
+            self.fail(f"the baseline refused a BY_ID instance read where it is: {e}")
+        self.assertEqual(json.loads(base.read_text())["instances"]["alice"]["marker_sha256"],
+                         hashlib.sha256(b'{"m": "by-id"}').hexdigest())
+        check = self.check(pre)
+        rm.do_adopt(CHECKOUT, IMAGE, str(self.config), str(check), REASON, self.run_dir,
+                    FakeRouter(plans={"alice": plan("alice", LID_A)}))
+        try:
+            rm.do_accept(CHECKOUT, IMAGE, str(self.config), str(check), str(base), self.run_dir, FakeRouter())
+        except rm.Stop as e:
+            self.fail(f"a clean BY_ID migration was refused: {e}")
+
+
+class TwoInstanceAcceptRows(Base):
+    """Opus's Z12 and Z13: accept checks every adopted instance, not only
+    the first, and gates every participant, a rename-only one too."""
+
+    def setUp(self):
+        super().setUp()
+        for name in ("alice", "bob"):
+            d = self.state / name
+            (d / "results").mkdir(parents=True)
+            (d / "results" / "r1.json").write_text(result("r1"))
+            (d / "first-seen.json").write_text(json.dumps({"m": name}))
+        self.plans = {"alice": plan("alice", LID_A), "bob": plan("bob", LID_B)}
+        self.pre, _ = self.preview(plans=self.plans)
+        self.baseline = rm.do_baseline(str(self.pre), self.run_dir)
+        self.move(self.pre)
+        self.check_path = self.check(self.pre, plans=self.plans)
+        rm.do_adopt(CHECKOUT, IMAGE, str(self.config), str(self.check_path), REASON, self.run_dir,
+                    FakeRouter(plans=self.plans))
+
+    def test_the_second_instance_is_checked_too(self):
+        (self.state / LID_B / ("gen-" + "f" * 32) / "first-seen.json").write_text('{"m": "changed"}')
+        with self.assertRaises(rm.Stop) as cm:
+            rm.do_accept(CHECKOUT, IMAGE, str(self.config), str(self.check_path), str(self.baseline),
+                         self.run_dir, FakeRouter())
+        self.assertIn("'bob'", str(cm.exception))
+
+    def test_a_held_participant_at_accept_is_refused(self):
+        held = the_map()
+        held["instances"]["bob"]["held"] = "skeleton_collision"
+        with self.assertRaises(rm.Stop) as cm:
+            rm.do_accept(CHECKOUT, IMAGE, str(self.config), str(self.check_path), str(self.baseline),
+                         self.run_dir, FakeRouter(maps=[held]))
+        self.assertIn("does not resolve 'bob'", str(cm.exception))
+
+
+class RenameOnlyAcceptRows(Base):
+    """Opus's Z12: a rename-only participant, not adopted, is still gated
+    by the registry at accept."""
+
+    def test_a_held_rename_only_participant_stops_accept(self):
+        (self.state / "alice" / "delivered").mkdir(parents=True)
+        pre, _ = self.preview(plans={})
+        base = rm.do_baseline(str(pre), self.run_dir)
+        self.move(pre)
+        check = rm.do_check(CHECKOUT, IMAGE, str(self.config), str(pre), REASON, self.run_dir, FakeRouter(plans={}))
+        collided = the_map()
+        collided["instances"]["alice"]["held"] = "skeleton_collision"
+        with self.assertRaises(rm.Stop) as cm:
+            rm.do_accept(CHECKOUT, IMAGE, str(self.config), str(check), str(base), self.run_dir,
+                         FakeRouter(maps=[collided]))
+        self.assertIn("does not resolve 'alice'", str(cm.exception))
+        rm.do_accept(CHECKOUT, IMAGE, str(self.config), str(check), str(base), self.run_dir, FakeRouter())
+
+
+class ReadRows(unittest.TestCase):
+    """Codex at a87d3a7e: _regular_bytes reads the same no-follow fd to EOF, within
+    RECORD_MAX, and a read error is a STOP."""
+
+    def setUp(self):
+        self.d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.d, ignore_errors=True)
+        self.f = self.d / "f"
+
+    def stopped(self, why, **patch):
+        try:
+            with mock.patch.object(rm.os, "read", patch["read"]):
+                rm._regular_bytes(self.f)
+        except rm.Stop as e:
+            self.assertIn(why, str(e))
+        except Exception as e:     # noqa: BLE001 — anything but a Stop is the failure
+            self.fail(f"_regular_bytes raised {type(e).__name__}, not Stop: {e}")
+        else:
+            self.fail(f"read, though: {why}")
+
+    def test_many_short_chunks_are_joined(self):
+        self.f.write_bytes(b"0123456789" * 7)
+        real = os.read
+        with mock.patch.object(rm.os, "read", lambda fd, n: real(fd, min(n, 3))):
+            self.assertEqual(rm._regular_bytes(self.f), b"0123456789" * 7)
+
+    def test_the_cap_is_held_across_chunks(self):
+        self.f.write_bytes(b"x")
+        self.stopped("larger than a record", read=lambda fd, n: b"y" * min(n, rm.RECORD_MAX // 3 + 1))
+
+    def test_a_read_error_mid_file_is_a_stop(self):
+        self.f.write_bytes(b"0123456789")
+        real, calls = os.read, []
+
+        def flaky(fd, n):
+            calls.append(n)
+            if len(calls) == 2:
+                raise OSError(errno.EIO, "Input/output error")
+            return real(fd, min(n, 3))
+        self.stopped("cannot be read", read=flaky)
+
+    def test_exactly_the_cap_is_read_whole(self):
+        self.f.write_bytes(b"z" * rm.RECORD_MAX)
+        self.assertEqual(len(rm._regular_bytes(self.f)), rm.RECORD_MAX)
+
+    def test_one_byte_over_the_cap_is_refused(self):
+        self.f.write_bytes(b"z" * (rm.RECORD_MAX + 1))
+        with self.assertRaises(rm.Stop):
+            rm._regular_bytes(self.f)
+
+
+class EarlyRefusalRows(Base):
+    """Codex at a87d3a7e: a record that cannot be used, or state R2 does not
+    migrate, is refused before anything changes."""
+
+    def setUp(self):
+        super().setUp()
+        d = self.state / "alice"
+        (d / "results").mkdir(parents=True)
+        (d / "results" / "r1.json").write_text(result("r1"))
+        self.pre, _ = self.preview()
+
+    def test_an_approval_only_instance_is_refused_at_the_baseline(self):
+        """The controller's ruling: R2 does not migrate approval-only state
+        (no first-seen.json); the baseline, before any move, refuses it."""
+        (self.state / "alice" / "approval.json").write_text("{}")
+        try:
+            rm.do_baseline(str(self.pre), self.run_dir)
+        except rm.Stop as e:
+            self.assertIn("does not migrate approval-only state", str(e))
+        except Exception as e:     # noqa: BLE001 — anything but a Stop is the failure
+            self.fail(f"baseline raised {type(e).__name__}, not Stop: {e}")
+        else:
+            self.fail("the baseline accepted state with no first-seen.json")
+        self.assertTrue((self.state / "alice").is_dir())
+        self.assertFalse((self.state / LID_A).exists())
+        self.assertEqual(list(self.run_dir.glob("router-migrate-baseline-*")), [])
+
+    def no_marker(self, name="alice"):
+        try:
+            rm.do_baseline(str(self.pre), self.run_dir)
+        except rm.Stop as e:
+            return str(e)
+        self.fail("the baseline accepted state with no first-seen.json")
+
+    def test_a_by_name_instance_with_a_dated_approval_gets_the_poll_remedy(self):
+        (self.state / "alice" / "approval.json").write_text(DATED_APPROVAL)
+        why = self.no_marker()
+        self.assertIn("let the old router poll the instance once", why)
+        self.assertNotIn("fence-legacy", why)
+
+    def test_a_by_name_instance_without_approved_ts_is_fenced(self):
+        (self.state / "alice" / "approval.json").write_text(json.dumps({"declared_root": "/inst/alice",
+                                                                        "outbox_snapshot": []}))
+        why = self.no_marker()
+        self.assertIn("fence-legacy", why)
+        self.assertNotIn("poll", why)
+
+    def test_dated_means_the_pin_s_own_parse(self):
+        """RL and Codex at b8dd5f75: dated is the pin's parse_utc_ts (strptime
+        with one format) under strict_json (strict UTF-8, no duplicate keys),
+        checked on the helper AND on the baseline's remedy text."""
+        def approval(ts):
+            return json.dumps({"approved_ts": ts, "declared_root": "/inst/alice", "outbox_snapshot": []})
+        cases = [
+            ("valid", approval("2026-01-02T03:04:05Z").encode(), True),
+            ("unpadded, which the pin accepts", approval("2026-1-2T3:4:5Z").encode(), True),
+            ("fractional seconds", approval("2026-01-02T03:04:05.5Z").encode(), False),
+            ("month 99", approval("2026-99-02T03:04:05Z").encode(), False),
+            ("2026-02-29, not a leap year", approval("2026-02-29T03:04:05Z").encode(), False),
+            ("second 60", approval("2026-01-02T03:04:60Z").encode(), False),
+            ("a duplicate approved_ts, the last valid",
+             b'{"approved_ts": "x", "approved_ts": "2026-01-02T03:04:05Z", "declared_root": "/inst/alice", '
+             b'"outbox_snapshot": []}', False),
+            ("UTF-16", approval("2026-01-02T03:04:05Z").encode("utf-16"), False),
+        ]
+        for why, raw, dated in cases:
+            with self.subTest(case=why):
+                (self.state / "alice" / "approval.json").write_bytes(raw)
+                self.assertEqual(rm.approval_dated(self.state / "alice"), dated)
+                text = self.no_marker()
+                if dated:
+                    self.assertIn("let the old router poll the instance once", text)
+                else:
+                    self.assertIn("fence-legacy", text)
+                    self.assertNotIn("poll", text)
+
+    def test_a_by_id_approval_only_instance_gets_no_start_instruction(self):
+        """Codex at 8302db87: a name-keyed old router never reads the
+        logical-id directory, so nothing tells the operator to start or
+        poll it, whatever its approval says."""
+        shutil.rmtree(self.state / "alice")
+        d = self.state / LID_A
+        (d / "results").mkdir(parents=True)
+        (d / "results" / "r1.json").write_text(result("r1"))
+        (d / "approval.json").write_text(DATED_APPROVAL)
+        self.pre, _ = self.preview()
+        why = self.no_marker()
+        self.assertIn("unsupported by R2", why)
+        self.assertIn(str(d), why)
+        self.assertNotIn("poll", why)
+        self.assertNotIn("let the old router", why)
+
+    def test_an_unusable_check_record_makes_no_adopt_call(self):
+        (self.state / "alice" / "first-seen.json").write_text("{}")
+        self.move(self.pre)
+        good = json.loads(self.check(self.pre).read_text())
+        for why, change in (("missing", lambda d: d.pop("participants")),
+                            ("wrong type", lambda d: d.update(participants="alice")),
+                            ("not the binding set", lambda d: d.update(participants=[])),
+                            ("an adopt outside it", lambda d: d.update(participants=["bob"],
+                                                                       binding={"bob": d["binding"]["alice"]}))):
+            with self.subTest(record=why):
+                doc = json.loads(json.dumps(good))
+                change(doc)
+                path = self.run_dir / f"check-{why.replace(' ', '-')}.json"
+                path.write_text(json.dumps(doc))
+                fake = FakeRouter(plans={"alice": plan("alice", LID_A)})
+                with self.assertRaises(rm.Stop) as cm:
+                    rm.do_adopt(CHECKOUT, IMAGE, str(self.config), str(path), REASON, self.run_dir, fake)
+                self.assertIn("does not name the plan's participants", str(cm.exception))
+                self.assertFalse([c for c in fake.calls if "adopt" in c[0] and "--dry-run" not in c[0]])
+                self.assertFalse((self.state / LID_A / "migration.json").exists())
+
+
+class ParticipantRows(Base):
+    """Codex at ce087971: a rename-only instance is an R2 participant, gated by
+    resolved() in adopt and verify though it needs no adopt."""
+
+    def setUp(self):
+        super().setUp()
+        (self.state / "alice" / "delivered").mkdir(parents=True)
+        self.pre, _ = self.preview(plans={})
+        self.move(self.pre)
+        self.check_path = rm.do_check(CHECKOUT, IMAGE, str(self.config), str(self.pre), REASON, self.run_dir,
+                                      FakeRouter(plans={}))
+
+    def test_the_check_records_every_participant(self):
+        doc = json.loads(self.check_path.read_text())
+        self.assertEqual((doc["instances"], doc["participants"]), ({}, ["alice"]))
+
+    def test_a_held_rename_only_instance_stops_adopt_and_verify(self):
+        collided = the_map()
+        collided["instances"]["alice"]["held"] = "skeleton_collision"
+        with self.assertRaises(rm.Stop) as cm:
+            rm.do_adopt(CHECKOUT, IMAGE, str(self.config), str(self.check_path), REASON, self.run_dir,
+                        FakeRouter(plans={}, maps=[collided]))
+        self.assertIn("does not resolve 'alice' (skeleton_collision)", str(cm.exception))
+        with self.assertRaises(rm.Stop) as cm:
+            rm.do_verify(CHECKOUT, IMAGE, str(self.config), str(self.check_path), self.run_dir,
+                         FakeRouter(maps=[collided]))
+        self.assertIn("does not resolve 'alice' (skeleton_collision)", str(cm.exception))
+
+    def test_a_resolved_rename_only_instance_passes(self):
+        rm.do_adopt(CHECKOUT, IMAGE, str(self.config), str(self.check_path), REASON, self.run_dir,
+                    FakeRouter(plans={}))
+        rm.do_verify(CHECKOUT, IMAGE, str(self.config), str(self.check_path), self.run_dir, FakeRouter())
+
+    def test_a_name_missing_from_the_map_is_not_resolved(self):
+        self.assertEqual(rm.holds(["alice", "bob"], {"instances": {"bob": dict(entry(LID_B), held=None)}}),
+                         {"alice": "not in the map"})
+
+    def test_a_check_record_without_participants_stops(self):
+        doc = json.loads(self.check_path.read_text())
+        del doc["participants"]
+        old = self.run_dir / "old-check.json"
+        old.write_text(json.dumps(doc))
+        with self.assertRaises(rm.Stop) as cm:
+            rm.do_verify(CHECKOUT, IMAGE, str(self.config), str(old), self.run_dir, FakeRouter())
+        self.assertIn("does not name the plan's participants", str(cm.exception))
+
+
+class FakeParity(unittest.TestCase):
+    """Codex at ce087971: the fake's hold is the pinned registry's, never
+    "generations.json exists"."""
+
+    def setUp(self):
+        self.state = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.state, ignore_errors=True)
+
+    def test_each_hold_as_the_pin_decides_it(self):
+        e = entry(LID_A)
+        (self.state / LID_A).mkdir()
+        (self.state / LID_A / "generations.json").write_text("{not json")
+        self.assertIsNone(registry_hold(self.state, "alice", e),
+                          "the registry resolves a moved name; a malformed generations file is the poll's concern")
+        self.assertEqual(registry_hold(self.state, "alice", dict(e, held="skeleton_collision")), "skeleton_collision")
+        (self.state / "alice").mkdir()
+        self.assertEqual(registry_hold(self.state, "alice", e), "state_conflict")
+        shutil.rmtree(self.state / LID_A)
+        self.assertEqual(registry_hold(self.state, "alice", e), "state_not_migrated")
+        self.assertEqual(registry_hold(self.state, "a" * 32, e), "name_shape")
+        self.assertEqual(registry_hold(self.state, "Status.json", e), "name_shape")
+
+    def test_own_state_entries_are_the_pins(self):
+        src = subprocess.run(["git", "-C", str(_workspace.HOP_ROUTER_ROOT), "show",
+                              "99329945edd20adb4b8b83f025ea1ef6382456ff:router/registry.py"],
+                             capture_output=True, text=True, check=True).stdout
+        self.assertIn('_OWN_STATE_ENTRIES = frozenset({SEQ_DIR.casefold(), "status.json", "aliases"})', src)
+        self.assertIn('SEQ_DIR = "registry"', src)
 
 
 class MoveRows(Base):
@@ -1018,6 +1812,25 @@ class VerbRows(Base):
         self.assertIn("needs --preview, --reason", lines[-1])
         self.assertEqual(rm.run(self.args("move", apply=True), out=lines.append, runner=FakeRouter()), 2)
         self.assertIn("exactly one", lines[-1])
+
+    def test_accept_prints_the_line_the_runbook_keys_on(self):
+        """Opus's Z17: step 11 goes on only on `router-migrate accept: ACCEPT:`."""
+        d = self.state / "alice"
+        (d / "results").mkdir(parents=True)
+        (d / "first-seen.json").write_text("{}")
+        pre, _ = self.preview()
+        base = rm.do_baseline(str(pre), self.run_dir)
+        self.move(pre)
+        check = self.check(pre)
+        rm.do_adopt(CHECKOUT, IMAGE, str(self.config), str(check), REASON, self.run_dir,
+                    FakeRouter(plans={"alice": plan("alice", LID_A)}))
+        import hop_router
+        lines = []
+        with mock.patch.object(hop_router, "hop_checkout", lambda: Path(CHECKOUT)):
+            rc = rm.run(self.args("accept", check=str(check), baseline=str(base), apply=True), out=lines.append,
+                        runner=FakeRouter())
+        self.assertEqual(rc, 0, lines)
+        self.assertTrue(lines[-1].startswith("router-migrate accept: ACCEPT: "), lines[-1])
 
     def test_a_relative_config_is_made_absolute(self):
         fake = FakeRouter()
