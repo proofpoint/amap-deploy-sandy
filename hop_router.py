@@ -399,7 +399,7 @@ def validate_with_hop_router(doc: Dict[str, Any], checkout: str) -> Optional[str
     code = ("import json, sys\nsys.path.insert(0, sys.argv[1])\nfrom router.config import load_obj\n"
             "load_obj(json.loads(sys.stdin.read()))\n")
     try:
-        p = subprocess.run([sys.executable, "-I", "-c", code, checkout], input=json.dumps(doc),
+        p = subprocess.run([sys.executable, "-I", "-B", "-c", code, checkout], input=json.dumps(doc),
                            capture_output=True, text=True, timeout=120)
     except (OSError, subprocess.TimeoutExpired) as e:
         return f"the hop router's loader could not run: {e}"
@@ -422,7 +422,7 @@ def horizon_default(checkout: str) -> Tuple[Optional[int], str]:
             "from router.config import INGRESS_DEDUP_HORIZON_DAYS_DEFAULT as d\nprint(d)\n")
     where = f"router.config.INGRESS_DEDUP_HORIZON_DAYS_DEFAULT in the hop checkout {checkout}"
     try:
-        p = subprocess.run([sys.executable, "-I", "-c", code, checkout], capture_output=True, text=True,
+        p = subprocess.run([sys.executable, "-I", "-B", "-c", code, checkout], capture_output=True, text=True,
                            timeout=120)
     except (OSError, subprocess.TimeoutExpired) as e:
         return None, f"{where} could not be read: {e}"
@@ -552,7 +552,7 @@ def loader_roots(doc: Dict[str, Any], checkout: str) -> Any:
     them from `doc` (the plugin may not sit inside one); an Unresolved when
     the loader cannot say."""
     try:
-        p = subprocess.run([sys.executable, "-I", "-c", ROOTS, checkout], input=json.dumps(doc),
+        p = subprocess.run([sys.executable, "-I", "-B", "-c", ROOTS, checkout], input=json.dumps(doc),
                            capture_output=True, text=True, timeout=120)
     except (OSError, subprocess.TimeoutExpired) as e:
         return rh.Unresolved(f"the hop router's loader could not run: {e}")

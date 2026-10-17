@@ -542,6 +542,11 @@ class LockTest(Secret):
         self.assertRefused(self.write(), "concurrent writer")
 
 
+def trusted(program, docker):
+    """probe_weekly's tool check, answered "root's alone": these rows are about
+    the probe's result, and test_root_tool_trust holds the check itself."""
+
+
 class ProbeWeeklyTest(Secret):
 
     def setUp(self):
@@ -550,7 +555,7 @@ class ProbeWeeklyTest(Secret):
 
     def probe(self, line, rc=0, now=1000, run_id="w-1"):
         prog = f"import sys;sys.stdout.write({line!r});raise SystemExit({rc})"
-        return st.probe_weekly(self.status, run_id, [sys.executable, "-c", prog], now=now)
+        return st.probe_weekly(self.status, run_id, [sys.executable, "-c", prog], now=now, verify=trusted)
 
     def doc(self):
         with open(self.status) as f:
@@ -591,7 +596,7 @@ class ProbeWeeklyTest(Secret):
         self.assertEqual(self.doc()["class"], "protocol_error")
 
     def test_a_command_that_cannot_start_is_engine_unavailable(self):
-        rc = st.probe_weekly(self.status, "w-9", [os.path.join(self.t, "absent")], now=5)
+        rc = st.probe_weekly(self.status, "w-9", [os.path.join(self.t, "absent")], now=5, verify=trusted)
         self.assertEqual(rc, st.REFUSED)
         self.assertEqual(self.doc()["class"], "engine_unavailable")
 
@@ -616,7 +621,7 @@ class ProbeWeeklyTest(Secret):
         st.PROBE_TIMEOUT_S = 0.5
         self.addCleanup(setattr, st, "PROBE_TIMEOUT_S", orig)
         rc = st.probe_weekly(self.status, "w-t", [sys.executable, "-c", "import time;time.sleep(5)"],
-                             now=10, docker=[fake])
+                             now=10, docker=[fake], verify=trusted)
         self.assertEqual((rc, self.doc()["class"]), (st.REFUSED, "timeout"))
         with open(log) as f:
             self.assertEqual(f.read().splitlines(), ["ps --all --quiet --filter label=org.amap.run=w-t",
@@ -626,8 +631,11 @@ class ProbeWeeklyTest(Secret):
         for opts in (["--engine", "unix:///nowhere.sock", "--docker", "/bin/true"],
                      ["--docker", "/bin/true", "--engine", "unix:///nowhere.sock"]):
             with self.subTest(opts=opts):
-                done = run("probe-weekly", self.status, "w-c", *opts, "--", sys.executable, "-c", "pass")
-                self.assertEqual(done.returncode, st.REFUSED, done)
+                self.addCleanup(setattr, st, "_verify_probe_tools", st._verify_probe_tools)
+                st._verify_probe_tools = trusted
+                rc = st._probe_weekly_main(["probe-weekly", self.status, "w-c", *opts, "--", sys.executable, "-c",
+                                            "pass"])
+                self.assertEqual(rc, st.REFUSED)
                 self.assertEqual(self.doc()["class"], "engine_unavailable")
         self.assertRefused(run("probe-weekly", self.status, "w-c", "--bogus", "x", "--", "/bin/true"), "usage")
 
@@ -638,7 +646,8 @@ class ProbeWeeklyTest(Secret):
     def engine_probe(self, endpoint, line="ok 235\n", rc=0):
         ran = os.path.join(self.t, "ran")
         prog = f"open({ran!r},'w').close();import sys;sys.stdout.write({line!r});raise SystemExit({rc})"
-        out = st.probe_weekly(self.status, "w-e", [sys.executable, "-c", prog], now=10, engine=endpoint)
+        out = st.probe_weekly(self.status, "w-e", [sys.executable, "-c", prog], now=10, engine=endpoint,
+                              verify=trusted)
         return out, os.path.exists(ran)
 
     def test_a_stopped_engine_is_recorded_without_running_the_probe(self):

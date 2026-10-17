@@ -23,7 +23,7 @@ config running. Adoption is partition-check V2's reload flag.
 partition_probe is in the weekly job's bundle; this module calls its P01 and
 P02 pieces unchanged, so the bundle does not move.
 
-Every docker call goes through ss.docker(spec.secrets), with no -H: the
+Every docker call goes through ss.live_docker(spec.secrets), with no -H: the
 local router and the hub-link router run on the one engine it reaches,
 and supervision.engine must be that engine. Another engine fails closed
 (its router reads as not running).
@@ -202,7 +202,12 @@ def run(document_path: str, document_sha256: str, t_run_id: str, *, apply: bool,
     named, _, why = pe.named_document(token, evidence_dir=spec.partition.evidence_dir, host=host, read=read)
     if named is None:
         return refuse(f"the live token names no issued document: {why}")
-    runner = p.get("runner") or pp.Runner(ss.docker(spec.secrets))
+    runner = p.get("runner")
+    if runner is None:
+        try:
+            runner = pp.Runner(ss.live_docker(spec.secrets))
+        except rh.CannotRun as e:
+            return refuse(f"the engine is not asked: {e}")
     docker = prun.Docker(runner)
     live = docker.inspect(spec.runtime_of(spec.hops[0][1])["container"])
     if not isinstance(live, dict) or pa.is_running(live) is not True:

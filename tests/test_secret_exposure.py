@@ -19,6 +19,7 @@ import host_setup as hs
 import router_health as rh
 import secret_exposure as se
 import secret_setup as ss
+from _gate import open_gate
 from test_secret_setup import full_doc, sec
 
 Id = namedtuple("Id", "st_dev st_ino st_mode", defaults=(stat.S_IFDIR | 0o755,))
@@ -158,6 +159,9 @@ def free_lock():
 
 
 class Base(unittest.TestCase):
+
+    def setUp(self):
+        open_gate(self)
 
     def sweep(self, run=None, *, s=None, lstat_=None, stat_=None, lock=free_lock, realpath=lambda p: p,
               platform="linux"):
