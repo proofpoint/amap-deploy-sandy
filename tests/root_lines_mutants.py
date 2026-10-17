@@ -592,6 +592,19 @@ M = [
      '                 (posixpath.basename(sup.weekly["timer"]), (STOPPED,))]',
      '                 (posixpath.basename(sup.weekly["timer"]), (STOPPED, FAILED))]',
      "test_hub_start_states"),
+    # the partition's place lines record the partition section's tools (§0.1)
+    ("ai-secrets-tools", "activation_install.py",
+     "                         shlex.quote, python3=py, tools=list(spec.partition.tools.values()))",
+     "                         shlex.quote, python3=py)",
+     "test_activation_install"),
+    ("ppa-secrets-tools", "partition_postactivation.py",
+     "                         tools=list(spec.partition.tools.values()))",
+     "                         )",
+     "test_partition_postactivation"),
+    ("walk-typed-shell-after-dashdash", "hub_supervise.py",
+     '    return ss.typed_root(spec.secrets, own(spec, "service", "--manager", m, spec.supervision.kind, action, *args), q,',
+     '    return ss.typed_root(spec.secrets, ["/bin/sh", "-c", "service"] + [m, spec.supervision.kind, action, *args], q,',
+     "test_root_walk"),
 ]
 
 

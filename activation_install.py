@@ -137,4 +137,4 @@ def place_step(spec: Any, source: str, final: bytes) -> str:
     py = spec.partition.tools["python3"]
     return ss.typed_root(spec.secrets, [py, "-I", "-S", "-B", spec.secrets.writer, "place", source,
                                         spec.keys.local_config, "--sha256", hashlib.sha256(final).hexdigest()],
-                         shlex.quote, python3=py)
+                         shlex.quote, python3=py, tools=list(spec.partition.tools.values()))

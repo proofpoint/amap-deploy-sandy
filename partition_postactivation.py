@@ -165,7 +165,8 @@ def place_line(spec: Any, source: str, dest: str, doc: bytes) -> str:
     import secret_setup as ss
     py = spec.partition.tools["python3"]
     return ss.typed_root(spec.secrets, [py, "-I", "-S", "-B", spec.secrets.writer, "place", source, dest,
-                                        "--sha256", hashlib.sha256(doc).hexdigest()], shlex.quote, python3=py)
+                                        "--sha256", hashlib.sha256(doc).hexdigest()], shlex.quote, python3=py,
+                         tools=list(spec.partition.tools.values()))
 
 
 def run(document_path: str, document_sha256: str, t_run_id: str, *, apply: bool, out=print,

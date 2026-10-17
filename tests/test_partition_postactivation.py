@@ -255,7 +255,7 @@ class BundleTest(unittest.TestCase):
         argv = shlex.split(ppa.place_line(spec, "/srv/op/run/a b", "/opt/ex/ev/x", b"doc"))
         cut = argv.index("--")
         self.assertEqual(argv, rt.typed_argv("/opt/ex/libexec/root-trust.sh", "b" * 64, "/opt/py/bin/python3",
-                                             sec.writer, list(sec.tools.values()), argv[cut + 1:]))
+                                             sec.writer, list(spec.partition.tools.values()), argv[cut + 1:]))
         self.assertEqual(argv[cut + 1:], ["/opt/py/bin/python3", "-I", "-S", "-B", sec.writer, "place",
                                           "/srv/op/run/a b", "/opt/ex/ev/x", "--sha256",
                                           hashlib.sha256(b"doc").hexdigest()])

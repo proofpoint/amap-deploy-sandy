@@ -842,13 +842,15 @@ COREDUMP_OFF = "kern.coredump=0"
 
 
 def typed_root(s: SecretSpec, argv: Sequence[str], q: Callable[[str], str], python3: Optional[str] = None,
-               also: Sequence[str] = ()) -> str:
+               also: Sequence[str] = (), tools: Optional[Sequence[str]] = None) -> str:
     """One operator-typed root line (d3.3 §5(d)) through the placed writer,
-    with the document's tools and each `also` trusted-exec judges beside
-    argv[0]. `python3` is the barrier's interpreter when argv runs another
-    than the secrets section's (the partition job's)."""
+    with its section's recorded tools (the secrets section's unless `tools`
+    names another's) and each `also` trusted-exec judges beside argv[0].
+    `python3` is the barrier's interpreter when argv runs another than the
+    secrets section's (the partition job's)."""
     return " ".join(q(a) for a in rt.typed_argv(posixpath.join(s.writer_dir, rt.NAME), s.writer_sha256,
-                                                python3 or s.tools["python3"], s.writer, list(s.tools.values()),
+                                                python3 or s.tools["python3"], s.writer,
+                                                list(s.tools.values() if tools is None else tools),
                                                 list(argv), also=also))
 
 

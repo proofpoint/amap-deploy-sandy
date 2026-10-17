@@ -150,7 +150,8 @@ class ActivateTest(A3):
 
     def test_the_place_step_runs_the_partition_interpreter_through_the_barrier(self):
         """d3.3 §5(d) and §4.1: the barrier's interpreter is the one the
-        writer runs under, the partition job's, as job_argv renders it."""
+        writer runs under, the partition job's, as job_argv renders it, and
+        the recorded set is the partition section's own (§0.1)."""
         import dataclasses
         import shlex
         import root_trust as rt
@@ -160,7 +161,7 @@ class ActivateTest(A3):
         cut = argv.index("--")
         sec = spec.secrets
         self.assertEqual(argv, rt.typed_argv(posixpath.join(sec.writer_dir, rt.NAME), sec.writer_sha256,
-                                             "/opt/py/bin/python3", sec.writer, list(sec.tools.values()),
+                                             "/opt/py/bin/python3", sec.writer, list(spec.partition.tools.values()),
                                              argv[cut + 1:]))
         self.assertEqual(argv[cut + 1:cut + 6], ["/opt/py/bin/python3", "-I", "-S", "-B", sec.writer])
 

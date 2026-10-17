@@ -395,6 +395,9 @@ starts with four steps, all as you, before any other root line:
    both files differing, or a partial pair each stops it before any sudo.
    Only then does sudo run, at most three times, as `install` reading the
    file your own shell opened. Go on only when it ends with `TXN-OK`.
+   A partial pair names each file's state and the context as `present,
+   sha256 <h>`: the transaction never parses the context, so the
+   maintainers read its recorded pins from the file with that sha256.
 3. G, `/usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C /bin/sh -c '<G>' sh …`:
    the placed route and bytes, before anything sources root-trust.sh. Go on
    only when it prints exactly `G-ROUTE-OK`, `G-BYTES-OK` and
@@ -1342,6 +1345,24 @@ delegation, so it de-activates the host, and `verify` reports it. A planned
 restart of the hub-link router after activation goes through
 `hub-start-check`, which needs A2's evidence still current: do it within that
 window, or after the weekly run renews it.
+
+`hub-start-check` reads each unit's or label's state on its own and prints
+the start step for that state. On Linux a hub that is not running gets its
+first start, a failed one gets `reset-failed` first, and a running one is
+restarted after `daemon-reload`, so a changed rendering takes effect. On
+macOS a loaded job keeps the arguments it was registered with, so each
+loaded label is booted out, then enabled and bootstrapped again, the weekly
+label first. A run in progress gets nothing: re-run the check after it
+ends. After the hub's bootout, run the printed
+`hub-start-check --until-stopped` and do not go on until it prints
+`NOT-RUNNING`: the hub's label is gone and the engine lists no running hub
+container. A state the check cannot classify prints no start line.
+
+A start line that exits 1 printed the manager's own words above its
+`service:` line. For the reason, read `systemctl status <unit>` and the
+journal (Linux), or the hub's error stream `hub-link-run.err` beside its
+status file (macOS). A barrier refusal inside an Exec line shows there as
+12.
 
 **What the outage window does to the local router.** In the local router's
 own words, with only these changes to its text: "the local router" where it
