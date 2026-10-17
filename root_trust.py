@@ -509,7 +509,11 @@ LAUNCHD_STATE_IDLE: Optional[str] = None
 #: `systemctl is-enabled <timer>` for a timer that does not exist, from ONE
 #: invocation: (status, stdout, stderr), trailing newlines dropped, a None
 #: text meaning that stream was empty. The whole tuple must match.
-SYSTEMD_TIMER_MISSING: Optional[Tuple[int, Optional[str], Optional[str]]] = None
+SYSTEMD_TIMER_MISSING: Optional[Tuple[int, Optional[str], Optional[str]]] = (4, "not-found", None)
+#: `systemctl is-active <unit>` for a unit that does not exist: (status, stdout), exactly. A
+#: missing unit cannot be running, so this counts as stopped for the hub unit, the weekly
+#: service and the timer.
+SYSTEMD_UNIT_MISSING_ACTIVE: Optional[Tuple[int, str]] = (4, "inactive")
 
 GATE = r"""
 _g_nl='
@@ -720,6 +724,7 @@ esac
 _t_held() { _t_stop "U0: $1. A running or enabled job holds the old pin. The remedies are: none needed if nothing is running or enabled; otherwise a one-time operator-typed quiescence, a trust-model exception (§6, N5). Run nothing else."; }
 _t_unknown() { _t_stop "U0: $1 answered ($_t_rc, $_t_out): unknown. Measure the state and fix the observation; nothing is assumed absent."; }
 _t_active() { _t_out=$(@SYSTEMCTL@ --no-pager is-active "$1" 2>/dev/null); _t_rc=$?; }
+_t_missing() { [ -n "@SUM_SET@" ] && [ "$_t_rc" = "@SUM_RC@" ] && [ "$_t_out" = @SUM_TEXT@ ]; }
 _t_print() { _t_out=$(@LAUNCHCTL@ print "system/$1" 2>&1); _t_rc=$?; }
 _t_notfound() { [ -n "@LDNF_SET@" ] && [ "$_t_rc" = "@LDNF_RC@" ] && [ "$_t_out" = @LDNF_TEXT@ ]; }
 # A fresh capture directory, $run_dir/<prefix>.<UTC time>[-N]: mkdir is the
@@ -748,10 +753,11 @@ _t_units() {
   if [ "$kind" = systemd ]; then
     for _t_u in "$hub" "$wsvc"; do
       _t_active "$_t_u"
+      _t_missing && continue
       case "$_t_rc:$_t_out" in 3:inactive|3:failed) ;; 0:active|0:reloading|0:activating|3:activating) _t_held "$_t_u is $_t_out" ;; *) _t_unknown "is-active $_t_u" ;; esac
     done
     _t_active "$wtimer"
-    case "$_t_rc:$_t_out" in 3:inactive) ;; 0:active|0:reloading|0:activating|3:activating) _t_held "$wtimer is $_t_out" ;; *) _t_unknown "is-active $wtimer" ;; esac
+    _t_missing || case "$_t_rc:$_t_out" in 3:inactive) ;; 0:active|0:reloading|0:activating|3:activating) _t_held "$wtimer is $_t_out" ;; *) _t_unknown "is-active $wtimer" ;; esac
     # ONE invocation, its status, stdout and stderr captured together.
     _t_fresh u0
     @SYSTEMCTL@ --no-pager is-enabled "$wtimer" > "$_t_d/out" 2> "$_t_d/err"
@@ -863,14 +869,17 @@ def render_txn(kind: str, systemctl: str, root: int = 0, top: str = "", sudo: st
     may supply measured facts); every rendered plan uses the defaults."""
     kind = "launchd" if kind == "launchd" else "systemd"
     m = {"LAUNCHD_NOT_FOUND": LAUNCHD_NOT_FOUND, "LAUNCHD_STATE_RUNNING": LAUNCHD_STATE_RUNNING,
-         "LAUNCHD_STATE_IDLE": LAUNCHD_STATE_IDLE, "SYSTEMD_TIMER_MISSING": SYSTEMD_TIMER_MISSING}
+         "LAUNCHD_STATE_IDLE": LAUNCHD_STATE_IDLE, "SYSTEMD_TIMER_MISSING": SYSTEMD_TIMER_MISSING,
+         "SYSTEMD_UNIT_MISSING_ACTIVE": SYSTEMD_UNIT_MISSING_ACTIVE}
     m.update(measured or {})
     nf, sdm = m["LAUNCHD_NOT_FOUND"], m["SYSTEMD_TIMER_MISSING"]
     # A measured wording is a whole line or a whole answer: an empty one would set its presence
     # flag and then match any blank line.
     for name, text in (("LAUNCHD_STATE_RUNNING", m["LAUNCHD_STATE_RUNNING"]),
                        ("LAUNCHD_STATE_IDLE", m["LAUNCHD_STATE_IDLE"]),
-                       ("LAUNCHD_NOT_FOUND", None if nf is None else nf[1])):
+                       ("LAUNCHD_NOT_FOUND", None if nf is None else nf[1]),
+                       ("SYSTEMD_UNIT_MISSING_ACTIVE", None if m["SYSTEMD_UNIT_MISSING_ACTIVE"] is None
+                        else m["SYSTEMD_UNIT_MISSING_ACTIVE"][1])):
         if text is not None and (not isinstance(text, str) or not text.strip()):
             raise ValueError(f"{name}: a measured wording is never empty")
     e = ("e" if kind == "launchd" else "") if lsopt is None else lsopt
@@ -883,6 +892,10 @@ def render_txn(kind: str, systemctl: str, root: int = 0, top: str = "", sudo: st
             "@LDNF_TEXT@": _measured(None if nf is None else nf[1]),
             "@LD_RUNNING_SET@": _present(m["LAUNCHD_STATE_RUNNING"]), "@LD_RUNNING@": _measured(m["LAUNCHD_STATE_RUNNING"]),
             "@LD_IDLE_SET@": _present(m["LAUNCHD_STATE_IDLE"]), "@LD_IDLE@": _measured(m["LAUNCHD_STATE_IDLE"]),
+            "@SUM_SET@": _present(m["SYSTEMD_UNIT_MISSING_ACTIVE"]),
+            "@SUM_RC@": "" if m["SYSTEMD_UNIT_MISSING_ACTIVE"] is None else str(int(m["SYSTEMD_UNIT_MISSING_ACTIVE"][0])),
+            "@SUM_TEXT@": _measured(None if m["SYSTEMD_UNIT_MISSING_ACTIVE"] is None
+                                    else m["SYSTEMD_UNIT_MISSING_ACTIVE"][1]),
             "@SDM_SET@": _present(sdm), "@SDM_RC@": "" if sdm is None else str(int(sdm[0])),
             "@SDM_OUT@": shlex.quote("" if sdm is None else sdm[1] or ""),
             "@SDM_ERR@": shlex.quote("" if sdm is None else sdm[2] or "")}

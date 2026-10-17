@@ -653,6 +653,8 @@ def active_state(answer: Any) -> Any:
         return RUNNING
     if (rc, out) == (3, "inactive"):
         return STOPPED
+    if rt.SYSTEMD_UNIT_MISSING_ACTIVE is not None and (rc, out) == rt.SYSTEMD_UNIT_MISSING_ACTIVE:
+        return STOPPED  # the measured answer for a unit that does not exist: it cannot be running
     if (rc, out) == (3, "failed"):
         return FAILED
     if out == "activating" and rc in (0, 3):

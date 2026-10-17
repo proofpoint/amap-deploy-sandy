@@ -413,8 +413,8 @@ M = [
      '      case "$_t_rc:$_t_out" in 3:inactive) ;;',
      "test_bootstrap_txn"),
     ("txn-failed-timer-ok", RT,
-     '    case "$_t_rc:$_t_out" in 3:inactive) ;; 0:active|0:reloading|0:activating|3:activating) _t_held "$wtimer is',
-     '    case "$_t_rc:$_t_out" in 3:inactive|3:failed) ;; 0:active|0:reloading|0:activating|3:activating) _t_held "$wtimer is',
+     '    _t_missing || case "$_t_rc:$_t_out" in 3:inactive) ;; 0:active|0:reloading|0:activating|3:activating) _t_held "$wtimer is',
+     '    _t_missing || case "$_t_rc:$_t_out" in 3:inactive|3:failed) ;; 0:active|0:reloading|0:activating|3:activating) _t_held "$wtimer is',
      "test_bootstrap_txn"),
     ("txn-no-role-check", RT,
      '  _t_unit "$hub" .service && _t_unit "$wsvc" .service && _t_unit "$wtimer" .timer \\',
@@ -651,6 +651,23 @@ M = [
      '        if text is not None and (not isinstance(text, str) or not text.strip()):',
      '        if False:',
      "test_bootstrap_txn"),
+    # E1: the measured missing-unit is-active answer, matched exactly
+    ("txn-missing-without-rc", RT,
+     '_t_missing() { [ -n "@SUM_SET@" ] && [ "$_t_rc" = "@SUM_RC@" ] && [ "$_t_out" = @SUM_TEXT@ ]; }',
+     '_t_missing() { [ -n "@SUM_SET@" ] && [ "$_t_out" = @SUM_TEXT@ ]; }',
+     "test_bootstrap_txn"),
+    ("txn-missing-without-text", RT,
+     '_t_missing() { [ -n "@SUM_SET@" ] && [ "$_t_rc" = "@SUM_RC@" ] && [ "$_t_out" = @SUM_TEXT@ ]; }',
+     '_t_missing() { [ -n "@SUM_SET@" ] && [ "$_t_rc" = "@SUM_RC@" ]; }',
+     "test_bootstrap_txn"),
+    ("hv-missing-any-rc-4", "hub_supervise.py",
+     '    if rt.SYSTEMD_UNIT_MISSING_ACTIVE is not None and (rc, out) == rt.SYSTEMD_UNIT_MISSING_ACTIVE:',
+     '    if rc == 4:',
+     "test_hub_start_states"),
+    ("hv-missing-while-unmeasured", "hub_supervise.py",
+     '    if rt.SYSTEMD_UNIT_MISSING_ACTIVE is not None and (rc, out) == rt.SYSTEMD_UNIT_MISSING_ACTIVE:',
+     '    if (rc, out) == (4, "inactive"):',
+     "test_hub_start_states"),
     # the partition's place lines record the partition section's tools (§0.1)
     ("ai-secrets-tools", "activation_install.py",
      "                         shlex.quote, python3=py, tools=list(spec.partition.tools.values()))",
@@ -673,7 +690,10 @@ M = [
 #:   the empty-mode case refuses exactly the inputs the status would.
 #: - G's --strict dropped where shasum supports it: with the 64-hex case
 #:   check in place, no G-level input can tell it apart.
-EQUIVALENT = ("g-ignores-ls-status", "g-no-strict")
+#: - the missing-unit presence flag replaced by its quoted word: while the
+#:   tuple is unmeasured its rc renders empty, and a status is never empty, so
+#:   the rc test alone refuses whatever the flag says.
+EQUIVALENT = ("g-ignores-ls-status", "g-no-strict", "txn-missing-word-as-flag")
 
 
 def main(labels):

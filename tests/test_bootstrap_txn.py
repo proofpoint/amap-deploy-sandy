@@ -530,7 +530,7 @@ class U0Rows(Tree):
                 ("hub-link-probe.timer", "is-enabled", [0, "enabled"], "A running or enabled job"),
                 ("hub-link-probe.timer", "is-enabled", [0, "static"], "unknown"),
                 ("hub-link-probe.timer", "is-enabled", [1, "not-found"], "unknown"),
-                ("hub-link.service", "is-active", [4, "inactive"], "unknown"),
+                ("hub-link.service", "is-active", [4, "unknown"], "unknown"),
                 ("hub-link.service", "is-active", [3, "deactivating"], "unknown"),
                 ("hub-link.service", "is-active", [3, "activating"], "A running or enabled job")):
             with self.subTest(unit=unit, ans=ans):
@@ -678,6 +678,71 @@ class EmptyWordingRows(unittest.TestCase):
     def test_the_constants_as_shipped_render(self):
         rt.render_txn("systemd", "/usr/bin/systemctl")
         rt.render_txn("launchd", "/usr/bin/systemctl")
+
+
+class MissingUnitRows(Tree):
+    """E1: the measured is-active answer for a unit that does not exist,
+    exactly, counts as stopped for the hub unit, the weekly service and the
+    timer; any other rc-4 answer, and every answer while unmeasured, refuses."""
+
+    def answer(self, unit, pair):
+        self.cfg["systemctl"][unit]["is-active"] = pair
+
+    def again(self):
+        for f in (self.log("sudo"), self.log("systemctl")):
+            if os.path.exists(f):
+                os.unlink(f)
+        if os.path.exists(self.wd):
+            shutil.rmtree(self.wd)
+
+    def test_a_fresh_install_with_every_unit_missing_passes(self):
+        """The measured facts: three missing units, one is-enabled
+        call for the missing timer."""
+        self.assertEqual(rt.SYSTEMD_UNIT_MISSING_ACTIVE, (4, "inactive"))
+        self.assertEqual(rt.SYSTEMD_TIMER_MISSING, (4, "not-found", None))
+        for unit in ("hub-link.service", "hub-link-probe.service", "hub-link-probe.timer"):
+            self.answer(unit, [4, "inactive"])
+        self.cfg["systemctl"]["hub-link-probe.timer"]["is-enabled"] = [4, "not-found", ""]
+        self.ok(self.run_txn(), "FRESH")
+
+    def test_each_unit_missing_alone_passes(self):
+        for unit in ("hub-link.service", "hub-link-probe.service", "hub-link-probe.timer"):
+            with self.subTest(unit=unit):
+                self.again()
+                self.answer_quiescent()
+                self.answer(unit, [4, "inactive"])
+                self.ok(self.run_txn(), "FRESH")
+
+    def test_another_rc_4_text_another_rc_or_an_unmeasured_constant_refuses(self):
+        for unit in ("hub-link.service", "hub-link-probe.service", "hub-link-probe.timer"):
+            for pair, measured in (([4, "unknown"], None), ([5, "inactive"], None), ([4, "inactive "], None),
+                                   ([4, "inactive"], {"SYSTEMD_UNIT_MISSING_ACTIVE": None})):
+                with self.subTest(unit=unit, pair=pair, measured=measured):
+                    self.again()
+                    self.answer_quiescent()
+                    self.answer(unit, pair)
+                    self.measured = measured or {}
+                    self.refused(self.run_txn(), "unknown")
+
+    def test_parity_with_active_state(self):
+        import hub_supervise as hv
+        import router_health as rh
+        pairs = [[3, "inactive"], [3, "failed"], [4, "inactive"], [4, "unknown"], [5, "inactive"], [0, "active"]]
+        for pair in pairs:
+            with self.subTest(pair=pair):
+                self.again()
+                self.answer_quiescent()
+                self.answer("hub-link.service", pair)
+                p = self.run_txn()
+                txn = "stopped" if p.returncode == 0 else "running" if "holds the old pin" in p.stderr else "unknown"
+                got = hv.active_state(tuple(pair))
+                py = "unknown" if isinstance(got, rh.Unresolved) else \
+                    "running" if got == hv.RUNNING else "stopped"
+                self.assertEqual(txn, py)
+
+    def test_an_empty_missing_text_is_refused_at_render(self):
+        with self.assertRaisesRegex(ValueError, "never empty"):
+            rt.render_txn("systemd", "/usr/bin/systemctl", measured={"SYSTEMD_UNIT_MISSING_ACTIVE": (4, "")})
 
 
 class TimerMissingRows(Tree):

@@ -70,9 +70,30 @@ class SystemdRestartRows(unittest.TestCase):
                 got = hv.active_state(pair)
                 self.assertIsInstance(got, rh.Unresolved)
                 self.assertIn("a restart loop or a start in progress", got.reason)
-        for pair in ((3, "deactivating"), (4, "inactive"), (0, "inactive"), (3, "active"), (1, "failed"), (3, "")):
+        for pair in ((3, "deactivating"), (4, "unknown"), (0, "inactive"), (3, "active"), (1, "failed"), (3, "")):
             with self.subTest(pair=pair):
                 self.assertIsInstance(hv.active_state(pair), rh.Unresolved)
+
+
+class MissingUnitStateRows(unittest.TestCase):
+    """E1, the Python half: the measured missing-unit answer is not running."""
+
+    def test_the_exact_tuple_only_and_only_while_measured(self):
+        self.assertEqual(hv.active_state((4, "inactive")), hv.STOPPED)
+        for pair in ((4, "unknown"), (5, "inactive"), (4, "inactive ")):
+            with self.subTest(pair=pair):
+                self.assertIsInstance(hv.active_state(pair), rh.Unresolved)
+        with mock.patch.object(rt, "SYSTEMD_UNIT_MISSING_ACTIVE", None):
+            self.assertIsInstance(hv.active_state((4, "inactive")), rh.Unresolved)
+
+    def test_not_running_with_every_unit_missing(self):
+        last = hv.not_running(spec(), old_context=False, active=lambda u: (4, "inactive"), container=lambda sp: False)
+        self.assertEqual(last, "NOT-RUNNING")
+
+    def test_a_missing_hub_unit_gets_the_first_start(self):
+        s = spec()
+        states = hs.unit_states(s, active=lambda u: (4, "inactive"))
+        self.assertEqual(hv.restart_commands(s, states), hv.start_commands(s))
 
 
 class LaunchdRestartRows(unittest.TestCase):
