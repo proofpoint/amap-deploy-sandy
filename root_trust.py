@@ -492,6 +492,8 @@ SOURCE_MAX = 4194304
 #: The reader's capture is refused after it exits when it is larger than this.
 CAPTURE_MAX = 65536
 CONTEXT_NAME = "deployed-context.json"
+#: The deployed context's bound, as hub_supervise.CONTEXT_MAX reads it: PARTIAL's note reads nothing larger.
+CONTEXT_BOUND = 65536
 #: The operator shell both run in: the system sh, under a pinned PATH.
 OPERATOR_ENV = ["/usr/bin/env", "-i", "PATH=/usr/bin:/bin", "LC_ALL=C", ANCHOR_SHELL, "-c"]
 #: Per kind: how the anchor's stat prints a size, and the hash command.
@@ -693,6 +695,10 @@ _t_ctxdiag() {
   _t_meta "$context" || { printf 'present, %s' "$_t_why"; return 0; }
   case $_t_mode in -*) ;; *) printf 'present, not a regular file (%s)' "$_t_mode"; return 0 ;; esac
   [ "$_t_uid" = @ROOT@ ] && [ "$_t_links" = 1 ] || { printf "present, not root's alone with one link"; return 0; }
+  case $_t_mode in ?????w*|????????w*) printf 'present, writable by others: not read'; return 0 ;; esac
+  _t_csz=$(@SIZE@ "$context" 2>/dev/null) || _t_csz=
+  case $_t_csz in ""|*[!0-9]*) printf 'present, its size cannot be measured: not read'; return 0 ;; esac
+  [ "$_t_csz" -le @CTXMAX@ ] || { printf 'present, larger than @CTXMAX@ bytes: not read'; return 0; }
   _t_hash "$context" || { printf 'present, unreadable'; return 0; }
   printf 'present, sha256 %s (informational: the maintainers read its pins from that file)' "$_t_h"
 }
@@ -860,12 +866,19 @@ def render_txn(kind: str, systemctl: str, root: int = 0, top: str = "", sudo: st
          "LAUNCHD_STATE_IDLE": LAUNCHD_STATE_IDLE, "SYSTEMD_TIMER_MISSING": SYSTEMD_TIMER_MISSING}
     m.update(measured or {})
     nf, sdm = m["LAUNCHD_NOT_FOUND"], m["SYSTEMD_TIMER_MISSING"]
+    # A measured wording is a whole line or a whole answer: an empty one would set its presence
+    # flag and then match any blank line.
+    for name, text in (("LAUNCHD_STATE_RUNNING", m["LAUNCHD_STATE_RUNNING"]),
+                       ("LAUNCHD_STATE_IDLE", m["LAUNCHD_STATE_IDLE"]),
+                       ("LAUNCHD_NOT_FOUND", None if nf is None else nf[1])):
+        if text is not None and (not isinstance(text, str) or not text.strip()):
+            raise ValueError(f"{name}: a measured wording is never empty")
     e = ("e" if kind == "launchd" else "") if lsopt is None else lsopt
     subs = {"@KIND@": kind, "@ROOT@": str(int(root)), "@TOP@": top, "@SUDO@": sudo, "@LS@": ls, "@E@": e,
             "@SIZE@": size or SIZE[kind], "@SYSTEMCTL@": shlex.quote(systemctl), "@LAUNCHCTL@": launchctl,
             "@LAUNCHD_DIR@": launchd_dir, "@SHA256SUM@": sha256sum, "@SHASUM@": shasum, "@CMP@": cmp,
             "@TAIL@": tail, "@MKDIR@": mkdir, "@DATE@": date, "@RTNAME@": NAME, "@CONTEXT@": CONTEXT_NAME,
-            "@SRCMAX@": str(SOURCE_MAX), "@CAPMAX@": str(CAPTURE_MAX),
+            "@SRCMAX@": str(SOURCE_MAX), "@CAPMAX@": str(CAPTURE_MAX), "@CTXMAX@": str(CONTEXT_BOUND),
             "@LDNF_SET@": _present(nf), "@LDNF_RC@": "" if nf is None else str(int(nf[0])),
             "@LDNF_TEXT@": _measured(None if nf is None else nf[1]),
             "@LD_RUNNING_SET@": _present(m["LAUNCHD_STATE_RUNNING"]), "@LD_RUNNING@": _measured(m["LAUNCHD_STATE_RUNNING"]),

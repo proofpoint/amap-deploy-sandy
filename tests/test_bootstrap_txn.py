@@ -663,6 +663,23 @@ def rt_unresolved():
     return rh.Unresolved
 
 
+class EmptyWordingRows(unittest.TestCase):
+    """A measured wording is a whole line or a whole answer, never empty:
+    an empty one would set its flag and match any blank line."""
+
+    def test_an_empty_measured_wording_is_refused_at_render(self):
+        for measured in ({"LAUNCHD_STATE_RUNNING": ""}, {"LAUNCHD_STATE_IDLE": " "},
+                         {"LAUNCHD_NOT_FOUND": (113, "")}, {"LAUNCHD_NOT_FOUND": (113, "\n")}):
+            with self.subTest(measured=measured):
+                with self.assertRaisesRegex(ValueError, "never empty"):
+                    rt.render_txn("launchd", "/usr/bin/systemctl", measured=measured)
+        rt.render_txn("launchd", "/usr/bin/systemctl", measured={"LAUNCHD_STATE_IDLE": IDLE_LINE})
+
+    def test_the_constants_as_shipped_render(self):
+        rt.render_txn("systemd", "/usr/bin/systemctl")
+        rt.render_txn("launchd", "/usr/bin/systemctl")
+
+
 class TimerMissingRows(Tree):
     """The missing timer's measured answer with one text unmeasured: an empty
     stdout or stderr never matches the field that was not measured."""
@@ -705,6 +722,48 @@ class ContextReadRows(Tree):
         p = self.run_txn(timeout=10)
         self.refused(p, "a partial bootstrap pair")
         self.assertIn("the context: present, not a regular file (p", p.stderr)
+
+    def hasher(self):
+        """sha256sum, recording every operand it is given."""
+        stub = os.path.join(self.bin, "sha256sum")
+        self.write(stub, (f"#!/bin/sh\nprintf '%s\\n' \"$@\" >> {shlex.quote(self.log('hash'))}\n"
+                          "exec /usr/bin/sha256sum \"$@\"\n").encode(), 0o755)
+        return stub
+
+    def hashed(self):
+        try:
+            with open(self.log("hash")) as f:
+                return [l.rstrip("\n") for l in f]
+        except FileNotFoundError:
+            return []
+
+    def test_partial_never_reads_a_writable_or_oversized_context(self):
+        for name, data, mode, words in (("writable", b"{}", 0o666, "present, writable by others: not read"),
+                                        ("oversized", b" " * (rt.CONTEXT_BOUND + 1), 0o444,
+                                         f"present, larger than {rt.CONTEXT_BOUND} bytes: not read")):
+            with self.subTest(name=name):
+                if os.path.exists(self.wd):
+                    shutil.rmtree(self.wd)
+                for f in (self.log("hash"), self.log("sudo")):
+                    if os.path.exists(f):
+                        os.unlink(f)
+                self.installed(writer=False)
+                self.write(self.context, data, mode)
+                p = self.run_txn(sha256sum=self.hasher())
+                self.refused(p, "a partial bootstrap pair")
+                self.assertIn(f"the context: {words}", p.stderr)
+                self.assertNotIn(self.context, self.hashed(), "the hash utility never sees the context")
+
+    def test_partial_hashes_a_small_trusted_context_only(self):
+        self.installed(writer=False, context=True)
+        p = self.run_txn(sha256sum=self.hasher())
+        self.refused(p, "a partial bootstrap pair")
+        self.assertIn(self.context, self.hashed())
+        self.assertIn("(informational", p.stderr)
+
+    def test_the_bound_is_the_readers(self):
+        import hub_supervise as hv
+        self.assertEqual(rt.CONTEXT_BOUND, hv.CONTEXT_MAX)
 
     def test_partial_reports_a_regular_contexts_digest_as_informational(self):
         self.installed(writer=False, context=True)
