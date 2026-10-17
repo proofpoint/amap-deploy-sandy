@@ -7,6 +7,7 @@ import dataclasses
 import hashlib
 import os
 import plistlib
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -19,7 +20,7 @@ P = ps.PartitionSpec(evidence_dir="/opt/ex/ev", scratch_dir="/opt/ex/scratch", w
                      exec_root="/opt/ex/exec", tools={"python3": "/usr/bin/python3", "docker": "/usr/bin/docker"})
 DOC = b'{"host_setup": {}}'
 ACT = b'{"approved": "A1"}'
-ARGV = pj.job_argv(P, writer="/opt/amap/host_steps.py", host="alpha", document="/opt/ov/overlay.json",
+ARGV = pj.job_argv(P, writer="/opt/amap/host_steps.py", writer_sha256="b" * 64, host="alpha", document="/opt/ov/overlay.json",
                    document_bytes=DOC, activation_bytes=ACT)
 
 
@@ -50,8 +51,19 @@ def halves(spec, *, darwin=False, owner="root", stubs=None, shell="/bin/sh", bou
 
 class JobTest(unittest.TestCase):
     def test_the_argv_carries_every_input_the_job_must_not_take_from_operator_files(self):
-        self.assertEqual(ARGV[:5], ["/usr/bin/python3", "-I", "-S", "-B", "/opt/amap/host_steps.py"])
-        opts = dict(zip(ARGV[6::2], ARGV[7::2]))
+        import root_trust as rt
+        self.assertEqual(ARGV[:6], rt.anchor() + ["/bin/sh", "-c"])
+        self.assertEqual(len(ARGV), 7, "the anchor, sh -c and one script")
+        body = shlex.split(ARGV[6].split("; ", 1)[1])
+        self.assertEqual(body[:13], ["root_exec", "b" * 64, "/usr/bin/python3", "/opt/amap/host_steps.py", "trusted-exec",
+                                     "--tool", "/usr/bin/docker", "--tool", "/usr/bin/python3",
+                                     "--also", "/usr/bin/docker", "--", "/usr/bin/python3"],
+                         "d3.3 §4.1: the partition document's whole recorded set as --tool")
+        self.assertEqual(ARGV[6].split("; ", 1)[0],
+                         "command . /opt/amap/root-trust.sh && command -v root_exec >/dev/null || exit 12")
+        step = body[12:]
+        self.assertEqual(step[:5], ["/usr/bin/python3", "-I", "-S", "-B", "/opt/amap/host_steps.py"])
+        opts = dict(zip(step[6::2], step[7::2]))
         self.assertEqual(opts, {"--exec-root": "/opt/ex/exec", "--host": "alpha", "--document": "/opt/ov/overlay.json",
                                 "--document-sha256": hashlib.sha256(DOC).hexdigest(),
                                 "--activation": "/opt/ex/ev/activation.json",
@@ -70,7 +82,10 @@ class JobTest(unittest.TestCase):
         self.assertIn("OnCalendar=Tue *-*-* 04:00:00", timer)
         self.assertIn(f"OnBootSec={pj.BOOT_DELAY_S}", timer)
         service = files["/etc/systemd/system/amap-partition-weekly.service"].decode()
-        self.assertIn("ExecStart=/usr/bin/python3 -I -S -B /opt/amap/host_steps.py partition-weekly", service)
+        self.assertIn("ExecStart=/usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin LC_ALL=C /bin/sh -c ", service)
+        self.assertIn("trusted-exec --tool /usr/bin/docker --tool /usr/bin/python3 --also /usr/bin/docker -- "
+                      "/usr/bin/python3 -I -S -B /opt/amap/host_steps.py "
+                      "partition-weekly", service)
 
     def test_launchd_runs_it_weekly_and_at_load(self):
         [(path, data)] = pj.rendered("launchd", P, ARGV)

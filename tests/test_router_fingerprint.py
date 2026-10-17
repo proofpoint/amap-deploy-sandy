@@ -1619,6 +1619,9 @@ class Engine:
         raise AssertionError(argv)
 
 
+REAL_SS_LIVE_DOCKER = rf.ss_live_docker
+
+
 class CaptureVerb(unittest.TestCase):
 
     def setUp(self):
@@ -1633,6 +1636,8 @@ class CaptureVerb(unittest.TestCase):
         real_docker = rf.ss_docker
         self.addCleanup(setattr, rf, "ss_docker", real_docker)
         rf.ss_docker = lambda spec: ["docker"]
+        self.addCleanup(setattr, rf, "ss_live_docker", rf.ss_live_docker)
+        rf.ss_live_docker = lambda spec: ["docker"]
         self.result = capture(TREE[C[1]])["result"]
 
     def args(self, **kw):
@@ -1640,6 +1645,50 @@ class CaptureVerb(unittest.TestCase):
                     overlay=None)
         base.update(kw)
         return SimpleNamespace(**base)
+
+    def live_spec(self):
+        """The sudo route's secrets, as live_docker reads them."""
+        return SimpleNamespace(run_dir=str(self.run_dir), docker_via_sudo=True, writer_dir="/opt/ex/libexec",
+                               writer="/opt/ex/libexec/host_steps.py", writer_sha256="b" * 64,
+                               tools={"docker": "/usr/bin/docker", "sudo": "/usr/bin/sudo",
+                                      "python3": "/usr/bin/python3"})
+
+    def test_apply_runs_through_the_barrier_and_a_refusal_runs_nothing(self):
+        """Codex at 184acedf (the other executing caller of ss.docker): the
+        capture runs the client live_docker returns; a refusing gate is
+        UNKNOWN before any call. The local router's engine is the default, so
+        no DOCKER_HOST."""
+        import secret_setup as ss
+        spec = SimpleNamespace(secrets=self.live_spec(), router=SimpleNamespace(container="amap-rl"))
+        rf._load_spec = lambda *a, **k: spec
+        rf.ss_live_docker = REAL_SS_LIVE_DOCKER
+        import router_health as rh
+        for refusal, args, want_calls in (("not run: python3 not root's alone", self.args(step=2, apply=True), False),
+                                          ("not run: python3 not root's alone",
+                                           self.args(image="example.org/rl:pin", apply=True), False),
+                                          (None, self.args(step=2, apply=True), True)):
+            with self.subTest(refusal=refusal, image=args.image):
+                ss._GATE.append(ss.Gate(refusal))
+                eng = Engine(self.result)
+                said = []
+                try:
+                    code = rf.run(args, out=said.append, runner=eng)
+                except rh.CannotRun as e:
+                    self.fail(f"a refusal escaped as an exception instead of UNKNOWN: {e}")
+                finally:
+                    ss._GATE.pop()
+                if not want_calls:
+                    self.assertEqual((code, eng.calls), (rf.EXIT[rf.UNKNOWN], []))
+                    self.assertEqual(said, [f"router-fingerprint: could not run: {refusal}"],
+                                     "the refusal is reported as itself, never as an internal error")
+                else:
+                    self.assertTrue(eng.calls)
+                    for c in eng.calls:
+                        self.assertEqual(c[:2], ["/usr/bin/sudo", "-n"])
+                        self.assertEqual(c[2:6], ["/usr/bin/env", "-i", "PATH=/usr/bin:/bin:/usr/sbin:/sbin",
+                                                  "LC_ALL=C"])
+                        self.assertEqual(c[6], "/bin/sh", "no DOCKER_HOST: [1] is on the default engine")
+                        self.assertIn("trusted-exec", c)
 
     def test_a_dry_run_makes_no_call(self):
         eng = Engine(self.result)

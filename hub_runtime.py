@@ -715,12 +715,12 @@ def inspect(spec: Any, name: str) -> Any:
     name, or an Unresolved."""
     s = spec.secrets
     try:
-        p = rh.run(ss.docker(s) + ["inspect", "--type", "container", name])
+        p = rh.run(ss.live_docker(s) + ["inspect", "--type", "container", name])
     except rh.CannotRun as e:
         return rh.Unresolved(str(e))
     if p.rc != 0:
         try:
-            q = rh.run(ss.docker(s) + ["ps", "-a", "-q", "--filter", f"name=^/{name}$"])
+            q = rh.run(ss.live_docker(s) + ["ps", "-a", "-q", "--filter", f"name=^/{name}$"])
         except rh.CannotRun as e:
             return rh.Unresolved(str(e))
         if q.rc == 0 and not q.out.strip():
@@ -736,7 +736,7 @@ def inspect(spec: Any, name: str) -> Any:
 
 def image_env(spec: Any) -> Any:
     try:
-        p = rh.run(ss.docker(spec.secrets) + ["image", "inspect", "--format", "{{json .Config.Env}}",
+        p = rh.run(ss.live_docker(spec.secrets) + ["image", "inspect", "--format", "{{json .Config.Env}}",
                                               spec.secrets.image])
     except rh.CannotRun as e:
         return rh.Unresolved(str(e))

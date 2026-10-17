@@ -3899,10 +3899,14 @@ def build_identity_outcome(args: argparse.Namespace, home: Path) -> rh.Outcome:
     usable = spec is not None and not isinstance(spec, rh.Unresolved)
     secrets = spec.secrets if usable else None
     supervision = getattr(spec, "supervision", None) if usable else None
-    hub_docker = hsu.ss.docker(secrets) + ["-H", supervision.engine] \
-        if secrets is not None and supervision is not None else None
     no_engine = rh.Unresolved("the host-setup document names no engine for [2] (no supervision section), so "
                               "the container verify would read may be another engine's")
+    hub_docker = None
+    if secrets is not None and supervision is not None:
+        try:
+            hub_docker = hsu.ss.live_docker(secrets, engine=supervision.engine) + ["-H", supervision.engine]
+        except rh.CannotRun as e:
+            no_engine = rh.Unresolved(str(e))
 
     def inspect(role: str, name: str) -> Any:
         if role == bi.ROLE_HUB:
@@ -4459,7 +4463,8 @@ def run_prepare(args: argparse.Namespace, policy: Dict[str, Any], doc: Dict[str,
     writer = os.path.join(spec.secrets.writer_dir, ss.WRITER)
     try:
         steps = list(pj.activation_steps(spec.partition, writer=writer, source=str(source), activation_bytes=record))
-        argv = pj.job_argv(spec.partition, writer=writer, host=hsu.partition_host(spec), document=str(overlay),
+        argv = pj.job_argv(spec.partition, writer=writer, writer_sha256=spec.secrets.writer_sha256,
+                           host=hsu.partition_host(spec), document=str(overlay),
                            document_bytes=overlay.read_bytes(), activation_bytes=record)
     except (OSError, ValueError) as e:
         print(f"partition-activate: cannot prepare A1 — {e}; nothing was written", file=sys.stderr)

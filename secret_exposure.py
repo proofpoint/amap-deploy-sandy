@@ -144,8 +144,8 @@ def overlap(source: str, protected: str, stat_: Callable,
 
 
 def _docker(s: ss.SecretSpec, context: Optional[str], *args: str) -> Any:
-    argv = ss.docker(s) + (["--context", context] if context else []) + list(args)
     try:
+        argv = ss.live_docker(s) + (["--context", context] if context else []) + list(args)
         p = rh.run(argv)
     except rh.CannotRun as e:
         return rh.Unresolved(str(e))

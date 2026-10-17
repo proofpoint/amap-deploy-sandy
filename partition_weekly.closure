@@ -17,6 +17,7 @@ partition_probe.py
 partition_run.py
 partition_setup.py
 partition_store.py
+root_trust.py
 router_health.py
 secret_exposure.py
 secret_setup.py
