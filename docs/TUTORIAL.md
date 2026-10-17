@@ -1355,14 +1355,13 @@ it cannot keep `env`'s assignments apart from the command it runs. The
 arguments `-i`, then one `PATH=<everything else>`, then any program join
 to the same string as the intended ones, and `env` would run that program
 as root, skipping `/bin/sh`, `root_exec` and `trusted-exec`. Do NOT install
-a `NOPASSWD` rule for `/usr/bin/env`, however narrow it looks. Any grant
-that lets this invocation run is root-equivalent, the same class as the old
-docker grant (root through the engine's socket), so a narrow one needs that
-entry point. Without one,
+a `NOPASSWD` rule for `/usr/bin/env`, however narrow it looks. Without one,
 `sudo -n` refuses, and no live check on that route can read the engine.
-The route needs a fixed-purpose, root-owned entry point that
-enforces the argument boundary before running anything the caller chose.
-That is a separate, reviewed change, not part of this setup.
+The route needs a fixed-purpose, root-owned entry point that enforces the
+argument boundary before running anything the caller chose. Any grant that
+lets this invocation run without one is root-equivalent, the same class as
+the old docker grant (root through the engine's socket). That entry point is
+a separate, reviewed change, not part of this setup.
 
 
 ### The weekly partition job's tools

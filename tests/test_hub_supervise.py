@@ -470,32 +470,52 @@ class WrapperTest(unittest.TestCase):
     def test_a_run_that_never_started_says_what_the_engine_finds_and_is_passed_on(self):
         """RE N7: exit 125 (no container) with its own words gone to /dev/null;
         the wrapper asks the engine about the image and the name, says what it
-        finds, and passes 125 on."""
+        finds, and passes 125 on. Every one of those docker calls, as every
+        other, comes straight after a barrier line (Opus D9/D10 at 76d32e53),
+        and the name filter is anchored (D4)."""
+        name = hv.hub_name(spec())
+        image = hs.hr.run_spec(self.spec_, self.spec_.hub)["image"]
         for shell in self.SHELLS:
-            for no_image, leftover in ((False, False), (True, False), (False, True)):
-                with self.subTest(shell=shell, no_image=no_image, leftover=leftover):
-                    for f in ("log", "state", "no_image"):
+            for no_image, leftover, ps_fail in ((False, False, False), (True, False, False), (False, True, False),
+                                                (False, True, True)):
+                with self.subTest(shell=shell, no_image=no_image, leftover=leftover, ps_fail=ps_fail):
+                    for f in ("log", "state", "no_image", "ps_fail"):
                         (self.stub / f).unlink(missing_ok=True)
                     if no_image:
                         (self.stub / "no_image").touch()
                     if leftover:
                         (self.stub / "state").write_text("exited\n")   # removed in step 1; still listed by the stub
+                    if ps_fail:
+                        (self.stub / "ps_fail").touch()             # step 1 inspects the leftover, so only the diagnosis asks ps
                     (self.stub / "code").write_text("125")
-                    r = subprocess.run(shell + [str(self.script)], env={"STUB": str(self.stub), "PATH": "/usr/bin:/bin"},
-                                       capture_output=True, text=True, timeout=30)
+                    try:
+                        r = subprocess.run(shell + [str(self.script)],
+                                           env={"STUB": str(self.stub), "PATH": "/usr/bin:/bin"},
+                                           capture_output=True, text=True, timeout=30)
+                    finally:
+                        (self.stub / "ps_fail").unlink(missing_ok=True)
                     self.assertEqual((r.returncode, self.status()), (125, hv.STARTED))
-                    image = hs.hr.run_spec(self.spec_, self.spec_.hub)["image"]
                     if no_image:
                         self.assertIn(hv.SAY + f"exit 125: the image {image} cannot be inspected: Error: No such image",
                                       r.stderr)
                     else:
                         self.assertIn(hv.SAY + "exit 125: the image is present (sha256:abc)", r.stderr)
-                    self.assertIn(hv.SAY + f"exit 125: a container named {hv.hub_name(spec())}: "
-                                  + ("abc" if leftover else "none"), r.stderr)
+                    if ps_fail:
+                        self.assertIn(hv.SAY + "exit 125: the engine does not answer:", r.stderr)
+                    else:
+                        self.assertIn(hv.SAY + f"exit 125: a container named {name}: "
+                                      + ("abc" if leftover else "none"), r.stderr)
                     self.assertIn(hv.SAY + "exit 125: passed on", r.stderr)
                     log = self.log()
                     self.assertTrue(any(l.startswith("image inspect --format {{.Id}} " + image) for l in log), log)
-                    self.assertTrue(any(l.startswith("ps -a -q --filter") for l in log), log)
+                    self.assertEqual([l for l in log if l.startswith("ps ")][-1], f"ps -a -q --filter name=^/{name}$")
+                    for k, line in enumerate(log):
+                        if not line.startswith("barrier"):
+                            with self.subTest(docker_call=line[:40]):
+                                self.assertTrue(k > 0 and log[k - 1].startswith("barrier"),
+                                                f"a docker call without its barrier line: {log}")
+                    self.assertEqual(len([l for l in log[1:] if l.startswith("barrier")]),
+                                     len([l for l in log if not l.startswith("barrier")]), log)
         (self.stub / "no_image").unlink(missing_ok=True)
 
     def test_no_start_is_recorded_when_step_1_itself_ends_with_125(self):
@@ -520,7 +540,8 @@ class WrapperTest(unittest.TestCase):
         wrapper line, the refusal, makes verify FAIL rather than read PASS."""
         sp = self.spec_
         said = hv.SAY + "exit 12: " + hv.REFUSED_RUN + " (its own words went with the run's output); passed on"
-        for last, want in ((said, rh.FAIL), (hv.SAY + "started: the barrier passed", rh.PASS)):
+        for last, want in ((said, rh.FAIL), (hv.SAY + "started: the barrier passed", rh.PASS),
+                           (said + "\n" + hv.SAY + "started: the barrier passed", rh.PASS)):
             with self.subTest(last=last[:40]):
                 files = {sp.supervision.hub["status"]: b"started 2026-10-17T00:00:00Z\n",
                          hv.err_path(sp): (hv.SAY + "started: the barrier passed\n" + last + "\n").encode()}
