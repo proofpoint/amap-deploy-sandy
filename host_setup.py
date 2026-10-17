@@ -492,7 +492,9 @@ def render_plan(spec: Spec, overlay_source: Optional[Path] = None,
         import partition_job as pj
         # Printed first: every later step that runs an interpreter as root comes after this check of what
         # root will run, and goes on only when it passes.
-        lines += pj.validation_steps(spec.partition, spec.supervision.kind, q)
+        lines += pj.validation_steps(spec.partition, writer=spec.secrets.writer,
+                                     writer_sha256=spec.secrets.writer_sha256,
+                                     tools=list(spec.partition.tools.values()), q=q)
     for r in sorted(spec.roots, key=lambda r: (r.path.count("/"), r.path)):
         p = spec.principals[r.owner]
         lines.append(f"{steps} root {q(r.path)} {p.uid} {spec.groups[r.group]} {r.mode:04o}  # {r.purpose}")

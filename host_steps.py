@@ -32,6 +32,10 @@ The weekly partition job's root half (see its section below):
                                                   one run of the provisioned bundle, under the job's lock
   python3 -I -S -B host_steps.py partition-provision DIR
                                                   DIR/bundle.new swapped in as the bundle, under the lock
+  python3 -I -S -B host_steps.py partition-judge --python3 PY --docker DOCKER [--docker-sha256 HEX]
+                                                  the weekly job's tools judged as trusted-exec judges
+                                                  them; END-OF-BLOCK last and 0 when clean, else each
+                                                  problem and its phase, and 12
 
 The one barrier every root command passes (ROOT-BOOTSTRAP d3.2; root-trust.sh's
 root_exec starts it, after judging this interpreter and this file):
@@ -2022,6 +2026,155 @@ def loader_dirs(platform=None, read=None, glob_=None):
     return sorted(set(out))
 
 
+class Judgment(tuple):
+    """judge()'s result: `(problems, phase)`. phase is "clean", "tools"
+    (a problem in the refusals, the recorded-set check, a tool's file rule,
+    route or pin: judging stopped there, before any library discovery) or
+    "closure" (the tools were clean and the closure was not)."""
+
+    def __new__(cls, problems, phase):
+        return super().__new__(cls, (tuple(problems), phase))
+
+    @property
+    def problems(self):
+        return self[0]
+
+    @property
+    def phase(self):
+        return self[1]
+
+
+def _pin_problem(t, want):
+    """A tool's sha256 against its pin, read without following a link and
+    without blocking: a FIFO in its place is a problem, never a hang."""
+    try:
+        fd = os.open(t, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0))
+    except OSError as e:
+        return f"{t}: {e.strerror}"
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return f"{t} is not a regular file"
+        h = hashlib.sha256()
+        for chunk in iter(lambda: os.read(fd, 1 << 20), b""):
+            h.update(chunk)
+    except OSError as e:
+        return f"{t}: {e.strerror}"
+    finally:
+        os.close(fd)
+    got = h.hexdigest()
+    return None if got == want else f"{t} is not the client the document pins (sha256 {got})"
+
+
+def judge(argv0, also=(), recorded=(), shas=None, platform=None, after_refusals=None):
+    """Everything trusted-exec judges before it execs, as a Judgment (d3.3
+    §5(d) §2.1). In order: an absolute program; ld.so.preload; sudo
+    anywhere; `after_refusals` (trusted_exec's _bound, at its own position);
+    the recorded-set check; each tool's file rule and route, every tool
+    judged and every independent problem kept; the pins, read only for a
+    tool that passed its file rule. Any problem so far stops judging there,
+    so the loader's list mode never maps a tool that failed (phase tools).
+    Only then the fresh closure, the loader's directories and the ACLs
+    (phase closure). A Tooling raised inside becomes a problem of the phase
+    it arose in; judge itself never raises one."""
+    try:
+        if not argv0 or not os.path.isabs(argv0):
+            return Judgment(["trusted-exec needs an absolute program"], "tools")
+        if (platform or sys.platform) != "darwin" and os.path.lexists(LD_SO_PRELOAD):
+            return Judgment([f"{LD_SO_PRELOAD} is present: the loader maps it into every process"], "tools")
+        tools = [argv0] + [t for t in also if t != argv0]
+        for t in tools:
+            if os.path.basename(t) == "sudo":
+                return Judgment([f"{t}: root's argv never holds sudo"], "tools")
+        if after_refusals is not None:
+            after_refusals()
+        own = bool(sys.executable) and os.path.realpath(argv0) == os.path.realpath(sys.executable)
+        unrecorded = [f"{t} is not a tool the document records" for t in tools
+                      if t not in set(recorded) and not (t == argv0 and own)]
+        if unrecorded:
+            return Judgment(unrecorded, "tools")
+        problems, reals, passed = [], [], set()
+        for t in tools:
+            try:
+                real = _trusted_tool(t)
+            except Tooling as e:
+                problems.append(str(e))
+                continue
+            bad = closure_problems([t], platform=platform)
+            if bad:
+                problems.append(f"{t}'s route is not root's alone: " + "; ".join(bad[:5]))
+                continue
+            reals.append(real)
+            passed.add(t)
+        for t, want in sorted((shas or {}).items()):
+            if t in passed:
+                bad = _pin_problem(t, want)
+                if bad:
+                    problems.append(bad)
+            elif t not in tools:
+                problems.append(f"{t} is pinned but is not a tool of this command")
+        if problems:
+            return Judgment(sorted(set(problems)), "tools")
+    except Tooling as e:
+        return Judgment([str(e)], "tools")
+    try:
+        python = sys.executable
+        if not python or not os.path.isabs(python):
+            return Judgment(["the running interpreter has no absolute path"], "closure")
+        closure = exec_closure(_trusted_tool(python), reals, [python] + tools, platform=platform)
+        darwin = (platform or sys.platform) == "darwin"
+        fallthrough = any(not os.path.lexists(p) and not p.startswith(SEALED_PREFIXES) for p in closure[OPTIONAL])
+        if not darwin or fallthrough:
+            closure[OPTIONAL] = sorted(set(closure[OPTIONAL] + loader_dirs(platform)))
+        judged = []
+        bad = closure_problems(closure, platform=platform, seen=judged)
+        bad += acl_problems(sorted(set(judged)), platform=platform)
+    except Tooling as e:
+        return Judgment([str(e)], "closure")
+    return Judgment(sorted(set(bad)), "closure") if bad else Judgment([], "clean")
+
+
+#: The line partition-judge prints last, and only when its judging found nothing.
+JUDGE_SENTINEL = "END-OF-BLOCK"
+
+
+def partition_judge(python3, docker, docker_sha256=None, out=print, platform=None):
+    """The weekly job's install-time check (d3.3 §5(d) §2): its own
+    interpreter and docker judged exactly as trusted-exec judges them,
+    every problem printed with its phase. JUDGE_SENTINEL is printed last,
+    and 0 returned, only when the judging found nothing; otherwise 12. It
+    writes no file. `python3` must be the interpreter running it."""
+    if not python3 or not sys.executable or os.path.realpath(python3) != os.path.realpath(sys.executable):
+        out(f"untrusted: --python3 {python3} is not the interpreter running this check")
+        out("phase: tools")
+        return ROOT_TRUST_EXIT
+    j = judge(sys.executable, also=[docker], recorded=[docker],
+              shas={docker: docker_sha256} if docker_sha256 else None, platform=platform)
+    if j.phase == "clean":
+        out(JUDGE_SENTINEL)
+        return 0
+    for p in j.problems:
+        out(f"untrusted: {p}")
+    out(f"phase: {j.phase}")
+    return ROOT_TRUST_EXIT
+
+
+def _partition_judge_main(argv):
+    """partition-judge --python3 PY --docker DOCKER [--docker-sha256 HEX]"""
+    usage = "partition-judge --python3 PY --docker DOCKER [--docker-sha256 HEX]"
+    opts = argv[1:]
+    if len(opts) not in (4, 6) or len(opts) % 2:
+        raise StepError(usage)
+    got = dict(zip(opts[0::2], opts[1::2]))
+    if not {"--python3", "--docker"} <= set(got) or set(got) - {"--python3", "--docker", "--docker-sha256"}:
+        raise StepError(usage)
+    pin = got.get("--docker-sha256")
+    if pin is not None and not re.fullmatch(r"[0-9a-f]{64}", pin):
+        raise StepError("--docker-sha256 is not a sha256")
+    if not os.path.isabs(got["--docker"]):
+        raise StepError("--docker must be an absolute path")
+    return partition_judge(got["--python3"], got["--docker"], pin)
+
+
 def trusted_exec(argv, also=(), shas=None, platform=None, execv=os.execv, tools=()):
     """Judge root's command and exec it. Refused (Tooling, nothing run):
     sudo anywhere in it (root's argv never holds sudo); a tool that is not
@@ -2031,48 +2184,15 @@ def trusted_exec(argv, also=(), shas=None, platform=None, execv=os.execv, tools=
     ACLs or the loader's directories. argv[0] is an allowlist (d3.3 §4.1):
     its own interpreter in the one exact vector, or a tool the document
     records (`tools`, by absolute path, carried on the rendered root line);
-    each --also tool is one of those too. Then os.execv of exactly `argv`."""
-    if not argv or not os.path.isabs(argv[0]):
+    each --also tool is one of those too. Then os.execv of exactly `argv`.
+    The judging is judge()'s; _bound runs at its own place in that order."""
+    if not argv:
         raise Tooling("trusted-exec needs an absolute program")
-    if (platform or sys.platform) != "darwin" and os.path.lexists(LD_SO_PRELOAD):
-        raise Tooling(f"{LD_SO_PRELOAD} is present: the loader maps it into every process")
-    recorded = set(tools)
-    tools = [argv[0]] + [t for t in also if t != argv[0]]
-    for t in tools:
-        if os.path.basename(t) == "sudo":
-            raise Tooling(f"{t}: root's argv never holds sudo")
-    _bound(argv)
-    own = bool(sys.executable) and os.path.realpath(argv[0]) == os.path.realpath(sys.executable)
-    for t in tools:
-        if t not in recorded and not (t == argv[0] and own):
-            raise Tooling(f"{t} is not a tool the document records")
-    reals = []
-    for t in tools:
-        reals.append(_trusted_tool(t))
-        bad = closure_problems([t], platform=platform)
-        if bad:
-            raise Tooling(f"{t}'s route is not root's alone: " + "; ".join(bad[:5]))
-    for t, want in (shas or {}).items():
-        try:
-            with open(t, "rb") as f:
-                got = hashlib.sha256(f.read()).hexdigest()
-        except OSError as e:
-            raise Tooling(f"{t}: {e.strerror}") from None
-        if got != want:
-            raise Tooling(f"{t} is not the client the document pins (sha256 {got})")
-    python = sys.executable
-    if not python or not os.path.isabs(python):
-        raise Tooling("the running interpreter has no absolute path")
-    closure = exec_closure(_trusted_tool(python), reals, [python] + tools, platform=platform)
-    darwin = (platform or sys.platform) == "darwin"
-    fallthrough = any(not os.path.lexists(p) and not p.startswith(SEALED_PREFIXES) for p in closure[OPTIONAL])
-    if not darwin or fallthrough:
-        closure[OPTIONAL] = sorted(set(closure[OPTIONAL] + loader_dirs(platform)))
-    judged = []
-    bad = closure_problems(closure, platform=platform, seen=judged)
-    bad += acl_problems(sorted(set(judged)), platform=platform)
-    if bad:
-        raise Tooling("the closure is not root's alone: " + "; ".join(sorted(set(bad))[:5]))
+    j = judge(argv[0], also, tools, shas, platform, after_refusals=lambda: _bound(argv))
+    if j.phase == "tools":
+        raise Tooling("; ".join(j.problems[:5]))
+    if j.phase == "closure":
+        raise Tooling("the closure is not root's alone: " + "; ".join(j.problems[:5]))
     execv(argv[0], argv)
 
 
@@ -3261,6 +3381,8 @@ def main(argv):
                                 "--activation PATH --activation-sha256 HEX [--prospective]")
             return partition_weekly(opts["--exec-root"], opts["--host"], opts["--document"], opts["--document-sha256"],
                                     opts["--activation"], opts["--activation-sha256"], prospective=len(argv) == 14)
+        elif argv and argv[0] == "partition-judge":
+            return _partition_judge_main(argv)
         elif len(argv) == 2 and argv[0] == "partition-provision":
             return partition_provision(argv[1])
         elif len(argv) >= 3 and argv[0] == "trusted-exec" and "--" in argv[1:]:
