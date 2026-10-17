@@ -693,3 +693,104 @@ class RecoveryBelowHorizonTest(unittest.TestCase):
             mod.checks = lambda *a, **k: []
         with self.assertRaises(Ran):
             hs.checks(spec(), production=False, containers=lambda c: None, openssl={})
+
+
+RUN = "/opt/run/router.json"
+
+
+class RunningConfigTest(VerifyTest):
+    """keys.running_config: the router reads a root-placed copy, and the
+    binding holds it to that path AND to local_config's bytes. Without it,
+    VerifyTest's rows are today's behaviour exactly."""
+
+    def setUp(self):
+        super().setUp()
+        self.spec = spec(running_config=RUN)
+        self.k = self.spec.keys
+        self.files.update({"/opt/run": st(stat.S_IFDIR | 0o755), RUN: st(stat.S_IFREG | 0o644)})
+
+    def live_ok(self):
+        return RUN, hk._sha(self.raw(LOCAL))
+
+    def test_the_bytes_hashed_are_the_bytes_judged(self):
+        """As VerifyTest's, with the copy: one read of local_config is both
+        hashed and parsed, and the router's live path is the copy's."""
+        signing = json.dumps({"instances": {}, "delegation": {}}).encode()
+        clean = json.dumps({"instances": {}}).encode()
+        reads = []
+
+        def raw(p):
+            reads.append(p)
+            return signing if len(reads) == 1 else clean
+        found = hk.verify_no_delegation(self.k, (RUN, hk._sha(signing)), raw, self.signing())
+        self.assertEqual(self.claim(found, "byte for byte").result, rh.PASS)
+        self.assertEqual(self.claim(found, "signs exactly").result, rh.FAIL)
+        self.assertEqual(reads, [LOCAL])
+
+    def test_the_copy_with_local_config_s_bytes_passes(self):
+        found = self.run_checks()
+        self.assertEqual(self.claim(found, "byte for byte").result, rh.PASS)
+        self.assertEqual(self.claim(found, "signs exactly").result, rh.PASS)
+
+    def test_one_byte_different_fails_the_binding(self):
+        other = json.dumps({"instances": {}}).encode() + b" "
+        found = self.run_checks(live=(RUN, hk._sha(other)))
+        self.assertEqual(self.claim(found, "byte for byte").result, rh.FAIL)
+        self.assertEqual(self.claim(found, "signs exactly").result, rh.UNKNOWN)
+
+    def test_a_router_reading_local_config_itself_fails_the_path(self):
+        found = self.run_checks(live=(LOCAL, hk._sha(self.raw(LOCAL))))
+        self.assertEqual(self.claim(found, "byte for byte").result, rh.FAIL)
+
+    def test_a_link_fails_the_copy_row(self):
+        self.files[RUN] = st(stat.S_IFLNK | 0o777)
+        self.assertEqual(self.claim(self.run_checks(), "root-owned regular file").result, rh.FAIL)
+
+    def test_a_root_owned_non_file_fails_by_type(self):
+        """A link's lstat mode is always 0777, so the writability rule catches
+        it too; a root-owned FIFO or directory with no write bits is caught
+        only by the regular-file rule."""
+        for mode in (stat.S_IFIFO | 0o644, stat.S_IFDIR | 0o755):
+            with self.subTest(mode=oct(mode)):
+                self.files[RUN] = st(mode)
+                c = self.claim(self.run_checks(), "root-owned regular file")
+                self.assertEqual(c.result, rh.FAIL)
+                self.assertIn("not a regular file", str(c.actual))
+
+    def test_a_group_writable_copy_fails(self):
+        self.files[RUN] = st(stat.S_IFREG | 0o664)
+        self.assertEqual(self.claim(self.run_checks(), "root-owned regular file").result, rh.FAIL)
+
+    def test_a_copy_owned_by_the_router_s_account_fails(self):
+        self.files[RUN] = st(stat.S_IFREG | 0o644, UP)
+        self.assertEqual(self.claim(self.run_checks(), "root-owned regular file").result, rh.FAIL)
+
+    def test_a_writable_directory_above_the_copy_fails(self):
+        self.files["/opt/run"] = st(stat.S_IFDIR | 0o777)
+        self.assertEqual(self.claim(self.run_checks(), "every directory above " + RUN).result, rh.FAIL)
+
+    def test_an_absent_copy_fails(self):
+        del self.files[RUN]
+        self.assertEqual(self.claim(self.run_checks(), "root-owned regular file").result, rh.FAIL)
+
+
+class RunningConfigUnsetTest(VerifyTest):
+    def test_unset_adds_no_row_and_binds_local_config(self):
+        found = self.run_checks()
+        self.assertFalse([c for c in found if "root-owned regular file" in c.claim])
+        self.assertEqual(self.claim(found, "byte for byte").result, rh.PASS)
+        self.assertIn(LOCAL + ", byte for byte the host's copy", self.claim(found, "byte for byte").claim)
+
+
+class RunningConfigLoadTest(LoadTest):
+    def test_a_relative_running_config_refuses(self):
+        self.refuses(full_doc(running_config="run/router.json"), "running_config must be an absolute")
+
+    def test_running_config_equal_to_local_config_refuses(self):
+        self.refuses(full_doc(running_config="/opt/ex/local/router.json"), "is local_config itself")
+
+    def test_running_config_inside_the_key_dir_refuses(self):
+        self.refuses(full_doc(running_config=KEY_DIR + "/router.json"), "overlaps the key")
+
+    def test_an_unknown_keys_member_still_refuses(self):
+        self.refuses(full_doc(running_copy=RUN), "optionally running_config")

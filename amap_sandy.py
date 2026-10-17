@@ -3584,6 +3584,13 @@ def hop_router_keys(policy: Dict[str, Any], state_dir: Path, overlay: Optional[P
             or os.path.realpath(spec.keys.local_config) == os.path.realpath(rendered)):
         problems.append(f"the host-setup document's keys.local_config is {spec.keys.local_config}, not {rendered}, "
                         f"the router config this renders: the no-signing check would read another file")
+    run_cfg = spec.keys.running_config if spec is not None and spec.keys is not None else None
+    if rendered is not None and run_cfg:
+        home_dir = os.path.realpath(Path(rendered).parents[2])
+        real = os.path.realpath(run_cfg)
+        if real == os.path.realpath(rendered) or real == home_dir or real.startswith(home_dir + os.sep):
+            problems.append(f"the host-setup document's keys.running_config {run_cfg} lies under $SANDY_HOME "
+                            f"({home_dir}): the copy the router reads must be root-placed outside it")
     return keys, problems
 
 

@@ -26,6 +26,13 @@ The host-setup document's `keys` section (it needs a `hub` section) names:
   approved block under the static part of that matrix
   (`verify_start_delegation`). Either passes only when the router reads
   this file, byte for byte.
+- `running_config` (optional): a root-placed byte copy of `local_config`
+  that the local router reads instead, for a router whose account cannot
+  read the operator's home. With it, the router must read THIS path, and its
+  bytes must be `local_config`'s: install still renders and binds
+  `local_config`, and the copy is only ever the same bytes elsewhere. verify
+  checks it is a regular file owned by root that no one else can write, under
+  root-owned directories (`verify_running_config`).
 
 The key-read probe runs the email router's own rendered run spec with only
 these changes: removed after `run`, no network, its own name and labels, no
@@ -121,6 +128,7 @@ class KeySpec:
     uid: int
     gid: int
     volume: str               # the secret volume, the one mount the probe drops
+    running_config: Optional[str] = None   # a root-placed byte copy the router reads instead
 
     @property
     def path(self) -> str:
@@ -148,12 +156,17 @@ def _related(a: str, b: str) -> bool:
 def load(sec: Any, spec: Any) -> KeySpec:
     if spec.hub is None:
         raise KeySpecError("the keys section needs a hub section")
-    if not isinstance(sec, dict) or set(sec) != {"dir", "file", "evidence_dir", "local_config"}:
-        raise KeySpecError("keys must have exactly dir, file, evidence_dir and local_config")
+    base = {"dir", "file", "evidence_dir", "local_config"}
+    if not isinstance(sec, dict) or set(sec) not in (base, base | {"running_config"}):
+        raise KeySpecError("keys must have exactly dir, file, evidence_dir and local_config, and optionally "
+                           "running_config")
     if not isinstance(sec["file"], str) or not _NAME.fullmatch(sec["file"]):
         raise KeySpecError("keys.file must be one file name")
     d, ev = _abs(sec["dir"], "dir"), _abs(sec["evidence_dir"], "evidence_dir")
     cfg = _abs(sec["local_config"], "local_config")
+    run = _abs(sec["running_config"], "running_config") if "running_config" in sec else None
+    if run is not None and run == cfg:
+        raise KeySpecError("keys.running_config is local_config itself; leave it out instead")
     hs = spec.hub
     local = next(up for name, up, _down, _env in spec.hops if name == hs.hop)
     s = spec.secrets
@@ -175,9 +188,11 @@ def load(sec: Any, spec: Any) -> KeySpec:
     for o in [x for x in others if x != ev] + [d]:
         if _related(ev, o):
             raise KeySpecError(f"keys.evidence_dir {ev} overlaps {o}; no runtime may reach the evidence")
+    if run is not None and (_related(run, d) or _related(run, ev)):
+        raise KeySpecError(f"keys.running_config {run} overlaps the key or the evidence directory")
     p = spec.principals[local]
     return KeySpec(dir=d, file=sec["file"], evidence_dir=ev, local_config=cfg, principal=local, uid=p.uid,
-                   gid=p.gids[0], volume=s.volume)
+                   gid=p.gids[0], volume=s.volume, running_config=run)
 
 
 # --- The probe ------------------------------------------------------------------
@@ -872,8 +887,13 @@ def ask_status(spec: Any, container: str) -> Any:
 def _bind(ks: KeySpec, live: Any, read_bytes_: Callable[[str], bytes]) -> Tuple[Any, rh.Check]:
     """One read of `local_config` (its bytes, or an Unresolved) and the
     check that the running local router reads it byte for byte (`live`,
-    from inside its container)."""
-    bind_claim = f"the local router reads {ks.local_config}, byte for byte the host's copy"
+    from inside its container): at `local_config` itself, or, when the
+    document names one, at `running_config`, the copy it reads instead."""
+    target = ks.running_config or ks.local_config
+    if ks.running_config:
+        bind_claim = f"the local router reads {target}, byte for byte {ks.local_config}"
+    else:
+        bind_claim = f"the local router reads {ks.local_config}, byte for byte the host's copy"
     try:
         raw: Any = read_bytes_(ks.local_config)
         host_sha: Any = _sha(raw)
@@ -881,11 +901,15 @@ def _bind(ks: KeySpec, live: Any, read_bytes_: Callable[[str], bytes]) -> Tuple[
         raw = host_sha = rh.Unresolved(f"{ks.local_config} is absent")
     except (OSError, ValueError) as e:
         raw = host_sha = rh.Unresolved(f"cannot read {ks.local_config}: {e}")
-    bind_want = _fact("live config", (ks.local_config, host_sha if isinstance(host_sha, str) else None),
-                      "keys.local_config, which install binds to the router.json it renders, and its bytes "
-                      "on the host")
-    bind_remedy = (f"start the local router with docker/run.sh --config {ks.local_config}, the file install "
-                   "renders, and never a copy")
+    bind_want = _fact("live config", (target, host_sha if isinstance(host_sha, str) else None),
+                      "keys.running_config where the document names it, else keys.local_config, and the bytes "
+                      "of keys.local_config, which install binds to the router.json it renders")
+    if ks.running_config:
+        bind_remedy = (f"copy {ks.local_config} byte for byte to {target} as root, then start the local router "
+                       f"with docker/run.sh --config {target}")
+    else:
+        bind_remedy = (f"start the local router with docker/run.sh --config {ks.local_config}, the file install "
+                       "renders, and never a copy")
     if isinstance(host_sha, rh.Unresolved):
         return raw, rh.unknown(bind_claim, bind_want, host_sha.reason, "render and place the local router's config")
     if live is None or isinstance(live, rh.Unresolved):
@@ -966,6 +990,29 @@ def verify_no_delegation(ks: KeySpec, live: Any = None,
                             status=rh.Unresolved("the local router's status.json was not read"),
                             witness=lambda h: (rh.UNKNOWN, "the local router was not watched"), now=time.time())
     return out + [verify_signing(ks, raw, bind, sg)]
+
+
+def verify_running_config(ks: KeySpec, lstat: Callable) -> List[rh.Check]:
+    """The copy the router reads, when the document names one: a regular
+    file, not a link, owned by root and writable by no one else, under
+    root-owned directories no one else can write. Nothing when it names none."""
+    if not ks.running_config:
+        return []
+    why = "the router reads this copy, so only root may change it between the check and the read"
+    st = _lst(ks.running_config, lstat)
+    claim = f"the running config {ks.running_config} is a root-owned regular file no one else can write"
+    want = _fact("running config", (0, False), why)
+    remedy = f"place it as root: install -o 0 -m 0644 {ks.local_config} {ks.running_config}"
+    if isinstance(st, rh.Unresolved):
+        out = [rh.unknown(claim, want, st.reason, remedy)]
+    elif st is None or not stat.S_ISREG(st.st_mode):
+        out = [rh.check(claim, want, "absent" if st is None else "not a regular file (a link or another type)",
+                        remedy, do_not="never point running_config at a link to the rendered file")]
+    else:
+        out = [rh.check(claim, want, (st.st_uid, bool(st.st_mode & (stat.S_IWGRP | stat.S_IWOTH))), remedy)]
+    out.append(ss._owned_chain(f"every directory above {ks.running_config} is root-owned and not group- or "
+                               f"world-writable", ks.running_config, (0,), why, lstat))
+    return out
 
 
 def verify_evidence_dir(ks: KeySpec, lstat: Callable) -> List[rh.Check]:
@@ -1108,6 +1155,7 @@ def checks(spec: Any, ks: KeySpec, *, lstat: Callable = os.lstat, read_json_: Ca
     out += verify_no_delegation(ks, ask_live_config(spec, local_container(spec, ks)) if live is ASK else live,
                                 read_bytes_, signing)
     out += verify_evidence_dir(ks, lstat)
+    out += verify_running_config(ks, lstat)
     out += verify_evidence_binds(ks, ask_containers(spec) if containers is ASK else containers, stat_, realpath)
     out += verify_evidence(spec, ks, lstat, read_json_)
     if d7_hash is ASK:

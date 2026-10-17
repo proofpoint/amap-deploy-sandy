@@ -1538,6 +1538,7 @@ def _start_checks(spec: Spec, *, lstat: Callable = os.lstat, digest: Callable[[s
         out += hk.verify_start_delegation(spec.keys, live, k.get("read_bytes_", hk.read_bytes),
                                           start_inputs(spec, policy_on, partition or {}))
         out += hk.verify_evidence_dir(spec.keys, lstat)
+        out += hk.verify_running_config(spec.keys, lstat)
         out += hk.verify_evidence_binds(spec.keys, hk.ask_containers(spec) if k.get("containers", hr.ASK)
                                         is hr.ASK else k["containers"])
         out += hk.verify_evidence(spec, spec.keys, lstat, k.get("read_json_", hk.read_json))

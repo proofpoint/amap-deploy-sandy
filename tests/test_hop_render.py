@@ -393,6 +393,25 @@ class InstallTest(unittest.TestCase):
         self.assertEqual(len(bad), 1, bad)
         self.assertIn("keys.local_config is " + local, bad[0])
 
+    def test_keys_running_config_must_lie_outside_sandy_home(self):
+        """The copy the router reads is root-placed outside $SANDY_HOME, the
+        operator's tree install writes; local_config stays the rendering."""
+        rendered = self.t / "home" / "features" / "amap" / "router.json"
+        for run, refused in ((str(self.t / "home" / "copy.json"), True),
+                             (str(rendered), True), (str(self.t / "run" / "router.json"), False)):
+            with self.subTest(run=run):
+                d = doc()
+                d["keys"]["local_config"] = str(rendered)
+                d["keys"]["running_config"] = run
+                overlay = self.t / "overlay-run.json"
+                overlay.write_text(json.dumps({hs.OVERLAY_SECTION: d}))
+                try:
+                    keys, bad = prov.hop_router_keys(self.policy, self.t / "state", overlay, rendered=rendered)
+                except Exception as e:
+                    keys, bad = None, [str(e)]
+                hit = [b for b in bad if "running_config" in b]
+                self.assertEqual(bool(hit), refused, bad)
+
     def test_hop_state_without_hop_link_refuses_unless_decommissioned(self):
         p = self.t / "state" / "a" / "gen-1" / "transport" / "hop.json"
         p.parent.mkdir(parents=True)
