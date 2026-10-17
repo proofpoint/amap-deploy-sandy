@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 
 import host_steps as hs
 
@@ -156,9 +157,14 @@ class ProbeToolsTest(unittest.TestCase):
 
 
 class LiveEngineGateTest(unittest.TestCase):
-    """Codex and Opus B2 at 3355eda0: no live engine call runs once the tool
-    rows find docker (or sudo, or the lock route's python3) not root's alone.
-    Every observation is the refusal, as UNKNOWN, and rh.run is never reached."""
+    """d3.3 §5(c), Codex B2 at 1c3f431c: no live engine call runs unless every
+    prerequisite PASSes (the interpreter, docker and sudo by their tool rows,
+    the writer by its pin, docker's startup closure computed as the operator),
+    on the held and the lock-wrapped route alike. Every observation is then
+    the refusal, as UNKNOWN, and rh.run is never reached. On the sudo route a
+    call is `sudo -n` and the §3 grammar, with the document's engine."""
+
+    PIN = "b" * 64
 
     def setUp(self):
         import test_secret_setup as tss
@@ -173,47 +179,132 @@ class LiveEngineGateTest(unittest.TestCase):
             f[path] = self.tss.fl(0o755, self.tss.OP)
         return self.tss.lstat_of(f)
 
-    def test_the_sudo_route_is_refused_when_docker_or_sudo_is_not_roots(self):
+    def gate(self, s, table=None, digest=None, closure=None, engine=None):
         import secret_setup as ss
-        s = self.tss.spec(docker_via_sudo=True)
-        for bad in ({"docker": "/usr/local/bin/docker"}, {"sudo": "/usr/bin/sudo"}):
-            with self.subTest(bad=bad):
-                with ss.trust_gate(s, self.table(**bad)):
-                    got = ss.ask_volume(s, "r1", held=True)
+        return ss.trust_gate(s, table or self.table(), lambda p: p, engine=engine,
+                             digest=digest or (lambda p: self.PIN), closure=closure or (lambda s_: None))
+
+    def refused(self, s, why, **gate):
+        import secret_setup as ss
+        for held in (True, False):
+            with self.subTest(held=held, why=why):
+                with self.gate(s, **gate):
+                    got = ss.ask_volume(s, "r1", held=held)
                 self.assertIsInstance(got, ss_rh().Unresolved)
-                self.assertIn(f"not run: {next(iter(bad))} not root's alone", got.reason)
+                self.assertIn(why, got.reason)
                 self.assertEqual(self.calls, [])
 
-    def test_the_direct_route_is_refused_too_and_a_root_docker_runs(self):
-        import secret_setup as ss
-        s = self.tss.spec()
-        with ss.trust_gate(s, self.table(docker="/usr/local/bin/docker")):
-            self.assertIsInstance(ss.ask_volume(s, "r1", held=True), ss_rh().Unresolved)
-        self.assertEqual(self.calls, [])
-        with ss.trust_gate(s, self.table()):
-            ss.ask_volume(s, "r1", held=True)
-        self.assertEqual(self.calls[0][0], "/usr/local/bin/docker")
+    def test_the_sudo_route_is_refused_when_docker_or_sudo_is_not_roots(self):
+        s = self.tss.spec(docker_via_sudo=True)
+        for name, path in (("docker", "/usr/local/bin/docker"), ("sudo", "/usr/bin/sudo")):
+            self.refused(s, f"not run: {name} not root's alone", table=self.table(**{name: path}))
 
-    def test_the_lock_route_also_needs_python3_roots(self):
+    def test_the_interpreter_is_a_prerequisite_on_both_routes(self):
+        for via in (True, False):
+            self.refused(self.tss.spec(docker_via_sudo=via), "not run: python3 not root's alone",
+                         table=self.table(python3="/usr/bin/python3"))
+
+    def test_a_writer_that_is_not_the_pinned_one_runs_no_engine(self):
+        """Codex's witness at 1c3f431c: a writer-pin FAIL still dispatched."""
+        for via in (True, False):
+            self.refused(self.tss.spec(docker_via_sudo=via), "not the pinned one", digest=lambda p: "0" * 64)
+
+    def test_a_closure_not_roots_alone_runs_no_engine(self):
+        for via in (True, False):
+            self.refused(self.tss.spec(docker_via_sudo=via), "startup closure is not root's alone: libz",
+                         closure=lambda s_: "libz is the operator's")
+
+    def test_a_closure_check_that_cannot_be_imported_refuses(self):
+        """In a bundle without the writer's module, the gate refuses: it never
+        passes a closure it could not compute."""
+        import sys
+        import secret_setup as ss
+        had = "host_steps" in sys.modules
+        before = sys.modules.get("host_steps")
+        self.addCleanup(lambda: sys.modules.__setitem__("host_steps", before) if had
+                        else sys.modules.pop("host_steps", None))
+        sys.modules["host_steps"] = None
+        why = ss._operator_closure(self.tss.spec())
+        self.assertIsInstance(why, str, "an unimportable closure check passed")
+        self.assertIn("not importable", why)
+
+    def test_the_direct_route_runs_the_operators_own_docker_when_everything_passes(self):
         import secret_setup as ss
         s = self.tss.spec()
-        with ss.trust_gate(s, self.table(python3="/usr/bin/python3")):
-            self.assertIsInstance(ss.ask_volume(s, "r1", held=False), ss_rh().Unresolved)
-            self.assertEqual(self.calls, [])
+        with self.gate(s):
             ss.ask_volume(s, "r1", held=True)
-        self.assertEqual(self.calls[0][0], "/usr/local/bin/docker", "the held route runs no python3")
+        self.assertEqual(self.calls[0][:3], ["/usr/local/bin/docker", "run", "--rm"])
+
+    def sudo_prefix(self, s, engine):
+        """Built here from the spec, not from live_docker: §3's positional grammar under sudo."""
+        tools = sorted(t for t in set(s.tools.values()) if not t.endswith("/sudo"))
+        return ([s.tools["sudo"], "-n", "/usr/bin/env", "-i", "PATH=/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL=C"]
+                + ([f"DOCKER_HOST={engine}"] if engine else [])
+                + ["/bin/sh", "-c", "command . /opt/ex/libexec/root-trust.sh && command -v root_exec >/dev/null "
+                                    "|| exit 12; root_exec \"$@\"", "sh", self.PIN, s.tools["python3"],
+                   "/opt/ex/libexec/host_steps.py", "trusted-exec"]
+                + [x for t in tools for x in ("--tool", t)] + ["--", s.tools["docker"]])
+
+    def test_the_sudo_route_is_the_section_3_grammar_with_the_documents_engine_on_both_routes(self):
+        import secret_setup as ss
+        s = self.tss.spec(docker_via_sudo=True)
+        want = self.sudo_prefix(s, "unix:///var/run/docker.sock")
+        with self.gate(s, engine="unix:///var/run/docker.sock"):
+            ss.ask_volume(s, "r1", held=True)
+            ss.ask_volume(s, "r2", held=False)
+        held, locked = self.calls
+        self.assertEqual(held[:len(want) + 2], want + ["run", "--rm"])
+        self.assertEqual(locked[:7], [s.tools["python3"], "-I", "-S", s.writer, "lock", s.run_dir, "--"])
+        self.assertEqual(locked[7:7 + len(want) + 2], want + ["run", "--rm"])
+        self.assertNotIn("sudo", " ".join(held[2:]), "root's argv never holds sudo")
+
+    def test_an_inner_gate_keeps_the_outer_gates_engine(self):
+        import secret_setup as ss
+        s = self.tss.spec(docker_via_sudo=True)
+        with self.gate(s, engine="unix:///x.sock"):
+            with self.gate(s):
+                argv = ss.live_docker(s)
+        self.assertIn("DOCKER_HOST=unix:///x.sock", argv)
+
+    def test_host_setup_opens_the_gate_with_the_documents_engine(self):
+        import host_setup as hs
+        import secret_setup as ss
+        got = []
+        self.addCleanup(setattr, ss, "trust_gate", ss.trust_gate)
+        ss.trust_gate = lambda s, lstat, realpath, engine=None, **k: got.append(engine)
+        spec = SimpleNamespace(secrets=object(), supervision=SimpleNamespace(engine="unix:///e.sock"))
+        hs._trust_gate(spec, lambda p: None, None)
+        self.assertEqual(got, ["unix:///e.sock"])
 
     def test_the_exposure_sweep_asks_no_engine(self):
         import secret_exposure as se
-        import secret_setup as ss
         import test_secret_exposure as tse
         spec_x, sx = tse.specs()
-        with ss.trust_gate(sx, self.table(docker=sx.tools["docker"])):
+        with self.gate(sx, table=self.table(docker=sx.tools["docker"])):
             found = se.checks(spec_x, sx, lstat_=lambda p: tse.Id(1, 1), stat_=tse.stat_of(), realpath=lambda p: p,
                               lock=tse.free_lock, platform="linux")
         self.assertEqual(self.calls, [])
         self.assertEqual([(c.result, c.reason) for c in found if c.result != ss_rh().PASS],
                          [(ss_rh().UNKNOWN, "not run: docker not root's alone")])
+
+    def test_verify_dispatches_no_one_shot_after_a_writer_pin_fail(self):
+        """Codex's aggregator witness: the REAL ss.checks, every tool root's,
+        the closure passing; a wrong writer digest leaves the pin row FAIL and
+        the volume one-shot is never dispatched. The control dispatches it."""
+        import secret_setup as ss
+        self.addCleanup(setattr, ss, "_operator_closure", ss._operator_closure)
+        ss._operator_closure = lambda s_: None
+        f = self.tss.fs()
+        for digest, dispatched in (("0" * 64, False), (self.PIN, True)):
+            with self.subTest(digest=digest[:1]):
+                self.calls.clear()
+                found = ss.checks(self.tss.spec(), lstat=self.tss.lstat_of(f), digest=lambda p, d=digest: d,
+                                  read=self.tss.reader(self.tss.files()), platform="linux",
+                                  listdir=lambda p: [], realpath=lambda p: p, now=self.tss.NOW, held=True,
+                                  stat_=self.tss.identity_of(f), exists=lambda p: False)
+                self.assertEqual(any("run" in c for c in self.calls), dispatched, self.calls)
+                pin = [c for c in found if c.claim.endswith("hashes to its pin")]
+                self.assertEqual(pin[0].result, ss_rh().PASS if dispatched else ss_rh().FAIL)
 
     def test_verify_with_its_real_tool_rows_runs_no_engine_after_a_docker_fail(self):
         """Codex's own_b2 shape: ss.checks with the REAL verify_tools, an

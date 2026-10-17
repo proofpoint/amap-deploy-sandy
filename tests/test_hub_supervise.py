@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 import plistlib
+import posixpath
 import shlex
 import shutil
 import signal
@@ -207,6 +208,17 @@ def rt_anchor_head():
 
 
 class LaunchdTest(unittest.TestCase):
+    def test_the_wrappers_error_stream_is_root_owned_beside_its_status(self):
+        """d3.3 §5 B3: a StandardErrorPath, in the root-owned status directory."""
+        s = spec("launchd")
+        doc = plistlib.loads(hv.hub_plist(s))
+        err = posixpath.join(posixpath.dirname(s.supervision.hub["status"]), "hub-link-run.err")
+        self.assertEqual(doc.get("StandardErrorPath"), err)
+        rows = [c for c in hv.checks(s, lstat=lambda p: st_(0o755, kind=stat.S_IFDIR) if p != err
+                                     else st_(0o666), read=lambda p: b"", ancestor=lambda c, o: True, label=None)
+                if err in c.claim and c.claim.endswith("not group- or world-writable")]
+        self.assertIn(rh.FAIL, [c.result for c in rows], "a group/world-writable error stream fails")
+
     def test_the_daemon_runs_the_wrapper_only_through_sh(self):
         s = spec("launchd")
         doc = plistlib.loads(hv.hub_plist(s))
@@ -436,6 +448,74 @@ class WrapperTest(unittest.TestCase):
                 p.stdout.close(); p.stderr.close()
                 (self.stub / "hold").unlink()
                 (self.stub / "refuse_stop").unlink()
+
+    def b3(self, shell, setup):
+        """Run the wrapper with the barrier refusing, the status dir as
+        `setup` leaves it; its stderr is what launchd writes to the
+        StandardErrorPath. Then the verifier's two status rows, on real files."""
+        for f in ("log", "state", "code"):
+            (self.stub / f).unlink(missing_ok=True)
+        setup()
+        (self.stub / "untrusted").touch()
+        try:
+            r = subprocess.run(shell + [str(self.script)], env={"STUB": str(self.stub), "PATH": "/usr/bin:/bin"},
+                               capture_output=True, text=True, timeout=30)
+        finally:
+            (self.stub / "untrusted").unlink()
+            os.chmod(self.t, 0o755)
+        (self.t / hv.ERR_NAME).write_text(r.stderr)
+        sp = dataclasses.replace(self.spec_, supervision=dataclasses.replace(
+            self.spec_.supervision, hub=dict(self.spec_.supervision.hub, status=str(self.t / "status"))))
+        rows = [(c.claim.split(" ")[2], c.result)
+                for c in hv.verify_wrapper_status(sp, os.lstat, lambda p: open(p, "rb").read())
+                if c.claim.startswith(("the wrapper's status", "the wrapper's last line"))]
+        return r, dict(rows)
+
+    def test_b3_a_refusal_whose_record_fails_leaves_no_status_and_verify_fails(self):
+        for shell in self.SHELLS:
+            with self.subTest(shell=shell):
+                def setup():
+                    (self.t / "status").write_text("0 old-observation\n")
+                    (self.t / "status.tmp").mkdir(exist_ok=True)
+                r, rows = self.b3(shell, setup)
+                (self.t / "status.tmp").rmdir()
+                self.assertEqual(r.returncode, 1)
+                self.assertFalse((self.t / "status").exists())
+                self.assertEqual(rows, {"status": rh.FAIL, "last": rh.FAIL})
+
+    def test_b3_a_refusal_that_can_neither_record_nor_remove_still_fails_verify(self):
+        """Codex's witness: a mode-0555 status directory; the old success
+        survives, and only the error stream's last line tells the truth."""
+        for shell in self.SHELLS:
+            with self.subTest(shell=shell):
+                def setup():
+                    (self.t / "status").write_text("0 old-observation\n")
+                    os.chmod(self.t, 0o555)
+                r, rows = self.b3(shell, setup)
+                self.assertEqual(r.returncode, 1)
+                self.assertEqual((self.t / "status").read_text(), "0 old-observation\n", "the old record survives")
+                self.assertIn("could not be removed", r.stderr)
+                self.assertIn(hv.UNRECORDED, r.stderr)
+                self.assertEqual(rows, {"status": rh.PASS, "last": rh.FAIL},
+                                 "the stale record reads as a success; the unrecorded refusal is what fails")
+
+    def test_b3_a_missing_status_is_a_fail_never_not_started(self):
+        sp = self.spec_
+        status = sp.supervision.hub["status"]
+        reads = {}
+
+        def read(p):
+            if p not in reads:
+                raise FileNotFoundError(p)
+            return reads[p]
+        for content, want in ((None, rh.FAIL), (b"untrusted_tools 2026-10-17T00:00:00Z\n", rh.FAIL),
+                              (b"0 2026-10-17T00:00:00Z\n", rh.PASS), (b"orphan_running 2026-10-17T00:00:00Z\n", rh.PASS)):
+            with self.subTest(content=content):
+                reads.clear()
+                if content is not None:
+                    reads[status] = content
+                [row] = [c for c in hv.verify_wrapper_status(sp, os.lstat, read) if c.claim.startswith("the wrapper's status")]
+                self.assertEqual(row.result, want)
 
 
 def st_(mode, uid=0, nlink=1, kind=stat.S_IFREG, gid=0):

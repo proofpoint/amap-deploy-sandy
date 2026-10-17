@@ -1793,7 +1793,15 @@ def elf_dynamic(path):
                     if base is None:
                         raise Tooling(f"{path} names a run path its string table cannot place")
                     raw = data[base + val:].split(b"\0", 1)[0].decode("ascii")
-                    paths += [p for p in raw.split(":") if p]
+                    for p in raw.split(":"):
+                        # An empty entry is the working directory to the loader, and a relative one is
+                        # under it: a place nothing here can judge. Never dropped, always refused.
+                        if not p:
+                            raise Tooling(f"{path}'s run path {raw!r} has an empty entry, which the loader "
+                                          "reads as the working directory")
+                        if not p.startswith(("/", "$")):     # a token other than $ORIGIN refuses in _elf_closure
+                            raise Tooling(f"{path}'s run path entry {p!r} is relative to the working directory")
+                        paths.append(p)
         return interp, paths
     except (struct.error, UnicodeDecodeError, IndexError) as e:
         raise Tooling(f"{path}: its ELF headers cannot be read: {e}") from None
@@ -1964,7 +1972,9 @@ def loader_dirs(platform=None, read=None, glob_=None):
     """The directories the loader searches or reads its configuration from,
     each judged (with the directories above it) when it exists: Linux's
     ld.so.cache and ld.so.conf with every file it includes and every
-    directory those name; macOS's dyld fallback directories."""
+    directory those name, read as root-trust.sh's _rt_conf reads them (an
+    unreadable file or an entry neither `include` nor absolute refuses);
+    macOS's dyld fallback directories."""
     if (platform or sys.platform) == "darwin":
         return list(DYLD_FALLBACK_DIRS)
     import glob as globmod
@@ -1978,8 +1988,10 @@ def loader_dirs(platform=None, read=None, glob_=None):
         done.add(conf)
         try:
             text = read(conf)
-        except OSError:
-            continue
+        except FileNotFoundError:
+            continue        # no ld.so.conf: the loader reads none
+        except OSError as e:
+            raise Tooling(f"{conf} cannot be read: {e.strerror}") from None
         for line in text.splitlines():
             line = line.split("#", 1)[0].strip()
             if not line:
@@ -1993,6 +2005,9 @@ def loader_dirs(platform=None, read=None, glob_=None):
                     todo.append(f)
             elif line.startswith("/"):
                 out.append(line)
+            else:
+                # the same textual rule as root-trust.sh's _rt_conf: an entry this does not read refuses
+                raise Tooling(f"{conf} names an entry this check does not read ({line})")
     return sorted(set(out))
 
 

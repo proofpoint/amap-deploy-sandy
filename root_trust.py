@@ -241,15 +241,52 @@ _rt_under() {
   /usr/bin/find -P "$1" -mindepth 1 -type l -exec /bin/sh -c '. "$0" && _rt_hop_each "$@"' "$_rt_self" {} + \
     || _rt_fail "$1" "holds a link whose route is not root's alone"
 }
+_rt_conf() {
+  local f line pat
+  f=$1
+  _rt_has "conf:$f" && return 0
+  _rt_add "conf:$f"
+  _rt_route "$f"
+  _rt_file "$f" read
+  while IFS= read -r line || [ -n "$line" ]; do
+    line=${line%%#*}
+    line=${line#"${line%%[![:space:]]*}"}
+    line=${line%"${line##*[![:space:]]}"}
+    case $line in
+      '') ;;
+      include\ *)
+        pat=${line#include }
+        pat=${pat#"${pat%%[![:space:]]*}"}
+        case $pat in /*) ;; *) _rt_dir "$f"; _rt_join "$_rt_d" "$pat"; pat=$_rt_j ;; esac
+        _rt_print "$pat"
+        _rt_include "$pat" ;;
+      /*)
+        _rt_print "$line"
+        _rt_up "$line"
+        if [ -e "$line" ] || [ -L "$line" ]; then _rt_visit "$line" chain; fi ;;
+      *) _rt_fail "$f" "names an entry this check does not read ($line)" ;;
+    esac
+  done < "$f" || _rt_fail "$f" "cannot be read"
+}
+_rt_include() {
+  local i
+  set +f
+  set -- $1
+  set -f
+  for i in "$@"; do
+    if [ -e "$i" ] || [ -L "$i" ]; then _rt_conf "$i"; fi
+  done
+  return 0
+}
 _rt_loader_config() {
   if [ -e "$_rt_preload" ] || [ -h "$_rt_preload" ]; then _rt_fail "$_rt_preload" "is present: the loader maps it into every process"; fi
-  for _rt_c in "$_rt_ldcache" "$_rt_ldconf"; do
-    if [ -e "$_rt_c" ] || [ -L "$_rt_c" ]; then _rt_route "$_rt_c"; _rt_file "$_rt_c" read; fi
-  done
+  if [ -e "$_rt_ldcache" ] || [ -L "$_rt_ldcache" ]; then _rt_route "$_rt_ldcache"; _rt_file "$_rt_ldcache" read; fi
   if [ -e "$_rt_ldconfd" ] || [ -L "$_rt_ldconfd" ]; then _rt_tree "$_rt_ldconfd"; fi
+  # every directory ld.so.conf names, through every file it includes (d3.3 §3.0)
+  if [ -e "$_rt_ldconf" ] || [ -L "$_rt_ldconf" ]; then _rt_conf "$_rt_ldconf"; fi
 }
 _rt_libs() {
-  local out err rc line lib n h found
+  local out err rc line lib n h r found
   if [ "$_rt_trace" = 1 ]; then
     out=$(LD_TRACE_LOADED_OBJECTS=1 "$_rt_loader" "$1" 2>/dev/null; r=$?; printf .; exit "$r"); rc=$?
     err=$(LD_TRACE_LOADED_OBJECTS=1 "$_rt_loader" "$1" 2>&1 >/dev/null)
@@ -266,8 +303,14 @@ _rt_libs() {
   found=
   while IFS= read -r line; do
     case $line in
-      "$_rt_tab"linux-vdso.so.1\ \(0x*\)|"$_rt_tab"linux-gate.so.1\ \(0x*\)) continue ;;
-      "$_rt_tab"linux-vdso.so.1\ =\>\ \ \(0x*\)|"$_rt_tab"linux-gate.so.1\ =\>\ \ \(0x*\)) continue ;;
+      "$_rt_tab"linux-vdso.so.1\ *|"$_rt_tab"linux-gate.so.1\ *)
+        # the whole record, as the Python half's: `(0x<hex>)`, or older glibc's `=>  (0x<hex>)`
+        r=${line#"$_rt_tab"linux-????.so.1" "}
+        case $r in "=>  (0x"*) r=${r#"=>  "} ;; esac
+        h=${r#"(0x"}; h=${h%")"}
+        [ "$r" = "(0x$h)" ] || _rt_fail "$1" "the loader printed a line outside the list mode's forms ($line)"
+        case $h in ''|*[!0-9a-f]*) _rt_fail "$1" "the loader printed a line outside the list mode's forms ($line)" ;; esac
+        continue ;;
       "$_rt_tab"/*" => "*) _rt_fail "$1" "the loader maps a path onto another ($line): its PT_INTERP is not the anchor's" ;;
       "$_rt_tab"?*" => /"*" (0x"*")") n=${line#"$_rt_tab"}; n=${n%% => *}; lib=${line#* => } ;;
       "$_rt_tab"/*" (0x"*")") n=; lib=${line#"$_rt_tab"} ;;
@@ -392,6 +435,20 @@ def root_line(rt: str, sha256: str, python3: str, writer: str, args: List[str]) 
     q = shlex.quote
     return f"command . {q(rt)} && command -v root_exec >/dev/null || exit {EXIT}; root_exec {q(sha256)} {q(python3)} {q(writer)} " + \
         " ".join(q(a) for a in args)
+
+
+#: The §3 grammar's sh -c body in its positional form: root_exec takes every
+#: argument from "$@", so a caller may append the command's own arguments.
+POSITIONAL = "command . {rt} && command -v root_exec >/dev/null || exit {exit}; root_exec \"$@\""
+
+
+def root_argv_positional(rt: str, sha256: str, python3: str, writer: str, args: List[str],
+                         engine: Optional[str] = None) -> List[str]:
+    """The §3 grammar as d3.3 writes it: `… /bin/sh -c '<source>; root_exec
+    "$@"' sh <sha256> <python3> <writer> <args…>`. Anything appended to the
+    returned argv reaches root_exec as further arguments, after `args`."""
+    return anchor(engine) + ["/bin/sh", "-c", POSITIONAL.format(rt=shlex.quote(rt), exit=EXIT), "sh",
+                             sha256, python3, writer] + list(args)
 
 
 def root_argv(rt: str, sha256: str, python3: str, writer: str, args: List[str],

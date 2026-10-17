@@ -258,6 +258,19 @@ class ElfDiscoveryTest(Tmp):
         subprocess.run([prog], check=True)
         self.assertTrue(os.path.exists(sentinel), "the control: a real run does")
 
+    def test_an_empty_or_relative_search_entry_refuses_and_is_never_dropped(self):
+        """Codex P1 at 1c3f431c: ':$ORIGIN/lib:' has an empty entry at each
+        end, which the loader reads as the working directory. Read only, never
+        loaded."""
+        for rp, why in ((":$ORIGIN/lib:", "empty entry"), ("$ORIGIN/lib::/opt/rp", "empty entry"),
+                        ("$ORIGIN/lib:", "empty entry"), ("lib", "relative"), ("/opt/a:rel/b", "relative")):
+            with self.subTest(runpath=rp):
+                p = self.put("app/bin/x", elf64(runpath=rp))
+                with self.assertRaisesRegex(hs.Tooling, why):
+                    hs.elf_dynamic(p)
+        p = self.put("app/bin/y", elf64(runpath="$ORIGIN/../lib:/opt/rp:${ORIGIN}/x"))
+        self.assertEqual(hs.elf_dynamic(p)[1], ["$ORIGIN/../lib", "/opt/rp", "${ORIGIN}/x"], "kept whole, in order")
+
     def test_a_runpath_with_another_token_refuses(self):
         loader, _ = hs.elf_dynamic(hs.ANCHOR_SHELL)
         p = self.put("bin/x", elf64(runpath="$LIB/x", interp=loader))
@@ -306,6 +319,19 @@ class ListModeTest(Tmp):
             with self.subTest(line=bad):
                 with self.assertRaises(hs.Tooling):
                     hs.list_mode_libraries("b", self.OK + bad, b"", 0) if bad else hs.list_mode_libraries("b", b"", b"", 0)
+
+    def test_the_shared_grammar_fixtures(self):
+        """The same table test_root_trust holds the sh half to (Codex P2 at 1c3f431c)."""
+        import _listmode
+        good = b"\tlibc.so.6 => /lib/libc.so.6 (0x1)\n"
+        for line, ok in _listmode.LINES:
+            with self.subTest(line=line):
+                out = good + line.format(lib="/lib/libm.so.6").encode() + b"\n"
+                if ok:
+                    hs.list_mode_libraries("b", out, b"", 0)
+                else:
+                    with self.assertRaises(hs.Tooling):
+                        hs.list_mode_libraries("b", out, b"", 0)
 
     def test_stderr_or_a_non_zero_rc_refuses(self):
         with self.assertRaisesRegex(hs.Tooling, "error stream"):
@@ -608,6 +634,24 @@ class LoaderConfigTest(unittest.TestCase):
         for p in ("/etc/ld.so.cache", "/etc/ld.so.conf", "/etc/ld.so.conf.d", "/etc/ld.so.conf.d/a.conf", "/opt/lib",
                   "/usr/local/lib"):
             self.assertIn(p, got)
+
+    def test_an_entry_it_does_not_read_or_an_unreadable_conf_refuses(self):
+        """The same textual rule as root-trust.sh's _rt_conf; a missing
+        ld.so.conf is an empty one."""
+        for text in ("hwcap 1 nosegneg\n", "relative/lib\n", "include\n"):
+            with self.subTest(text=text):
+                with self.assertRaisesRegex(hs.Tooling, "does not read"):
+                    hs.loader_dirs("linux", read=lambda p, t=text: t, glob_=lambda p: [])
+
+        def denied(p):
+            raise PermissionError(13, "Permission denied")
+        with self.assertRaisesRegex(hs.Tooling, "cannot be read"):
+            hs.loader_dirs("linux", read=denied, glob_=lambda p: [])
+
+        def absent(p):
+            raise FileNotFoundError(2, "No such file or directory")
+        self.assertEqual(hs.loader_dirs("linux", read=absent, glob_=lambda p: []),
+                         sorted([hs.LD_SO_CACHE, hs.LD_SO_CONF, hs.LD_SO_CONF_D]))
 
     def test_darwin_names_the_dyld_fallbacks(self):
         self.assertEqual(set(hs.loader_dirs("darwin")), set(hs.DYLD_FALLBACK_DIRS))

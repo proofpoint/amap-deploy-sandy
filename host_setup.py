@@ -1061,10 +1061,13 @@ def read_spec(spec_path: Optional[Path], overlay: Optional[Path]) -> Any:
 def _trust_gate(spec: Spec, lstat: Callable, secrets: Optional[Dict[str, Any]]) -> Any:
     """The live engine route's judgement for a whole run of checks, made with
     the same lstat (and realpath) the tool rows use: no live docker call in the
-    run executes unless those rows prove docker (and sudo) root's alone."""
+    run executes unless every d3.3 §5(c) prerequisite PASSes (the interpreter,
+    the writer, docker's closure, sudo), and on the sudo route each names the
+    document's engine as DOCKER_HOST."""
     if spec.secrets is None:
         return contextlib.nullcontext()
-    return ss.trust_gate(spec.secrets, lstat, (secrets or {}).get("realpath", os.path.realpath))
+    return ss.trust_gate(spec.secrets, lstat, (secrets or {}).get("realpath", os.path.realpath),
+                         engine=spec.supervision.engine if spec.supervision else None)
 
 
 def checks(spec: Spec, *, production: bool, lstat: Callable = os.lstat, secrets: Optional[Dict[str, Any]] = None,

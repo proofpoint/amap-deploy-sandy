@@ -573,6 +573,14 @@ class ShellListModeTest(Fixture):
                 self.assertEqual(r.returncode, rt.EXIT, r.stderr)
         self.bad(self.libs(""), "listed nothing")
 
+    def test_the_shared_grammar_fixtures(self):
+        """The same table test_trusted_exec holds the Python half to (Codex P2 at 1c3f431c)."""
+        import _listmode
+        for line, ok in _listmode.LINES:
+            with self.subTest(line=line):
+                r = self.libs(f"\tlibc.so.6 => {self.lib} (0x1)\n" + line.format(lib=self.lib) + "\n")
+                self.assertEqual(r.returncode, 0 if ok else rt.EXIT, r.stderr)
+
     def test_stderr_or_a_non_zero_rc_refuses(self):
         good = f"\tlibc.so.6 => {self.lib} (0x1)\n"
         self.bad(self.libs(good, err="ld.so: warning\n"), "error stream")
@@ -619,6 +627,60 @@ class ShellListModeTest(Fixture):
         self.assertIn("\n_rt_trace=1\n", rt.render("systemd", "/x/rt.sh", loader="/lib/ld.so"))
         rt.trace_form = lambda: False
         self.assertIn("\n_rt_trace=0\n", rt.render("systemd", "/x/rt.sh", loader="/lib/ld.so"))
+
+
+class LoaderConfTest(Fixture):
+    """d3.3 §3.0 in the sh half (Codex P2 at 1c3f431c): before any discovery,
+    every directory ld.so.conf names, through every file it includes, is
+    judged by the textual walk and the file rule; an entry it does not read
+    refuses."""
+
+    def setUp(self):
+        super().setUp()
+        self.libdir = self.p("lib/one")
+        self.incdir = self.p("lib/two")
+        os.makedirs(self.libdir, mode=0o755)
+        os.makedirs(self.incdir, mode=0o755)
+        self.file("etc/ld.so.conf.d/x.conf", 0o644, f"# included\n{self.incdir}\n")
+        self.conf(f"include ld.so.conf.d/*.conf\n{self.libdir}   # a comment\n\n")
+
+    def conf(self, text):
+        self.file("etc/ld.so.conf", 0o644, text)
+
+    def go(self):
+        return self.sh("_rt_loader_config", etc=self.p("etc"), loader="/lib/ld.so")
+
+    def test_every_named_directory_passes_when_roots_alone(self):
+        r = self.go()
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_a_named_directory_writable_by_others_fails(self):
+        os.chmod(self.libdir, 0o777)
+        r = self.go()
+        self.assertEqual(r.returncode, rt.EXIT, r.stderr)
+        self.assertIn(self.libdir, r.stderr)
+
+    def test_a_directory_named_by_an_included_file_is_judged_too(self):
+        os.chmod(self.incdir, 0o777)
+        r = self.go()
+        self.assertEqual(r.returncode, rt.EXIT, r.stderr)
+        self.assertIn(self.incdir, r.stderr)
+
+    def test_an_absent_directory_is_judged_as_a_would_be_place(self):
+        os.makedirs(self.p("open"), mode=0o755)
+        os.chmod(self.p("open"), 0o777)
+        self.conf(f"{self.p('open/later')}\n")
+        r = self.go()
+        self.assertEqual(r.returncode, rt.EXIT, r.stderr)
+        self.assertIn(self.p("open"), r.stderr)
+
+    def test_an_entry_this_check_does_not_read_refuses(self):
+        for line in ("hwcap 1 nosegneg", "relative/lib", "include"):
+            with self.subTest(line=line):
+                self.conf(f"{self.libdir}\n{line}\n")
+                r = self.go()
+                self.assertEqual(r.returncode, rt.EXIT, r.stderr)
+                self.assertIn("does not read", r.stderr)
 
 
 class LaunchdRootExecTest(Fixture):

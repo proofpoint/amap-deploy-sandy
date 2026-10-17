@@ -3900,7 +3900,7 @@ def build_identity_outcome(args: argparse.Namespace, home: Path) -> rh.Outcome:
     hub_docker = None
     if secrets is not None and supervision is not None:
         try:
-            hub_docker = hsu.ss.live_docker(secrets) + ["-H", supervision.engine]
+            hub_docker = hsu.ss.live_docker(secrets, engine=supervision.engine) + ["-H", supervision.engine]
         except rh.CannotRun as e:
             no_engine = rh.Unresolved(str(e))
 

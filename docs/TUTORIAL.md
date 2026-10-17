@@ -1068,6 +1068,18 @@ but this has not been measured. On either system, if `docker ps` still
 names the hub-link router after a stop, find out why the barrier refused
 before you stop the container by hand.
 
+On macOS the wrapper's error stream goes to `hub-link-run.err`, beside its
+status in the root-owned status directory. `verify` reads both. A missing
+status is a failure, not "never started", because a refusal that cannot
+record itself removes the last one. A refusal is a failure whether or not it
+was recorded.
+
+`verify`'s own live engine calls go through the same barrier. Each runs
+only when the interpreter, the pinned writer, docker's startup closure
+(computed as you) and sudo all pass. On the sudo route each call is
+`sudo -n /usr/bin/env -i … /bin/sh -c '… root_exec …'`, so your sudo must
+let you run `/usr/bin/env` as root without a password, not just docker.
+
 
 ### The weekly partition job's tools
 

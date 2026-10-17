@@ -30,6 +30,13 @@ OTHER = "sha256:" + "b" * 64
 PIN = "1" * 40
 COMMIT = "2" * 40
 ENGINE = "unix:///zz/run/docker.sock"
+#: [2]'s docker on the sudo route (d3.3 §5(c)): sudo -n, then the §3 grammar
+#: with the engine, then docker's own -H; built from the fixture's fields.
+HUB_PREFIX = (["/zz/sudo", "-n", "/usr/bin/env", "-i", "PATH=/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL=C",
+               "DOCKER_HOST=" + ENGINE, "/bin/sh", "-c",
+               "command . /zz/libexec/root-trust.sh && command -v root_exec >/dev/null || exit 12; root_exec \"$@\"",
+               "sh", "d" * 64, "/zz/python3", "/zz/libexec/host_steps.py", "trusted-exec",
+               "--tool", "/zz/docker", "--tool", "/zz/python3", "--", "/zz/docker", "-H", ENGINE])
 LABEL = bi.LABEL
 
 
@@ -1398,8 +1405,10 @@ class InstallAndVerifyTest(unittest.TestCase):
         """A host whose hub is reached through `sudo -n docker`: the shape
         build_identity_outcome reads (no hop router, no plugin pin)."""
         secrets = SimpleNamespace(principal="zz-hub-principal", image="zz-hub:recorded", image_commit=COMMIT,
-                                  docker_via_sudo=True, tools={"sudo": "/zz/sudo", "docker": "/zz/docker"},
-                                  uid=2101, gid=2100)
+                                  docker_via_sudo=True,
+                                  tools={"sudo": "/zz/sudo", "docker": "/zz/docker", "python3": "/zz/python3"},
+                                  writer_dir="/zz/libexec", writer="/zz/libexec/host_steps.py",
+                                  writer_sha256="d" * 64, uid=2101, gid=2100)
         return SimpleNamespace(router=None, hub=SimpleNamespace(dirs={"RELAY_LEDGER_DIR": "/zz/h/ledger"}),
                                secrets=secrets, overlay_path=None, overlay_pin=None,
                                supervision=SimpleNamespace(engine=ENGINE),
@@ -1423,7 +1432,7 @@ class InstallAndVerifyTest(unittest.TestCase):
         self.patch(rh, "run", run)
         self.patch(self.cpin, "pinned_commit", lambda *a, **k: PIN)
         out = self.prov.build_identity_outcome(SimpleNamespace(overlay=None), self.home)
-        prefix = ["/zz/sudo", "-n", "/zz/docker", "-H", ENGINE]
+        prefix = HUB_PREFIX
         self.assertEqual(calls, [prefix + ["inspect", "--type", "container", "zz-hub"],
                                  prefix + ["image", "inspect", "--format", "{{json .Config.Labels}}", OTHER]])
         self.assertEqual([(e["id"], c.result) for e, c in zip(out.extras, out.checks)], [(bi.ID_HUB, rh.PASS)])
@@ -1705,17 +1714,18 @@ class InstallAndVerifyTest(unittest.TestCase):
     def test_the_hub_plugin_is_read_by_one_exec_on_its_engine_and_passes_when_it_advanced(self):
         c, e, calls = self.hub_outcome(self.envelope())
         self.assertEqual((c.result, e.get("observed_sha256")), (rh.PASS, "c" * 64))
-        prefix = ["/zz/sudo", "-n", "/zz/docker", "-H", ENGINE]
-        self.assertTrue(all(a[:5] == prefix for a in calls), calls)
+        prefix = HUB_PREFIX
+        self.assertTrue(all(a[:len(prefix)] == prefix for a in calls), calls)
         kinds = ["exec" if "exec" in a else "ps" if "ps" in a else "image" if "image" in a else "inspect"
                  for a in calls]
         self.assertEqual(kinds, ["inspect", "image", "exec", "ps", "inspect"])
         [ex] = [a for a in calls if "exec" in a]
         self.assertEqual(ex, bi.hub_reader_argv(prefix, container()["Id"], "2101:2100",
                                                 "/data/ledger/hub-status.json"))
-        self.assertEqual(ex[5:15], ["exec", "-u", "2101:2100", container()["Id"], "python3", "-I", "-S", "-c",
+        n = len(prefix)
+        self.assertEqual(ex[n:n + 10], ["exec", "-u", "2101:2100", container()["Id"], "python3", "-I", "-S", "-c",
                                     bi.HUB_READER, "/data/ledger/hub-status.json"])
-        self.assertEqual(ex[15:], [repr(bi.PROGRESS_STEP_S), repr(bi.PROGRESS_MARGIN_S), repr(bi.WINDOW_MAX_S),
+        self.assertEqual(ex[n + 10:], [repr(bi.PROGRESS_STEP_S), repr(bi.PROGRESS_MARGIN_S), repr(bi.WINDOW_MAX_S),
                                    repr(bi.INTERVAL_CAP_S), str(bi.MAX_STATUS_BYTES), str(bi.HUB_OBS_MAX),
                                    str(bi.HUB_CAPTURE_MAX)])
         # The budget: the exec its own bound, every other call AUX_TIMEOUT_S

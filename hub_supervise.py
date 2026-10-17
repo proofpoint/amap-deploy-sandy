@@ -105,6 +105,13 @@ BARRIER_S = 10
 ORPHAN = "orphan_running"
 #: The wrapper's record when the writer finds docker or python3 not root's alone: nothing ran.
 UNTRUSTED = "untrusted_tools"
+#: The wrapper's error stream, launchd's StandardErrorPath (d3.3 §5 B3): beside
+#: its status, in the root-owned status directory. Its own lines start SAY.
+ERR_NAME = "hub-link-run.err"
+SAY = "hub-link-run: "
+#: What the wrapper says when a refusal could not be recorded: the one line
+#: that tells verify the status beside it may be a stale, earlier one.
+UNRECORDED = "the refusal could not be recorded"
 LAUNCHCTL = "/bin/launchctl"
 WEEKLY_RUN_ID = "weekly"
 REVISION_LABEL = "org.opencontainers.image.revision"
@@ -340,7 +347,7 @@ NAME={q(hub_name(spec))}
 STATUS={q(sup.hub['status'])}
 DOCKER_HOST={q(sup.engine)}
 export DOCKER_HOST
-say() {{ printf 'hub-link-run: %s\\n' "$1" >&2; }}
+say() {{ printf '{SAY}%s\\n' "$1" >&2; }}
 # Every docker call root makes goes through the one barrier, in a subshell (root_exec execs).
 root_docker() {{ ( command . "$RT" && command -v root_exec >/dev/null || exit {rt.EXIT}; root_exec "$SHA" "$PY" "$WR" trusted-exec {tools} -- "$DOCKER" "$@" ); }}
 record() {{
@@ -357,8 +364,8 @@ if ! ( command . "$RT" && command -v root_exec >/dev/null || exit {rt.EXIT}; roo
         say "docker or python3 is not root's alone: nothing was run"
         exit 0
     fi
-    rm -f "$STATUS"
-    say "docker or python3 is not root's alone: nothing was run, and the refusal could not be recorded"
+    rm -f "$STATUS" || say "the last status could not be removed: it may be an earlier one"
+    say "docker or python3 is not root's alone: nothing was run, and {UNRECORDED}"
     exit 1
 fi
 
@@ -415,11 +422,17 @@ esac
 """.encode("utf-8")
 
 
+def err_path(spec: Any) -> str:
+    """The wrapper's StandardErrorPath, beside its status."""
+    return posixpath.join(posixpath.dirname(spec.supervision.hub["status"]), ERR_NAME)
+
+
 def hub_plist(spec: Any) -> bytes:
     h = spec.supervision.hub
     return plistlib.dumps({
         "Label": h["label"],
         "ProgramArguments": rt.anchor() + ["/bin/sh", h["wrapper"]],
+        "StandardErrorPath": err_path(spec),
         "KeepAlive": {"SuccessfulExit": False},
         "ThrottleInterval": RESTART_SEC,
         "RunAtLoad": True,
@@ -783,9 +796,60 @@ def verify_stop_bound(spec: Any) -> List[rh.Check]:
                      do_not="lower STOP_TIMEOUT_S below the router's join bound to make room")]
 
 
+def verify_wrapper_status(spec: Any, lstat: Callable, read: Callable[[str], bytes]) -> List[rh.Check]:
+    """d3.3 §5 B3, launchd: the wrapper's error stream goes to a root-owned
+    place; its status says how the last start ended, and a missing one is a
+    FAIL (a refusal that could not be recorded removes it), never "not
+    started"; a refusal, recorded or not, is a FAIL. When the status could not
+    be removed either, the error stream's last wrapper line says so."""
+    status, err = spec.supervision.hub["status"], err_path(spec)
+    why = "launchd writes the wrapper's error stream as root"
+    remedy = "keep the status directory root's alone, as the plan creates it"
+    out = [ss._owned_chain(f"every directory above {err} is root-owned and not group- or world-writable", err,
+                           (0,), why, lstat)]
+    st = ss._lst(err, lstat)
+    claim = f"{err} is owned by uid 0 and not group- or world-writable"
+    want = _fact("error stream", True, why)
+    if isinstance(st, rh.Unresolved):
+        out.append(rh.unknown(claim, want, st.reason, remedy))
+    elif st is not None:
+        out.append(rh.check(claim, want, st.st_uid == 0 and not st.st_mode & 0o022, remedy))
+    claim = f"the wrapper's status {status} records a start that was not refused"
+    want = _fact("status", True, "the wrapper records every end; a refusal it cannot record removes the last one")
+    remedy = (f"read {err} for why, fix what the barrier refused (verify's tool and closure rows name it), and "
+              "let launchd start the wrapper again")
+    try:
+        got: Any = read(status).decode("utf-8", "replace").split()
+    except FileNotFoundError:
+        got = None
+    except OSError as e:
+        got = rh.Unresolved(f"cannot read {status}: {e}")
+    if isinstance(got, rh.Unresolved):
+        out.append(rh.unknown(claim, want, got.reason, remedy))
+    else:
+        out.append(rh.check(claim, want, bool(got) and got[0] != UNTRUSTED, remedy,
+                            do_not="never write a status by hand: a missing one is the refusal's own evidence"))
+    try:
+        lines = read(err).decode("utf-8", "replace").splitlines()
+    except FileNotFoundError:
+        lines = []
+    except OSError as e:
+        lines = rh.Unresolved(f"cannot read {err}: {e}")
+    claim = f"the wrapper's last line in {err} is not an unrecorded refusal"
+    want = _fact("unrecorded refusal", False, f"the wrapper says \"{UNRECORDED}\" when it could not record one")
+    if isinstance(lines, rh.Unresolved):
+        out.append(rh.unknown(claim, want, lines.reason, remedy))
+    else:
+        mine = [l for l in lines if l.startswith(SAY)]
+        out.append(rh.check(claim, want, bool(mine) and UNRECORDED in mine[-1], remedy))
+    return out
+
+
 def checks(spec: Any, *, lstat: Callable, read: Callable[[str], bytes] = hr.dd.read_file,
            ancestor: Any = ASK, label: Any = ASK) -> List[rh.Check]:
     out = verify_files(spec, lstat, read)
+    if spec.supervision.kind == "launchd":
+        out += verify_wrapper_status(spec, lstat, read)
     out += verify_stop_budget(spec)
     out += verify_stop_bound(spec)
     out += verify_ancestry(spec, (lambda c, o: ask_ancestor(spec, c, o)) if ancestor is ASK else ancestor,
