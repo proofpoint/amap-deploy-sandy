@@ -524,7 +524,10 @@ def render_plan(spec: Spec, overlay_source: Optional[Path] = None,
     if spec.supervision is not None:
         lines += hv.plan(spec, q, steps)
     if spec.partition is not None:
-        lines += ps.plan(spec.partition, spec.gate, q, anchor=spec.secrets.anchor if spec.secrets else None)
+        install = (lambda args: ss.typed_root(spec.secrets, [spec.secrets.tools["install"]] + args, q)) \
+            if spec.secrets is not None else None
+        lines += ps.plan(spec.partition, spec.gate, q, anchor=spec.secrets.anchor if spec.secrets else None,
+                         install=install)
         if spec.supervision is None or spec.secrets is None:
             lines.append("# The weekly job's validation and bundle steps need the supervision and secrets sections "
                          "(the host's kind, the deploy pin and the pinned writer).")

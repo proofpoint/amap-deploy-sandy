@@ -14,11 +14,16 @@ claim names it must stop passing.
 
 import copy
 import json
+import os
+import shlex
 import stat
+import subprocess
+import tempfile
 import unittest
 from collections import namedtuple
 
 import host_setup as hs
+import root_trust as rt
 import router_health as rh
 import secret_setup as ss
 from _gate import open_gate
@@ -789,6 +794,59 @@ class RemedyAndProbeTest(Base):
         ss.ask_volume(s, "r1", held=True)
         self.assertEqual(seen[0][0], "/usr/local/bin/docker")
         self.assertNotIn("lock", seen[0][:6])
+
+
+class TypedRootTest(unittest.TestCase):
+    """d3.3 §5(d): an operator-typed root line is the anchor's sudo, then the
+    §3 grammar, with install the document's own and never a bare name."""
+
+    def test_a_document_without_install_is_refused(self):
+        tools = {k: v for k, v in sec()["tools"].items() if k != "install"}
+        with self.assertRaises(hs.SpecError):
+            spec(tools=tools)
+
+    def test_the_plan_names_the_recorded_install_and_no_bare_one(self):
+        s = spec(tools=dict(sec()["tools"], install="/opt/tools/install"))
+        lines = [ln for ln in ss.render(s, shlex.quote) if not ln.startswith("#")]
+        self.assertTrue(any("/opt/tools/install" in ln for ln in lines))
+        self.assertFalse(any(shlex.split(ln)[1:2] == ["install"] or shlex.split(ln)[:1] == ["install"]
+                             for ln in lines if ln.strip()), lines)
+
+    def test_the_line_is_the_section_3_grammar(self):
+        s = spec()
+        argv = shlex.split(ss.typed_root(s, [s.tools["install"], "-d", "/x y"], shlex.quote))
+        self.assertEqual(argv[0], "/usr/bin/sudo")
+        self.assertNotEqual(argv[1], "-n", "a typed line may prompt: no -n")
+        self.assertEqual(argv[1:1 + len(rt.anchor())], rt.anchor())
+        rest = argv[1 + len(rt.anchor()):]
+        self.assertEqual(rest[:2], ["/bin/sh", "-c"])
+        self.assertEqual(rest[3:8], ["sh", s.writer_sha256, s.tools["python3"], s.writer, "trusted-exec"])
+        self.assertIn(shlex.quote(os.path.join(s.writer_dir, rt.NAME)), rest[2])
+        cut = rest.index("--")
+        self.assertEqual(rest[cut + 1:], [s.tools["install"], "-d", "/x y"])
+        opts = rest[8:cut]
+        self.assertEqual(opts[0::2], ["--tool"] * (len(opts) // 2))
+        self.assertEqual(set(opts[1::2]), {t for t in s.tools.values() if os.path.basename(t) != "sudo"})
+        self.assertFalse(any(os.path.basename(a) == "sudo" for a in rest), "root's argv never holds sudo")
+
+    def test_appended_arguments_reach_root_exec(self):
+        """By execution, not by string: the sh -c body sources root-trust.sh
+        and hands root_exec every argument, those appended to the line too."""
+        s = spec()
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: subprocess.run(["rm", "-rf", d]))
+        stub = os.path.join(d, rt.NAME)
+        with open(stub, "w") as f:
+            f.write('root_exec() { printf "%s\\n" "$@"; }\n')
+        line = ss.typed_root(s, [s.tools["python3"], "-I", "-S", "-B", s.writer], shlex.quote) + " place 'a b' c"
+        argv = shlex.split(line)
+        body = argv[1 + len(rt.anchor()) + 2]
+        args = argv[1 + len(rt.anchor()) + 3:]
+        body = body.replace(shlex.quote(os.path.join(s.writer_dir, rt.NAME)), shlex.quote(stub))
+        out = subprocess.run(["/bin/sh", "-c", body] + args, capture_output=True, text=True, check=True).stdout
+        got = out.split("\n")[:-1]
+        self.assertEqual(got[:4], [s.writer_sha256, s.tools["python3"], s.writer, "trusted-exec"])
+        self.assertEqual(got[got.index("--") + 1:], [s.tools["python3"], "-I", "-S", "-B", s.writer, "place", "a b", "c"])
 
 
 class HostSetupLockTest(unittest.TestCase):

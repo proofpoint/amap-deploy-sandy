@@ -72,7 +72,8 @@ IN_WRITER = "/w"
 IN_VOLUME = "/v"
 LOCK_FILE = "oneshot.lock"
 #: Every tool the checks run; the runbook's own tools are the document's too.
-REQUIRED_TOOLS = ("git", "docker", "python3", "ssh", "ssh-keygen")
+#: install is the plan's root lines' own, and has no bare fallback (d3.3 §5(d)).
+REQUIRED_TOOLS = ("git", "docker", "python3", "ssh", "ssh-keygen", "install")
 #: The tools root executes: docker (the hub's supervisor, the weekly probe and
 #: the one-shots), python3 (the pinned writer's steps), sudo (the operator's
 #: door to root when docker_via_sudo) and install (the plan's root lines). Each
@@ -348,7 +349,7 @@ def render(s: SecretSpec, q: Callable[[str], str]) -> List[str]:
     hash_tool = t.get("sha256sum") or t.get("shasum")
     hash_cmd = (q(hash_tool) + (" -a 256" if hash_tool == t.get("shasum") else "")) if hash_tool \
         else "<the recorded sha256 tool>"
-    install = q(t["install"]) if "install" in t else "install"
+    install = q(t["install"])
     sudo = q(t["sudo"]) if "sudo" in t else "sudo"
     etc = posixpath.dirname(s.anchor)
     lines = [
@@ -777,6 +778,21 @@ def live_docker(s: SecretSpec, *, engine: Optional[str] = None) -> List[str]:
     if not s.docker_via_sudo:
         return [s.tools["docker"]]
     return sudo_route(s, engine or gate.engine)
+
+
+#: The typed root lines' sudo: the anchor's own (d3.3 §1, §5(d)).
+SUDO = "/usr/bin/sudo"
+
+
+def typed_root(s: SecretSpec, argv: Sequence[str], q: Callable[[str], str]) -> str:
+    """One operator-typed root line (d3.3 §5(d)): sudo, then the §3 grammar,
+    root-trust.sh's root_exec with the writer's pin, trusted-exec with the
+    document's tools, and `argv`, whose argv[0] is one of them. sudo prompts
+    as it would for any typed line; it is never in root's argv."""
+    tools = [x for t in sorted(set(s.tools.values())) if posixpath.basename(t) != "sudo" for x in ("--tool", t)]
+    return " ".join(q(a) for a in [SUDO] + rt.root_argv_positional(
+        posixpath.join(s.writer_dir, rt.NAME), s.writer_sha256, s.tools["python3"], s.writer,
+        ["trusted-exec"] + tools + ["--"] + list(argv)))
 
 
 def sudo_route(s: SecretSpec, engine: Optional[str]) -> List[str]:

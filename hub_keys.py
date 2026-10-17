@@ -343,7 +343,7 @@ def run_probe(spec: Any, ks: KeySpec, *, apply: bool, run_id: Optional[str] = No
 
 
 def plan(spec: Any, ks: KeySpec, q: Callable[[str], str], steps: str) -> List[str]:
-    install = q(spec.secrets.tools.get("install", "install"))
+    install = q(spec.secrets.tools["install"])
     run_dir = spec.secrets.run_dir
     return [
         f"# The local router's signing key. Its directory, {ks.principal}'s, 0700, under root-owned "

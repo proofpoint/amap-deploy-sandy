@@ -654,7 +654,7 @@ def _sha(b: bytes) -> str:
 def plan(spec: Any, hs: HubSpec, r: Rendered, q: Callable[[str], str], steps: str) -> List[str]:
     """The hub-link router's root steps, after the operator's `hub-render --apply`."""
     run_dir = spec.secrets.run_dir
-    install = q(spec.secrets.tools.get("install", "install"))
+    install = q(spec.secrets.tools["install"])
     lines = ["# The hub-link router's files. First, as the operator: `amap-sandy.py hub-render --apply` writes "
              f"them into {run_dir}."]
     if hs.d7_source_sha256 is not None:

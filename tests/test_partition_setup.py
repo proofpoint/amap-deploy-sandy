@@ -280,12 +280,25 @@ class PlanTest(unittest.TestCase):
     def test_the_plan_prints_the_six_steps_with_this_hosts_paths(self):
         def gone(p):
             raise FileNotFoundError(p)
-        text = "\n".join(ps.plan(self.part, None, lambda s: s, anchor="/opt/amap/etc/overlay.sha", read=gone))
-        for words in (f"install -d -o 0 -g 0 -m 0755 {EV}", f"install -d -o 0 -g 0 -m 0700 {SCRATCH}",
-                      f"install -d -o 0 -g 0 -m 0700 {EXEC}",
-                      f"{EV}/gate-record.json", "COPIED from the record's own", "squash",
-                      "/opt/amap/etc/overlay.sha", "no placed record"):
+        text = "\n".join(ps.plan(self.part, None, lambda s: s, anchor="/opt/amap/etc/overlay.sha", read=gone,
+                                 install=lambda args: "BARRIER install " + " ".join(args)))
+        for words in (f"BARRIER install -d -o 0 -g 0 -m 0755 {EV}", f"BARRIER install -d -o 0 -g 0 -m 0700 {SCRATCH}",
+                      f"BARRIER install -d -o 0 -g 0 -m 0700 {EXEC}",
+                      f"#   2. BARRIER install -o 0 -g 0 -m 0444 <the relayed file> {EV}/gate-record.json",
+                      "BARRIER install -o 0 -g 0 -m 0444 <a file holding the merged commit sha> /opt/amap/etc/overlay.sha",
+                      "COPIED from the record's own", "squash", "no placed record"):
             self.assertIn(words, text)
+        self.assertEqual(text.count("install -"), text.count("BARRIER install -"),
+                         "every root install goes through the barrier (d3.3 §5(d))")
+
+    def test_without_a_writer_no_root_line_is_printed_bare(self):
+        """No secrets section, no pinned writer: each root line names what it
+        needs, and no bare `install` is printed for the operator to run."""
+        def gone(p):
+            raise FileNotFoundError(p)
+        lines = ps.plan(self.part, None, lambda s: s, anchor=None, read=gone)
+        self.assertEqual(sum(ps.NO_WRITER in ln for ln in lines), 5)
+        self.assertFalse(any("install -" in ln for ln in lines), lines)
 
     def test_a_placed_record_has_its_harness_sha_printed_with_no_url(self):
         raw = hg.canonical(healthy())
