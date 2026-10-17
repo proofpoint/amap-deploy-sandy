@@ -689,8 +689,6 @@ class LoaderConfigTest(unittest.TestCase):
         self.assertEqual(set(hs.loader_dirs("darwin")), set(hs.DYLD_FALLBACK_DIRS))
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 class DynloadTest(unittest.TestCase):
@@ -799,3 +797,7 @@ class FakeInterpreterTest(Tmp):
         seen, closure, py, dyn, fw = self.calls("darwin", destshared=None)
         self.assertNotIn(os.path.join(fw, *hs.DARWIN_APP_MAIN), closure[hs.REQUIRED])
         self.assertIn(((dyn + "/_ctypes.so", dyn + "/m.so"), py), [(tuple(i), m) for _, i, m in seen])
+
+
+if __name__ == "__main__":
+    unittest.main()
