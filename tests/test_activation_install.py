@@ -243,8 +243,8 @@ class CommandTest(unittest.TestCase):
         self.spec = SimpleNamespace(
             secrets=SimpleNamespace(run_dir=str(self.t / "run"), writer_dir="/opt/ex/libexec",
                                     writer="/opt/ex/libexec/host_steps.py", writer_sha256="b" * 64,
-                                    tools={"python3": "/usr/bin/python3", "install": "/usr/bin/install"}),
-            partition=SimpleNamespace(tools={"python3": "/usr/bin/python3"}), keys=SimpleNamespace(local_config="/x"),
+                                    tools={"python3": "/usr/bin/python3", "install": "/usr/bin/install"}, pins={}),
+            partition=SimpleNamespace(tools={"python3": "/usr/bin/python3"}, pins={}), keys=SimpleNamespace(local_config="/x"),
             gate=None, overlay_pin={"commit": "a" * 40}, hub=SimpleNamespace(host_label="alpha"),
             router=SimpleNamespace(container="router-a"), supervision=SimpleNamespace(kind="systemd"))
         self.policy = {"fleet_domain": FLEET_DOMAIN, "hop_link": {"link": "link-a", "trusted_fleet_hosts": ["beta.internal"],

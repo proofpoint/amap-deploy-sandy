@@ -395,10 +395,10 @@ class Host:
         os.chmod(p, 0o444)
         self.act_path, self.act_digest = p, hashlib.sha256(data).hexdigest()
 
-    def recovery(self, target=TARGET):
+    def recovery(self, target=TARGET, docker=None):
         data = json.dumps({"schema": hs.RECOVERY_SCHEMA, "host": "alpha", "run_id": "r0", "at": "x",
                            "evidence_dir": self.ev, "live_config_path": self.conf, "router_container_id": target,
-                           "engine": "unix://" + self.sock_path, "docker": self.docker, "config_sha256": "1" * 64,
+                           "engine": "unix://" + self.sock_path, "docker": docker or self.docker, "config_sha256": "1" * 64,
                            "evidence_run_id": "r0", "evidence_sha256": "2" * 64, "inspect_digest": "3" * 64,
                            "activation_sha256": "4" * 64}, sort_keys=True, separators=(",", ":"))
         p = f"{self.exec}/recovery.json"
@@ -775,6 +775,67 @@ class WriterTest(unittest.TestCase):
         self.assertEqual(self.h.runs(), ["run-wold"], "the abandoned run is left undecided")
         self.assertTrue(self.delegation())
         self.assertIsNone(self.h.side_read("child-started.json"))
+
+    def pinned(self, sha256):
+        """The approved document recording the docker client itself (a pin is
+        read at the recorded path, never through a link), pinned to `sha256`."""
+        with open(self.h.docker, "rb") as f:
+            real = hashlib.sha256(f.read()).hexdigest()
+        self.h.document(partition={"evidence_dir": self.h.ev, "exec_root": self.h.exec,
+                                   "tools": {"python3": sys.executable, "docker": self.h.docker},
+                                   "tool_sha256": {"docker": sha256 or real}})
+
+    def test_a_docker_that_is_not_the_pinned_client_reaches_no_engine(self):
+        """DS2-TOOL-SHA-PIN, d3.3 §4 C3: the approved document's partition pin
+        is checked before any engine call and before the closure is computed;
+        a mismatch runs nothing, and the matching pin runs as before."""
+        self.h.abandoned("wold", FAIL3)
+        self.pinned("0" * 64)
+        bad = f"{self.h.root}/lib"
+        os.mkdir(bad)
+        os.chmod(bad, 0o777)
+        p = self.h.run(env={"PW_CLOSURE": json.dumps([bad])})
+        self.assertEqual(p.returncode, hs.EXIT_TOOLING, p.stdout + p.stderr)
+        self.assertIn("is not the client the document pins", p.stdout, "refused by the pin, before the closure")
+        self.assertNotIn("startup closure", p.stdout)
+        self.assertEqual(self.h.logged(), [], "no engine call at all")
+        self.assertIsNone(self.h.side_read("child-started.json"))
+        self.h.recovery()
+        p = self.h.run(env={"PW_CLOSURE": json.dumps([bad])})
+        self.assertEqual(p.returncode, hs.EXIT_TOOLING, p.stdout + p.stderr)
+        self.assertIn("recovery description's docker is not verified either", p.stdout,
+                      "the recovery stop runs no client the document's pin refuses")
+        self.assertEqual(self.h.logged(), [], "nothing is stopped with an unpinned client")
+        self.pinned(None)
+        self.h.plan([["expect", B], ["evidence", B, FAIL3], ["stop"], ["exit", 9]])
+        p = self.h.run()
+        self.assertEqual(p.returncode, hs.EXIT_INCIDENT, p.stdout + p.stderr)
+        self.assertTrue(self.h.logged(), "the pinned client reaches the engine")
+
+    def test_a_recovery_docker_recorded_as_a_link_is_refused_even_to_matching_bytes(self):
+        """Codex at b6f809b7: the recovery stop reads the pin at the RECORDED
+        path, its leaf never followed, before it resolves anything or
+        discovers a closure; a link there to the very bytes pinned stops
+        nothing, and the regular file beside it stops the target."""
+        self.pinned(None)
+        self.h.bundle(extra={"stray.py": "x = 1\n"})    # a Tooling that is not the pin's
+        self.h.recovery(docker=self.h.docker_link)
+        p = self.h.run()
+        self.assertEqual(p.returncode, hs.EXIT_TOOLING, p.stdout + p.stderr)
+        self.assertIn("recovery description's docker is not verified either", p.stdout)
+        self.assertEqual(self.h.stops(), [], "a linked leaf stops nothing")
+        self.h.recovery()
+        self.assertEqual(self.h.run().returncode, hs.EXIT_TOOLING)
+        self.assertEqual(self.h.stops(), [TARGET], "the regular file's matching bytes stop the target")
+
+    def test_a_malformed_docker_pin_in_the_document_is_a_handoff(self):
+        self.h.document(partition={"evidence_dir": self.h.ev, "exec_root": self.h.exec,
+                                   "tools": {"python3": sys.executable, "docker": self.h.docker},
+                                   "tool_sha256": {"docker": "A" * 64}})
+        p = self.h.run()
+        self.assertEqual(p.returncode, hs.EXIT_HANDOFF, p.stdout + p.stderr)
+        self.assertIn("docker pin is not a sha256", p.stdout)
+        self.assertEqual(self.h.logged(), [])
 
     def test_every_engine_call_runs_the_verified_realpath_never_the_documents_link(self):
         self.h.recovery()

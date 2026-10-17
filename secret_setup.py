@@ -45,6 +45,8 @@ What it checks, through router_health's three outcomes:
   previous_class, last_ok_at}, every member required.
 """
 
+import errno
+import hashlib
 import json
 import os
 import posixpath
@@ -53,6 +55,7 @@ import shlex
 import stat
 import sys
 import time
+import dataclasses
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -155,6 +158,12 @@ class SecretSpec:
     probe: Optional[Dict[str, Any]] = None  # network, smtp_host, smtp_port, username
     zsh: Optional[Dict[str, str]] = None    # version, module_path: the recorded zsh
     image_commit: Optional[str] = None      # the commit `image` was built from, when recorded
+    tool_sha256: Dict[str, str] = dataclasses.field(default_factory=dict)  # tool name -> pinned sha256 (C3)
+
+    @property
+    def pins(self) -> Dict[str, str]:
+        """The pinned tools by recorded path (root_trust.tool_pins)."""
+        return rt.tool_pins(self.tools, self.tool_sha256, SECTION)
 
     @property
     def writer(self) -> str:
@@ -182,7 +191,8 @@ def load(sec: Any, principals: Dict[str, Any], runtimes: Sequence[Dict[str, Any]
     keys = ("volume", "label", "principal", "file", "container_dir", "image", "writer", "anchor",
             "state_file", "clones", "tools", "uv", "status_dir", "run_dir", "ssh", "operator_uid")
     sec = _exact(sec, keys, "(the section)", ("docker_via_sudo", "caps_allow", "attestations", "exposure",
-                                                "pipeline_locks", "probe", "zsh", "image_commit"))
+                                                "pipeline_locks", "probe", "zsh", "image_commit",
+                                                rt.TOOL_SHA256))
     if not isinstance(sec["volume"], str) or not _NAME.fullmatch(sec["volume"]):
         raise SecretSpecError("secrets.volume must be a volume name")
     if not isinstance(sec["label"], str) or not _LABEL.fullmatch(sec["label"]):
@@ -225,6 +235,10 @@ def load(sec: Any, principals: Dict[str, Any], runtimes: Sequence[Dict[str, Any]
     if not isinstance(tools, dict) or set(REQUIRED_TOOLS) - set(tools):
         raise SecretSpecError(f"secrets.tools must give at least {', '.join(REQUIRED_TOOLS)}")
     tools = {name: _abs(path, f"tools.{name}") for name, path in tools.items()}
+    try:
+        rt.tool_pins(tools, sec.get(rt.TOOL_SHA256), SECTION)
+    except ValueError as e:
+        raise SecretSpecError(str(e)) from None
     uv = _exact(sec["uv"], ("binary", "cache_dir", "python_dir"), "uv")
     if "uv" in tools and tools["uv"] != uv.get("binary"):
         raise SecretSpecError("secrets.tools.uv and secrets.uv.binary name different binaries")
@@ -286,6 +300,7 @@ def load(sec: Any, principals: Dict[str, Any], runtimes: Sequence[Dict[str, Any]
              "known_hosts": _abs(ssh["known_hosts"], "ssh.known_hosts"), "alias": ssh["alias"]},
         operator_uid=op, docker_via_sudo=via_sudo, principal=sec["principal"],
         pipeline_locks=tuple(locks), probe=probe, zsh=zsh, image_commit=image_commit,
+        tool_sha256=dict(sec.get(rt.TOOL_SHA256) or {}),
         extra={"caps_allow": dict(caps), "attestations": dict(att), "exposure": exposure})
 
 
@@ -707,23 +722,72 @@ def verify_overlay_source(s: SecretSpec, overlay: Optional[str], stat_: Callable
 
 
 def verify_tools(s: SecretSpec, lstat: Callable,
-                 realpath: Callable[[str], str] = os.path.realpath) -> List[rh.Check]:
+                 realpath: Callable[[str], str] = os.path.realpath,
+                 pin_read: Optional[Callable[[str], Any]] = None) -> List[rh.Check]:
     """Each tool's real path a regular executable no one else can write, under
     directories no one else can write. A tool root executes (ROOT_EXEC_TOOLS)
     must be root's: its real path and every directory above it, and above the
     recorded path too, so no one else can repoint a link. Any other tool may
-    also be the operator's."""
+    also be the operator's. A pinned tool is also the client its pin names."""
     out = []
     every = dict(s.tools)
     every.setdefault("uv", s.uv["binary"])
     for name, path in sorted(every.items()):
-        out += _tool_rows(s, name, path, lstat, realpath)
+        out += _tool_rows(s, name, path, lstat, realpath, pin_read or pin_digest)
     return out
 
 
+def pin_digest(path: str) -> Any:
+    """The sha256 of the file at `path`, read as trusted-exec reads a pinned
+    tool: its leaf never followed, and never blocking, so a FIFO in its place
+    is an answer and not a hang. A link or another non-regular file is a
+    sentence (which matches no pin); a file that cannot be read is
+    Unresolved."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError as e:
+        if e.errno == errno.ELOOP:
+            return f"{path} is a link, which trusted-exec refuses to read"
+        return rh.Unresolved(f"cannot read {path}: {e.strerror or e}")
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return f"{path} is not a regular file"
+        h = hashlib.sha256()
+        for chunk in iter(lambda: os.read(fd, 1 << 20), b""):
+            h.update(chunk)
+        return h.hexdigest()
+    except OSError as e:
+        return rh.Unresolved(f"cannot read {path}: {e.strerror or e}")
+    finally:
+        os.close(fd)
+
+
+def tool_pin_row(section: str, name: str, path: str, want_sha256: str, lstat: Callable,
+                 read: Optional[Callable[[str], Any]] = None) -> rh.Check:
+    """A pinned tool's bytes against its pin (d3.3 §4 C3), read at the recorded
+    path by `read` (pin_digest), which, like trusted-exec, never follows the
+    leaf and never blocks: a link or another non-regular file is a FAIL, an
+    unreadable file UNKNOWN. A PASS here stands beside the tool's other rows,
+    never in place of them."""
+    claim = f"the {section} {name} {path} is the client {section}.{rt.TOOL_SHA256}.{name} pins"
+    want = _fact("tool sha256", want_sha256, f"{section}.{rt.TOOL_SHA256}.{name} in the document (d3.3 §4 C3)")
+    remedy = (f"stop [2] through its supervisor, place the reviewed client at {path}, record its sha256 as "
+              f"{section}.{rt.TOOL_SHA256}.{name} (and in every section recording {path}), re-render, then start [2]")
+    do_not = "never change the pin to match the file: a changed client is re-placed, re-hashed and re-gated"
+    st = _lst(path, lstat)
+    if isinstance(st, rh.Unresolved):
+        return rh.unknown(claim, want, st.reason, remedy)
+    if st is not None and stat.S_ISLNK(st.st_mode):
+        return rh.check(claim, want, f"{path} is a link, which trusted-exec refuses to read", remedy, do_not=do_not)
+    got = (read or pin_digest)(path)
+    if isinstance(got, rh.Unresolved):
+        return rh.unknown(claim, want, got.reason, remedy)
+    return rh.check(claim, want, got, remedy, do_not=do_not)
+
+
 def _tool_rows(s: SecretSpec, name: str, path: str, lstat: Callable,
-               realpath: Callable[[str], str]) -> List[rh.Check]:
-    """verify_tools' rows for one tool."""
+               realpath: Callable[[str], str], pin_read: Optional[Callable[[str], Any]] = None) -> List[rh.Check]:
+    """verify_tools' rows for one tool, with its pin's row where it is pinned."""
     if name in ROOT_EXEC_TOOLS:
         owners, whose, why = (0,), "root", f"root executes {name}"
     else:
@@ -745,6 +809,8 @@ def _tool_rows(s: SecretSpec, name: str, path: str, lstat: Callable,
         out.append(_owned_chain(f"every directory above the recorded {path} is owned by root and not group- "
                                 f"or world-writable, so no one else can point it elsewhere", path, owners, why,
                                 lstat))
+    if pin_read is not None and name in s.tool_sha256:
+        out.append(tool_pin_row(SECTION, name, path, s.tool_sha256[name], lstat, pin_read))
     return out
 
 
@@ -772,7 +838,7 @@ def _operator_closure(s: SecretSpec) -> Optional[str]:
     except ImportError:
         return "the closure check (host_steps) is not importable here"
     try:
-        host_steps._verified_tools(s.tools["python3"], s.tools["docker"])
+        host_steps._verified_tools(s.tools["python3"], s.tools["docker"], s.pins.get(s.tools["docker"]))
     except host_steps.Tooling as e:
         return str(e)
     return None
@@ -787,13 +853,17 @@ def live_refusal(s: SecretSpec, lstat: Callable = os.lstat,
     docker and sudo (where used) by verify_tools' rows; the writer by its pin;
     docker's startup closure, computed as the operator. Otherwise why not."""
     names = ["python3", "docker"] + (["sudo"] if s.docker_via_sudo else [])
+    if digest is None:
+        import host_setup
+        digest = host_setup._sha256
     bad = [n for n in names
            if any(c.result != rh.PASS for c in _tool_rows(s, n, s.tools[n], lstat, realpath))]
     if bad:
         return f"not run: {' and '.join(bad)} not root's alone"
-    if digest is None:
-        import host_setup
-        digest = host_setup._sha256
+    not_pinned_client = [n for n in names if n in s.tool_sha256
+                         and tool_pin_row(SECTION, n, s.tools[n], s.tool_sha256[n], lstat).result != rh.PASS]
+    if not_pinned_client:
+        return f"not run: {' and '.join(not_pinned_client)} not the client the document pins"
     if any(c.result != rh.PASS for c in _writer_rows(s, lstat, digest)):
         return f"not run: the writer {s.writer} is not the pinned one, root's alone"
     why = (closure or _operator_closure)(s)
@@ -849,26 +919,26 @@ COREDUMP_OFF = "kern.coredump=0"
 
 
 def typed_root(s: SecretSpec, argv: Sequence[str], q: Callable[[str], str], python3: Optional[str] = None,
-               also: Sequence[str] = (), tools: Optional[Sequence[str]] = None) -> str:
+               also: Sequence[str] = (), tools: Optional[Sequence[str]] = None,
+               pins: Optional[Dict[str, str]] = None) -> str:
     """One operator-typed root line (d3.3 §5(d)) through the placed writer,
-    with its section's recorded tools (the secrets section's unless `tools`
-    names another's) and each `also` trusted-exec judges beside argv[0].
-    `python3` is the barrier's interpreter when argv runs another than the
-    secrets section's (the partition job's)."""
+    with its section's recorded tools and pins (the secrets section's unless
+    `tools` and `pins` name another's) and each `also` trusted-exec judges
+    beside argv[0]. `python3` is the barrier's interpreter when argv runs
+    another than the secrets section's (the partition job's)."""
     return " ".join(q(a) for a in rt.typed_argv(posixpath.join(s.writer_dir, rt.NAME), s.writer_sha256,
                                                 python3 or s.tools["python3"], s.writer,
                                                 list(s.tools.values() if tools is None else tools),
-                                                list(argv), also=also))
+                                                list(argv), also=also, pins=s.pins if pins is None else pins))
 
 
 def sudo_route(s: SecretSpec, engine: Optional[str]) -> List[str]:
     """`sudo -n` and the §3 grammar up to `-- <docker>`, the one prefix of
     every live call on the sudo route. No sudoers rule can admit it safely
     (SUDO_ROUTE_NOTICE)."""
-    tools = [x for t in sorted(set(s.tools.values())) if posixpath.basename(t) != "sudo" for x in ("--tool", t)]
     return [s.tools["sudo"], "-n"] + rt.root_argv_positional(
         posixpath.join(s.writer_dir, rt.NAME), s.writer_sha256, s.tools["python3"], s.writer,
-        ["trusted-exec"] + tools + ["--", s.tools["docker"]], engine=engine)
+        rt.trusted_exec_args(s.tools.values(), [s.tools["docker"]], pins=s.pins), engine=engine)
 
 
 #: What the plan says about sudo on the sudo route (Codex P1 at 0aa3e39e): there is no

@@ -57,9 +57,8 @@ def job_argv(p: ps.PartitionSpec, *, writer: str, writer_sha256: str, host: str,
     step = [py, "-I", "-S", "-B", writer, "partition-weekly", "--exec-root", p.exec_root, "--host", host,
             "--document", document, "--document-sha256", hashlib.sha256(document_bytes).hexdigest(),
             "--activation", activation_path(p), "--activation-sha256", hashlib.sha256(activation_bytes).hexdigest()]
-    tools = [x for t in sorted(set(p.tools.values())) if posixpath.basename(t) != "sudo" for x in ("--tool", t)]
     return rt.root_argv(posixpath.join(posixpath.dirname(writer), rt.NAME), writer_sha256, py, writer,
-                        ["trusted-exec"] + tools + ["--also", p.tools["docker"], "--"] + step)
+                        rt.trusted_exec_args(p.tools.values(), step, [p.tools["docker"]], p.pins))
 
 
 def activation_steps(p: ps.PartitionSpec, *, writer: str, writer_sha256: str, tools: List[str], source: str,
@@ -73,7 +72,7 @@ def activation_steps(p: ps.PartitionSpec, *, writer: str, writer_sha256: str, to
             " ".join(q(a) for a in rt.typed_argv(
                 posixpath.join(posixpath.dirname(writer), rt.NAME), writer_sha256, py, writer, tools,
                 [py, "-I", "-S", "-B", writer, "place", source, activation_path(p),
-                 "--sha256", hashlib.sha256(activation_bytes).hexdigest()]))]
+                 "--sha256", hashlib.sha256(activation_bytes).hexdigest()], pins=p.pins))]
 
 
 def _sd(arg: str) -> str:
@@ -149,9 +148,16 @@ def provision_steps(p: ps.PartitionSpec, pin: str, writer: str, writer_sha256: s
     argv = rt.typed_argv(posixpath.join(posixpath.dirname(writer), rt.NAME), writer_sha256, py, writer,
                          list(p.tools.values()),
                          [py, "-I", "-S", "-B", writer, "partition-fetch", "--git", git, "--git-remote-https", helper,
-                          "--exec-root", p.exec_root, "--pin", pin, "--repo", PUBLIC_REPO], also=[git, helper])
+                          "--exec-root", p.exec_root, "--pin", pin, "--repo", PUBLIC_REPO], also=[git, helper],
+                         pins=p.pins)
     return ["# The weekly job's bundle, at the deploy pin, as root (at install and after every pin move):",
             " ".join(q(a) for a in argv)]
+
+
+def docker_pin(p: ps.PartitionSpec) -> List[str]:
+    """partition-judge's `--docker-sha256`, when the section pins its docker (d3.3 §4 C3)."""
+    h = p.pins.get(p.tools["docker"])
+    return ["--docker-sha256", h] if h else []
 
 
 #: The line partition-judge prints last, and only when its judging found
@@ -169,7 +175,7 @@ def validation_steps(p: ps.PartitionSpec, *, writer: str, writer_sha256: str, to
     py = p.tools["python3"]
     line = rt.typed_argv(posixpath.join(posixpath.dirname(writer), rt.NAME), writer_sha256, py, writer, tools,
                          [py, "-I", "-S", "-B", writer, "partition-judge", "--python3", py,
-                          "--docker", p.tools["docker"]])
+                          "--docker", p.tools["docker"]] + docker_pin(p), pins=p.pins)
     return [
         "# The tools the weekly job runs as root, and everything they load: run this at install AND again after",
         "# any operating-system, interpreter or docker update, before the next weekly run. root-trust.sh judges",
