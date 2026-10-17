@@ -89,12 +89,18 @@ CONTAINER_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 RESERVED_STATE_NAMES = frozenset({"registry", "status.json", "aliases", "peer-decision.key", "peer-replay",
                                   "peer-vacant", "peer-clock.json", "_runtime"})
 INSTANCE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
-LOGICAL_ID = re.compile(r"[0-9a-fA-F]{32}")
+#: A logical_id is lowercase, as the pinned registry mints it; 32 hex digits
+#: in any other case are neither a logical_id nor a name the router keys by.
+LOGICAL_ID = re.compile(r"[0-9a-f]{32}")
+HEX32 = re.compile(r"[0-9a-fA-F]{32}")
 GEN_FILE = "generations.json"
 LAYOUT_KINDS = ("dir", "file", "link", "other")
 #: A pre-registry router's entrypoint sets no umask (amap-router-local's
-#: docker/entrypoint.sh gains `umask 0027` 32 first-parent commits below the
-#: pin, before registry_dir); its PID 1 must still mask group and other write.
+#: docker/entrypoint.sh gains `umask 0027` at 08aeed47, 31 first-parent
+#: commits below the pin and 17 after a84e0d98); its PID 1, measured live,
+#: must still mask group and other write. The umask reaches only directories
+#: there: its state files are created 0600 explicitly, as the router's
+#: maintainers measured over every rehearsal under 0022.
 PRE_REGISTRY_UMASK_BITS = 0o022
 
 ENTRY_TYPES = ("file", "dir", "link", "other")
@@ -1039,9 +1045,9 @@ def _match(capture_bytes: bytes, bases_bytes: bytes, history: Any, pin: str,
         return layout
     needs = layout[1]
     if base == "pre_registry":
-        if layout[2]:
-            return _unknown("state_layout", "a pre-registry router's state directory holds generation-keyed "
-                            "state: " + ", ".join(layout[2]))
+        if r["config"]["registry_dir"]["present"]:
+            return _unknown("state_layout", "a pre-registry router's live config sets registry_dir, which its "
+                            "loader cannot read")
         return _out(MIGRATE, "pre_registry_base", "every check passed; the running router predates registry_dir "
                     "and its upgrade is supported only by the router's own migration. Take the runbook's "
                     "migration branch: " + ", ".join(m) + _named(" state to migrate: ", needs))
@@ -1068,13 +1074,20 @@ def _layout(r: Dict[str, Any]) -> Tuple[Any, ...]:
                         "state_dir")
     needs, generations = [], []
     for name, kind, gen in sl["entries"]:
-        if name.casefold() in RESERVED_STATE_NAMES or kind == "file":
+        if name.casefold() in RESERVED_STATE_NAMES:
+            continue
+        if kind == "file":
+            # The router holds an instance whose name has an entry of any type
+            # (state_not_migrated); a file is never its state, so refuse it.
+            if HEX32.fullmatch(name) or INSTANCE_NAME.fullmatch(name):
+                return _unknown("state_layout", f"the state directory holds a file named {name!r}, like an "
+                                "instance's state; if it is a temporary of the router's own, fingerprint again")
             continue
         if kind != "dir":
             return _unknown("state_layout", f"the state directory holds {name!r}, a {kind}, which is not one of "
                             "the router's own entries")
         if LOGICAL_ID.fullmatch(name) is None:
-            if INSTANCE_NAME.fullmatch(name) is None:
+            if HEX32.fullmatch(name) or INSTANCE_NAME.fullmatch(name) is None:
                 return _unknown("state_layout", f"the state directory holds {name!r}, which is neither the "
                                 "router's own entry nor an instance's")
             needs.append(name)

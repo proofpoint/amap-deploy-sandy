@@ -841,14 +841,13 @@ class RealHistory(Outcome):
         self.assertIn("migration branch", got[3])
 
     def test_the_real_pre_registry_class_is_before_to_from(self):
-        """(a84e0d98, 9854a5e8]: index 49 to 56 is MIGRATE; index 57, older
-        than from, is pre_registry_unchecked; a84e0d98 itself (48) stays
-        `unmeasured`."""
+        """(a84e0d98, 5e9f84bb]: index 49 to 69, the root, is MIGRATE (the
+        router's maintainers rehearsed the migration from each); a84e0d98
+        itself (48) stays `unmeasured`."""
         bases_bytes = rf.BASES_PATH.read_bytes()
         fp = self.h["first_parent"]
         for i, outcome, reason in ((48, rf.UNMEASURED, "unmeasured"), (49, rf.MIGRATE, "pre_registry_base"),
-                                   (56, rf.MIGRATE, "pre_registry_base"),
-                                   (57, rf.UNMEASURED, "pre_registry_unchecked")):
+                                   (56, rf.MIGRATE, "pre_registry_base"), (69, rf.MIGRATE, "pre_registry_base")):
             with self.subTest(index=i):
                 got = rf.match(b(self.real_capture(fp[i])), bases_bytes, self.h, REAL_TARGET, PLUGIN)
                 self.assertGate(got, outcome, reason)
@@ -2041,7 +2040,12 @@ class PreRegistryGateRows(Outcome):
         got = rf.match(b(capture(trees[C[5]])), bases(before=C[4], oldest=C[5]), history(trees), TARGET, PLUGIN)
         self.assertGate(got, rf.UNMEASURED, "pre_registry_unchecked")
 
-    def test_a_pre_registry_base_with_generation_state_is_unknown(self):
+    def test_a_pre_registry_router_on_a_registry_config_is_unknown(self):
+        """Its loader cannot read registry_dir, so a live config that sets
+        one is not the config it runs."""
+        def reg(d):
+            d["result"]["config"]["registry_dir"] = {"present": True, "value": "/reg"}
+        self.assertGate(self.run_pre(reg), rf.UNKNOWN, "state_layout")
         def gen(d):
             d["result"]["state_layout"] = layout([LID_A, "dir", True])
         self.assertGate(self.run_pre(gen), rf.UNKNOWN, "state_layout")
@@ -2073,6 +2077,20 @@ class StateLayoutRows(Outcome):
     def test_the_reserved_names_are_compared_casefolded(self):
         self.assertGate(self.run_layout(layout(["REGISTRY", "dir", False], [LID_A, "dir", True])), rf.MEASURED,
                         "measured")
+
+    def test_a_file_named_like_an_instance_is_unknown(self):
+        """The router holds an instance with an entry of ANY type under its
+        name (state_not_migrated); only its own files, and names no instance
+        can have, are skipped."""
+        for name in ("alice", LID_A, "A" * 32):
+            with self.subTest(file=name):
+                self.assertGate(self.run_layout(layout([name, "file", None])), rf.UNKNOWN, "state_layout")
+        sl = layout([".router.lock", "file", None], ["status.json", "file", None], ["peer-clock.json", "file", None],
+                    ["Status.JSON", "file", None])
+        self.assertGate(self.run_layout(sl), rf.MEASURED, "measured")
+
+    def test_an_upper_case_logical_id_dir_is_unknown(self):
+        self.assertGate(self.run_layout(layout(["A" * 32, "dir", True])), rf.UNKNOWN, "state_layout")
 
     def test_what_the_router_would_not_guess_is_unknown(self):
         cases = {"a link": layout(["alice", "link", None]), "an other": layout(["sock", "other", None]),
@@ -2252,8 +2270,9 @@ class RouterVocabularyPins(unittest.TestCase):
     def test_the_instance_name_logical_id_and_generations_file(self):
         self.assertIn('_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\\Z")', self.show("router/config.py"))
         self.assertEqual(rf.INSTANCE_NAME.pattern, "[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+        self.assertIn('_LOGICAL_ID = re.compile(r"[0-9a-f]{32}\\Z")', self.show("router/registry.py"))
         self.assertIn('_ID_SHAPED = re.compile(r"[0-9a-fA-F]{32}\\Z")', self.show("router/registry.py"))
-        self.assertEqual(rf.LOGICAL_ID.pattern, "[0-9a-fA-F]{32}")
+        self.assertEqual((rf.LOGICAL_ID.pattern, rf.HEX32.pattern), ("[0-9a-f]{32}", "[0-9a-fA-F]{32}"))
         self.assertIn('GEN_FILE = "generations.json"', self.show("router/generations.py"))
         self.assertIn('"generations.json"', rf.PROGRAM)
 
@@ -2297,14 +2316,14 @@ class Pins(unittest.TestCase):
     def test_the_plugin_digest(self):
         self.assertEqual(hp.PLUGIN_SHA256, "f15855c974df021c2ae5c551aff2448d934725a6796fb03434e573305d24fe93")
 
-    def test_pre_registry_from_is_the_rehearsed_base(self):
-        """from = 9854a5e8, the base the router's maintainers rehearsed the
-        migration on, older than before on the hop chain."""
+    def test_pre_registry_from_is_the_root(self):
+        """from = 5e9f84bb, the hop chain's root: the router's maintainers
+        rehearsed the migration from every first-parent commit."""
         pre = json.loads(rf.BASES_PATH.read_bytes())["pre_registry"]
-        self.assertEqual(pre["from"], "9854a5e8e932ef2989237de7b0a15ac322f38e5a")
+        self.assertEqual(pre["from"], "5e9f84bb3547c37740b09879fe3a48e082605b0e")
         fp = subprocess.run([GIT, "-C", HOP, "rev-list", "--first-parent", REAL_TARGET], capture_output=True,
                             text=True, check=True).stdout.split()
-        self.assertEqual((fp.index(pre["before"]), fp.index(pre["from"])), (48, 56))
+        self.assertEqual((fp.index(pre["before"]), fp.index(pre["from"]), len(fp)), (48, 69, 70))
 
     def test_the_program_sha256(self):
         self.assertEqual(rf.PROGRAM_SHA256, "153c24c30e444b9284f7122ee1329030d48787fc4a6abbdb1ee5a43f0f6cb157")

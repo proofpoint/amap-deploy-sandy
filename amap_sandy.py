@@ -4294,6 +4294,8 @@ def run_sync(args: argparse.Namespace, home: Path, boxes_dir: Path) -> int:
       3. The router's config, a generated sibling of the manifest
          (`router_sibling_path`): written under --apply, compared otherwise.
     """
+    if getattr(args, "render_to", None) is not None:
+        return run_render_only(args, home)
     if getattr(args, "activate", None) is not None or getattr(args, "activation_sha256", None) is not None:
         return run_activate_only(args, home)
     # Before anything is written: the connector checkout the payload is
@@ -4483,6 +4485,22 @@ def run_partition_activate(args: argparse.Namespace, home: Path) -> int:
         print(f"partition-activate: no {policy_path}: install the host first; nothing was written", file=sys.stderr)
         return 2
     args.prepare = True
+    policy = fp.load_policy(policy_path)
+    boxes = discover_sandboxes(args.sandy)
+    return run_render_router(args, home, boxes, policy, apply=args.apply)
+
+
+def run_render_only(args: argparse.Namespace, home: Path) -> int:
+    """`install --render-to FILE` (R2 step 2): nothing but the rendering. The
+    manifest, the payload, the roster, the router's live config and the
+    registry are never written on this path; its one write, the rendering
+    into FILE under --apply, comes after every check install makes, and its
+    exit code is the step's."""
+    policy_path = feature_manifest_path(home)
+    if not policy_path.is_file():
+        print(f"install: cannot render — no {policy_path}: install the host first; nothing was written",
+              file=sys.stderr)
+        return 2
     policy = fp.load_policy(policy_path)
     boxes = discover_sandboxes(args.sandy)
     return run_render_router(args, home, boxes, policy, apply=args.apply)
@@ -5402,10 +5420,10 @@ def build_parser() -> argparse.ArgumentParser:
     rmig.add_argument("step", choices=("map", "preview", "move", "check", "adopt"))
     rmig.add_argument("--config", help="the migration config: install --render-to's file before the stop, the "
                                        "live config after it")
-    rmig.add_argument("--map", help="a map step's file (preview, move and check)")
-    rmig.add_argument("--preview", help="the preview step's file (check)")
+    rmig.add_argument("--preview", help="the preview step's file, the plan (move and check)")
     rmig.add_argument("--check", help="the check step's file (adopt)")
-    rmig.add_argument("--reverse", metavar="JOURNAL", help="move: undo that move journal's renames")
+    rmig.add_argument("--reverse", metavar="JOURNAL", help="move: undo that move journal's renames, newest first; "
+                                                          "run again until it completes")
     rmig.add_argument("--reason", help="why, written to each instance's audit log by the router")
     rmig.add_argument("--spec", type=Path, default=None,
                       help="the host-setup document (default: the deployment overlay's host_setup section)")

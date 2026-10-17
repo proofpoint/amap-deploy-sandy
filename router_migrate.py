@@ -1,6 +1,6 @@
 """router-migrate: the local router's migration from state keyed by instance
-name to the pinned router's registry layout, as its own window (the
-runbook's R2), before any activation.
+name to the pinned router's generation layout under the registry, as its own
+window (the runbook's R2), before any activation.
 
 Every router step runs the PINNED router's own code: the hop checkout's
 `docker/run.sh` (its identity mounts, as the operator's uid), with
@@ -9,23 +9,32 @@ entrypoint's `shell` mode. Nothing here writes the live config.
 
 - `map`: the name -> logical_id mapping and each binding, printed by
   MAP_PROGRAM, the router maintainers' read-only program over the pin's own
-  registry functions (persist=False). It is fed to `python3 -I -S -` on
-  stdin, so no long line is ever typed or relayed.
-- `preview`: before the stop, each name-keyed state directory is copied to a
-  scratch state_dir under its logical_id, and `generation adopt --dry-run`
-  runs against the migration config with state_dir pointed at the copy. The
-  copy of a running router's state is only a preview.
-- `move`: after the stop, each `<state_dir>/<name>` is renamed to
-  `<state_dir>/<logical_id>`, journaled first; `--reverse` undoes it.
+  registry functions (persist=False), fed to `python3 -I -S -` on stdin.
+- `preview`: before the stop, the PLAN. Each mapped instance whose state is
+  pre-generation is either to be renamed (state under its name) or only
+  adopted (state already under its logical_id). Its state is copied to a
+  scratch state_dir under its logical_id and `generation adopt --dry-run`
+  runs there. The plan binds every later step to its context: the
+  config's sha256, state_dir and its identity, registry_dir, the checkout,
+  the image, the binding, and each instance's source identity and root.
+- `move`: after the stop, the plan's renames, each by an atomic no-replace
+  rename bound to the source directory's identity, journaled durably first;
+  `--reverse` undoes them, idempotently.
 - `check`: after the move, the binding dry run on the real state, compared
   with the preview field by field (the router maintainers' rules: COMPARED,
   ZERO and FREE below). N comes only from this dry run's refusal text.
 - `adopt`: the real `generation adopt`, with the N `check` recorded.
 
-Each step exits 0 when it completed, 1 when it refused (STOP), and 2 when it
-could not run.
+Every step after `preview` re-reads the map through the pinned code, and
+refuses before any mutation unless the config, state_dir, checkout, image
+and binding are the plan's. Each step exits 0 when it completed, 1 when it
+refused (STOP), and 2 when it could not run.
 """
 
+import contextlib
+import ctypes
+import ctypes.util
+import fcntl
 import hashlib
 import json
 import os
@@ -33,6 +42,7 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -54,7 +64,10 @@ MAP_PROGRAM_SHA256 = hashlib.sha256(MAP_PROGRAM.encode("utf-8")).hexdigest()
 
 #: The container name every one-shot step runs under; `docker run --rm` frees it.
 STEP_CONTAINER = "amap-router-migrate"
-LOGICAL_ID = re.compile(r"[0-9a-fA-F]{32}")
+#: A registry logical_id: lowercase, as the pinned router mints them.
+LOGICAL_ID = re.compile(r"[0-9a-f]{32}")
+#: The files that make a logical_id directory generation-keyed, or mid-adopt.
+GEN_FILE, MIGRATION_FILE = "generations.json", "migration.json"
 #: The refusal that names N: `attest it with --no-transport-history=N`.
 ATTEST = re.compile(r"attest it with --no-transport-history=([0-9]+)\s*$")
 #: The dry-run summary fields compared between the preview and the binding run.
@@ -68,9 +81,14 @@ ZERO = ("inflight", "transport", "positive_evidence_count", "malformed")
 #: generation (minted per run), legacy.local and so N, legacy.manifest_sha256,
 #: paths, converted, and legacy.basis moving from empty to attested.
 FREE = ("generation", "local", "manifest_sha256", "paths", "converted", "basis")
-SCHEMA = "amap-deploy.router-migrate/1"
-#: The binding fields the map carries and the move and adopt are bound to.
+SCHEMA = "amap-deploy.router-migrate/2"
+#: The binding fields the map carries; every step after the preview is bound to them.
 BINDING = ("logical_id", "adapter", "stable_key", "binding_seq")
+#: How an instance's pre-generation state is found: under its name (renamed,
+#: then adopted) or already under its logical_id (adopted in place).
+BY_NAME, BY_ID = "name", "logical_id"
+#: The context every record carries and every later step must match.
+CONTEXT = ("config_sha256", "state_dir", "state_ident", "registry_dir", "checkout", "image")
 
 
 class Stop(Exception):
@@ -118,6 +136,9 @@ def _call(argv: List[str], runner: Runner, stdin: Optional[bytes] = None) -> Tup
     return p.returncode, p.stdout.decode("utf-8", "replace"), p.stderr.decode("utf-8", "replace")
 
 
+# --- The map -----------------------------------------------------------------------------
+
+
 def parse_map(text: str) -> Dict[str, Any]:
     """The map's JSON, held to its exact shape, and its STOP rules."""
     try:
@@ -145,6 +166,25 @@ def read_map(checkout: str, image: str, config: str, runner: Runner) -> Dict[str
     if rc != 0:
         raise Cannot(f"the map program exited {rc}: {err.strip()[-400:]}")
     return parse_map(out)
+
+
+def bindings(the_map: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    return {n: {k: e[k] for k in BINDING} for n, e in the_map["instances"].items()}
+
+
+def compare_bindings(plan: Dict[str, Any], now: Dict[str, Any]) -> None:
+    """The live registry's binding of every planned instance is the plan's."""
+    live = bindings(now)
+    for name, want in sorted(plan.items()):
+        got = live.get(name)
+        if got is None:
+            raise Stop(f"the registry no longer resolves {name!r}")
+        for k in BINDING:
+            if got[k] != want[k]:
+                raise Stop(f"{name!r}'s {k} is {got[k]!r} now, {want[k]!r} in the plan")
+
+
+# --- The adopt dry run ---------------------------------------------------------------------
 
 
 def dry_run(checkout: str, image: str, config: str, name: str, reason: str,
@@ -193,13 +233,7 @@ def compare_plans(name: str, preview: Dict[str, Any], binding: Dict[str, Any]) -
             raise Stop(f"{name!r}'s root.{k} is {br.get(k)!r} after the stop, {pr.get(k)!r} in the preview")
 
 
-def compare_maps(before: Dict[str, Any], after: Dict[str, Any]) -> None:
-    if set(before["instances"]) != set(after["instances"]):
-        raise Stop("the registry resolves a different set of instances after the stop")
-    for name, e in before["instances"].items():
-        for k in BINDING:
-            if after["instances"][name][k] != e[k]:
-                raise Stop(f"{name!r}'s {k} is {after['instances'][name][k]!r} after the stop, {e[k]!r} before")
+# --- The state directory -------------------------------------------------------------------
 
 
 def _lstat(p: Path) -> Optional[os.stat_result]:
@@ -209,29 +243,157 @@ def _lstat(p: Path) -> Optional[os.stat_result]:
         return None
 
 
-def to_migrate(state_dir: Path, the_map: Dict[str, Any]) -> List[Tuple[str, str]]:
-    """(name, logical_id) for each mapped instance whose state is a real
-    directory under its name. A name with an entry under its logical_id as
-    well is a conflict the router would not guess: STOP."""
-    out = []
+def _ident(st: os.stat_result) -> List[int]:
+    return [st.st_dev, st.st_ino]
+
+
+def classify(state_dir: Path, the_map: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Each mapped instance with pre-generation state: how it is found (by
+    name, to be renamed; or by logical_id, adopted in place), and that
+    directory's identity. An instance with no state, or already in the
+    generation layout, is not planned. Anything the router would not guess
+    about STOPs: a name entry that is not a real directory, state under both
+    the name and the logical_id, a logical_id entry that is not a directory,
+    or an adopt already begun."""
+    out = {}
     for name, e in sorted(the_map["instances"].items()):
-        src, dst = _lstat(state_dir / name), _lstat(state_dir / e["logical_id"])
-        if src is None:
-            continue
-        if not stat.S_ISDIR(src.st_mode):
-            raise Stop(f"{state_dir / name} is not a directory (a link or a file is never moved)")
-        if dst is not None:
-            raise Stop(f"both {state_dir / name} and {state_dir / e['logical_id']} exist: the router holds this as "
-                       "state_conflict and so does this step")
-        out.append((name, e["logical_id"]))
+        lid = e["logical_id"]
+        src, dst = _lstat(state_dir / name), _lstat(state_dir / lid)
+        if src is not None and not stat.S_ISDIR(src.st_mode):
+            raise Stop(f"{state_dir / name} is not a directory: the router holds any entry under the name, and "
+                       "this step never moves a link or a file")
+        if src is not None and dst is not None:
+            raise Stop(f"both {state_dir / name} and {state_dir / lid} exist: the router holds this as "
+                       "state_conflict, and so does this step")
+        if dst is not None and not stat.S_ISDIR(dst.st_mode):
+            raise Stop(f"{state_dir / lid} is not a directory")
+        if src is not None:
+            out[name] = {"logical_id": lid, "source": BY_NAME, "ident": _ident(src)}
+        elif dst is not None:
+            if _lstat(state_dir / lid / MIGRATION_FILE) is not None:
+                raise Stop(f"{state_dir / lid / MIGRATION_FILE} exists: an adopt has begun; resume it with the "
+                           "adopt step, never with a new plan")
+            if _lstat(state_dir / lid / GEN_FILE) is None:
+                out[name] = {"logical_id": lid, "source": BY_ID, "ident": _ident(dst)}
     return out
 
 
+def layout_needs(state_dir: Path) -> Tuple[set, set]:
+    """What the stop gate's layout rule counts as needing migration, read
+    the same way: (instance names whose state is under the name, logical_ids
+    whose directory has no generations file). An entry the router would not
+    guess about STOPs: a link or other entry, a file named like an instance
+    or a logical_id, or a directory that is neither the router's own nor an
+    instance's."""
+    import router_fingerprint as rfp
+    names, ids = set(), set()
+    with os.scandir(state_dir) as it:
+        found = list(it)
+    for e in found:
+        n = e.name
+        if n.casefold() in rfp.RESERVED_STATE_NAMES:
+            continue
+        hexish = rfp.HEX32.fullmatch(n) is not None
+        if e.is_symlink() or not (e.is_dir(follow_symlinks=False) or e.is_file(follow_symlinks=False)):
+            raise Stop(f"{state_dir / n} is a link or another kind of entry, which the router does not guess about")
+        if e.is_file(follow_symlinks=False):
+            if hexish or rfp.INSTANCE_NAME.fullmatch(n):
+                raise Stop(f"{state_dir / n} is a file named like an instance's state: the router holds such an "
+                           "instance, and this step does not guess")
+            continue
+        if LOGICAL_ID.fullmatch(n):
+            if _lstat(state_dir / n / GEN_FILE) is None:
+                ids.add(n)
+        elif hexish or rfp.INSTANCE_NAME.fullmatch(n) is None:
+            raise Stop(f"{state_dir / n} is neither the router's own entry nor an instance's")
+        else:
+            names.add(n)
+    return names, ids
+
+
+def cover(state_dir: Path, planned: Dict[str, Dict[str, Any]], *, moved: bool) -> None:
+    """The plan covers exactly what the layout says needs migration: every
+    name-keyed directory is a planned rename (before the move; none remain
+    after it), and every logical_id directory without generations is a
+    planned instance. Anything else (an unconfigured name, an unmapped
+    logical_id, a name that appeared since the plan) STOPs."""
+    names, ids = layout_needs(state_dir)
+    want_names = set() if moved else {n for n, p in planned.items() if p["source"] == BY_NAME}
+    want_ids = {p["logical_id"] for p in planned.values()} if moved else \
+        {p["logical_id"] for p in planned.values() if p["source"] == BY_ID}
+    if names != want_names or ids != want_ids:
+        extra = sorted((names - want_names) | (ids - want_ids))
+        missing = sorted((want_names - names) | (want_ids - ids))
+        raise Stop("the state directory's layout is not the plan's: "
+                   + (f"not planned: {', '.join(extra)}" if extra else "")
+                   + ("; " if extra and missing else "")
+                   + (f"planned but absent: {', '.join(missing)}" if missing else ""))
+
+
+@contextlib.contextmanager
+def drain_lock(state_dir: Path) -> Any:
+    """The router's own drain lock (flock on state_dir/.router.lock), held
+    for the renames: a router that runs on this kernel holds it, so the
+    step refuses rather than move state beneath it."""
+    fd = os.open(state_dir / ".router.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            raise Stop(f"{state_dir / '.router.lock'} is held: a router is running on this state") from None
+        yield
+    finally:
+        os.close(fd)
+
+
+def _fsync_dir(d: Path) -> None:
+    fd = os.open(d, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def _write_new(path: Path, doc: Any) -> None:
-    data = json.dumps(doc, sort_keys=True, indent=2) + "\n"
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as f:
-        f.write(data)
+        f.write(json.dumps(doc, sort_keys=True, indent=2) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+    _fsync_dir(path.parent)
+
+
+def _publish(path: Path, doc: Any) -> None:
+    """Replace `path` atomically and durably: a temporary beside it, fsynced,
+    renamed over it, and the directory fsynced. A crash leaves the old
+    record or the new one, never a truncated one."""
+    tmp = path.with_name(path.name + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(json.dumps(doc, sort_keys=True, indent=2) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+    _fsync_dir(path.parent)
+
+
+def rename_noreplace(src: Path, dst: Path) -> None:
+    """An atomic rename that never replaces an entry at `dst`, of any type:
+    renameat2(RENAME_NOREPLACE) on Linux, renamex_np(RENAME_EXCL) on
+    darwin. Anything else cannot run."""
+    libc = ctypes.CDLL(ctypes.util.find_library("c") or None, use_errno=True)
+    s, d = os.fsencode(str(src)), os.fsencode(str(dst))
+    if sys.platform.startswith("linux") and hasattr(libc, "renameat2"):
+        at_fdcwd, rename_noreplace_flag = -100, 1
+        rc = libc.renameat2(at_fdcwd, s, at_fdcwd, d, rename_noreplace_flag)
+    elif sys.platform == "darwin" and hasattr(libc, "renamex_np"):
+        rename_excl = 0x4
+        rc = libc.renamex_np(s, d, rename_excl)
+    else:
+        raise Cannot("this platform has no atomic no-replace rename")
+    if rc != 0:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err), str(dst))
 
 
 def _record(run_dir: Path, step: str, suffix: str = ".json") -> Path:
@@ -245,17 +407,19 @@ def _record(run_dir: Path, step: str, suffix: str = ".json") -> Path:
     raise Cannot(f"no free record name for {step} in {run_dir}")
 
 
-def _read_doc(path: str, what: str) -> Dict[str, Any]:
+def _read_doc(path: str, step: str) -> Dict[str, Any]:
     try:
         doc = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, ValueError) as e:
-        raise Cannot(f"cannot read the {what} {path}: {e}") from None
-    if not isinstance(doc, dict) or doc.get("schema") != SCHEMA:
-        raise Cannot(f"{path} is not a router-migrate {what}")
+        raise Cannot(f"cannot read the {step} record {path}: {e}") from None
+    if not isinstance(doc, dict) or doc.get("schema") != SCHEMA or doc.get("step") != step:
+        raise Cannot(f"{path} is not a router-migrate {step} record")
     return doc
 
 
-def _config(path: str) -> Tuple[Dict[str, Any], Path, str]:
+def _config(path: str) -> Dict[str, Any]:
+    """The config's own facts, as every step binds them: its sha256, its
+    state_dir and that directory's identity, and its registry_dir."""
     try:
         raw = Path(path).read_bytes()
         doc = json.loads(raw)
@@ -263,107 +427,200 @@ def _config(path: str) -> Tuple[Dict[str, Any], Path, str]:
         raise Cannot(f"cannot read the config {path}: {e}") from None
     if not isinstance(doc, dict) or not isinstance(doc.get("state_dir"), str) or not doc.get("registry_dir"):
         raise Stop(f"{path} names no state_dir, or sets no registry_dir: it is not a migration config")
-    return doc, Path(doc["state_dir"]), hashlib.sha256(raw).hexdigest()
+    sd = Path(doc["state_dir"])
+    st = _lstat(sd)
+    if st is None or not stat.S_ISDIR(st.st_mode):
+        raise Stop(f"{sd} is not a directory")
+    return {"doc": doc, "sha256": hashlib.sha256(raw).hexdigest(), "state_dir": str(sd),
+            "state_ident": _ident(st), "registry_dir": doc["registry_dir"]}
+
+
+def _context(cfg: Dict[str, Any], checkout: str, image: str) -> Dict[str, Any]:
+    return {"config_sha256": cfg["sha256"], "state_dir": cfg["state_dir"], "state_ident": cfg["state_ident"],
+            "registry_dir": cfg["registry_dir"], "checkout": checkout, "image": image}
+
+
+def bind_context(want: Dict[str, Any], cfg: Dict[str, Any], checkout: str, image: str) -> None:
+    """Refuse unless this invocation's config, state directory, checkout and
+    image are the plan's. Runs before any mutation."""
+    got = _context(cfg, checkout, image)
+    for k in CONTEXT:
+        if got[k] != want.get(k):
+            raise Stop(f"this run's {k} is {got[k]!r}, not the plan's {want.get(k)!r}")
+
+
+# --- The steps -----------------------------------------------------------------------------
 
 
 def do_map(checkout: str, image: str, config: str, run_dir: Path, runner: Runner) -> Path:
-    _config(config)
+    cfg = _config(config)
     the_map = read_map(checkout, image, config, runner)
     out = _record(run_dir, "map")
-    _write_new(out, {"schema": SCHEMA, "step": "map", "config": config, "map": the_map})
+    _write_new(out, {"schema": SCHEMA, "step": "map", "context": _context(cfg, checkout, image), "map": the_map})
     return out
 
 
-def do_preview(checkout: str, image: str, config: str, map_path: str, reason: str, run_dir: Path,
-               runner: Runner) -> Path:
-    doc, state_dir, sha = _config(config)
-    the_map = _read_doc(map_path, "map")["map"]
-    pending = to_migrate(state_dir, the_map)
+def do_preview(checkout: str, image: str, config: str, reason: str, run_dir: Path, runner: Runner) -> Path:
+    cfg = _config(config)
+    the_map = read_map(checkout, image, config, runner)
+    state_dir = Path(cfg["state_dir"])
+    planned = classify(state_dir, the_map)
+    cover(state_dir, planned, moved=False)
     out = _record(run_dir, "preview")
     scratch = out.with_suffix(".d")
     os.mkdir(scratch, 0o700)
     try:
         state = scratch / "state"
         os.mkdir(state, 0o700)
-        for name, lid in pending:
-            shutil.copytree(state_dir / name, state / lid, symlinks=True)
-        cfg = scratch / "config.json"
-        _write_new(cfg, dict(doc, state_dir=str(state)))
-        plans = {}
-        for name, lid in pending:
-            plan, n = dry_run(checkout, image, str(cfg), name, reason, runner)
-            if plan.get("logical_id") != lid:
-                raise Stop(f"{name!r}'s preview is for {plan.get('logical_id')!r}, not the map's {lid}")
-            plans[name] = {"logical_id": lid, "advisory_n": n, "plan": plan}
+        for name, p in planned.items():
+            src = state_dir / (name if p["source"] == BY_NAME else p["logical_id"])
+            shutil.copytree(src, state / p["logical_id"], symlinks=True)
+        scfg = scratch / "config.json"
+        _write_new(scfg, dict(cfg["doc"], state_dir=str(state)))
+        for name, p in planned.items():
+            plan, n = dry_run(checkout, image, str(scfg), name, reason, runner)
+            if plan.get("logical_id") != p["logical_id"]:
+                raise Stop(f"{name!r}'s preview is for {plan.get('logical_id')!r}, not the map's "
+                           f"{p['logical_id']}")
+            p.update(advisory_n=n, plan=plan)
     finally:
-        shutil.rmtree(scratch, ignore_errors=True)
-    _write_new(out, {"schema": SCHEMA, "step": "preview", "config_sha256": sha, "map": the_map,
-                     "instances": plans})
+        failed: List[str] = []
+        shutil.rmtree(scratch, onerror=lambda fn, path, exc: failed.append(path))
+        if failed:
+            raise Stop(f"the scratch copy of the state at {scratch} could not be removed ({failed[0]}): remove it "
+                       "by hand; it is a copy of the router's private state")
+    live = bindings(the_map)
+    _write_new(out, {"schema": SCHEMA, "step": "preview", "context": _context(cfg, checkout, image),
+                     "binding": {n: live[n] for n in planned}, "instances": planned})
     return out
 
 
-def do_move(config: str, map_path: str, run_dir: Path, *, reverse: Optional[str] = None) -> Path:
-    """The guarded renames, each journaled before it is made; stops at the
-    first failure. With `reverse`, that journal's moves are undone, newest
-    first, under the same guards turned around."""
-    _, state_dir, _ = _config(config)
-    if reverse is not None:
-        journal = _read_doc(reverse, "move journal")
-        for name, lid in reversed(journal["moves"]):
-            src, dst = _lstat(state_dir / lid), _lstat(state_dir / name)
-            if src is None or not stat.S_ISDIR(src.st_mode) or dst is not None:
-                raise Stop(f"cannot move {state_dir / lid} back to {state_dir / name}: the source is not a "
-                           "directory, or the name has an entry again")
-            os.rename(state_dir / lid, state_dir / name)
-        return Path(reverse)
-    the_map = _read_doc(map_path, "map")["map"]
-    pending = to_migrate(state_dir, the_map)
-    out = _record(run_dir, "moves")
-    moves: List[List[str]] = []
-    _write_new(out, {"schema": SCHEMA, "step": "move", "state_dir": str(state_dir), "moves": moves})
-    for name, lid in pending:
-        moves.append([name, lid])
-        out.write_text(json.dumps({"schema": SCHEMA, "step": "move", "state_dir": str(state_dir), "moves": moves},
-                                  sort_keys=True, indent=2) + "\n", encoding="utf-8")
-        if _lstat(state_dir / lid) is not None:
-            raise Stop(f"{state_dir / lid} appeared before the move")
-        os.rename(state_dir / name, state_dir / lid)
-    return out
-
-
-def do_check(checkout: str, image: str, config: str, preview_path: str, map_path: str, reason: str,
-             run_dir: Path, runner: Runner) -> Path:
-    _config(config)
+def do_move(checkout: str, image: str, config: str, preview_path: str, run_dir: Path, runner: Runner) -> Path:
+    """The plan's renames, after the stop. Each is journaled (intent) and
+    published durably before it is made, made by an atomic no-replace
+    rename, then checked (the moved directory is the source the plan
+    recorded) and journaled done. The first failure stops the step, and its
+    message names the journal, which `--reverse` reads."""
     preview = _read_doc(preview_path, "preview")
-    after = _read_doc(map_path, "map")["map"]
-    compare_maps(preview["map"], after)
+    cfg = _config(config)
+    bind_context(preview["context"], cfg, checkout, image)
+    compare_bindings(preview["binding"], read_map(checkout, image, config, runner))
+    state_dir = Path(cfg["state_dir"])
+    with drain_lock(state_dir):
+        cover(state_dir, preview["instances"], moved=False)
+        return _moves(state_dir, preview, run_dir)
+
+
+def _moves(state_dir: Path, preview: Dict[str, Any], run_dir: Path) -> Path:
+    out = _record(run_dir, "moves")
+    journal: Dict[str, Any] = {"schema": SCHEMA, "step": "moves", "context": preview["context"], "moves": []}
+    _write_new(out, journal)
+    try:
+        for name, p in sorted(preview["instances"].items()):
+            if p["source"] != BY_NAME:
+                continue
+            src, dst = state_dir / name, state_dir / p["logical_id"]
+            st = _lstat(src)
+            if st is None or not stat.S_ISDIR(st.st_mode) or _ident(st) != p["ident"]:
+                raise Stop(f"{src} is not the directory the plan recorded")
+            entry = {"name": name, "logical_id": p["logical_id"], "ident": p["ident"], "state": "intent"}
+            journal["moves"].append(entry)
+            _publish(out, journal)
+            try:
+                rename_noreplace(src, dst)
+            except OSError as e:
+                entry["state"] = "not_applied"
+                _publish(out, journal)
+                raise Stop(f"cannot move {src} to {dst}: {e.strerror}") from None
+            moved = _lstat(dst)
+            if moved is None or _ident(moved) != p["ident"] or _lstat(src) is not None:
+                raise Stop(f"{dst} is not the directory moved from {src}")
+            entry["state"] = "done"
+            _publish(out, journal)
+            _fsync_dir(state_dir)
+    except Stop as e:
+        raise Stop(f"{e}; the journal is {out}") from None
+    return out
+
+
+def do_reverse(config: str, journal_path: str) -> Path:
+    """Undo a move journal, newest first, idempotently: an entry whose
+    directory is under its logical_id (and is the recorded one) moves back;
+    one whose directory is still under its name was never applied, or was
+    already reversed; anything else is ambiguous and STOPs."""
+    journal = _read_doc(journal_path, "moves")
+    cfg = _config(config)
+    want = journal["context"]
+    for k in ("state_dir", "state_ident"):
+        if cfg[k] != want[k]:
+            raise Stop(f"this config's {k} is {cfg[k]!r}, not the journal's {want[k]!r}")
+    state_dir = Path(want["state_dir"])
+    with drain_lock(state_dir):
+        _reverse(state_dir, journal, journal_path)
+    return Path(journal_path)
+
+
+def _reverse(state_dir: Path, journal: Dict[str, Any], journal_path: str) -> None:
+    for entry in reversed(journal["moves"]):
+        src, dst = state_dir / entry["name"], state_dir / entry["logical_id"]
+        at_name, at_id = _lstat(src), _lstat(dst)
+        if at_id is not None and at_name is None and _ident(at_id) == entry["ident"]:
+            rename_noreplace(dst, src)
+            back = _lstat(src)
+            if back is None or _ident(back) != entry["ident"]:
+                raise Stop(f"{src} is not the directory moved back from {dst}")
+            entry["state"] = "reversed"
+            _publish(Path(journal_path), journal)
+            _fsync_dir(state_dir)
+        elif at_name is not None and at_id is None and _ident(at_name) == entry["ident"]:
+            continue
+        else:
+            raise Stop(f"cannot tell whether {entry['name']!r} was moved: neither {src} alone nor {dst} alone "
+                       f"holds the recorded directory; the journal is {journal_path}")
+
+
+def do_check(checkout: str, image: str, config: str, preview_path: str, reason: str, run_dir: Path,
+             runner: Runner) -> Path:
+    preview = _read_doc(preview_path, "preview")
+    cfg = _config(config)
+    bind_context(preview["context"], cfg, checkout, image)
+    compare_bindings(preview["binding"], read_map(checkout, image, config, runner))
+    cover(Path(cfg["state_dir"]), preview["instances"], moved=True)
     plans = {}
-    for name, rec in sorted(preview["instances"].items()):
+    for name, p in sorted(preview["instances"].items()):
         plan, n = dry_run(checkout, image, config, name, reason, runner)
-        compare_plans(name, rec["plan"], plan)
-        plans[name] = {"logical_id": rec["logical_id"], "n": n}
+        compare_plans(name, p["plan"], plan)
+        plans[name] = {"logical_id": p["logical_id"], "n": n, "root": plan["root"]}
     out = _record(run_dir, "check")
-    _write_new(out, {"schema": SCHEMA, "step": "check", "instances": plans})
+    _write_new(out, {"schema": SCHEMA, "step": "check", "context": preview["context"],
+                     "binding": preview["binding"], "instances": plans})
     return out
 
 
 def do_adopt(checkout: str, image: str, config: str, check_path: str, reason: str, run_dir: Path,
              runner: Runner) -> Path:
-    _config(config)
+    """The real adopt, for exactly the checked instances, with the checked N,
+    and only while the config, state, checkout, image and binding are the
+    checked ones. The router itself re-verifies the root and binding it is
+    given; a failure leaves its journal, and re-running this step resumes."""
     check = _read_doc(check_path, "check")
-    done = {}
+    cfg = _config(config)
+    bind_context(check["context"], cfg, checkout, image)
+    compare_bindings(check["binding"], read_map(checkout, image, config, runner))
+    done: Dict[str, Any] = {}
     out = _record(run_dir, "adopt")
     for name, rec in sorted(check["instances"].items()):
         rc, stdout, err = _call(adopt_argv(checkout, image, config, name, reason, dry_run=False, n=rec["n"]),
                                 runner)
-        if rc != 0:
-            _write_new(out, {"schema": SCHEMA, "step": "adopt", "done": done, "failed": name})
-            raise Stop(f"adopt for {name!r} exited {rc}: {err.strip()[-400:]}; re-running the same step "
-                       "resumes it")
         try:
-            done[name] = json.loads(stdout)
+            result = json.loads(stdout) if rc == 0 else None
         except ValueError:
-            done[name] = None
+            result = None
+        if rc != 0 or not isinstance(result, dict) or result.get("logical_id") != rec["logical_id"]:
+            _write_new(out, {"schema": SCHEMA, "step": "adopt", "done": done, "failed": name})
+            raise Stop(f"adopt for {name!r} exited {rc}, or answered for another identity: "
+                       f"{err.strip()[-400:]}; re-running the same step resumes it")
+        done[name] = result
     _write_new(out, {"schema": SCHEMA, "step": "adopt", "done": done, "failed": None})
     return out
 
@@ -393,11 +650,13 @@ def _run(args: Any, out: Callable[[str], None], runner: Runner) -> int:
         raise Cannot("the host-setup document has no router section (its image)")
     checkout, image, run_dir = str(hp.hop_checkout()), spec.router.image_digest, Path(spec.secrets.run_dir)
     step = args.step
-    need = {"map": ("config",), "preview": ("config", "map", "reason"), "move": ("config",),
-            "check": ("config", "preview", "map", "reason"), "adopt": ("config", "check", "reason")}[step]
+    if getattr(args, "config", None) is not None:
+        args.config = os.path.abspath(args.config)
+    need = {"map": ("config",), "preview": ("config", "reason"), "move": ("config",),
+            "check": ("config", "preview", "reason"), "adopt": ("config", "check", "reason")}[step]
     missing = [k for k in need if getattr(args, k, None) is None]
-    if step == "move" and args.map is None and args.reverse is None:
-        missing.append("map or reverse")
+    if step == "move" and (args.preview is None) == (args.reverse is None):
+        missing.append("preview or --reverse, exactly one")
     if missing:
         raise Cannot("needs --" + ", --".join(missing))
     if not args.apply:
@@ -407,11 +666,13 @@ def _run(args: Any, out: Callable[[str], None], runner: Runner) -> int:
     if step == "map":
         path = do_map(checkout, image, args.config, run_dir, runner)
     elif step == "preview":
-        path = do_preview(checkout, image, args.config, args.map, args.reason, run_dir, runner)
+        path = do_preview(checkout, image, args.config, args.reason, run_dir, runner)
+    elif step == "move" and args.reverse is not None:
+        path = do_reverse(args.config, args.reverse)
     elif step == "move":
-        path = do_move(args.config, args.map, run_dir, reverse=args.reverse)
+        path = do_move(checkout, image, args.config, args.preview, run_dir, runner)
     elif step == "check":
-        path = do_check(checkout, image, args.config, args.preview, args.map, args.reason, run_dir, runner)
+        path = do_check(checkout, image, args.config, args.preview, args.reason, run_dir, runner)
     else:
         path = do_adopt(checkout, image, args.config, args.check, args.reason, run_dir, runner)
     out(f"router-migrate {step}: done: {path}")

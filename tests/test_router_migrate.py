@@ -5,24 +5,28 @@ checkout's docker/run.sh and answers as the pinned router's code does. The
 dry-run plan's members and the refusal that names N are the router's own
 at the pin (router/generations.py: operator_migrate's summary and
 legacy_basis's message), as the router's maintainers answered the deploy's
-Q5 and Q6.
+Q5 and Q6. The renames, the journal and the drain lock run on real files in
+a scratch directory.
 """
 
+import fcntl
 import hashlib
 import json
 import os
 import shutil
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import amap_sandy
 import router_migrate as rm
 
 CHECKOUT = "/hop"
 IMAGE = "sha256:" + "e" * 64
-LID_A, LID_B = "a" * 32, "b" * 32
+LID_A, LID_B, LID_C = "a" * 32, "b" * 32, "c" * 32
 REASON = "R2 on this host"
 
 
@@ -38,7 +42,7 @@ def the_map(**over):
     return doc
 
 
-def plan(name, lid, *, local=1, root=("/inst/" + "alice", 41, 9), **legacy):
+def plan(name, lid, *, local=1, root=("/inst/alice", 41, 9), **legacy):
     facts = {"basis": "attested", "counter": None, "inflight": 0, "local": local, "malformed": 0,
              "manifest_sha256": "0" * 64, "positive_evidence_count": 0, "transport": 0}
     facts.update(legacy)
@@ -50,18 +54,20 @@ def plan(name, lid, *, local=1, root=("/inst/" + "alice", 41, 9), **legacy):
 class FakeRouter:
     """Answers each run.sh call as the pinned router's code would."""
 
-    def __init__(self, the_map=None, plans=None, n=None, adopt_rc=0):
-        self.map = the_map if the_map is not None else globals()["the_map"]()
+    def __init__(self, maps=None, plans=None, n=None, adopt_rc=0, answer_lid=None):
+        self.maps = list(maps) if maps is not None else []
         self.plans = plans or {}
         self.n = n or {}
         self.adopt_rc = adopt_rc
+        self.answer_lid = answer_lid or {}
         self.calls = []
 
     def __call__(self, argv, input=b"", **kw):
         self.calls.append((list(argv), input))
         inner = argv[argv.index("shell") + 1:]
         if inner[:4] == ["python3", "-I", "-S", "-"]:
-            return self.done(0, json.dumps(self.map))
+            m = self.maps.pop(0) if len(self.maps) > 1 else (self.maps[0] if self.maps else the_map())
+            return self.done(0, json.dumps(m))
         name = inner[inner.index("adopt") + 1]
         given = next((int(a.split("=", 1)[1]) for a in inner if a.startswith("--no-transport-history=")), None)
         need = self.n.get(name)
@@ -70,7 +76,8 @@ class FakeRouter:
                                     f"{need} local anchor(s) remain; if this instance never had a transport route, "
                                     f"attest it with --no-transport-history={need}\n")
         if "--dry-run" not in inner:
-            return self.done(self.adopt_rc, json.dumps({"name": name, "verb": "adopt"}),
+            lid = self.answer_lid.get(name, the_map()["instances"].get(name, entry(LID_C))["logical_id"])
+            return self.done(self.adopt_rc, json.dumps({"name": name, "verb": "adopt", "logical_id": lid}),
                              "" if self.adopt_rc == 0 else "router: generation adopt: refused: no\n")
         cfg = json.loads(Path(inner[inner.index("--config") + 1]).read_text())
         self.seen_state = cfg["state_dir"]
@@ -88,16 +95,32 @@ class Base(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.base, ignore_errors=True)
         self.state = self.base / "state"
         self.state.mkdir(mode=0o700)
+        (self.state / "status.json").write_text("{}")
+        (self.state / ".router.lock").write_text("")
         self.run_dir = self.base / "run"
         self.run_dir.mkdir()
         self.config = self.base / "r2-config.json"
-        self.config.write_text(json.dumps({"state_dir": str(self.state), "registry_dir": "/reg",
-                                           "instances": {"alice": {}, "bob": {}}}))
+        self.write_config()
 
-    def write_map(self, doc=None):
-        p = self.run_dir / f"map-{len(list(self.run_dir.iterdir()))}.json"
-        p.write_text(json.dumps({"schema": rm.SCHEMA, "step": "map", "map": doc or the_map()}))
-        return str(p)
+    def write_config(self, **over):
+        doc = {"state_dir": str(self.state), "registry_dir": "/reg", "instances": {"alice": {}, "bob": {}}}
+        doc.update(over)
+        self.config.write_text(json.dumps(doc))
+
+    def name_dir(self, name):
+        (self.state / name / "results").mkdir(parents=True)
+        (self.state / name / "results" / "r1.json").write_text("{}")
+
+    def preview(self, plans=None, n=None, maps=None):
+        fake = FakeRouter(maps=maps, plans=plans or {"alice": plan("alice", LID_A)}, n=n)
+        return rm.do_preview(CHECKOUT, IMAGE, str(self.config), REASON, self.run_dir, fake), fake
+
+    def move(self, preview, runner=None):
+        return rm.do_move(CHECKOUT, IMAGE, str(self.config), str(preview), self.run_dir, runner or FakeRouter())
+
+    def check(self, preview, plans=None, n=None, maps=None):
+        return rm.do_check(CHECKOUT, IMAGE, str(self.config), str(preview), REASON, self.run_dir,
+                           FakeRouter(maps=maps, plans=plans or {"alice": plan("alice", LID_A)}, n=n))
 
 
 class MapProgram(unittest.TestCase):
@@ -120,7 +143,8 @@ class MapProgram(unittest.TestCase):
     def test_the_stop_rules(self):
         for doc, exc in ((the_map(registry_state="unavailable"), rm.Stop), (the_map(unknown=["carol"]), rm.Stop),
                          ({"registry_state": "ok"}, rm.Cannot),
-                         (the_map(instances={"alice": dict(entry(LID_A), logical_id="short")}), rm.Cannot)):
+                         (the_map(instances={"alice": dict(entry(LID_A), logical_id="short")}), rm.Cannot),
+                         (the_map(instances={"alice": dict(entry(LID_A), logical_id="A" * 32)}), rm.Cannot)):
             with self.subTest(doc=doc):
                 with self.assertRaises(exc):
                     rm.parse_map(json.dumps(doc))
@@ -132,7 +156,7 @@ class DryRunRows(Base):
 
     def test_n_is_taken_from_the_refusal_and_asked_again(self):
         fake = FakeRouter(plans={"alice": plan("alice", LID_A, local=3)}, n={"alice": 3})
-        got, n = rm.dry_run(CHECKOUT, IMAGE, str(self.config), "alice", REASON, fake)
+        _, n = rm.dry_run(CHECKOUT, IMAGE, str(self.config), "alice", REASON, fake)
         self.assertEqual(n, 3)
         self.assertEqual(len(fake.calls), 2)
         self.assertIn("--no-transport-history=3", fake.calls[1][0])
@@ -189,120 +213,309 @@ class CompareRows(unittest.TestCase):
         rm.compare_plans("alice", a, b)
 
     def test_a_binding_change_stops(self):
-        for k, v in (("logical_id", LID_B), ("adapter", "other"), ("stable_key", "k2"), ("binding_seq", 2)):
+        want = rm.bindings(the_map())
+        for k, v in (("logical_id", LID_C), ("adapter", "other"), ("stable_key", "k2"), ("binding_seq", 2)):
             with self.subTest(field=k):
-                after = the_map()
-                after["instances"]["alice"][k] = v
+                now = the_map()
+                now["instances"]["alice"][k] = v
                 with self.assertRaises(rm.Stop):
-                    rm.compare_maps(the_map(), after)
+                    rm.compare_bindings(want, now)
         with self.assertRaises(rm.Stop):
-            rm.compare_maps(the_map(), the_map(instances={"alice": entry(LID_A)}))
+            rm.compare_bindings(want, the_map(instances={"bob": entry(LID_B)}))
 
 
-class MoveRows(Base):
+class LayoutRows(Base):
+    """The plan is built from the layout the stop gate reads (Codex's B1 and
+    B2, Opus's 2): nothing the gate counts as needing migration is missed."""
 
-    def test_moves_each_name_to_its_logical_id_and_journals_it(self):
-        (self.state / "alice" / "results").mkdir(parents=True)
-        journal = rm.do_move(str(self.config), self.write_map(), self.run_dir)
-        self.assertTrue((self.state / LID_A / "results").is_dir())
-        self.assertFalse((self.state / "alice").exists())
-        self.assertEqual(json.loads(journal.read_text())["moves"], [["alice", LID_A]])
+    def test_a_name_dir_is_renamed_and_a_logical_id_dir_is_adopted_in_place(self):
+        self.name_dir("alice")
+        self.name_dir(LID_B)
+        got = rm.classify(self.state, the_map())
+        self.assertEqual({n: p["source"] for n, p in got.items()}, {"alice": rm.BY_NAME, "bob": rm.BY_ID})
+        rm.cover(self.state, got, moved=False)
 
-    def test_the_guards(self):
-        os.symlink(str(self.base), str(self.state / "alice"))
+    def test_generation_keyed_and_fresh_instances_are_not_planned(self):
+        self.name_dir(LID_A)
+        (self.state / LID_A / "generations.json").write_text("{}")
+        self.assertEqual(rm.classify(self.state, the_map()), {})
+        rm.cover(self.state, {}, moved=False)
+
+    def test_what_the_router_would_not_guess_stops(self):
+        cases = {
+            "a file under a name": lambda: (self.state / "alice").write_text("x"),
+            "a link under a name": lambda: os.symlink(str(self.base), str(self.state / "alice")),
+            "both name and logical_id": lambda: (self.name_dir("alice"), self.name_dir(LID_A)),
+            "an adopt begun": lambda: (self.name_dir(LID_A), (self.state / LID_A / "migration.json").write_text("{}")),
+        }
+        for name, make in cases.items():
+            with self.subTest(case=name):
+                d = self.base / "s"
+                if d.exists():
+                    shutil.rmtree(d)
+                self.state = d
+                d.mkdir()
+                make()
+                with self.assertRaises(rm.Stop):
+                    rm.classify(self.state, the_map())
+
+    def test_layout_needs_reads_as_the_gate_does(self):
+        self.name_dir("alice")
+        self.name_dir(LID_B)
+        (self.state / "registry").mkdir()
+        (self.state / "_runtime").mkdir()
+        self.assertEqual(rm.layout_needs(self.state), ({"alice"}, {LID_B}))
+        for bad, make in (("carol-file", lambda p: p.write_text("x")), ("A" * 32, lambda p: p.mkdir()),
+                          ("_weird", lambda p: p.mkdir())):
+            with self.subTest(entry=bad):
+                make(self.state / bad)
+                with self.assertRaises(rm.Stop):
+                    rm.layout_needs(self.state)
+                p = self.state / bad
+                p.rmdir() if p.is_dir() else p.unlink()
+
+    def test_an_unconfigured_name_dir_stops_the_preview(self):
+        """Opus's (c): a removed instance's state is counted by the gate and
+        no step would touch it, so the preview refuses before anything."""
+        self.name_dir("alice")
+        self.name_dir("carol")
         with self.assertRaises(rm.Stop):
-            rm.to_migrate(self.state, the_map())
-        os.unlink(self.state / "alice")
-        (self.state / "alice").mkdir()
-        os.symlink("/nowhere", str(self.state / LID_A))
+            self.preview()
+
+    def test_a_logical_id_dir_with_no_mapping_stops_the_preview(self):
+        self.name_dir("alice")
+        self.name_dir(LID_C)
         with self.assertRaises(rm.Stop):
-            rm.to_migrate(self.state, the_map())
-        os.unlink(self.state / LID_A)
-        (self.state / LID_A).write_text("x")
-        with self.assertRaises(rm.Stop):
-            rm.to_migrate(self.state, the_map())
-
-    def test_an_instance_with_no_name_state_is_left_alone(self):
-        self.assertEqual(rm.to_migrate(self.state, the_map()), [])
-
-    def test_reverse_undoes_newest_first_and_refuses_a_reborn_name(self):
-        (self.state / "alice").mkdir()
-        (self.state / "bob").mkdir()
-        journal = rm.do_move(str(self.config), self.write_map(), self.run_dir)
-        rm.do_move(str(self.config), None, self.run_dir, reverse=str(journal))
-        self.assertTrue((self.state / "alice").is_dir() and (self.state / "bob").is_dir())
-        self.assertFalse((self.state / LID_A).exists() or (self.state / LID_B).exists())
-        journal = rm.do_move(str(self.config), self.write_map(), self.run_dir)
-        (self.state / "bob").mkdir()
-        with self.assertRaises(rm.Stop):
-            rm.do_move(str(self.config), None, self.run_dir, reverse=str(journal))
+            self.preview()
 
 
-class PreviewCheckAdoptRows(Base):
-
-    def setUp(self):
-        super().setUp()
-        (self.state / "alice" / "results").mkdir(parents=True)
-        (self.state / "alice" / "results" / "r1.json").write_text("{}")
+class PlanRows(Base):
 
     def test_preview_runs_on_a_scratch_copy_and_removes_it(self):
-        fake = FakeRouter(plans={"alice": plan("alice", LID_A)}, n={"alice": 1})
-        out = rm.do_preview(CHECKOUT, IMAGE, str(self.config), self.write_map(), REASON, self.run_dir, fake)
+        self.name_dir("alice")
+        out, fake = self.preview(n={"alice": 1})
         self.assertNotEqual(fake.seen_state, str(self.state))
-        self.assertTrue(fake.seen_state.endswith("/state"))
         self.assertFalse(Path(fake.seen_state).exists())
         self.assertTrue((self.state / "alice" / "results" / "r1.json").is_file())
         doc = json.loads(out.read_text())
         self.assertEqual(doc["instances"]["alice"]["advisory_n"], 1)
+        self.assertEqual(doc["context"]["config_sha256"], hashlib.sha256(self.config.read_bytes()).hexdigest())
         self.assertEqual([p.name for p in self.run_dir.iterdir() if p.suffix == ".d"], [])
 
-    def test_a_preview_for_another_logical_id_stops(self):
-        fake = FakeRouter(plans={"alice": plan("alice", LID_B)})
-        with self.assertRaises(rm.Stop):
-            rm.do_preview(CHECKOUT, IMAGE, str(self.config), self.write_map(), REASON, self.run_dir, fake)
+    def test_a_logical_id_dir_is_previewed_checked_and_adopted_without_a_rename(self):
+        """Codex's B2, Opus's (a): state already under its logical_id."""
+        self.name_dir(LID_A)
+        pre, _ = self.preview()
+        journal = json.loads(self.move(pre).read_text())
+        self.assertEqual(journal["moves"], [])
+        check = self.check(pre)
+        self.assertEqual(json.loads(check.read_text())["instances"]["alice"]["logical_id"], LID_A)
+        fake = FakeRouter()
+        rm.do_adopt(CHECKOUT, IMAGE, str(self.config), str(check), REASON, self.run_dir, fake)
+        self.assertTrue(any("adopt" in c[0] and "--dry-run" not in c[0] for c in fake.calls))
 
-    def flow(self, preview_n, post_n, post_local):
-        m = self.write_map()
-        pre = rm.do_preview(CHECKOUT, IMAGE, str(self.config), m, REASON, self.run_dir,
-                            FakeRouter(plans={"alice": plan("alice", LID_A, local=preview_n)},
-                                       n={"alice": preview_n}))
-        rm.do_move(str(self.config), m, self.run_dir)
-        return rm.do_check(CHECKOUT, IMAGE, str(self.config), str(pre), self.write_map(), REASON, self.run_dir,
-                           FakeRouter(plans={"alice": plan("alice", LID_A, local=post_local)},
-                                      n={"alice": post_n}))
+    def test_a_name_dir_that_appears_after_the_preview_stops_the_move(self):
+        """Opus's (b): the running router made bob's state after the plan."""
+        self.name_dir("alice")
+        pre, _ = self.preview()
+        self.name_dir("bob")
+        with self.assertRaises(rm.Stop):
+            self.move(pre)
+        self.assertTrue((self.state / "alice").is_dir())
+        self.assertFalse((self.state / LID_A).exists())
 
     def test_check_takes_n_only_from_the_post_stop_refusal(self):
-        check = self.flow(preview_n=1, post_n=4, post_local=4)
-        self.assertEqual(json.loads(check.read_text())["instances"], {"alice": {"logical_id": LID_A, "n": 4}})
+        self.name_dir("alice")
+        pre, _ = self.preview(n={"alice": 1})
+        self.move(pre)
+        check = self.check(pre, plans={"alice": plan("alice", LID_A, local=4)}, n={"alice": 4})
+        rec = json.loads(check.read_text())["instances"]["alice"]
+        self.assertEqual((rec["logical_id"], rec["n"]), (LID_A, 4))
 
-    def test_adopt_runs_with_the_checked_n_and_stops_on_a_failure(self):
-        check = self.flow(preview_n=1, post_n=2, post_local=2)
+    def test_check_stops_unless_every_planned_rename_was_made(self):
+        self.name_dir("alice")
+        pre, _ = self.preview()
+        with self.assertRaises(rm.Stop):
+            self.check(pre)
+
+    def test_adopt_runs_with_the_checked_n_and_stops_on_a_failure_or_another_identity(self):
+        self.name_dir("alice")
+        pre, _ = self.preview(n={"alice": 2}, plans={"alice": plan("alice", LID_A, local=2)})
+        self.move(pre)
+        check = self.check(pre, plans={"alice": plan("alice", LID_A, local=2)}, n={"alice": 2})
         fake = FakeRouter(n={"alice": 2})
         rm.do_adopt(CHECKOUT, IMAGE, str(self.config), str(check), REASON, self.run_dir, fake)
-        argv = fake.calls[0][0]
+        argv = fake.calls[-1][0]
         self.assertIn("--no-transport-history=2", argv)
         self.assertNotIn("--dry-run", argv)
-        with self.assertRaises(rm.Stop):
-            rm.do_adopt(CHECKOUT, IMAGE, str(self.config), str(check), REASON, self.run_dir,
-                        FakeRouter(n={"alice": 2}, adopt_rc=1))
+        for runner in (FakeRouter(n={"alice": 2}, adopt_rc=1), FakeRouter(n={"alice": 2}, answer_lid={"alice": LID_C})):
+            with self.subTest(runner=runner.adopt_rc):
+                with self.assertRaises(rm.Stop):
+                    rm.do_adopt(CHECKOUT, IMAGE, str(self.config), str(check), REASON, self.run_dir, runner)
 
     def test_a_step_run_twice_in_one_second_gets_a_second_record(self):
-        """A resumed adopt re-runs at once; its record never collides."""
         a = rm.do_map(CHECKOUT, IMAGE, str(self.config), self.run_dir, FakeRouter())
         b = rm.do_map(CHECKOUT, IMAGE, str(self.config), self.run_dir, FakeRouter())
         self.assertNotEqual(a, b)
-        self.assertTrue(a.is_file() and b.is_file())
 
     def test_a_config_with_no_registry_dir_is_refused(self):
-        self.config.write_text(json.dumps({"state_dir": str(self.state)}))
+        self.write_config(registry_dir=None)
         with self.assertRaises(rm.Stop):
             rm.do_map(CHECKOUT, IMAGE, str(self.config), self.run_dir, FakeRouter())
+
+
+class BindingRows(Base):
+    """Codex's B4: every step after the preview is bound to its context."""
+
+    def setUp(self):
+        super().setUp()
+        self.name_dir("alice")
+        self.pre, _ = self.preview()
+
+    def test_a_changed_config_stops_every_later_step(self):
+        self.write_config(extra=1)
+        for step in (lambda: self.move(self.pre), lambda: self.check(self.pre)):
+            with self.subTest(step=step):
+                with self.assertRaises(rm.Stop):
+                    step()
+        self.assertTrue((self.state / "alice").is_dir())
+
+    def test_another_checkout_or_image_stops(self):
+        for checkout, image in (("/other", IMAGE), (CHECKOUT, "sha256:" + "f" * 64)):
+            with self.subTest(checkout=checkout, image=image):
+                with self.assertRaises(rm.Stop):
+                    rm.do_move(checkout, image, str(self.config), str(self.pre), self.run_dir, FakeRouter())
+
+    def test_a_changed_binding_stops_before_any_rename(self):
+        now = the_map()
+        now["instances"]["alice"]["binding_seq"] = 2
+        with self.assertRaises(rm.Stop):
+            self.move(self.pre, FakeRouter(maps=[now]))
+        self.assertTrue((self.state / "alice").is_dir())
+
+    def test_adopt_is_bound_to_the_checked_config(self):
+        self.move(self.pre)
+        check = self.check(self.pre)
+        self.write_config(extra=1)
+        fake = FakeRouter()
+        with self.assertRaises(rm.Stop):
+            rm.do_adopt(CHECKOUT, IMAGE, str(self.config), str(check), REASON, self.run_dir, fake)
+        self.assertFalse(any("adopt" in c[0] for c in fake.calls))
+
+
+class MoveRows(Base):
+    """Codex's B3, Opus's 1: an atomic no-replace rename, a durable journal
+    and an idempotent reverse."""
+
+    def setUp(self):
+        super().setUp()
+        self.name_dir("alice")
+        self.name_dir("bob")
+        self.pre, _ = self.preview(plans={"alice": plan("alice", LID_A), "bob": plan("bob", LID_B)})
+
+    def journal(self, path):
+        return json.loads(Path(path).read_text())
+
+    def test_moves_each_name_and_journals_it_done(self):
+        out = self.move(self.pre)
+        self.assertTrue((self.state / LID_A / "results").is_dir() and (self.state / LID_B).is_dir())
+        self.assertEqual([m["state"] for m in self.journal(out)["moves"]], ["done", "done"])
+
+    def test_a_failed_second_rename_then_a_full_reverse(self):
+        real = rm.rename_noreplace
+        calls = []
+
+        def failing(src, dst):
+            calls.append(src)
+            if len(calls) == 2:
+                raise OSError(5, "Input/output error", str(dst))
+            real(src, dst)
+        with mock.patch.object(rm, "rename_noreplace", failing):
+            with self.assertRaises(rm.Stop) as cm:
+                self.move(self.pre)
+        self.assertIn("the journal is", str(cm.exception))
+        journal = str(cm.exception).rsplit("the journal is ", 1)[1]
+        self.assertEqual([m["state"] for m in self.journal(journal)["moves"]], ["done", "not_applied"])
+        rm.do_reverse(str(self.config), journal)
+        self.assertTrue((self.state / "alice").is_dir() and (self.state / "bob").is_dir())
+        self.assertFalse((self.state / LID_A).exists() or (self.state / LID_B).exists())
+
+    def test_an_interrupted_reverse_resumes(self):
+        out = self.move(self.pre)
+        real = rm.rename_noreplace
+        calls = []
+
+        def once_then_crash(src, dst):
+            calls.append(src)
+            if len(calls) == 2:
+                raise OSError(5, "Input/output error", str(dst))
+            real(src, dst)
+        with mock.patch.object(rm, "rename_noreplace", once_then_crash):
+            with self.assertRaises(OSError):
+                rm.do_reverse(str(self.config), str(out))
+        rm.do_reverse(str(self.config), str(out))
+        rm.do_reverse(str(self.config), str(out))
+        self.assertTrue((self.state / "alice").is_dir() and (self.state / "bob").is_dir())
+
+    def test_a_destination_that_appears_is_never_replaced(self):
+        real = rm.rename_noreplace
+
+        def interpose(src, dst):
+            os.mkdir(dst)
+            real(src, dst)
+        with mock.patch.object(rm, "rename_noreplace", interpose):
+            with self.assertRaises(rm.Stop):
+                self.move(self.pre)
+        self.assertTrue((self.state / "alice" / "results").is_dir())
+        self.assertEqual(list((self.state / LID_A).iterdir()), [])
+
+    def test_a_different_directory_at_the_destination_after_the_rename_stops(self):
+        """The rename is checked: the directory now under the logical_id must
+        be the one the plan recorded."""
+        def swap(src, dst):
+            os.rename(src, self.base / "elsewhere")
+            os.mkdir(dst)
+        with mock.patch.object(rm, "rename_noreplace", swap):
+            with self.assertRaises(rm.Stop) as cm:
+                self.move(self.pre)
+        self.assertIn("is not the directory moved from", str(cm.exception))
+
+    @unittest.skipUnless(sys.platform.startswith("linux") or sys.platform == "darwin", "no-replace rename")
+    def test_rename_noreplace_refuses_an_existing_entry_of_any_type(self):
+        for make in (lambda p: p.mkdir(), lambda p: p.write_text("x"), lambda p: os.symlink("/nowhere", str(p))):
+            with self.subTest(make=make):
+                dst = self.base / "dst"
+                make(dst)
+                with self.assertRaises(OSError):
+                    rm.rename_noreplace(self.state / "alice", dst)
+                self.assertTrue((self.state / "alice").is_dir())
+                dst.unlink() if dst.is_symlink() or dst.is_file() else dst.rmdir()
+
+    def test_reverse_refuses_another_state_dir_and_an_ambiguous_entry(self):
+        out = self.move(self.pre)
+        other = self.base / "other"
+        other.mkdir()
+        cfg = self.base / "other.json"
+        cfg.write_text(json.dumps({"state_dir": str(other), "registry_dir": "/reg"}))
+        with self.assertRaises(rm.Stop):
+            rm.do_reverse(str(cfg), str(out))
+        (self.state / "bob").mkdir()
+        with self.assertRaises(rm.Stop):
+            rm.do_reverse(str(self.config), str(out))
+
+    def test_a_held_drain_lock_stops_the_move(self):
+        fd = os.open(self.state / ".router.lock", os.O_RDWR)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with self.assertRaises(rm.Stop):
+            self.move(self.pre)
+        self.assertTrue((self.state / "alice").is_dir())
 
 
 class VerbRows(Base):
 
     def args(self, step, **kw):
-        base = dict(step=step, config=str(self.config), map=None, preview=None, check=None, reverse=None,
+        base = dict(step=step, config=str(self.config), preview=None, check=None, reverse=None,
                     reason=None, spec=None, overlay=None, apply=False)
         base.update(kw)
         return SimpleNamespace(**base)
@@ -328,10 +541,21 @@ class VerbRows(Base):
         lines = []
         self.assertEqual(rm.run(self.args("map", apply=True), out=lines.append, runner=FakeRouter()), 0)
         self.assertEqual(rm.run(self.args("map", apply=True), out=lines.append,
-                                runner=FakeRouter(the_map=the_map(registry_state="rolled_back"))), 1)
+                                runner=FakeRouter(maps=[the_map(registry_state="rolled_back")])), 1)
         self.assertIn("STOP", lines[-1])
-        self.assertEqual(rm.run(self.args("preview", apply=True), out=lines.append, runner=FakeRouter()), 2)
-        self.assertIn("needs --map, --reason", lines[-1])
+        self.assertEqual(rm.run(self.args("check", apply=True), out=lines.append, runner=FakeRouter()), 2)
+        self.assertIn("needs --preview, --reason", lines[-1])
+        self.assertEqual(rm.run(self.args("move", apply=True), out=lines.append, runner=FakeRouter()), 2)
+        self.assertIn("exactly one", lines[-1])
+
+    def test_a_relative_config_is_made_absolute(self):
+        fake = FakeRouter()
+        cwd = os.getcwd()
+        self.addCleanup(os.chdir, cwd)
+        os.chdir(self.base)
+        self.assertEqual(rm.run(self.args("map", config=self.config.name, apply=True), out=lambda s: None,
+                                runner=fake), 0)
+        self.assertEqual(fake.calls[0][0][2], str(self.config))
 
 
 class RenderToRows(unittest.TestCase):
@@ -357,6 +581,23 @@ class RenderToRows(unittest.TestCase):
         self.assertEqual(amap_sandy.run_render_to(out, {}, self.live, apply=True, hop=False, combined=False), 2)
         self.assertEqual(amap_sandy.run_render_to(out, {}, self.live, apply=True, hop=True, combined=True), 2)
         self.assertFalse(out.exists())
+
+    def test_install_render_to_runs_nothing_but_the_rendering_and_returns_its_code(self):
+        """Opus's 3: install --render-to is its own path. It never reaches
+        the connector guard, the provision, or the identity step, and its
+        exit code is the render's."""
+        args = SimpleNamespace(render_to=str(self.base / "r.json"), apply=True, sandy="sandy")
+        home = self.base / "home"
+        seen = []
+        with mock.patch.object(amap_sandy, "feature_manifest_path", lambda h: self.live), \
+                mock.patch.object(amap_sandy.fp, "load_policy", lambda p: {}), \
+                mock.patch.object(amap_sandy, "discover_sandboxes", lambda s: []), \
+                mock.patch.object(amap_sandy, "run_provision", lambda *a, **k: seen.append("provision")), \
+                mock.patch.object(amap_sandy, "run_install_identity", lambda *a, **k: seen.append("identity")), \
+                mock.patch.object(amap_sandy.cpin, "guard", lambda *a, **k: seen.append("guard")), \
+                mock.patch.object(amap_sandy, "run_render_router", lambda *a, **k: 2):
+            self.assertEqual(amap_sandy.run_sync(args, home, self.base), 2)
+        self.assertEqual(seen, [])
 
 
 if __name__ == "__main__":
