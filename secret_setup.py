@@ -49,6 +49,7 @@ import json
 import os
 import posixpath
 import re
+import shlex
 import stat
 import sys
 import time
@@ -72,7 +73,8 @@ IN_WRITER = "/w"
 IN_VOLUME = "/v"
 LOCK_FILE = "oneshot.lock"
 #: Every tool the checks run; the runbook's own tools are the document's too.
-REQUIRED_TOOLS = ("git", "docker", "python3", "ssh", "ssh-keygen")
+#: install is the plan's root lines' own, and has no bare fallback (d3.3 §5(d)).
+REQUIRED_TOOLS = ("git", "docker", "python3", "ssh", "ssh-keygen", "install")
 #: The tools root executes: docker (the hub's supervisor, the weekly probe and
 #: the one-shots), python3 (the pinned writer's steps), sudo (the operator's
 #: door to root when docker_via_sudo) and install (the plan's root lines). Each
@@ -349,32 +351,37 @@ def probe(s: SecretSpec, run_id: str, root: bool = False) -> List[str]:
     return argv + [s.image, "probe-login"]
 
 
-def render(s: SecretSpec, q: Callable[[str], str]) -> List[str]:
-    """The secret's root-run steps, as shell lines, in order. Printed, never run."""
+def hash_command(s: SecretSpec, q: Callable[[str], str]) -> str:
+    """The recorded sha256 tool, as the operator runs it."""
     t = s.tools
-    hash_tool = t.get("sha256sum") or t.get("shasum")
-    hash_cmd = (q(hash_tool) + (" -a 256" if hash_tool == t.get("shasum") else "")) if hash_tool \
-        else "<the recorded sha256 tool>"
-    install = q(t["install"]) if "install" in t else "install"
-    sudo = q(t["sudo"]) if "sudo" in t else "sudo"
+    tool = t.get("sha256sum") or t.get("shasum")
+    if not tool:
+        return "<the recorded sha256 tool>"
+    return q(tool) + (" -a 256" if tool == t.get("shasum") else "")
+
+
+#: What the plan prints in place of a root line when the document cannot bootstrap the barrier.
+NO_BARRIER = "<a root line: it needs the secrets and supervision sections, the pinned writer and its barrier>"
+
+
+def render(s: SecretSpec, q: Callable[[str], str], root: Optional[Callable[[List[str]], str]] = None) -> List[str]:
+    """The secret's root-run steps, as shell lines, in order, after the
+    bootstrap: each root line through the barrier (`root` renders it).
+    Printed, never run."""
+    root = root or (lambda argv: typed_root(s, argv, q))
+    install = s.tools["install"]
     etc = posixpath.dirname(s.anchor)
     lines = [
         "# The runtime's secret file. The anchor is the operator's alone: the reviewed overlay's sha, "
         "copied from its approval record.",
-        f"{sudo} {install} -d -o 0 -g 0 -m 0755 {q(etc)}",
-        f"{sudo} {install} -o 0 -g 0 -m 0444 <a file holding the approved overlay sha> {q(s.anchor)}",
-        f"# The writer, never by running the file being installed: its sha256 must be {s.writer_sha256}.",
-        f"{hash_cmd} {q(posixpath.join(s.clones['deploy']['path'], WRITER))}",
-        f"{sudo} {install} -d -o 0 -g 0 -m 0755 {q(s.writer_dir)}",
-        f"{sudo} {install} -o 0 -g 0 -m 0444 {q(posixpath.join(s.clones['deploy']['path'], WRITER))} "
-        f"{q(s.writer)}",
-        f"{hash_cmd} {q(s.writer)}",
+        root([install, "-d", "-o", "0", "-g", "0", "-m", "0755", etc]),
+        root([install, "-o", "0", "-g", "0", "-m", "0444", "<a file holding the approved overlay sha>", s.anchor]),
         "# As the operator, before any one-shot: the run directory and the lock files the one-shots, "
         "verify and the runbook share.",
-        f"{install} -d -m 0700 {q(s.run_dir)}",
+        f"{q(install)} -d -m 0700 {q(s.run_dir)}",
     ]
     for name in (LOCK_FILE,) + s.pipeline_locks:
-        lines.append(f"{install} -m 0600 /dev/null {q(posixpath.join(s.run_dir, name))}")
+        lines.append(f"{q(install)} -m 0600 /dev/null {q(posixpath.join(s.run_dir, name))}")
     state_tmp = posixpath.join(s.run_dir, "state.tmp")
     lines += [
         "# The runtime's network is rendered with the runtime itself, not here.",
@@ -386,10 +393,61 @@ def render(s: SecretSpec, q: Callable[[str], str]) -> List[str]:
         f"# The state, until the secret is written: {STATES[0]}. Written to a file first: BSD install "
         f"refuses a pipe as its source.",
         f"printf '{STATES[0]}\\n' > {q(state_tmp)}",
-        f"{sudo} {install} -o 0 -g 0 -m 0444 {q(state_tmp)} {q(s.state_file)}",
+        root([install, "-o", "0", "-g", "0", "-m", "0444", state_tmp, s.state_file]),
         f"rm {q(state_tmp)}",
     ]
     return lines
+
+
+def _ancestry(path: str) -> List[str]:
+    """`/`, each ancestor of `path`, then `path`, outermost first."""
+    out = [path]
+    while out[0] != "/":
+        out.insert(0, posixpath.dirname(out[0]))
+    return out
+
+
+def bootstrap(spec: Any, q: Callable[[str], str], document: Optional[Tuple[str, str]] = None) -> List[str]:
+    """Steps 0-3 of the bootstrap (d3.3 §5(d) §3.1): the operator's staging,
+    the advisory hash of the writer's source, the one TXN line (GATE0, U0
+    and B1-B3 in one operator shell, sudo only inside it), then G. Every
+    root line after these runs through the barrier they place."""
+    import hub_supervise as hv  # it imports this module
+    s, sup = spec.secrets, spec.supervision
+    clone = s.clones["deploy"]["path"]
+    source = posixpath.join(clone, WRITER)
+    rt_path = hv.rt_path(spec)
+    rt_sha = hv.rt_sha256(spec)
+    hashword = rt.HASHWORD[sup.kind]
+    docsource, docpath = document or ("<the document's source: spec or overlay>", "<the document>")
+    if sup.kind == "systemd":
+        names = [posixpath.basename(sup.hub["unit"]), posixpath.basename(sup.weekly["service"]),
+                 posixpath.basename(sup.weekly["timer"])]
+        plists: List[str] = []
+    else:
+        names = [sup.hub["label"], sup.weekly["label"]]
+        plists = [posixpath.join(s.run_dir, hv.staged(sup.weekly["plist"])), sup.weekly["plist"]]
+    operands = [s.writer_dir, s.writer, rt_path, posixpath.join(s.writer_dir, rt.CONTEXT_NAME), s.writer_sha256,
+                rt_sha, hashword, source, posixpath.join(s.run_dir, hv.staged(rt_path)), sup.kind] + names + \
+        [s.tools["python3"], posixpath.join(clone, "amap-sandy.py"), docsource, docpath] + plists
+    txn = rt.OPERATOR_ENV + [rt.render_txn(sup.kind, s.tools.get("systemctl", "/usr/bin/systemctl")), "sh"] + operands
+    gate = rt.OPERATOR_ENV + [rt.render_gate(sup.kind), "sh", hashword, s.writer_sha256, rt_sha, s.writer, rt_path] + \
+        _ancestry(s.writer_dir)
+    stage = "amap-sandy.py " + (f"--overlay {q(docpath)} hub-supervise --apply" if docsource == "overlay"
+                                else f"hub-supervise --apply --spec {q(docpath)}")
+    return [
+        f"# 0. As the operator: `{stage}` stages every supervision file in {s.run_dir}, root-trust.sh among "
+        "them, and the deployed context. Placing them enables nothing.",
+        f"# 1. As the operator, advisory (G binds the bytes): it must print {s.writer_sha256}.",
+        f"{hash_command(s, q)} {q(source)}",
+        "# 2. As the operator, one transaction: GATE0 decides from the state before any byte is replaced, "
+        "U0 guards a running job, and only then root makes the writer's directory and copies what is new. "
+        "Go on only when it ends with TXN-OK.",
+        " ".join(q(a) for a in txn),
+        "# 3. As the operator, G: the placed route and bytes, before anything sources root-trust.sh. Go on "
+        "only when it prints exactly G-ROUTE-OK, G-BYTES-OK and BOOTSTRAP-OK.",
+        " ".join(q(a) for a in gate),
+    ]
 
 
 # --- Verify ---------------------------------------------------------------------
@@ -786,6 +844,23 @@ def live_docker(s: SecretSpec, *, engine: Optional[str] = None) -> List[str]:
     return sudo_route(s, engine or gate.engine)
 
 
+#: The setting the coredump check's remedy writes, through the barrier.
+COREDUMP_OFF = "kern.coredump=0"
+
+
+def typed_root(s: SecretSpec, argv: Sequence[str], q: Callable[[str], str], python3: Optional[str] = None,
+               also: Sequence[str] = (), tools: Optional[Sequence[str]] = None) -> str:
+    """One operator-typed root line (d3.3 §5(d)) through the placed writer,
+    with its section's recorded tools (the secrets section's unless `tools`
+    names another's) and each `also` trusted-exec judges beside argv[0].
+    `python3` is the barrier's interpreter when argv runs another than the
+    secrets section's (the partition job's)."""
+    return " ".join(q(a) for a in rt.typed_argv(posixpath.join(s.writer_dir, rt.NAME), s.writer_sha256,
+                                                python3 or s.tools["python3"], s.writer,
+                                                list(s.tools.values() if tools is None else tools),
+                                                list(argv), also=also))
+
+
 def sudo_route(s: SecretSpec, engine: Optional[str]) -> List[str]:
     """`sudo -n` and the §3 grammar up to `-- <docker>`, the one prefix of
     every live call on the sudo route. No sudoers rule can admit it safely
@@ -1041,8 +1116,10 @@ def verify_core(s: SecretSpec, platform: str, read: Callable[[str], Any],
         return out
     claim = "the kernel writes no core files (kern.coredump=0)"
     want = _fact("kern.coredump", "0", "a crashing root service holds the value in memory")
-    remedy = "run `sudo sysctl kern.coredump=0` before each write or rotation"
     tool = s.tools.get("sysctl")
+    remedy = (f"run `{typed_root(s, [tool, COREDUMP_OFF], shlex.quote)}` before each write or rotation" if tool
+              else "record tools.sysctl, then run the root line this check prints for it before each write or "
+                   "rotation")
     if tool is None:
         return [rh.unknown(claim, want, "tools has no sysctl to ask", remedy)]
     try:

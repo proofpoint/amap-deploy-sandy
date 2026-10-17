@@ -22,7 +22,8 @@ from test_hub_runtime import setUpModule, tearDownModule  # noqa: F401 -- the fi
 EV = "/opt/ex/partition-evidence"
 SCRATCH = "/opt/ex/partition-scratch"
 EXEC = "/opt/ex/partition-exec"
-TOOLS = {"python3": "/usr/bin/python3", "docker": "/usr/local/libexec/amap/docker"}
+TOOLS = {"python3": "/usr/bin/python3", "docker": "/usr/local/libexec/amap/docker", "git": "/usr/bin/git",
+         "git-remote-https": "/usr/lib/git-core/git-remote-https"}
 PART = {"evidence_dir": EV, "scratch_dir": SCRATCH, "exec_root": EXEC, "tools": dict(TOOLS),
         "weekly": {"weekday": 0, "hour": 3}}
 
@@ -59,8 +60,9 @@ class LoadTest(unittest.TestCase):
         self.refuses(doc(partition=dict(PART, extra=1)), "exactly evidence_dir")
         self.refuses(doc(partition={k: v for k, v in PART.items() if k != "weekly"}), "exactly evidence_dir")
         self.refuses(doc(partition={k: v for k, v in PART.items() if k != "exec_root"}), "exactly evidence_dir")
-        self.refuses(doc(partition=dict(PART, tools=dict(TOOLS, git="/usr/bin/git"))), "exactly docker, python3")
-        self.refuses(doc(partition=dict(PART, tools={"python3": "/usr/bin/python3"})), "exactly docker, python3")
+        self.refuses(doc(partition=dict(PART, tools=dict(TOOLS, curl="/usr/bin/curl"))), "exactly docker, python3, git, git-remote-https")
+        self.refuses(doc(partition=dict(PART, tools={k: v for k, v in TOOLS.items() if k != "git-remote-https"})),
+                     "exactly docker, python3, git, git-remote-https")
         self.refuses(doc(partition=dict(PART, tools=dict(TOOLS, docker="docker"))), "absolute")
         self.refuses(doc(gate=dict(gate(), extra=1)), "exactly harness_sha")
         self.refuses(doc(gate={k: v for k, v in gate().items() if k != "record_sha256"}), "exactly harness_sha")
@@ -147,7 +149,8 @@ class GateTest(unittest.TestCase):
         wants it, as lstat shows it; realpath is the identity."""
         d = stat.S_IFDIR
         files = {p: st(d | 0o755) for p in ("/", "/opt", "/opt/ex", "/usr", "/usr/bin", "/usr/local",
-                                              "/usr/local/libexec", "/usr/local/libexec/amap", EV)}
+                                              "/usr/local/libexec", "/usr/local/libexec/amap", "/usr/lib",
+                                              "/usr/lib/git-core", EV)}
         files.update({SCRATCH: st(d | 0o700), EXEC: st(d | 0o700)})
         files.update({t: st(stat.S_IFREG | 0o755) for t in TOOLS.values()})
         return files
@@ -280,12 +283,25 @@ class PlanTest(unittest.TestCase):
     def test_the_plan_prints_the_six_steps_with_this_hosts_paths(self):
         def gone(p):
             raise FileNotFoundError(p)
-        text = "\n".join(ps.plan(self.part, None, lambda s: s, anchor="/opt/amap/etc/overlay.sha", read=gone))
-        for words in (f"install -d -o 0 -g 0 -m 0755 {EV}", f"install -d -o 0 -g 0 -m 0700 {SCRATCH}",
-                      f"install -d -o 0 -g 0 -m 0700 {EXEC}",
-                      f"{EV}/gate-record.json", "COPIED from the record's own", "squash",
-                      "/opt/amap/etc/overlay.sha", "no placed record"):
+        text = "\n".join(ps.plan(self.part, None, lambda s: s, anchor="/opt/amap/etc/overlay.sha", read=gone,
+                                 install=lambda args: "BARRIER install " + " ".join(args)))
+        for words in (f"BARRIER install -d -o 0 -g 0 -m 0755 {EV}", f"BARRIER install -d -o 0 -g 0 -m 0700 {SCRATCH}",
+                      f"BARRIER install -d -o 0 -g 0 -m 0700 {EXEC}",
+                      f"#   2. BARRIER install -o 0 -g 0 -m 0444 <the relayed file> {EV}/gate-record.json",
+                      "BARRIER install -o 0 -g 0 -m 0444 <a file holding the merged commit sha> /opt/amap/etc/overlay.sha",
+                      "COPIED from the record's own", "squash", "no placed record"):
             self.assertIn(words, text)
+        self.assertEqual(text.count("install -"), text.count("BARRIER install -"),
+                         "every root install goes through the barrier (d3.3 §5(d))")
+
+    def test_without_a_writer_no_root_line_is_printed_bare(self):
+        """No secrets section, no pinned writer: each root line names what it
+        needs, and no bare `install` is printed for the operator to run."""
+        def gone(p):
+            raise FileNotFoundError(p)
+        lines = ps.plan(self.part, None, lambda s: s, anchor=None, read=gone)
+        self.assertEqual(sum(ps.NO_WRITER in ln for ln in lines), 5)
+        self.assertFalse(any("install -" in ln for ln in lines), lines)
 
     def test_a_placed_record_has_its_harness_sha_printed_with_no_url(self):
         raw = hg.canonical(healthy())
@@ -533,10 +549,8 @@ class StopTargetTest(unittest.TestCase):
         self.assertEqual(out[0].result, rh.UNKNOWN, "an unreadable live config is not proof delegation is off")
 
     def document_spec(self, **drop):
-        import hub_supervise as hv
-        from test_hub_supervise import sup_section
-        d = doc(gate=gate()) if drop.pop("gate", False) else doc()
-        d[hv.SECTION] = sup_section()
+        from test_hub_supervise import supervise
+        d = supervise(doc(gate=gate()) if drop.pop("gate", False) else doc())
         for section in drop:
             d.pop(section, None)
         return hs.load_spec(d)

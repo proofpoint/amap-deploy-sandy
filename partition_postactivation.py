@@ -157,6 +157,18 @@ def probe(plan: pp.Plan, runner: pp.Runner, run_argv: Callable, lstat_: Callable
     return probes, (1 if "FAIL" in verdicts else 2 if "UNKNOWN" in verdicts else 0), report
 
 
+def place_line(spec: Any, source: str, dest: str, doc: bytes) -> str:
+    """The root step that places the document, bound to its sha256, by the
+    pinned writer through the barrier (d3.3 §5(d)), under the partition
+    job's interpreter as job_argv runs it."""
+    import shlex
+    import secret_setup as ss
+    py = spec.partition.tools["python3"]
+    return ss.typed_root(spec.secrets, [py, "-I", "-S", "-B", spec.secrets.writer, "place", source, dest,
+                                        "--sha256", hashlib.sha256(doc).hexdigest()], shlex.quote, python3=py,
+                         tools=list(spec.partition.tools.values()))
+
+
 def run(document_path: str, document_sha256: str, t_run_id: str, *, apply: bool, out=print,
         now: Optional[float] = None, p: Optional[Dict[str, Any]] = None) -> int:
     """The verb. Refuses, writing nothing, unless the document is the unit's,
@@ -251,8 +263,6 @@ def run(document_path: str, document_sha256: str, t_run_id: str, *, apply: bool,
         out(f"partition-probe --post-activation: wrote {source}")
     else:
         out(f"partition-probe --post-activation: would write {source} (pass --apply)")
-    writer = os.path.join(spec.secrets.writer_dir, ss.WRITER)
     out("  then, as root:")
-    out(f"    sudo {shlex.quote(spec.partition.tools['python3'])} -I -S -B {shlex.quote(writer)} place "
-        f"{shlex.quote(source)} {shlex.quote(dest)} --sha256 {hashlib.sha256(doc).hexdigest()}")
+    out("    " + place_line(spec, source, dest, doc))
     return 0 if code == 0 else 1

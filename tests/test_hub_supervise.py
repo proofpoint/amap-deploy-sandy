@@ -29,6 +29,7 @@ from pathlib import Path
 import host_setup as hs
 import hub_runtime as hr
 import hub_supervise as hv
+import root_trust as rt
 import router_health as rh
 from _gate import open_gate
 from test_hub_keys import full_doc as keys_doc
@@ -52,12 +53,22 @@ def sup_section(kind="systemd"):
             "requires": REQ}
 
 
-def spec(kind_="systemd", **over):
-    d = keys_doc()
+#: The manager each kind's host records (hub_supervise.MANAGERS).
+MANAGER = {"systemd": "/usr/bin/systemctl", "launchd": hv.LAUNCHCTL}
+
+
+def supervise(d, kind_="systemd", **over):
+    """`d` with the supervision section of `kind_`, and the secrets section
+    recording that kind's manager, as the spec requires."""
     sec = sup_section(kind_)
     sec.update(over)
     d[hv.SECTION] = sec
-    return hs.load_spec(d)
+    d["secrets"]["tools"][hv.MANAGERS[kind_]] = MANAGER[kind_]
+    return d
+
+
+def spec(kind_="systemd", **over):
+    return hs.load_spec(supervise(keys_doc(), kind_, **over))
 
 
 class LoadTest(unittest.TestCase):
@@ -176,7 +187,8 @@ class SystemdTest(unittest.TestCase):
         plan = "\n".join(hv.plan(spec(), lambda x: x, "steps"))
         self.assertNotIn("systemctl", plan)
         self.assertNotIn("launchctl", hv.plan(spec("launchd"), lambda x: x, "steps")[-1])
-        self.assertIn("systemctl enable --now hub-link.service", hv.start_commands(spec()))
+        self.assertTrue(hv.start_commands(spec())[-1].endswith(
+            "service --manager /usr/bin/systemctl systemd enable-now hub-link.service"))
 
     def test_the_weekly_job_runs_the_probe_under_the_lock(self):
         s = spec()
@@ -834,13 +846,13 @@ class StartGateTest(unittest.TestCase):
         hs.load_spec = lambda doc: built
         hs.start_checks = lambda s, **k: [self.check(r) for r in results]
         said = []
-        rc = hs.hub_start_check(None, out=said.append)
+        rc = hs.hub_start_check(None, out=said.append, states={"active": lambda u: (3, "inactive")})
         return rc, "\n".join(said)
 
     def test_a_pass_prints_the_start_step(self):
         rc, said = self.run_gate([rh.PASS, rh.PASS])
         self.assertEqual(rc, 0)
-        self.assertIn("systemctl enable --now hub-link.service", said)
+        self.assertIn("service --manager /usr/bin/systemctl systemd enable-now hub-link.service", said)
 
     def test_any_fail_or_unknown_refuses_and_prints_no_start_step(self):
         for bad in (rh.FAIL, rh.UNKNOWN):
@@ -936,6 +948,7 @@ class StartSweepTest(unittest.TestCase):
             setattr(mod, name, value)
         said = []
         rc = hs.hub_start_check(spec_path, overlay=overlay, out=said.append, state="active",
+                                states={"active": lambda u: (3, "inactive")},
                                 keys=keys or {"containers": []}, secret_lock=free_lock)
         return rc, "\n".join(said)
 
@@ -1010,7 +1023,7 @@ class StartSweepTest(unittest.TestCase):
         rc, said = self.gate([rh.check("y", rh.Fact("y", True, "a test"), True, "x")])
         self.assertEqual(rc, 0, said)
         self.assertIn("`host-setup` (verify) must ALSO pass", said)
-        self.assertIn("systemctl enable --now hub-link.service", said)
+        self.assertIn("service --manager /usr/bin/systemctl systemd enable-now hub-link.service", said)
 
 
 class LaunchdEnablementTest(unittest.TestCase):
@@ -1021,11 +1034,17 @@ class LaunchdEnablementTest(unittest.TestCase):
 
     def test_the_plan_disables_both_labels_before_placing_anything(self):
         s = spec("launchd")
-        lines = hv.plan(s, lambda x: x, "STEPS")
-        dis = [i for i, l in enumerate(lines) if l.startswith(f"{hv.LAUNCHCTL} disable system/")]
+        lines = hv.plan(s, shlex.quote, "STEPS")
+        dis = [i for i, l in enumerate(lines) if " service --manager " in l and not l.startswith("#")]
         place = [i for i, l in enumerate(lines) if l.startswith("STEPS place ")]
-        self.assertEqual([lines[i].split()[2] for i in dis],
-                         ["system/org.example.hub-probe", "system/org.example.hub"])
+        argvs = [shlex.split(lines[i]) for i in dis]
+        self.assertEqual([a[a.index("--") + 1:][-3:] for a in argvs],
+                         [["launchd", "disable", "org.example.hub-probe"], ["launchd", "disable", "org.example.hub"]])
+        for a in argvs:
+            self.assertEqual(a, rt.typed_argv(hv.rt_path(s), s.secrets.writer_sha256, s.secrets.tools["python3"],
+                                              s.secrets.writer, list(s.secrets.tools.values()),
+                                              hv.own(s, "service", "--manager", hv.LAUNCHCTL, "launchd", "disable",
+                                                     a[-1]), also=[hv.LAUNCHCTL]))
         self.assertTrue(place and max(dis) < min(place))
         self.assertFalse(any("enable" in l.replace("enables nothing", "") and "disable" not in l for l in lines))
 
@@ -1034,11 +1053,12 @@ class LaunchdEnablementTest(unittest.TestCase):
         self.assertFalse(any("launchctl" in l for l in hv.plan(spec(), lambda x: x, "STEPS")))
 
     def test_the_start_step_enables_each_label_then_bootstraps_it(self):
-        self.assertEqual(hv.start_commands(spec("launchd")), [
-            f"{hv.LAUNCHCTL} enable system/org.example.hub-probe",
-            f"{hv.LAUNCHCTL} bootstrap system /Library/LaunchDaemons/org.example.hub-probe.plist",
-            f"{hv.LAUNCHCTL} enable system/org.example.hub",
-            f"{hv.LAUNCHCTL} bootstrap system /Library/LaunchDaemons/org.example.hub.plist"])
+        s = spec("launchd")
+        self.assertEqual(hv.start_commands(s), [
+            hv.service_line(s, "enable", "org.example.hub-probe"),
+            hv.service_line(s, "bootstrap", "org.example.hub-probe", "/Library/LaunchDaemons/org.example.hub-probe.plist"),
+            hv.service_line(s, "enable", "org.example.hub"),
+            hv.service_line(s, "bootstrap", "org.example.hub", "/Library/LaunchDaemons/org.example.hub.plist")])
 
     def test_print_disabled_is_read_in_both_spellings(self):
         """The two spellings `launchctl print-disabled system` is documented to
@@ -1080,8 +1100,9 @@ class LaunchdEnablementTest(unittest.TestCase):
         self.assertEqual(r, [rh.UNKNOWN, rh.UNKNOWN])
 
     def test_loaded_is_read_from_launchctl_print(self):
-        """`launchctl print system/<label>`: exit 0 is loaded; its documented
-        not-found message is not loaded; anything else is unknown."""
+        """`launchctl print system/<label>`: exit 0 is loaded; only the
+        measured not-loaded answer is not loaded, exactly; anything else,
+        and everything while that answer is unmeasured, is unknown."""
         calls = []
 
         def fake(rc, out="", err=""):
@@ -1092,10 +1113,22 @@ class LaunchdEnablementTest(unittest.TestCase):
         self.addCleanup(setattr, hv.rh, "run", hv.rh.run)
         hv.rh.run = fake(0)
         self.assertIs(hv.ask_loaded("org.example.hub"), True)
-        self.assertEqual(calls[-1], [hv.LAUNCHCTL, "print", "system/org.example.hub"])
-        hv.rh.run = fake(113, err='Could not find service "org.example.hub" in domain for system')
+        self.assertEqual(calls[-1], ["/bin/sh", "-c", 'exec "$0" print "system/$1" 2>&1', hv.LAUNCHCTL,
+                                     "org.example.hub"], "one merged stream, as the answer was measured")
+        nf = hv.rt.LAUNCHD_NOT_FOUND
+        answer = nf[1].replace("{label}", "org.example.hub")
+        hv.rh.run = fake(nf[0], out=answer + "\n")
         self.assertIs(hv.ask_loaded("org.example.hub"), False)
-        hv.rh.run = fake(5, err="Operation not permitted")
+        self.addCleanup(setattr, hv.rt, "LAUNCHD_NOT_FOUND", hv.rt.LAUNCHD_NOT_FOUND)
+        hv.rt.LAUNCHD_NOT_FOUND = None
+        self.assertIsInstance(hv.ask_loaded("org.example.hub"), rh.Unresolved, "unmeasured: unknown")
+        hv.rt.LAUNCHD_NOT_FOUND = nf
+        other = nf[1].replace("{label}", "org.example.hub-probe")
+        for rc, out in ((nf[0] + 1, answer), (nf[0], "could not find service"), (nf[0], answer + " (and more)"),
+                        (nf[0], other), (nf[0], "Bad request."), (nf[0], answer.split("\n")[1])):
+            hv.rh.run = fake(rc, out=out)
+            self.assertIsInstance(hv.ask_loaded("org.example.hub"), rh.Unresolved, (rc, out))
+        hv.rh.run = fake(5, out="Operation not permitted")
         self.assertIsInstance(hv.ask_loaded("org.example.hub"), rh.Unresolved)
 
     def test_disabled_labels_pass_without_asking_the_gate(self):

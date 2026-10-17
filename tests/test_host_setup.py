@@ -19,6 +19,7 @@ from collections import namedtuple
 
 import host_setup as hs
 import router_health as rh
+import secret_setup as ss
 
 St = namedtuple("St", "st_mode st_uid st_gid st_ino", defaults=(0,))
 UP, DOWN, GID = 2101, 2102, 2100
@@ -260,19 +261,26 @@ class NothingIsLeftUncheckedTest(unittest.TestCase):
 
 class PlanTest(unittest.TestCase):
 
+    """A document with no secrets or supervision section (d3.3 §5(d) §3.7):
+    no pinned writer, no root-trust.sh, so every root line is the
+    placeholder, followed by the step it would run."""
+
     def setUp(self):
         self.plan = hs.render_plan(hs.load_spec(doc()))
-        self.steps = f"python3 {hs.HOST_STEPS}"
+        self.steps = ss.NO_BARRIER
+
+    def args(self, line):
+        return line[len(self.steps) + 1:]
 
     def test_roots_are_created_parents_first_with_owner_group_and_mode(self):
-        roots = [l for l in self.plan if l.startswith(f"{self.steps} root ")]
-        self.assertEqual(roots[0], f"{self.steps} root /srv/example/a/b {UP} {GID} 2750  # the shared root")
-        order = [l.split()[3] for l in roots]
+        roots = [self.args(l) for l in self.plan if l.startswith(f"{self.steps} root ")]
+        self.assertEqual(roots[0], f"root /srv/example/a/b {UP} {GID} 2750  # the shared root")
+        order = [l.split()[1] for l in roots]
         self.assertLess(order.index("/srv/example/a/b"), order.index("/srv/example/a/b/inner"))
 
     def test_the_barrier_fsyncs_every_root_and_ancestor_deepest_first(self):
         barrier = next(l for l in self.plan if l.startswith(f"{self.steps} sync "))
-        args = barrier.split()[3:]
+        args = self.args(barrier).split()[1:]
         for p in ("/", "/srv", "/srv/example", "/srv/example/a", "/srv/example/a/b/inner",
                   "/srv/example/state/up"):
             self.assertIn(p, args)
@@ -283,6 +291,7 @@ class PlanTest(unittest.TestCase):
             if not line.startswith("#"):
                 self.assertTrue(line.startswith(self.steps), line)
         self.assertFalse(any(l.startswith(("install ", "sh -c", "chown", "chmod")) for l in self.plan))
+        self.assertFalse(any("sudo" in l for l in self.plan), "no root line can run without the barrier")
 
     def test_each_side_gets_the_other_sides_uid(self):
         self.assertIn(f"# downstream's runtime environment: EX_PEER_UID={UP}", self.plan)
@@ -300,7 +309,7 @@ class PlanTest(unittest.TestCase):
         self.assertTrue(line.startswith(f"{self.steps} marker /srv/example/a/b/.root-id"))
 
     def test_nothing_is_run(self):
-        self.assertTrue(self.plan[0].startswith("# Run as root"))
+        self.assertTrue(self.plan[0].startswith("# Each line is one step; nothing here has run."))
 
     def test_each_runtime_is_told_its_umask_and_none_starts_before_the_steps(self):
         self.assertIn("# upstream's runtime (ex-up) starts under umask 0027: UMask=0027 in its service unit, "

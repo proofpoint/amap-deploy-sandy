@@ -593,8 +593,11 @@ class PlanTest(unittest.TestCase):
         s = spec()
         lines = hk.plan(s, s.keys, lambda x: x, "steps")
         self.assertTrue(any("install -d -o 2101 -g 2201 -m 0700 /opt/ex/keys" in ln for ln in lines))
-        self.assertFalse(any(ln and not ln.startswith("#") and ("genpkey" in ln or "ssh-keygen" in ln)
-                             for ln in lines))
+        def command(ln):
+            argv = ln.split()
+            return argv[len(argv) - argv[::-1].index("--"):] if "--" in argv else argv
+        self.assertFalse(any(ln and not ln.startswith("#") and {"genpkey", "ssh-keygen"} & {
+            os.path.basename(a) for a in command(ln)} for ln in lines), "no line runs a key generator")
         self.assertTrue(any("keyprobe.json /opt/ex/evidence/keyprobe.json" in ln for ln in lines))
 
 

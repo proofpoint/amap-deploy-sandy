@@ -49,8 +49,12 @@ GATE_RECORD = "gate-record.json"
 EVIDENCE_MODE = 0o755
 SCRATCH_MODE = 0o700
 EXEC_MODE = 0o700
-#: The tools the weekly job runs as root, and nothing else.
-WEEKLY_TOOLS = ("docker", "python3")
+#: The tools the weekly job runs as root, and the two its bundle is fetched with.
+WEEKLY_TOOLS = ("docker", "python3", "git", "git-remote-https")
+#: On darwin, git and its https helper are the Command Line Tools' own:
+#: /usr/bin/git is the xcrun shim, which execs another git by absolute path.
+CLT_GIT = "/Library/Developer/CommandLineTools/usr/bin/git"
+CLT_GIT_REMOTE_HTTPS = "/Library/Developer/CommandLineTools/usr/libexec/git-core/git-remote-https"
 RECORD_MODE = 0o444
 _HEX40 = re.compile(r"[0-9a-f]{40}")
 _HEX64 = re.compile(r"[0-9a-f]{64}")
@@ -105,6 +109,10 @@ def load(sec: Any, spec: Any) -> PartitionSpec:
     if not isinstance(t, dict) or set(t) != set(WEEKLY_TOOLS):
         raise PartitionSpecError(f"partition.tools must be exactly {', '.join(WEEKLY_TOOLS)}")
     tools = {k: _abs(t[k], f"partition.tools.{k}") for k in WEEKLY_TOOLS}
+    if getattr(getattr(spec, "supervision", None), "kind", None) == "launchd" and \
+            (tools["git"], tools["git-remote-https"]) != (CLT_GIT, CLT_GIT_REMOTE_HTTPS):
+        raise PartitionSpecError(f"on a launchd host, partition.tools.git must be {CLT_GIT} and git-remote-https "
+                                 f"{CLT_GIT_REMOTE_HTTPS}: /usr/bin/git is the xcrun shim")
     w = sec["weekly"]
     if not isinstance(w, dict) or set(w) != {"weekday", "hour"} or not _int(w["weekday"]) or not _int(w["hour"]) \
             or not 0 <= w["weekday"] <= 6 or not 0 <= w["hour"] <= 23:
@@ -473,22 +481,31 @@ def verify_tools(ps: PartitionSpec, lstat: Callable, owned_chain: Callable,
     return out
 
 
+#: What the plan prints in place of a root line when there is no pinned writer to run it through.
+NO_WRITER = "<the secrets section's pinned writer: every root line runs through it>"
+
+
 def plan(p: PartitionSpec, gs: Optional[GateSpec], q: Callable[[str], str], *, anchor: Optional[str],
+         install: Optional[Callable[[List[str]], str]] = None,
          read: Callable[[str], bytes] = read_record) -> List[str]:
     """The operator's steps for the two sections: the directories, and, for the
     gate, the design's six steps with this host's paths. When a record is
-    already placed, its own harness_sha is printed for the overlay change."""
+    already placed, its own harness_sha is printed for the overlay change.
+    `install` renders one root `install` line through the barrier (d3.3
+    §5(d)) from install's arguments; without one, each root line names the
+    writer it needs instead."""
+    root = install or (lambda args: NO_WRITER)
     record = posixpath.join(p.evidence_dir, GATE_RECORD)
     lines = [
         "# The partition evidence: root-owned, under root-owned directories; the controls' scratch space:",
-        f"install -d -o 0 -g 0 -m 0755 {q(p.evidence_dir)}",
-        f"install -d -o 0 -g 0 -m 0700 {q(p.scratch_dir)}",
+        root(["-d", "-o", "0", "-g", "0", "-m", "0755", p.evidence_dir]),
+        root(["-d", "-o", "0", "-g", "0", "-m", "0700", p.scratch_dir]),
         "# The weekly job's root: its provisioned bundle, lock, run directories and recovery description:",
-        f"install -d -o 0 -g 0 -m 0700 {q(p.exec_root)}",
+        root(["-d", "-o", "0", "-g", "0", "-m", "0700", p.exec_root]),
         "# The delegation gate, the operator's alone, when the conformance harness reports its full run passed,",
         "# given the relayed record and its sha256:",
         "#   1. shasum -a 256 <the relayed file>   (or sha256sum): it must print the relayed sha256",
-        f"#   2. install -o 0 -g 0 -m 0444 <the relayed file> {q(record)}",
+        "#   2. " + root(["-o", "0", "-g", "0", "-m", "0444", "<the relayed file>", record]),
         "#   3. in the private overlay, a PR setting delegation_gate: harness_sha COPIED from the record's own",
         "#      harness_sha member (the commit the gate ran at, reachable from the harness PR's head ref; squash",
         f"#      merges leave it off main), record_sha256 the relayed sha256, record_path {record}",
@@ -500,8 +517,9 @@ def plan(p: PartitionSpec, gs: Optional[GateSpec], q: Callable[[str], str], *, a
     except (OSError, hg.RecordError) as e:
         lines.append(f"#      (no placed record to read the harness_sha from: {e})")
     lines += [
-        "#   4. after the PR merges, write its commit to the anchor: install -o 0 -g 0 -m 0444 <a file holding the "
-        f"merged commit sha> {q(anchor) if anchor else '<secrets.anchor>'}",
+        "#   4. after the PR merges, write its commit to the anchor: "
+        + root(["-o", "0", "-g", "0", "-m", "0444", "<a file holding the merged commit sha>",
+                anchor if anchor else "<secrets.anchor>"]),
         "#   5. make the fresh overlay clone at that commit, as the runbook does for an overlay change",
         "#   6. amap-sandy.py install (a dry run first), then the activation sequence; it refuses unless the gate "
         "holds",

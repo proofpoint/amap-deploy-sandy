@@ -4462,7 +4462,9 @@ def run_prepare(args: argparse.Namespace, policy: Dict[str, Any], doc: Dict[str,
     source = Path(spec.secrets.run_dir) / ps.ACTIVATION
     writer = os.path.join(spec.secrets.writer_dir, ss.WRITER)
     try:
-        steps = list(pj.activation_steps(spec.partition, writer=writer, source=str(source), activation_bytes=record))
+        steps = list(pj.activation_steps(spec.partition, writer=writer, writer_sha256=spec.secrets.writer_sha256,
+                                         tools=list(spec.partition.tools.values()), source=str(source),
+                                         activation_bytes=record))
         argv = pj.job_argv(spec.partition, writer=writer, writer_sha256=spec.secrets.writer_sha256,
                            host=hsu.partition_host(spec), document=str(overlay),
                            document_bytes=overlay.read_bytes(), activation_bytes=record)
@@ -5372,6 +5374,12 @@ def build_parser() -> argparse.ArgumentParser:
                                 "pass, and only then, prints the start step. Runs nothing")
     hstart.add_argument("--spec", type=Path, default=None,
                         help="the host-setup document (default: the deployment overlay's host_setup section)")
+    hstart.add_argument("--until-stopped", action="store_true",
+                        help="only the NOT-RUNNING check: read-only; the last line is NOT-RUNNING, or the first "
+                             "unmet condition")
+    hstart.add_argument("--old-context", action="store_true",
+                        help="with --until-stopped: read the engine under the deployed context's pins (an update's "
+                             "guard)")
 
     pact = sub.add_parser(
         "partition-activate", help="A1: from install's rendering, the staged delegation config, the prospective "
@@ -5495,6 +5503,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             return hsu.hub_supervise(args.spec, apply=args.apply, overlay=ha.overlay_path(args.overlay))
 
         if args.command == "hub-start-check":
+            if args.until_stopped or args.old_context:
+                return hsu.hub_start_check(args.spec, overlay=ha.overlay_path(args.overlay),
+                                           until_stopped=args.until_stopped, old_context=args.old_context)
             return hsu.hub_start_check(args.spec, overlay=ha.overlay_path(args.overlay),
                                        policy_on=delegation_policy(home))
 

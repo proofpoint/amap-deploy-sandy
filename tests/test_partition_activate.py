@@ -83,7 +83,9 @@ class PrepareTest(A1):
         self.assertEqual((rc, after), (0, before), err)
         self.assertIn("its sha256, A3's --activation-sha256:", out)
         self.assertIn(" place ", out)
-        lines = [l.strip() for l in out.splitlines() if l.strip().startswith("/usr/bin/sudo ")]
+        typed = [l.strip() for l in out.splitlines() if l.strip().startswith("/usr/bin/sudo ")]
+        self.assertEqual(len([l for l in typed if " place " in l]), 1, "the place step is a typed root line")
+        lines = [l for l in typed if " place " not in l]
         self.assertEqual(len(lines), 2, out)
         a2, d7 = (shlex.split(l) for l in lines)
         self.assertEqual(a2, d7 + ["--prospective"])            # 7b and 7d differ only by the flag

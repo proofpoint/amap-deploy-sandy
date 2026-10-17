@@ -366,15 +366,48 @@ runtimes; a deployment must not pre-create or chown them. Each level is
 checked by the runtime that makes it and never repaired, so one made or
 re-owned by anyone else stops that runtime's admission of the link.
 
-Run the printed steps as root, in order, **before any hop runtime starts**,
-from a checkout that no sandbox mounts read-write: a fresh clone at the
-recorded deploy commit, never an agent's workspace checkout. The steps run
-that checkout's `host_steps.py` as root.
+Run the printed steps in order, **before any hop runtime starts**. Print
+the plan on the host it is for, from a checkout that no sandbox mounts
+read-write: a fresh clone at the recorded deploy commit, never an agent's
+workspace checkout. That clone is only the writer's source: root runs the
+placed, pinned copy, through the barrier the bootstrap below places.
 Each step goes through `host_steps.py`, which reaches every path from `/`
 without following a symbolic link and stops at one. Every root is created
 with its owner, group and mode, then it and every ancestor are fsynced, so a
 runtime never opens a root that is not durable. The steps are safe to run
 again.
+
+**The bootstrap.** With a secrets and a supervision section, the plan
+starts with four steps, all as you, before any other root line:
+
+0. `amap-sandy.py hub-supervise --apply` stages every supervision file in
+   the run directory, root-trust.sh and the deployed context among them.
+1. The recorded sha256 tool over the clone's `host_steps.py`. It must print
+   the writer's pin. This is advisory: G binds the bytes.
+2. One transaction, `/usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C /bin/sh -c
+   '<TXN>' sh …`. It decides everything once, from the state before any byte
+   is replaced: whether the writer's directory and each placed file are
+   root's alone, and which of the writer and root-trust.sh are already at
+   their pins. A fresh host copies both. A writer-only update first reads
+   the old hub through the deployed context the last install published,
+   and goes on only when that check prints `NOT-RUNNING`. Nothing new
+   copies nothing. A running or enabled job, an answer it cannot classify,
+   both files differing, or a partial pair each stops it before any sudo.
+   Only then does sudo run, at most three times, as `install` reading the
+   file your own shell opened. Go on only when it ends with `TXN-OK`.
+   A partial pair names each file's state and the context as `present,
+   sha256 <h>`: the transaction never parses the context, so the
+   maintainers read its recorded pins from the file with that sha256.
+3. G, `/usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C /bin/sh -c '<G>' sh …`:
+   the placed route and bytes, before anything sources root-trust.sh. Go on
+   only when it prints exactly `G-ROUTE-OK`, `G-BYTES-OK` and
+   `BOOTSTRAP-OK`.
+
+Every later root line runs through the barrier, and the plan's last one
+publishes the deployed context with the new pins. A document without a
+secrets or a supervision section has no pinned writer and no
+root-trust.sh, so the plan prints each root line behind a placeholder
+that names what is missing, and none of them can run.
 
 Start each hop runtime under the umask the plan names for it: `UMask=0027`
 in its service unit, or `umask 0027` in its launcher before it execs. 0027
@@ -491,8 +524,9 @@ principal that owns it, the runtime image by digest, the pinned writer, a
 root-owned anchor holding the reviewed overlay's sha, a root-owned state
 file (`pending_b5`, `active` or `retired`), the fresh clones the tooling
 runs from, and the absolute path of every tool. `host-setup` then prints the
-steps that create the anchor, install the writer, create the volume and its
-root, the lock file and the state, and checks, without reading the secret:
+bootstrap that places the writer, then the steps that create the anchor,
+the volume and its root, the lock file and the state, and checks, without
+reading the secret:
 - the document itself was read from the anchored overlay clone, as a file
   that clone tracks, never from a copy or a working checkout;
 - the writer, the anchor and the state file are root-owned 0444 with one
@@ -1131,7 +1165,7 @@ engine reads as not running.
      tail -c 32 "$T/pub.der" > "$T/pub.raw"
      printf 'public_key '; od -An -tx1 "$T/pub.raw" | tr -d ' \n'; echo
      printf 'key_id     '; "$OPENSSL" dgst -sha256 -r "$T/pub.raw" | cut -c1-64
-     /usr/bin/sudo /usr/bin/install -o <the local router's uid> -g <its gid> -m 0400 "$T/seed" <keys.dir>/<keys.file>
+     /usr/bin/sudo /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin LC_ALL=C /bin/sh -c '<root-trust.sh's root_exec>' sh <the writer's pin> <python3> <writer> trusted-exec <the secrets tools> -- <install> -o <the local router's uid> -g <its gid> -m 0400 "$T/seed" <keys.dir>/<keys.file>
    ); echo "exit $? (anything but 0: STOP, nothing was installed)"
    ```
 
@@ -1314,6 +1348,24 @@ restart of the hub-link router after activation goes through
 `hub-start-check`, which needs A2's evidence still current: do it within that
 window, or after the weekly run renews it.
 
+`hub-start-check` reads each unit's or label's state on its own and prints
+the start step for that state. On Linux a hub that is not running gets its
+first start, a failed one gets `reset-failed` first, and a running one is
+restarted after `daemon-reload`, so a changed rendering takes effect. On
+macOS a loaded job keeps the arguments it was registered with, so each
+loaded label is booted out, then enabled and bootstrapped again, the weekly
+label first. A run in progress gets nothing: re-run the check after it
+ends. After the hub's bootout, run the printed
+`hub-start-check --until-stopped` and do not go on until it prints
+`NOT-RUNNING`: the hub's label is gone and the engine lists no running hub
+container. A state the check cannot classify prints no start line.
+
+A start line that exits 1 printed the manager's own words above its
+`service:` line. For the reason, read `systemctl status <unit>` and the
+journal (Linux), or the hub's error stream `hub-link-run.err` beside its
+status file (macOS). A barrier refusal inside an Exec line shows there as
+12.
+
 **What the outage window does to the local router.** In the local router's
 own words, with only these changes to its text: "the local router" where it
 named itself or this router by a label; "(above)" for the back-out it cited;
@@ -1388,6 +1440,13 @@ systemd's first `ExecStartPre`, whose failure fails the start, and the
 launchd wrapper, which then records `untrusted_tools` and exits 0, so
 launchd does not restart it. Root runs no docker that is not root's alone.
 
+The service manager is called the same way. The secrets section's `tools`
+record it: `systemctl` on Linux, and `launchctl` as `/bin/launchctl` on
+macOS. Each typed line names it twice: as `--also` before `--`, and as
+`service --manager` after it. The writer's `service` verb judges it again
+and runs only a fixed set of its actions. The plan's lines that disable
+both labels before their plists are placed are such lines.
+
 A stop goes through the barrier too, so a refused stop never reaches
 `docker stop`. On macOS the wrapper says "the stop was refused or failed",
 and when launchd's `ExitTimeOut` ends the wrapper, the container is still
@@ -1439,47 +1498,52 @@ a separate, reviewed change, not part of this setup.
 ### The weekly partition job's tools
 
 The weekly partition job runs the host's interpreter and docker as root, so
-when the document has a partition section, the plan's first steps check them
-and everything they load at startup. Run these steps at install AND again after any
+when the document has a partition section, the plan's first root line checks
+them and everything they load. Run this at install AND again after any
 operating-system, interpreter or docker update, before the next weekly run.
-Those updates change the startup closure the per-run tripwire holds to the
-install-time state.
 
-Root makes a directory only root can open, and writes two scripts into it
-from the plan's text before anything that is being checked runs:
-`discover.sh`, which runs the interpreter, `ldd` (or `otool`) and
-`xcode-select` to list the closure, and `judge.sh`, which judges that list
-with the operating system's own `find` and executes nothing it judges. The
-plan prints both scripts and their sha256 digests:
-
-```sh
-R=$(sudo mktemp -d /tmp/amap-judge.XXXXXXXX)
-sudo chmod 0400 "$R/judge.sh" "$R/discover.sh"
-```
-
-Then one root invocation checks the digests, runs discovery as `nobody`
-(no terminal, an empty environment, its output cut at 1 MiB and one byte)
-and judges what it wrote. On Linux:
+The line runs through the barrier like every root line: root-trust.sh judges
+the operating system's interpreter and the pinned writer before the
+interpreter starts, then the writer's `partition-judge` judges that
+interpreter and docker exactly as `trusted-exec` judges them on every run:
+each file and its route, the libraries each one loads, the loader's own
+directories, and their ACLs. It writes nothing, and nothing runs as another
+identity. The plan prints the line with this host's paths:
 
 ```sh
-sudo sh -c 'sha256sum --status -c "$1/judge.sha256" || { echo "discovery failed: the judging scripts do not match their digests; nothing is run"; exit 1; }; ( cd / && setsid -w runuser -u nobody -- env -i PATH=/usr/bin:/bin HOME=/ LC_ALL=C sh -c "$(cat "$1/discover.sh")" </dev/null 2>/dev/null ) | head -c 1048577 > "$1/closure.env"; chmod 0400 "$1/closure.env" && sh "$1/judge.sh" "$1/closure.env"' sh "$R"
+/usr/bin/sudo /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin LC_ALL=C /bin/sh -c '<root-trust.sh's root_exec>' sh <pin> <python3> <writer> trusted-exec <the partition tools> -- <python3> -I -S -B <writer> partition-judge --python3 <python3> --docker <docker>
 ```
 
-On macOS:
+Go on only when its last line is exactly `END-OF-BLOCK` and it exited 0.
+Otherwise it prints each problem as `untrusted: …` and then `phase: tools`
+(a tool's file, route or pin) or `phase: closure` (what the tools load),
+and exits 12. The plan prints this check first among the root lines, and the
+bundle's provisioning comes after it.
+
+### The weekly job's bundle
+
+The bundle is fetched as root, at the deploy pin, by the writer's
+`partition-fetch`, under the job's lock. Run it at install and after every
+pin move. The partition section's `tools` record `git` and
+`git-remote-https` beside `python3` and `docker`. On a launchd host they
+are the Command Line Tools' own,
+`/Library/Developer/CommandLineTools/usr/bin/git` and
+`/Library/Developer/CommandLineTools/usr/libexec/git-core/git-remote-https`,
+never `/usr/bin/git`, which is the xcrun shim. The plan prints the line:
 
 ```sh
-sudo sh -c 'shasum -a 256 --status -c "$1/judge.sha256" || { echo "discovery failed: the judging scripts do not match their digests; nothing is run"; exit 1; }; ( cd / && /usr/bin/perl -MPOSIX -e "POSIX::setsid() >= 0 or exit 1; exec @ARGV" /usr/bin/sudo -u nobody -g nobody /usr/bin/env -i PATH=/usr/bin:/bin HOME=/var/empty LC_ALL=C /bin/sh -c "$(cat "$1/discover.sh")" </dev/null 2>/dev/null ) | head -c 1048577 > "$1/closure.env"; chmod 0400 "$1/closure.env" && sh "$1/judge.sh" "$1/closure.env"' sh "$R"
+/usr/bin/sudo /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin LC_ALL=C /bin/sh -c '<root-trust.sh's root_exec>' sh <pin> <python3> <writer> trusted-exec <the partition tools> --also <git> --also <git-remote-https> -- <python3> -I -S -B <writer> partition-fetch --git <git> --git-remote-https <git-remote-https> --exec-root <exec_root> --pin <the deploy pin> --repo https://github.com/proofpoint/amap-deploy-sandy
 ```
 
-Go on only when it printed exactly `END-OF-BLOCK` and exited 0. The plan
-prints this check first, before every step that runs an interpreter as root,
-and the bundle's provisioning
-(`partition-provision`, under the job's lock) comes after it. `nobody` must
-hold no sudoers rule and own nothing in the closure, and sudo's default
-`closefrom` must hold. The check trusts, as given, the completeness of the
-lists discovery writes beyond the tools themselves and its self-checks, and
-only as far as no hostile process runs as `nobody`. The interpreter
-names its own library paths from its standard library, so whoever can already
-write that library can make it misreport them: a known limit, the same for
-the per-run tripwire. A process discovery leaves behind that holds the pipe
-makes the step hang visibly; interrupt it, and run nothing after it.
+The writer judges git and its helper again before it touches anything, then
+runs them through a private directory holding only a link to each, with an
+environment it builds itself. It clones without checking out, reads the
+closure list and each file it names as the pinned blobs, and swaps the
+bundle in only when it verifies. Exit 0 is done. 12: a tool is not root's
+alone, and nothing changed. 3: another run holds the lock; run it again
+when that one ends. 4: git failed, a file in the pinned tree is outside the
+bundle's rules, or a git process outlived its cleanup; the live bundle is
+unchanged. When the message says a git process group survived, leave
+`git.pgid` in the exec root where it is: the next fetch refuses while that
+group exists. Remove `git.pgid` by hand only after you have shown that
+group is git's and gone.

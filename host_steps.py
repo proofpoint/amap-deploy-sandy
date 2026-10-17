@@ -32,6 +32,13 @@ The weekly partition job's root half (see its section below):
                                                   one run of the provisioned bundle, under the job's lock
   python3 -I -S -B host_steps.py partition-provision DIR
                                                   DIR/bundle.new swapped in as the bundle, under the lock
+  python3 -I -S -B host_steps.py partition-fetch --git G --git-remote-https H --exec-root DIR --pin PIN --repo URL
+                                                  the bundle at the pin, from a fresh https clone, swapped
+                                                  in under the job's lock (12 untrusted, 3 handoff, 4 refused)
+  python3 -I -S -B host_steps.py partition-judge --python3 PY --docker DOCKER [--docker-sha256 HEX]
+                                                  the weekly job's tools judged as trusted-exec judges
+                                                  them; END-OF-BLOCK last and 0 when clean, else each
+                                                  problem and its phase, and 12
 
 The one barrier every root command passes (ROOT-BOOTSTRAP d3.2; root-trust.sh's
 root_exec starts it, after judging this interpreter and this file):
@@ -2022,6 +2029,155 @@ def loader_dirs(platform=None, read=None, glob_=None):
     return sorted(set(out))
 
 
+class Judgment(tuple):
+    """judge()'s result: `(problems, phase)`. phase is "clean", "tools"
+    (a problem in the refusals, the recorded-set check, a tool's file rule,
+    route or pin: judging stopped there, before any library discovery) or
+    "closure" (the tools were clean and the closure was not)."""
+
+    def __new__(cls, problems, phase):
+        return super().__new__(cls, (tuple(problems), phase))
+
+    @property
+    def problems(self):
+        return self[0]
+
+    @property
+    def phase(self):
+        return self[1]
+
+
+def _pin_problem(t, want):
+    """A tool's sha256 against its pin, read without following a link and
+    without blocking: a FIFO in its place is a problem, never a hang."""
+    try:
+        fd = os.open(t, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0))
+    except OSError as e:
+        return f"{t}: {e.strerror}"
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return f"{t} is not a regular file"
+        h = hashlib.sha256()
+        for chunk in iter(lambda: os.read(fd, 1 << 20), b""):
+            h.update(chunk)
+    except OSError as e:
+        return f"{t}: {e.strerror}"
+    finally:
+        os.close(fd)
+    got = h.hexdigest()
+    return None if got == want else f"{t} is not the client the document pins (sha256 {got})"
+
+
+def judge(argv0, also=(), recorded=(), shas=None, platform=None, after_refusals=None):
+    """Everything trusted-exec judges before it execs, as a Judgment (d3.3
+    §5(d) §2.1). In order: an absolute program; ld.so.preload; sudo
+    anywhere; `after_refusals` (trusted_exec's _bound, at its own position);
+    the recorded-set check; each tool's file rule and route, every tool
+    judged and every independent problem kept; the pins, read only for a
+    tool that passed its file rule. Any problem so far stops judging there,
+    so the loader's list mode never maps a tool that failed (phase tools).
+    Only then the fresh closure, the loader's directories and the ACLs
+    (phase closure). A Tooling raised inside becomes a problem of the phase
+    it arose in; judge itself never raises one."""
+    try:
+        if not argv0 or not os.path.isabs(argv0):
+            return Judgment(["trusted-exec needs an absolute program"], "tools")
+        if (platform or sys.platform) != "darwin" and os.path.lexists(LD_SO_PRELOAD):
+            return Judgment([f"{LD_SO_PRELOAD} is present: the loader maps it into every process"], "tools")
+        tools = [argv0] + [t for t in also if t != argv0]
+        for t in tools:
+            if os.path.basename(t) == "sudo":
+                return Judgment([f"{t}: root's argv never holds sudo"], "tools")
+        if after_refusals is not None:
+            after_refusals()
+        own = bool(sys.executable) and os.path.realpath(argv0) == os.path.realpath(sys.executable)
+        unrecorded = [f"{t} is not a tool the document records" for t in tools
+                      if t not in set(recorded) and not (t == argv0 and own)]
+        if unrecorded:
+            return Judgment(unrecorded, "tools")
+        problems, reals, passed = [], [], set()
+        for t in tools:
+            try:
+                real = _trusted_tool(t)
+            except Tooling as e:
+                problems.append(str(e))
+                continue
+            bad = closure_problems([t], platform=platform)
+            if bad:
+                problems.append(f"{t}'s route is not root's alone: " + "; ".join(bad[:5]))
+                continue
+            reals.append(real)
+            passed.add(t)
+        for t, want in sorted((shas or {}).items()):
+            if t in passed:
+                bad = _pin_problem(t, want)
+                if bad:
+                    problems.append(bad)
+            elif t not in tools:
+                problems.append(f"{t} is pinned but is not a tool of this command")
+        if problems:
+            return Judgment(sorted(set(problems)), "tools")
+    except Tooling as e:
+        return Judgment([str(e)], "tools")
+    try:
+        python = sys.executable
+        if not python or not os.path.isabs(python):
+            return Judgment(["the running interpreter has no absolute path"], "closure")
+        closure = exec_closure(_trusted_tool(python), reals, [python] + tools, platform=platform)
+        darwin = (platform or sys.platform) == "darwin"
+        fallthrough = any(not os.path.lexists(p) and not p.startswith(SEALED_PREFIXES) for p in closure[OPTIONAL])
+        if not darwin or fallthrough:
+            closure[OPTIONAL] = sorted(set(closure[OPTIONAL] + loader_dirs(platform)))
+        judged = []
+        bad = closure_problems(closure, platform=platform, seen=judged)
+        bad += acl_problems(sorted(set(judged)), platform=platform)
+    except Tooling as e:
+        return Judgment([str(e)], "closure")
+    return Judgment(sorted(set(bad)), "closure") if bad else Judgment([], "clean")
+
+
+#: The line partition-judge prints last, and only when its judging found nothing.
+JUDGE_SENTINEL = "END-OF-BLOCK"
+
+
+def partition_judge(python3, docker, docker_sha256=None, out=print, platform=None):
+    """The weekly job's install-time check (d3.3 §5(d) §2): its own
+    interpreter and docker judged exactly as trusted-exec judges them,
+    every problem printed with its phase. JUDGE_SENTINEL is printed last,
+    and 0 returned, only when the judging found nothing; otherwise 12. It
+    writes no file. `python3` must be the interpreter running it."""
+    if not python3 or not sys.executable or os.path.realpath(python3) != os.path.realpath(sys.executable):
+        out(f"untrusted: --python3 {python3} is not the interpreter running this check")
+        out("phase: tools")
+        return ROOT_TRUST_EXIT
+    j = judge(sys.executable, also=[docker], recorded=[docker],
+              shas={docker: docker_sha256} if docker_sha256 else None, platform=platform)
+    if j.phase == "clean":
+        out(JUDGE_SENTINEL)
+        return 0
+    for p in j.problems:
+        out(f"untrusted: {p}")
+    out(f"phase: {j.phase}")
+    return ROOT_TRUST_EXIT
+
+
+def _partition_judge_main(argv):
+    """partition-judge --python3 PY --docker DOCKER [--docker-sha256 HEX]"""
+    usage = "partition-judge --python3 PY --docker DOCKER [--docker-sha256 HEX]"
+    opts = argv[1:]
+    if len(opts) not in (4, 6) or len(opts) % 2:
+        raise StepError(usage)
+    got = dict(zip(opts[0::2], opts[1::2]))
+    if not {"--python3", "--docker"} <= set(got) or set(got) - {"--python3", "--docker", "--docker-sha256"}:
+        raise StepError(usage)
+    pin = got.get("--docker-sha256")
+    if pin is not None and not re.fullmatch(r"[0-9a-f]{64}", pin):
+        raise StepError("--docker-sha256 is not a sha256")
+    if not os.path.isabs(got["--docker"]):
+        raise StepError("--docker must be an absolute path")
+    return partition_judge(got["--python3"], got["--docker"], pin)
+
+
 def trusted_exec(argv, also=(), shas=None, platform=None, execv=os.execv, tools=()):
     """Judge root's command and exec it. Refused (Tooling, nothing run):
     sudo anywhere in it (root's argv never holds sudo); a tool that is not
@@ -2031,48 +2187,15 @@ def trusted_exec(argv, also=(), shas=None, platform=None, execv=os.execv, tools=
     ACLs or the loader's directories. argv[0] is an allowlist (d3.3 §4.1):
     its own interpreter in the one exact vector, or a tool the document
     records (`tools`, by absolute path, carried on the rendered root line);
-    each --also tool is one of those too. Then os.execv of exactly `argv`."""
-    if not argv or not os.path.isabs(argv[0]):
+    each --also tool is one of those too. Then os.execv of exactly `argv`.
+    The judging is judge()'s; _bound runs at its own place in that order."""
+    if not argv:
         raise Tooling("trusted-exec needs an absolute program")
-    if (platform or sys.platform) != "darwin" and os.path.lexists(LD_SO_PRELOAD):
-        raise Tooling(f"{LD_SO_PRELOAD} is present: the loader maps it into every process")
-    recorded = set(tools)
-    tools = [argv[0]] + [t for t in also if t != argv[0]]
-    for t in tools:
-        if os.path.basename(t) == "sudo":
-            raise Tooling(f"{t}: root's argv never holds sudo")
-    _bound(argv)
-    own = bool(sys.executable) and os.path.realpath(argv[0]) == os.path.realpath(sys.executable)
-    for t in tools:
-        if t not in recorded and not (t == argv[0] and own):
-            raise Tooling(f"{t} is not a tool the document records")
-    reals = []
-    for t in tools:
-        reals.append(_trusted_tool(t))
-        bad = closure_problems([t], platform=platform)
-        if bad:
-            raise Tooling(f"{t}'s route is not root's alone: " + "; ".join(bad[:5]))
-    for t, want in (shas or {}).items():
-        try:
-            with open(t, "rb") as f:
-                got = hashlib.sha256(f.read()).hexdigest()
-        except OSError as e:
-            raise Tooling(f"{t}: {e.strerror}") from None
-        if got != want:
-            raise Tooling(f"{t} is not the client the document pins (sha256 {got})")
-    python = sys.executable
-    if not python or not os.path.isabs(python):
-        raise Tooling("the running interpreter has no absolute path")
-    closure = exec_closure(_trusted_tool(python), reals, [python] + tools, platform=platform)
-    darwin = (platform or sys.platform) == "darwin"
-    fallthrough = any(not os.path.lexists(p) and not p.startswith(SEALED_PREFIXES) for p in closure[OPTIONAL])
-    if not darwin or fallthrough:
-        closure[OPTIONAL] = sorted(set(closure[OPTIONAL] + loader_dirs(platform)))
-    judged = []
-    bad = closure_problems(closure, platform=platform, seen=judged)
-    bad += acl_problems(sorted(set(judged)), platform=platform)
-    if bad:
-        raise Tooling("the closure is not root's alone: " + "; ".join(sorted(set(bad))[:5]))
+    j = judge(argv[0], also, tools, shas, platform, after_refusals=lambda: _bound(argv))
+    if j.phase == "tools":
+        raise Tooling("; ".join(j.problems[:5]))
+    if j.phase == "closure":
+        raise Tooling("the closure is not root's alone: " + "; ".join(j.problems[:5]))
     execv(argv[0], argv)
 
 
@@ -3157,42 +3280,649 @@ def partition_weekly(exec_root, host, document, sha256, activation, activation_s
 
 def partition_provision(exec_root):
     """Swap `<exec_root>/bundle.new` in as the bundle, under the job's lock,
-    once it verifies (its own PIN is the one it carries). The operator runs
-    this after the printed provisioning commands fill bundle.new."""
+    once it verifies (its own PIN is the one it carries). partition-fetch
+    calls the same core under its own lock; this verb takes it once, after
+    the git.pgid guard, before anything in the staging is touched."""
     efd = _root_dir(exec_root, 0o700)
     lock_fd = None
     try:
         lock_fd = _take_partition_lock(efd)
-        nfd = os.open("bundle.new", _DIR, dir_fd=efd)
-        try:
-            pin = _read_at(nfd, PIN, 64)[0].decode("ascii").strip()
-        finally:
-            os.close(nfd)
-        os.rename("bundle.new", "bundle.check", src_dir_fd=efd, dst_dir_fd=efd)
-        try:
-            os.rename("bundle", "bundle.old", src_dir_fd=efd, dst_dir_fd=efd)
-        except FileNotFoundError:
-            pass
-        os.rename("bundle.check", BUNDLE, src_dir_fd=efd, dst_dir_fd=efd)
-        try:
-            _verify_bundle(efd, pin)
-        except (Tooling, Handoff):
-            os.rename(BUNDLE, "bundle.new", src_dir_fd=efd, dst_dir_fd=efd)
-            try:
-                os.rename("bundle.old", BUNDLE, src_dir_fd=efd, dst_dir_fd=efd)
-            except FileNotFoundError:
-                pass
-            raise
-        try:
-            _remove_tree(efd, "bundle.old")
-        except FileNotFoundError:
-            pass
-        os.fsync(efd)
-        return 0
+        _pgid_guard(efd)
+        return _provision_core(efd, lock_fd)
     finally:
         if lock_fd is not None:
             os.close(lock_fd)
         os.close(efd)
+
+
+def _provision_core(efd, lock_fd):
+    """bundle.new swapped in as the bundle and verified, rolled back on a
+    refusal. It borrows the caller's exec_root descriptor and held lock: it
+    never opens the lock, and closes neither (d3.3 §5(d) §1.5)."""
+    nfd = os.open("bundle.new", _DIR, dir_fd=efd)
+    try:
+        pin = _read_at(nfd, PIN, 64)[0].decode("ascii").strip()
+    finally:
+        os.close(nfd)
+    os.rename("bundle.new", "bundle.check", src_dir_fd=efd, dst_dir_fd=efd)
+    try:
+        os.rename("bundle", "bundle.old", src_dir_fd=efd, dst_dir_fd=efd)
+    except FileNotFoundError:
+        pass
+    os.rename("bundle.check", BUNDLE, src_dir_fd=efd, dst_dir_fd=efd)
+    try:
+        _verify_bundle(efd, pin)
+    except (Tooling, Handoff):
+        os.rename(BUNDLE, "bundle.new", src_dir_fd=efd, dst_dir_fd=efd)
+        try:
+            os.rename("bundle.old", BUNDLE, src_dir_fd=efd, dst_dir_fd=efd)
+        except FileNotFoundError:
+            pass
+        raise
+    try:
+        _remove_tree(efd, "bundle.old")
+    except FileNotFoundError:
+        pass
+    os.fsync(efd)
+    return 0
+
+
+# --- partition-fetch: the bundle from the pinned commit, as root (d3.3 §5(d) §1) -------------
+#
+# git runs under a profile that keeps every program it can find by lookup to
+# the two judged files: PATH and GIT_EXEC_PATH name a private directory this
+# run makes, holding exactly a link to the recorded git and one to its
+# remote helper. The four commands read blobs by their pinned ids; nothing is
+# checked out and nothing is archived (archive would apply the tree's own
+# .gitattributes). Each child runs in its own process group, every stream is
+# capped while it is read, and the group is proven empty before the lock is
+# released, with one exception: a survivor is refused and left recorded.
+
+class Untrusted(Exception):
+    """A judged program is not root's alone: exit ROOT_TRUST_EXIT, nothing run."""
+
+
+class Survivor(Tooling):
+    """A git process group outlived its cleanup: its staging and git.pgid are kept."""
+
+
+PIN_FORM = re.compile(r"[0-9a-f]{40}")
+REPO_FORM = re.compile(r"https://[A-Za-z0-9.-]+(?::[0-9]+)?/[A-Za-z0-9._/-]+")
+MANIFEST_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]*")
+GIT_EXEC, EMPTY_HOME, SRC_NEW, BUNDLE_NEW, PGID_FILE = "git-exec", "empty-home", "src.new", "bundle.new", "git.pgid"
+FETCH_TIMEOUT_S, GIT_LOCAL_TIMEOUT_S, DRAIN_S = 600, 60, 5
+STDERR_MAX = 64 << 10
+#: ls-tree -z's own output for the manifest's names: mode, type, oid and a name per entry.
+LSTREE_MAX = (BUNDLE_MAX_FILES + 2) * 512
+#: `cat-file -t` of a commit, byte for byte; anything else, or an eighth byte, refuses.
+COMMIT_TYPE = b"commit\n"
+#: The one configuration the four commands run under, beside git_env.
+GIT_CONFIG = ("-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "core.attributesFile=/dev/null",
+              "-c", "core.pager=cat", "-c", "core.askPass=", "-c", "core.sshCommand=", "-c", "credential.helper=",
+              "-c", "init.templateDir=", "-c", "protocol.allow=never", "-c", "protocol.https.allow=always",
+              "-c", "uploadpack.packObjectsHook=")
+
+
+def git_env(exec_root):
+    """The whole environment of every git call, built here and inherited from
+    nothing. The plan renders its fact line from this same function."""
+    exec_dir, home = os.path.join(exec_root, GIT_EXEC), os.path.join(exec_root, EMPTY_HOME)
+    return {"PATH": exec_dir, "GIT_EXEC_PATH": exec_dir, "LC_ALL": "C", "HOME": home, "XDG_CONFIG_HOME": home,
+            "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_ATTR_NOSYSTEM": "1",
+            "GIT_TERMINAL_PROMPT": "0", "GIT_NO_REPLACE_OBJECTS": "1", "GIT_EDITOR": ":"}
+
+
+def _pgid_guard(efd):
+    """FIRST, before anything in the staging is removed or replaced: a git
+    process group a previous run left recorded must be gone. A live one is
+    refused, never signalled: its number may now name another group."""
+    try:
+        raw = _read_at(efd, PGID_FILE, 32)[0]
+    except FileNotFoundError:
+        return
+    except (OSError, ValueError) as e:
+        raise Tooling(f"{PGID_FILE} cannot be read ({e}); nothing is removed") from None
+    try:
+        pgid = int(raw.decode("ascii").strip())
+    except (UnicodeDecodeError, ValueError):
+        raise Tooling(f"{PGID_FILE} does not hold a process group id; nothing is removed") from None
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        os.unlink(PGID_FILE, dir_fd=efd)
+        return
+    except PermissionError:
+        pass
+    raise Survivor(f"the git process group {pgid} a previous run recorded in {PGID_FILE} still exists: nothing is "
+                  f"removed; confirm it is git's and gone, then remove {PGID_FILE}")
+
+
+class _Interrupted(Exception):
+    pass
+
+
+def _cleanup_group(child, pgid):
+    """The failure path, within one monotonic deadline: SIGKILL the group
+    only while its leader is unreaped (so the number cannot name another
+    group), drain both pipes, reap with a timed wait, and confirm the group
+    is empty. True when it is; False is the survivor exception."""
+    end = time.monotonic() + DRAIN_S
+    while True:
+        if child.returncode is None:
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        for stream in (child.stdout, child.stderr):
+            if stream is not None and not stream.closed:
+                os.set_blocking(stream.fileno(), False)
+                try:
+                    while time.monotonic() < end and stream.read(1 << 16):
+                        pass
+                except (BlockingIOError, OSError, ValueError):
+                    pass
+        try:
+            child.wait(timeout=max(0.0, min(end - time.monotonic(), 0.2)))
+        except subprocess.TimeoutExpired:
+            pass
+        if _group_gone(pgid):
+            return True
+        if time.monotonic() >= end:
+            return False
+
+
+def _group_gone(pgid):
+    """Signal 0 to the group: True only on ProcessLookupError. An answer
+    that the group exists only ever supports a refusal."""
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        pass
+    return False
+
+
+def _await_empty(pgid):
+    """After a leader exited 0 and was reaped: no signal but 0, until the
+    group is empty or DRAIN_S passes."""
+    end = time.monotonic() + DRAIN_S
+    while not _group_gone(pgid):
+        if time.monotonic() >= end:
+            return False
+        time.sleep(0.02)
+    return True
+
+
+def _git(efd, argv, env, cwd, cap, deadline_s, popen=subprocess.Popen):
+    """One git child in its own process group: stdout read while it runs
+    and refused past `cap`, stderr kept to STDERR_MAX and the rest counted
+    and dropped (never a reason to kill), a deadline on one monotonic
+    clock, SIGINT and SIGTERM taking the failure path. (stdout, stderr,
+    dropped) on exit 0; Tooling otherwise, after the group is proven empty."""
+    import selectors
+    old = {}
+
+    def interrupted(signum, frame):
+        raise _Interrupted(signal.Signals(signum).name)
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        old[sig] = signal.signal(sig, interrupted)
+    child, pgid, why = None, None, None
+    out, err, dropped = bytearray(), bytearray(), 0
+    try:
+        child = popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
+                      cwd=cwd, close_fds=True, start_new_session=True)
+        pgid = child.pid
+        _write_at(efd, PGID_FILE, f"{pgid}\n".encode("ascii"), 0o600)
+        end = time.monotonic() + deadline_s
+        sel = selectors.DefaultSelector()
+        sel.register(child.stdout, selectors.EVENT_READ, "out")
+        sel.register(child.stderr, selectors.EVENT_READ, "err")
+        while sel.get_map():
+            left = end - time.monotonic()
+            if left <= 0:
+                why = f"did not finish within {deadline_s} s"
+                break
+            for key, _ in sel.select(timeout=left):
+                chunk = os.read(key.fileobj.fileno(), 1 << 16)
+                if not chunk:
+                    sel.unregister(key.fileobj)
+                elif key.data == "out":
+                    out += chunk
+                    if len(out) > cap:
+                        why = f"wrote more than {cap} bytes to stdout"
+                        break
+                else:
+                    room = STDERR_MAX - len(err)
+                    err += chunk[:max(0, room)]
+                    dropped += max(0, len(chunk) - max(0, room))
+            if why:
+                break
+        if why is None:
+            try:
+                child.wait(timeout=max(0.0, end - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                why = f"did not finish within {deadline_s} s"
+    except _Interrupted as e:
+        why = f"was interrupted ({e})"
+    except Exception as e:
+        if child is None:
+            raise
+        why = f"could not be followed ({e})"
+    finally:
+        for sig, handler in old.items():
+            signal.signal(sig, handler)
+    if child is None:
+        raise Tooling("git could not be started")
+    what = next((a for a in argv if a in ("clone", "cat-file", "ls-tree")), "git")
+    try:
+        return _git_settle(efd, child, pgid, why, what, out, err, dropped)
+    finally:
+        for stream in (child.stdout, child.stderr):
+            stream.close()
+
+
+def _git_settle(efd, child, pgid, why, what, out, err, dropped):
+    """A finished or abandoned git child: on any failure the group is killed
+    and proven empty first, then the refusal; on exit 0 the group must
+    already be empty. git.pgid is removed only once the group is."""
+    if why is not None or child.returncode != 0:
+        try:
+            empty = _cleanup_group(child, pgid)
+        except BaseException as e:  # an EPERM, a drain or wait error, an interrupt: the group is not shown empty
+            raise Survivor(f"git process group {pgid} could not be shown empty ({e!r}): {PGID_FILE} and the "
+                           "staging are kept and nothing is removed") from None
+        if not empty:
+            raise Survivor(f"a git process survived in group {pgid}: {PGID_FILE} is kept and nothing is removed")
+        try:
+            os.unlink(PGID_FILE, dir_fd=efd)
+        except FileNotFoundError:
+            pass
+        tail = bytes(err[-400:]).decode("utf-8", "replace").strip()
+        note = f" ({dropped} stderr bytes dropped)" if dropped else ""
+        raise Tooling(f"git {what} {why or f'exited {child.returncode}'}: {tail}{note}")
+    try:
+        gone = _await_empty(pgid)
+    except BaseException as e:
+        raise Survivor(f"git process group {pgid} could not be shown empty ({e!r}): {PGID_FILE} and the staging "
+                       "are kept and nothing is removed") from None
+    if not gone:
+        raise Survivor(f"a git process survived in group {pgid} after its leader exited: {PGID_FILE} is kept and "
+                       "nothing is removed")
+    os.unlink(PGID_FILE, dir_fd=efd)
+    if dropped:
+        print(f"partition-fetch: git {what} wrote {dropped} stderr bytes past {STDERR_MAX}; they were dropped",
+              file=sys.stderr)
+    return bytes(out), bytes(err), dropped
+
+
+def _manifest_names(raw):
+    """The manifest's names, by its grammar: UTF-8, no NUL, one name a line,
+    each a plain file name, no repeats, LAUNCHER among them, neither
+    reserved name, room left for the manifest and PIN in the count bound."""
+    if b"\0" in raw:
+        raise Tooling("the closure list holds a NUL")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise Tooling("the closure list is not UTF-8") from None
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    names = []
+    for line in lines:
+        if MANIFEST_NAME.fullmatch(line) is None or line.startswith((".", "-")) or len(line) > 255:
+            raise Tooling(f"the closure list names {line!r}, which is not a plain file name")
+        if line in (CLOSURE, PIN):
+            raise Tooling(f"the closure list names the reserved {line!r}")
+        if line in names:
+            raise Tooling(f"the closure list names {line!r} twice")
+        names.append(line)
+    if LAUNCHER not in names:
+        raise Tooling(f"the closure list does not name {LAUNCHER}")
+    if len(names) > BUNDLE_MAX_FILES - 2:
+        raise Tooling("the closure list names too many files")
+    return names
+
+
+def _tree_entries(raw, names):
+    """ls-tree -z's entries for exactly `names`: each a regular blob, mode
+    100644 or 100755. A link, a gitlink, a tree or a missing name refuses."""
+    seen = {}
+    for entry in raw.split(b"\0"):
+        if not entry:
+            continue
+        try:
+            meta, name = entry.split(b"\t", 1)
+            mode, kind, _oid = meta.split(b" ")
+            name = name.decode("utf-8")
+        except ValueError:
+            raise Tooling("ls-tree printed an entry outside its form") from None
+        if mode not in (b"100644", b"100755") or kind != b"blob":
+            raise Tooling(f"{name!r} is not a regular blob in the pinned tree ({mode.decode()} {kind.decode()})")
+        seen[name] = True
+    if sorted(seen) != sorted(names):
+        raise Tooling("the pinned tree's entries are not exactly the closure list")
+
+
+def partition_fetch(exec_root, pin, repo, git, helper, popen=subprocess.Popen):
+    """The weekly job's bundle at the deploy pin, from a fresh root-owned
+    https clone (d3.3 §5(d) §1), swapped in under the job's lock, which is
+    taken once and held throughout."""
+    if not PIN_FORM.fullmatch(pin or ""):
+        raise Tooling("--pin must be a full 40-hex commit id")
+    if not REPO_FORM.fullmatch(repo or "") or "@" in repo:
+        raise Tooling("--repo must be a plain https:// URL")
+    for path, base in ((git, "git"), (helper, "git-remote-https")):
+        if not os.path.isabs(path) or os.path.basename(path) != base:
+            raise Tooling(f"--{base} must be an absolute path to {base}")
+    efd = _root_dir(exec_root, 0o700)
+    lock_fd, staged = None, False
+    try:
+        lock_fd = _take_partition_lock(efd)
+        # Phase A: the two targets judged in process, before any staging change.
+        j = judge(sys.executable, also=[git, helper], recorded=[git, helper])
+        if j.phase != "clean":
+            raise Untrusted("; ".join(j.problems[:5]))
+        _pgid_guard(efd)
+        staged = True
+        for name in (SRC_NEW, BUNDLE_NEW, GIT_EXEC):
+            try:
+                _remove_tree(efd, name)
+            except FileNotFoundError:
+                pass
+        _empty_home(efd)
+        os.mkdir(GIT_EXEC, 0o700, dir_fd=efd)
+        gfd = os.open(GIT_EXEC, _DIR, dir_fd=efd)
+        try:
+            os.fchmod(gfd, 0o700)
+            made = os.fstat(gfd)
+            os.symlink(git, "git", dir_fd=gfd)
+            os.symlink(helper, "git-remote-https", dir_fd=gfd)
+        finally:
+            os.close(gfd)
+        _phase_b(efd, made, git, helper)
+        _fetch_bundle(efd, exec_root, pin, repo, popen)
+        _provision_core(efd, lock_fd)
+        _fetch_cleanup(efd)
+        return 0
+    except Survivor:
+        staged = False
+        raise
+    except BaseException:
+        if staged:
+            try:
+                _fetch_cleanup(efd)
+            except OSError:
+                pass
+        raise
+    finally:
+        if lock_fd is not None:
+            os.close(lock_fd)
+        os.close(efd)
+
+
+def _empty_home(efd):
+    """empty-home, made or re-checked: root's, 0700, empty."""
+    try:
+        os.mkdir(EMPTY_HOME, 0o700, dir_fd=efd)
+    except FileExistsError:
+        pass
+    hfd = os.open(EMPTY_HOME, _DIR, dir_fd=efd)
+    try:
+        st = os.fstat(hfd)
+        if st.st_uid != ROOT_UID or stat.S_IMODE(st.st_mode) != 0o700 or os.listdir(hfd):
+            raise Tooling(f"{EMPTY_HOME} is not root's alone, 0700 and empty")
+    finally:
+        os.close(hfd)
+
+
+def _phase_b(efd, made, git, helper):
+    """Immediately before the first git call, the writer's own check of the
+    two aliases, through a fresh descriptor for git-exec: the directory this
+    run made (its recorded identity), root's, 0700, holding exactly two links
+    naming the Phase A targets by exact string. judge never sees the alias
+    spellings, so the recorded set does not widen."""
+    try:
+        gfd = os.open(GIT_EXEC, _DIR, dir_fd=efd)
+    except OSError as e:
+        raise Untrusted(f"{GIT_EXEC} cannot be opened as a directory ({e.strerror})") from None
+    try:
+        now = os.fstat(gfd)
+        if ((now.st_dev, now.st_ino) != (made.st_dev, made.st_ino) or now.st_uid != ROOT_UID
+                or stat.S_IMODE(now.st_mode) != 0o700 or sorted(os.listdir(gfd)) != ["git", "git-remote-https"]):
+            raise Untrusted(f"{GIT_EXEC} is not the directory this run made, with only its two links")
+        for alias, target in (("git", git), ("git-remote-https", helper)):
+            if (not stat.S_ISLNK(os.stat(alias, dir_fd=gfd, follow_symlinks=False).st_mode)
+                    or os.readlink(alias, dir_fd=gfd) != target):
+                raise Untrusted(f"{GIT_EXEC}/{alias} does not name {target}")
+    finally:
+        os.close(gfd)
+
+
+def _fetch_bundle(efd, exec_root, pin, repo, popen):
+    """The four commands, then bundle.new: each named blob, the manifest
+    and PIN, written exclusively, within the bundle's bounds."""
+    env, home = git_env(exec_root), os.path.join(exec_root, EMPTY_HOME)
+    g = [os.path.join(exec_root, GIT_EXEC, "git"), *GIT_CONFIG]
+    src = os.path.join(exec_root, SRC_NEW)
+    _git(efd, g + ["clone", "--no-checkout", "--quiet", "--template=", "--", repo, src], env, home, 0,
+         FETCH_TIMEOUT_S, popen)
+    kind = _git(efd, g + ["-C", src, "cat-file", "-t", pin], env, home, len(COMMIT_TYPE), GIT_LOCAL_TIMEOUT_S,
+                popen)[0]
+    if kind != COMMIT_TYPE:
+        raise Tooling(f"the pin does not name a commit (cat-file -t printed {kind!r})")
+    manifest = _git(efd, g + ["-C", src, "cat-file", "blob", f"{pin}:{CLOSURE}"], env, home, BUNDLE_FILE_MAX,
+                    GIT_LOCAL_TIMEOUT_S, popen)[0]
+    names = _manifest_names(manifest)
+    _tree_entries(_git(efd, g + ["-C", src, "ls-tree", "-z", pin, "--", *names], env, home, LSTREE_MAX,
+                       GIT_LOCAL_TIMEOUT_S, popen)[0], names)
+    os.mkdir(BUNDLE_NEW, 0o755, dir_fd=efd)
+    nfd = os.open(BUNDLE_NEW, _DIR, dir_fd=efd)
+    try:
+        total = len(manifest) + len(pin) + 1
+        for name in names:
+            blob = _git(efd, g + ["-C", src, "cat-file", "blob", f"{pin}:{name}"], env, home, BUNDLE_FILE_MAX,
+                        GIT_LOCAL_TIMEOUT_S, popen)[0]
+            total += len(blob)
+            if total > BUNDLE_MAX_BYTES:
+                raise Tooling("the bundle is over its size bound")
+            _write_at(nfd, name, blob, 0o444, exclusive=True)
+        _write_at(nfd, CLOSURE, manifest, 0o444, exclusive=True)
+        _write_at(nfd, PIN, f"{pin}\n".encode("ascii"), 0o444, exclusive=True)
+        os.fchmod(nfd, 0o555)
+        os.fsync(nfd)
+    finally:
+        os.close(nfd)
+
+
+def _fetch_cleanup(efd):
+    """Once every group is proven empty: src.new and git-exec go, and
+    empty-home is emptied. bundle.new, when a refusal left it, stays for a
+    look; the next fetch removes it."""
+    for name in (SRC_NEW, GIT_EXEC):
+        try:
+            _remove_tree(efd, name)
+        except FileNotFoundError:
+            pass
+    try:
+        hfd = os.open(EMPTY_HOME, _DIR, dir_fd=efd)
+    except FileNotFoundError:
+        return
+    try:
+        for n in os.listdir(hfd):
+            _remove_tree(hfd, n)
+    finally:
+        os.close(hfd)
+    os.fsync(efd)
+
+
+def _partition_fetch_main(argv):
+    """partition-fetch --git G --git-remote-https H --exec-root DIR --pin PIN --repo URL"""
+    usage = "partition-fetch --git G --git-remote-https H --exec-root DIR --pin PIN --repo URL"
+    opts = argv[1:]
+    if len(opts) != 10:
+        raise Tooling(usage)
+    got = dict(zip(opts[0::2], opts[1::2]))
+    if set(got) != {"--git", "--git-remote-https", "--exec-root", "--pin", "--repo"}:
+        raise Tooling(usage)
+    return partition_fetch(got["--exec-root"], got["--pin"], got["--repo"], got["--git"], got["--git-remote-https"])
+
+
+# --- service: the service manager's whitelisted calls, as root (d3.3 §5(d) §4) ---------------
+#
+# argv[0] of the typed line stays the writer's interpreter; the manager is
+# judged by trusted-exec (--also) and again here, on the exact path run, and
+# the argv the manager gets comes only from SERVICE_TABLE. The writer reads
+# no document.
+
+#: The one budget a service call has: restart waits for the supervisor's
+#: stop bound, three barrier lines and a margin (hub_supervise.verify_service_bound).
+SERVICE_TIMEOUT_S = 180
+#: The manager's whole environment: root_trust.PATH and LC_ALL, no pager variable.
+SERVICE_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+LAUNCHD_DIR = "/Library/LaunchDaemons"
+SERVICE_LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+SERVICE_UNIT = re.compile(r"[A-Za-z0-9][A-Za-z0-9@._-]*\.(service|timer)")
+SYSTEMCTL_FLAGS = ("--no-ask-password", "--no-pager")
+MANAGER_NAMES = {"systemd": "systemctl", "launchd": "launchctl"}
+#: launchctl bootout's "Operation now in progress": the job is still going away.
+BOOTOUT_IN_PROGRESS = 36
+#: `launchctl print system/<label>`'s (exit status, output) once the label is
+#: gone, exactly: stdout and stderr as one stream, trailing newlines dropped,
+#: as TXN captures it (root_trust.LAUNCHD_NOT_FOUND, the same value). The text
+#: names the label, so `{label}` is replaced by the label asked about first.
+#: While it is None, every print answer is unknown and a bootout is never
+#: confirmed.
+LAUNCHD_NOT_FOUND = (113, 'Bad request.\nCould not find service "{label}" in domain for system')
+#: (kind, action): (the argument kinds, the argv after the manager).
+SERVICE_TABLE = {
+    ("launchd", "disable"): (("label",), lambda a: ["disable", f"system/{a[0]}"]),
+    ("launchd", "enable"): (("label",), lambda a: ["enable", f"system/{a[0]}"]),
+    ("launchd", "bootstrap"): (("label", "plist"), lambda a: ["bootstrap", "system", a[1]]),
+    ("launchd", "bootout"): (("label",), lambda a: ["bootout", f"system/{a[0]}"]),
+    ("systemd", "daemon-reload"): ((), lambda a: [*SYSTEMCTL_FLAGS, "daemon-reload"]),
+    ("systemd", "enable-now"): (("unit",), lambda a: [*SYSTEMCTL_FLAGS, "enable", "--now", a[0]]),
+    ("systemd", "restart"): (("service",), lambda a: [*SYSTEMCTL_FLAGS, "restart", a[0]]),
+    ("systemd", "stop"): (("unit",), lambda a: [*SYSTEMCTL_FLAGS, "stop", a[0]]),
+    ("systemd", "reset-failed"): (("service",), lambda a: [*SYSTEMCTL_FLAGS, "reset-failed", a[0]]),
+}
+
+
+def service_argv(manager, kind, action, args):
+    """The manager's argv for one row of SERVICE_TABLE, or Tooling: an
+    action outside the table, an argument outside its row's rule, or a
+    manager that is not the kind's by name (a kind check only)."""
+    if kind not in MANAGER_NAMES or not os.path.isabs(manager or "") \
+            or os.path.basename(manager) != MANAGER_NAMES[kind]:
+        raise Tooling("--manager must be an absolute path to " + MANAGER_NAMES.get(kind, "the kind's manager"))
+    row = SERVICE_TABLE.get((kind, action))
+    if row is None:
+        raise Tooling(f"{kind} {action} is not a service action")
+    kinds, build = row
+    if len(args) != len(kinds):
+        raise Tooling(f"{kind} {action} takes {len(kinds)} argument(s)")
+    for k, a in zip(kinds, args):
+        if k == "label":
+            ok = SERVICE_LABEL.fullmatch(a) is not None
+        elif k == "plist":
+            ok = a == f"{LAUNCHD_DIR}/{args[0]}.plist"
+        elif k == "unit":
+            ok = SERVICE_UNIT.fullmatch(a) is not None
+        else:
+            ok = SERVICE_UNIT.fullmatch(a) is not None and a.endswith(".service")
+        if not ok:
+            raise Tooling(f"{a!r} is not a {k} {kind} {action} accepts")
+    return [manager] + build(list(args))
+
+
+def _plist_problem(plist, platform=None):
+    """The bootstrap plist as root will load it: every directory from / to
+    its own, root's and not writable by others, reached without a link;
+    the plist a regular file, root's, not group- or world-writable, one
+    link, opened without following one; no ACL anywhere on that route."""
+    parent, name = os.path.split(plist)
+    try:
+        pfd = _walk(parent, _ancestor_ok, _ancestor_ok, "the plist's directory")
+    except Tooling as e:
+        return str(e)
+    try:
+        try:
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=pfd)
+        except OSError as e:
+            return f"{plist} cannot be opened without following a link ({e.strerror})"
+        try:
+            st = os.fstat(fd)
+        finally:
+            os.close(fd)
+    finally:
+        os.close(pfd)
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != ROOT_UID or st.st_mode & 0o022 or st.st_nlink != 1:
+        return f"{plist} is not a regular root-owned file, one link, that no one else can write"
+    route = ["/"] + ["/" + "/".join(_parts(parent)[:i + 1]) for i in range(len(_parts(parent)))] + [plist]
+    bad = acl_problems(route, platform=platform)
+    return "; ".join(bad) if bad else None
+
+
+def _timed_out(argv, out):
+    out(f"service: {' '.join(argv)} did not finish in {SERVICE_TIMEOUT_S} s; the manager's job may still be "
+        "running: check `systemctl is-active <unit>` (or `launchctl print system/<label>`) and run verify")
+    return 1
+
+
+def service(manager, kind, action, args, run=subprocess.run, out=print, platform=None, clock=time.monotonic,
+            sleep=time.sleep):
+    """One whitelisted manager call as root: 0 when the manager exited 0
+    (a bootout only once the label is shown gone), 1 when it did not or
+    did not finish, never the manager's own status."""
+    argv = service_argv(manager, kind, action, args)
+    j = judge(sys.executable, also=[manager], recorded=[manager], platform=platform)
+    if j.phase != "clean":
+        raise Untrusted("; ".join(j.problems[:5]))
+    if action == "bootstrap":
+        bad = _plist_problem(args[1], platform)
+        if bad:
+            raise Tooling(bad)
+    env = {"PATH": SERVICE_PATH, "LC_ALL": "C"}
+    end = clock() + SERVICE_TIMEOUT_S
+    try:
+        p = run(argv, shell=False, close_fds=True, stdin=subprocess.DEVNULL, env=env, timeout=SERVICE_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        return _timed_out(argv, out)
+    if action != "bootout":
+        if p.returncode != 0:
+            out(f"service: {' '.join(argv)} exited {p.returncode}")
+            return 1
+        return 0
+    probe = [manager, "print", f"system/{args[0]}"]
+    while True:
+        left = end - clock()
+        if left <= 0:
+            return _timed_out(argv, out)
+        try:
+            q = run(probe, shell=False, close_fds=True, stdin=subprocess.DEVNULL, env=env, timeout=left,
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        except subprocess.TimeoutExpired:
+            return _timed_out(argv, out)
+        said = (q.stdout or b"").decode("utf-8", "replace").rstrip("\n")
+        if LAUNCHD_NOT_FOUND is not None and \
+                (q.returncode, said) == (LAUNCHD_NOT_FOUND[0], LAUNCHD_NOT_FOUND[1].replace("{label}", args[0])):
+            return 0
+        if q.returncode == 0 and p.returncode not in (0, BOOTOUT_IN_PROGRESS):
+            out(f"service: {' '.join(argv)} exited {p.returncode}")
+            return 1
+        if LAUNCHD_NOT_FOUND is None or q.returncode != 0:
+            out(f"service: {' '.join(argv)} exited {p.returncode}; bootout could not be confirmed; run the "
+                "NOT-RUNNING check")
+            return 1
+        sleep(min(1.0, max(0.0, end - clock())))
+
+
+def _service_main(argv):
+    """service --manager M <kind> <action> [<name> [<plist>]]"""
+    if len(argv) < 5 or argv[1] != "--manager" or len(argv) > 7:
+        raise Tooling("service --manager M <kind> <action> [<name> [<plist>]]")
+    return service(argv[2], argv[3], argv[4], argv[5:])
 
 
 def _secret_main(argv):
@@ -3261,6 +3991,20 @@ def main(argv):
                                 "--activation PATH --activation-sha256 HEX [--prospective]")
             return partition_weekly(opts["--exec-root"], opts["--host"], opts["--document"], opts["--document-sha256"],
                                     opts["--activation"], opts["--activation-sha256"], prospective=len(argv) == 14)
+        elif argv and argv[0] == "partition-judge":
+            return _partition_judge_main(argv)
+        elif argv and argv[0] == "partition-fetch":
+            try:
+                return _partition_fetch_main(argv)
+            except Untrusted as e:
+                print(f"untrusted: {e}", file=sys.stderr)
+                return ROOT_TRUST_EXIT
+        elif argv and argv[0] == "service":
+            try:
+                return _service_main(argv)
+            except Untrusted as e:
+                print(f"untrusted: {e}", file=sys.stderr)
+                return ROOT_TRUST_EXIT
         elif len(argv) == 2 and argv[0] == "partition-provision":
             return partition_provision(argv[1])
         elif len(argv) >= 3 and argv[0] == "trusted-exec" and "--" in argv[1:]:

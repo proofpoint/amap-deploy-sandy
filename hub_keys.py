@@ -342,17 +342,20 @@ def run_probe(spec: Any, ks: KeySpec, *, apply: bool, run_id: Optional[str] = No
 # --- The plan -------------------------------------------------------------------
 
 
-def plan(spec: Any, ks: KeySpec, q: Callable[[str], str], steps: str) -> List[str]:
-    install = q(spec.secrets.tools.get("install", "install"))
+def plan(spec: Any, ks: KeySpec, q: Callable[[str], str], steps: str,
+         root: Optional[Callable[[List[str]], str]] = None) -> List[str]:
+    """The local router's key steps; `root` renders a root line through the barrier."""
+    root = root or (lambda argv: ss.typed_root(spec.secrets, argv, q))
+    install = spec.secrets.tools["install"]
     run_dir = spec.secrets.run_dir
     return [
         f"# The local router's signing key. Its directory, {ks.principal}'s, 0700, under root-owned "
         f"directories:",
-        f"{install} -d -o {ks.uid} -g {ks.gid} -m 0700 {q(ks.dir)}",
+        root([install, "-d", "-o", str(ks.uid), "-g", str(ks.gid), "-m", "0700", ks.dir]),
         f"# The key is generated ON this host by the operator, as {ks.principal} (uid {ks.uid}), into "
         f"{ks.path}, mode 0400; nothing here generates, reads or copies it. Its public key goes into the "
         f"inventory.",
-        f"{install} -d -o 0 -g 0 -m 0755 {q(ks.evidence_dir)}",
+        root([install, "-d", "-o", "0", "-g", "0", "-m", "0755", ks.evidence_dir]),
         "# Then, as the operator: `amap-sandy.py hub-keyprobe --apply` (the email router's run spec, without "
         "its secret volume, lstat-ing the key's paths); it prints the record's sha256. Place the record:",
         f"{steps} place {q(posixpath.join(run_dir, EVIDENCE_NAME))} {q(ks.evidence)} --sha256 <the printed sha256>",

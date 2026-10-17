@@ -246,14 +246,12 @@ class VerifyTest(unittest.TestCase):
 class WiringTest(unittest.TestCase):
     def test_verify_runs_the_record_check_for_a_document_with_a_partition_section(self):
         import host_setup as hset
-        import hub_supervise as hv
         from test_hub_runtime import setUpModule, tearDownModule
-        from test_hub_supervise import sup_section
+        from test_hub_supervise import supervise
         from test_partition_setup import doc
         setUpModule()
         self.addCleanup(tearDownModule)
-        d = doc()
-        d[hv.SECTION] = sup_section()
+        d = supervise(doc())
         spec = hset.load_spec(d)
         for name in ("verify_roots", "verify_overlay", "verify_containers", "verify_mounts", "verify_openssl",
                      "verify_umasks", "verify_groups", "secret_checks", "start_checks", "verify_recovery_horizon",
@@ -275,14 +273,12 @@ class WiringTest(unittest.TestCase):
 
     def test_the_record_is_judged_against_the_documents_own_live_config(self):
         import host_setup as hset
-        import hub_supervise as hv
         from test_hub_runtime import setUpModule, tearDownModule
-        from test_hub_supervise import sup_section
+        from test_hub_supervise import supervise
         from test_partition_setup import doc
         setUpModule()
         self.addCleanup(tearDownModule)
-        d = doc()
-        d[hv.SECTION] = sup_section()
+        d = supervise(doc())
         spec = hset.load_spec(d)
         asked = []
         out = hset.verify_weekly_runs(spec, {"read": lambda p: asked.append(p) or b'{"delegation": {}}',

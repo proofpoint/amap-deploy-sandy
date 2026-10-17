@@ -477,22 +477,63 @@ def _ancestors(path: str) -> List[str]:
     return ["/" + "/".join(parts[:i]) for i in range(len(parts))] if parts != [""] else []
 
 
+def document_source(spec_path: Optional[Path], overlay: Optional[Path]) -> Optional[Tuple[str, str]]:
+    """Where the host-setup document was read: `spec` and the file, or
+    `overlay` and the overlay; None with neither. TXN names it to its reader
+    by source, since `env -i` clears the overlay's environment variable."""
+    if spec_path is not None:
+        return "spec", os.path.abspath(str(spec_path))
+    if overlay is not None:
+        return "overlay", os.path.abspath(str(overlay))
+    return None
+
+
+def document_sha256(document: Optional[Tuple[str, str]]) -> Optional[str]:
+    """The document file's own sha256, or None when it cannot be read."""
+    if document is None:
+        return None
+    try:
+        return hashlib.sha256(Path(document[1]).read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
 def render_plan(spec: Spec, overlay_source: Optional[Path] = None,
-                hub: Optional[hr.Rendered] = None) -> List[str]:
+                hub: Optional[hr.Rendered] = None, document: Optional[Tuple[str, str]] = None) -> List[str]:
     """The root-run steps, in order, as shell lines. Printed, never run.
-    `hub` is the hub-link router's rendering, when the document has one."""
+    `hub` is the hub-link router's rendering, when the document has one;
+    `document` is where the document was read (document_source)."""
     q = shlex.quote
-    steps = f"python3 {q(str(HOST_STEPS))}"
-    lines = ["# Run as root. Each line is one step; nothing here has run. No step follows a "
-             "symbolic link, and each is safe to run again.",
-             f"# Run them from a checkout no sandbox mounts read-write (a fresh clone at the recorded "
-             f"deploy commit), never from an agent's workspace: these steps run {HOST_STEPS.name} as root."]
-    if spec.partition is not None and spec.supervision is not None and spec.secrets is not None:
+    barrier = spec.secrets is not None and spec.supervision is not None
+    if barrier:
+        steps = ss.typed_root(spec.secrets, [spec.secrets.tools["python3"], "-I", "-S", "-B", spec.secrets.writer], q)
+
+        def root(argv: List[str]) -> str:
+            return ss.typed_root(spec.secrets, argv, q)
+    else:
+        steps = ss.NO_BARRIER
+
+        def root(argv: List[str]) -> str:
+            return " ".join([ss.NO_BARRIER] + [q(a) for a in argv])
+    lines = ["# Each line is one step; nothing here has run. No step follows a symbolic link, and each is safe "
+             "to run again. Root runs only through the bootstrap below, then through its barrier.",
+             "# Print it on the host it is for (G checks root-trust.sh against this host's own render), from "
+             "a checkout no sandbox mounts read-write (a fresh clone at the recorded deploy commit), never "
+             "from an agent's workspace: that clone is the writer's source, renders root-trust.sh and runs "
+             "the update guard's reader."]
+    if not barrier:
+        lines.append("# This document has no secrets or no supervision section: there is no pinned writer or "
+                     "root-trust.sh, so no root line below can run.")
+    else:
+        lines += ss.bootstrap(spec, q, document)
+    if spec.partition is not None and barrier:
         # Imported here: host_setup is in the weekly job's bundle, and the job's own installation is not.
         import partition_job as pj
-        # Printed first: every later step that runs an interpreter as root comes after this check of what
-        # root will run, and goes on only when it passes.
-        lines += pj.validation_steps(spec.partition, spec.supervision.kind, q)
+        # The first barrier line, right after G: every later step that runs an interpreter as root comes
+        # after this check of what root will run, and goes on only when it passes.
+        lines += pj.validation_steps(spec.partition, writer=spec.secrets.writer,
+                                     writer_sha256=spec.secrets.writer_sha256,
+                                     tools=list(spec.partition.tools.values()), q=q)
     for r in sorted(spec.roots, key=lambda r: (r.path.count("/"), r.path)):
         p = spec.principals[r.owner]
         lines.append(f"{steps} root {q(r.path)} {p.uid} {spec.groups[r.group]} {r.mode:04o}  # {r.purpose}")
@@ -515,22 +556,34 @@ def render_plan(spec: Spec, overlay_source: Optional[Path] = None,
                      f"UMask={r['umask']:04o} in its service unit, or `umask {r['umask']:04o}` in its "
                      f"launcher before it execs")
     if spec.secrets is not None:
-        lines += ss.render(spec.secrets, q)
+        lines += ss.render(spec.secrets, q, root)
         lines += ss.sudo_route_notice(spec.secrets)
     if spec.hub is not None and hub is not None:
-        lines += hr.plan(spec, spec.hub, hub, q, steps)
+        lines += hr.plan(spec, spec.hub, hub, q, steps, root)
     if spec.keys is not None:
-        lines += hk.plan(spec, spec.keys, q, steps)
-    if spec.supervision is not None:
+        lines += hk.plan(spec, spec.keys, q, steps, root)
+    if spec.supervision is not None and spec.secrets is not None:
         lines += hv.plan(spec, q, steps)
     if spec.partition is not None:
-        lines += ps.plan(spec.partition, spec.gate, q, anchor=spec.secrets.anchor if spec.secrets else None)
+        install = (lambda args: root([spec.secrets.tools["install"]] + args)) if barrier else None
+        lines += ps.plan(spec.partition, spec.gate, q, anchor=spec.secrets.anchor if spec.secrets else None,
+                         install=install)
         if spec.supervision is None or spec.secrets is None:
             lines.append("# The weekly job's validation and bundle steps need the supervision and secrets sections "
                          "(the host's kind, the deploy pin and the pinned writer).")
         else:
             # The validation of what root will run was printed first, above every other step.
-            lines += pj.provision_steps(spec.partition, spec.secrets.clones["deploy"]["sha"], spec.secrets.writer, q)
+            lines += pj.git_fact_steps(spec.partition, spec.supervision.kind, q)
+            lines += pj.provision_steps(spec.partition, spec.secrets.clones["deploy"]["sha"], spec.secrets.writer,
+                                        spec.secrets.writer_sha256, q)
+    if barrier and spec.hub is not None:
+        sha = document_sha256(document)
+        staged = posixpath.join(spec.secrets.run_dir, hv.staged(hv.context_path(spec)))
+        lines.append("# Last among the barrier lines: the deployed context, the pins and identities a later "
+                     "update's guard reads the old hub under (staged by step 0).")
+        lines.append(f"{steps} place {q(staged)} {q(hv.context_path(spec))} --sha256 "
+                     + (hashlib.sha256(hv.context_bytes(spec, sha)).hexdigest() if sha else
+                        "<the sha256 of the staged context: the document cannot be read>"))
     lines.append("# Start no runtime until every step above has run: each root exists and is synced "
                  "before a runtime opens it.")
     return lines
@@ -1391,7 +1444,8 @@ def run(spec_path: Optional[Path], *, production: bool, overlay: Optional[Path] 
     out("host-setup (1/2): the plan. Nothing here has run; each step is the operator's, as root.")
     hub = hr.render_all(spec, spec.hub, hr.read_source(spec, spec.hub)) if spec.hub is not None else None
     for line in render_plan(spec, STUB_PLUGIN if spec.overlay_pin and
-                            spec.overlay_pin["sha256"] == STUB_SHA256 else None, hub):
+                            spec.overlay_pin["sha256"] == STUB_SHA256 else None, hub,
+                            document_source(spec_path, overlay)):
         out(f"  {line}")
     out("host-setup (2/2): the host against the plan.")
     rc = report(checks(spec, production=production, overlay=None if spec_path is not None else overlay,
@@ -1559,20 +1613,54 @@ def hub_supervise(spec_path: Optional[Path], *, apply: bool, overlay: Optional[P
     if spec.supervision is None:
         out("hub-supervise: the host-setup document has no supervision section")
         return 2
-    return hv.write_files(spec, apply=apply, out=out)
+    return hv.write_files(spec, apply=apply, out=out,
+                          overlay_sha256=document_sha256(document_source(spec_path, overlay)))
+
+
+def unit_states(spec: Spec, active: Optional[Callable[[str], Any]] = None,
+                print_: Optional[Callable[[str], Any]] = None, loaded: Optional[Callable[[str], Any]] = None) -> Any:
+    """Each unit's or label's state, read separately (d3.3 §5(d) §4.3): the
+    states restart_commands takes, or the first Unresolved."""
+    sup = spec.supervision
+    if sup.kind == "systemd":
+        ask = active or (lambda u: hv.ask_active(spec, u))
+        states = {"hub": hv.active_state(ask(posixpath.basename(sup.hub["unit"]))),
+                  "timer": hv.active_state(ask(posixpath.basename(sup.weekly["timer"])))}
+    else:
+        states = {"weekly": hv.weekly_state((print_ or hv.ask_print)(sup.weekly["label"]), sup.weekly["label"]),
+                  "hub": (loaded or hv.ask_loaded)(sup.hub["label"])}
+        if states["hub"] is True:
+            states["hub"] = hv.LOADED
+        elif states["hub"] is False:
+            states["hub"] = hv.NOT_LOADED
+    for v in states.values():
+        if isinstance(v, rh.Unresolved):
+            return v
+    return states
 
 
 def hub_start_check(spec_path: Optional[Path], *, overlay: Optional[Path] = None, out=print,
-                    **probes: Any) -> int:
+                    until_stopped: bool = False, old_context: bool = False,
+                    states: Optional[Dict[str, Callable[..., Any]]] = None, **probes: Any) -> int:
     """The `hub-start-check` verb: every start check, printed; on a pass, and
-    only then, the start step for the operator to run."""
+    only then, the start step for the states read now. With until_stopped,
+    only the NOT-RUNNING check: read-only, its last line NOT-RUNNING or the
+    first unmet condition (old_context reads the engine under the deployed
+    context's pin)."""
     try:
         spec = load_spec(read_spec(spec_path, overlay))
     except ValueError as e:     # SpecError included
         out(f"hub-start-check: {e}")
         return 2
-    if spec.supervision is None or spec.hub is None:
-        out("hub-start-check: the host-setup document has no hub and supervision sections")
+    if spec.supervision is None or spec.hub is None or spec.secrets is None:
+        out("hub-start-check: the host-setup document has no hub, secrets and supervision sections")
+        return 2
+    if until_stopped:
+        last = hv.not_running(spec, old_context=old_context, **(states or {}))
+        out(last)
+        return 0 if last == "NOT-RUNNING" else 1
+    if old_context:
+        out("hub-start-check: --old-context reads only with --until-stopped")
         return 2
     # The document's provenance, as `run` gives it: a --spec document is never
     # checked as though it were read from the anchored overlay.
@@ -1580,8 +1668,12 @@ def hub_start_check(spec_path: Optional[Path], *, overlay: Optional[Path] = None
     if rc != 0:
         out("hub-start-check: REFUSED. The hub-link router may not start; nothing to run.")
         return rc
+    found = unit_states(spec, **(states or {}))
+    if isinstance(found, rh.Unresolved):
+        out(f"hub-start-check: no start line: {found.reason}")
+        return 1
     out("hub-start-check: every check passed. `host-setup` (verify) must ALSO pass for this host before "
         "the start: it checks the whole host, which this does not. The start step, as root:")
-    for line in hv.start_commands(spec):
+    for line in hv.restart_commands(spec, found, document_source(spec_path, overlay)):
         out(f"  {line}")
     return 0

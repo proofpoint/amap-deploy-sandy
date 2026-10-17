@@ -9,6 +9,7 @@ partition_evidence.build, the staged bytes by partition_activation.staged_bytes.
 """
 
 import hashlib
+import posixpath
 import json
 import unittest
 
@@ -147,6 +148,23 @@ class ActivateTest(A3):
         self.assertIn(f"--sha256 {hashlib.sha256(final).hexdigest()}", step)
         self.assertIn(f" place /srv/op/run/router.activated.json {self.spec.keys.local_config} ", step)
 
+    def test_the_place_step_runs_the_partition_interpreter_through_the_barrier(self):
+        """d3.3 §5(d) and §4.1: the barrier's interpreter is the one the
+        writer runs under, the partition job's, as job_argv renders it, and
+        the recorded set is the partition section's own (§0.1)."""
+        import dataclasses
+        import shlex
+        import root_trust as rt
+        spec = dataclasses.replace(self.spec, partition=dataclasses.replace(
+            self.spec.partition, tools=dict(self.spec.partition.tools, python3="/opt/py/bin/python3")))
+        argv = shlex.split(ai.place_step(spec, "/srv/op/run/router.activated.json", b"x"))
+        cut = argv.index("--")
+        sec = spec.secrets
+        self.assertEqual(argv, rt.typed_argv(posixpath.join(sec.writer_dir, rt.NAME), sec.writer_sha256,
+                                             "/opt/py/bin/python3", sec.writer, list(spec.partition.tools.values()),
+                                             argv[cut + 1:]))
+        self.assertEqual(argv[cut + 1:cut + 6], ["/opt/py/bin/python3", "-I", "-S", "-B", sec.writer])
+
 
 class CliTest(unittest.TestCase):
 
@@ -223,7 +241,9 @@ class CommandTest(unittest.TestCase):
         (self.t / "run").mkdir()
         self.prov, self.ai_ = prov, ai
         self.spec = SimpleNamespace(
-            secrets=SimpleNamespace(run_dir=str(self.t / "run"), writer_dir="/opt/ex/libexec"),
+            secrets=SimpleNamespace(run_dir=str(self.t / "run"), writer_dir="/opt/ex/libexec",
+                                    writer="/opt/ex/libexec/host_steps.py", writer_sha256="b" * 64,
+                                    tools={"python3": "/usr/bin/python3", "install": "/usr/bin/install"}),
             partition=SimpleNamespace(tools={"python3": "/usr/bin/python3"}), keys=SimpleNamespace(local_config="/x"),
             gate=None, overlay_pin={"commit": "a" * 40}, hub=SimpleNamespace(host_label="alpha"),
             router=SimpleNamespace(container="router-a"), supervision=SimpleNamespace(kind="systemd"))

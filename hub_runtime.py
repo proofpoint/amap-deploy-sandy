@@ -651,10 +651,13 @@ def _sha(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()
 
 
-def plan(spec: Any, hs: HubSpec, r: Rendered, q: Callable[[str], str], steps: str) -> List[str]:
-    """The hub-link router's root steps, after the operator's `hub-render --apply`."""
+def plan(spec: Any, hs: HubSpec, r: Rendered, q: Callable[[str], str], steps: str,
+         root: Optional[Callable[[List[str]], str]] = None) -> List[str]:
+    """The hub-link router's root steps, after the operator's `hub-render --apply`.
+    `root` renders a root line through the barrier."""
     run_dir = spec.secrets.run_dir
-    install = q(spec.secrets.tools.get("install", "install"))
+    root = root or (lambda argv: ss.typed_root(spec.secrets, argv, q))
+    install = spec.secrets.tools["install"]
     lines = ["# The hub-link router's files. First, as the operator: `amap-sandy.py hub-render --apply` writes "
              f"them into {run_dir}."]
     if hs.d7_source_sha256 is not None:
@@ -665,17 +668,18 @@ def plan(spec: Any, hs: HubSpec, r: Rendered, q: Callable[[str], str], steps: st
                   f"# On the runner: shasum -a 256 {staged}   # must print {hs.d7_source_sha256}",
                   f"# Copy that one file to this host as {staged} (scp, or ssh with cat), never a directory.",
                   f"# A later D7 commit leaves verify UNKNOWN until this document's pin moves to it.",
-                  f"{install} -d -o 0 -g 0 -m 0755 {q(posixpath.dirname(hs.d7_source))}",
+                  root([install, "-d", "-o", "0", "-g", "0", "-m", "0755", posixpath.dirname(hs.d7_source)]),
                   f"{steps} place {staged} {q(hs.d7_source)} --sha256 {hs.d7_source_sha256}",
                   f"rm -f {staged}"]
     if isinstance(r.d7, (bytes, bytearray)):
-        lines += [f"{install} -d -o 0 -g 0 -m 0755 {q(hs.d7_dir)}  # holds the D7 file and nothing else",
+        lines += ["# The D7 file's directory holds the D7 file and nothing else:",
+                  root([install, "-d", "-o", "0", "-g", "0", "-m", "0755", hs.d7_dir]),
                   f"{steps} place {q(posixpath.join(run_dir, D7_RENDERED))} {q(hs.d7_path)} --sha256 {_sha(r.d7)}"]
     elif isinstance(r.d7, dd.NotAttested):
         lines.append(f"# D7: {r.d7.reason}. Nothing is rendered for the hub-link router, and it must not start.")
     else:
         lines.append(f"# D7: {r.d7.reason}. Nothing is rendered for the hub-link router, and it must not start.")
-    lines += [f"{install} -d -o 0 -g 0 -m 0755 {q(posixpath.dirname(hs.env_file))}",
+    lines += [root([install, "-d", "-o", "0", "-g", "0", "-m", "0755", posixpath.dirname(hs.env_file)]),
               f"{steps} place {q(posixpath.join(run_dir, ENV_RENDERED))} {q(hs.env_file)} --sha256 {_sha(r.env)}",
               f"# Its run spec: {spec_sha256(r.spec_doc)} (the key probe's evidence is bound to this hash)."]
     return lines

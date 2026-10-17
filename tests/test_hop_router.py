@@ -100,7 +100,7 @@ class PlanTest(unittest.TestCase):
         """HOST's condition: root runs host_steps.py from the checkout that
         printed the plan, so the plan says it must be one no sandbox can write."""
         lines = hs.render_plan(spec())
-        self.assertTrue(lines[0].startswith("# Run as root."))
+        self.assertTrue(lines[0].startswith("# Each line is one step; nothing here has run."))
         self.assertIn("a checkout no sandbox mounts read-write", lines[1])
         self.assertIn("never from an agent's workspace", lines[1])
 
