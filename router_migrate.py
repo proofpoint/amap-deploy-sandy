@@ -921,16 +921,25 @@ def do_baseline(preview_path: str, run_dir: Path) -> Path:
     its private results already hold, read-only, under the drain lock."""
     preview = _read_doc(preview_path, "preview")
     state_dir = Path(preview["context"]["state_dir"])
+    st = _lstat(state_dir)
+    if st is None or not stat.S_ISDIR(st.st_mode) or _ident(st) != preview["context"]["state_ident"]:
+        raise Stop(f"{state_dir} is not the state directory the preview recorded")
     instances = {}
     with drain_lock(state_dir):
+        cover(state_dir, preview["instances"], moved=False)
         for name, p in sorted(preview["instances"].items()):
             if not p["adopt"]:
                 continue
             d = state_dir / (name if p["source"] == BY_NAME else p["logical_id"])
+            src = _lstat(d)
+            if src is None or not stat.S_ISDIR(src.st_mode) or _ident(src) != p["ident"]:
+                raise Stop(f"{d} is not the directory the preview recorded: the baseline runs at step 5, before "
+                           "any move")
             marker = _regular_bytes(d / MARKER)
             if marker is None:
                 raise Stop(f"{name!r}'s legacy state has no {MARKER}: R2 does not migrate approval-only state, and "
-                           "nothing has moved; take back-out B")
+                           "nothing has moved. Take back-out B, let the old router poll the instance once (its "
+                           f"first sight writes {MARKER} from approval.json), then run R2 again from step 1")
             instances[name] = {"logical_id": p["logical_id"],
                                "marker_sha256": hashlib.sha256(marker).hexdigest(),
                                "quarantined": quarantined(d / "results")}
@@ -939,12 +948,14 @@ def do_baseline(preview_path: str, run_dir: Path) -> Path:
     return out
 
 
-def accept_instance(state_dir: Path, name: str, lid: str, base: Dict[str, Any]) -> Dict[str, Any]:
+def accept_instance(state_dir: Path, name: str, lid: str, ident: List[int], base: Dict[str, Any]) -> Dict[str, Any]:
     """One adopted instance after the acceptance poll: the adopted
     generation is still the current and last one, its marker is the legacy
     marker's bytes, and its private results hold no first-sight rejection
-    the baseline did not."""
+    the baseline did not. Its directory is still the one the check recorded,
+    and its current generation is a directory, not a link."""
     d = state_dir / lid
+    _at(state_dir, lid, ident)
     gens, mig = _read_json(d / GEN_FILE), _read_json(d / MIGRATION_FILE)
     if not isinstance(gens, dict) or not isinstance(gens.get("gens"), list) or not isinstance(mig, dict):
         raise Stop(f"{name!r} has no readable {GEN_FILE} and {MIGRATION_FILE} under {d}")
@@ -954,6 +965,9 @@ def accept_instance(state_dir: Path, name: str, lid: str, base: Dict[str, Any]) 
         raise Stop(f"{name!r}'s current generation is {cur!r}, not the adopted {mig.get('gen')!r} as the last one: "
                    "a new generation took a fresh first sight")
     gen = d / f"gen-{cur}"
+    gst = _lstat(gen)
+    if gst is None or not stat.S_ISDIR(gst.st_mode):
+        raise Stop(f"{gen} is not a directory: the pinned router holds a linked or missing current generation")
     marker = _regular_bytes(gen / MARKER)
     want = base.get("marker_sha256")
     if want is None:
@@ -964,7 +978,10 @@ def accept_instance(state_dir: Path, name: str, lid: str, base: Dict[str, Any]) 
     if new:
         raise Stop(f"{name!r} has first-sight rejections the baseline did not: {', '.join(new)}")
     q = gen / "quarantine"
-    corroboration = sorted(os.listdir(q)) if _lstat(q) is not None and stat.S_ISDIR(os.lstat(q).st_mode) else []
+    try:
+        corroboration = sorted(os.listdir(q)) if _lstat(q) is not None and stat.S_ISDIR(os.lstat(q).st_mode) else []
+    except OSError as e:
+        corroboration = [f"unreadable: {e.strerror}"]     # corroboration only: it never decides
     return {"generation": cur, "marker_sha256": want, "carried": base.get("quarantined", []),
             "quarantine_entries": corroboration}
 
@@ -987,16 +1004,19 @@ def do_accept(checkout: str, image: str, config: str, check_path: str, baseline_
         b = base["instances"].get(name)
         if not isinstance(b, dict) or b.get("logical_id") != rec["logical_id"]:
             raise Stop(f"the baseline has no record of {name!r} under {rec['logical_id']}")
-        facts[name] = accept_instance(state_dir, name, rec["logical_id"], b)
+        facts[name] = accept_instance(state_dir, name, rec["logical_id"], rec["ident"], b)
     out = _record(run_dir, "accept")
     _write_new(out, {"schema": SCHEMA, "step": "accept", "accepted": facts})
     return out
 
 
 def _read_json(path: Path) -> Any:
+    """A router record, regular and within RECORD_MAX, or None when absent."""
+    if not _file_state(path):
+        return None
     try:
-        return json.loads(path.read_bytes()) if _file_state(path) else None
-    except (OSError, ValueError) as e:
+        return json.loads(_regular_bytes(path) or b"")
+    except ValueError as e:
         raise Stop(f"{path} cannot be read: {e}") from None
 
 

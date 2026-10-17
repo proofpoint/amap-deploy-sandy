@@ -1082,12 +1082,210 @@ class AcceptRows(Base):
         except rm.Stop as e:
             self.fail(f"a staging name was read as a result: {e}")
 
+    def test_a_baseline_for_another_logical_id_is_refused(self):
+        doc = json.loads(self.baseline.read_text())
+        doc["instances"]["alice"]["logical_id"] = LID_B
+        self.baseline.chmod(0o600)
+        self.baseline.write_text(json.dumps(doc))
+        self.refused("the baseline has no record of 'alice'")
+
+    def test_a_current_generation_that_is_not_an_id_is_refused(self):
+        """Opus's Z11: the generation id is held to the pin's shape before it
+        names a path, even when the two records agree on it."""
+        d = self.state / LID_A
+        g = json.loads((d / "generations.json").read_text())
+        g["gens"][-1]["gen"] = g["current"] = "x" * 32
+        (d / "generations.json").write_text(json.dumps(g))
+        m = json.loads((d / "migration.json").read_text())
+        m["gen"] = "x" * 32
+        (d / "migration.json").write_text(json.dumps(m))
+        os.rename(self.gen, d / ("gen-" + "x" * 32))
+        self.refused("a new generation took a fresh first sight")
+
+    def test_a_linked_current_generation_is_refused(self):
+        """Opus at a87d3a7e: the pin holds a linked current generation as a
+        layout conflict; accept refuses it rather than following it."""
+        real = self.state / LID_A / "real-gen"
+        os.rename(self.gen, real)
+        os.symlink(real, self.gen)
+        self.refused("is not a directory")
+
+    def test_a_replaced_instance_directory_is_refused(self):
+        shutil.copytree(self.state / LID_A, self.base / "copy", symlinks=True)
+        shutil.rmtree(self.state / LID_A)
+        os.rename(self.base / "copy", self.state / LID_A)
+        self.refused("is not the instance state the plan recorded")
+
+    def test_an_oversized_generations_file_is_refused(self):
+        (self.state / LID_A / "generations.json").write_bytes(b" " * (rm.RECORD_MAX + 1))
+        self.refused("larger than a record")
+
+    def test_each_unreadable_result_is_refused(self):
+        """The reader's guards (Opus's Z4-Z8, Z14): a link, an oversized
+        file, malformed JSON, an unreadable file, and results that are not
+        a directory each STOP; none reads as clean."""
+        r = self.gen / "results"
+        os.symlink(r / "r1.json", r / "link.json")
+        self.refused("cannot be read")
+        os.remove(r / "link.json")
+        (r / "big.json").write_bytes(b" " * (rm.RECORD_MAX + 1))
+        self.refused("larger than a record")
+        os.remove(r / "big.json")
+        (r / "bad.json").write_text("{not json")
+        self.refused("is not a private result")
+        os.remove(r / "bad.json")
+        if os.geteuid() != 0:
+            (r / "locked.json").write_text(result("locked"))
+            os.chmod(r / "locked.json", 0)
+            self.refused("cannot be read")
+            os.remove(r / "locked.json")
+        shutil.rmtree(r)
+        r.write_text("not a directory")
+        self.refused("is not a directory")
+
     def test_a_held_participant_after_the_poll_is_refused(self):
         collided = the_map()
         collided["instances"]["alice"]["held"] = "skeleton_collision"
         with self.assertRaises(rm.Stop):
             rm.do_accept(CHECKOUT, IMAGE, str(self.config), str(self.check_path), str(self.baseline),
                          self.run_dir, FakeRouter(maps=[collided]))
+
+
+class BaselineRows(Base):
+    """Opus at a87d3a7e: the baseline runs at step 5, before any move, on
+    the preview's own state directory; a BY_ID instance is read where it
+    is."""
+
+    def setUp(self):
+        super().setUp()
+        d = self.state / "alice"
+        (d / "results").mkdir(parents=True)
+        (d / "results" / "r1.json").write_text(result("r1"))
+        (d / "first-seen.json").write_text('{"m": "alice"}')
+        self.pre, _ = self.preview()
+
+    def stopped(self, why):
+        try:
+            rm.do_baseline(str(self.pre), self.run_dir)
+        except rm.Stop as e:
+            self.assertIn(why, str(e))
+        except Exception as e:     # noqa: BLE001 — anything but a Stop is the failure
+            self.fail(f"baseline raised {type(e).__name__}, not Stop: {e}")
+        else:
+            self.fail(f"the baseline ran, though: {why}")
+        self.assertEqual(list(self.run_dir.glob("router-migrate-baseline-*")), [])
+
+    def test_a_baseline_after_the_move_is_refused(self):
+        self.move(self.pre)
+        self.stopped("")
+
+    def test_a_replaced_state_directory_is_refused(self):
+        os.rename(self.state, self.base / "old-state")
+        shutil.copytree(self.base / "old-state", self.state, symlinks=True)
+        self.stopped("is not the state directory the preview recorded")
+
+    def test_a_held_drain_lock_refuses_the_baseline(self):
+        """Opus's Z3: the baseline reads under the router's drain lock."""
+        fd = os.open(self.state / ".router.lock", os.O_RDWR)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if os.fork() == 0:     # a second open file description: flock is per description
+            try:
+                rm.do_baseline(str(self.pre), self.run_dir)
+                os._exit(0)
+            except rm.Stop as e:
+                os._exit(3 if "is held" in str(e) else 4)
+            except BaseException:     # noqa: BLE001
+                os._exit(5)
+        _, status = os.wait()
+        self.assertEqual(os.WEXITSTATUS(status), 3)
+        self.assertEqual(list(self.run_dir.glob("router-migrate-baseline-*")), [])
+
+    def test_a_replaced_source_directory_is_refused(self):
+        shutil.copytree(self.state / "alice", self.base / "copy")
+        shutil.rmtree(self.state / "alice")
+        os.rename(self.base / "copy", self.state / "alice")
+        self.stopped("is not the directory the preview recorded")
+
+
+class ByIdRows(Base):
+    """Opus's Z2/Z15: an instance already under its logical id is adopted
+    in place, and its baseline reads <state_dir>/<logical_id>."""
+
+    def test_a_by_id_instance_is_baselined_and_accepted_where_it_is(self):
+        d = self.state / LID_A
+        (d / "results").mkdir(parents=True)
+        (d / "results" / "r1.json").write_text(result("r1"))
+        (d / "first-seen.json").write_text('{"m": "by-id"}')
+        pre, _ = self.preview()
+        self.assertEqual(json.loads(pre.read_text())["instances"]["alice"]["source"], rm.BY_ID)
+        try:
+            base = rm.do_baseline(str(pre), self.run_dir)
+        except rm.Stop as e:
+            self.fail(f"the baseline refused a BY_ID instance read where it is: {e}")
+        self.assertEqual(json.loads(base.read_text())["instances"]["alice"]["marker_sha256"],
+                         hashlib.sha256(b'{"m": "by-id"}').hexdigest())
+        check = self.check(pre)
+        rm.do_adopt(CHECKOUT, IMAGE, str(self.config), str(check), REASON, self.run_dir,
+                    FakeRouter(plans={"alice": plan("alice", LID_A)}))
+        try:
+            rm.do_accept(CHECKOUT, IMAGE, str(self.config), str(check), str(base), self.run_dir, FakeRouter())
+        except rm.Stop as e:
+            self.fail(f"a clean BY_ID migration was refused: {e}")
+
+
+class TwoInstanceAcceptRows(Base):
+    """Opus's Z12 and Z13: accept checks every adopted instance, not only
+    the first, and gates every participant, a rename-only one too."""
+
+    def setUp(self):
+        super().setUp()
+        for name in ("alice", "bob"):
+            d = self.state / name
+            (d / "results").mkdir(parents=True)
+            (d / "results" / "r1.json").write_text(result("r1"))
+            (d / "first-seen.json").write_text(json.dumps({"m": name}))
+        self.plans = {"alice": plan("alice", LID_A), "bob": plan("bob", LID_B)}
+        self.pre, _ = self.preview(plans=self.plans)
+        self.baseline = rm.do_baseline(str(self.pre), self.run_dir)
+        self.move(self.pre)
+        self.check_path = self.check(self.pre, plans=self.plans)
+        rm.do_adopt(CHECKOUT, IMAGE, str(self.config), str(self.check_path), REASON, self.run_dir,
+                    FakeRouter(plans=self.plans))
+
+    def test_the_second_instance_is_checked_too(self):
+        (self.state / LID_B / ("gen-" + "f" * 32) / "first-seen.json").write_text('{"m": "changed"}')
+        with self.assertRaises(rm.Stop) as cm:
+            rm.do_accept(CHECKOUT, IMAGE, str(self.config), str(self.check_path), str(self.baseline),
+                         self.run_dir, FakeRouter())
+        self.assertIn("'bob'", str(cm.exception))
+
+    def test_a_held_participant_at_accept_is_refused(self):
+        held = the_map()
+        held["instances"]["bob"]["held"] = "skeleton_collision"
+        with self.assertRaises(rm.Stop) as cm:
+            rm.do_accept(CHECKOUT, IMAGE, str(self.config), str(self.check_path), str(self.baseline),
+                         self.run_dir, FakeRouter(maps=[held]))
+        self.assertIn("does not resolve 'bob'", str(cm.exception))
+
+
+class RenameOnlyAcceptRows(Base):
+    """Opus's Z12: a rename-only participant, not adopted, is still gated
+    by the registry at accept."""
+
+    def test_a_held_rename_only_participant_stops_accept(self):
+        (self.state / "alice" / "delivered").mkdir(parents=True)
+        pre, _ = self.preview(plans={})
+        base = rm.do_baseline(str(pre), self.run_dir)
+        self.move(pre)
+        check = rm.do_check(CHECKOUT, IMAGE, str(self.config), str(pre), REASON, self.run_dir, FakeRouter(plans={}))
+        collided = the_map()
+        collided["instances"]["alice"]["held"] = "skeleton_collision"
+        with self.assertRaises(rm.Stop) as cm:
+            rm.do_accept(CHECKOUT, IMAGE, str(self.config), str(check), str(base), self.run_dir,
+                         FakeRouter(maps=[collided]))
+        self.assertIn("does not resolve 'alice'", str(cm.exception))
+        rm.do_accept(CHECKOUT, IMAGE, str(self.config), str(check), str(base), self.run_dir, FakeRouter())
 
 
 class ReadRows(unittest.TestCase):
@@ -1492,6 +1690,25 @@ class VerbRows(Base):
         self.assertIn("needs --preview, --reason", lines[-1])
         self.assertEqual(rm.run(self.args("move", apply=True), out=lines.append, runner=FakeRouter()), 2)
         self.assertIn("exactly one", lines[-1])
+
+    def test_accept_prints_the_line_the_runbook_keys_on(self):
+        """Opus's Z17: step 11 goes on only on `router-migrate accept: ACCEPT:`."""
+        d = self.state / "alice"
+        (d / "results").mkdir(parents=True)
+        (d / "first-seen.json").write_text("{}")
+        pre, _ = self.preview()
+        base = rm.do_baseline(str(pre), self.run_dir)
+        self.move(pre)
+        check = self.check(pre)
+        rm.do_adopt(CHECKOUT, IMAGE, str(self.config), str(check), REASON, self.run_dir,
+                    FakeRouter(plans={"alice": plan("alice", LID_A)}))
+        import hop_router
+        lines = []
+        with mock.patch.object(hop_router, "hop_checkout", lambda: Path(CHECKOUT)):
+            rc = rm.run(self.args("accept", check=str(check), baseline=str(base), apply=True), out=lines.append,
+                        runner=FakeRouter())
+        self.assertEqual(rc, 0, lines)
+        self.assertTrue(lines[-1].startswith("router-migrate accept: ACCEPT: "), lines[-1])
 
     def test_a_relative_config_is_made_absolute(self):
         fake = FakeRouter()

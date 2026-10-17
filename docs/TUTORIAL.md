@@ -894,10 +894,13 @@ marker and reply ledger carry over, and it drains on the first poll.
    <at>.json`, the sha256 of its legacy `first-seen.json` and the private
    results that already record a first sight's rejection
    (`quarantined_pre_approval`). Step 11 compares against this file.
+   It STOPs unless the state directory and each instance's directory are
+   still the ones step 4 recorded, so it runs only here, before any move.
    R2 does not migrate approval-only state: an instance to be adopted whose
    legacy state has no `first-seen.json` STOPs the baseline, before
-   anything has moved, and back-out B applies. Every base in R2's scope
-   writes `first-seen.json`.
+   anything has moved. Then take back-out B, let the old router poll that
+   instance once (its first sight writes `first-seen.json` from
+   `approval.json`), and run R2 again from step 1.
 6. **The live config.** `python3 amap-sandy.py install --apply`. Then
    `sha256sum <the live config>` must equal the sha256 step 2 printed.
    Every later step refuses a config whose sha256 is not the plan's.
@@ -976,12 +979,15 @@ marker and reply ledger carry over, and it drains on the first poll.
       <router.container> 2>&1 | grep -F "': FIRST SIGHT"` prints nothing;
     - for each migrated instance, `docker/run.sh --config <the live config>
       --image <router.image.digest> --name amap-router-migrate -- shell
-      python3 -m router --config <the live config> quarantine list <name>`,
-      from the hop checkout, must exit 0 and print nothing, on stdout or
-      stderr. It reads the INGRESS quarantine only (inbound cross-host
-      items), plus the host's own intakes whatever the name: it says nothing
-      about the waiting outbox requests. It is read-only and takes no lock,
-      so its listing is a snapshot, not a barrier;
+      python3 -m router --config <the live config> quarantine list <name> >
+      <run_dir>/r2-ingress-<name>.txt`, from the hop checkout, as
+      corroboration only: it must exit 0 with nothing on stderr (the read
+      worked), and its listing is kept, not judged. It reads the INGRESS
+      quarantine (inbound cross-host items a first poll may legitimately
+      quarantine), plus the host's own intakes whatever the name, so an
+      entry there is not an R2 failure, and it says nothing about the
+      waiting outbox requests. It is read-only and takes no lock, so the
+      listing is a snapshot, not a barrier;
     - `python3 amap-sandy.py verify` must pass.
 12. **Only then**, `docker rm <the old container's Id>`, by the Id step 5's
     file records.
