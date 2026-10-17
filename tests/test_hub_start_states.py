@@ -131,6 +131,18 @@ class LaunchdRestartRows(unittest.TestCase):
                     self.assertEqual(got, want)
 
 
+class NotLoadedRows(unittest.TestCase):
+    def test_not_loaded_is_only_the_measured_exact_answer(self):
+        nf = (113, 'Could not find service "x" in domain for system')
+        with mock.patch.object(rt, "LAUNCHD_NOT_FOUND", None):
+            self.assertIsInstance(hv.weekly_state((113, nf[1] + "\n")), rh.Unresolved)
+        with mock.patch.object(rt, "LAUNCHD_NOT_FOUND", nf):
+            self.assertEqual(hv.weekly_state((113, nf[1] + "\n")), hv.NOT_LOADED)
+            for answer in ((113, "Could not find service"), (114, nf[1]), (113, "could not find service, maybe")):
+                with self.subTest(answer=answer):
+                    self.assertIsInstance(hv.weekly_state(answer), rh.Unresolved)
+
+
 class OutcomeRows(unittest.TestCase):
     """hub_start_check prints exactly one outcome for the states it reads."""
 

@@ -604,6 +604,88 @@ class NothingRows(Tree):
         self.refused(self.run_txn(kind="launchd"), "org.example.hub-probe is loaded")
 
 
+class MeasuredRows(NothingRows):
+    """An unmeasured answer is tested by its presence flag, never by its
+    quoted word: an empty word must not read as present, and a blank line
+    must not match it."""
+    BLANK = "system/x = {\n\n\tstate = spawned\n}"
+
+    def weekly(self, rc, out):
+        for f in (self.log("launchctl"), self.log("sudo")):
+            if os.path.exists(f):
+                os.unlink(f)
+        self.cfg["launchctl"] = {"org.example.hub-probe": [rc, out]}
+        return self.run_txn(kind="launchd")
+
+    def test_unmeasured_wordings_and_a_blank_line_are_unknown(self):
+        self.measured = {"LAUNCHD_NOT_FOUND": NOT_FOUND}
+        p = self.weekly(0, self.BLANK)
+        self.refused(p, "unknown")
+        self.assertNotIn("in progress", p.stderr)
+
+    def test_only_running_measured_never_reads_a_blank_line_as_idle(self):
+        self.measured = {"LAUNCHD_NOT_FOUND": NOT_FOUND, "LAUNCHD_STATE_RUNNING": RUNNING_LINE}
+        self.refused(self.weekly(0, self.BLANK), "unknown")
+
+    def test_only_idle_measured_never_reads_a_blank_line_as_running(self):
+        self.measured = {"LAUNCHD_NOT_FOUND": NOT_FOUND, "LAUNCHD_STATE_IDLE": IDLE_LINE}
+        p = self.weekly(0, self.BLANK)
+        self.refused(p, "unknown")
+        self.assertNotIn("in progress", p.stderr)
+
+    def test_parity_with_weekly_state_on_the_same_answers(self):
+        import hub_supervise as hv
+        from unittest import mock
+        answers = [(0, f"system/x = {{\n{IDLE_LINE}\n}}"), (0, f"system/x = {{\n{RUNNING_LINE}\n}}"),
+                   (0, self.BLANK), (0, ""), list(NOT_FOUND), (NOT_FOUND[0], "could not find service"), (5, "")]
+        configs = [{}, {"LAUNCHD_NOT_FOUND": NOT_FOUND},
+                   {"LAUNCHD_NOT_FOUND": NOT_FOUND, "LAUNCHD_STATE_RUNNING": RUNNING_LINE},
+                   {"LAUNCHD_NOT_FOUND": NOT_FOUND, "LAUNCHD_STATE_IDLE": IDLE_LINE},
+                   {"LAUNCHD_NOT_FOUND": NOT_FOUND, "LAUNCHD_STATE_RUNNING": RUNNING_LINE,
+                    "LAUNCHD_STATE_IDLE": IDLE_LINE}]
+        for config in configs:
+            for rc, out in answers:
+                with self.subTest(config=sorted(config), rc=rc, out=out[:30]):
+                    self.measured = config
+                    p = self.weekly(rc, out)
+                    txn = "ok" if p.returncode == 0 else "in progress" if "in progress" in p.stderr else "unknown"
+                    with mock.patch.multiple(rt, LAUNCHD_NOT_FOUND=config.get("LAUNCHD_NOT_FOUND"),
+                                             LAUNCHD_STATE_RUNNING=config.get("LAUNCHD_STATE_RUNNING"),
+                                             LAUNCHD_STATE_IDLE=config.get("LAUNCHD_STATE_IDLE")):
+                        got = hv.weekly_state((rc, out + "\n"))
+                    py = "unknown" if isinstance(got, rt_unresolved()) else \
+                        "in progress" if got == hv.IN_PROGRESS else "ok"
+                    self.assertEqual(txn, py)
+
+
+def rt_unresolved():
+    import router_health as rh
+    return rh.Unresolved
+
+
+class TimerMissingRows(Tree):
+    """The missing timer's measured answer with one text unmeasured: an empty
+    stdout or stderr never matches the field that was not measured."""
+
+    def test_a_none_field_never_matches_an_empty_answer(self):
+        for measured, answer in (((4, None, "No such file or directory"), [4, "", "another error"]),
+                                 ((4, None, "No such file or directory"), [4, "", ""]),
+                                 ((4, "not-found", None), [4, "", ""])):
+            with self.subTest(measured=measured, answer=answer):
+                if os.path.exists(self.wd):
+                    shutil.rmtree(self.wd)
+                if os.path.exists(self.log("sudo")):
+                    os.unlink(self.log("sudo"))
+                self.measured = {"SYSTEMD_TIMER_MISSING": measured}
+                self.cfg["systemctl"]["hub-link-probe.timer"]["is-enabled"] = answer
+                self.refused(self.run_txn(), "unknown")
+
+    def test_the_measured_field_still_matches(self):
+        self.measured = {"SYSTEMD_TIMER_MISSING": (4, None, "No such file or directory")}
+        self.cfg["systemctl"]["hub-link-probe.timer"]["is-enabled"] = [4, "", "No such file or directory"]
+        self.ok(self.run_txn(), "FRESH")
+
+
 class RoleRows(Tree):
     def test_wrong_operand_counts_refuse_before_anything(self):
         o = self.operands("systemd")

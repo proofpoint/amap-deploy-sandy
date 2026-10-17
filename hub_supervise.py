@@ -680,9 +680,10 @@ def ask_print(label: str) -> Any:
 
 def weekly_state(answer: Any) -> Any:
     """The weekly label: loaded and idle, a run in progress, not loaded, or
-    an Unresolved. Running and idle are told apart only by print's measured
-    lines (root_trust.LAUNCHD_STATE_RUNNING and _IDLE); until they are
-    measured a loaded label is unknown."""
+    an Unresolved, by print's MEASURED answers alone, as TXN reads them:
+    running and idle by its exact lines (root_trust.LAUNCHD_STATE_RUNNING and
+    _IDLE), not loaded by its exact (status, output) (LAUNCHD_NOT_FOUND).
+    Each answer is unknown while it is unmeasured."""
     if isinstance(answer, rh.Unresolved):
         return answer
     rc, out = answer
@@ -693,9 +694,11 @@ def weekly_state(answer: Any) -> Any:
         if rt.LAUNCHD_STATE_IDLE is not None and rt.LAUNCHD_STATE_IDLE in lines:
             return LOADED
         return rh.Unresolved("launchctl print's wording for a loaded weekly label is not measured here")
-    if "could not find service" in out.lower():
+    if rt.LAUNCHD_NOT_FOUND is None:
+        return rh.Unresolved("launchctl print's answer for a label that is not loaded is not measured here")
+    if (rc, out.rstrip("\n")) == rt.LAUNCHD_NOT_FOUND:
         return NOT_LOADED
-    return rh.Unresolved(f"launchctl print system/<weekly label> exited {rc}")
+    return rh.Unresolved(f"launchctl print system/<weekly label> answered ({rc}, {out.strip()[:80]!r})")
 
 
 def until_stopped_line(spec: Any, document: Optional[Tuple[str, str]] = None) -> str:

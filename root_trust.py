@@ -37,7 +37,7 @@ import os
 import posixpath
 import shlex
 import struct
-from typing import List, Optional, Sequence, Tuple
+from typing import Any, List, Optional, Sequence, Tuple
 
 #: The check's exit: outside PROBE_EXITS, REFUSED, the partition job's codes,
 #: the hub's NO_RESTART (0-11), the engine's 125, the shell's 126-127 and 143.
@@ -704,7 +704,7 @@ _t_held() { _t_stop "U0: $1. A running or enabled job holds the old pin. The rem
 _t_unknown() { _t_stop "U0: $1 answered ($_t_rc, $_t_out): unknown. Measure the state and fix the observation; nothing is assumed absent."; }
 _t_active() { _t_out=$(@SYSTEMCTL@ --no-pager is-active "$1" 2>/dev/null); _t_rc=$?; }
 _t_print() { _t_out=$(@LAUNCHCTL@ print "system/$1" 2>&1); _t_rc=$?; }
-_t_notfound() { [ -n "@LDNF_RC@" ] && [ "$_t_rc" = "@LDNF_RC@" ] && [ "$_t_out" = @LDNF_TEXT@ ]; }
+_t_notfound() { [ -n "@LDNF_SET@" ] && [ "$_t_rc" = "@LDNF_RC@" ] && [ "$_t_out" = @LDNF_TEXT@ ]; }
 _t_units() {
   if [ "$kind" = systemd ]; then
     for _t_u in "$hub" "$wsvc"; do
@@ -718,9 +718,9 @@ _t_units() {
       1:disabled|1:masked) return 0 ;;
       0:enabled|0:enabled-runtime) _t_held "$wtimer is $_t_out" ;;
     esac
-    if [ -n "@SDM_RC@" ] && [ "$_t_rc" = "@SDM_RC@" ]; then
-      [ -n "@SDM_OUT@" ] && [ "$_t_out" = @SDM_OUT@ ] && return 0
-      if [ -n "@SDM_ERR@" ]; then
+    if [ -n "@SDM_SET@" ] && [ "$_t_rc" = "@SDM_RC@" ]; then
+      [ -n "@SDM_OUT_SET@" ] && [ "$_t_out" = @SDM_OUT@ ] && return 0
+      if [ -n "@SDM_ERR_SET@" ]; then
         _t_err=$(@SYSTEMCTL@ --no-pager is-enabled "$wtimer" 2>&1 >/dev/null)
         [ "$_t_err" = @SDM_ERR@ ] && return 0
       fi
@@ -737,10 +737,10 @@ _t_units() {
 _t_weekly() {
   _t_print "$wlabel"
   if [ "$_t_rc" = 0 ]; then
-    if [ -n "@LD_RUNNING@" ] && printf '%s\n' "$_t_out" | grep -Fxq -- @LD_RUNNING@; then
+    if [ -n "@LD_RUNNING_SET@" ] && printf '%s\n' "$_t_out" | grep -Fxq -- @LD_RUNNING@; then
       _t_stop "a weekly run is in progress; re-run after it ends"
     fi
-    [ -n "@LD_IDLE@" ] && printf '%s\n' "$_t_out" | grep -Fxq -- @LD_IDLE@ && return 0
+    [ -n "@LD_IDLE_SET@" ] && printf '%s\n' "$_t_out" | grep -Fxq -- @LD_IDLE@ && return 0
     _t_unknown "print system/$wlabel"
   fi
   _t_notfound || _t_unknown "print system/$wlabel"
@@ -800,7 +800,14 @@ echo "TXN-OK $class"
 
 
 def _measured(v: Optional[str]) -> str:
+    """A measured text as one shell word. An unmeasured one is never read:
+    TXN tests its presence flag (_present), never the word itself."""
     return shlex.quote(v) if v is not None else "''"
+
+
+def _present(v: Any) -> str:
+    """A measured value's presence flag in TXN: `1`, or empty while unmeasured."""
+    return "" if v is None else "1"
 
 
 def render_gate(kind: str, root: int = 0, ls: str = "/bin/ls", lsopt: Optional[str] = None,
@@ -832,11 +839,13 @@ def render_txn(kind: str, systemctl: str, root: int = 0, top: str = "", sudo: st
             "@LAUNCHD_DIR@": launchd_dir, "@SHA256SUM@": sha256sum, "@SHASUM@": shasum, "@CMP@": cmp,
             "@TAIL@": tail, "@MKDIR@": mkdir, "@DATE@": date, "@RTNAME@": NAME, "@CONTEXT@": CONTEXT_NAME,
             "@SRCMAX@": str(SOURCE_MAX), "@CAPMAX@": str(CAPTURE_MAX),
-            "@LDNF_RC@": "" if nf is None else str(int(nf[0])), "@LDNF_TEXT@": _measured(None if nf is None else nf[1]),
-            "@LD_RUNNING@": _measured(m["LAUNCHD_STATE_RUNNING"]), "@LD_IDLE@": _measured(m["LAUNCHD_STATE_IDLE"]),
-            "@SDM_RC@": "" if sdm is None else str(int(sdm[0])),
-            "@SDM_OUT@": _measured(None if sdm is None else sdm[1]),
-            "@SDM_ERR@": _measured(None if sdm is None else sdm[2])}
+            "@LDNF_SET@": _present(nf), "@LDNF_RC@": "" if nf is None else str(int(nf[0])),
+            "@LDNF_TEXT@": _measured(None if nf is None else nf[1]),
+            "@LD_RUNNING_SET@": _present(m["LAUNCHD_STATE_RUNNING"]), "@LD_RUNNING@": _measured(m["LAUNCHD_STATE_RUNNING"]),
+            "@LD_IDLE_SET@": _present(m["LAUNCHD_STATE_IDLE"]), "@LD_IDLE@": _measured(m["LAUNCHD_STATE_IDLE"]),
+            "@SDM_SET@": _present(sdm), "@SDM_RC@": "" if sdm is None else str(int(sdm[0])),
+            "@SDM_OUT_SET@": _present(None if sdm is None else sdm[1]), "@SDM_OUT@": _measured(None if sdm is None else sdm[1]),
+            "@SDM_ERR_SET@": _present(None if sdm is None else sdm[2]), "@SDM_ERR@": _measured(None if sdm is None else sdm[2])}
     out = TXN
     for k, v in subs.items():
         out = out.replace(k, v)
