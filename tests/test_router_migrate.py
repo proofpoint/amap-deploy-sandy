@@ -9,6 +9,7 @@ Q5 and Q6. The renames, the journal and the drain lock run on real files in
 a scratch directory.
 """
 
+import errno
 import fcntl
 import hashlib
 import json
@@ -1033,12 +1034,160 @@ class AcceptRows(Base):
         self.baseline.write_text(json.dumps(doc))
         self.refused("the baseline's state_ident is not the check's")
 
+    def test_a_changed_suffix_behind_short_reads_is_refused(self):
+        """Codex at a87d3a7e: under reads of three bytes at a time, a marker that
+        shares the legacy marker's prefix and differs after it is refused:
+        the whole file is hashed, never its first chunk."""
+        legacy = (self.gen / "first-seen.json").read_bytes()
+        (self.gen / "first-seen.json").write_bytes(legacy[:-2] + b"X}")
+        real = os.read
+        with mock.patch.object(rm.os, "read", lambda fd, n: real(fd, min(n, 3))):
+            self.refused("is not the legacy marker's bytes")
+
+    def test_a_clean_migration_under_short_reads_is_accepted(self):
+        real = os.read
+        with mock.patch.object(rm.os, "read", lambda fd, n: real(fd, min(n, 3))):
+            try:
+                self.accept()
+            except rm.Stop as e:
+                self.fail(f"short reads made a clean migration fail: {e}")
+
+    def test_each_malformed_private_result_is_refused_never_clean(self):
+        """Codex at a87d3a7e: a result the pin's _finish would not write is not
+        evidence of no loss."""
+        cases = {
+            "empty-result": '{"digest": "0", "result": {}}',
+            "null-reason": json.dumps({"digest": "0", "result": {"req_id": "x", "outcome": "ok", "reason_code": None}}),
+            "integer-reason": json.dumps({"digest": "0", "result": {"req_id": "x", "outcome": "ok", "reason_code": 7}}),
+            "empty-reason": json.dumps({"digest": "0", "result": {"req_id": "x", "outcome": "ok", "reason_code": ""}}),
+            "another-id": json.dumps({"digest": "0", "result": {"req_id": "old", "outcome": "rejected",
+                                                                 "reason_code": rm.QUARANTINED}}),
+            "no-digest": json.dumps({"result": {"req_id": "x", "outcome": "ok", "reason_code": "delivered"}}),
+            "duplicate-key": '{"digest": "0", "result": {"req_id": "x", "outcome": "ok", "reason_code": "'
+                             + rm.QUARANTINED + '", "reason_code": "delivered"}}',
+            "not-an-object": "[]",
+        }
+        for why, text in cases.items():
+            with self.subTest(case=why):
+                (self.gen / "results" / "x.json").write_text(text)
+                self.refused("is not a private result")
+        os.remove(self.gen / "results" / "x.json")
+
+    def test_a_name_not_ending_in_json_is_not_a_result(self):
+        """The pin's atomic writes stage under other names (RL), so such an
+        entry is not read as a result, and a clean migration still passes."""
+        (self.gen / "results" / ".x.json.tmp").write_text("partial")
+        try:
+            self.accept()
+        except rm.Stop as e:
+            self.fail(f"a staging name was read as a result: {e}")
+
     def test_a_held_participant_after_the_poll_is_refused(self):
         collided = the_map()
         collided["instances"]["alice"]["held"] = "skeleton_collision"
         with self.assertRaises(rm.Stop):
             rm.do_accept(CHECKOUT, IMAGE, str(self.config), str(self.check_path), str(self.baseline),
                          self.run_dir, FakeRouter(maps=[collided]))
+
+
+class ReadRows(unittest.TestCase):
+    """Codex at a87d3a7e: _regular_bytes reads the same no-follow fd to EOF, within
+    RECORD_MAX, and a read error is a STOP."""
+
+    def setUp(self):
+        self.d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.d, ignore_errors=True)
+        self.f = self.d / "f"
+
+    def stopped(self, why, **patch):
+        try:
+            with mock.patch.object(rm.os, "read", patch["read"]):
+                rm._regular_bytes(self.f)
+        except rm.Stop as e:
+            self.assertIn(why, str(e))
+        except Exception as e:     # noqa: BLE001 — anything but a Stop is the failure
+            self.fail(f"_regular_bytes raised {type(e).__name__}, not Stop: {e}")
+        else:
+            self.fail(f"read, though: {why}")
+
+    def test_many_short_chunks_are_joined(self):
+        self.f.write_bytes(b"0123456789" * 7)
+        real = os.read
+        with mock.patch.object(rm.os, "read", lambda fd, n: real(fd, min(n, 3))):
+            self.assertEqual(rm._regular_bytes(self.f), b"0123456789" * 7)
+
+    def test_the_cap_is_held_across_chunks(self):
+        self.f.write_bytes(b"x")
+        self.stopped("larger than a record", read=lambda fd, n: b"y" * min(n, rm.RECORD_MAX // 3 + 1))
+
+    def test_a_read_error_mid_file_is_a_stop(self):
+        self.f.write_bytes(b"0123456789")
+        real, calls = os.read, []
+
+        def flaky(fd, n):
+            calls.append(n)
+            if len(calls) == 2:
+                raise OSError(errno.EIO, "Input/output error")
+            return real(fd, min(n, 3))
+        self.stopped("cannot be read", read=flaky)
+
+    def test_exactly_the_cap_is_read_whole(self):
+        self.f.write_bytes(b"z" * rm.RECORD_MAX)
+        self.assertEqual(len(rm._regular_bytes(self.f)), rm.RECORD_MAX)
+
+    def test_one_byte_over_the_cap_is_refused(self):
+        self.f.write_bytes(b"z" * (rm.RECORD_MAX + 1))
+        with self.assertRaises(rm.Stop):
+            rm._regular_bytes(self.f)
+
+
+class EarlyRefusalRows(Base):
+    """Codex at a87d3a7e: a record that cannot be used, or state R2 does not
+    migrate, is refused before anything changes."""
+
+    def setUp(self):
+        super().setUp()
+        d = self.state / "alice"
+        (d / "results").mkdir(parents=True)
+        (d / "results" / "r1.json").write_text(result("r1"))
+        self.pre, _ = self.preview()
+
+    def test_an_approval_only_instance_is_refused_at_the_baseline(self):
+        """The controller's ruling: R2 does not migrate approval-only state
+        (no first-seen.json); the baseline, before any move, refuses it."""
+        (self.state / "alice" / "approval.json").write_text("{}")
+        try:
+            rm.do_baseline(str(self.pre), self.run_dir)
+        except rm.Stop as e:
+            self.assertIn("does not migrate approval-only state", str(e))
+        except Exception as e:     # noqa: BLE001 — anything but a Stop is the failure
+            self.fail(f"baseline raised {type(e).__name__}, not Stop: {e}")
+        else:
+            self.fail("the baseline accepted state with no first-seen.json")
+        self.assertTrue((self.state / "alice").is_dir())
+        self.assertFalse((self.state / LID_A).exists())
+        self.assertEqual(list(self.run_dir.glob("router-migrate-baseline-*")), [])
+
+    def test_an_unusable_check_record_makes_no_adopt_call(self):
+        (self.state / "alice" / "first-seen.json").write_text("{}")
+        self.move(self.pre)
+        good = json.loads(self.check(self.pre).read_text())
+        for why, change in (("missing", lambda d: d.pop("participants")),
+                            ("wrong type", lambda d: d.update(participants="alice")),
+                            ("not the binding set", lambda d: d.update(participants=[])),
+                            ("an adopt outside it", lambda d: d.update(participants=["bob"],
+                                                                       binding={"bob": d["binding"]["alice"]}))):
+            with self.subTest(record=why):
+                doc = json.loads(json.dumps(good))
+                change(doc)
+                path = self.run_dir / f"check-{why.replace(' ', '-')}.json"
+                path.write_text(json.dumps(doc))
+                fake = FakeRouter(plans={"alice": plan("alice", LID_A)})
+                with self.assertRaises(rm.Stop) as cm:
+                    rm.do_adopt(CHECKOUT, IMAGE, str(self.config), str(path), REASON, self.run_dir, fake)
+                self.assertIn("does not name the plan's participants", str(cm.exception))
+                self.assertFalse([c for c in fake.calls if "adopt" in c[0] and "--dry-run" not in c[0]])
+                self.assertFalse((self.state / LID_A / "migration.json").exists())
 
 
 class ParticipantRows(Base):
@@ -1085,7 +1234,7 @@ class ParticipantRows(Base):
         old.write_text(json.dumps(doc))
         with self.assertRaises(rm.Stop) as cm:
             rm.do_verify(CHECKOUT, IMAGE, str(self.config), str(old), self.run_dir, FakeRouter())
-        self.assertIn("names no participants", str(cm.exception))
+        self.assertIn("does not name the plan's participants", str(cm.exception))
 
 
 class FakeParity(unittest.TestCase):

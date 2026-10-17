@@ -894,6 +894,10 @@ marker and reply ledger carry over, and it drains on the first poll.
    <at>.json`, the sha256 of its legacy `first-seen.json` and the private
    results that already record a first sight's rejection
    (`quarantined_pre_approval`). Step 11 compares against this file.
+   R2 does not migrate approval-only state: an instance to be adopted whose
+   legacy state has no `first-seen.json` STOPs the baseline, before
+   anything has moved, and back-out B applies. Every base in R2's scope
+   writes `first-seen.json`.
 6. **The live config.** `python3 amap-sandy.py install --apply`. Then
    `sha256sum <the live config>` must equal the sha256 step 2 printed.
    Every later step refuses a config whose sha256 is not the plan's.

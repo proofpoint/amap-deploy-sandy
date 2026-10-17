@@ -213,10 +213,12 @@ def resolved(names: List[str], now: Dict[str, Any]) -> None:
 
 def participants(check: Dict[str, Any]) -> List[str]:
     """Every instance R2 moved or adopts, as the check recorded them: a
-    rename-only instance is one, though it needs no adopt."""
+    rename-only instance is one, though it needs no adopt. They are the
+    plan's whole binding set, and include every instance to adopt."""
     names = check.get("participants")
-    if not isinstance(names, list) or not all(isinstance(n, str) for n in names):
-        raise Stop("the check record names no participants: run the check step again")
+    if (not isinstance(names, list) or not all(isinstance(n, str) for n in names)
+            or set(names) != set(check.get("binding", {})) or not set(check["instances"]) <= set(names)):
+        raise Stop("the check record does not name the plan's participants: run the check step again")
     return names
 
 
@@ -764,6 +766,7 @@ def do_adopt(checkout: str, image: str, config: str, check_path: str, reason: st
     checked ones. The router itself re-verifies the root and binding it is
     given; a failure leaves its journal, and re-running this step resumes."""
     check = _read_doc(check_path, "check")
+    names = participants(check)
     cfg = _config(config)
     bind_context(check["context"], cfg, checkout, image)
     compare_bindings(check["binding"], read_map(checkout, image, config, runner))
@@ -797,10 +800,10 @@ def do_adopt(checkout: str, image: str, config: str, check_path: str, reason: st
                              "root_mismatch": name})
             raise
     now = read_map(checkout, image, config, runner)
-    held = holds(participants(check), now)
+    held = holds(names, now)
     if held:
         _write_new(out, {"schema": SCHEMA, "step": "adopt", "done": done, "failed": None, "held": held})
-        resolved(participants(check), now)
+        resolved(names, now)
     _write_new(out, {"schema": SCHEMA, "step": "adopt", "done": done, "failed": None})
     return out
 
@@ -851,20 +854,43 @@ def _regular_bytes(p: Path) -> Optional[bytes]:
     except OSError as e:
         raise Stop(f"{p} cannot be read: {e.strerror}") from None
     try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
             raise Stop(f"{p} is not a regular file")
-        data = os.read(fd, RECORD_MAX + 1)
+        if st.st_size > RECORD_MAX:
+            raise Stop(f"{p} is larger than a record")
+        chunks, total = [], 0
+        while True:     # a short read is not the end: read the same fd to EOF, within the bound
+            chunk = os.read(fd, RECORD_MAX + 1 - total)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > RECORD_MAX:
+                raise Stop(f"{p} is larger than a record")
+    except OSError as e:
+        raise Stop(f"{p} cannot be read: {e.strerror}") from None
     finally:
         os.close(fd)
-    if len(data) > RECORD_MAX:
-        raise Stop(f"{p} is larger than a record")
-    return data
+    return b"".join(chunks)
+
+
+def _no_duplicates(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
+    keys = [k for k, _ in pairs]
+    if len(set(keys)) != len(keys):
+        raise ValueError("a duplicate key")
+    return dict(pairs)
 
 
 def quarantined(results: Path) -> List[str]:
     """The req_ids of the private results under `results` that record a
-    first sight's rejection. An absent directory has none; an entry that
-    cannot be read as a result STOPs, never counts as clean."""
+    first sight's rejection. An absent directory has none. Every
+    `<req_id>.json` must be a private result as the pin's _finish writes it
+    (`{"digest", "result": {"req_id", "outcome", "reason_code", "ts"}}`),
+    with its req_id the file's own name and its reason_code a non-empty
+    string; anything else STOPs, and never counts as clean. An entry not
+    ending in `.json` is not a result: the pin's atomic writes stage under
+    other names and rename into `<req_id>.json`."""
     st = _lstat(results)
     if st is None:
         return []
@@ -874,15 +900,18 @@ def quarantined(results: Path) -> List[str]:
     for entry in sorted(os.listdir(results)):
         if not entry.endswith(".json"):
             continue
+        req_id = entry[:-len(".json")]
         try:
-            doc = json.loads(_regular_bytes(results / entry) or b"")
+            doc = json.loads(_regular_bytes(results / entry) or b"", object_pairs_hook=_no_duplicates)
         except ValueError:
-            raise Stop(f"{results / entry} is not a result") from None
+            raise Stop(f"{results / entry} is not a private result for {req_id!r}: not one JSON object") from None
         result = doc.get("result") if isinstance(doc, dict) else None
-        if not isinstance(result, dict):
-            raise Stop(f"{results / entry} is not a result")
-        if result.get("reason_code") == QUARANTINED:
-            out.append(result.get("req_id") if isinstance(result.get("req_id"), str) else entry[:-len(".json")])
+        if (not isinstance(doc, dict) or not isinstance(doc.get("digest"), str) or not isinstance(result, dict)
+                or result.get("req_id") != req_id or not isinstance(result.get("outcome"), str)
+                or not isinstance(result.get("reason_code"), str) or not result["reason_code"]):
+            raise Stop(f"{results / entry} is not a private result for {req_id!r}")
+        if result["reason_code"] == QUARANTINED:
+            out.append(req_id)
     return sorted(out)
 
 
@@ -899,8 +928,11 @@ def do_baseline(preview_path: str, run_dir: Path) -> Path:
                 continue
             d = state_dir / (name if p["source"] == BY_NAME else p["logical_id"])
             marker = _regular_bytes(d / MARKER)
+            if marker is None:
+                raise Stop(f"{name!r}'s legacy state has no {MARKER}: R2 does not migrate approval-only state, and "
+                           "nothing has moved; take back-out B")
             instances[name] = {"logical_id": p["logical_id"],
-                               "marker_sha256": hashlib.sha256(marker).hexdigest() if marker is not None else None,
+                               "marker_sha256": hashlib.sha256(marker).hexdigest(),
                                "quarantined": quarantined(d / "results")}
     out = _record(run_dir, "baseline")
     _write_new(out, {"schema": SCHEMA, "step": "baseline", "context": preview["context"], "instances": instances})
