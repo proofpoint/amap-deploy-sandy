@@ -2078,13 +2078,14 @@ def _bound(argv):
     except OSError as e:
         raise Tooling(f"{argv[0]}: {e.strerror}") from None
     names = {os.path.basename(argv[0]), os.path.basename(os.path.realpath(argv[0]))}
+    own = bool(sys.executable) and os.path.realpath(argv[0]) == os.path.realpath(sys.executable)
     if names & SHELLS:
         raise Tooling(f"{argv[0]} is a shell: whatever it reads, nothing judged it")
-    if names & EXEC_WRAPPERS:
+    if names & EXEC_WRAPPERS and not own:   # its own interpreter, whatever its name, is bound to one vector below
         raise Tooling(f"{argv[0]} execs a program from its arguments, which nothing would judge")
-    if sys.executable and os.path.realpath(argv[0]) == os.path.realpath(sys.executable):
-        own = os.path.abspath(sys.argv[0]) if sys.argv and sys.argv[0] else None
-        if own is None or argv[1:4] != list(OWN_FLAGS) or len(argv) < 6 or os.path.abspath(argv[4]) != own:
+    if own:
+        writer = os.path.abspath(sys.argv[0]) if sys.argv and sys.argv[0] else None
+        if writer is None or argv[1:4] != list(OWN_FLAGS) or len(argv) < 6 or os.path.abspath(argv[4]) != writer:
             raise Tooling("the interpreter is exec'd only as `<python3> -I -S -B <this writer> <step> ...`")
 
 

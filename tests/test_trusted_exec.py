@@ -416,6 +416,25 @@ class BindTest(Tmp):
             hs._bound([os.path.join(self.d, "bin/docker"), "ps"])
         hs._bound([self.put("bin2/docker", b"\x7fELF", 0o755), "ps"])
 
+    def test_its_own_interpreter_spelled_python_runs_its_vector_and_another_python_does_not(self):
+        """CI's interpreter is .../bin/python: a name in EXEC_WRAPPERS. Its own
+        interpreter is bound to the one vector, not refused by name."""
+        own = self.put("libexec/host_steps.py", b"print(1)\n", 0o644)
+        self.addCleanup(setattr, sys, "argv", sys.argv)
+        sys.argv = [own]
+        spelled = os.path.join(self.d, "hc/bin/python")
+        os.makedirs(os.path.dirname(spelled))
+        os.symlink(os.path.realpath(sys.executable), spelled)
+        try:
+            hs._bound([spelled, "-I", "-S", "-B", own, "noop"])
+        except hs.Tooling as e:
+            self.fail(f"its own interpreter, spelled python, was refused: {e}")
+        with self.assertRaisesRegex(hs.Tooling, "exec'd only as"):
+            hs._bound([spelled, "-c", "print(1)"])
+        other = self.put("other/bin/python", b"\x7fELF", 0o755)
+        with self.assertRaisesRegex(hs.Tooling, "execs a program from its arguments"):
+            hs._bound([other, "-I", "-S", "-B", own, "noop"])
+
     def test_the_interpreter_runs_only_its_own_writer(self):
         own = self.put("libexec/host_steps.py", b"print(1)\n", 0o644)
         other = self.put("libexec/other.py", b"print(2)\n", 0o644)
