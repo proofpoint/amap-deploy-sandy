@@ -277,6 +277,9 @@ FEATURE_SELECTED_NAME = "selected.json"             # sandy's verdict; written a
 # byte-identical, so the file may sit beside `feature.json`; the router reads
 # it by `--config`, which names one file and has no search path.
 ROUTER_SIBLING_NAME = "router.json"
+# The feature root's one-line record of a router config named outside
+# $SANDY_HOME (`--router-config-path`), so every later consumer finds it.
+ROUTER_CONFIG_POINTER = "router-config.path"
 # The verdict file's own `schema`. It carries its own number so it can move
 # independently of the manifest and the CLI schema. An OPAQUE token like the
 # others: a file with any other value is refused by name, never read with this
@@ -607,10 +610,68 @@ def feature_selected_path(home: Path) -> Path:
     return feature_root(home) / FEATURE_SELECTED_NAME
 
 
+#: `--router-config-path`, for this invocation, before install records it.
+_ROUTER_CONFIG_OVERRIDE: Optional[Path] = None
+
+
+def router_config_named(home: Path, value: Any) -> Path:
+    """A named router config path, refused unless absolute, normalised and
+    outside $SANDY_HOME: a path in the operator's own tree is the default's,
+    and naming one there is a mistake, never a choice."""
+    if not isinstance(value, str) or not value.startswith("/") or os.path.normpath(value) != value \
+            or value.startswith("//"):
+        raise ProvisionError(f"the router config path {value!r} must be an absolute, normalised path")
+    real_home = os.path.realpath(home)
+    real = os.path.realpath(value)
+    if real != value:
+        raise ProvisionError(f"the router config path {value} has a symlinked component (it resolves to {real}); "
+                             f"name the real path: the router's ROUTER_CONFIG is compared as the exact string")
+    if real == real_home or real.startswith(real_home + os.sep):
+        raise ProvisionError(f"the router config path {value} lies under $SANDY_HOME ({real_home}); the "
+                             f"default {feature_root(home) / ROUTER_SIBLING_NAME} is that case, named")
+    return Path(value)
+
+
+def router_config_pointer(home: Path) -> Path:
+    return feature_root(home) / ROUTER_CONFIG_POINTER
+
+
+def recorded_router_config(home: Path) -> Optional[Path]:
+    """The path install recorded with `--router-config-path`, or None."""
+    try:
+        text = router_config_pointer(home).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        raise ProvisionError(f"cannot read {router_config_pointer(home)}: {e}") from None
+    return router_config_named(home, text.rstrip("\n"))
+
+
 def router_sibling_path(home: Path) -> Path:
-    """`$SANDY_HOME/features/amap/router.json` — the router's config, rendered
-    by `install` beside the manifest and read by the router's `--config`."""
-    return feature_root(home) / ROUTER_SIBLING_NAME
+    """The router's config, rendered by `install` and read by the router's
+    `--config`: `$SANDY_HOME/features/amap/router.json` by default, or the
+    path named by `--router-config-path` and recorded beside the manifest
+    (`router-config.path`), so verify, teardown and health find the same file.
+    A flag that disagrees with the record refuses: one host, one file."""
+    recorded = recorded_router_config(home)
+    if _ROUTER_CONFIG_OVERRIDE is not None:
+        if recorded is not None and recorded != _ROUTER_CONFIG_OVERRIDE:
+            raise ProvisionError(f"--router-config-path {_ROUTER_CONFIG_OVERRIDE} is not the recorded "
+                                 f"{recorded} ({router_config_pointer(home)}): one host renders one file")
+        return _ROUTER_CONFIG_OVERRIDE
+    return recorded if recorded is not None else feature_root(home) / ROUTER_SIBLING_NAME
+
+
+def record_router_config(home: Path, *, dry_run: bool) -> Optional[str]:
+    """Under --apply, write the pointer for `--router-config-path` (absent
+    when no path was named). The router config's directory must exist."""
+    if _ROUTER_CONFIG_OVERRIDE is None:
+        return None
+    if not _ROUTER_CONFIG_OVERRIDE.parent.is_dir():
+        raise ProvisionError(f"the router config's directory {_ROUTER_CONFIG_OVERRIDE.parent} does not exist: "
+                             f"make it first (owned by the operator, mode 0755)")
+    return _write_file(router_config_pointer(home), f"{_ROUTER_CONFIG_OVERRIDE}\n", dry_run=dry_run,
+                       label=ROUTER_CONFIG_POINTER)
 
 
 def feature_roster_dir(home: Path) -> Path:
@@ -3658,6 +3719,9 @@ def run_render_router(args: argparse.Namespace, home: Path, boxes: List[Dict[str
     was not written; 2 when it cannot be rendered at all. Prints one line per
     outcome; sibling tools parse them, so their spelling moves by agreement."""
     path = router_sibling_path(home)
+    note = record_router_config(home, dry_run=not apply)
+    if note:
+        print(f"router config path: {note}")
     members = load_membership(home, boxes)
     state_dir = sibling_state_dir(home, args.state_dir)
     sandbox_paths = {b["name"]: Path(b["path"]) for b in boxes if b.get("name") and b.get("path")}
@@ -5164,6 +5228,11 @@ def run_teardown(args: argparse.Namespace, home: Path, boxes_dir: Path) -> int:
             sibling.unlink()
     else:
         print("  already absent")
+    pointer = router_config_pointer(home)
+    if pointer.is_file():
+        print(f"  {would}remove {pointer} (where the router's config was named)")
+        if apply:
+            pointer.unlink()
 
     print("\n3. router state — first-sight markers, the reply ledger, held requests")
     if state_dir.is_dir():
@@ -5221,6 +5290,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--overlay", type=Path, default=None,
                     help="the deployment overlay, the private file naming the host registry's "
                          "identifiers (default: $AMAP_DEPLOY_OVERLAY)")
+    ap.add_argument("--router-config-path", default=None, metavar="PATH",
+                    help="render the router's config at PATH, outside $SANDY_HOME, instead of beside the "
+                         "manifest; install --apply records it, so later verbs find it without the flag")
     ap.add_argument("--state-dir", type=Path, default=None,
                     help=f"router-private state, rendered into the router's config as "
                          f"`state_dir` (default: $SANDY_HOME/{ROUTER_STATE_SUBDIR})")
@@ -5453,8 +5525,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     home = args.sandy_home or sandy_home()
     boxes_dir = sandboxes_dir(home)
+    global _ROUTER_CONFIG_OVERRIDE
 
     try:
+        _ROUTER_CONFIG_OVERRIDE = (router_config_named(home, args.router_config_path)
+                                   if args.router_config_path else None)
         if args.command == "install":
             return run_sync(args, home, boxes_dir)
 

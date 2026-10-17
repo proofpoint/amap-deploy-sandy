@@ -393,6 +393,38 @@ class InstallTest(unittest.TestCase):
         self.assertEqual(len(bad), 1, bad)
         self.assertIn("keys.local_config is " + local, bad[0])
 
+    def test_a_named_router_config_is_the_rendered_file_the_guard_binds(self):
+        """Under --router-config-path the document's keys.local_config names
+        the file install renders outside $SANDY_HOME: the render guard passes
+        for exactly that file and refuses the default sibling."""
+        named = self.t / "rl-config" / "router.json"
+        d = doc()
+        d["keys"]["local_config"] = str(named)
+        overlay = self.t / "overlay-named.json"
+        overlay.write_text(json.dumps({hs.OVERLAY_SECTION: d}))
+        _, bad = prov.hop_router_keys(self.policy, self.t / "state", overlay, rendered=named)
+        self.assertFalse([b for b in bad if "keys.local_config" in b], bad)
+        _, bad = prov.hop_router_keys(self.policy, self.t / "state", overlay,
+                                      rendered=self.t / "home" / "features" / "amap" / "router.json")
+        self.assertTrue([b for b in bad if "keys.local_config is " + str(named) in b], bad)
+
+    def test_the_weekly_writer_s_live_config_is_the_named_path(self):
+        """The weekly job's fail-stop rewrites, and _verified_target binds
+        ROUTER_CONFIG to, values["live_config"]: the document's
+        keys.local_config, so the named path itself."""
+        import host_steps as hstp
+        named = "/var/lib/example/rl-config/router.json"
+        sec = {"partition": {"evidence_dir": "/var/lib/example/ev", "exec_root": "/var/lib/example/exec",
+                             "tools": {"python3": "/usr/bin/python3", "docker": "/usr/bin/docker"}},
+               "supervision": {"engine": "unix:///run/docker.sock"},
+               "keys": {"local_config": named},
+               "secrets": {"clones": {"deploy": {"sha": "a" * 40}}}}
+        try:
+            values = hstp._authority(sec, "/var/lib/example/exec")
+        except hstp.Handoff as e:
+            self.fail(f"the minimal approved document is refused: {e}")
+        self.assertEqual(values["live_config"], named)
+
     def test_hop_state_without_hop_link_refuses_unless_decommissioned(self):
         p = self.t / "state" / "a" / "gen-1" / "transport" / "hop.json"
         p.parent.mkdir(parents=True)
