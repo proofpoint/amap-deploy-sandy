@@ -82,6 +82,8 @@ CONTAINER_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 #: A --label for a capture file's name (the runbook's R2 uses `r2`), kept apart
 #: from the activation's router-fingerprint-<step>-* files.
 LABEL = re.compile(r"[a-z][a-z0-9]{0,15}")
+#: Labels a capture's own mode already writes under (`--image`'s router-fingerprint-image-*).
+RESERVED_LABELS = frozenset({"image"})
 
 #: The pinned router's own vocabulary for its state_dir's top level
 #: (router/config.py, router/registry.py and router/generations.py at the pin;
@@ -1477,8 +1479,9 @@ def _run(args: Any, *, out: Callable[[str], None], git: Optional[str], runner: R
             out("router-fingerprint: --container is not a container name ([A-Za-z0-9][A-Za-z0-9_.-]*)")
             return EXIT[UNKNOWN]
     label = getattr(args, "label", None)
-    if label is not None and (args.step is None or LABEL.fullmatch(label) is None):
-        out("router-fingerprint: --label goes only with --step, and is [a-z][a-z0-9]{0,15}")
+    if label is not None and (args.step is None or LABEL.fullmatch(label) is None or label in RESERVED_LABELS):
+        out("router-fingerprint: --label goes only with --step, and is [a-z][a-z0-9]{0,15}, never "
+            + ", ".join(sorted(RESERVED_LABELS)))
         return EXIT[UNKNOWN]
     if args.verify_image is not None:
         commit = args.commit

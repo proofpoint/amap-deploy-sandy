@@ -186,14 +186,38 @@ def bindings(the_map: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     return {n: {k: e[k] for k in BINDING} for n, e in the_map["instances"].items()}
 
 
-def resolved(names: List[str], now: Dict[str, Any]) -> None:
-    """After the adopt, every adopted instance must be what the router's
-    poll drains: resolved by the registry, with no hold (`held` null)."""
+def holds(names: List[str], now: Dict[str, Any]) -> Dict[str, str]:
+    """Each of `names` the registry does not resolve, and why: its `held`
+    reason, or "not in the map" for a name the registry does not know."""
+    out = {}
     for name in sorted(names):
-        held = now["instances"].get(name, {}).get("held")
-        if name not in now["instances"] or held is not None:
-            raise Stop(f"{name!r} is held by the registry ({held!r}) after the adopt: its first poll would not "
-                       "drain it; do not start the router (back-out D)")
+        e = now["instances"].get(name)
+        if e is None:
+            out[name] = "not in the map"
+        elif e["held"] is not None:
+            out[name] = e["held"]
+    return out
+
+
+def resolved(names: List[str], now: Dict[str, Any]) -> None:
+    """The REGISTRY stage only: every R2 participant is resolved by the
+    registry, with no hold. It is necessary, not sufficient: the router's
+    generation stage can still hold an instance at its poll, which step
+    11's acceptance checks."""
+    held = holds(names, now)
+    if held:
+        name = min(held)
+        raise Stop(f"the registry does not resolve {name!r} ({held[name]}): do not start the router (back-out "
+                   "D)")
+
+
+def participants(check: Dict[str, Any]) -> List[str]:
+    """Every instance R2 moved or adopts, as the check recorded them: a
+    rename-only instance is one, though it needs no adopt."""
+    names = check.get("participants")
+    if not isinstance(names, list) or not all(isinstance(n, str) for n in names):
+        raise Stop("the check record names no participants: run the check step again")
+    return names
 
 
 def compare_bindings(plan: Dict[str, Any], now: Dict[str, Any]) -> None:
@@ -728,7 +752,8 @@ def do_check(checkout: str, image: str, config: str, preview_path: str, reason: 
         plans[name] = {"logical_id": p["logical_id"], "n": n, "root": plan["root"], "ident": p["ident"]}
     out = _record(run_dir, "check")
     _write_new(out, {"schema": SCHEMA, "step": "check", "context": preview["context"],
-                     "binding": preview["binding"], "instances": plans})
+                     "binding": preview["binding"], "instances": plans,
+                     "participants": sorted(preview["instances"])})
     return out
 
 
@@ -771,7 +796,11 @@ def do_adopt(checkout: str, image: str, config: str, check_path: str, reason: st
             _write_new(out, {"schema": SCHEMA, "step": "adopt", "done": done, "failed": None,
                              "root_mismatch": name})
             raise
-    resolved(list(check["instances"]), read_map(checkout, image, config, runner))
+    now = read_map(checkout, image, config, runner)
+    held = holds(participants(check), now)
+    if held:
+        _write_new(out, {"schema": SCHEMA, "step": "adopt", "done": done, "failed": None, "held": held})
+        resolved(participants(check), now)
     _write_new(out, {"schema": SCHEMA, "step": "adopt", "done": done, "failed": None})
     return out
 
@@ -785,7 +814,7 @@ def do_verify(checkout: str, image: str, config: str, check_path: str, run_dir: 
     bind_context(check["context"], cfg, checkout, image)
     now = read_map(checkout, image, config, runner)
     compare_bindings(check["binding"], now)
-    resolved(list(check["instances"]), now)
+    resolved(participants(check), now)
     state_dir = Path(cfg["state_dir"])
     for name, rec in sorted(check["instances"].items()):
         _at(state_dir, rec["logical_id"], rec["ident"])

@@ -789,8 +789,11 @@ resume.
   a writable bind of an instance root or of any ancestor of one, and stop
   any that does for the window. If that is the hub-link router, stop and
   start it through its supervisor (`systemctl stop` and `start` of its
-  unit, or launchd's `bootout` and `bootstrap` of its label), never with a
-  bare `docker stop`, which its supervisor answers by restarting it.
+  unit, or launchd's `bootout system/<label>` and then `bootstrap system
+  <its plist path>`), never with a bare `docker stop`: its default 10 s
+  timeout is shorter than the router's own stop budget, so it can kill the
+  router in the middle of a send, and the supervisor then restarts it (exit
+  137). The supervisor's stop waits for the router's own clean exit.
 - For every instance being migrated, until step 11 passes:
   - no sandbox lifecycle action (launch, relaunch, remove or recreate);
   - no host-side change under its `instances/<slug>`;
@@ -943,9 +946,11 @@ marker and reply ledger carry over, and it drains on the first poll.
     - for each migrated instance, `docker/run.sh --config <the live config>
       --image <router.image.digest> --name amap-router-migrate -- shell
       python3 -m router --config <the live config> quarantine list <name>`,
-      from the hop checkout, must print nothing: no request was quarantined,
-      so nothing of R2's is left for a later baseline. It is read-only and
-      takes no lock;
+      from the hop checkout, must exit 0 and print nothing, on stdout or
+      stderr. It reads the INGRESS quarantine only (inbound cross-host
+      items), plus the host's own intakes whatever the name: it says nothing
+      about the waiting outbox requests. It is read-only and takes no lock,
+      so its listing is a snapshot, not a barrier;
     - `python3 amap-sandy.py verify` must pass.
 12. **Only then**, `docker rm <the old container's Id>`, by the Id step 5's
     file records.

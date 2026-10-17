@@ -12,6 +12,7 @@ a scratch directory.
 import fcntl
 import hashlib
 import json
+import re
 import os
 import shutil
 import subprocess
@@ -53,11 +54,42 @@ def plan(name, lid, *, local=1, root=("/inst/alice", 41, 9), **legacy):
             "paths": [], "converted": {}, "legacy": facts}
 
 
+#: The pinned registry's own state entries (registry.py:359, _OWN_STATE_ENTRIES at 99329945).
+OWN_STATE_ENTRIES = frozenset({"registry", "status.json", "aliases"})
+
+
+def _present(p):
+    """registry._present at the pin: lstat sees something, any shape; an
+    error other than "no such entry" counts as present."""
+    try:
+        os.lstat(p)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def registry_hold(state, name, e):
+    """The pinned registry.report_for's hold for a known name (registry.py:
+    376-384 and 455-473 at 99329945): a skeleton collision, injected by the
+    map, holds whatever the state is; otherwise registry._state_hold over
+    the real state directory. generations.json is never consulted: the
+    registry stage clears at the move, not at the adopt."""
+    if e.get("held") == "skeleton_collision":
+        return "skeleton_collision"
+    if re.fullmatch(r"[0-9a-fA-F]{32}", name) or name.casefold() in OWN_STATE_ENTRIES:
+        return "name_shape"
+    if not _present(state / name):
+        return None
+    return "state_conflict" if _present(state / e["logical_id"]) else "state_not_migrated"
+
+
 class FakeRouter:
     """Answers each run.sh call as the pinned router's code would."""
 
     def __init__(self, maps=None, plans=None, n=None, adopt_rc=0, answer_lid=None, noop=(), adopted_root=None,
-                 live=None, journal_root=None, keep_held=False):
+                 live=None, journal_root=None):
         self.maps = list(maps) if maps is not None else []
         self.plans = plans or {}
         self.n = n or {}
@@ -67,7 +99,6 @@ class FakeRouter:
         self.adopted_root = adopted_root or {}
         self.live = live
         self.journal_root = journal_root or {}
-        self.keep_held = keep_held
         self.calls = []
 
     def __call__(self, argv, input=b"", **kw):
@@ -83,11 +114,9 @@ class FakeRouter:
                 state = Path(json.loads(Path(inner[4]).read_text())["state_dir"])
             except (OSError, ValueError, KeyError):
                 state = None
-            if state is not None and not self.keep_held:
-                # As the pin resolves it: an instance whose state is generation-keyed is no longer held.
-                for e in m["instances"].values():
-                    if (state / e["logical_id"] / "generations.json").is_file():
-                        e["held"] = None
+            if state is not None:
+                for n, e in m["instances"].items():
+                    e["held"] = registry_hold(state, n, e)
             return self.done(0, json.dumps(m))
         name = inner[inner.index("adopt") + 1]
         given = next((int(a.split("=", 1)[1]) for a in inner if a.startswith("--no-transport-history=")), None)
@@ -744,17 +773,51 @@ class BindingRows(Base):
             rm.do_verify(CHECKOUT, IMAGE, str(self.config), str(check), self.run_dir, FakeRouter())
         self.assertIn("is not the instance state the plan recorded", str(cm.exception))
 
-    def test_a_held_instance_after_the_adopt_stops_adopt_and_verify(self):
-        """RL: after the adopt, the poll drains only a resolved instance;
-        one the registry still holds stops R2 before the start."""
+    def adopt(self, check, **fake):
+        return rm.do_adopt(CHECKOUT, IMAGE, str(self.config), str(check), REASON, self.run_dir,
+                           FakeRouter(plans={"alice": plan("alice", LID_A)}, **fake))
+
+    def verify(self, check, **fake):
+        return rm.do_verify(CHECKOUT, IMAGE, str(self.config), str(check), self.run_dir, FakeRouter(**fake))
+
+    def test_a_skeleton_collision_stays_held_after_the_adopt_and_is_recorded(self):
+        """RL and Codex at ce087971: a skeleton collision holds the name whether or
+        not the adopt wrote generations.json. The adopt STOPs after its loop
+        and records what it did and what is held; verify STOPs too."""
         self.move(self.pre)
         check = self.check(self.pre)
+        collided = the_map()
+        collided["instances"]["alice"]["held"] = "skeleton_collision"
         with self.assertRaises(rm.Stop) as cm:
-            rm.do_adopt(CHECKOUT, IMAGE, str(self.config), str(check), REASON, self.run_dir,
-                        FakeRouter(plans={"alice": plan("alice", LID_A)}, keep_held=True))
-        self.assertIn("held by the registry", str(cm.exception))
-        with self.assertRaises(rm.Stop):
-            rm.do_verify(CHECKOUT, IMAGE, str(self.config), str(check), self.run_dir, FakeRouter(keep_held=True))
+            self.adopt(check, maps=[collided])
+        self.assertIn("does not resolve 'alice' (skeleton_collision)", str(cm.exception))
+        self.assertTrue((self.state / LID_A / "generations.json").is_file())
+        records = [json.loads(p.read_text()) for p in sorted(self.run_dir.glob("router-migrate-adopt-*.json"))]
+        self.assertEqual([(sorted(r["done"]), r["failed"], r.get("held")) for r in records],
+                         [(["alice"], None, {"alice": "skeleton_collision"})])
+        with self.assertRaises(rm.Stop) as cm:
+            self.verify(check, maps=[collided])
+        self.assertIn("skeleton_collision", str(cm.exception))
+
+    def test_the_old_name_recreated_after_the_adopt_stops_verify(self):
+        """RL's row: the old container started by mistake after the move
+        recreates state_dir/<name>; the pinned registry then holds
+        state_conflict, generations.json or not, and verify STOPs."""
+        self.move(self.pre)
+        check = self.check(self.pre)
+        self.adopt(check)
+        self.verify(check)
+        (self.state / "alice").mkdir()
+        with self.assertRaises(rm.Stop) as cm:
+            self.verify(check)
+        self.assertIn("does not resolve 'alice' (state_conflict)", str(cm.exception))
+
+    def test_a_completed_migration_is_resolved_and_records_no_hold(self):
+        self.move(self.pre)
+        check = self.check(self.pre)
+        out = self.adopt(check)
+        self.assertNotIn("held", json.loads(out.read_text()))
+        self.verify(check)
 
     def test_the_root_program_reads_as_the_router_does(self):
         self.assertIn("O_NOFOLLOW", rm.ROOT_PROGRAM)
@@ -824,6 +887,125 @@ class BindingRows(Base):
         out = rm.do_adopt(CHECKOUT, IMAGE, str(self.config), str(check), REASON, self.run_dir, fake)
         self.assertEqual(json.loads(out.read_text())["done"]["alice"]["noop"], True)
         self.assertFalse(any("adopt" in c[0] and "--dry-run" not in c[0] for c in fake.calls))
+
+
+class ResolvedRows(unittest.TestCase):
+    """resolved() over several names (Opus note 4): every hold counts, not
+    only the state ones, and every name is checked, not only the first."""
+
+    def now(self, **held):
+        m = {"instances": {"alice": dict(entry(LID_A), held=None), "bob": dict(entry(LID_B), held=None)}}
+        for n, why in held.items():
+            m["instances"][n]["held"] = why
+        return m
+
+    def test_a_hold_on_the_second_name_of_any_reason_stops(self):
+        for why in ("skeleton_collision", "state_conflict", "name_shape", "state_not_migrated"):
+            with self.subTest(held=why):
+                try:
+                    rm.resolved(["alice", "bob"], self.now(bob=why))
+                except rm.Stop as e:
+                    self.assertIn(f"does not resolve 'bob' ({why})", str(e))
+                except Exception as e:     # noqa: BLE001 — anything but a Stop is the failure
+                    self.fail(f"resolved() raised {type(e).__name__}, not Stop: {e}")
+                else:
+                    self.fail(f"a {why} hold on the second name passed")
+
+    def test_every_hold_is_named_and_none_passes(self):
+        self.assertEqual(rm.holds(["alice", "bob"], self.now(alice="name_shape", bob="skeleton_collision")),
+                         {"alice": "name_shape", "bob": "skeleton_collision"})
+        self.assertIsNone(rm.resolved(["alice", "bob"], self.now()))
+
+
+class CliParseRows(unittest.TestCase):
+    """The runbook's own command lines parse (Opus note 5): `--label r2`
+    reaches router-fingerprint's arguments."""
+
+    def test_router_fingerprint_takes_a_label(self):
+        import amap_sandy
+        argv = ["router-fingerprint", "--step", "2", "--label", "r2", "--apply"]
+        try:
+            args = amap_sandy.build_parser().parse_args(argv)
+        except SystemExit as e:
+            self.fail(f"the CLI refused the runbook's own line (exit {e.code}): {argv}")
+        self.assertEqual((args.step, args.label, args.apply), (2, "r2", True))
+
+
+class ParticipantRows(Base):
+    """Codex at ce087971: a rename-only instance is an R2 participant, gated by
+    resolved() in adopt and verify though it needs no adopt."""
+
+    def setUp(self):
+        super().setUp()
+        (self.state / "alice" / "delivered").mkdir(parents=True)
+        self.pre, _ = self.preview(plans={})
+        self.move(self.pre)
+        self.check_path = rm.do_check(CHECKOUT, IMAGE, str(self.config), str(self.pre), REASON, self.run_dir,
+                                      FakeRouter(plans={}))
+
+    def test_the_check_records_every_participant(self):
+        doc = json.loads(self.check_path.read_text())
+        self.assertEqual((doc["instances"], doc["participants"]), ({}, ["alice"]))
+
+    def test_a_held_rename_only_instance_stops_adopt_and_verify(self):
+        collided = the_map()
+        collided["instances"]["alice"]["held"] = "skeleton_collision"
+        with self.assertRaises(rm.Stop) as cm:
+            rm.do_adopt(CHECKOUT, IMAGE, str(self.config), str(self.check_path), REASON, self.run_dir,
+                        FakeRouter(plans={}, maps=[collided]))
+        self.assertIn("does not resolve 'alice' (skeleton_collision)", str(cm.exception))
+        with self.assertRaises(rm.Stop) as cm:
+            rm.do_verify(CHECKOUT, IMAGE, str(self.config), str(self.check_path), self.run_dir,
+                         FakeRouter(maps=[collided]))
+        self.assertIn("does not resolve 'alice' (skeleton_collision)", str(cm.exception))
+
+    def test_a_resolved_rename_only_instance_passes(self):
+        rm.do_adopt(CHECKOUT, IMAGE, str(self.config), str(self.check_path), REASON, self.run_dir,
+                    FakeRouter(plans={}))
+        rm.do_verify(CHECKOUT, IMAGE, str(self.config), str(self.check_path), self.run_dir, FakeRouter())
+
+    def test_a_name_missing_from_the_map_is_not_resolved(self):
+        self.assertEqual(rm.holds(["alice", "bob"], {"instances": {"bob": dict(entry(LID_B), held=None)}}),
+                         {"alice": "not in the map"})
+
+    def test_a_check_record_without_participants_stops(self):
+        doc = json.loads(self.check_path.read_text())
+        del doc["participants"]
+        old = self.run_dir / "old-check.json"
+        old.write_text(json.dumps(doc))
+        with self.assertRaises(rm.Stop) as cm:
+            rm.do_verify(CHECKOUT, IMAGE, str(self.config), str(old), self.run_dir, FakeRouter())
+        self.assertIn("names no participants", str(cm.exception))
+
+
+class FakeParity(unittest.TestCase):
+    """Codex at ce087971: the fake's hold is the pinned registry's, never
+    "generations.json exists"."""
+
+    def setUp(self):
+        self.state = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.state, ignore_errors=True)
+
+    def test_each_hold_as_the_pin_decides_it(self):
+        e = entry(LID_A)
+        (self.state / LID_A).mkdir()
+        (self.state / LID_A / "generations.json").write_text("{not json")
+        self.assertIsNone(registry_hold(self.state, "alice", e),
+                          "the registry resolves a moved name; a malformed generations file is the poll's concern")
+        self.assertEqual(registry_hold(self.state, "alice", dict(e, held="skeleton_collision")), "skeleton_collision")
+        (self.state / "alice").mkdir()
+        self.assertEqual(registry_hold(self.state, "alice", e), "state_conflict")
+        shutil.rmtree(self.state / LID_A)
+        self.assertEqual(registry_hold(self.state, "alice", e), "state_not_migrated")
+        self.assertEqual(registry_hold(self.state, "a" * 32, e), "name_shape")
+        self.assertEqual(registry_hold(self.state, "Status.json", e), "name_shape")
+
+    def test_own_state_entries_are_the_pins(self):
+        src = subprocess.run(["git", "-C", str(_workspace.HOP_ROUTER_ROOT), "show",
+                              "99329945edd20adb4b8b83f025ea1ef6382456ff:router/registry.py"],
+                             capture_output=True, text=True, check=True).stdout
+        self.assertIn('_OWN_STATE_ENTRIES = frozenset({SEQ_DIR.casefold(), "status.json", "aliases"})', src)
+        self.assertIn('SEQ_DIR = "registry"', src)
 
 
 class MoveRows(Base):
