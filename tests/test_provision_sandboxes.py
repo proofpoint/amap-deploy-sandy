@@ -2528,3 +2528,118 @@ class CadenceAndTeardownVerbsTest(_ConnectorFixtureMixin, unittest.TestCase):
         self.assertFalse((lane / "notice-1.json").exists())
         self.assertTrue(lane.is_dir(), "the directory is sandy's and stays")
         self.assertIn("1 file(s) from the instance lanes", out)
+
+
+class RouterConfigPathTest(_ConnectorFixtureMixin, unittest.TestCase):
+    """`--router-config-path`: install renders the router's config at a named
+    path outside $SANDY_HOME and records it beside the manifest, so every later
+    consumer (router_sibling_path: the render, verify, teardown, health)
+    finds the same one file without the flag."""
+
+    def setUp(self):
+        super().setUp()
+        import tempfile
+        self.outside = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.outside, True)
+        self.named = self.outside / "router.json"
+        self.addCleanup(setattr, prov, "_ROUTER_CONFIG_OVERRIDE", None)
+
+    _policy, _sync, _fleet = SyncTest._policy, SyncTest._sync, SyncTest._fleet
+
+    def _with_path(self, *extra, path=None):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = prov.main(["--router-config-path", str(path or self.named)] + self._base_args()
+                           + ["install", *extra])
+        return rc, out.getvalue() + err.getvalue()
+
+    def test_install_renders_at_the_named_path_and_records_it(self):
+        self._fleet()
+        rc, out = self._with_path("--apply")
+        self.assertEqual(rc, 0, out)
+        self.assertTrue(self.named.is_file(), out)
+        self.assertFalse((prov.feature_root(self.tmp) / prov.ROUTER_SIBLING_NAME).exists(),
+                         "nothing is rendered beside the manifest")
+        self.assertEqual(prov.router_config_pointer(self.tmp).read_text(), f"{self.named}\n")
+
+    def test_later_consumers_find_it_without_the_flag(self):
+        self._fleet()
+        self.assertEqual(self._with_path("--apply")[0], 0)
+        prov._ROUTER_CONFIG_OVERRIDE = None
+        self.assertEqual(prov.router_sibling_path(self.tmp), self.named)
+        rc, out = self._sync(None)
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn(str(prov.feature_root(self.tmp) / prov.ROUTER_SIBLING_NAME), out)
+        import router_health as rh
+        self.assertEqual(Path(rh._f_router_config(_ctx_with_home(self.tmp))[0]), self.named)
+
+    def test_a_path_under_sandy_home_refuses(self):
+        self._fleet()
+        rc, out = self._with_path("--apply", path=self.tmp / "elsewhere" / "router.json")
+        self.assertNotEqual(rc, 0)
+        self.assertIn("lies under $SANDY_HOME", out)
+        self.assertFalse(prov.router_config_pointer(self.tmp).exists())
+
+    def test_a_relative_path_refuses(self):
+        self._fleet()
+        rc, out = self._with_path("--apply", path="rel/router.json")
+        self.assertNotEqual(rc, 0)
+        self.assertIn("absolute, normalised", out)
+
+    def test_a_flag_disagreeing_with_the_record_refuses(self):
+        self._fleet()
+        self.assertEqual(self._with_path("--apply")[0], 0)
+        other = self.outside / "other.json"
+        rc, out = self._with_path("--apply", path=other)
+        self.assertNotEqual(rc, 0)
+        self.assertIn("is not the recorded", out)
+        self.assertFalse(other.exists())
+
+    def test_a_symlinked_component_refuses(self):
+        """The router's ROUTER_CONFIG is compared as the exact string the
+        container reports, so the named path must be the real one."""
+        self._fleet()
+        link = self.outside / "link"
+        real = self.outside / "real"
+        real.mkdir()
+        link.symlink_to(real)
+        rc, out = self._with_path("--apply", path=link / "router.json")
+        self.assertNotEqual(rc, 0)
+        self.assertIn("symlinked component", out)
+
+    def test_a_missing_directory_refuses(self):
+        self._fleet()
+        rc, out = self._with_path("--apply", path=self.outside / "absent" / "router.json")
+        self.assertNotEqual(rc, 0)
+        self.assertIn("does not exist", out)
+
+    def test_a_corrupted_record_under_sandy_home_refuses(self):
+        self._fleet()
+        p = prov.router_config_pointer(self.tmp)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(f"{self.tmp / 'x.json'}\n")
+        with self.assertRaises(prov.ProvisionError):
+            prov.router_sibling_path(self.tmp)
+
+    def test_unset_is_beside_the_manifest(self):
+        self.assertEqual(prov.router_sibling_path(self.tmp),
+                         prov.feature_root(self.tmp) / prov.ROUTER_SIBLING_NAME)
+
+    def test_teardown_removes_the_named_file_and_the_record(self):
+        self._fleet()
+        self.assertEqual(self._with_path("--apply")[0], 0)
+        prov._ROUTER_CONFIG_OVERRIDE = None
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = prov.main(self._base_args() + ["teardown", "--apply"])
+        self.assertEqual(rc, 0, out.getvalue() + err.getvalue())
+        self.assertFalse(self.named.exists())
+        self.assertFalse(prov.router_config_pointer(self.tmp).exists())
+
+
+def _ctx_with_home(home):
+    class _Ctx:
+        def value(self, name):
+            assert name == "sandy_home", name
+            return str(home)
+    return _Ctx()
