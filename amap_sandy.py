@@ -5339,6 +5339,24 @@ def build_parser() -> argparse.ArgumentParser:
     pcheck.add_argument("--document-sha256", required=True, help="that document's sha256, as the unit's argv pins it")
     pcheck.add_argument("--ready", action="store_true", help="exit 0 only when all six claims PASS (A5's acceptance)")
 
+    rfp = sub.add_parser(
+        "router-fingerprint", help="the local router's upgrade base: capture the running router (--step) or an "
+                                   "image (--image) into the run directory (with --apply), or match a capture "
+                                   "against router-upgrade-bases.json (--match) or one commit (--verify-image). "
+                                   "Stops nothing")
+    mode = rfp.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--step", type=int, choices=(0, 2), help="capture the running local router at activation "
+                                                                "step 0 or 2")
+    mode.add_argument("--image", metavar="REF", help="capture an image, run by its immutable Id")
+    mode.add_argument("--match", metavar="FILE", help="match a running capture: MEASURED (0), UNMEASURED (1) "
+                                                      "or UNKNOWN (2)")
+    mode.add_argument("--verify-image", metavar="FILE", help="check an image capture against --commit: EXACT (0), "
+                                                             "DIFFERS (1) or UNKNOWN (2)")
+    rfp.add_argument("--commit", help="the commit --verify-image checks against (the hop pin)")
+    rfp.add_argument("--spec", type=Path, default=None,
+                     help="the host-setup document (default: the deployment overlay's host_setup section)")
+    rfp.add_argument("--apply", action="store_true", help="capture and write the file (default: show)")
+
     teardown = sub.add_parser(
         "teardown", help="the fleet back to its pre-install state for a clean rebuild: "
                          "remove the payload, the router's config and router-state/ (held "
@@ -5409,6 +5427,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         if args.command == "partition-check":
             import partition_check as pcheck
             return pcheck.run(args.document, args.document_sha256, ready_only=args.ready)
+
+        if args.command == "router-fingerprint":
+            import router_fingerprint as rfp
+            return rfp.run(args)
 
         if args.command == "migrate-registry":
             return run_migrate_registry(args, home)
