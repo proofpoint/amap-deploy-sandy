@@ -18,9 +18,13 @@ router's maintainers review).
 - `verify_image` answers whether an image capture is exactly one commit's
   router package: the clean-build check before A1.
 
-The outcomes are MEASURED (exit 0), UNMEASURED (1) and UNKNOWN (2) for the
-match, and EXACT (0), DIFFERS (1) and UNKNOWN (2) for the image check. Every
-refusal has a stable reason id, so another program compares ids, not prose.
+The outcomes are MEASURED (exit 0), UNMEASURED (1), UNKNOWN (2) and MIGRATE
+(3) for the match, and EXACT (0), DIFFERS (1) and UNKNOWN (2) for the image
+check. MIGRATE means every check passed and the router's state is keyed by
+instance name (`migration_required`), or its base predates `registry_dir`
+(`pre_registry_base`): the upgrade is supported only by the router's own
+migration, the runbook's R2, which no activation window runs. Every refusal
+has a stable reason id, so another program compares ids, not prose.
 
 The clock premises the match relies on (step 7):
 - C1: the host wall clock is not stepped between the previous router
@@ -52,13 +56,17 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import hygiene_gate as hg
 
-SCHEMA = "amap-deploy.router-fingerprint/1"
+SCHEMA = "amap-deploy.router-fingerprint/2"
 BASES_NAME = "router-upgrade-bases.json"
+BASES_SCHEMA = 3
 BASES_PATH = Path(__file__).resolve().parent / BASES_NAME
 
 MEASURED, UNMEASURED, UNKNOWN = "MEASURED", "UNMEASURED", "UNKNOWN"
+#: Every stop-gate check passed, and the upgrade is supported only through the
+#: router's own migration: continue, and only through the runbook's migration branch.
+MIGRATE = "MIGRATE"
 EXACT, DIFFERS = "EXACT", "DIFFERS"
-EXIT = {MEASURED: 0, UNMEASURED: 1, UNKNOWN: 2, EXACT: 0, DIFFERS: 1}
+EXIT = {MEASURED: 0, UNMEASURED: 1, UNKNOWN: 2, MIGRATE: 3, EXACT: 0, DIFFERS: 1}
 
 _HEX40 = re.compile(r"[0-9a-f]{40}")
 _HEX64 = re.compile(r"[0-9a-f]{64}")
@@ -69,6 +77,31 @@ _AT = re.compile(r"([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]
 _WHOLE = re.compile(r"([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2})Z")
 _DOCKER_TS = re.compile(r"([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2})(?:\.([0-9]{1,9}))?Z")
 _PY_ENV_NAME = re.compile(r"PYTHON[A-Z]")
+#: Docker's container-name grammar, so a --container value never reaches docker as an option.
+CONTAINER_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
+
+#: The pinned router's own vocabulary for its state_dir's top level
+#: (router/config.py, router/registry.py and router/generations.py at the pin;
+#: a test holds these equal to the hop checkout's): the names of the entries it
+#: keeps there itself (RESERVED_STATE_NAMES, compared casefolded), an
+#: instance name's grammar, a logical_id's shape, and the file that makes a
+#: logical_id directory generation-keyed.
+RESERVED_STATE_NAMES = frozenset({"registry", "status.json", "aliases", "peer-decision.key", "peer-replay",
+                                  "peer-vacant", "peer-clock.json", "_runtime"})
+INSTANCE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+#: A logical_id is lowercase, as the pinned registry mints it; 32 hex digits
+#: in any other case are neither a logical_id nor a name the router keys by.
+LOGICAL_ID = re.compile(r"[0-9a-f]{32}")
+HEX32 = re.compile(r"[0-9a-fA-F]{32}")
+GEN_FILE = "generations.json"
+LAYOUT_KINDS = ("dir", "file", "link", "other")
+#: A pre-registry router's entrypoint sets no umask (amap-router-local's
+#: docker/entrypoint.sh gains `umask 0027` at 08aeed47, 31 first-parent
+#: commits below the pin and 17 after a84e0d98); its PID 1, measured live,
+#: must still mask group and other write. The umask reaches only directories
+#: there: its state files are created 0600 explicitly, as the router's
+#: maintainers measured over every rehearsal under 0022.
+PRE_REGISTRY_UMASK_BITS = 0o022
 
 ENTRY_TYPES = ("file", "dir", "link", "other")
 OBJECT_TYPES = ("commit", "tree", "blob", "tag")
@@ -264,7 +297,7 @@ def read_config(path):
     fstat, before any read, supplies the identity; a second fstat after the
     read, and a stat of the path, decide `stable`."""
     out = {"path": path, "realpath_ok": None, "regular": None, "stable": None, "dev": None, "ino": None,
-           "ctime_ns": None, "state_dir": None, "transport_plugin": None}
+           "ctime_ns": None, "state_dir": None, "transport_plugin": None, "registry_dir": None}
     before = os.path.realpath(path) == path
     out["realpath_ok"] = before
     try:
@@ -322,7 +355,44 @@ def read_config(path):
     if present and not isinstance(sha, str):
         err("the live config's transport_plugin has no sha256")
     out["transport_plugin"] = {"present": present, "sha256": sha if present else None}
+    rd_present = isinstance(doc, dict) and "registry_dir" in doc
+    rd = doc.get("registry_dir") if rd_present else None
+    if rd_present and not isinstance(rd, str):
+        err("the live config's registry_dir is not a string")
+        rd = None
+    out["registry_dir"] = {"present": rd_present, "value": rd}
     return out
+
+
+def read_layout(state_dir):
+    """state_dir's top level, never followed: each entry's name and kind, and
+    for a directory whether it holds a regular generations.json (null when
+    that cannot be read)."""
+    with os.scandir(state_dir) as it:
+        found = list(it)
+    out = []
+    for e in found:
+        if e.is_symlink():
+            kind = "link"
+        elif e.is_dir(follow_symlinks=False):
+            kind = "dir"
+        elif e.is_file(follow_symlinks=False):
+            kind = "file"
+        else:
+            kind = "other"
+        gen = None
+        if kind == "dir":
+            try:
+                st = os.lstat(os.path.join(state_dir, e.name, "generations.json"))
+                gen = True if stat.S_ISREG(st.st_mode) else None
+                if gen is None:
+                    err("a generations.json under the state directory is not a regular file")
+            except FileNotFoundError:
+                gen = False
+            except OSError as x:
+                err("cannot read a generations.json under the state directory", x.strerror)
+        out.append([e.name, kind, gen])
+    return {"state_dir": state_dir, "entries": sorted(out)}
 
 
 def read_status(state_dir):
@@ -377,7 +447,7 @@ def guarded(what, fn, *args):
 def collect(mode, app="/app", pid=1):
     result = dict(guarded("/app", read_app, app) or {"app": None, "docker": None, "entries": None,
                                                          "py": None, "entrypoint": None})
-    process = config = status = peer = clock = env = None
+    process = config = status = peer = clock = env = layout = None
     if mode == "running":
         got = guarded("PID 1", read_process, pid)
         if got is not None:
@@ -392,10 +462,12 @@ def collect(mode, app="/app", pid=1):
         if state_dir is not None:
             status = guarded("status.json", read_status, state_dir)
             peer = guarded("the state directory", walk_peer, state_dir)
+            layout = guarded("the state directory's top level", read_layout, state_dir)
         clock = guarded("the clock", read_clock, pid)
     else:
         result["interpreter"] = guarded("the interpreter", read_interpreter, None, None)
-    result.update(process=process, config=config, status=status, peer_lane=peer, clock=clock)
+    result.update(process=process, config=config, status=status, peer_lane=peer, clock=clock,
+                  state_layout=layout)
     result["errors"] = list(ERRORS)
     return result
 
@@ -490,11 +562,12 @@ def _want(ok: bool, what: str) -> None:
 TOP = ("schema", "source", "step", "at_before", "at", "container", "image", "image_python_env",
        "program_sha256", "result")
 RESULT = ("app", "docker", "entries", "py", "entrypoint", "process", "clock", "interpreter", "config",
-          "status", "peer_lane", "errors")
+          "status", "peer_lane", "state_layout", "errors")
 PROCESS = ("argv", "cwd", "router_config", "python_env", "ld_env", "umask")
 CLOCK = ("now_ns", "uptime_s", "pid1_starttime_ticks", "clk_tck")
 INTERP = ("name", "major", "minor", "exec_exe", "pid1_exe", "user_site")
-CONFIG = ("path", "realpath_ok", "regular", "stable", "dev", "ino", "ctime_ns", "state_dir", "transport_plugin")
+CONFIG = ("path", "realpath_ok", "regular", "stable", "dev", "ino", "ctime_ns", "state_dir", "transport_plugin",
+          "registry_dir")
 PEER = ("state_dir", "peer_entries")
 
 
@@ -551,7 +624,7 @@ def _structure(doc: Any) -> None:
     else:
         _want(loose, "interpreter is present")
     if not running:
-        for k in ("process", "clock", "config", "status", "peer_lane"):
+        for k in ("process", "clock", "config", "status", "peer_lane", "state_layout"):
             _want(r[k] is None, f"{k} is null for an image")
         return
     p = r["process"]
@@ -592,6 +665,14 @@ def _structure(doc: Any) -> None:
             _want(isinstance(tp["present"], bool), "config.transport_plugin.present is a bool")
             _want(tp["sha256"] is None if not tp["present"] else (isinstance(tp["sha256"], str) or loose),
                   "config.transport_plugin.sha256")
+        rd = c["registry_dir"]
+        if rd is None:
+            _want(loose, "config.registry_dir is present")
+        else:
+            _members(rd, ("present", "value"), "config.registry_dir")
+            _want(isinstance(rd["present"], bool) and (rd["value"] is None if not rd["present"]
+                                                       else (isinstance(rd["value"], str) or loose)),
+                  "config.registry_dir is {present, value}")
     else:
         _want(loose, "config is present")
     s = r["status"]
@@ -610,6 +691,17 @@ def _structure(doc: Any) -> None:
               "peer_lane is {state_dir, peer_entries}")
     else:
         _want(loose, "peer_lane is present")
+    sl = r["state_layout"]
+    if sl is not None:
+        _members(sl, ("state_dir", "entries"), "state_layout")
+        _want(isinstance(sl["state_dir"], str) and isinstance(sl["entries"], list),
+              "state_layout is {state_dir, entries}")
+        for e in sl["entries"]:
+            _want(isinstance(e, list) and len(e) == 3 and isinstance(e[0], str) and e[1] in LAYOUT_KINDS
+                  and (e[2] is None or e[2] is True or e[2] is False)
+                  and (e[1] == "dir" or e[2] is None), "state_layout.entries are [name, kind, generations]")
+    else:
+        _want(loose, "state_layout is present")
 
 
 def _times(doc: Dict[str, Any]) -> Dict[str, Any]:
@@ -750,11 +842,17 @@ def _bases(bases_bytes: bytes, pin: str) -> Tuple[Optional[Dict[str, Any]], Opti
         b = json.loads(bases_bytes)
     except ValueError:
         return None, _unknown("bases_schema", f"{BASES_NAME} is not JSON")
-    keys = {"schema", "target", "measured_from", "property", "peer_lane", "premises", "measured_by"}
+    keys = {"schema", "target", "measured_from", "property", "peer_lane", "premises", "measured_by", "pre_registry"}
     if not isinstance(b, dict) or set(b) != keys:
         return None, _unknown("bases_schema", f"{BASES_NAME} does not have exactly the members {sorted(keys)}")
-    if not _is_int(b["schema"]) or b["schema"] != 1:
-        return None, _unknown("bases_schema", f"{BASES_NAME}'s schema is not 1")
+    if not _is_int(b["schema"]) or b["schema"] != BASES_SCHEMA:
+        return None, _unknown("bases_schema", f"{BASES_NAME}'s schema is not {BASES_SCHEMA}")
+    pre = b["pre_registry"]
+    if (not isinstance(pre, dict) or set(pre) != {"before", "from", "statement"}
+            or not all(isinstance(pre[k], str) and _HEX40.fullmatch(pre[k]) for k in ("before", "from"))
+            or not isinstance(pre["statement"], str)):
+        return None, _unknown("bases_schema", f"{BASES_NAME}'s pre_registry is not "
+                              "{before: 40-hex, from: 40-hex, statement}")
     if not all(isinstance(b[k], str) and _HEX40.fullmatch(b[k]) for k in ("target", "measured_from")):
         return None, _unknown("bases_schema", f"{BASES_NAME}'s target and measured_from are not 40-hex")
     if not all(isinstance(b[k], str) for k in ("property", "peer_lane", "premises", "measured_by")):
@@ -784,7 +882,7 @@ def precheck(capture_bytes: bytes, bases_bytes: bytes, pin: str) -> Optional[Tup
 
 def match(capture_bytes: bytes, bases_bytes: bytes, history: Any, pin: str,
           plugin_sha256: str) -> Tuple[str, int, str, str]:
-    """The stop gate: MEASURED (0), UNMEASURED (1) or UNKNOWN (2), with a
+    """The stop gate: MEASURED (0), UNMEASURED (1), UNKNOWN (2) or MIGRATE (3), with a
     stable reason id. Reads nothing but its arguments."""
     try:
         return _match(capture_bytes, bases_bytes, history, pin, plugin_sha256)
@@ -828,19 +926,44 @@ def _match(capture_bytes: bytes, bases_bytes: bytes, history: Any, pin: str,
         return _unknown("history_root", "the history's first-parent chain does not start at target")
     if mfrom not in fp:
         return _unknown("off_chain", "measured_from is not on target's first-parent chain")
-    # 4. The domains.
+    before = bases["pre_registry"]["before"]
+    if before not in fp:
+        return _unknown("pre_registry_off_chain", "the bases file's pre_registry.before is not on target's "
+                        "first-parent chain")
+    if fp.index(before) <= fp.index(mfrom):
+        return _unknown("pre_registry_order", "the bases file's pre_registry.before is not older than "
+                        "measured_from")
+    oldest = bases["pre_registry"]["from"]
+    if oldest not in fp:
+        return _unknown("pre_registry_off_chain", "the bases file's pre_registry.from is not on target's "
+                        "first-parent chain")
+    if fp.index(oldest) < fp.index(before):
+        return _unknown("pre_registry_order", "the bases file's pre_registry.from is newer than "
+                        "pre_registry.before")
+    # 4. The domains: measured is [measured_from, target]; the pre-registry
+    # class is (before, from], older than before and no older than from.
     measured = set(fp[:fp.index(mfrom) + 1])
-    # 5. The match.
+    pre_class = set(fp[fp.index(before) + 1:fp.index(oldest) + 1])
+    # 5. The match classifies the base. Nothing returns on it yet but a refusal:
+    # every later check applies to a pre-registry base too.
     r = doc["result"]
     m = [c for c in fp if commit_matches(r, history["trees"][c])]
     if not m:
         return _unknown("no_match", "the running router's source is no commit on the pin's first-parent chain")
-    if not set(m) <= measured:
-        if not set(m) & measured:
-            return _out(UNMEASURED, "unmeasured", "the running router is older than the measured range: "
-                        + ", ".join(m))
+    if set(m) <= measured:
+        base = "measured"
+    elif set(m) & measured:
         return _unknown("mixed", "the running router's source matches commits both inside and outside the "
                         "measured range: " + ", ".join(m))
+    elif set(m) <= pre_class:
+        base = "pre_registry"
+    elif all(fp.index(c) > fp.index(before) for c in m):
+        return _out(UNMEASURED, "pre_registry_unchecked", "the running router predates registry_dir and is older "
+                    "than the pre-registry range the router's maintainers checked (pre_registry.from): "
+                    + ", ".join(m))
+    else:
+        return _out(UNMEASURED, "unmeasured", "the running router is older than the measured range: "
+                    + ", ".join(m))
     # 6. The layout, process and environment.
     if PYCACHE in r["entries"]:
         return _unknown("pycache", "/app/router holds a __pycache__; a cached .pyc may run in place of the source")
@@ -863,8 +986,10 @@ def _match(capture_bytes: bytes, bases_bytes: bytes, history: Any, pin: str,
                         + ", ".join(sorted(PYTHON_ENV_ALLOWED)) + ", or PYTHONDONTWRITEBYTECODE is not set")
     if p["ld_env"]:
         return _unknown("ld_env", "PID 1 has LD_* variables: " + ", ".join(p["ld_env"]))
-    if p["umask"] != ROUTER_UMASK:
+    if base == "measured" and p["umask"] != ROUTER_UMASK:
         return _unknown("umask", f"PID 1's umask is not {ROUTER_UMASK}")
+    if base == "pre_registry" and int(p["umask"], 8) & PRE_REGISTRY_UMASK_BITS != PRE_REGISTRY_UMASK_BITS:
+        return _unknown("umask", "PID 1's umask lets the pre-registry router create group- or world-writable files")
     it = r["interpreter"]
     if it["user_site"]:
         return _unknown("user_site", "the user site directory PID 1 would load from exists")
@@ -913,8 +1038,70 @@ def _match(capture_bytes: bytes, bases_bytes: bytes, history: Any, pin: str,
             return _out(UNMEASURED, "plugin", "the running transport plugin is not the pinned plugin")
     elif c["transport_plugin"]["present"] and c["transport_plugin"]["sha256"] != plugin_sha256:
         return _out(UNMEASURED, "plugin", "the configured transport plugin is not the pinned plugin")
+    # 10. The state layout: a migration is required by state keyed by name, or
+    # by a logical_id directory with no generations file, whatever the commit.
+    layout = _layout(r)
+    if layout[0] == UNKNOWN:
+        return layout
+    needs = layout[1]
+    if base == "pre_registry":
+        if r["config"]["registry_dir"]["present"]:
+            return _unknown("state_layout", "a pre-registry router's live config sets registry_dir, which its "
+                            "loader cannot read")
+        return _out(MIGRATE, "pre_registry_base", "every check passed; the running router predates registry_dir "
+                    "and its upgrade is supported only by the router's own migration. Take the runbook's "
+                    "migration branch: " + ", ".join(m) + _named(" state to migrate: ", needs))
+    if needs:
+        return _out(MIGRATE, "migration_required", "every check passed and the base was measured, but its state "
+                    "is keyed by instance name or is pre-generation. Take the runbook's migration branch: "
+                    + ", ".join(m) + _named(" state to migrate: ", needs))
     return _out(MEASURED, "measured", f"the running router's base was measured (capture step {doc['step']} at "
                 f"{doc['at']}): " + ", ".join(m))
+
+
+def _named(prefix: str, names: Sequence[str]) -> str:
+    return (prefix + ", ".join(names)) if names else ""
+
+
+def _layout(r: Dict[str, Any]) -> Tuple[Any, ...]:
+    """The state directory's top level, in the pinned router's vocabulary:
+    (UNKNOWN, reason, text) when it cannot be read, or holds what the
+    router would not guess about; otherwise ("ok", the entries a migration
+    must move or adopt, the generation-keyed entries)."""
+    sl, c = r["state_layout"], r["config"]
+    if sl is None or sl["state_dir"] != c["state_dir"]:
+        return _unknown("state_layout", "the state directory's top level was not read for the live config's "
+                        "state_dir")
+    needs, generations = [], []
+    for name, kind, gen in sl["entries"]:
+        if name.casefold() in RESERVED_STATE_NAMES:
+            continue
+        if kind == "file":
+            # The router holds an instance whose name has an entry of any type
+            # (state_not_migrated); a file is never its state, so refuse it.
+            if HEX32.fullmatch(name) or INSTANCE_NAME.fullmatch(name):
+                return _unknown("state_layout", f"the state directory holds a file named {name!r}, like an "
+                                "instance's state; if it is a temporary of the router's own, fingerprint again")
+            continue
+        if kind != "dir":
+            return _unknown("state_layout", f"the state directory holds {name!r}, a {kind}, which is not one of "
+                            "the router's own entries")
+        if LOGICAL_ID.fullmatch(name) is None:
+            if HEX32.fullmatch(name) or INSTANCE_NAME.fullmatch(name) is None:
+                return _unknown("state_layout", f"the state directory holds {name!r}, which is neither the "
+                                "router's own entry nor an instance's")
+            needs.append(name)
+        elif gen is None:
+            return _unknown("state_layout", f"whether {name!r} holds a generations file is unknown")
+        elif gen:
+            generations.append(name)
+        else:
+            needs.append(name)
+    rd = c["registry_dir"]
+    if not rd["present"] and (generations or any(LOGICAL_ID.fullmatch(n) for n in needs)):
+        return _unknown("state_layout", "the live config sets no registry_dir, yet the state directory holds "
+                        "state keyed by logical_id")
+    return "ok", needs, generations
 
 
 def verify_image(capture_bytes: bytes, history: Any, commit: str) -> Tuple[str, int, str, str]:
@@ -1278,6 +1465,14 @@ def run(args: Any, *, out: Callable[[str], None] = print, git: Optional[str] = N
 def _run(args: Any, *, out: Callable[[str], None], git: Optional[str], runner: Runner) -> int:
     import hop_router as hp
     git = git or shutil.which("git") or "git"
+    container = getattr(args, "container", None)
+    if container is not None:
+        if args.verify_image is not None or args.image is not None:
+            out("router-fingerprint: --container applies only to --step and --match")
+            return EXIT[UNKNOWN]
+        if CONTAINER_NAME.fullmatch(container) is None:
+            out("router-fingerprint: --container is not a container name ([A-Za-z0-9][A-Za-z0-9_.-]*)")
+            return EXIT[UNKNOWN]
     if args.verify_image is not None:
         commit = args.commit
         if not isinstance(commit, str) or _HEX40.fullmatch(commit) is None:
@@ -1316,13 +1511,14 @@ def _run(args: Any, *, out: Callable[[str], None], git: Optional[str], runner: R
     if spec.router is None:
         out("router-fingerprint: the host-setup document has no router section")
         return EXIT[UNKNOWN]
+    name = getattr(args, "container", None) or spec.router.container
     if not args.apply:
-        out(f"would run: {' '.join(docker)} inspect {spec.router.container}; image inspect <its Image>; exec "
+        out(f"would run: {' '.join(docker)} inspect {name}; image inspect <its Image>; exec "
             f"<its Id> python3 -I -S -c PROGRAM running; inspect again; and write "
             f"router-fingerprint-{args.step}-<at>.json into {spec.secrets.run_dir} (dry run; --apply to capture)")
         return 0
     try:
-        doc = capture_running(ss_live_docker(spec), spec.router.container, args.step, run=runner)
+        doc = capture_running(ss_live_docker(spec), name, args.step, run=runner)
     except CaptureError as e:
         out(f"router-fingerprint: {e}")
         return EXIT[UNKNOWN]
@@ -1379,7 +1575,8 @@ def _run_match(args: Any, spec: Any, out: Callable[[str], None], git: str, hp: A
     if dirty:
         return _show(_unknown("bases_dirty", dirty), out)
     name = json.loads(capture)["container"]["name"]
-    if spec.router is None or not container_name_ok(name, spec.router.container):
+    expected = getattr(args, "container", None) or (spec.router.container if spec.router is not None else None)
+    if expected is None or not container_name_ok(name, expected):
         return _show(_unknown("container_name", f"the capture is of {name!r}, not of the router container"), out)
     b = json.loads(bases)
     try:
