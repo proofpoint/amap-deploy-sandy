@@ -27,6 +27,7 @@ import host_setup as hs
 import hub_runtime as hr
 import router_health as rh
 import secret_setup as ss
+from _gate import open_gate
 from test_host_setup import doc as host_doc
 from test_secret_setup import sec as secrets_sec
 from test_delivered_domains import source as d7_source, link as d7_link, STATEMENT
@@ -408,6 +409,7 @@ class InspectTest(unittest.TestCase):
     """inspect() against a fake docker that answers as the real CLI does."""
 
     def setUp(self):
+        open_gate(self)
         self.spec = spec()
         self.calls = []
         self.real = rh.run

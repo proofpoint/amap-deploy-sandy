@@ -1058,7 +1058,23 @@ def read_spec(spec_path: Optional[Path], overlay: Optional[Path]) -> Any:
     return sec
 
 
-def checks(spec: Spec, *, production: bool, lstat: Callable = os.lstat,
+def _trust_gate(spec: Spec, lstat: Callable, secrets: Optional[Dict[str, Any]]) -> Any:
+    """The live engine route's judgement for a whole run of checks, made with
+    the same lstat (and realpath) the tool rows use: no live docker call in the
+    run executes unless those rows prove docker (and sudo) root's alone."""
+    if spec.secrets is None:
+        return contextlib.nullcontext()
+    return ss.trust_gate(spec.secrets, lstat, (secrets or {}).get("realpath", os.path.realpath))
+
+
+def checks(spec: Spec, *, production: bool, lstat: Callable = os.lstat, secrets: Optional[Dict[str, Any]] = None,
+           **probes: Any) -> List[rh.Check]:
+    """_checks, under the live engine route's trust gate."""
+    with _trust_gate(spec, lstat, secrets):
+        return _checks(spec, production=production, lstat=lstat, secrets=secrets, **probes)
+
+
+def _checks(spec: Spec, *, production: bool, lstat: Callable = os.lstat,
            digest: Callable[[str], Any] = _sha256,
            openssl: Optional[Dict[str, Any]] = None,
            containers: Optional[Callable[[str], Any]] = None,
@@ -1468,7 +1484,14 @@ def hub_keyprobe(spec_path: Optional[Path], *, apply: bool, overlay: Optional[Pa
     return hk.run_probe(spec, spec.keys, apply=apply, out=out)
 
 
-def start_checks(spec: Spec, *, lstat: Callable = os.lstat, digest: Callable[[str], Any] = _sha256,
+def start_checks(spec: Spec, *, lstat: Callable = os.lstat, secrets: Optional[Dict[str, Any]] = None,
+                 **probes: Any) -> List[rh.Check]:
+    """_start_checks, under the live engine route's trust gate."""
+    with _trust_gate(spec, lstat, secrets):
+        return _start_checks(spec, lstat=lstat, secrets=secrets, **probes)
+
+
+def _start_checks(spec: Spec, *, lstat: Callable = os.lstat, digest: Callable[[str], Any] = _sha256,
                  hub: Optional[Dict[str, Any]] = None, keys: Optional[Dict[str, Any]] = None,
                  supervision: Optional[Dict[str, Any]] = None, state: Any = hr.ASK,
                  overlay: Optional[Path] = None, secrets: Optional[Dict[str, Any]] = None,

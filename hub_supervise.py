@@ -42,11 +42,15 @@ commit, makes it exit 0. Without the handler a planned stop runs out the
 macOS a wrapper maps the codes for a LaunchDaemon whose KeepAlive restarts
 only on a non-zero wrapper exit; it passes 143 on, so launchd restarts it.
 The wrapper is placed root 0444 by the plan's `place --sha256` and run as
-`/bin/sh <wrapper>`, never directly. Before any docker call, both supervisors
-run the pinned writer's `trusted-tools <python3> <docker>` (`trust_argv`): on
-Linux the unit's first ExecStartPre, whose failure fails the start; on macOS
-the wrapper, which records UNTRUSTED and exits 0, so launchd does not restart
-it. Root runs no docker that is not root's alone. It starts `docker run` in the
+`/bin/sh <wrapper>` under the barrier's anchor, never directly. Every command
+root runs goes through the one barrier (`root_cmd`, ROOT-BOOTSTRAP d3.2): the
+anchor's empty environment, then `root_exec` from the placed root-trust.sh,
+which judges the OS interpreter and the pinned writer before the writer's
+`trusted-exec` judges the command and its fresh closure. The first barrier
+line runs the writer's `noop` step and judges docker with it: on Linux the unit's first
+ExecStartPre, whose failure fails the start; on macOS the wrapper's step 0,
+which records UNTRUSTED and exits 0, so launchd does not restart it. Each
+docker call after it passes through the barrier again. It starts `docker run` in the
 background and blocks in `wait`, because a POSIX shell defers a trap while a
 foreground command runs.
 """
@@ -61,6 +65,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import hub_runtime as hr
+import root_trust as rt
 import router_health as rh
 import secret_setup as ss
 
@@ -91,6 +96,12 @@ QUIT_S = 5
 #: The supervisors' own bounds sit above the stop: systemd's default
 #: TimeoutStopSec (90 s) and launchd's default ExitTimeOut (20 s) are below it.
 SUPERVISOR_STOP_S = 120
+#: The barrier's own cost before a stop's `docker stop` starts (RE N1): the
+#: ExecStop line and the wrapper's stop_it both pass through it. Measured on
+#: one Linux host at about 0.5 s (the shell half 0.3 s, trusted-exec 0.2 s,
+#: with no docker in the closure); macOS is not measured, so this is a
+#: declared bound, and the supervisors' bound must cover it plus the stop.
+BARRIER_S = 10
 ORPHAN = "orphan_running"
 #: The wrapper's record when the writer finds docker or python3 not root's alone: nothing ran.
 UNTRUSTED = "untrusted_tools"
@@ -213,15 +224,51 @@ def run_argv(spec: Any) -> List[str]:
     return [spec.secrets.tools["docker"], "run"] + hr.argv(hr.run_spec(spec, spec.hub))
 
 
+#: The writer's step that does nothing: the barrier's first line judges docker
+#: (--also) and runs none of it, through the one vector trusted-exec admits.
+NOOP = "noop"
+
+
+def rt_path(spec: Any) -> str:
+    """root-trust.sh, placed root 0444 beside the writer."""
+    return posixpath.join(spec.secrets.writer_dir, rt.NAME)
+
+
+def root_cmd(spec: Any, argv: List[str], also: Sequence[str] = ()) -> List[str]:
+    """`argv`, run by root through the one barrier (ROOT-BOOTSTRAP d3.2):
+    the anchor (with the engine, which env -i would wipe), root-trust.sh's
+    root_exec judging the OS interpreter and the pinned writer, then the
+    writer's trusted-exec judging argv and `also`, and exec'ing argv."""
+    s = spec.secrets
+    args = ["trusted-exec"] + tool_args(spec) + [x for t in also for x in ("--also", t)] + ["--"] + list(argv)
+    return rt.root_argv(rt_path(spec), s.writer_sha256, s.tools["python3"], s.writer, args,
+                        engine=spec.supervision.engine)
+
+
+def tool_args(spec: Any) -> List[str]:
+    """`--tool T` for every tool the document records: trusted-exec's argv[0]
+    allowlist (d3.3 §4.1), the document's whole set, never a line's own. sudo
+    is left out: trusted-exec refuses it anywhere, and root's line never names it."""
+    return [x for t in sorted(set(spec.secrets.tools.values())) if posixpath.basename(t) != "sudo"
+            for x in ("--tool", t)]
+
+
+def own(spec: Any, *step: str) -> List[str]:
+    """The pinned writer run by its own interpreter: the one vector trusted-exec admits."""
+    s = spec.secrets
+    return [s.tools["python3"], "-I", "-S", "-B", s.writer] + list(step)
+
+
 def weekly_argv(spec: Any) -> List[str]:
     """The weekly probe: the one-shot login probe, under the run directory's
-    lock, recorded by the pinned writer's probe-weekly."""
+    lock, recorded by the pinned writer's probe-weekly, all of it through the
+    barrier. Root runs docker directly: root's argv never holds sudo."""
     s = spec.secrets
     sup = spec.supervision
     status = posixpath.join(s.status_dir, ss.STATUS_FILE)
-    inner = [s.tools["python3"], "-I", "-S", s.writer, "probe-weekly", status, WEEKLY_RUN_ID,
-             "--engine", sup.engine, "--docker", s.tools["docker"], "--"] + ss.probe(s, WEEKLY_RUN_ID)
-    return ss.locked(s, inner)
+    inner = own(spec, "probe-weekly", status, WEEKLY_RUN_ID, "--engine", sup.engine, "--docker", s.tools["docker"],
+                "--") + ss.probe(s, WEEKLY_RUN_ID, root=True)
+    return root_cmd(spec, own(spec, "lock", s.run_dir, "--") + inner, also=[s.tools["docker"]])
 
 
 def _sd(arg: str) -> str:
@@ -239,13 +286,6 @@ def _sd_line(argv: Sequence[str]) -> str:
 HEADER = "# Rendered by amap-deploy-sandy hub-supervise from the anchored overlay. Place it; never edit it.\n"
 
 
-def trust_argv(spec: Any) -> List[str]:
-    """The writer's check, run as root before any docker call: the recorded
-    python3 and docker, and their startup closure, root's alone."""
-    s = spec.secrets
-    return [s.tools["python3"], "-I", "-S", s.writer, "trusted-tools", s.tools["python3"], s.tools["docker"]]
-
-
 def systemd_unit(spec: Any) -> bytes:
     sup = spec.supervision
     docker, name = spec.secrets.tools["docker"], hub_name(spec)
@@ -254,11 +294,10 @@ def systemd_unit(spec: Any) -> bytes:
             "After=docker.service\nRequires=docker.service\n"
             f"StartLimitIntervalSec={START_LIMIT_INTERVAL_S}\nStartLimitBurst={START_LIMIT_BURST}\n\n"
             "[Service]\nType=exec\n"
-            f"Environment={_sd('DOCKER_HOST=' + sup.engine)}\n"
-            f"ExecStartPre={_sd_line(trust_argv(spec))}\n"
-            f"ExecStartPre=-{_sd_line([docker, 'rm', name])}\n"
-            f"ExecStart={_sd_line(run_argv(spec))}\n"
-            f"ExecStop={_sd_line([docker, 'stop', '-t', str(STOP_TIMEOUT_S), name])}\n"
+            f"ExecStartPre={_sd_line(root_cmd(spec, own(spec, NOOP), also=[docker]))}\n"
+            f"ExecStartPre=-{_sd_line(root_cmd(spec, [docker, 'rm', name]))}\n"
+            f"ExecStart={_sd_line(root_cmd(spec, run_argv(spec)))}\n"
+            f"ExecStop={_sd_line(root_cmd(spec, [docker, 'stop', '-t', str(STOP_TIMEOUT_S), name]))}\n"
             f"TimeoutStopSec={SUPERVISOR_STOP_S}\n"
             f"Restart=on-failure\nRestartSec={RESTART_SEC}\n"
             f"RestartPreventExitStatus={' '.join(map(str, NO_RESTART))}\n"
@@ -271,7 +310,6 @@ def systemd_weekly(spec: Any) -> Tuple[bytes, bytes]:
     w = sup.weekly
     service = (HEADER + "[Unit]\nDescription=amap hub-link login probe, weekly\n\n"
                "[Service]\nType=oneshot\n"
-               f"Environment={_sd('DOCKER_HOST=' + sup.engine)}\n"
                f"ExecStart={_sd_line(weekly_argv(spec))}\n").encode("utf-8")
     timer = (HEADER + "[Unit]\nDescription=amap hub-link login probe, weekly\n\n"
              f"[Timer]\nOnCalendar={DAYS[w['weekday']]} *-*-* {w['hour']:02d}:{w['minute']:02d}:00\n"
@@ -285,36 +323,50 @@ def wrapper(spec: Any) -> bytes:
     sup = spec.supervision
     q = shlex.quote
     keep = "|".join(map(str, (0,) + NO_RESTART))
-    run = " ".join(q(a) for a in run_argv(spec))
-    trust = " ".join(q(a) for a in trust_argv(spec))
+    run = " ".join(q(a) for a in run_argv(spec)[1:])
+    tools = " ".join(q(a) for a in tool_args(spec))
+    s = spec.secrets
     return f"""#!/bin/sh
 # hub-link-run. Rendered by amap-deploy-sandy hub-supervise from the anchored
 # overlay; placed root 0444 by the pinned writer and run by its LaunchDaemon as
 # /bin/sh <this file>. Never edit it.
 set -u
 DOCKER={q(spec.secrets.tools['docker'])}
+RT={q(rt_path(spec))}
+SHA={q(s.writer_sha256)}
+PY={q(s.tools['python3'])}
+WR={q(s.writer)}
 NAME={q(hub_name(spec))}
 STATUS={q(sup.hub['status'])}
 DOCKER_HOST={q(sup.engine)}
 export DOCKER_HOST
 say() {{ printf 'hub-link-run: %s\\n' "$1" >&2; }}
+# Every docker call root makes goes through the one barrier, in a subshell (root_exec execs).
+root_docker() {{ ( command . "$RT" && command -v root_exec >/dev/null || exit {rt.EXIT}; root_exec "$SHA" "$PY" "$WR" trusted-exec {tools} -- "$DOCKER" "$@" ); }}
 record() {{
     printf '%s %s\\n' "$1" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$STATUS.tmp" && mv -f "$STATUS.tmp" "$STATUS"
 }}
 
 # 0. Root runs docker only when the pinned writer finds it, and python3, root's
-#    alone; otherwise nothing runs, and the refusal is final (no restart).
-if ! {trust} >/dev/null; then
-    record {UNTRUSTED}
-    say "docker or python3 is not root's alone: nothing was run"
-    exit 0
+#    alone; otherwise nothing runs, and the refusal is final (no restart) once
+#    it is recorded. A refusal that cannot be recorded removes the last status,
+#    so no earlier result stands for it, and exits 1: launchd retries, and each
+#    retry refuses again.
+if ! ( command . "$RT" && command -v root_exec >/dev/null || exit {rt.EXIT}; root_exec "$SHA" "$PY" "$WR" trusted-exec {tools} --also "$DOCKER" -- "$PY" -I -S -B "$WR" {NOOP} ) >/dev/null; then
+    if record {UNTRUSTED}; then
+        say "docker or python3 is not root's alone: nothing was run"
+        exit 0
+    fi
+    rm -f "$STATUS"
+    say "docker or python3 is not root's alone: nothing was run, and the refusal could not be recorded"
+    exit 1
 fi
 
 # 1. A container left by the last run: a stopped one is removed (never -f);
 #    a running one is an orphan, left alone, and this run ends cleanly.
-if state=$("$DOCKER" inspect -f '{{{{.State.Status}}}}' "$NAME" 2>/dev/null); then
+if state=$(root_docker inspect -f '{{{{.State.Status}}}}' "$NAME" 2>/dev/null); then
     case "$state" in
-        created|exited|dead) "$DOCKER" rm "$NAME" >/dev/null || exit 125 ;;
+        created|exited|dead) root_docker rm "$NAME" >/dev/null || exit 125 ;;
         running|paused|restarting)
             record {ORPHAN}
             say "$NAME is already $state: not started, and not stopped"
@@ -322,17 +374,23 @@ if state=$("$DOCKER" inspect -f '{{{{.State.Status}}}}' "$NAME" 2>/dev/null); th
         *) say "$NAME is in an unknown state: $state"; exit 125 ;;
     esac
 else
-    ids=$("$DOCKER" ps -a -q --filter "name=^/$NAME\\$") || {{ say "the engine does not answer"; exit 125; }}
+    ids=$(root_docker ps -a -q --filter "name=^/$NAME\\$") || {{ say "the engine does not answer"; exit 125; }}
     [ -z "$ids" ] || {{ say "$NAME exists but cannot be inspected"; exit 125; }}
 fi
 
-# 2. A stop request becomes a docker stop; the run continues to its exit.
+# 2. A stop request becomes a docker stop; the run continues to its exit. A stop the barrier
+#    refuses never reaches docker: the container keeps running, and launchd's ExitTimeOut
+#    then kills this wrapper and the client, not the container (RE N2).
 interrupted=0
-stop_it() {{ interrupted=1; "$DOCKER" stop -t {STOP_TIMEOUT_S} "$NAME" >/dev/null 2>&1; }}
+stop_it() {{
+    interrupted=1
+    root_docker stop -t {STOP_TIMEOUT_S} "$NAME" >/dev/null 2>&1 \
+        || say "the stop was refused or failed: the container may still be running; docker ps names it"
+}}
 trap stop_it TERM INT
 
 # 3. The run, in the background, so a signal is handled while it runs.
-{run} &
+root_docker {run} &
 child=$!
 wait "$child"
 code=$?
@@ -361,7 +419,7 @@ def hub_plist(spec: Any) -> bytes:
     h = spec.supervision.hub
     return plistlib.dumps({
         "Label": h["label"],
-        "ProgramArguments": ["/bin/sh", h["wrapper"]],
+        "ProgramArguments": rt.anchor() + ["/bin/sh", h["wrapper"]],
         "KeepAlive": {"SuccessfulExit": False},
         "ThrottleInterval": RESTART_SEC,
         "RunAtLoad": True,
@@ -376,7 +434,6 @@ def weekly_plist(spec: Any) -> bytes:
         "Label": w["label"],
         "ProgramArguments": weekly_argv(spec),
         "StartCalendarInterval": {"Weekday": w["weekday"], "Hour": w["hour"], "Minute": w["minute"]},
-        "EnvironmentVariables": {"DOCKER_HOST": sup.engine},
         "RunAtLoad": False,
     }, sort_keys=True)
 
@@ -384,12 +441,13 @@ def weekly_plist(spec: Any) -> bytes:
 def rendered(spec: Any) -> List[Tuple[str, bytes]]:
     """`(placed path, bytes)` for every supervision file, in placement order."""
     sup = spec.supervision
+    first = [(rt_path(spec), rt.render(sup.kind, rt_path(spec)).encode("utf-8"))]   # sourced by all the rest
     if sup.kind == "systemd":
         service, timer = systemd_weekly(spec)
-        return [(sup.hub["unit"], systemd_unit(spec)), (sup.weekly["service"], service),
-                (sup.weekly["timer"], timer)]
-    return [(sup.hub["wrapper"], wrapper(spec)), (sup.hub["plist"], hub_plist(spec)),
-            (sup.weekly["plist"], weekly_plist(spec))]
+        return first + [(sup.hub["unit"], systemd_unit(spec)), (sup.weekly["service"], service),
+                        (sup.weekly["timer"], timer)]
+    return first + [(sup.hub["wrapper"], wrapper(spec)), (sup.hub["plist"], hub_plist(spec)),
+                    (sup.weekly["plist"], weekly_plist(spec))]
 
 
 def staged(path: str) -> str:
@@ -618,7 +676,7 @@ def ask_ancestor(spec: Any, commit: str, of: str) -> Any:
 def ask_label(spec: Any) -> Any:
     """The image's OCI revision label, None when it has none, or an Unresolved."""
     try:
-        p = rh.run(ss.docker(spec.secrets) + ["image", "inspect", "--format", "{{json .Config.Labels}}",
+        p = rh.run(ss.live_docker(spec.secrets) + ["image", "inspect", "--format", "{{json .Config.Labels}}",
                                               spec.secrets.image])
     except rh.CannotRun as e:
         return rh.Unresolved(str(e))
@@ -711,10 +769,25 @@ def verify_stop_budget(spec: Any) -> List[rh.Check]:
                      "dot budget", ok=lambda e, a: a >= e)]
 
 
+def verify_stop_bound(spec: Any) -> List[rh.Check]:
+    """RE N1: the supervisor's own stop bound (systemd TimeoutStopSec, launchd
+    ExitTimeOut, both rendered from SUPERVISOR_STOP_S and held to the
+    rendering by verify_files) covers the barrier and then the stop timeout,
+    so a planned stop is never cut short by the barrier in front of it."""
+    claim = (f"the supervisor's stop bound ({SUPERVISOR_STOP_S} s) covers the barrier in front of `docker stop` "
+             f"({BARRIER_S} s, declared) and then the stop timeout ({STOP_TIMEOUT_S} s)")
+    want = rh.Fact("stop with barrier", BARRIER_S + STOP_TIMEOUT_S,
+                   "BARRIER_S, a declared bound measured on Linux only, + STOP_TIMEOUT_S")
+    return [rh.check(claim, want, SUPERVISOR_STOP_S, "raise SUPERVISOR_STOP_S to at least the barrier plus the "
+                     "stop timeout", ok=lambda e, a: a >= e,
+                     do_not="lower STOP_TIMEOUT_S below the router's join bound to make room")]
+
+
 def checks(spec: Any, *, lstat: Callable, read: Callable[[str], bytes] = hr.dd.read_file,
            ancestor: Any = ASK, label: Any = ASK) -> List[rh.Check]:
     out = verify_files(spec, lstat, read)
     out += verify_stop_budget(spec)
+    out += verify_stop_bound(spec)
     out += verify_ancestry(spec, (lambda c, o: ask_ancestor(spec, c, o)) if ancestor is ASK else ancestor,
                            ask_label(spec) if label is ASK else label)
     return out

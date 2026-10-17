@@ -1,7 +1,7 @@
 """Root runs docker only when it is root's alone.
 
-The hub's supervisor (systemd's ExecStartPre, launchd's wrapper) asks the
-pinned writer's `trusted-tools` first; `probe-weekly` checks its own tools
+The hub's supervisor (systemd's ExecStartPre, launchd's wrapper) runs the
+barrier over docker first; `probe-weekly` checks its own tools
 before it runs anything; partition-weekly already did. All three rest on
 host_steps._trusted_tool and the startup closure. These rows hold the rule on
 real files, with root mapped to this test's uid (as ToolTrustTest does) and
@@ -155,31 +155,109 @@ class ProbeToolsTest(unittest.TestCase):
             self.assertFalse(os.path.exists(status))
 
 
-class TrustedToolsStepTest(unittest.TestCase):
-    """The writer's `trusted-tools PYTHON3 DOCKER`, which the supervisors run."""
+class LiveEngineGateTest(unittest.TestCase):
+    """Codex and Opus B2 at 3355eda0: no live engine call runs once the tool
+    rows find docker (or sudo, or the lock route's python3) not root's alone.
+    Every observation is the refusal, as UNKNOWN, and rh.run is never reached."""
 
-    def test_it_is_the_partition_jobs_own_check(self):
-        seen = []
-        self.addCleanup(setattr, hs, "_verified_tools", hs._verified_tools)
-        hs._verified_tools = lambda py, dk: seen.append((py, dk)) or (py, dk)
-        self.assertEqual(hs.main(["trusted-tools", "/usr/bin/python3", "/usr/bin/docker"]), 0)
-        self.assertEqual(seen, [("/usr/bin/python3", "/usr/bin/docker")])
+    def setUp(self):
+        import test_secret_setup as tss
+        self.tss = tss
+        self.calls = []
+        self.addCleanup(setattr, ss_rh(), "run", ss_rh().run)
+        ss_rh().run = lambda argv, **kw: self.calls.append(list(argv)) or ss_rh().Proc(tuple(argv), 0, "{}", "")
 
-        def refuse(py, dk):
-            raise hs.Tooling(f"{dk} resolves to /x, which is not a root-owned executable no one else can write")
-        hs._verified_tools = refuse
-        self.assertEqual(hs.main(["trusted-tools", "/usr/bin/python3", "/usr/bin/docker"]), hs.EXIT_TOOLING)
+    def table(self, **owned_by_op):
+        f = self.tss.fs()
+        for path in owned_by_op.values():
+            f[path] = self.tss.fl(0o755, self.tss.OP)
+        return self.tss.lstat_of(f)
 
-    @unittest.skipIf(os.geteuid() == 0, "as root, a file this test makes is root's")
-    def test_the_cli_refuses_an_operator_owned_docker(self):
-        with tempfile.TemporaryDirectory() as t:
-            docker = os.path.join(t, "docker")
-            with open(docker, "w") as f:
-                f.write("#!/bin/sh\n")
-            os.chmod(docker, 0o755)
-            done = subprocess.run([sys.executable, "-I", "-S", HOST_STEPS, "trusted-tools", sys.executable, docker],
-                                  capture_output=True, text=True, timeout=120)
-            self.assertEqual(done.returncode, hs.EXIT_TOOLING, done.stderr)
+    def test_the_sudo_route_is_refused_when_docker_or_sudo_is_not_roots(self):
+        import secret_setup as ss
+        s = self.tss.spec(docker_via_sudo=True)
+        for bad in ({"docker": "/usr/local/bin/docker"}, {"sudo": "/usr/bin/sudo"}):
+            with self.subTest(bad=bad):
+                with ss.trust_gate(s, self.table(**bad)):
+                    got = ss.ask_volume(s, "r1", held=True)
+                self.assertIsInstance(got, ss_rh().Unresolved)
+                self.assertIn(f"not run: {next(iter(bad))} not root's alone", got.reason)
+                self.assertEqual(self.calls, [])
+
+    def test_the_direct_route_is_refused_too_and_a_root_docker_runs(self):
+        import secret_setup as ss
+        s = self.tss.spec()
+        with ss.trust_gate(s, self.table(docker="/usr/local/bin/docker")):
+            self.assertIsInstance(ss.ask_volume(s, "r1", held=True), ss_rh().Unresolved)
+        self.assertEqual(self.calls, [])
+        with ss.trust_gate(s, self.table()):
+            ss.ask_volume(s, "r1", held=True)
+        self.assertEqual(self.calls[0][0], "/usr/local/bin/docker")
+
+    def test_the_lock_route_also_needs_python3_roots(self):
+        import secret_setup as ss
+        s = self.tss.spec()
+        with ss.trust_gate(s, self.table(python3="/usr/bin/python3")):
+            self.assertIsInstance(ss.ask_volume(s, "r1", held=False), ss_rh().Unresolved)
+            self.assertEqual(self.calls, [])
+            ss.ask_volume(s, "r1", held=True)
+        self.assertEqual(self.calls[0][0], "/usr/local/bin/docker", "the held route runs no python3")
+
+    def test_the_exposure_sweep_asks_no_engine(self):
+        import secret_exposure as se
+        import secret_setup as ss
+        import test_secret_exposure as tse
+        spec_x, sx = tse.specs()
+        with ss.trust_gate(sx, self.table(docker=sx.tools["docker"])):
+            found = se.checks(spec_x, sx, lstat_=lambda p: tse.Id(1, 1), stat_=tse.stat_of(), realpath=lambda p: p,
+                              lock=tse.free_lock, platform="linux")
+        self.assertEqual(self.calls, [])
+        self.assertEqual([(c.result, c.reason) for c in found if c.result != ss_rh().PASS],
+                         [(ss_rh().UNKNOWN, "not run: docker not root's alone")])
+
+    def test_verify_with_its_real_tool_rows_runs_no_engine_after_a_docker_fail(self):
+        """Codex's own_b2 shape: ss.checks with the REAL verify_tools, an
+        operator-owned docker, and nothing injected for the volume."""
+        import secret_setup as ss
+        f = self.tss.fs()
+        f["/usr/local/bin/docker"] = self.tss.fl(0o755, self.tss.OP)
+        found = ss.checks(self.tss.spec(), lstat=self.tss.lstat_of(f), digest=lambda p: "b" * 64,
+                          read=self.tss.reader(self.tss.files()), platform="linux",
+                          listdir=lambda p: [], realpath=lambda p: p, now=self.tss.NOW, held=True,
+                          stat_=self.tss.identity_of(f), exists=lambda p: False)
+        self.assertFalse([c for c in self.calls if "run" in c], self.calls)
+        rows = {c.claim: (c.result, c.reason) for c in found}
+        self.assertEqual(rows["the docker tool /usr/local/bin/docker is a regular executable file owned by root"][0],
+                         ss_rh().FAIL)
+        vol = [v for k, v in rows.items() if k.startswith("the volume ")]
+        self.assertTrue(vol and all(r == ss_rh().UNKNOWN and "not run: docker" in (why or "") for r, why in vol), vol)
+
+    def test_outside_any_gate_live_docker_judges_the_real_files(self):
+        import secret_setup as ss
+        s = self.tss.spec(tools=dict(self.tss.sec()["tools"], docker="/nonexistent/amap-test/docker"))
+        with self.assertRaises(ss_rh().CannotRun):
+            ss.live_docker(s)
+
+
+class RootExecToolListTest(unittest.TestCase):
+    """Opus B1 at 3355eda0: the list is pinned by name, so dropping one fails a row."""
+
+    def test_the_tools_root_executes_are_exactly_these(self):
+        import secret_setup as ss
+        self.assertEqual(ss.ROOT_EXEC_TOOLS, ("docker", "python3", "sudo", "install"))
+
+    def test_an_operator_owned_sudo_fails(self):
+        import test_secret_setup as tss
+        f = tss.fs()
+        f["/usr/bin/sudo"] = tss.fl(0o755, tss.OP)
+        import secret_setup as ss
+        rows = [c for c in ss.verify_tools(tss.spec(), tss.lstat_of(f), lambda p: p) if "the sudo tool" in c.claim]
+        self.assertEqual([c.result for c in rows], [ss_rh().FAIL])
+
+
+def ss_rh():
+    import router_health
+    return router_health
 
 
 if __name__ == "__main__":

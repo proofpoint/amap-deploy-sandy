@@ -21,6 +21,7 @@ from collections import namedtuple
 import host_setup as hs
 import router_health as rh
 import secret_setup as ss
+from _gate import open_gate
 from test_host_setup import doc as host_doc, good_fs, lstat_of
 
 St = namedtuple("St", "st_mode st_uid st_gid st_ino st_nlink", defaults=(0, 1))
@@ -432,6 +433,12 @@ class RootExecToolsTest(Base):
         f["/usr/bin/git"] = fl(0o755, OP)
         self.assertEqual(self.bad(f=f), set(), "git may be the operator's")
 
+    def test_install_is_root_exec_the_plans_root_lines_run_it(self):
+        f = fs()
+        f["/usr/bin/install"] = fl(0o755, OP)
+        self.assertEqual(self.bad(f=f), {"the install tool /usr/bin/install is a regular executable file owned by "
+                                         "root"})
+
     def test_a_group_writable_directory_above_a_root_exec_tool_fails(self):
         f = fs()
         f["/usr/local/bin"] = dr(0o775)
@@ -533,6 +540,7 @@ class VolumeTest(Base):
         orig = rh.run
         rh.run = run
         self.addCleanup(setattr, rh, "run", orig)
+        open_gate(self)
         got = ss.ask_volume(s, "r1")
         self.assertEqual(got["entries"], [])
         argv = seen[0]
@@ -777,6 +785,7 @@ class RemedyAndProbeTest(Base):
         orig = rh.run
         rh.run = run
         self.addCleanup(setattr, rh, "run", orig)
+        open_gate(self)
         ss.ask_volume(s, "r1", held=True)
         self.assertEqual(seen[0][0], "/usr/local/bin/docker")
         self.assertNotIn("lock", seen[0][:6])

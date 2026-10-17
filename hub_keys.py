@@ -316,6 +316,8 @@ def run_probe(spec: Any, ks: KeySpec, *, apply: bool, run_id: Optional[str] = No
         out("  " + " ".join(argv[:-len(probe["command"])]) + f" <the probe script> {len(candidates(base, ks))} path(s)")
         return 0
     try:
+        if runner is None:
+            ss.live_docker(spec.secrets)
         p = (runner or rh.run)(argv)
     except rh.CannotRun as e:
         out(f"hub-keyprobe: could not run: {e}")
@@ -472,7 +474,7 @@ def ask_live_config(spec: Any, container: str) -> Any:
     """(path, sha256) of the config `container` reads, as its own environment
     names it, or an Unresolved naming why it could not be asked."""
     try:
-        p = rh.run(ss.docker(spec.secrets) + ["exec", container, "python3", "-I", "-S", "-c", LIVE_CONFIG_SCRIPT])
+        p = rh.run(ss.live_docker(spec.secrets) + ["exec", container, "python3", "-I", "-S", "-c", LIVE_CONFIG_SCRIPT])
     except rh.CannotRun as e:
         return rh.Unresolved(str(e))
     if p.rc != 0:
@@ -711,7 +713,7 @@ UNSUPPORTED = ("the signing PASS needs a native-Linux single-file bind (the same
 
 def ask_config_tuple(spec: Any, container: str) -> Any:
     try:
-        p = rh.run(ss.docker(spec.secrets) + ["exec", container, "python3", "-I", "-S", "-c", CONFIG_TUPLE_SCRIPT])
+        p = rh.run(ss.live_docker(spec.secrets) + ["exec", container, "python3", "-I", "-S", "-c", CONFIG_TUPLE_SCRIPT])
     except rh.CannotRun as e:
         return rh.Unresolved(str(e))
     if p.rc != 0:
@@ -852,7 +854,7 @@ STATUS_SCRIPT = ("import json,os,sys\n"
 def ask_status(spec: Any, container: str) -> Any:
     """The local router's status.json, as it wrote it, or an Unresolved."""
     try:
-        p = rh.run(ss.docker(spec.secrets) + ["exec", container, "python3", "-I", "-S", "-c", STATUS_SCRIPT])
+        p = rh.run(ss.live_docker(spec.secrets) + ["exec", container, "python3", "-I", "-S", "-c", STATUS_SCRIPT])
     except rh.CannotRun as e:
         return rh.Unresolved(str(e))
     if p.rc != 0:
@@ -1064,7 +1066,7 @@ def ask_d7_hash(spec: Any, container: str, path: str) -> Any:
     """The D7 file's sha256 as `container` sees it, or an Unresolved naming
     why it could not be asked (the container not running among them)."""
     try:
-        p = rh.run(ss.docker(spec.secrets) + ["exec", container, "python3", "-I", "-S", "-c", D7_HASH_SCRIPT, path])
+        p = rh.run(ss.live_docker(spec.secrets) + ["exec", container, "python3", "-I", "-S", "-c", D7_HASH_SCRIPT, path])
     except rh.CannotRun as e:
         return rh.Unresolved(str(e))
     if p.rc != 0:

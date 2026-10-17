@@ -20,6 +20,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import _workspace  # noqa: F401
+from _gate import open_gate
 import build_identity as bi
 import hop_router as hp
 import router_health as rh
@@ -1355,6 +1356,7 @@ class InstallAndVerifyTest(unittest.TestCase):
         import amap_sandy as prov
         import connector_pin as cpin
         self.prov, self.cpin = prov, cpin
+        open_gate(self)
         td = tempfile.TemporaryDirectory()
         self.addCleanup(td.cleanup)
         self.home = Path(td.name)
@@ -1834,6 +1836,9 @@ class InstallAndVerifyTest(unittest.TestCase):
 
 class BothRoutersTest(unittest.TestCase):
     """A host with [1] on the bare engine and [2] on its supervised one."""
+
+    def setUp(self):
+        open_gate(self)
 
     def test_2s_own_bind_above_1s_state_directory_is_a_named_standing_unknown(self):
         """Opus 1 on v2.3: [1]'s state_dir is listed on [2]'s engine too, and

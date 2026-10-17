@@ -502,7 +502,7 @@ root, the lock file and the state, and checks, without reading the secret:
   git configuration ignored;
 - each tool is a regular executable whose real path, and every directory
   above it, is owned by root or the operator and not group- or
-  world-writable. docker, python3 and sudo, which root executes, must be
+  world-writable. docker, python3, sudo and install, which root executes, must be
   root's alone: the real path, every directory above it, and every
   directory above the recorded path, so no one else can repoint a link.
   A docker inside an operator-owned application bundle (OrbStack's), or a
@@ -990,11 +990,24 @@ its supervisor's (systemd `Restart=on-failure`, launchd `KeepAlive`) and is
 not gated: the check governs the start step it prints and launchd's
 enablement.
 
-Every start of the hub-link router, the gated one and each restart, first
-runs the pinned writer's `trusted-tools <python3> <docker>` as root:
+Every command root runs for the hub-link router goes through one barrier:
+an empty environment, then `root_exec` from `root-trust.sh`, placed root
+0444 beside the writer. It judges the operating system's own python3 and the
+pinned writer before either runs, and the writer's `trusted-exec` then
+judges the command and everything it loads before it executes it. Every
+start, the gated one and each restart, first runs that barrier over docker:
 systemd's first `ExecStartPre`, whose failure fails the start, and the
 launchd wrapper, which then records `untrusted_tools` and exits 0, so
 launchd does not restart it. Root runs no docker that is not root's alone.
+
+A stop goes through the barrier too, so a refused stop never reaches
+`docker stop`. On macOS the wrapper says "the stop was refused or failed",
+and when launchd's `ExitTimeOut` ends the wrapper, the container is still
+running. On Linux, systemd then sends its own TERM to the docker client.
+The client is attached, so it should forward that TERM to the container,
+but this has not been measured. On either system, if `docker ps` still
+names the hub-link router after a stop, find out why the barrier refused
+before you stop the container by hand.
 
 
 ### The weekly partition job's tools

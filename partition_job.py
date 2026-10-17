@@ -22,6 +22,7 @@ import shlex
 from typing import Any, Callable, List, Optional, Tuple
 
 import partition_setup as ps
+import root_trust as rt
 
 #: The job's unit names: systemd's, and launchd's label.
 UNIT = "amap-partition-weekly"
@@ -44,15 +45,21 @@ def activation_path(p: ps.PartitionSpec) -> str:
     return posixpath.join(p.evidence_dir, ACTIVATION)
 
 
-def job_argv(p: ps.PartitionSpec, *, writer: str, host: str, document: str, document_bytes: bytes,
-             activation_bytes: bytes) -> List[str]:
-    """The job's command: the pinned writer, under the root-trusted
-    interpreter, with the document's and A1's approved record's sha256s
-    computed from their exact bytes. The unit is rendered again after every
-    overlay change and after every A1."""
-    return [p.tools["python3"], "-I", "-S", "-B", writer, "partition-weekly", "--exec-root", p.exec_root,
-            "--host", host, "--document", document, "--document-sha256", hashlib.sha256(document_bytes).hexdigest(),
+def job_argv(p: ps.PartitionSpec, *, writer: str, writer_sha256: str, host: str, document: str,
+             document_bytes: bytes, activation_bytes: bytes) -> List[str]:
+    """The job's command, through the one barrier (ROOT-BOOTSTRAP d3.2):
+    root-trust.sh (beside the writer) judges the OS interpreter and the pinned
+    writer, the writer's trusted-exec judges docker and what everything loads,
+    then the writer runs partition-weekly with the document's and A1's
+    approved record's sha256s computed from their exact bytes. The unit is
+    rendered again after every overlay change and after every A1."""
+    py = p.tools["python3"]
+    step = [py, "-I", "-S", "-B", writer, "partition-weekly", "--exec-root", p.exec_root, "--host", host,
+            "--document", document, "--document-sha256", hashlib.sha256(document_bytes).hexdigest(),
             "--activation", activation_path(p), "--activation-sha256", hashlib.sha256(activation_bytes).hexdigest()]
+    tools = [x for t in sorted(set(p.tools.values())) if posixpath.basename(t) != "sudo" for x in ("--tool", t)]
+    return rt.root_argv(posixpath.join(posixpath.dirname(writer), rt.NAME), writer_sha256, py, writer,
+                        ["trusted-exec"] + tools + ["--also", p.tools["docker"], "--"] + step)
 
 
 def activation_steps(p: ps.PartitionSpec, *, writer: str, source: str, activation_bytes: bytes,

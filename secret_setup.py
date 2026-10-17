@@ -73,10 +73,10 @@ LOCK_FILE = "oneshot.lock"
 #: Every tool the checks run; the runbook's own tools are the document's too.
 REQUIRED_TOOLS = ("git", "docker", "python3", "ssh", "ssh-keygen")
 #: The tools root executes: docker (the hub's supervisor, the weekly probe and
-#: the one-shots), python3 (the pinned writer's steps) and sudo (the operator's
-#: door to root when docker_via_sudo). Each must be root's alone; every other
-#: tool may also be the operator's.
-ROOT_EXEC_TOOLS = ("docker", "python3", "sudo")
+#: the one-shots), python3 (the pinned writer's steps), sudo (the operator's
+#: door to root when docker_via_sudo) and install (the plan's root lines). Each
+#: must be root's alone; every other tool may also be the operator's.
+ROOT_EXEC_TOOLS = ("docker", "python3", "sudo", "install")
 CLONE_ROLES = ("deploy", "overlay", "producer", "runtime")
 OPTIONAL_CLONE_ROLE = "producer"
 REQUIRED_CLONE_ROLES = set(CLONE_ROLES) - {OPTIONAL_CLONE_ROLE}
@@ -318,15 +318,16 @@ def locked(s: SecretSpec, argv: List[str]) -> List[str]:
 WRITER_CAPS = ("CHOWN", "FOWNER", "DAC_OVERRIDE")
 
 
-def probe(s: SecretSpec, run_id: str) -> List[str]:
+def probe(s: SecretSpec, run_id: str, root: bool = False) -> List[str]:
     """The one-shot login probe (the design's §6): the runtime's image, uid,
     read-only mount, network and SMTP settings, running only `probe-login`,
     with its phase budgets set so the whole probe fits inside the weekly
-    job's timeout."""
+    job's timeout. `root`: the job root runs, which names docker directly
+    (root's argv never holds sudo)."""
     if s.probe is None:
         raise SecretSpecError("secrets.probe is needed to render the probe")
     pr = s.probe
-    argv = docker(s) + [
+    argv = ([s.tools["docker"]] if root else docker(s)) + [
         "run", "--rm", "--pull", "never", "--log-driver", "none", "--read-only", "--ulimit", "core=0",
         "--security-opt", "no-new-privileges", "--cap-drop", "ALL", "--network", pr["network"],
         "--user", f"{s.uid}:{s.gid}", "--label", "org.amap.oneshot=probe", "--label", f"org.amap.run={run_id}",
@@ -642,29 +643,86 @@ def verify_tools(s: SecretSpec, lstat: Callable,
     every = dict(s.tools)
     every.setdefault("uv", s.uv["binary"])
     for name, path in sorted(every.items()):
-        if name in ROOT_EXEC_TOOLS:
-            owners, whose, why = (0,), "root", f"root executes {name}"
-        else:
-            owners, whose = (0, s.operator_uid), "root or the operator"
-            why = f"{name} runs with docker or root authority in the runbook or verify"
-        real = realpath(path)
-        st = _lst(real, lstat)
-        claim = f"the {name} tool {path} is a regular executable file owned by {whose}"
-        want = _fact("tool", True, why)
-        remedy = f"record a {name} owned by root (a system one), or fix {real}'s owner and mode"
-        if isinstance(st, rh.Unresolved):
-            out.append(rh.unknown(claim, want, st.reason, remedy))
-            continue
-        ok = st is not None and stat.S_ISREG(st.st_mode) and bool(st.st_mode & 0o111) \
-            and st.st_uid in owners and _no_write_by_others(st)
-        out.append(rh.check(claim, want, ok, remedy, do_not="never record a tool that an agent could write"))
-        out.append(_owned_chain(f"every directory above {real} is owned by {whose} and "
-                                f"not group- or world-writable", real, owners, why, lstat))
-        if name in ROOT_EXEC_TOOLS and real != path:
-            out.append(_owned_chain(f"every directory above the recorded {path} is owned by root and not group- "
-                                    f"or world-writable, so no one else can point it elsewhere", path, owners, why,
-                                    lstat))
+        out += _tool_rows(s, name, path, lstat, realpath)
     return out
+
+
+def _tool_rows(s: SecretSpec, name: str, path: str, lstat: Callable,
+               realpath: Callable[[str], str]) -> List[rh.Check]:
+    """verify_tools' rows for one tool."""
+    if name in ROOT_EXEC_TOOLS:
+        owners, whose, why = (0,), "root", f"root executes {name}"
+    else:
+        owners, whose = (0, s.operator_uid), "root or the operator"
+        why = f"{name} runs with docker or root authority in the runbook or verify"
+    real = realpath(path)
+    st = _lst(real, lstat)
+    claim = f"the {name} tool {path} is a regular executable file owned by {whose}"
+    want = _fact("tool", True, why)
+    remedy = f"record a {name} owned by root (a system one), or fix {real}'s owner and mode"
+    if isinstance(st, rh.Unresolved):
+        return [rh.unknown(claim, want, st.reason, remedy)]
+    ok = st is not None and stat.S_ISREG(st.st_mode) and bool(st.st_mode & 0o111) \
+        and st.st_uid in owners and _no_write_by_others(st)
+    out = [rh.check(claim, want, ok, remedy, do_not="never record a tool that an agent could write"),
+           _owned_chain(f"every directory above {real} is owned by {whose} and "
+                        f"not group- or world-writable", real, owners, why, lstat)]
+    if name in ROOT_EXEC_TOOLS and real != path:
+        out.append(_owned_chain(f"every directory above the recorded {path} is owned by root and not group- "
+                                f"or world-writable, so no one else can point it elsewhere", path, owners, why,
+                                lstat))
+    return out
+
+
+# --- The live engine route ---------------------------------------------------------
+#
+# Every live docker call (a one-shot, an inspect, an exec, the exposure sweep)
+# goes through live_docker(s), never through docker(s), which only renders.
+# docker, and sudo when docker_via_sudo, run with the engine's authority, so
+# a live call is refused, before anything executes, unless verify_tools' own
+# rows prove each of them root's alone. The refusal is rh.CannotRun, which
+# every caller already reports as UNKNOWN. Each check reads the filesystem
+# through `lstat`: trust_gate holds an answer computed with the caller's own,
+# so a verify run and its rows judge the same files; outside a gate, live_docker
+# judges the real ones.
+
+
+def live_refusal(s: SecretSpec, lstat: Callable = os.lstat,
+                 realpath: Callable[[str], str] = os.path.realpath, *, locked_route: bool = False) -> Optional[str]:
+    """None when every tool a live engine call executes is root's alone by
+    verify_tools' rows: docker, sudo when docker_via_sudo, and python3 when the
+    call goes through the `lock` wrapper. Otherwise why not, naming them."""
+    names = ["docker"] + (["sudo"] if s.docker_via_sudo else []) + (["python3"] if locked_route else [])
+    bad = [n for n in names
+           if any(c.result != rh.PASS for c in _tool_rows(s, n, s.tools[n], lstat, realpath))]
+    return f"not run: {' and '.join(bad)} not root's alone" if bad else None
+
+
+_GATE: List[Tuple[Optional[str], Optional[str]]] = []
+
+
+class trust_gate:
+    """While held, live_docker answers from this judgement, made once with
+    `lstat` and `realpath`: (the direct route, the lock-wrapped route)."""
+
+    def __init__(self, s: SecretSpec, lstat: Callable = os.lstat, realpath: Callable[[str], str] = os.path.realpath):
+        self.answer = (live_refusal(s, lstat, realpath), live_refusal(s, lstat, realpath, locked_route=True))
+
+    def __enter__(self) -> "trust_gate":
+        _GATE.append(self.answer)
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        _GATE.pop()
+
+
+def live_docker(s: SecretSpec, *, locked_route: bool = False) -> List[str]:
+    """docker(s), for a call that runs now: rh.CannotRun, before anything
+    executes, unless the tools it runs are root's alone."""
+    why = _GATE[-1][1 if locked_route else 0] if _GATE else live_refusal(s, locked_route=locked_route)
+    if why:
+        raise rh.CannotRun(why)
+    return docker(s)
 
 
 def _dir(claim: str, path: str, owner: Sequence[int], mode: Optional[int], why: str,
@@ -788,10 +846,11 @@ def ask_volume(s: SecretSpec, run_id: str, held: bool = False) -> Any:
     """The volume's metadata from a one-shot container, by lstat alone: a
     dict, or an Unresolved. Under the lock: verify's own (`held`), or the
     `lock` wrapper's."""
-    argv = oneshot(s, "stat", run_id, user=f"{s.uid}:{s.gid}", rw=False) + ["stat-secret", IN_VOLUME]
-    if not held:
-        argv = locked(s, argv)
     try:
+        live_docker(s, locked_route=not held)
+        argv = oneshot(s, "stat", run_id, user=f"{s.uid}:{s.gid}", rw=False) + ["stat-secret", IN_VOLUME]
+        if not held:
+            argv = locked(s, argv)
         p = rh.run(argv)
     except rh.CannotRun as e:
         return rh.Unresolved(str(e))
@@ -1036,7 +1095,8 @@ def checks(s: SecretSpec, *, lstat: Callable = os.lstat, digest: Optional[Callab
     out += verify_ssh(s, lstat)
     out += verify_zsh(s, lstat)
     run_id = f"verify-{int(when)}"
-    seen = volume(s, run_id) if volume is not None else ask_volume(s, run_id, held=held)
+    with trust_gate(s, lstat, realpath):
+        seen = volume(s, run_id) if volume is not None else ask_volume(s, run_id, held=held)
     out += verify_volume(s, st_, seen)
     out += verify_core(s, platform, read, exists)
     out += verify_status(s, st_, read, when, lstat)

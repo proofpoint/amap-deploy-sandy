@@ -23,7 +23,7 @@ each exactly {id, claim, result, reason, remedy}.
 The exit status means only "the object was written in full". `--ready`
 exits 0 only when all six are PASS: that is A5's acceptance.
 
-Every docker call goes through ss.docker(spec.secrets), with no -H: the
+Every docker call goes through ss.live_docker(spec.secrets), with no -H: the
 local router and the hub-link router run on the one engine it reaches,
 and supervision.engine must be that engine. Another engine fails closed
 (its router reads as not running).
@@ -319,11 +319,11 @@ def utc_now(now: float) -> str:
 
 
 def ask_json(spec: Any, argv: List[str], what: str) -> Any:
-    """One docker call through ss.docker(spec.secrets), which honours the
+    """One docker call through ss.live_docker(spec.secrets), which honours the
     document's docker_via_sudo: its stdout as JSON, or an Unresolved."""
     import secret_setup as ss
     try:
-        p = rh.run(ss.docker(spec.secrets) + argv)
+        p = rh.run(ss.live_docker(spec.secrets) + argv)
     except rh.CannotRun as e:
         return rh.Unresolved(str(e))
     if p.rc != 0:
@@ -339,11 +339,11 @@ def ask_inspect(spec: Any, ref: str) -> Any:
     affirms there is none, or an Unresolved."""
     import secret_setup as ss
     try:
-        p = rh.run(ss.docker(spec.secrets) + ["inspect", "--type", "container", ref])
+        p = rh.run(ss.live_docker(spec.secrets) + ["inspect", "--type", "container", ref])
     except rh.CannotRun as e:
         return rh.Unresolved(str(e))
     if p.rc != 0:
-        q = rh.run(ss.docker(spec.secrets) + ["ps", "--all", "--quiet", "--no-trunc", "--filter", f"name=^/{ref}$"])
+        q = rh.run(ss.live_docker(spec.secrets) + ["ps", "--all", "--quiet", "--no-trunc", "--filter", f"name=^/{ref}$"])
         return None if q.rc == 0 and not q.out.strip() else rh.Unresolved(f"docker inspect {ref} exited {p.rc}")
     try:
         doc = json.loads(p.out)

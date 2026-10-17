@@ -33,11 +33,13 @@ The weekly partition job's root half (see its section below):
   python3 -I -S -B host_steps.py partition-provision DIR
                                                   DIR/bundle.new swapped in as the bundle, under the lock
 
-A supervisor's own check before it runs docker as root:
+The one barrier every root command passes (ROOT-BOOTSTRAP d3.2; root-trust.sh's
+root_exec starts it, after judging this interpreter and this file):
 
-  python3 -I -S host_steps.py trusted-tools PYTHON3 DOCKER
-                                                  exit 0 when both, and their startup closure, are
-                                                  root's alone; 4 (and why, on stderr) otherwise
+  python3 -I -S -B host_steps.py trusted-exec [--also TOOL]... [--sha256 TOOL=HEX]... -- ARGV...
+                                                  ARGV exec'd once it, the tools and everything
+                                                  they load are judged root's alone; 12 (and why,
+                                                  on stderr) otherwise
 
 Every path is walked from `/` one component at a time, each opened with
 O_NOFOLLOW | O_DIRECTORY, so a symbolic link anywhere on the way, or a
@@ -61,6 +63,7 @@ stdin.
 """
 
 import calendar
+import errno
 import fcntl
 import hashlib
 import json
@@ -767,7 +770,7 @@ EVIDENCE_DIR_MODE = 0o755
 #: How far a placed file's time may precede the run's start (clock grain).
 PLACED_SLACK_S = 2
 #: The operating system's own tools that list a binary's linked libraries.
-LDD, OTOOL, XCODE_SELECT = "/usr/bin/ldd", "/usr/bin/otool", "/usr/bin/xcode-select"
+XCODE_SELECT = "/usr/bin/xcode-select"
 #: ELF: the program header naming the interpreter (a dynamic binary's loader),
 #: the dynamic section's, and its entries naming a needed library and its end.
 PT_INTERP, PT_DYNAMIC, DT_NEEDED, DT_NULL = 3, 2, 1, 0
@@ -1285,24 +1288,21 @@ def _otool_libraries(b, out, err, rc):
 
 
 def _linked_libraries(binaries):
-    """The shared libraries `binaries` link, and the loader, as the operating
-    system's own tool names them, completely; Tooling when neither tool is
-    there or discovery is incomplete for any binary."""
-    if os.path.exists(LDD):
-        argv, parse = [LDD], _ldd_libraries
-    elif os.path.exists(OTOOL):
-        argv, parse = [OTOOL, "-L"], _otool_libraries
-    else:
-        raise Tooling("no ldd and no otool: the startup closure's libraries cannot be listed")
-    out = set()
-    for b in binaries:
-        try:
-            p = subprocess.run(argv + [b], shell=False, close_fds=True, stdin=subprocess.DEVNULL, env={},
-                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
-        except (OSError, subprocess.TimeoutExpired) as e:
-            raise Tooling(f"cannot list {b}'s libraries: {e}") from None
-        out.update(parse(b, p.stdout, p.stderr, p.returncode))
-    return sorted(out)
+    """The shared libraries `binaries` link, and the loader, completely, read
+    without running anything of theirs: on Linux through the anchor's own
+    loader in its list mode (never ldd, a shell script), each binary's
+    PT_INTERP that loader; on macOS from the Mach-O load commands (never
+    /usr/bin/otool, an xcrun stub). Tooling when discovery is incomplete."""
+    if not binaries:
+        return []
+    try:
+        with open(binaries[0], "rb") as f:
+            magic = f.read(4)
+    except OSError as e:
+        raise Tooling(f"cannot read {binaries[0]}: {e.strerror}") from None
+    if magic in _MH or magic in _FAT:
+        return _macho_closure(list(binaries), binaries[0])[0]
+    return _elf_closure(list(binaries))[0]
 
 
 #: Asks the interpreter, under an empty environment, where its startup closure is.
@@ -1385,7 +1385,7 @@ def _entry(t, stat_=os.stat, realpath=os.path.realpath):
 
 
 def closure_problems(closure, lstat=os.lstat, walk=os.walk, realpath=os.path.realpath, platform=None,
-                     readlink=os.readlink, stat_=os.stat):
+                     readlink=os.readlink, stat_=os.stat, seen=None):
     """Every path in the startup closure, every directory above it and
     everything under it, root-owned and writable by no one else, exactly as
     the install-time block judges it. A link is judged itself, then followed
@@ -1403,7 +1403,8 @@ def closure_problems(closure, lstat=os.lstat, walk=os.walk, realpath=os.path.rea
     the dyld shared cache on the sealed system volume. An optional path is
     judged whole when present; when absent, the directories its would-be
     place is under are judged instead. A directory the walk cannot list is
-    a problem. The problems, empty when there are none."""
+    a problem. The problems, empty when there are none. `seen`, a list, is
+    given every entry judged, for a caller's further rule (trusted-exec's ACLs)."""
     if not isinstance(closure, dict):
         closure = {REQUIRED: list(closure), LIBRARIES: [], OPTIONAL: []}
     bad, trees, chains, ups = [], set(), set(), set()
@@ -1420,6 +1421,8 @@ def closure_problems(closure, lstat=os.lstat, walk=os.walk, realpath=os.path.rea
         except OSError as e:
             bad.append(f"{p}: {e.strerror}")
             return None
+        if seen is not None:
+            seen.append(p)
         if st.st_uid != ROOT_UID or st.st_mode & 0o022 and not stat.S_ISLNK(st.st_mode):
             bad.append(f"{p} is not root-owned, or is writable by others")
         return st
@@ -1539,6 +1542,571 @@ def _verified_tools(python3, docker):
     if bad:
         raise Tooling("the startup closure is not root's alone: " + "; ".join(bad[:5]))
     return python, dock
+
+
+# --- trusted-exec: the one barrier every root command passes (ROOT-BOOTSTRAP d3 §4) ----------
+#
+# root-trust.sh has judged, without running them, the OS interpreter this
+# runs under (its install root whole) and this file (its pinned sha256). This
+# step judges everything else the command will load, fresh on every run, by
+# the real closure_problems, and then execs exactly the argv it judged: the
+# process that judged it is the process that execs it.
+
+#: trusted-exec's refusal: outside every exit code that already means something.
+ROOT_TRUST_EXIT = 12
+#: Mach-O magic numbers, thin (32 and 64 bit, either byte order) and fat.
+_MH = {b"\xfe\xed\xfa\xce": (">", 28), b"\xce\xfa\xed\xfe": ("<", 28),
+       b"\xfe\xed\xfa\xcf": (">", 32), b"\xcf\xfa\xed\xfe": ("<", 32)}
+_FAT = {b"\xca\xfe\xba\xbe": 20, b"\xca\xfe\xba\xbf": 32}
+#: The running architecture's Mach-O cputype: a fat file is read for it alone.
+_CPU = {"arm64": 0x0100000C, "x86_64": 0x01000007}
+LC_LOAD_DYLIB, LC_LOAD_WEAK_DYLIB, LC_REEXPORT_DYLIB, LC_LAZY_LOAD_DYLIB, LC_LOAD_UPWARD_DYLIB = (
+    0xC, 0x80000018, 0x8000001F, 0x20, 0x80000023)
+LC_RPATH, LC_LOAD_DYLINKER, LC_DYLD_ENVIRONMENT = 0x8000001C, 0xE, 0x27
+_DYLIB_COMMANDS = (LC_LOAD_DYLIB, LC_LOAD_WEAK_DYLIB, LC_REEXPORT_DYLIB, LC_LAZY_LOAD_DYLIB, LC_LOAD_UPWARD_DYLIB)
+#: Load commands that change nothing dyld loads or where it looks: read past.
+#: Each names no file and no search place; what it does acts on images
+#: already loaded. Every other command, LC_DYLD_ENVIRONMENT (0x27) and the
+#: kernel's LC_FILESET_ENTRY among them, refuses: an unknown command could
+#: select what is loaded (d3.3 §4.3).
+_MACHO_BENIGN_NAMED = frozenset({   # d3.3 §4.3's named list, as written there
+    0x19, 0x2, 0xB, 0x1B, 0x32, 0x2A,  # SEGMENT_64, SYMTAB, DYSYMTAB, UUID, BUILD_VERSION, SOURCE_VERSION
+    0x80000028, 0x26, 0x29, 0x1D,      # MAIN, FUNCTION_STARTS, DATA_IN_CODE, CODE_SIGNATURE
+    0x80000022, 0x80000033, 0x80000034,  # DYLD_INFO_ONLY, DYLD_EXPORTS_TRIE, DYLD_CHAINED_FIXUPS
+    0x31, 0x2D,                        # NOTE, LINKER_OPTION
+})
+_MACHO_HANDLED_OWN = frozenset({0xD})   # LC_ID_DYLIB: §4.3 "handled"; this image's own name, not a load
+_MACHO_BENIGN_FURTHER = frozenset({     # each beyond §4.3's list, with its named reason
+    0x1,                        # LC_SEGMENT: SEGMENT_64's 32-bit form; maps this image's own bytes
+    0x3,                        # LC_SYMSEG: an obsolete symbol table of this image
+    0x4, 0x5,                   # LC_THREAD, LC_UNIXTHREAD: where this image starts, as MAIN
+    0xF,                        # LC_ID_DYLINKER: a loader's own name, as ID_DYLIB; LOAD_DYLINKER is the load
+    0x11, 0x1A,                 # LC_ROUTINES(_64): an initializer inside this image
+    0x12, 0x13, 0x14, 0x15,     # LC_SUB_FRAMEWORK/UMBRELLA/CLIENT/LIBRARY: who may link to whom; restricts, loads nothing
+    0x16,                       # LC_TWOLEVEL_HINTS: lookup hints into images already listed
+    0x17,                       # LC_PREBIND_CKSUM: a checksum
+    0x2B,                       # LC_DYLIB_CODE_SIGN_DRS: signature data, as CODE_SIGNATURE
+    0x1E, 0x2E,                 # split info, optimization hints: offsets in this image
+    0x21, 0x2C,                 # LC_ENCRYPTION_INFO(_64): an encrypted range of this image
+    0x22,                       # LC_DYLD_INFO: DYLD_INFO_ONLY's non-required form; binds to the dylibs listed by ordinal
+    0x24, 0x25, 0x2F, 0x30,     # LC_VERSION_MIN_*: the platform built for, as BUILD_VERSION
+    0x36,                       # LC_ATOM_INFO: linker data, as LINKER_OPTION
+})
+_MACHO_INERT = _MACHO_BENIGN_NAMED | _MACHO_HANDLED_OWN | _MACHO_BENIGN_FURTHER
+DYLD = "/usr/lib/dyld"
+#: Where macOS's loader looks when an install name is not on disk, and the
+#: framework fallback; each is judged when it exists.
+DYLD_FALLBACK_DIRS = ("/usr/local/lib", "/usr/lib", "/Library/Frameworks", "/Network/Library/Frameworks")
+#: Linux's loader configuration: the cache and the files naming its directories.
+LD_SO_CACHE, LD_SO_CONF, LD_SO_CONF_D = "/etc/ld.so.cache", "/etc/ld.so.conf", "/etc/ld.so.conf.d"
+LD_SO_PRELOAD = "/etc/ld.so.preload"
+#: The anchor: the shell root trusts unchecked, whose loader is the one loader allowed.
+ANCHOR_SHELL = "/bin/sh"
+
+
+def macho_load_commands(data, arch=None):
+    """_macho_load_commands, with a malformed image refused, never a crash."""
+    try:
+        return _macho_load_commands(data, arch)
+    except (struct.error, IndexError, ValueError) as e:
+        raise Tooling(f"a Mach-O image cannot be read: {e}") from None
+
+
+def _macho_load_commands(data, arch=None):
+    """[(cmd, text)] of every dylib, rpath and loader command in a Mach-O
+    image, for the running architecture's slice of a fat file: what dyld will
+    look for, read from the bytes, nothing executed. Tooling for anything that
+    is not Mach-O, a fat file with no slice for this architecture, and any
+    load command outside the known set (an unknown one could select what is
+    loaded): LC_DYLD_ENVIRONMENT, and a loader other than /usr/lib/dyld."""
+    magic = data[:4]
+    if magic in _FAT:
+        want = _CPU.get(arch or os.uname().machine)
+        n = struct.unpack(">I", data[4:8])[0]
+        size = _FAT[magic]
+        for i in range(n):
+            entry = data[8 + i * size:8 + (i + 1) * size]
+            if magic == b"\xca\xfe\xba\xbe":
+                cpu, _, off, length, _ = struct.unpack(">5I", entry)
+            else:
+                cpu, _, off, length, _, _ = struct.unpack(">2I2Q2I", entry)
+            if cpu == want:
+                return _macho_load_commands(data[off:off + length], arch)
+        raise Tooling("a fat Mach-O file has no slice for this architecture")
+    if len(data) < 32 or magic not in _MH:
+        raise Tooling("not a Mach-O image")
+    order, header = _MH[magic]
+    cpu, = struct.unpack(order + "I", data[4:8])
+    if arch is not None or os.uname().sysname == "Darwin":
+        if cpu != _CPU.get(arch or os.uname().machine):
+            raise Tooling("a Mach-O image for another architecture")
+    ncmds, sizeofcmds = struct.unpack(order + "2I", data[16:24])
+    at, end, out = header, header + sizeofcmds, []
+    if end > len(data):
+        raise Tooling("a Mach-O image is shorter than its load commands")
+    for _ in range(ncmds):
+        if at + 8 > end:
+            raise Tooling("a Mach-O load command runs past its header")
+        cmd, cmdsize = struct.unpack(order + "2I", data[at:at + 8])
+        if cmdsize < 8 or at + cmdsize > end:
+            raise Tooling("a Mach-O load command has an impossible size")
+        if cmd in _DYLIB_COMMANDS or cmd in (LC_RPATH, LC_LOAD_DYLINKER):
+            name_at = struct.unpack(order + "I", data[at + 8:at + 12])[0]
+            raw = data[at + name_at:at + cmdsize].split(b"\0", 1)[0]
+            try:
+                text = raw.decode("ascii")
+            except UnicodeDecodeError:
+                raise Tooling("a Mach-O load command names a path that is not ASCII") from None
+            if cmd == LC_LOAD_DYLINKER and text != DYLD:
+                raise Tooling(f"a Mach-O image names a loader other than {DYLD}: {text}")
+            out.append((cmd, text))
+        elif cmd not in _MACHO_INERT:
+            raise Tooling(f"a Mach-O image carries load command {cmd:#x}, which this check does not judge")
+        at += cmdsize
+    return out
+
+
+def macho_libraries(binary, main, inherited=(), arch=None, exists=os.path.lexists):
+    """What `binary` makes dyld load, as dyld resolves it: (libraries, weak
+    libraries absent on disk, every candidate directory searched, its own
+    rpaths). @loader_path is the binary's directory, @executable_path the main
+    executable's (python, for extension modules); @rpath is tried against the
+    binary's own rpaths and then those `inherited` from the images that loaded
+    it, in that order, the first that exists winning; every earlier candidate's
+    directory is returned to be judged, since a library planted there later
+    would win. An @rpath name no candidate resolves is returned as its first
+    candidate (judged absent) or, with no rpath at all, refused."""
+    try:
+        with open(binary, "rb") as f:
+            data = f.read()
+    except OSError as e:
+        raise Tooling(f"cannot read {binary}: {e.strerror}") from None
+    cmds = macho_load_commands(data, arch)
+    here, exe = os.path.dirname(binary), os.path.dirname(main)
+
+    def expand(p):
+        # Textual, as dyld joins it: a `..` after a link is the kernel's to
+        # resolve (and closure_problems' route walk), never collapsed here.
+        for token, base in (("@loader_path", here), ("@executable_path", exe)):
+            if p == token or p.startswith(token + "/"):
+                return base + p[len(token):]
+        return p
+    own = [expand(t) for c, t in cmds if c == LC_RPATH]
+    stack = own + [r for r in inherited if r not in own]
+    libs, weak_absent, searched = [], [], []
+    for c, name in cmds:
+        if c in (LC_RPATH, LC_LOAD_DYLINKER):
+            continue
+        if name.startswith("@rpath/"):
+            tail = name[len("@rpath/"):]
+            if not stack:
+                raise Tooling(f"{binary} loads {name} with no rpath to resolve it")
+            hit = None
+            for r in stack:
+                cand = os.path.join(r, tail)
+                searched.append(os.path.dirname(cand))
+                if exists(cand):
+                    hit = cand
+                    break
+            path = hit or os.path.join(stack[0], tail)
+        else:
+            path = expand(name)
+        if not path.startswith("/"):
+            raise Tooling(f"{binary} names a library dyld could not place: {name}")
+        if c == LC_LOAD_WEAK_DYLIB and not exists(path):
+            weak_absent.append(path)
+        else:
+            libs.append(path)
+    return libs, weak_absent, sorted(set(searched)), own
+
+
+def _macho_closure(binaries, main, arch=None):
+    """Every library `binaries` load, followed through every library outside
+    the sealed system (whose own dependencies the dyld shared cache holds),
+    each with the rpath stack inherited from the image that loaded it; the
+    absent weak libraries and every searched directory, to be judged as
+    would-be places."""
+    libs, optional, todo, done = set(), set(), [(b, ()) for b in binaries], set()
+    while todo:
+        b, inherited = todo.pop()
+        if (b, inherited) in done:
+            continue
+        done.add((b, inherited))
+        found, weak_absent, searched, own = macho_libraries(b, main, inherited, arch)
+        optional.update(weak_absent)
+        optional.update(searched)
+        stack = tuple(own + [r for r in inherited if r not in own])
+        for lib in found:
+            libs.add(lib)
+            if not lib.startswith(SEALED_PREFIXES) and os.path.isfile(lib):
+                todo.append((lib, stack))
+    return sorted(libs), sorted(optional)
+
+
+def elf_dynamic(path):
+    """(PT_INTERP or None, [DT_RPATH and DT_RUNPATH entries]) of an ELF file,
+    read from its headers and dynamic section: nothing runs. Tooling for a
+    file that is not a readable ELF."""
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError as e:
+        raise Tooling(f"cannot read {path}: {e.strerror}") from None
+    if len(data) < 52 or data[:4] != b"\x7fELF" or data[4] not in (1, 2) or data[5] not in (1, 2):
+        raise Tooling(f"{path} is not an ELF file")
+    end, wide = ("<" if data[5] == 1 else ">"), data[4] == 2
+    try:
+        if wide:
+            phoff, = struct.unpack(end + "Q", data[32:40])
+            phentsize, phnum = struct.unpack(end + "HH", data[54:58])
+        else:
+            phoff, = struct.unpack(end + "I", data[28:32])
+            phentsize, phnum = struct.unpack(end + "HH", data[42:46])
+        interp, dynamic, loads = None, None, []
+        for i in range(phnum):
+            h = data[phoff + i * phentsize:phoff + (i + 1) * phentsize]
+            if wide:
+                ptype, _, off, vaddr, _, filesz, _, _ = struct.unpack(end + "IIQQQQQQ", h[:56])
+            else:
+                ptype, off, vaddr, _, filesz, _, _, _ = struct.unpack(end + "IIIIIIII", h[:32])
+            if ptype == 3:
+                interp = data[off:off + filesz].split(b"\0", 1)[0].decode("ascii")
+            elif ptype == 2:
+                dynamic = (off, filesz)
+            elif ptype == 1:
+                loads.append((vaddr, off, filesz))
+        paths = []
+        if dynamic:
+            fmt = end + ("qQ" if wide else "iI")
+            step = struct.calcsize(fmt)
+            entries, strtab = [], None
+            for at in range(dynamic[0], dynamic[0] + dynamic[1] - step + 1, step):
+                tag, val = struct.unpack(fmt, data[at:at + step])
+                if tag == 0:
+                    break
+                if tag == 5:
+                    strtab = val
+                entries.append((tag, val))
+            base = next((o + strtab - v for v, o, s in loads if strtab is not None and v <= strtab < v + s), None)
+            for tag, val in entries:
+                if tag in (15, 29):          # DT_RPATH, DT_RUNPATH
+                    if base is None:
+                        raise Tooling(f"{path} names a run path its string table cannot place")
+                    raw = data[base + val:].split(b"\0", 1)[0].decode("ascii")
+                    paths += [p for p in raw.split(":") if p]
+        return interp, paths
+    except (struct.error, UnicodeDecodeError, IndexError) as e:
+        raise Tooling(f"{path}: its ELF headers cannot be read: {e}") from None
+
+
+#: The anchor loader's list-mode lines (d3.3 §3.6b), each whole, tab first:
+#: a vdso line by its leading name (either form), `<name> => <path> (0x…)`
+#: and `<path> (0x…)`. Any other line refuses.
+_LIST_VDSO = re.compile(r"\t(?:linux-vdso\.so\.1|linux-gate\.so\.1)(?: =>  | )\(0x[0-9a-f]+\)")
+_LIST_NAMED = re.compile(r"\t([A-Za-z0-9._+-]+) => (/[!-~]*) \(0x[0-9a-f]+\)")
+_LIST_PATH = re.compile(r"\t(/[!-~]*) \(0x[0-9a-f]+\)")
+
+
+def list_mode_libraries(b, out, err, rc, loader=None):
+    """The libraries the anchor loader listed for `b` in its list mode,
+    parsed as d3.3 §3.6b closes it: any rc but 0, any byte on stderr, or any
+    line outside the three forms refuses (a `not found` line among them); a
+    lone `statically linked` is an empty set. With `loader`, b is the
+    interpreter and must list that loader as its own, found by its text."""
+    if rc != 0:
+        raise Tooling(f"the loader cannot list {b}'s libraries (exit {rc})")
+    if err:
+        raise Tooling(f"the loader wrote to its error stream while listing {b}")
+    try:
+        text = out.decode("ascii")
+    except UnicodeDecodeError:
+        raise Tooling(f"the loader listed {b} outside ASCII") from None
+    lines = text[:-1].split("\n") if text.endswith("\n") else text.split("\n")
+    if lines == ["\tstatically linked"]:
+        return []
+    libs, own = [], False
+    for line in lines:
+        if _LIST_VDSO.fullmatch(line):
+            continue
+        m = _LIST_NAMED.fullmatch(line) or _LIST_PATH.fullmatch(line)
+        if not m:
+            raise Tooling(f"the loader printed a line outside the list mode's forms for {b}: {line!r}")
+        path = m.group(m.lastindex)
+        own = own or (m.re is _LIST_PATH and path == loader)
+        libs.append(path)
+    if loader is not None and not own:
+        raise Tooling(f"the loader did not list itself as {b}'s interpreter")
+    return libs
+
+
+def _trace_form(confstr=getattr(os, "confstr", None)):
+    """True on a glibc older than 2.33, whose loader lists in the
+    LD_TRACE_LOADED_OBJECTS form; root_trust.trace_form makes the same read."""
+    try:
+        v = confstr("CS_GNU_LIBC_VERSION") if confstr else None
+    except (ValueError, OSError):
+        return False
+    parts = (v or "").split()
+    if len(parts) != 2 or parts[0] != "glibc":
+        return False
+    try:
+        major, minor = (int(x) for x in parts[1].split(".")[:2])
+    except ValueError:
+        return False
+    return (major, minor) < (2, 33)
+
+
+def _elf_closure(binaries, run=subprocess.run, trace=None):
+    """Every library `binaries` link, as the anchor's own loader lists them in
+    its list mode (which maps them and runs none of their code; never ldd, a
+    shell script): each binary's PT_INTERP must be that loader. And every
+    DT_RPATH/DT_RUNPATH directory of every object, $ORIGIN expanded, to be
+    judged as would-be places: a library planted there would win."""
+    loader, _ = elf_dynamic(ANCHOR_SHELL)
+    if not loader:
+        raise Tooling(f"{ANCHOR_SHELL} names no loader")
+    libs, searched = set(), set()
+    for b in binaries:
+        interp, _ = elf_dynamic(b)
+        if interp is not None and interp != loader:
+            raise Tooling(f"{b} starts under {interp}, not the anchor's loader {loader}")
+        if interp is None and _links_nothing(b) is True:
+            continue        # a static ELF: no loader, no library; its file rule and route are its whole check
+        traced = _trace_form() if trace is None else trace
+        try:
+            p = run([loader, b] if traced else [loader, "--list", b], shell=False, close_fds=True,
+                    stdin=subprocess.DEVNULL, env={"LD_TRACE_LOADED_OBJECTS": "1"} if traced else {},
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            raise Tooling(f"the loader cannot list {b}'s libraries: {e}") from None
+        libs.update(list_mode_libraries(b, p.stdout, p.stderr, p.returncode))
+    for obj in sorted(set(binaries) | libs):
+        _, runpaths = elf_dynamic(obj)
+        for r in runpaths:
+            if "$" in r.replace("$ORIGIN", "").replace("${ORIGIN}", ""):
+                raise Tooling(f"{obj} names a run path this check does not judge: {r}")
+            # Textual, as the loader joins it: a `..` after a link is the kernel's (Codex d3 A2).
+            searched.add(r.replace("${ORIGIN}", "$ORIGIN").replace("$ORIGIN", os.path.dirname(obj)))
+    return sorted(libs), sorted(searched)
+
+
+def exec_closure(python, tools, spelled, platform=None):
+    """The startup closure of one root command, recomputed now: the
+    interpreter's standard library, platform library and extension modules
+    (asked of the interpreter, which root-trust.sh has already judged), the
+    interpreter and `tools` by realpath and by their spellings, and every
+    library they and the modules link. On macOS the libraries are read from
+    the Mach-O load commands, never through /usr/bin/otool (an xcrun stub),
+    and the rpath directories dyld searches are optional paths."""
+    try:
+        p = subprocess.run([python, "-I", "-S", "-B", "-c", _CLOSURE_QUERY], shell=False, close_fds=True,
+                           stdin=subprocess.DEVNULL, env={}, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                           timeout=60)
+        found = json.loads(p.stdout)
+        paths, zips = found["paths"], found["zips"]
+    except (OSError, subprocess.TimeoutExpired, ValueError, KeyError, TypeError) as e:
+        raise Tooling(f"the interpreter cannot say where its library is: {e}") from None
+    if not (isinstance(paths, list) and len(paths) == 3 and isinstance(zips, list)
+            and all(isinstance(x, str) and x.startswith("/") for x in paths + zips)):
+        raise Tooling("the interpreter did not name its library in absolute paths")
+    dynload = paths[2]
+    modules = sorted(os.path.join(dynload, n) for n in os.listdir(dynload) if n.endswith(".so")) \
+        if os.path.isdir(dynload) else []
+    binaries = [python] + list(tools)
+    if (platform or sys.platform) == "darwin":
+        libraries, searched = _macho_closure(binaries + modules, python)
+    else:
+        libraries, searched = _elf_closure(binaries + modules)
+    return {REQUIRED: sorted(set(paths + binaries + list(spelled))), LIBRARIES: libraries,
+            OPTIONAL: sorted(set(zips + searched))}
+
+
+def acl_problems(paths, platform=None, listxattr=getattr(os, "listxattr", None), run=subprocess.run):
+    """Each path that carries an access control list, which its mode bits do
+    not show. Linux: the POSIX ACL extended attributes, where a filesystem
+    that cannot hold any (ENOTSUP) has none, and any other error is a
+    problem. macOS: `ls -led`, whose entry lines are the ACL (its `@`
+    replaces `+` when extended attributes are also present)."""
+    bad = []
+    if (platform or sys.platform) == "darwin":
+        for i in range(0, len(paths), 256):
+            chunk = paths[i:i + 256]
+            try:
+                p = run(["/bin/ls", "-lden", "--"] + chunk, shell=False, close_fds=True, stdin=subprocess.DEVNULL,
+                        env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"}, stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE, timeout=120)
+            except (OSError, subprocess.TimeoutExpired) as e:
+                return [f"the ACLs cannot be read: {e}"]
+            if p.returncode != 0:
+                return [f"the ACLs cannot be read: ls exited {p.returncode}"]
+            current = None
+            for line in p.stdout.decode("utf-8", "replace").splitlines():
+                if re.match(r" \d+: ", line):
+                    bad.append(f"{current or '?'} carries an ACL")
+                else:
+                    current = next((c for c in chunk if line.endswith(" " + c) or line.endswith(" " + c + " -> ")
+                                    or (" " + c + " -> ") in line), current)
+        return sorted(set(bad))
+    for path in paths:
+        try:
+            names = listxattr(path, follow_symlinks=False)
+        except OSError as e:
+            if e.errno in (getattr(errno, "ENOTSUP", -1), getattr(errno, "EOPNOTSUPP", -1)):
+                continue
+            bad.append(f"{path}: its ACL cannot be read: {e.strerror}")
+            continue
+        if "system.posix_acl_access" in names or "system.posix_acl_default" in names:
+            bad.append(f"{path} carries an ACL")
+    return bad
+
+
+def loader_dirs(platform=None, read=None, glob_=None):
+    """The directories the loader searches or reads its configuration from,
+    each judged (with the directories above it) when it exists: Linux's
+    ld.so.cache and ld.so.conf with every file it includes and every
+    directory those name; macOS's dyld fallback directories."""
+    if (platform or sys.platform) == "darwin":
+        return list(DYLD_FALLBACK_DIRS)
+    import glob as globmod
+    read = read or (lambda p: open(p, encoding="utf-8", errors="replace").read())
+    glob_ = glob_ or globmod.glob
+    out, todo, done = [LD_SO_CACHE, LD_SO_CONF, LD_SO_CONF_D], [LD_SO_CONF], set()
+    while todo:
+        conf = todo.pop()
+        if conf in done:
+            continue
+        done.add(conf)
+        try:
+            text = read(conf)
+        except OSError:
+            continue
+        for line in text.splitlines():
+            line = line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            if line.startswith("include "):
+                pattern = line[len("include "):].strip()
+                if not pattern.startswith("/"):
+                    pattern = os.path.join(os.path.dirname(conf), pattern)
+                for f in sorted(glob_(pattern)):
+                    out.append(f)
+                    todo.append(f)
+            elif line.startswith("/"):
+                out.append(line)
+    return sorted(set(out))
+
+
+def trusted_exec(argv, also=(), shas=None, platform=None, execv=os.execv, tools=()):
+    """Judge root's command and exec it. Refused (Tooling, nothing run):
+    sudo anywhere in it (root's argv never holds sudo); a tool that is not
+    root's alone by the file rule and its textual route, judged BEFORE any
+    library discovery (the loader's list mode maps its target); a tool whose
+    pinned sha256 (`shas`) differs; and any problem in the closure, its
+    ACLs or the loader's directories. argv[0] is an allowlist (d3.3 §4.1):
+    its own interpreter in the one exact vector, or a tool the document
+    records (`tools`, by absolute path, carried on the rendered root line);
+    each --also tool is one of those too. Then os.execv of exactly `argv`."""
+    if not argv or not os.path.isabs(argv[0]):
+        raise Tooling("trusted-exec needs an absolute program")
+    if (platform or sys.platform) != "darwin" and os.path.lexists(LD_SO_PRELOAD):
+        raise Tooling(f"{LD_SO_PRELOAD} is present: the loader maps it into every process")
+    recorded = set(tools)
+    tools = [argv[0]] + [t for t in also if t != argv[0]]
+    for t in tools:
+        if os.path.basename(t) == "sudo":
+            raise Tooling(f"{t}: root's argv never holds sudo")
+    _bound(argv)
+    own = bool(sys.executable) and os.path.realpath(argv[0]) == os.path.realpath(sys.executable)
+    for t in tools:
+        if t not in recorded and not (t == argv[0] and own):
+            raise Tooling(f"{t} is not a tool the document records")
+    reals = []
+    for t in tools:
+        reals.append(_trusted_tool(t))
+        bad = closure_problems([t], platform=platform)
+        if bad:
+            raise Tooling(f"{t}'s route is not root's alone: " + "; ".join(bad[:5]))
+    for t, want in (shas or {}).items():
+        try:
+            with open(t, "rb") as f:
+                got = hashlib.sha256(f.read()).hexdigest()
+        except OSError as e:
+            raise Tooling(f"{t}: {e.strerror}") from None
+        if got != want:
+            raise Tooling(f"{t} is not the client the document pins (sha256 {got})")
+    python = sys.executable
+    if not python or not os.path.isabs(python):
+        raise Tooling("the running interpreter has no absolute path")
+    closure = exec_closure(_trusted_tool(python), reals, [python] + tools, platform=platform)
+    darwin = (platform or sys.platform) == "darwin"
+    fallthrough = any(not os.path.lexists(p) and not p.startswith(SEALED_PREFIXES) for p in closure[OPTIONAL])
+    if not darwin or fallthrough:
+        closure[OPTIONAL] = sorted(set(closure[OPTIONAL] + loader_dirs(platform)))
+    judged = []
+    bad = closure_problems(closure, platform=platform, seen=judged)
+    bad += acl_problems(sorted(set(judged)), platform=platform)
+    if bad:
+        raise Tooling("the closure is not root's alone: " + "; ".join(sorted(set(bad))[:5]))
+    execv(argv[0], argv)
+
+
+#: Programs that would run a command string nothing judged.
+SHELLS = frozenset({"sh", "bash", "dash", "zsh", "ksh", "csh", "tcsh", "fish", "busybox"})
+#: Programs that exec another program named in their own arguments, which
+#: trusted-exec would never judge: refused as argv[0] even when a document
+#: records one as a tool (Opus d3.3 N2).
+EXEC_WRAPPERS = frozenset({"env", "timeout", "xargs", "nice", "nohup", "setsid", "stdbuf", "flock", "find", "chroot",
+                           "runuser", "perl", "busybox", "sudo", "doas", "su", "nsenter", "unshare", "ionice",
+                           "taskset", "chrt", "time", "watch", "script", "expect", "python", "python2", "awk",
+                           "gawk", "mawk", "nawk", "sed", "ruby", "node", "lua", "tclsh", "osascript", "launchctl",
+                           "systemd-run", "caffeinate", "arch", "sandbox-exec"})
+#: The one way trusted-exec execs its own interpreter: these flags, then this writer, then a step.
+OWN_FLAGS = ("-I", "-S", "-B")
+
+
+def _bound(argv):
+    """What trusted-exec execs is what it judged, and nothing more: no #!
+    file (its interpreter would go unjudged); no shell at all, under any
+    flags (a string or a file nothing judged); no exec wrapper, by name or
+    by what it resolves to, recorded or not; and its own interpreter only
+    as the exact vector `<python3> -I -S -B <this writer> <step> ...`, the
+    writer this very file by path (root_exec pinned its sha256)."""
+    try:
+        with open(argv[0], "rb") as f:
+            if f.read(2) == b"#!":
+                raise Tooling(f"{argv[0]} is a #! script: its interpreter would run unjudged")
+    except OSError as e:
+        raise Tooling(f"{argv[0]}: {e.strerror}") from None
+    names = {os.path.basename(argv[0]), os.path.basename(os.path.realpath(argv[0]))}
+    if names & SHELLS:
+        raise Tooling(f"{argv[0]} is a shell: whatever it reads, nothing judged it")
+    if names & EXEC_WRAPPERS:
+        raise Tooling(f"{argv[0]} execs a program from its arguments, which nothing would judge")
+    if sys.executable and os.path.realpath(argv[0]) == os.path.realpath(sys.executable):
+        own = os.path.abspath(sys.argv[0]) if sys.argv and sys.argv[0] else None
+        if own is None or argv[1:4] != list(OWN_FLAGS) or len(argv) < 6 or os.path.abspath(argv[4]) != own:
+            raise Tooling("the interpreter is exec'd only as `<python3> -I -S -B <this writer> <step> ...`")
+
+
+def _trusted_exec_main(argv):
+    """trusted-exec [--tool TOOL]... [--also TOOL]... [--sha256 TOOL=HEX]... -- ARGV..."""
+    cut = argv.index("--")
+    opts, rest = argv[1:cut], argv[cut + 1:]
+    also, shas, tools = [], {}, []
+    while opts:
+        if opts[0] == "--tool" and len(opts) > 1:
+            tools.append(opts[1])
+        elif opts[0] == "--also" and len(opts) > 1:
+            also.append(opts[1])
+        elif opts[0] == "--sha256" and len(opts) > 1 and "=" in opts[1]:
+            t, _, h = opts[1].rpartition("=")
+            if not re.fullmatch(r"[0-9a-f]{64}", h):
+                raise Tooling(f"--sha256 {opts[1]}: not a sha256")
+            shas[t] = h
+        else:
+            raise Tooling("trusted-exec [--tool TOOL]... [--also TOOL]... [--sha256 TOOL=HEX]... -- ARGV...")
+        opts = opts[2:]
+    trusted_exec(rest, also, shas, tools=tools)
 
 
 def _engine_socket(endpoint):
@@ -2656,6 +3224,8 @@ def main(argv):
             place(argv[1], argv[2], sha256=argv[4], mode=int(argv[6], 8))
         elif len(argv) == 2 and argv[0] == "marker":
             marker(argv[1])
+        elif argv == ["noop"]:
+            pass        # the barrier's first line: everything was judged on the way here, and nothing runs
         elif len(argv) in (13, 14) and argv[0] == "partition-weekly" and (len(argv) == 13 or argv[13] == "--prospective"):
             opts = dict(zip(argv[1:13:2], argv[2:13:2]))
             if set(opts) != {"--exec-root", "--host", "--document", "--document-sha256", "--activation",
@@ -2666,9 +3236,12 @@ def main(argv):
                                     opts["--activation"], opts["--activation-sha256"], prospective=len(argv) == 14)
         elif len(argv) == 2 and argv[0] == "partition-provision":
             return partition_provision(argv[1])
-        elif len(argv) == 3 and argv[0] == "trusted-tools":
-            _verified_tools(argv[1], argv[2])
-            return 0
+        elif len(argv) >= 3 and argv[0] == "trusted-exec" and "--" in argv[1:]:
+            try:
+                _trusted_exec_main(argv)
+            except Tooling as e:
+                print(f"untrusted: {e}", file=sys.stderr)
+                return ROOT_TRUST_EXIT
         else:
             print(__doc__.split("\n\n")[1], file=sys.stderr)
             return 2
