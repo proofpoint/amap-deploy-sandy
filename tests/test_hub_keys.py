@@ -200,6 +200,10 @@ class Proc:
 
 
 class RunProbeTest(unittest.TestCase):
+    def setUp(self):
+        from _gate import open_gate
+        open_gate(self)
+
     def run_it(self, out_text, rc=0, apply=True):
         td = tempfile.TemporaryDirectory()
         self.addCleanup(td.cleanup)
@@ -238,6 +242,52 @@ class RunProbeTest(unittest.TestCase):
     def test_a_probe_that_exits_non_zero_fails(self):
         code, rec, _ = self.run_it("", rc=125)
         self.assertEqual((code, rec["result"]), (1, "FAIL"))
+
+    def barrier_spec(self, tmp):
+        import dataclasses
+        from types import SimpleNamespace
+        d = full_doc()
+        d[ss.SECTION]["run_dir"] = tmp
+        d[ss.SECTION]["docker_via_sudo"] = True
+        s = hs.load_spec(d)
+        return dataclasses.replace(s, supervision=SimpleNamespace(engine="unix:///var/run/hub.sock"))
+
+    def test_apply_runs_the_barrier_with_the_documents_engine_through_the_default_runner(self):
+        """Codex P1 at 184acedf: the client live_docker returns is what runs,
+        with no runner injected, not the bare `sudo -n docker`."""
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        s = self.barrier_spec(td.name)
+        ran = []
+        self.addCleanup(setattr, rh, "run", rh.run)
+        rh.run = lambda argv, **k: ran.append(list(argv)) or Proc(0, "0 ENOENT\n1 ENOENT\n")
+        code = hk.run_probe(s, s.keys, apply=True, run_id="r1", out=lambda x: None, now=lambda: 2_000_000_000)
+        self.assertEqual(code, 0)
+        [argv] = ran
+        sec = s.secrets
+        self.assertEqual(argv[:2], [sec.tools["sudo"], "-n"])
+        self.assertEqual(argv[2:8], ["/usr/bin/env", "-i", "PATH=/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL=C",
+                                     "DOCKER_HOST=unix:///var/run/hub.sock", "/bin/sh"])
+        at = argv.index("trusted-exec")
+        self.assertEqual(argv[at - 3:at], [sec.writer_sha256, sec.tools["python3"], sec.writer])
+        dash = argv.index("--", at)
+        self.assertEqual(argv[dash + 1:dash + 3], [sec.tools["docker"], "run"])
+        self.assertNotIn("sudo", " ".join(argv[2:]))
+
+    def test_a_refusing_gate_dispatches_no_probe_and_writes_nothing(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        s = self.barrier_spec(td.name)
+        ss._GATE.append(ss.Gate("not run: the writer is not the pinned one"))
+        self.addCleanup(ss._GATE.pop)
+        ran = []
+        self.addCleanup(setattr, rh, "run", rh.run)
+        rh.run = lambda argv, **k: ran.append(list(argv)) or Proc(0, "0 ENOENT\n1 ENOENT\n")
+        said = []
+        code = hk.run_probe(s, s.keys, apply=True, run_id="r1", out=said.append, now=lambda: 2_000_000_000)
+        self.assertEqual((code, ran), (1, []))
+        self.assertIn("not the pinned one", said[-1])
+        self.assertFalse(os.path.exists(os.path.join(td.name, hk.EVIDENCE_NAME)))
 
     def test_without_apply_nothing_runs_or_is_written(self):
         code, rec, said = self.run_it("0 ENOENT\n1 ENOENT\n", apply=False)
@@ -527,6 +577,8 @@ class ReadJsonTest(unittest.TestCase):
             hk.read_json(self.write(b'{"a": 1, "a": 2}'))
 
     def test_the_record_writer_survives_short_writes(self):
+        from _gate import open_gate
+        open_gate(self)
         real = os.write
         os.write = lambda fd, b: real(fd, bytes(b[:5]))
         try:

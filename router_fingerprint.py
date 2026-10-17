@@ -1509,7 +1509,7 @@ def _run(args: Any, *, out: Callable[[str], None], git: Optional[str], runner: R
                 f"router-fingerprint-image-<at>.json into {spec.secrets.run_dir} (dry run; --apply to capture)")
             return 0
         try:
-            doc = capture_image(docker, args.image, run=runner)
+            doc = capture_image(ss_live_docker(spec), args.image, run=runner)
         except CaptureError as e:
             out(f"router-fingerprint: {e}")
             return EXIT[UNKNOWN]
@@ -1526,7 +1526,7 @@ def _run(args: Any, *, out: Callable[[str], None], git: Optional[str], runner: R
             "(dry run; --apply to capture)")
         return 0
     try:
-        doc = capture_running(docker, name, args.step, run=runner)
+        doc = capture_running(ss_live_docker(spec), name, args.step, run=runner)
     except CaptureError as e:
         out(f"router-fingerprint: {e}")
         return EXIT[UNKNOWN]
@@ -1535,8 +1535,22 @@ def _run(args: Any, *, out: Callable[[str], None], git: Optional[str], runner: R
 
 
 def ss_docker(spec: Any) -> List[str]:
+    """docker as a dry run shows it."""
     import secret_setup as ss
     return ss.docker(spec.secrets)
+
+
+def ss_live_docker(spec: Any) -> List[str]:
+    """docker for a call that runs now: through secret_setup's gate and, on
+    the sudo route, the barrier (d3.3 §5(c)). The local router is on the
+    default engine, so no DOCKER_HOST is named. A refusal is a CaptureError,
+    reported as UNKNOWN before anything runs."""
+    import router_health as rh
+    import secret_setup as ss
+    try:
+        return ss.live_docker(spec.secrets)
+    except rh.CannotRun as e:
+        raise CaptureError(f"could not run: {e}") from None
 
 
 def _load_spec(args: Any, out: Callable[[str], None], *, secrets: bool) -> Any:

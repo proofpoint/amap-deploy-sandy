@@ -45,7 +45,7 @@ class A1(tai.A3):
         self.live.write_text(json.dumps(self.doc, indent=2) + "\n")
         self.spec = SimpleNamespace(**{k: getattr(self.spec, k) for k in (
             "partition", "router", "keys", "gate", "overlay_pin", "hub", "fleet_keys", "hops")},
-            secrets=SimpleNamespace(run_dir=str(self.t / "run"), writer_dir="/opt/ex/libexec"),
+            secrets=SimpleNamespace(run_dir=str(self.t / "run"), writer_dir="/opt/ex/libexec", writer_sha256="b" * 64),
             runtime_of=self.spec.runtime_of)
         self.policy = {"fleet_domain": tai.FLEET_DOMAIN, "hop_link": {
             "link": "link-a", "trusted_fleet_hosts": list(self.link.trusted), "egress": True,

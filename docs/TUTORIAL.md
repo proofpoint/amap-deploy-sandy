@@ -502,7 +502,11 @@ root, the lock file and the state, and checks, without reading the secret:
   git configuration ignored;
 - each tool is a regular executable whose real path, and every directory
   above it, is owned by root or the operator and not group- or
-  world-writable;
+  world-writable. docker, python3, sudo and install, which root executes, must be
+  root's alone: the real path, every directory above it, and every
+  directory above the recorded path, so no one else can repoint a link.
+  A docker inside an operator-owned application bundle (OrbStack's), or a
+  python3 under the operator's home, fails here: record root-owned ones;
 - the hub ssh key is pinned in a 0400 known_hosts, and ssh's effective
   host-key checking is strict in the producer's own option order;
 - the volume holds exactly what the state says, read by `stat-secret` in a
@@ -564,7 +568,10 @@ wrapper's refusal rather than a probe result. `probe-weekly` keeps a class
 only when the probe's exit is that class's own; a stopped engine is
 recorded as `engine_unavailable` without running anything, and a probe that
 outruns its time has its containers removed by the run's label and is
-recorded as `timeout`.
+recorded as `timeout`. Before anything runs, `probe-weekly` checks that its
+interpreter, the docker client and the probe's program are root's alone,
+with their startup closure, as the weekly partition job checks its own; when
+they are not it refuses (`refused: tools`), runs nothing and records nothing.
 
 ### The hub-link router's files
 
@@ -1005,12 +1012,14 @@ Activation is A1 to A5, then the weekly job's first manual run. Each step
 is required before the next, and each command prints the next step.
 
 Every Docker call the activation verbs make goes through the document's
-docker client (`docker`, or `sudo -n docker` where `docker_via_sudo` is
-set), with no `-H`. So the local router and the hub-link router must run on
-the one engine that client reaches, and `supervision.engine` must name that
-engine. Under sudo's default environment reset, `sudo -n` drops `DOCKER_HOST`. If
-the engines differ, the checks fail closed: a router on another engine
-reads as not running.
+docker client, with no `-H`. That client is `docker` itself, or, where
+`docker_via_sudo` is set, `sudo -n` followed by the root barrier line
+(`/usr/bin/env -i …`, then root-trust.sh's root_exec and trusted-exec, then
+docker). Outside `verify`'s own run that line names no `DOCKER_HOST`, so
+docker reaches its default engine. The local router and the hub-link router
+must therefore run on that one engine, and `supervision.engine` must name
+it. If the engines differ, the checks fail closed: a router on another
+engine reads as not running.
 
 0. **Before A1, on each host, in this order.** A2's evidence, the
    post-activation document and the key probe's record bind the approved
@@ -1315,6 +1324,63 @@ the local router signs. A crash or boot restart of the hub-link router is
 its supervisor's (systemd `Restart=on-failure`, launchd `KeepAlive`) and is
 not gated: the check governs the start step it prints and launchd's
 enablement.
+
+Every command root runs for the hub-link router goes through one barrier:
+an empty environment, then `root_exec` from `root-trust.sh`, placed root
+0444 beside the writer. It judges the operating system's own python3 and the
+pinned writer before either runs, and the writer's `trusted-exec` then
+judges the command and everything it loads before it executes it. Every
+start, the gated one and each restart, first runs that barrier over docker:
+systemd's first `ExecStartPre`, whose failure fails the start, and the
+launchd wrapper, which then records `untrusted_tools` and exits 0, so
+launchd does not restart it. Root runs no docker that is not root's alone.
+
+A stop goes through the barrier too, so a refused stop never reaches
+`docker stop`. On macOS the wrapper says "the stop was refused or failed",
+and when launchd's `ExitTimeOut` ends the wrapper, the container is still
+running. On Linux, systemd then sends its own TERM to the docker client.
+The client is attached, so it should forward that TERM to the container,
+but this has not been measured. On either system, if `docker ps` still
+names the hub-link router after a stop, find out why the barrier refused
+before you stop the container by hand.
+
+On macOS the wrapper's error stream goes to `hub-link-run.err`, beside its
+status in the root-owned status directory. It holds only the wrapper's own
+lines: the router's output goes to the engine's log (`docker logs`).
+`verify` reads both files. Two consequences follow from where the router's
+output goes:
+- With `hub.log_driver` set to `none`, the hub-link router's observation
+  lines are not kept anywhere on macOS.
+- The `json-file` driver does not rotate unless the daemon sets `log-opts`;
+  the `local` driver does.
+
+If a start ends in exit 125 (docker never started the container), the
+wrapper says what the engine reports about the image and about a container
+of that name before passing the code on. A missing
+status is a failure, not "never started", because a refusal that cannot
+record itself removes the last one. A refusal is a failure whether or not it
+was recorded.
+
+`verify`'s own live engine calls go through the same barrier. Each runs
+only when the interpreter, the pinned writer, docker's startup closure
+(computed as you) and sudo all pass. On the sudo route each call is
+`sudo -n /usr/bin/env -i PATH=… LC_ALL=C DOCKER_HOST=<engine> /bin/sh -c
+'<the fixed source line> root_exec "$@"' sh <writer sha256> <python3> <writer>
+trusted-exec --tool … -- <docker> …`.
+
+No sudoers rule is safe for that invocation yet, so the sudo route is
+unavailable. sudoers compares the arguments as one space-joined string, so
+it cannot keep `env`'s assignments apart from the command it runs. The
+arguments `-i`, then one `PATH=<everything else>`, then any program join
+to the same string as the intended ones, and `env` would run that program
+as root, skipping `/bin/sh`, `root_exec` and `trusted-exec`. Do NOT install
+a `NOPASSWD` rule for `/usr/bin/env`, however narrow it looks. Without one,
+`sudo -n` refuses, and no live check on that route can read the engine.
+The route needs a fixed-purpose, root-owned entry point that enforces the
+argument boundary before running anything the caller chose. Any grant that
+lets this invocation run without one is root-equivalent, the same class as
+the old docker grant (root through the engine's socket). That entry point is
+a separate, reviewed change, not part of this setup.
 
 
 ### The weekly partition job's tools

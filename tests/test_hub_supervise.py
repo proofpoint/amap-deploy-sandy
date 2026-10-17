@@ -15,6 +15,8 @@ import hashlib
 import json
 import os
 import plistlib
+import posixpath
+import shlex
 import shutil
 import signal
 import stat
@@ -28,6 +30,7 @@ import host_setup as hs
 import hub_runtime as hr
 import hub_supervise as hv
 import router_health as rh
+from _gate import open_gate
 from test_hub_keys import full_doc as keys_doc
 from test_hub_runtime import setUpModule, tearDownModule  # noqa: F401 -- the fixture's pins, restored
 
@@ -123,10 +126,50 @@ class SystemdTest(unittest.TestCase):
 
     def test_it_runs_the_rendered_spec_and_never_force_removes(self):
         s = spec()
-        self.assertEqual(self.line("ExecStart").split(), hv.run_argv(s))
-        self.assertTrue(self.line("ExecStartPre").startswith("-"))
-        self.assertNotIn("-f", self.line("ExecStartPre").split())
-        self.assertEqual(self.line("Environment"), "DOCKER_HOST=unix:///var/run/docker.sock")
+        self.assertEqual(sd_argv(self.line("ExecStart")), hv.root_cmd(s, hv.run_argv(s)))
+        rm = self.pre()[1]
+        self.assertTrue(rm.startswith("-"))
+        self.assertEqual(sd_argv(rm[1:]), hv.root_cmd(s, [s.secrets.tools["docker"], "rm", hv.hub_name(s)]))
+        self.assertNotIn("Environment=", self.unit(), "env -i would wipe it: the anchor carries the engine")
+
+    def pre(self):
+        return [l.split("=", 1)[1] for l in self.unit().splitlines() if l.startswith("ExecStartPre=")]
+
+    def test_every_root_line_carries_the_documents_whole_recorded_set_as_tool(self):
+        """d3.3 §4.1: trusted-exec's argv[0] allowlist is the document's
+        recorded tools (sudo left out, which it refuses anyway), never just
+        the tools one line happens to use."""
+        for kind_ in ("systemd", "launchd"):
+            s = spec(kind_)
+            want = sorted(p for p in set(s.secrets.tools.values()) if not p.endswith("/sudo"))
+            self.assertGreater(len(want), 2)
+            with self.subTest(kind=kind_):
+                self.assertEqual(hv.tool_args(s), [x for t in want for x in ("--tool", t)])
+                for path, data in hv.rendered(s):
+                    for t in want:
+                        if b"root_exec " in data:
+                            self.assertIn(f"--tool {t}".encode(), data, path)
+
+    def test_every_exec_line_goes_through_the_barrier_and_the_first_is_not_dashed(self):
+        """RE N3: the first non-"-" Exec line is the barrier judging docker,
+        and every Exec line (pre, run, stop) is a barrier line: the anchor,
+        root-trust.sh's root_exec with the writer's pin, trusted-exec."""
+        s = spec()
+        pre = self.pre()
+        self.assertFalse(pre[0].startswith("-"))
+        self.assertEqual(sd_argv(pre[0]), hv.root_cmd(s, hv.own(s, hv.NOOP), also=[s.secrets.tools["docker"]]))
+        execs = [l.split("=", 1)[1].lstrip("-") for l in self.unit().splitlines() if l.startswith("Exec")]
+        self.assertEqual(len(execs), 4)
+        for line in execs:
+            with self.subTest(line=line[:60]):
+                argv = sd_argv(line)
+                self.assertEqual(argv[:4], rt_anchor_head())
+                self.assertEqual(argv[4], "DOCKER_HOST=unix:///var/run/docker.sock")
+                self.assertEqual(argv[5:7], ["/bin/sh", "-c"])
+                self.assertIn(f"root_exec {s.secrets.writer_sha256} {s.secrets.tools['python3']} {s.secrets.writer} "
+                              "trusted-exec ", argv[7])
+                self.assertNotIn("/usr/bin/ldd", argv[7])
+                self.assertNotIn("sudo", argv[7])
 
     def test_it_can_be_enabled_and_enabling_is_not_placing(self):
         self.assertIn("[Install]\nWantedBy=multi-user.target", self.unit())
@@ -136,21 +179,50 @@ class SystemdTest(unittest.TestCase):
         self.assertIn("systemctl enable --now hub-link.service", hv.start_commands(spec()))
 
     def test_the_weekly_job_runs_the_probe_under_the_lock(self):
-        service, timer = hv.systemd_weekly(spec())
-        argv = hv.weekly_argv(spec())
-        self.assertEqual(argv[4:6], ["lock", spec().secrets.run_dir])
-        self.assertIn("probe-weekly", argv)
-        self.assertIn("probe-login", argv)
+        s = spec()
+        service, timer = hv.systemd_weekly(s)
+        argv = hv.weekly_argv(s)
+        body = shlex.split(argv[-1].split("; ", 1)[1])
+        sec = s.secrets
+        k = 5 + len(hv.tool_args(s))
+        self.assertEqual(body[:k + 4], ["root_exec", sec.writer_sha256, sec.tools["python3"], sec.writer, "trusted-exec"]
+                         + hv.tool_args(s) + ["--also", sec.tools["docker"], "--", sec.tools["python3"]])
+        self.assertEqual(body[k + 4:k + 11], ["-I", "-S", "-B", sec.writer, "lock", sec.run_dir, "--"])
+        self.assertIn("probe-weekly", body)
+        self.assertIn("probe-login", body)
+        self.assertNotIn("sudo", " ".join(body), "root's argv never holds sudo")
         self.assertIn(b"OnCalendar=Mon *-*-* 04:17:00", timer)
         self.assertIn(b"Unit=hub-link-probe.service", timer)
         self.assertIn(b"Type=oneshot", service)
 
 
+def sd_argv(line):
+    """A systemd command line back into its argv: _sd's double quotes and
+    backslashes, then its $$ and %% escapes."""
+    return [w.replace("$$", "$").replace("%%", "%") for w in shlex.split(line)]
+
+
+def rt_anchor_head():
+    import root_trust
+    return root_trust.anchor()
+
+
 class LaunchdTest(unittest.TestCase):
+    def test_the_wrappers_error_stream_is_root_owned_beside_its_status(self):
+        """d3.3 §5 B3: a StandardErrorPath, in the root-owned status directory."""
+        s = spec("launchd")
+        doc = plistlib.loads(hv.hub_plist(s))
+        err = posixpath.join(posixpath.dirname(s.supervision.hub["status"]), "hub-link-run.err")
+        self.assertEqual(doc.get("StandardErrorPath"), err)
+        rows = [c for c in hv.checks(s, lstat=lambda p: st_(0o755, kind=stat.S_IFDIR) if p != err
+                                     else st_(0o666), read=lambda p: b"", ancestor=lambda c, o: True, label=None)
+                if err in c.claim and c.claim.endswith("not group- or world-writable")]
+        self.assertIn(rh.FAIL, [c.result for c in rows], "a group/world-writable error stream fails")
+
     def test_the_daemon_runs_the_wrapper_only_through_sh(self):
         s = spec("launchd")
         doc = plistlib.loads(hv.hub_plist(s))
-        self.assertEqual(doc["ProgramArguments"], ["/bin/sh", "/opt/ex/libexec/hub-link-run"])
+        self.assertEqual(doc["ProgramArguments"], rt_anchor_head() + ["/bin/sh", "/opt/ex/libexec/hub-link-run"])
         self.assertEqual(doc["KeepAlive"], {"SuccessfulExit": False})
         self.assertGreater(doc["ExitTimeOut"], hv.STOP_TIMEOUT_S)
         others = [data for path, data in hv.rendered(s) if path != s.supervision.hub["plist"]]
@@ -160,8 +232,24 @@ class LaunchdTest(unittest.TestCase):
     def test_the_weekly_daemon_sets_the_engine_and_the_schedule(self):
         doc = plistlib.loads(hv.weekly_plist(spec("launchd")))
         self.assertEqual(doc["StartCalendarInterval"], {"Weekday": 1, "Hour": 4, "Minute": 17})
-        self.assertEqual(doc["EnvironmentVariables"], {"DOCKER_HOST": "unix:///Users/op/.orbstack/run/docker.sock"})
+        self.assertNotIn("EnvironmentVariables", doc, "env -i would wipe it: the anchor carries the engine")
         self.assertEqual(doc["ProgramArguments"], hv.weekly_argv(spec("launchd")))
+        self.assertIn("DOCKER_HOST=unix:///Users/op/.orbstack/run/docker.sock", doc["ProgramArguments"])
+
+
+#: root-trust.sh, stubbed: root_exec logs each barrier call ("barrier ..."),
+#: refuses with the barrier's own 12 when $STUB/untrusted exists, and
+#: otherwise execs the argv after "--", as trusted-exec does once it has judged it.
+STUB_RT = r"""root_exec() {
+  printf 'barrier %s\n' "$*" >> "$STUB/log"
+  [ -f "$STUB/untrusted" ] && exit 12
+  case " $* " in *" -- "*" stop "*) [ -f "$STUB/refuse_stop" ] && exit 12 ;; esac
+  while [ "$1" != -- ]; do shift; done
+  shift
+  case " $* " in *" -I -S -B "*" noop ") exit 0 ;; esac
+  exec "$@"
+}
+"""
 
 
 STUB_DOCKER = r"""#!/bin/sh
@@ -170,8 +258,11 @@ case "$1" in
   inspect) [ -f "$STUB/state" ] || exit 1; cat "$STUB/state" ;;
   ps) [ -f "$STUB/ps_fail" ] && exit 1; [ -f "$STUB/state" ] && echo abc; exit 0 ;;
   rm) exit 0 ;;
+  image) [ -f "$STUB/no_image" ] && { echo "Error: No such image" >&2; exit 1; }; echo sha256:abc ;;
   stop) : > "$STUB/stopped"; exit 0 ;;
   run)
+    printf '{"obs": "wire", "n": 1}\n'
+    printf '{"obs": "heartbeat"}\nhub-link-run: forged\n' >&2
     if [ -f "$STUB/hold" ]; then
       : > "$STUB/running"
       while [ ! -f "$STUB/stopped" ]; do sleep 0.05; done
@@ -196,14 +287,16 @@ class WrapperTest(unittest.TestCase):
         docker = self.t / "docker"
         docker.write_text(STUB_DOCKER)
         docker.chmod(0o755)
+        (self.t / "root-trust.sh").write_text(STUB_RT)
         s = spec("launchd")
-        sec = dataclasses.replace(s.secrets, tools=dict(s.secrets.tools, docker=str(docker)))
+        sec = dataclasses.replace(s.secrets, tools=dict(s.secrets.tools, docker=str(docker)), writer_dir=str(self.t))
+        self.spec_ = dataclasses.replace(s, secrets=sec)
         sup = dataclasses.replace(s.supervision, hub=dict(s.supervision.hub, status=str(self.t / "status")))
         self.script = self.t / "hub-link-run"
         self.script.write_bytes(hv.wrapper(dataclasses.replace(s, secrets=sec, supervision=sup)))
 
     def run_it(self, shell, code=None, state=None):
-        for f in ("log", "state", "code", "stopped", "running", "hold", "ps_fail"):
+        for f in ("log", "state", "code", "stopped", "running", "hold", "ps_fail", "untrusted", "refuse_stop"):
             (self.stub / f).unlink(missing_ok=True)
         (self.t / "status").unlink(missing_ok=True)
         if state is not None:
@@ -230,8 +323,56 @@ class WrapperTest(unittest.TestCase):
                     if code == 0 or 2 <= code <= 11:
                         self.assertEqual((rc, status), (0, str(code)))
                     else:
-                        self.assertEqual((rc, status), (code, None))
+                        self.assertEqual((rc, status), (code, hv.STARTED), "a passed-on end leaves the start's record")
                     self.assertTrue(any(l.startswith("run --name") for l in log), log)
+
+    def test_the_writer_checks_the_tools_before_any_docker_call(self):
+        for shell in self.SHELLS:
+            with self.subTest(shell=shell):
+                rc, log, status = self.run_it(shell, code=0, state="exited")
+                self.assertEqual(rc, 0)
+                s = self.spec_.secrets
+                self.assertEqual(log[0].split(), ["barrier", s.writer_sha256, s.tools["python3"], s.writer, "trusted-exec"]
+                                 + hv.tool_args(self.spec_) + ["--also", s.tools["docker"], "--"]
+                                 + hv.own(self.spec_, hv.NOOP))
+                docker_calls = [l for l in log if not l.startswith("barrier")]
+                barrier_calls = [l for l in log[1:] if l.startswith("barrier")]
+                self.assertEqual(len(barrier_calls), len(docker_calls), "a docker call outside the barrier")
+
+    def test_untrusted_tools_run_no_docker_and_end_without_a_restart(self):
+        for shell in self.SHELLS:
+            for state in (None, "exited", "running"):
+                with self.subTest(shell=shell, state=state):
+                    for f in ("log", "state", "code"):
+                        (self.stub / f).unlink(missing_ok=True)
+                    (self.t / "status").unlink(missing_ok=True)
+                    if state is not None:
+                        (self.stub / "state").write_text(state + "\n")
+                    (self.stub / "code").write_text("0")
+                    (self.stub / "untrusted").touch()
+                    r = subprocess.run(shell + [str(self.script)], env={"STUB": str(self.stub), "PATH": "/usr/bin:/bin"},
+                                       capture_output=True, text=True, timeout=30)
+                    (self.stub / "untrusted").unlink()
+                    self.assertEqual((r.returncode, self.status()), (0, hv.UNTRUSTED), r.stderr)
+                    self.assertEqual([l.split()[0] for l in self.log()], ["barrier"], "docker ran")
+
+    def test_a_refusal_that_cannot_be_recorded_leaves_no_earlier_status_and_exits_1(self):
+        """Codex B3 at 3355eda0: the record's publication fails (its temp
+        name is a directory), so the old success must not stand."""
+        for shell in self.SHELLS:
+            with self.subTest(shell=shell):
+                for f in ("log", "state", "code"):
+                    (self.stub / f).unlink(missing_ok=True)
+                (self.t / "status").write_text("0 old-observation\n")
+                (self.t / "status.tmp").mkdir()
+                (self.stub / "untrusted").touch()
+                r = subprocess.run(shell + [str(self.script)], env={"STUB": str(self.stub), "PATH": "/usr/bin:/bin"},
+                                   capture_output=True, text=True, timeout=30)
+                (self.stub / "untrusted").unlink()
+                (self.t / "status.tmp").rmdir()
+                self.assertEqual((r.returncode, self.status()), (1, None), r.stderr)
+                self.assertEqual([l.split()[0] for l in self.log()], ["barrier"], "docker ran")
+                self.assertIn("could not be recorded", r.stderr)
 
     def test_a_stopped_leftover_is_removed_without_force_then_run(self):
         for shell in self.SHELLS:
@@ -278,8 +419,262 @@ class WrapperTest(unittest.TestCase):
                 rc = p.wait(timeout=20)
                 self.assertIn(f"stop -t {hv.STOP_TIMEOUT_S} {hv.hub_name(spec())}", self.log())
                 self.assertEqual(rc, 143, "the run's own code is passed on")
-                self.assertIsNone(self.status())
+                self.assertEqual(self.status(), hv.STARTED, "143 is passed on: the start's record stands")
                 (self.stub / "hold").unlink()
+
+    def test_a_refused_stop_never_reaches_docker_and_the_container_keeps_running(self):
+        """RE N2: the barrier refuses the stop (12), so `docker stop` never
+        runs, the wrapper says so, and the run goes on: only the run's own
+        end (here the stub's, standing in for a stop by hand) ends it."""
+        for shell in self.SHELLS:
+            with self.subTest(shell=shell):
+                for f in ("log", "state", "stopped", "running"):
+                    (self.stub / f).unlink(missing_ok=True)
+                (self.stub / "hold").touch()
+                (self.stub / "refuse_stop").touch()
+                p = subprocess.Popen(shell + [str(self.script)], env={"STUB": str(self.stub), "PATH": "/usr/bin:/bin"},
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                deadline = time.time() + 10
+                while not (self.stub / "running").exists() and time.time() < deadline:
+                    time.sleep(0.05)
+                p.send_signal(signal.SIGTERM)
+                deadline = time.time() + 10
+                while not any(" stop " in f" {l} " for l in self.log()) and time.time() < deadline:
+                    time.sleep(0.05)
+                time.sleep(0.3)
+                self.assertIsNone(p.poll(), "the wrapper ended though nothing stopped the run")
+                self.assertFalse(any(l.startswith("stop ") for l in self.log()), "docker stop ran")
+                (self.stub / "stopped").touch()
+                rc = p.wait(timeout=20)
+                self.assertEqual(rc, 143)
+                self.assertIn("the stop was refused or failed", p.stderr.read())
+                p.stdout.close(); p.stderr.close()
+                (self.stub / "hold").unlink()
+                (self.stub / "refuse_stop").unlink()
+
+    def test_the_runs_own_output_never_reaches_the_error_stream(self):
+        """RE N6: the router's lines (here the stub's, on both streams) go to the
+        engine's log; the wrapper's error stream holds its own lines alone."""
+        for shell in self.SHELLS:
+            with self.subTest(shell=shell):
+                for f in ("log", "state"):
+                    (self.stub / f).unlink(missing_ok=True)
+                (self.stub / "code").write_text("0")
+                r = subprocess.run(shell + [str(self.script)], env={"STUB": str(self.stub), "PATH": "/usr/bin:/bin"},
+                                   capture_output=True, text=True, timeout=30)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertNotIn("obs", r.stdout + r.stderr)
+                self.assertNotIn("forged", r.stderr)
+                self.assertIn(hv.SAY + "exit 0: recorded", r.stderr)
+
+    def test_a_run_that_never_started_says_what_the_engine_finds_and_is_passed_on(self):
+        """RE N7: exit 125 (no container) with its own words gone to /dev/null;
+        the wrapper asks the engine about the image and the name, says what it
+        finds, and passes 125 on. Every one of those docker calls, as every
+        other, comes straight after a barrier line (Opus D9/D10 at 76d32e53),
+        and the name filter is anchored (D4)."""
+        name = hv.hub_name(spec())
+        image = hs.hr.run_spec(self.spec_, self.spec_.hub)["image"]
+        for shell in self.SHELLS:
+            for no_image, leftover, ps_fail in ((False, False, False), (True, False, False), (False, True, False),
+                                                (False, True, True)):
+                with self.subTest(shell=shell, no_image=no_image, leftover=leftover, ps_fail=ps_fail):
+                    for f in ("log", "state", "no_image", "ps_fail"):
+                        (self.stub / f).unlink(missing_ok=True)
+                    if no_image:
+                        (self.stub / "no_image").touch()
+                    if leftover:
+                        (self.stub / "state").write_text("exited\n")   # removed in step 1; still listed by the stub
+                    if ps_fail:
+                        (self.stub / "ps_fail").touch()             # step 1 inspects the leftover, so only the diagnosis asks ps
+                    (self.stub / "code").write_text("125")
+                    try:
+                        r = subprocess.run(shell + [str(self.script)],
+                                           env={"STUB": str(self.stub), "PATH": "/usr/bin:/bin"},
+                                           capture_output=True, text=True, timeout=30)
+                    finally:
+                        (self.stub / "ps_fail").unlink(missing_ok=True)
+                    self.assertEqual((r.returncode, self.status()), (125, hv.STARTED))
+                    if no_image:
+                        self.assertIn(hv.SAY + f"exit 125: the image {image} cannot be inspected: Error: No such image",
+                                      r.stderr)
+                    else:
+                        self.assertIn(hv.SAY + "exit 125: the image is present (sha256:abc)", r.stderr)
+                    if ps_fail:
+                        self.assertIn(hv.SAY + "exit 125: the engine does not answer:", r.stderr)
+                    else:
+                        self.assertIn(hv.SAY + f"exit 125: a container named {name}: "
+                                      + ("abc" if leftover else "none"), r.stderr)
+                    self.assertIn(hv.SAY + "exit 125: passed on", r.stderr)
+                    log = self.log()
+                    self.assertTrue(any(l.startswith("image inspect --format {{.Id}} " + image) for l in log), log)
+                    self.assertEqual([l for l in log if l.startswith("ps ")][-1], f"ps -a -q --filter name=^/{name}$")
+                    for k, line in enumerate(log):
+                        if not line.startswith("barrier"):
+                            with self.subTest(docker_call=line[:40]):
+                                self.assertTrue(k > 0 and log[k - 1].startswith("barrier"),
+                                                f"a docker call without its barrier line: {log}")
+                    self.assertEqual(len([l for l in log[1:] if l.startswith("barrier")]),
+                                     len([l for l in log if not l.startswith("barrier")]), log)
+        (self.stub / "no_image").unlink(missing_ok=True)
+
+    def test_no_start_is_recorded_when_step_1_itself_ends_with_125(self):
+        """Opus T3: `started` comes after the leftover handling; an engine that
+        does not answer there leaves no `started` and says no start."""
+        for shell in self.SHELLS:
+            with self.subTest(shell=shell):
+                for f in ("log", "state"):
+                    (self.stub / f).unlink(missing_ok=True)
+                (self.t / "status").unlink(missing_ok=True)
+                (self.stub / "ps_fail").touch()
+                try:
+                    r = subprocess.run(shell + [str(self.script)], env={"STUB": str(self.stub), "PATH": "/usr/bin:/bin"},
+                                       capture_output=True, text=True, timeout=30)
+                finally:
+                    (self.stub / "ps_fail").unlink()
+                self.assertEqual((r.returncode, self.status()), (125, None))
+                self.assertNotIn("started:", r.stderr)
+
+    def test_a_run_the_barrier_refused_fails_the_last_line_row_while_status_says_started(self):
+        """Opus (iv): after an exit-12 run the status stays `started`; the last
+        wrapper line, the refusal, makes verify FAIL rather than read PASS."""
+        sp = self.spec_
+        said = hv.SAY + "exit 12: " + hv.REFUSED_RUN + " (its own words went with the run's output); passed on"
+        for last, want in ((said, rh.FAIL), (hv.SAY + "started: the barrier passed", rh.PASS),
+                           (said + "\n" + hv.SAY + "started: the barrier passed", rh.PASS)):
+            with self.subTest(last=last[:40]):
+                files = {sp.supervision.hub["status"]: b"started 2026-10-17T00:00:00Z\n",
+                         hv.err_path(sp): (hv.SAY + "started: the barrier passed\n" + last + "\n").encode()}
+                [row] = [c for c in hv.verify_wrapper_status(sp, os.lstat, lambda q: files[q])
+                         if c.claim.startswith("the wrapper's last line")]
+                self.assertEqual(row.result, want)
+
+    def test_a_run_the_barrier_refuses_says_so_and_is_passed_on(self):
+        for shell in self.SHELLS:
+            with self.subTest(shell=shell):
+                for f in ("log", "state"):
+                    (self.stub / f).unlink(missing_ok=True)
+                (self.t / "status").unlink(missing_ok=True)
+                (self.stub / "code").write_text("12")
+                r = subprocess.run(shell + [str(self.script)], env={"STUB": str(self.stub), "PATH": "/usr/bin:/bin"},
+                                   capture_output=True, text=True, timeout=30)
+                self.assertEqual((r.returncode, self.status()), (12, hv.STARTED))
+                self.assertIn(hv.SAY + "exit 12: the barrier refused the run", r.stderr)
+
+    def b3(self, shell, setup):
+        """Run the wrapper with the barrier refusing, the status dir as
+        `setup` leaves it; its stderr is what launchd writes to the
+        StandardErrorPath. Then the verifier's two status rows, on real files."""
+        for f in ("log", "state", "code"):
+            (self.stub / f).unlink(missing_ok=True)
+        setup()
+        (self.stub / "untrusted").touch()
+        try:
+            r = subprocess.run(shell + [str(self.script)], env={"STUB": str(self.stub), "PATH": "/usr/bin:/bin"},
+                               capture_output=True, text=True, timeout=30)
+        finally:
+            (self.stub / "untrusted").unlink()
+            os.chmod(self.t, 0o755)
+        (self.t / hv.ERR_NAME).write_text(r.stderr)
+        sp = dataclasses.replace(self.spec_, supervision=dataclasses.replace(
+            self.spec_.supervision, hub=dict(self.spec_.supervision.hub, status=str(self.t / "status"))))
+        rows = [(c.claim.split(" ")[2], c.result)
+                for c in hv.verify_wrapper_status(sp, os.lstat, lambda p: open(p, "rb").read())
+                if c.claim.startswith(("the wrapper's status", "the wrapper's last line"))]
+        return r, dict(rows)
+
+    def test_b3_a_refusal_whose_record_fails_leaves_no_status_and_verify_fails(self):
+        for shell in self.SHELLS:
+            with self.subTest(shell=shell):
+                def setup():
+                    (self.t / "status").write_text("0 old-observation\n")
+                    (self.t / "status.tmp").mkdir(exist_ok=True)
+                r, rows = self.b3(shell, setup)
+                (self.t / "status.tmp").rmdir()
+                self.assertEqual(r.returncode, 1)
+                self.assertFalse((self.t / "status").exists())
+                self.assertEqual(rows, {"status": rh.FAIL, "last": rh.FAIL})
+
+    def test_b3_a_refusal_that_can_neither_record_nor_remove_still_fails_verify(self):
+        """Codex's witness: a mode-0555 status directory; the old success
+        survives, and only the error stream's last line tells the truth."""
+        for shell in self.SHELLS:
+            with self.subTest(shell=shell):
+                def setup():
+                    (self.t / "status").write_text("0 old-observation\n")
+                    os.chmod(self.t, 0o555)
+                r, rows = self.b3(shell, setup)
+                self.assertEqual(r.returncode, 1)
+                self.assertEqual((self.t / "status").read_text(), "0 old-observation\n", "the old record survives")
+                self.assertIn("could not be removed", r.stderr)
+                self.assertIn(hv.UNRECORDED, r.stderr)
+                self.assertEqual(rows, {"status": rh.PASS, "last": rh.FAIL},
+                                 "the stale record reads as a success; the unrecorded refusal is what fails")
+
+    def test_a_healthy_start_is_recorded_and_said_after_the_barrier(self):
+        """Opus N1: while the run runs, the status is `started` and the last
+        wrapper line is the start, so verify reads neither a missing status nor
+        an earlier, fixed refusal as this run's."""
+        for shell in self.SHELLS:
+            with self.subTest(shell=shell):
+                for f in ("log", "state", "stopped", "running"):
+                    (self.stub / f).unlink(missing_ok=True)
+                (self.t / "status").unlink(missing_ok=True)
+                (self.stub / "hold").touch()
+                p = subprocess.Popen(shell + [str(self.script)], env={"STUB": str(self.stub), "PATH": "/usr/bin:/bin"},
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                deadline = time.time() + 10
+                while not (self.stub / "running").exists() and time.time() < deadline:
+                    time.sleep(0.05)
+                self.assertEqual(self.status(), hv.STARTED, "recorded before the run")
+                (self.stub / "stopped").touch()
+                p.wait(timeout=20)
+                err = p.stderr.read()
+                p.stdout.close(); p.stderr.close()
+                (self.stub / "hold").unlink()
+                self.assertIn(hv.SAY + "started: the barrier passed", err)
+                unrecorded = hv.SAY + "docker or python3 is not root's alone: nothing was run, and " + hv.UNRECORDED
+                sp = self.spec_
+                files = {sp.supervision.hub["status"]: b"started 2026-10-17T00:00:00Z\n",
+                         hv.err_path(sp): (unrecorded + "\n" + err).encode()}
+                rows = {c.claim.split(" ")[2]: c.result for c in hv.verify_wrapper_status(sp, os.lstat, lambda q: files[q])
+                        if c.claim.startswith(("the wrapper's status", "the wrapper's last line"))}
+                self.assertEqual(rows, {"status": rh.PASS, "last": rh.PASS}, "a fixed refusal no longer FAILs the run")
+
+    def test_the_last_wrapper_line_is_found_among_container_lines(self):
+        """RE N6: lines that are not the wrapper's (an engine's, a container's
+        JSON) never hide or stand in for its last line."""
+        sp = self.spec_
+        err = hv.err_path(sp)
+        status = sp.supervision.hub["status"]
+        unrecorded = hv.SAY + "docker or python3 is not root's alone: nothing was run, and " + hv.UNRECORDED
+        for text, want in (
+                (unrecorded + '\n{"obs": "wire"}\nError response from daemon: x\n{"obs": "heartbeat"}\n', rh.FAIL),
+                (unrecorded + '\n{"obs": "wire"}\n' + hv.SAY + "exit 0: recorded, not restarted\n{\"obs\": 1}\n", rh.PASS),
+                ('{"obs": "' + hv.UNRECORDED + '"}\n' + hv.SAY + "exit 0: recorded, not restarted\n", rh.PASS)):
+            with self.subTest(text=text[:40]):
+                files = {status: b"0 2026-10-17T00:00:00Z\n", err: text.encode()}
+                [row] = [c for c in hv.verify_wrapper_status(sp, os.lstat, lambda p: files[p])
+                         if c.claim.startswith("the wrapper's last line")]
+                self.assertEqual(row.result, want)
+
+    def test_b3_a_missing_status_is_a_fail_never_not_started(self):
+        sp = self.spec_
+        status = sp.supervision.hub["status"]
+        reads = {}
+
+        def read(p):
+            if p not in reads:
+                raise FileNotFoundError(p)
+            return reads[p]
+        for content, want in ((None, rh.FAIL), (b"untrusted_tools 2026-10-17T00:00:00Z\n", rh.FAIL),
+                              (b"0 2026-10-17T00:00:00Z\n", rh.PASS), (b"orphan_running 2026-10-17T00:00:00Z\n", rh.PASS)):
+            with self.subTest(content=content):
+                reads.clear()
+                if content is not None:
+                    reads[status] = content
+                [row] = [c for c in hv.verify_wrapper_status(sp, os.lstat, read) if c.claim.startswith("the wrapper's status")]
+                self.assertEqual(row.result, want)
 
 
 def st_(mode, uid=0, nlink=1, kind=stat.S_IFREG, gid=0):
@@ -314,8 +709,37 @@ class VerifyTest(unittest.TestCase):
                 self.assertTrue(all(c.result == rh.PASS for c in self.results(spec(kind_))))
         s = spec("launchd")
         self.assertEqual({p: hv.mode_of(s, p) for p, _ in hv.rendered(s)},
-                         {s.supervision.hub["wrapper"]: 0o444, s.supervision.hub["plist"]: 0o644,
+                         {hv.rt_path(s): 0o444, s.supervision.hub["wrapper"]: 0o444, s.supervision.hub["plist"]: 0o644,
                           s.supervision.weekly["plist"]: 0o644})
+        for kind_ in ("systemd", "launchd"):
+            with self.subTest(kind=kind_):
+                self.assertEqual(hv.rendered(spec(kind_))[0][0], hv.rt_path(spec(kind_)),
+                                 "root-trust.sh is placed before what sources it")
+
+    def test_a_different_anchor_loader_renders_other_bytes_and_the_placed_copy_fails(self):
+        """d3.2: root-trust.sh carries the PT_INTERP of /bin/sh read at render;
+        when the OS moves its loader, the placed copy no longer matches its
+        rendering, and the placement check FAILs naming root-trust.sh."""
+        import root_trust as rt
+        s = spec()
+        placed = dict(hv.rendered(s))[hv.rt_path(s)]
+        self.addCleanup(setattr, rt, "elf_interpreter", rt.elf_interpreter)
+        rt.elf_interpreter = lambda path: "/lib/ld-other.so.9"
+        now = dict(hv.rendered(s))[hv.rt_path(s)]
+        self.assertNotEqual(now, placed)
+        self.assertIn(b"_rt_loader=/lib/ld-other.so.9", now)
+        bad = [c for c in self.results(s, data_over={hv.rt_path(s): placed}) if c.result != rh.PASS]
+        self.assertTrue(bad)
+        self.assertTrue(all(hv.rt_path(s) in c.claim or hv.rt_path(s) in str(c.actual) for c in bad), [c.claim for c in bad])
+
+    def test_nothing_rendered_for_root_names_ldd_or_otool(self):
+        """d3.1/d3.2: no ldd anywhere (and no otool, an xcrun stub on macOS):
+        libraries are listed by the anchor loader or the Mach-O reader."""
+        for kind_ in ("systemd", "launchd"):
+            for path, data in hv.rendered(spec(kind_)):
+                with self.subTest(kind=kind_, path=path):
+                    self.assertNotIn(b"ldd", data)
+                    self.assertNotIn(b"otool", data)
 
     def test_a_plist_at_0444_a_wrapper_at_0644_a_wrong_gid_or_a_writable_parent_fails(self):
         """Erratum 5(a): the plist is root:wheel 0644 in /Library/LaunchDaemons;
@@ -474,6 +898,9 @@ class StartSweepTest(unittest.TestCase):
     also mounts the secret volume refuses the start step. The overlap is the
     REAL sweep's finding, from secret_exposure's own fixture (another
     container mounting the volume read-only)."""
+
+    def setUp(self):
+        open_gate(self)
 
     def planted_overlap(self):
         import test_secret_exposure as tse
@@ -758,6 +1185,21 @@ class StopBudgetTest(unittest.TestCase):
         [c] = hv.verify_stop_budget(spec())
         self.assertEqual(c.result, rh.PASS)
         self.assertIn("does not cover the start probe's login window (185 s)", c.claim)
+
+    def test_the_supervisors_bound_covers_the_barrier_then_the_stop(self):
+        """RE N1: ExecStop and the wrapper's stop_it pass through the barrier
+        before `docker stop -t`, so the supervisor's own bound must hold both.
+        One second short is a FAIL on the row whose claim names the barrier,
+        and both renderings carry the bound the row judged."""
+        [c] = hv.verify_stop_bound(spec())
+        self.assertEqual((c.result, c.expected.value), (rh.PASS, hv.BARRIER_S + hv.STOP_TIMEOUT_S))
+        self.assertIn("barrier", c.claim)
+        self.addCleanup(setattr, hv, "SUPERVISOR_STOP_S", hv.SUPERVISOR_STOP_S)
+        hv.SUPERVISOR_STOP_S = hv.BARRIER_S + hv.STOP_TIMEOUT_S - 1
+        [c] = hv.verify_stop_bound(spec())
+        self.assertEqual((c.result, c.actual), (rh.FAIL, hv.SUPERVISOR_STOP_S))
+        self.assertIn(f"TimeoutStopSec={hv.SUPERVISOR_STOP_S}\n", hv.systemd_unit(spec()).decode())
+        self.assertEqual(plistlib.loads(hv.hub_plist(spec("launchd")))["ExitTimeOut"], hv.SUPERVISOR_STOP_S)
 
     def test_a_dot_budget_past_the_stop_timeout_fails(self):
         self.addCleanup(setattr, hs.hr, "environment", hs.hr.environment)
