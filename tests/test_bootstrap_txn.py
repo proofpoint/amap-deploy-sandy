@@ -686,6 +686,76 @@ class TimerMissingRows(Tree):
         self.ok(self.run_txn(), "FRESH")
 
 
+class ContextReadRows(Tree):
+    """The context's presence bit alone decides the class: NOTHING never
+    opens it; PARTIAL's digest note runs only on a regular, root's-alone
+    file and names anything else without reading it."""
+
+    def test_nothing_with_a_context_present_never_reads_it(self):
+        self.installed()
+        os.mkfifo(self.context, 0o444)
+        self.ok(self.run_txn(timeout=10), "NOTHING")
+        os.unlink(self.context)
+        self.write(self.context, b"{}", 0o000)
+        self.ok(self.run_txn(timeout=10), "NOTHING")
+
+    def test_partial_names_a_nonregular_context_without_reading_it(self):
+        self.installed(writer=False)
+        os.mkfifo(self.context, 0o444)
+        p = self.run_txn(timeout=10)
+        self.refused(p, "a partial bootstrap pair")
+        self.assertIn("the context: present, not a regular file (p", p.stderr)
+
+    def test_partial_reports_a_regular_contexts_digest_as_informational(self):
+        self.installed(writer=False, context=True)
+        with open(self.context, "rb") as f:
+            digest = sha(f.read())
+        p = self.run_txn()
+        self.refused(p, "a partial bootstrap pair")
+        self.assertIn(f"the context: present, sha256 {digest} (informational", p.stderr)
+
+
+class SingleCaptureRows(Tree):
+    """The missing timer's evidence is ONE is-enabled invocation's whole
+    (status, stdout, stderr)."""
+
+    def test_one_invocation_and_the_whole_tuple(self):
+        self.measured = {"SYSTEMD_TIMER_MISSING": (4, None, "No such file or directory")}
+        for answer, ok in (([4, "", "No such file or directory"], True), ([1, "unknown", "No such file or directory"], False),
+                           ([4, "x", "No such file or directory"], False), ([7, "", "No such file or directory"], False)):
+            with self.subTest(answer=answer):
+                for f in (self.log("sudo"), self.log("systemctl")):
+                    if os.path.exists(f):
+                        os.unlink(f)
+                if os.path.exists(self.wd):
+                    shutil.rmtree(self.wd)
+                self.cfg["systemctl"]["hub-link-probe.timer"]["is-enabled"] = answer
+                p = self.run_txn()
+                if ok:
+                    self.ok(p, "FRESH")
+                else:
+                    self.refused(p, "unknown")
+                self.assertEqual(len([c for c in self.calls("systemctl") if "is-enabled" in c]), 1)
+
+    def test_a_capture_that_cannot_be_made_stops_before_any_copy(self):
+        mkdir = os.path.join(self.bin, "mkdir")
+        self.write(mkdir, b"#!/bin/sh\nexit 1\n", 0o755)
+        self.refused(self.run_txn(mkdir=mkdir), "cannot be made: nothing was read")
+        self.assertFalse([c for c in self.calls("systemctl") if "is-enabled" in c])
+
+
+class LaunchdTupleRows(Tree):
+    def test_a_mismatched_not_found_status_or_text_is_unknown(self):
+        self.measured = {"LAUNCHD_NOT_FOUND": NOT_FOUND}
+        for answer in ([NOT_FOUND[0] + 1, NOT_FOUND[1]], [NOT_FOUND[0], "could not find service"],
+                       [NOT_FOUND[0], NOT_FOUND[1] + " (more)"]):
+            with self.subTest(answer=answer):
+                if os.path.exists(self.log("sudo")):
+                    os.unlink(self.log("sudo"))
+                self.cfg["launchctl"] = {"org.example.hub": answer, "org.example.hub-probe": list(NOT_FOUND)}
+                self.refused(self.run_txn(kind="launchd"), "unknown")
+
+
 class RoleRows(Tree):
     def test_wrong_operand_counts_refuse_before_anything(self):
         o = self.operands("systemd")

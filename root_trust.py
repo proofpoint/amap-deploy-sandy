@@ -504,7 +504,9 @@ LAUNCHD_NOT_FOUND: Optional[Tuple[int, str]] = None
 #: Its line for a weekly run in progress, and for a loaded, idle label.
 LAUNCHD_STATE_RUNNING: Optional[str] = None
 LAUNCHD_STATE_IDLE: Optional[str] = None
-#: `systemctl is-enabled <timer>` for a timer that does not exist: (status, stdout, stderr), either text None.
+#: `systemctl is-enabled <timer>` for a timer that does not exist, from ONE
+#: invocation: (status, stdout, stderr), trailing newlines dropped, a None
+#: text meaning that stream was empty. The whole tuple must match.
 SYSTEMD_TIMER_MISSING: Optional[Tuple[int, Optional[str], Optional[str]]] = None
 
 GATE = r"""
@@ -668,11 +670,9 @@ _t_ancestors "$writer_dir"
 if _t_listed "$_t_parent" "${writer_dir##*/}"; then _t_searchdir "$writer_dir"; _t_wd=present; else _t_wd=absent; fi
 _t_same "$writer" "$wpin"; ws=$_t_s wsw=${_t_sw-} wh=$_t_sh
 _t_same "$rt" "$rpin"; rs=$_t_s rsw=${_t_sw-} rh=$_t_sh
+# The context's presence bit alone decides the class; nothing here opens it.
 ctx=absent
-if [ "$_t_wd" = present ] && _t_listed "$writer_dir" "@CONTEXT@"; then
-  ctx=present
-  _t_hash "$context" && ctx="present, sha256 $_t_h"
-fi
+if [ "$_t_wd" = present ] && _t_listed "$writer_dir" "@CONTEXT@"; then ctx=present; fi
 plist=none
 if [ "$kind" = launchd ]; then
   _t_ancestors "$placed"
@@ -685,6 +685,17 @@ fi
 [ "$ws" -lt 3 ] || _t_stop "SAME failed for the writer ($wsw): nothing is written" 3
 [ "$rs" -lt 3 ] || _t_stop "SAME failed for root-trust.sh ($rsw): nothing is written" 3
 
+# PARTIAL's informational note on the context: its digest only after the
+# listing shows a regular, root's-alone file in the root-owned directory
+# GATE0 judged; anything else is named, never hashed. It is never adopted.
+_t_ctxdiag() {
+  [ "$ctx" = present ] || { printf absent; return 0; }
+  _t_meta "$context" || { printf 'present, %s' "$_t_why"; return 0; }
+  case $_t_mode in -*) ;; *) printf 'present, not a regular file (%s)' "$_t_mode"; return 0 ;; esac
+  [ "$_t_uid" = @ROOT@ ] && [ "$_t_links" = 1 ] || { printf "present, not root's alone with one link"; return 0; }
+  _t_hash "$context" || { printf 'present, unreadable'; return 0; }
+  printf 'present, sha256 %s (informational: the maintainers read its pins from that file)' "$_t_h"
+}
 _t_state() { case $1 in 0) printf 'sha256 %s (the pin)' "$3" ;; 1) printf absent ;; *) printf 'sha256 %s' "$2" ;; esac; }
 if [ "$ws" = 1 ] && [ "$rs" = 1 ] && [ "$ctx" = absent ]; then class=FRESH
 elif [ "$ws" = 2 ] && [ "$rs" = 0 ]; then class=WRITER-ONLY
@@ -696,7 +707,7 @@ fi
 case $class in
   BOTH) _t_stop "a two-leaf update is not supported yet (post-M1, §5b)" ;;
   RT-ONLY) _t_stop "root-trust.sh's render changed (deploy pin or host loader); an image-only update with the deploy pin unchanged is not affected (on launchd an image-only update re-registers the weekly job, see U0)" ;;
-  PARTIAL) _t_stop "a partial bootstrap pair: the maintainers' call. The writer: $(_t_state "$ws" "$wh" "$wpin"), expected sha256 $wpin; root-trust.sh: $(_t_state "$rs" "$rh" "$rpin"), expected sha256 $rpin; the context: $ctx" ;;
+  PARTIAL) _t_stop "a partial bootstrap pair: the maintainers' call. The writer: $(_t_state "$ws" "$wh" "$wpin"), expected sha256 $wpin; root-trust.sh: $(_t_state "$rs" "$rh" "$rpin"), expected sha256 $rpin; the context: $(_t_ctxdiag)" ;;
 esac
 
 # U0, the update guard: read-only and tri-state; every unknown answer refuses.
@@ -705,6 +716,28 @@ _t_unknown() { _t_stop "U0: $1 answered ($_t_rc, $_t_out): unknown. Measure the 
 _t_active() { _t_out=$(@SYSTEMCTL@ --no-pager is-active "$1" 2>/dev/null); _t_rc=$?; }
 _t_print() { _t_out=$(@LAUNCHCTL@ print "system/$1" 2>&1); _t_rc=$?; }
 _t_notfound() { [ -n "@LDNF_SET@" ] && [ "$_t_rc" = "@LDNF_RC@" ] && [ "$_t_out" = @LDNF_TEXT@ ]; }
+# A fresh capture directory, $run_dir/<prefix>.<UTC time>[-N]: mkdir is the
+# atomic arbiter, so nothing can already be inside it.
+_t_fresh() {
+  _t_at=$(@DATE@ -u +%Y%m%dT%H%M%SZ) || _t_stop "no time for the capture's name"
+  _t_d=$run_dir/$1.$_t_at _t_i=0
+  while [ -e "$_t_d" ] || [ -h "$_t_d" ]; do
+    _t_i=$((_t_i + 1))
+    [ "$_t_i" -lt 1000 ] || _t_stop "no free capture name in $run_dir"
+    _t_d=$run_dir/$1.$_t_at-$_t_i
+  done
+  @MKDIR@ -m 0700 "$_t_d" || _t_stop "the capture directory $_t_d cannot be made: nothing was read"
+}
+# One capture file's text: a regular file within @CAPMAX@ bytes, trailing newlines dropped.
+_t_slurp() {
+  [ -f "$1" ] && [ ! -h "$1" ] || _t_stop "the capture $1 is not a regular file"
+  _t_sz=$(@SIZE@ "$1") || _t_sz=
+  case $_t_sz in ""|*[!0-9]*) _t_stop "the capture $1 cannot be measured" ;; esac
+  [ "$_t_sz" -le @CAPMAX@ ] || _t_stop "the capture $1 is larger than @CAPMAX@ bytes"
+  _t_txt=$(cat -- "$1" && printf .) || _t_stop "the capture $1 cannot be read"
+  _t_txt=${_t_txt%.}
+  while :; do case $_t_txt in *"$_t_nl") _t_txt=${_t_txt%"$_t_nl"} ;; *) break ;; esac; done
+}
 _t_units() {
   if [ "$kind" = systemd ]; then
     for _t_u in "$hub" "$wsvc"; do
@@ -713,17 +746,18 @@ _t_units() {
     done
     _t_active "$wtimer"
     case "$_t_rc:$_t_out" in 3:inactive) ;; 0:active|0:reloading|0:activating|3:activating) _t_held "$wtimer is $_t_out" ;; *) _t_unknown "is-active $wtimer" ;; esac
-    _t_out=$(@SYSTEMCTL@ --no-pager is-enabled "$wtimer" 2>/dev/null); _t_rc=$?
+    # ONE invocation, its status, stdout and stderr captured together.
+    _t_fresh u0
+    @SYSTEMCTL@ --no-pager is-enabled "$wtimer" > "$_t_d/out" 2> "$_t_d/err"
+    _t_rc=$?
+    _t_slurp "$_t_d/out"; _t_out=$_t_txt
+    _t_slurp "$_t_d/err"; _t_err=$_t_txt
     case "$_t_rc:$_t_out" in
       1:disabled|1:masked) return 0 ;;
       0:enabled|0:enabled-runtime) _t_held "$wtimer is $_t_out" ;;
     esac
-    if [ -n "@SDM_SET@" ] && [ "$_t_rc" = "@SDM_RC@" ]; then
-      [ -n "@SDM_OUT_SET@" ] && [ "$_t_out" = @SDM_OUT@ ] && return 0
-      if [ -n "@SDM_ERR_SET@" ]; then
-        _t_err=$(@SYSTEMCTL@ --no-pager is-enabled "$wtimer" 2>&1 >/dev/null)
-        [ "$_t_err" = @SDM_ERR@ ] && return 0
-      fi
+    if [ -n "@SDM_SET@" ] && [ "$_t_rc" = "@SDM_RC@" ] && [ "$_t_out" = @SDM_OUT@ ] && [ "$_t_err" = @SDM_ERR@ ]; then
+      return 0
     fi
     _t_unknown "is-enabled $wtimer"
   else
@@ -746,14 +780,7 @@ _t_weekly() {
   _t_notfound || _t_unknown "print system/$wlabel"
 }
 _t_reader() {
-  _t_at=$(@DATE@ -u +%Y%m%dT%H%M%SZ) || _t_stop "no time for the capture's name"
-  _t_d=$run_dir/hsc.$_t_at _t_i=0
-  while [ -e "$_t_d" ] || [ -h "$_t_d" ]; do
-    _t_i=$((_t_i + 1))
-    [ "$_t_i" -lt 1000 ] || _t_stop "no free capture name in $run_dir"
-    _t_d=$run_dir/hsc.$_t_at-$_t_i
-  done
-  @MKDIR@ -m 0700 "$_t_d" || _t_stop "the capture directory $_t_d cannot be made: nothing was read"
+  _t_fresh hsc
   if [ "$docsource" = spec ]; then
     "$py" "$amap" hub-start-check --until-stopped --old-context --spec "$docpath" > "$_t_d/out"
   else
@@ -844,8 +871,8 @@ def render_txn(kind: str, systemctl: str, root: int = 0, top: str = "", sudo: st
             "@LD_RUNNING_SET@": _present(m["LAUNCHD_STATE_RUNNING"]), "@LD_RUNNING@": _measured(m["LAUNCHD_STATE_RUNNING"]),
             "@LD_IDLE_SET@": _present(m["LAUNCHD_STATE_IDLE"]), "@LD_IDLE@": _measured(m["LAUNCHD_STATE_IDLE"]),
             "@SDM_SET@": _present(sdm), "@SDM_RC@": "" if sdm is None else str(int(sdm[0])),
-            "@SDM_OUT_SET@": _present(None if sdm is None else sdm[1]), "@SDM_OUT@": _measured(None if sdm is None else sdm[1]),
-            "@SDM_ERR_SET@": _present(None if sdm is None else sdm[2]), "@SDM_ERR@": _measured(None if sdm is None else sdm[2])}
+            "@SDM_OUT@": shlex.quote("" if sdm is None else sdm[1] or ""),
+            "@SDM_ERR@": shlex.quote("" if sdm is None else sdm[2] or "")}
     out = TXN
     for k, v in subs.items():
         out = out.replace(k, v)

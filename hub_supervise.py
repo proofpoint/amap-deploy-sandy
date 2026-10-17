@@ -694,11 +694,8 @@ def weekly_state(answer: Any) -> Any:
         if rt.LAUNCHD_STATE_IDLE is not None and rt.LAUNCHD_STATE_IDLE in lines:
             return LOADED
         return rh.Unresolved("launchctl print's wording for a loaded weekly label is not measured here")
-    if rt.LAUNCHD_NOT_FOUND is None:
-        return rh.Unresolved("launchctl print's answer for a label that is not loaded is not measured here")
-    if (rc, out.rstrip("\n")) == rt.LAUNCHD_NOT_FOUND:
-        return NOT_LOADED
-    return rh.Unresolved(f"launchctl print system/<weekly label> answered ({rc}, {out.strip()[:80]!r})")
+    absent = launchd_absent(rc, out)
+    return NOT_LOADED if absent is True else absent
 
 
 def until_stopped_line(spec: Any, document: Optional[Tuple[str, str]] = None) -> str:
@@ -766,7 +763,8 @@ def _no_duplicates(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
 
 
 def read_old_context(spec: Any, *, lstat: Callable = os.lstat, digest: Optional[Callable[[str], Any]] = None,
-                     acl: Optional[Callable[[List[str]], List[str]]] = None, root_uid: int = 0) -> Any:
+                     acl: Optional[Callable[[List[str]], List[str]]] = None, root_uid: int = 0,
+                     read: Callable[[int, int], bytes] = os.read) -> Any:
     """The deployed context the placed writer's install published, read
     strictly, or an Unresolved naming why not: its route root's alone,
     searchable, no ACL; the file regular, one link, exactly root:root 0444;
@@ -806,7 +804,15 @@ def read_old_context(spec: Any, *, lstat: Callable = os.lstat, digest: Optional[
         f = os.fstat(fd)
         if (f.st_dev, f.st_ino) != (st.st_dev, st.st_ino):
             return rh.Unresolved(f"{path} changed while it was read")
-        raw = os.read(fd, CONTEXT_MAX + 1)
+        if f.st_size > CONTEXT_MAX:
+            return rh.Unresolved(f"{path} is larger than {CONTEXT_MAX} bytes")
+        # A short read is not the end: read to EOF, never past the bound plus one.
+        raw = b""
+        while len(raw) <= CONTEXT_MAX:
+            chunk = read(fd, CONTEXT_MAX + 1 - len(raw))
+            if not chunk:
+                break
+            raw += chunk
     finally:
         os.close(fd)
     if len(raw) > CONTEXT_MAX:
@@ -939,20 +945,33 @@ def ask_disabled(spec: Any) -> Any:
     return parse_disabled(p.out)
 
 
+def launchd_absent(rc: int, text: str) -> Any:
+    """Whether `launchctl print`'s answer is the MEASURED not-loaded answer:
+    True only on the exact (status, output) root_trust.LAUNCHD_NOT_FOUND
+    names, trailing newlines dropped as TXN captures it; an Unresolved
+    while that fact is unmeasured, or for any other answer. The one test
+    every absence reader uses: TXN's U0, the service verb's bootout wait,
+    weekly_state and ask_loaded."""
+    if rt.LAUNCHD_NOT_FOUND is None:
+        return rh.Unresolved("launchctl print's answer for a label that is not loaded is not measured here")
+    if (rc, text.rstrip("\n")) == rt.LAUNCHD_NOT_FOUND:
+        return True
+    return rh.Unresolved(f"launchctl print answered ({rc}, {text.strip()[:80]!r}), not the measured not-loaded answer")
+
+
 def ask_loaded(label: str) -> Any:
     """True when the system domain has `label` loaded (`launchctl print
-    system/<label>` exits 0), False when launchctl reports it cannot find
-    the service, an Unresolved otherwise. The not-found wording is
-    launchctl's documented message; NOT measured on a host here."""
+    system/<label>` exits 0), False only on the measured not-loaded answer
+    (launchd_absent), an Unresolved otherwise, including while that answer
+    is unmeasured."""
     try:
         p = rh.run([LAUNCHCTL, "print", f"system/{label}"])
     except rh.CannotRun as e:
         return rh.Unresolved(str(e))
     if p.rc == 0:
         return True
-    if "could not find service" in (p.out + p.err).lower():
-        return False
-    return rh.Unresolved(f"launchctl print system/{label} exited {p.rc}")
+    absent = launchd_absent(p.rc, p.out + p.err)
+    return False if absent is True else absent
 
 
 def verify_enablement(spec: Any, disabled: Any, gate: Callable[[], Any],

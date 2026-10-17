@@ -143,6 +143,56 @@ class NotLoadedRows(unittest.TestCase):
                     self.assertIsInstance(hv.weekly_state(answer), rh.Unresolved)
 
 
+class AbsenceReaderRows(unittest.TestCase):
+    """Every absence reader takes not-loaded only from the measured exact
+    answer: None, a mismatched status or text, and blank-line answers under
+    each partial measurement are unknown, and unknown never prints
+    NOT-RUNNING or a start line."""
+    NF = (113, 'Could not find service "org.example.hub" in domain for system')
+
+    def answering(self, answers):
+        def run(argv, **k):
+            rc, out = answers[argv[-1].split("/", 1)[1]]
+            return rh.Proc(tuple(argv), rc, "", out + "\n")
+        p = mock.patch.object(hv.rh, "run", run)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_the_old_context_not_running_path(self):
+        s = spec("launchd")
+        doc = hv.context_doc(s, "f" * 64)
+        for nf, answer, want in ((None, self.NF, "unknown: "), (self.NF, (self.NF[0] + 1, self.NF[1]), "unknown: "),
+                                 (self.NF, (self.NF[0], "could not find service"), "unknown: "),
+                                 (self.NF, self.NF, "NOT-RUNNING")):
+            with self.subTest(nf=nf, answer=answer):
+                self.answering({"org.example.hub": answer})
+                with mock.patch.object(rt, "LAUNCHD_NOT_FOUND", nf):
+                    last = hv.not_running(s, old_context=True, context=lambda sp: doc, container=lambda sp: False)
+                self.assertTrue(last.startswith(want), last)
+
+    def test_the_start_states(self):
+        s = spec("launchd")
+        blank = f"x = {{\n\n\tstate = spawned\n}}"
+        cases = [({}, {"org.example.hub": self.NF, "org.example.hub-probe": self.NF}),
+                 ({"LAUNCHD_NOT_FOUND": self.NF}, {"org.example.hub": (self.NF[0], "could not find service"),
+                                                   "org.example.hub-probe": self.NF}),
+                 ({"LAUNCHD_NOT_FOUND": self.NF}, {"org.example.hub": self.NF, "org.example.hub-probe": (0, blank)}),
+                 ({"LAUNCHD_NOT_FOUND": self.NF, "LAUNCHD_STATE_RUNNING": RUNNING},
+                  {"org.example.hub": self.NF, "org.example.hub-probe": (0, blank)}),
+                 ({"LAUNCHD_NOT_FOUND": self.NF, "LAUNCHD_STATE_IDLE": IDLE},
+                  {"org.example.hub": self.NF, "org.example.hub-probe": (0, blank)})]
+        for measured, answers in cases:
+            with self.subTest(measured=sorted(measured), answers=answers):
+                self.answering(answers)
+                with mock.patch.multiple(rt, LAUNCHD_NOT_FOUND=measured.get("LAUNCHD_NOT_FOUND"),
+                                         LAUNCHD_STATE_RUNNING=measured.get("LAUNCHD_STATE_RUNNING"),
+                                         LAUNCHD_STATE_IDLE=measured.get("LAUNCHD_STATE_IDLE")):
+                    self.assertIsInstance(hs.unit_states(s), rh.Unresolved)
+        self.answering({"org.example.hub": self.NF, "org.example.hub-probe": self.NF})
+        with mock.patch.object(rt, "LAUNCHD_NOT_FOUND", self.NF):
+            self.assertEqual(hs.unit_states(s), {"weekly": hv.NOT_LOADED, "hub": hv.NOT_LOADED})
+
+
 class OutcomeRows(unittest.TestCase):
     """hub_start_check prints exactly one outcome for the states it reads."""
 
@@ -269,7 +319,7 @@ class ContextReadRows(unittest.TestCase):
             f.write(raw if raw is not None else json.dumps(doc).encode())
         os.chmod(self.real, mode)
 
-    def read(self, acl=lambda paths: [], digest=None, leaf_uid=None, leaf_gid=0):
+    def read(self, acl=lambda paths: [], digest=None, leaf_uid=None, leaf_gid=0, read=os.read):
         uid = os.getuid()
         real = os.lstat(self.real)
 
@@ -285,7 +335,8 @@ class ContextReadRows(unittest.TestCase):
         pins = {self.s.secrets.writer: self.doc["writer_sha256"], hv.rt_path(self.s): self.doc["root_trust_sha256"]}
         real_open = os.open
         with mock.patch.object(os, "open", lambda p, *a, **k: real_open(self.real if p == self.path else p, *a, **k)):
-            return hv.read_old_context(self.s, lstat=lstat, digest=digest or pins.get, acl=acl, root_uid=uid)
+            return hv.read_old_context(self.s, lstat=lstat, digest=digest or pins.get, acl=acl, root_uid=uid,
+                                       read=read)
 
     def test_a_good_context_reads(self):
         self.assertEqual(self.read(), self.doc)
@@ -296,6 +347,27 @@ class ContextReadRows(unittest.TestCase):
                          ("other pins", dict(digest=lambda p: "0" * 64))):
             with self.subTest(name=name):
                 self.assertIsInstance(self.read(**kw), rh.Unresolved, name)
+
+    def test_short_reads_are_read_to_the_end(self):
+        """A short read is not EOF: a document split across chunks reads
+        whole, and trailing data after it or a size past the bound refuses."""
+        def short(fd, n):
+            return os.read(fd, min(n, 5))
+        self.assertEqual(self.read(read=short), self.doc)
+        self.place(None, json.dumps(self.doc).encode() + b" trailing")
+        self.assertIsInstance(self.read(read=short), rh.Unresolved)
+        self.place(None, json.dumps(self.doc).encode() + b" " * hv.CONTEXT_MAX)
+        self.assertIsInstance(self.read(read=short), rh.Unresolved)
+
+    def test_a_fifo_at_the_context_is_refused_without_a_read(self):
+        os.unlink(self.real)
+        os.mkfifo(self.real, 0o444)
+        uid = os.getuid()
+        real = os.lstat(self.real)
+        got = hv.read_old_context(self.s, lstat=lambda p: real if p == self.path else type("S", (), dict(
+            st_mode=0o040755, st_uid=uid, st_gid=0, st_nlink=2))(), digest=lambda p: None,
+            acl=lambda paths: [], root_uid=uid, read=lambda fd, n: self.fail("read a FIFO"))
+        self.assertIsInstance(got, rh.Unresolved)
 
     def test_mode_schema_members_duplicates_and_size_are_strict(self):
         for name, doc, raw, mode in (

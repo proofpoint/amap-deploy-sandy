@@ -1100,8 +1100,9 @@ class LaunchdEnablementTest(unittest.TestCase):
         self.assertEqual(r, [rh.UNKNOWN, rh.UNKNOWN])
 
     def test_loaded_is_read_from_launchctl_print(self):
-        """`launchctl print system/<label>`: exit 0 is loaded; its documented
-        not-found message is not loaded; anything else is unknown."""
+        """`launchctl print system/<label>`: exit 0 is loaded; only the
+        measured not-loaded answer is not loaded, exactly; anything else,
+        and everything while that answer is unmeasured, is unknown."""
         calls = []
 
         def fake(rc, out="", err=""):
@@ -1113,8 +1114,15 @@ class LaunchdEnablementTest(unittest.TestCase):
         hv.rh.run = fake(0)
         self.assertIs(hv.ask_loaded("org.example.hub"), True)
         self.assertEqual(calls[-1], [hv.LAUNCHCTL, "print", "system/org.example.hub"])
-        hv.rh.run = fake(113, err='Could not find service "org.example.hub" in domain for system')
+        nf = (113, 'Could not find service "org.example.hub" in domain for system')
+        hv.rh.run = fake(nf[0], err=nf[1] + "\n")
+        self.assertIsInstance(hv.ask_loaded("org.example.hub"), rh.Unresolved, "unmeasured: unknown")
+        self.addCleanup(setattr, hv.rt, "LAUNCHD_NOT_FOUND", hv.rt.LAUNCHD_NOT_FOUND)
+        hv.rt.LAUNCHD_NOT_FOUND = nf
         self.assertIs(hv.ask_loaded("org.example.hub"), False)
+        for rc, err in ((nf[0] + 1, nf[1]), (nf[0], "could not find service"), (nf[0], nf[1] + " (and more)")):
+            hv.rh.run = fake(rc, err=err)
+            self.assertIsInstance(hv.ask_loaded("org.example.hub"), rh.Unresolved, (rc, err))
         hv.rh.run = fake(5, err="Operation not permitted")
         self.assertIsInstance(hv.ask_loaded("org.example.hub"), rh.Unresolved)
 

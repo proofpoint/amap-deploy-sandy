@@ -3527,7 +3527,11 @@ def _git_settle(efd, child, pgid, why, what, out, err, dropped):
     and proven empty first, then the refusal; on exit 0 the group must
     already be empty. git.pgid is removed only once the group is."""
     if why is not None or child.returncode != 0:
-        empty = _cleanup_group(child, pgid)
+        try:
+            empty = _cleanup_group(child, pgid)
+        except BaseException as e:  # an EPERM, a drain or wait error, an interrupt: the group is not shown empty
+            raise Survivor(f"git process group {pgid} could not be shown empty ({e!r}): {PGID_FILE} and the "
+                           "staging are kept and nothing is removed") from None
         if not empty:
             raise Survivor(f"a git process survived in group {pgid}: {PGID_FILE} is kept and nothing is removed")
         try:
@@ -3537,10 +3541,18 @@ def _git_settle(efd, child, pgid, why, what, out, err, dropped):
         tail = bytes(err[-400:]).decode("utf-8", "replace").strip()
         note = f" ({dropped} stderr bytes dropped)" if dropped else ""
         raise Tooling(f"git {what} {why or f'exited {child.returncode}'}: {tail}{note}")
-    if not _await_empty(pgid):
+    try:
+        gone = _await_empty(pgid)
+    except BaseException as e:
+        raise Survivor(f"git process group {pgid} could not be shown empty ({e!r}): {PGID_FILE} and the staging "
+                       "are kept and nothing is removed") from None
+    if not gone:
         raise Survivor(f"a git process survived in group {pgid} after its leader exited: {PGID_FILE} is kept and "
                        "nothing is removed")
     os.unlink(PGID_FILE, dir_fd=efd)
+    if dropped:
+        print(f"partition-fetch: git {what} wrote {dropped} stderr bytes past {STDERR_MAX}; they were dropped",
+              file=sys.stderr)
     return bytes(out), bytes(err), dropped
 
 

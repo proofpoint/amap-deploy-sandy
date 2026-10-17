@@ -556,6 +556,97 @@ class FollowRows(Fetch):
         self.assertTrue(hs._group_gone(started[0].pid))
 
 
+class SurvivorRows(Fetch):
+    """Once a child exists, any failure to show its group empty is the
+    survivor path: staging and git.pgid are kept, and the next entry's guard
+    refuses with nothing changed."""
+
+    def assertSurvivor(self):
+        try:
+            self.fetch()
+        except hs.Survivor:
+            return
+        except BaseException as e:  # any other exit is this row's failure, not an error
+            self.fail(f"not the survivor path: {e!r}")
+        self.fail("the fetch passed")
+
+    def kill_recorded(self):
+        try:
+            with open(os.path.join(self.exec, hs.PGID_FILE)) as f:
+                pgid = int(f.read())
+        except (OSError, ValueError):
+            return
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    def test_a_kill_refused_with_eperm_is_a_survivor(self):
+        real = os.killpg
+
+        def killpg(pgid, sig):
+            if sig == signal.SIGKILL:
+                raise PermissionError(1, "Operation not permitted")
+            return real(pgid, sig)
+        self.addCleanup(setattr, os, "killpg", real)
+        os.killpg = killpg
+        self.patch("GIT_LOCAL_TIMEOUT_S", 1)
+        self.patch("DRAIN_S", 0.5)
+        self.stub(act={"cat-file -t": {"hang": True}})
+        self.assertSurvivor()
+        os.killpg = real
+        self.addCleanup(self.kill_recorded)
+        left = sorted(os.listdir(self.exec))
+        for name in (hs.PGID_FILE, hs.SRC_NEW, hs.GIT_EXEC):
+            self.assertIn(name, left)
+        before = {n: os.lstat(os.path.join(self.exec, n)).st_ino for n in left}
+        os.unlink(os.path.join(self.tools, "log.jsonl"))
+        with self.assertRaises(hs.Survivor):
+            self.fetch()
+        self.assertEqual({n: os.lstat(os.path.join(self.exec, n)).st_ino for n in sorted(os.listdir(self.exec))},
+                         before)
+        self.assertEqual(self.calls(), [])
+
+    def test_a_cleanup_error_or_interrupt_is_a_survivor(self):
+        for name, exc in (("error", OSError(5, "Input/output error")), ("interrupt", KeyboardInterrupt())):
+            with self.subTest(name=name):
+                for n in list(os.listdir(self.exec)):
+                    if n in (hs.SRC_NEW, hs.GIT_EXEC, hs.BUNDLE_NEW, hs.PGID_FILE):
+                        self.kill_recorded()
+                        p = os.path.join(self.exec, n)
+                        shutil.rmtree(p) if os.path.isdir(p) and not os.path.islink(p) else os.unlink(p)
+                self.patch("GIT_LOCAL_TIMEOUT_S", 1)
+                self.stub(act={"cat-file -t": {"hang": True}})
+                real = hs._cleanup_group
+
+                def broken(child, pgid, exc=exc):
+                    raise exc
+                hs._cleanup_group = broken
+                try:
+                    self.assertSurvivor()
+                finally:
+                    hs._cleanup_group = real
+                self.addCleanup(self.kill_recorded)
+                left = sorted(os.listdir(self.exec))
+                for n in (hs.PGID_FILE, hs.SRC_NEW, hs.GIT_EXEC):
+                    self.assertIn(n, left)
+                before = {n: os.lstat(os.path.join(self.exec, n)).st_ino for n in left}
+                with self.assertRaises(hs.Survivor):
+                    self.fetch()
+                self.assertEqual({n: os.lstat(os.path.join(self.exec, n)).st_ino
+                                  for n in sorted(os.listdir(self.exec))}, before)
+                self.kill_recorded()
+
+    def test_a_dropped_stderr_is_reported(self):
+        import contextlib
+        import io
+        self.stub(act={"cat-file -t": {"stderr": hs.STDERR_MAX + 10}})
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(self.fetch(), 0)
+        self.assertIn(f"git cat-file wrote 10 stderr bytes past {hs.STDERR_MAX}; they were dropped", err.getvalue())
+
+
 class TreeRows(Fetch):
     """§1.6's process tree, on real processes."""
 
