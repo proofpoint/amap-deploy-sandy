@@ -721,6 +721,121 @@ Three changes are refused rather than rendered:
   `python3 amap-sandy.py install --decommission-hop --apply`, then restart
   the router.
 
+### The local router's migration to the registry layout (R2)
+
+A local router whose state is keyed by instance name (any router that ran
+without `registry_dir`) cannot be upgraded to the pinned router
+transparently. On a configuration that sets `registry_dir`, the pinned
+router holds each such instance (`state_not_migrated`, then
+`legacy_state_unadopted`). It places nothing for it and loses nothing,
+until the instance's state directory is moved to its logical id and
+adopted. R2 does that as its own window, before any activation. It ends
+with the pinned router running under the host-setup document's
+`router.container`, on its registry configuration, and fingerprinting
+`MEASURED`, which is what activation's step 2 requires. R2 is never part of
+an activation window.
+
+R2 needs the hop link above (the policy's `hop_link`, so that `install`
+renders `registry_dir`), the hop checkout at its pin, and the local
+router's image built and checked. Run every step as the operator: the
+router runs as the operator's uid, and its `state_dir` is the operator's.
+Each `router-migrate` step runs the pinned router's own code through the
+hop checkout's `docker/run.sh`, on the document's `router.image`, and
+writes its record into the run directory. Each exits 0 when it is done,
+1 on a STOP, and 2 when it cannot run. Any non-zero exit stops R2 at that
+point, and the back-out for that point (below) applies.
+
+1. **Fingerprint.** `python3 amap-sandy.py router-fingerprint --step 0
+   --apply`, then `python3 amap-sandy.py router-fingerprint --match <the
+   file it wrote>`, each with `--container <its current name>` while the
+   router's container is not yet `router.container`. The match must print
+   `MIGRATE` and exit 3 (`pre_registry_base` or `migration_required`).
+   `MEASURED` means no migration is needed. Any other result names its own
+   remedy, and R2 does not start.
+2. **Render.** `python3 amap-sandy.py install --render-to <run_dir>/r2-config.json
+   --apply`. It writes the pinned router's configuration to that new file
+   only, and prints its sha256. The live config is not written yet: the
+   running router's loader refuses the hop keys.
+3. **Map.** `python3 amap-sandy.py router-migrate map --config
+   <run_dir>/r2-config.json --apply`. It records each instance's logical id
+   and registry binding. It STOPs when the registry is not `ok`, or when a
+   configured instance is not resolved.
+4. **Preview.** `python3 amap-sandy.py router-migrate preview --config
+   <run_dir>/r2-config.json --map <step 3's file> --reason "<text>" --apply`.
+   It copies each name-keyed state directory to a scratch state directory
+   under its logical id, runs `generation adopt --dry-run` there, and removes
+   the copy. A copy of a running router's state is only a preview: the
+   binding dry run is step 9's.
+5. **The window opens.** Fingerprint and match again, as in step 1, with
+   `--step 2`. It must print `MIGRATE` with the same reason. Then, at once,
+   with no other step between them:
+   - `sha256sum <the live config>`, recorded;
+   - `cp -p <the live config> <run_dir>/r2-pre-migration-config.json`;
+   - `docker stop <the container Id the file records>`;
+   - `docker update --restart no <that Id>`, so that a daemon restart cannot
+     start it beside the new router;
+   - `docker rename <that Id> <router.container>-pre-registry`, so that
+     step 11 can start the new router under `router.container`.
+6. **The live config.** `python3 amap-sandy.py install --apply`. Then
+   `sha256sum <the live config>` must equal the sha256 step 2 printed.
+7. **Map again.** `python3 amap-sandy.py router-migrate map --config <the
+   live config> --apply`.
+8. **Move.** `python3 amap-sandy.py router-migrate move --config <the live
+   config> --map <step 7's file> --apply`. For each instance, it moves
+   `<state_dir>/<name>` to `<state_dir>/<logical_id>`, and only when the
+   name's entry is a real directory (never a link) and the logical id has no
+   entry of any type, a dangling link included. `state_dir` is the same
+   path on the host and in the container: `run.sh` mounts it at its own
+   path. Each move is journaled before it is made, and the first failure
+   stops the step.
+9. **Check.** `python3 amap-sandy.py router-migrate check --config <the live
+   config> --preview <step 4's file> --map <step 7's file> --reason "<text>"
+   --apply`. It STOPs when the binding (logical id, adapter, stable key and
+   binding sequence), the root or the verb differs from the preview's, or
+   when any instance shows transport history: a counter, in-flight entries,
+   transport verdicts or malformed anchors. The count of local anchors may
+   differ from the preview's, because the running router went on delivering.
+   `--no-transport-history=N` attests that an instance never had a transport
+   route, and N is its exact count of local anchors. The check takes N only
+   from this dry run's own refusal text, and records it.
+10. **Adopt.** `python3 amap-sandy.py router-migrate adopt --config <the live
+    config> --check <step 9's file> --reason "<text>" --apply`. From here
+    R2 only goes forward (back-out D).
+11. **Start.** `docker/run.sh --config <the live config> --image
+    <router.image.digest> --name <router.container> --detach`, from the hop
+    checkout.
+12. **Accept.** Wait for a poll at least 3 s after the start. Then
+    `python3 amap-sandy.py router-fingerprint --step 0 --apply` and its
+    `--match` must print `MEASURED` (`measured`): the pinned router, on its
+    registry configuration, with every instance's state in the generation
+    layout. `python3 amap-sandy.py verify` must pass.
+13. **Only then**, `docker rm <the old container's Id>`, by the Id step 5's
+    file records.
+
+**R2's back-outs**, by the point reached:
+
+- A. Before step 5's stop: nothing has changed. The run directory's files
+  are inert.
+- B. After the stop, before step 8's first move:
+  1. If step 6 ran, `cp -p <run_dir>/r2-pre-migration-config.json <the live
+     config>`, and check that `sha256sum` equals step 5's record.
+  2. `docker rename <that Id> <its old name>`.
+  3. `docker update --restart unless-stopped <that Id>`.
+  4. `docker start <that Id>`.
+- C. After a move, before step 10:
+  1. `python3 amap-sandy.py router-migrate move --config <the live config>
+     --reverse <step 8's journal> --apply`, which moves each journaled
+     directory back, newest first.
+  2. Then back-out B.
+- D. Once step 10 has begun: forward only. The adopted state is in the
+  generation layout under the logical id, which the old router never reads.
+  - Re-running step 10 resumes an interrupted adopt: until it completes, the
+    router holds the instance as `state_layout_conflict`.
+  - If the pinned router cannot start, keep the old container stopped and
+    stop: the window stays open, and the router's maintainers decide the
+    next step. `generation fence-legacy` exists only for an origin that
+    cannot be vouched for.
+
 ### The local router's delegation: fleet keys and activation
 
 Signed delegation between hosts needs three inputs, and it stays off until
@@ -779,7 +894,10 @@ reads as not running.
       is that commit, so the weekly job hands off until it is provisioned).
    8. Take an early fingerprint of the running local router and match it (the
       two commands in step 2, with `--step 0`), so that an unmeasured base
-      shows before the window.
+      shows before the window. If it prints `MIGRATE` (exit 3), the router's
+      state must be migrated first: run R2 (the local router's migration,
+      above), which ends with this match printing `MEASURED`, then take this
+      step again.
    9. Make the operator a member of the hop tree's group before A1, and check
       it with `id -Gn` after a fresh login: step 7's P02 reads the hop tree as
       the operator. Never chmod the hop tree.
@@ -880,16 +998,17 @@ reads as not running.
      - If the live config is not one regular file at its own path
        (`config_identity`), relaunch the router with the config bound at its
        own real path, as `docker/run.sh` does.
-     - If the reason is `pre_registry_base`, the running router predates
-       `registry_dir`: each instance's state is kept under its name. The
-       upgrade is not transparent for it. Continue the activation, and take
-       A4's migration branch (below). Run that branch's dry run first, after
-       A1 and before this step's stop.
-     - Only for `no_match`, `unmeasured`, `mixed` or `peer_lane` does the
+     - Only for `no_match`, `unmeasured`, `pre_registry_unchecked`, `mixed`
+       or `peer_lane` does the
        upgrade wait until its base is measured and recorded in
        `router-upgrade-bases.json` in a reviewed change. That moves the
        deploy commit, so the activation starts again at step 0. Every other
        refusal names its own remedy.
+   - On `MIGRATE` (exit 3, reason `pre_registry_base` or
+     `migration_required`), do not stop the router, and do not continue the
+     activation either: this window never migrates state. The router's state
+     is keyed by instance name, so run R2 (the local router's migration,
+     above) as its own window first, then start again at step 0's item 8.
    - A router that is not running is `UNKNOWN`.
    - An image capture never satisfies this step.
 3. **A2.** Immediately, as root, the printed 7b argv
@@ -908,29 +1027,7 @@ reads as not running.
 4. **A3.** `python3 amap-sandy.py install --apply --activate <A2's run id>
    --activation-sha256 <A1's printed digest>`, then the root place it prints.
    Add A3's printed sha256 line to the same file, labelled.
-5. **A4.** `docker/run.sh --config <the live config> --detach`. For a
-   pre-registry base (step 2's `pre_registry_base`), take the migration branch
-   below first, with the router still stopped.
-   **A4's migration branch (a pre-registry base only).** The router holds each
-   instance (`state_not_migrated`, then `legacy_state_unadopted`) until it is
-   migrated, places nothing for it, and loses nothing.
-   1. Before step 2's stop, after A1: run
-      `python3 -m router --config <the activated config> generation adopt <name> --reason <text> --dry-run`
-      for each instance, against the configuration A3 will place, and read
-      what it reports. If it cannot be run, or it reports anything but a
-      clean adoption, do not open the window.
-   2. In the window, after A3's place and with the router stopped: move each
-      instance's state directory to its logical id,
-      `mv <state_dir>/<name> <state_dir>/<logical_id>`, checking first that
-      the source exists and the target does not.
-   3. Run the same `generation adopt <name> --reason <text>` without
-      `--dry-run`, adding `--no-transport-history=N` when the command asks
-      for it (it does for a base that never had a transport).
-   4. Then A4, starting the router under the host-setup document's
-      `router.container` name: `docker/run.sh --config <the live config> --name <router.container> --detach`.
-   5. Only after A4's router runs and A5's preliminary check passes, remove
-      the old, stopped container by the Id step 2's file records:
-      `docker rm <that Id>`.
+5. **A4.** `docker/run.sh --config <the live config> --detach`.
 6. **A5, preliminary.** `python3 amap-sandy.py partition-check --document <the
    unit argv's document> --document-sha256 <its sha256>`. Only V1 and V2 must
    PASS here. T1 FAILs until step 8 records a stop target (its remedy, "run
@@ -1031,9 +1128,9 @@ removed.
 > LOST OR DROPPED BY THE STOP ITSELF: nothing.
 > C1: The local router installs no SIGTERM handler, so `docker stop` ends PID 1 at once, mid-poll if one is running. It is the same as a crash, and SIGKILL after docker's grace period is the same again. The router is built for this: every side effect is atomic and durable and passes through one crash seam, and recovery from a crash after any single write is a tested property. On restart the interrupted poll's work is redone or settled EXACTLY ONCE (idempotency anchors; a handed request is never re-handed under a new id).
 >
-> If the local router's state predates `registry_dir` (each instance's private state is kept under its name), a restart on a configuration that sets `registry_dir` does not drain that instance by itself. With the router stopped, move each instance's state directory to its logical id, then run `python3 -m router --config <config> generation adopt <name> --reason <text>`, adding `--no-transport-history=N` when the command asks for it. Until then the router holds the instance, places nothing for it, and loses nothing. The first-sight marker and the reply ledger carry over.
+> If the local router's state is keyed by instance name (a router that ran without `registry_dir`), a restart on a configuration that sets `registry_dir` does not drain that instance by itself: the router holds it, places nothing for it, and loses nothing. Such a router never reaches this window: step 2 refuses it (`MIGRATE`), and R2 migrates it in its own window first.
 >
-> DRAINS ON RESTART WITH NO OPERATOR STEP: yes.
+> DRAINS ON RESTART WITH NO OPERATOR STEP: yes, for a router whose state is in the registry layout, which is the only router this window stops.
 > - The kernel releases the drain lock when the process dies.
 > - First sight is a persisted marker, so a restart never re-snapshots or quarantines waiting requests.
 > - A restart never begins a generation (the binding and root are unchanged).
@@ -1054,7 +1151,6 @@ removed.
 > - Plan target, NOT a cancellation point: the whole window, from `docker stop <router>` to A4's start of the router on the activated config (or the back-out's start on the unchanged config), is planned to close within 30 minutes. That is half of P's default 3600 s, leaving margin for clock skew and the first poll. Missing the target cancels nothing.
 > - Worst case: the window lasts until A2 exits plus the steps after it. No figure here caps it, and it can exceed P (P's default is 3600 s). However long it lasts, the only effect on the local router past P is the inbound clause above: waiting signed statements older than now - P are demoted, each with a notice to its sender, and none is dropped. Local delivery and hand-over simply wait, as C1 says. Nothing on disk is lost, and the restart drains with no operator step. The 7-day reply windows are the only later limit, and only an outage measured in days would reach them.
 > - If no peer signs tasks to this router before its own activation, the inbound clause has nothing to act on, and the window only bounds the local-delivery and hand-over outage C1 describes, however long A2 runs.
-> - For such a router, the window also includes that migration, after the stop and before A4's start. The effects past P are unchanged.
 
 `verify` passes the signing check only when the router
 signs exactly as the policy and the gate allow, under the token of current

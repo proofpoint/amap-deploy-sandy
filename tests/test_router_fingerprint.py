@@ -88,13 +88,14 @@ def history(trees=None, fp=None, types=None):
             "first_parent": fp, "trees": {c: trees[c] for c in fp}}
 
 
-def bases(target=TARGET, measured_from=FROM, before=None, **ov):
+def bases(target=TARGET, measured_from=FROM, before=None, oldest=None, **ov):
     """The repository's bases file, with the synthetic (or a fixture's) ids.
-    pre_registry.before defaults to the synthetic chain's oldest commit, so
-    no synthetic commit is a pre-registry base unless a row says so."""
+    pre_registry.before and .from default to the synthetic chain's oldest
+    commit, so the pre-registry class is empty and no synthetic commit is a
+    pre-registry base unless a row says so."""
     doc = json.loads(rf.BASES_PATH.read_text(encoding="utf-8"))
     doc.update(target=target, measured_from=measured_from, **ov)
-    doc["pre_registry"] = dict(doc["pre_registry"], before=before or C[6])
+    doc["pre_registry"] = dict(doc["pre_registry"], before=before or C[6], **{"from": oldest or before or C[6]})
     return json.dumps(doc).encode()
 
 
@@ -140,9 +141,12 @@ def capture(tree, *, sa="100.7", started_ts=100, pst="100.8", lp=105, now="110",
                             "pid1_exe": "/usr/local/bin/python3.11", "user_site": False},
             "config": {"path": "/cfg/router.json", "realpath_ok": True, "regular": True, "stable": True,
                        "dev": 41, "ino": 7, "ctime_ns": at_ns(ctime), "state_dir": "/state",
-                       "transport_plugin": {"present": True, "sha256": PLUGIN}},
+                       "transport_plugin": {"present": True, "sha256": PLUGIN},
+                       "registry_dir": {"present": False, "value": None}},
             "status": status,
             "peer_lane": {"state_dir": "/state", "peer_entries": False},
+            "state_layout": {"state_dir": "/state", "entries": [[".router.lock", "file", None],
+                                                                ["status.json", "file", None]]},
             "errors": [],
         },
     }
@@ -150,7 +154,7 @@ def capture(tree, *, sa="100.7", started_ts=100, pst="100.8", lp=105, now="110",
         doc.update(source="image", step=None, container=None,
                    image={"ref": "example.org/rl:pin", "id": "sha256:" + "e" * 64})
         r = doc["result"]
-        r.update(process=None, clock=None, config=None, status=None, peer_lane=None)
+        r.update(process=None, clock=None, config=None, status=None, peer_lane=None, state_layout=None)
         r["interpreter"].update(pid1_exe=None, user_site=None)
     return doc
 
@@ -170,7 +174,7 @@ def gate(doc, hist=None, *, pin=TARGET, bases_bytes=None, plugin=PLUGIN):
 
 #: The exit each outcome must give, stated here rather than read from the
 #: module, so a change to the module's exit map shows.
-EXITS = {"MEASURED": 0, "UNMEASURED": 1, "UNKNOWN": 2, "EXACT": 0, "DIFFERS": 1}
+EXITS = {"MEASURED": 0, "UNMEASURED": 1, "UNKNOWN": 2, "MIGRATE": 3, "EXACT": 0, "DIFFERS": 1}
 
 
 class Outcome(unittest.TestCase):
@@ -195,10 +199,10 @@ class DomainRows(Outcome):
                 self.assertGate(gate(capture(TREE[c])), rf.UNMEASURED, "unmeasured")
 
     def test_a_base_older_than_pre_registry_before_is_a_pre_registry_base(self):
-        """before = c5: c6 predates registry_dir, so it is sent to the
-        migration branch; c5 itself and c4 stay `unmeasured`."""
-        bb = bases(before=C[5])
-        self.assertGate(rf.match(b(capture(TREE[C[6]])), bb, H, TARGET, PLUGIN), rf.UNMEASURED, "pre_registry_base")
+        """before = c5, from = c6: c6 predates registry_dir and every check
+        passes, so it is MIGRATE; c5 itself and c4 stay `unmeasured`."""
+        bb = bases(before=C[5], oldest=C[6])
+        self.assertGate(rf.match(b(capture(TREE[C[6]])), bb, H, TARGET, PLUGIN), rf.MIGRATE, "pre_registry_base")
         for c in (C[4], C[5]):
             with self.subTest(commit=c):
                 self.assertGate(rf.match(b(capture(TREE[c])), bb, H, TARGET, PLUGIN), rf.UNMEASURED, "unmeasured")
@@ -404,7 +408,8 @@ class BasesAndHistoryRows(Outcome):
 
     def test_each_bases_schema_defect(self):
         doc = json.loads(bases())
-        defects = {"not JSON": b"{", "schema 1": bases(schema=1), "schema 3": bases(schema=3), "schema true": bases(schema=True),
+        defects = {"not JSON": b"{", "schema 2": bases(schema=2), "schema 4": bases(schema=4),
+                   "schema true": bases(schema=True),
                    "short target": bases(target=TARGET[:39]), "an extra key": bases(extra="x")}
         for key in ("premises", "peer_lane"):
             d = dict(doc)
@@ -832,8 +837,21 @@ class RealHistory(Outcome):
         fp = self.h["first_parent"]
         old = next(c for c in fp if c.startswith("9854a5e8"))
         got = rf.match(b(self.real_capture(old)), bases_bytes, self.h, REAL_TARGET, PLUGIN)
-        self.assertGate(got, rf.UNMEASURED, "pre_registry_base")
-        self.assertIn("migration required", got[3])
+        self.assertGate(got, rf.MIGRATE, "pre_registry_base")
+        self.assertIn("migration branch", got[3])
+
+    def test_the_real_pre_registry_class_is_before_to_from(self):
+        """(a84e0d98, 9854a5e8]: index 49 to 56 is MIGRATE; index 57, older
+        than from, is pre_registry_unchecked; a84e0d98 itself (48) stays
+        `unmeasured`."""
+        bases_bytes = rf.BASES_PATH.read_bytes()
+        fp = self.h["first_parent"]
+        for i, outcome, reason in ((48, rf.UNMEASURED, "unmeasured"), (49, rf.MIGRATE, "pre_registry_base"),
+                                   (56, rf.MIGRATE, "pre_registry_base"),
+                                   (57, rf.UNMEASURED, "pre_registry_unchecked")):
+            with self.subTest(index=i):
+                got = rf.match(b(self.real_capture(fp[i])), bases_bytes, self.h, REAL_TARGET, PLUGIN)
+                self.assertGate(got, outcome, reason)
 
     def test_below_the_range_is_unmeasured(self):
         bases_bytes = rf.BASES_PATH.read_bytes()
@@ -1772,7 +1790,7 @@ class MatchVerbNoHop(Outcome):
         real_bases = rf.BASES_PATH
         self.addCleanup(setattr, rf, "BASES_PATH", real_bases)
         doc = json.loads(rf.BASES_PATH.read_bytes())
-        doc["schema"] = 3
+        doc["schema"] = 2
         rf.BASES_PATH = self.base / "bases.json"
         rf.BASES_PATH.write_text(json.dumps(doc))
         f = self.base / "cap.json"
@@ -1942,6 +1960,317 @@ class BasesDirty(unittest.TestCase):
         self.assertEqual(rec.calls(), [])
 
 
+# --- Every check applies to a pre-registry base, and the state layout --------------
+
+
+def pre_bases():
+    """c6 is the one pre-registry base: before = c5, from = c6."""
+    return bases(before=C[5], oldest=C[6])
+
+
+def pre_capture():
+    return capture(TREE[C[6]])
+
+
+def layout(*entries, state_dir="/state"):
+    return {"state_dir": state_dir, "entries": sorted([list(e) for e in entries])}
+
+
+LID_A, LID_B = "a" * 32, "b" * 32
+
+
+class PreRegistryGateRows(Outcome):
+    """Codex's and Opus's witnesses: each later check refuses on a
+    pre-registry capture exactly as on a measured one, never returning
+    pre_registry_base first."""
+
+    def run_pre(self, fn):
+        d = pre_capture()
+        fn(d)
+        return rf.match(b(d), pre_bases(), H, TARGET, PLUGIN)
+
+    def test_the_positive_control_is_migrate(self):
+        self.assertGate(self.run_pre(lambda d: None), rf.MIGRATE, "pre_registry_base")
+
+    def test_each_later_check_refuses_first(self):
+        def peer(v):
+            return lambda d: d["result"]["peer_lane"].update(peer_entries=v)
+        cases = {
+            "pycache": (lambda d: d["result"]["entries"].update({"__pycache__": "dir"}), rf.UNKNOWN, "pycache"),
+            "ld_env": (lambda d: d["result"]["process"].update(ld_env=["LD_PRELOAD"]), rf.UNKNOWN, "ld_env"),
+            "run_form": (lambda d: d["result"]["process"]["argv"].__setitem__(5, "once"), rf.UNKNOWN, "run_form"),
+            "config_identity": (lambda d: d["result"]["config"].update(regular=False), rf.UNKNOWN,
+                                "config_identity"),
+            "config_changed": (lambda d: d["result"]["config"].update(ctime_ns=at_ns("101")), rf.UNKNOWN,
+                               "config_changed"),
+            "interpreter": (lambda d: d["result"]["interpreter"].update(minor=12), rf.UNKNOWN, "interpreter"),
+            "plugin": (lambda d: d["result"]["status"]["transport_plugin"]["value"].update(sha256="0" * 64),
+                       rf.UNMEASURED, "plugin"),
+            "peer_lane": (peer(True), rf.UNMEASURED, "peer_lane"),
+            "peer_unknown": (peer(None), rf.UNKNOWN, "peer_unknown"),
+            "stale_status": (lambda d: d["result"]["status"]["last_poll_ts"].update(value=whole(101)), rf.UNKNOWN,
+                             "stale_status"),
+        }
+        for name, (fn, outcome, reason) in cases.items():
+            with self.subTest(check=name):
+                self.assertGate(self.run_pre(fn), outcome, reason)
+
+    def test_the_pre_registry_umask_rule(self):
+        """A pre-registry entrypoint sets no umask: 0022 and 0027 pass, a
+        umask that lets group or other write does not; a measured base still
+        needs exactly 0027."""
+        for umask, outcome, reason in (("0022", rf.MIGRATE, "pre_registry_base"),
+                                       ("0027", rf.MIGRATE, "pre_registry_base"),
+                                       ("0002", rf.UNKNOWN, "umask"), ("0020", rf.UNKNOWN, "umask")):
+            with self.subTest(umask=umask):
+                self.assertGate(self.run_pre(lambda d: d["result"]["process"].update(umask=umask)), outcome,
+                                reason)
+        d = capture(TREE[C[1]])
+        d["result"]["process"]["umask"] = "0022"
+        self.assertGate(gate(d), rf.UNKNOWN, "umask")
+
+    def test_older_than_from_is_unchecked(self):
+        bb = bases(before=C[4], oldest=C[5])
+        self.assertGate(rf.match(b(capture(TREE[C[6]])), bb, H, TARGET, PLUGIN), rf.UNMEASURED,
+                        "pre_registry_unchecked")
+        self.assertGate(rf.match(b(capture(TREE[C[5]])), bb, H, TARGET, PLUGIN), rf.MIGRATE, "pre_registry_base")
+
+    def test_a_class_straddling_from_is_unchecked(self):
+        trees = {c: {"router": router(i), "entrypoint": ENTRY} for i, c in enumerate(C)}
+        trees[C[6]]["router"] = copy.deepcopy(trees[C[5]]["router"])
+        got = rf.match(b(capture(trees[C[5]])), bases(before=C[4], oldest=C[5]), history(trees), TARGET, PLUGIN)
+        self.assertGate(got, rf.UNMEASURED, "pre_registry_unchecked")
+
+    def test_a_pre_registry_base_with_generation_state_is_unknown(self):
+        def gen(d):
+            d["result"]["state_layout"] = layout([LID_A, "dir", True])
+        self.assertGate(self.run_pre(gen), rf.UNKNOWN, "state_layout")
+
+
+class StateLayoutRows(Outcome):
+    """The migration trigger is the state layout, whatever the commit (RL's
+    B1): a measured base keyed by name is MIGRATE `migration_required`."""
+
+    def run_layout(self, sl, registry=True):
+        d = capture(TREE[C[1]])
+        d["result"]["state_layout"] = sl
+        d["result"]["config"]["registry_dir"] = {"present": registry, "value": "/reg" if registry else None}
+        return gate(d)
+
+    def test_name_keyed_state_on_a_measured_base_is_migration_required(self):
+        got = self.run_layout(layout(["alice", "dir", False], [".router.lock", "file", None]), registry=False)
+        self.assertGate(got, rf.MIGRATE, "migration_required")
+        self.assertIn("alice", got[3])
+
+    def test_a_logical_id_with_no_generations_file_is_migration_required(self):
+        self.assertGate(self.run_layout(layout([LID_A, "dir", False])), rf.MIGRATE, "migration_required")
+
+    def test_generation_keyed_state_is_measured(self):
+        sl = layout([LID_A, "dir", True], [LID_B, "dir", True], ["registry", "dir", False],
+                    ["_runtime", "dir", False], ["status.json", "file", None], ["peer-replay", "dir", False])
+        self.assertGate(self.run_layout(sl), rf.MEASURED, "measured")
+
+    def test_the_reserved_names_are_compared_casefolded(self):
+        self.assertGate(self.run_layout(layout(["REGISTRY", "dir", False], [LID_A, "dir", True])), rf.MEASURED,
+                        "measured")
+
+    def test_what_the_router_would_not_guess_is_unknown(self):
+        cases = {"a link": layout(["alice", "link", None]), "an other": layout(["sock", "other", None]),
+                 "an unreadable generations file": layout([LID_A, "dir", None]),
+                 "neither the router's nor an instance's": layout(["_weird", "dir", False])}
+        for name, sl in cases.items():
+            with self.subTest(case=name):
+                self.assertGate(self.run_layout(sl), rf.UNKNOWN, "state_layout")
+
+    def test_id_keyed_state_without_a_registry_is_unknown(self):
+        for sl in (layout([LID_A, "dir", True]), layout([LID_A, "dir", False])):
+            with self.subTest(layout=sl):
+                self.assertGate(self.run_layout(sl, registry=False), rf.UNKNOWN, "state_layout")
+
+    def test_a_layout_of_another_state_dir_is_unknown(self):
+        self.assertGate(self.run_layout(layout(state_dir="/other")), rf.UNKNOWN, "state_layout")
+
+
+class PreRegistryBasesRows(Outcome):
+    """pre_registry's exact shape (Opus's X1) and its from bound."""
+
+    def bad(self, pre):
+        doc = json.loads(bases())
+        doc["pre_registry"] = pre
+        return json.dumps(doc).encode()
+
+    def test_each_shape_defect_is_bases_schema(self):
+        good = json.loads(bases())["pre_registry"]
+        cases = {"not an object": [], "from absent": {k: v for k, v in good.items() if k != "from"},
+                 "an extra key": dict(good, extra="x"), "from short": dict(good, **{"from": C[6][:39]}),
+                 "before upper case": dict(good, before=C[6].upper()), "statement not a string": dict(good,
+                                                                                                    statement=1)}
+        for name, pre in cases.items():
+            with self.subTest(defect=name):
+                self.assertGate(gate(capture(TREE[C[1]]), bases_bytes=self.bad(pre)), rf.UNKNOWN, "bases_schema")
+
+    def test_from_off_the_chain_or_newer_than_before(self):
+        self.assertGate(gate(capture(TREE[C[1]]), bases_bytes=bases(before=C[5], oldest=oid("elsewhere"))),
+                        rf.UNKNOWN, "pre_registry_off_chain")
+        self.assertGate(gate(capture(TREE[C[1]]), bases_bytes=bases(before=C[5], oldest=C[4])), rf.UNKNOWN,
+                        "pre_registry_order")
+
+
+class NewMembersStructureRows(Outcome):
+
+    def test_each_new_member_defect_is_schema(self):
+        def drop_rd(d):
+            del d["result"]["config"]["registry_dir"]
+        cases = {
+            "config.registry_dir absent": drop_rd,
+            "registry_dir not an object": lambda d: d["result"]["config"].update(registry_dir="x"),
+            "registry_dir present with no value": lambda d: d["result"]["config"].update(
+                registry_dir={"present": True, "value": None}),
+            "a layout entry of another kind": lambda d: d["result"].update(state_layout=layout(["x", "fifo", None])),
+            "generations on a file": lambda d: d["result"].update(state_layout=layout(["x", "file", True])),
+            "a two-member entry": lambda d: d["result"].update(state_layout={"state_dir": "/state",
+                                                                            "entries": [["x", "dir"]]}),
+            "an integer for generations": lambda d: d["result"].update(state_layout=layout(["x", "dir", 1])),
+            "state_layout absent without errors": lambda d: d["result"].update(state_layout=None),
+        }
+        for name, fn in cases.items():
+            with self.subTest(defect=name):
+                d = capture(TREE[C[1]])
+                fn(d)
+                self.assertGate(gate(d), rf.UNKNOWN, "schema")
+
+    def test_an_image_capture_carries_no_layout(self):
+        d = capture(TREE[C[1]], source="image")
+        d["result"]["state_layout"] = layout()
+        self.assertGate(rf.verify_image(b(d), H, C[1]), rf.UNKNOWN, "schema")
+
+
+class ContainerOptionRows(unittest.TestCase):
+    """--container: a container name only (HAR's N1, Opus), never with
+    --image or --verify-image, and named by the dry run (Opus's X4)."""
+
+    def setUp(self):
+        real = rf._load_spec
+        self.addCleanup(setattr, rf, "_load_spec", real)
+        spec = SimpleNamespace(secrets=SimpleNamespace(run_dir="/nonexistent", docker_via_sudo=False,
+                                                       tools={"docker": "docker"}),
+                               router=SimpleNamespace(container="amap-rl"))
+        rf._load_spec = lambda *a, **k: spec
+        real_docker = rf.ss_docker
+        self.addCleanup(setattr, rf, "ss_docker", real_docker)
+        rf.ss_docker = lambda spec: ["docker"]
+
+    def args(self, **kw):
+        base = dict(verify_image=None, match=None, image=None, step=None, apply=False, commit=None, spec=None,
+                    overlay=None, container=None)
+        base.update(kw)
+        return SimpleNamespace(**base)
+
+    def test_a_value_that_is_not_a_name_is_refused(self):
+        for bad in ("-H", "--format", "a b", "", "x/y"):
+            with self.subTest(value=bad):
+                lines = []
+                self.assertEqual(rf.run(self.args(step=2, container=bad), out=lines.append), 2)
+                self.assertIn("is not a container name", lines[-1])
+
+    def test_it_never_goes_with_image_or_verify_image(self):
+        for kw in (dict(image="example.org/rl:pin"), dict(verify_image="/x", commit=C[1])):
+            with self.subTest(mode=kw):
+                lines = []
+                self.assertEqual(rf.run(self.args(container="amap-router-local", **kw), out=lines.append), 2)
+                self.assertIn("applies only to --step and --match", lines[-1])
+
+    def test_the_dry_run_names_the_given_container(self):
+        lines = []
+        self.assertEqual(rf.run(self.args(step=2, container="amap-router-local"), out=lines.append), 0)
+        self.assertIn("inspect amap-router-local;", lines[-1])
+        lines = []
+        self.assertEqual(rf.run(self.args(step=2), out=lines.append), 0)
+        self.assertIn("inspect amap-rl;", lines[-1])
+
+
+@unittest.skipUnless(os.path.isdir("/proc/self"), "PROGRAM reads /proc")
+class ProgramLayoutRows(unittest.TestCase):
+    """PROGRAM's read_layout and the config's registry_dir, on real files."""
+
+    def setUp(self):
+        self.base = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.base, ignore_errors=True)
+
+    def test_read_layout_names_each_entry_never_followed(self):
+        p = program()
+        sd = self.base / "state"
+        (sd / "alice").mkdir(parents=True)
+        (sd / LID_A).mkdir()
+        (sd / LID_A / "generations.json").write_text("{}")
+        (sd / LID_B).mkdir()
+        (sd / LID_B / "generations.json").mkdir()
+        (sd / "status.json").write_text("{}")
+        os.symlink(str(sd / "alice"), str(sd / "bob"))
+        (sd / (LID_A[:31] + "c")).mkdir()
+        got = p["read_layout"](str(sd))
+        self.assertEqual(got, {"state_dir": str(sd), "entries": sorted([
+            ["alice", "dir", False], [LID_A, "dir", True], [LID_B, "dir", None], ["status.json", "file", None],
+            ["bob", "link", None], [LID_A[:31] + "c", "dir", False]])})
+        self.assertTrue(any("generations.json" in e for e in p["ERRORS"]))
+
+    def test_read_config_records_registry_dir(self):
+        for body, want, errors in (({"state_dir": "/s"}, {"present": False, "value": None}, False),
+                                   ({"state_dir": "/s", "registry_dir": "/r"}, {"present": True, "value": "/r"},
+                                    False),
+                                   ({"state_dir": "/s", "registry_dir": 7}, {"present": True, "value": None}, True)):
+            with self.subTest(body=body):
+                p = program()
+                cfg = self.base / f"router-{len(list(self.base.iterdir()))}.json"
+                cfg.write_text(json.dumps(body))
+                got = p["read_config"](str(cfg))
+                self.assertEqual(got["registry_dir"], want)
+                self.assertEqual(any("registry_dir" in e for e in p["ERRORS"]), errors)
+
+
+class RouterVocabularyPins(unittest.TestCase):
+    """The state layout's vocabulary is the pinned router's own, read from
+    the hop checkout's source at the pin."""
+
+    def show(self, path):
+        return subprocess.run([GIT, "-C", HOP, "show", f"{REAL_TARGET}:{path}"], capture_output=True, text=True,
+                              check=True).stdout
+
+    def test_reserved_state_names(self):
+        src = self.show("router/config.py")
+        self.assertIn('RESERVED_STATE_NAMES = frozenset({"registry", "status.json", "aliases"})', src)
+        self.assertIn('PEER_STATE_NAMES = frozenset({"peer-decision.key", "peer-replay", "peer-vacant",\n'
+                      '                              "peer-clock.json"})', src)
+        self.assertIn('RUNTIME_NS = "_runtime"', src)
+        self.assertIn("RESERVED_STATE_NAMES = RESERVED_STATE_NAMES | PEER_STATE_NAMES", src)
+        self.assertIn("RESERVED_STATE_NAMES = RESERVED_STATE_NAMES | frozenset({RUNTIME_NS})", src)
+        self.assertEqual(src.count("RESERVED_STATE_NAMES = "), 3)
+        self.assertEqual(rf.RESERVED_STATE_NAMES, frozenset({"registry", "status.json", "aliases",
+                                                             "peer-decision.key", "peer-replay", "peer-vacant",
+                                                             "peer-clock.json", "_runtime"}))
+
+    def test_the_instance_name_logical_id_and_generations_file(self):
+        self.assertIn('_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\\Z")', self.show("router/config.py"))
+        self.assertEqual(rf.INSTANCE_NAME.pattern, "[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+        self.assertIn('_ID_SHAPED = re.compile(r"[0-9a-fA-F]{32}\\Z")', self.show("router/registry.py"))
+        self.assertEqual(rf.LOGICAL_ID.pattern, "[0-9a-fA-F]{32}")
+        self.assertIn('GEN_FILE = "generations.json"', self.show("router/generations.py"))
+        self.assertIn('"generations.json"', rf.PROGRAM)
+
+    def test_the_pre_registry_entrypoint_sets_no_umask(self):
+        """The rule's premise: the entrypoint gains `umask 0027` above
+        a84e0d98, and the pre-registry range has none."""
+        bases_doc = json.loads(rf.BASES_PATH.read_bytes())
+        for c, has in ((REAL_TARGET, True), (bases_doc["pre_registry"]["before"], False),
+                       (bases_doc["pre_registry"]["from"], False)):
+            with self.subTest(commit=c):
+                self.assertEqual("\numask 0027\n" in self.show_at(c, "docker/entrypoint.sh"), has)
+
+    def show_at(self, commit, path):
+        return subprocess.run([GIT, "-C", HOP, "show", f"{commit}:{path}"], capture_output=True, text=True,
+                              check=True).stdout
+
+
 class Pins(unittest.TestCase):
 
     def test_pre_registry_before_is_where_registry_dir_lands(self):
@@ -1968,8 +2297,17 @@ class Pins(unittest.TestCase):
     def test_the_plugin_digest(self):
         self.assertEqual(hp.PLUGIN_SHA256, "f15855c974df021c2ae5c551aff2448d934725a6796fb03434e573305d24fe93")
 
+    def test_pre_registry_from_is_the_rehearsed_base(self):
+        """from = 9854a5e8, the base the router's maintainers rehearsed the
+        migration on, older than before on the hop chain."""
+        pre = json.loads(rf.BASES_PATH.read_bytes())["pre_registry"]
+        self.assertEqual(pre["from"], "9854a5e8e932ef2989237de7b0a15ac322f38e5a")
+        fp = subprocess.run([GIT, "-C", HOP, "rev-list", "--first-parent", REAL_TARGET], capture_output=True,
+                            text=True, check=True).stdout.split()
+        self.assertEqual((fp.index(pre["before"]), fp.index(pre["from"])), (48, 56))
+
     def test_the_program_sha256(self):
-        self.assertEqual(rf.PROGRAM_SHA256, "e808f20f8a59a2dec9716c35d3a4206cee07489beb848c1906765c48052d6186")
+        self.assertEqual(rf.PROGRAM_SHA256, "153c24c30e444b9284f7122ee1329030d48787fc4a6abbdb1ee5a43f0f6cb157")
 
 
 if __name__ == "__main__":
