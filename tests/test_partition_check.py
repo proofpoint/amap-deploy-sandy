@@ -26,7 +26,7 @@ import partition_setup as ps
 import router_health as rh
 import test_activation_install as tai
 from test_hub_runtime import setUpModule, tearDownModule  # noqa: F401 -- the fixture's pins, restored
-from test_hub_supervise import sup_section
+from test_hub_supervise import supervise
 from test_partition_activation import IMAGE, inspect_of
 from test_partition_evidence import AT, NOW, BINDINGS, build, probe
 
@@ -53,7 +53,7 @@ class Host(tai.A3):
 
     def setUp(self):
         orig = tai.partition_doc
-        tai.partition_doc = lambda *a, **k: dict(orig(*a, **k), supervision=sup_section("systemd"))
+        tai.partition_doc = lambda *a, **k: supervise(orig(*a, **k), "systemd")
         try:
             tai.A3.setUp(self)
         finally:

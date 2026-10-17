@@ -7,10 +7,10 @@ start) is printed only by `hub-start-check`, only when every check passes.
 Starting is the operator's act.
 
 On macOS, launchd loads every plist in /Library/LaunchDaemons at boot, so
-placing one would start it at the next boot. The plan therefore runs
-`launchctl disable system/<label>` for both labels BEFORE placing them (a
-persistent override that launchd honours at boot), and the start step is
-`launchctl enable` followed by `launchctl bootstrap`. Verify reads the
+placing one would start it at the next boot. The plan therefore disables
+both labels BEFORE placing them (a persistent override that launchd
+honours at boot), through the writer's `service` verb as every manager
+call is, and the start step is enable followed by bootstrap. Verify reads the
 override back (`launchctl print-disabled system`): a label that is not
 disabled is a FAIL unless every start check passes now.
 
@@ -102,6 +102,12 @@ SUPERVISOR_STOP_S = 120
 #: with no docker in the closure); macOS is not measured, so this is a
 #: declared bound, and the supervisors' bound must cover it plus the stop.
 BARRIER_S = 10
+#: What a planned restart's budget keeps beyond its stop and its three barrier lines.
+SERVICE_MARGIN_S = 30
+#: The barrier lines a planned restart passes after its stop: the anchor ExecStartPre, `-docker rm`, ExecStart.
+RESTART_BARRIER_LINES = 3
+#: Each kind's manager, recorded in secrets.tools under this name.
+MANAGERS = {"systemd": "systemctl", "launchd": "launchctl"}
 ORPHAN = "orphan_running"
 #: The wrapper's record once the barrier passed and the run is next; the run's own end replaces it.
 STARTED = "started"
@@ -186,6 +192,11 @@ def load(sec: Any, spec: Any) -> SupervisionSpec:
         raise SupervisionSpecError(f"supervision.kind must be one of {', '.join(KINDS)}")
     if not isinstance(sec["engine"], str) or not _ENGINE.fullmatch(sec["engine"]):
         raise SupervisionSpecError("supervision.engine must be unix:///<socket path>")
+    tools = spec.secrets.tools
+    if not isinstance(tools.get(MANAGERS[kind]), str) or not posixpath.isabs(tools[MANAGERS[kind]]):
+        raise SupervisionSpecError(f"a {kind} host records its manager as secrets.tools.{MANAGERS[kind]}")
+    if "launchctl" in tools and tools["launchctl"] != LAUNCHCTL:
+        raise SupervisionSpecError(f"secrets.tools.launchctl must be {LAUNCHCTL}")
     if kind == "systemd":
         hub = _exact(sec["hub"], ("unit",), "hub")
         if not _abs(hub["unit"], "hub.unit").endswith(".service"):
@@ -537,6 +548,19 @@ def mode_of(spec: Any, path: str) -> int:
     return PLIST_MODE if path in plists else FILE_MODE
 
 
+def manager(spec: Any) -> str:
+    """The recorded manager of the host's kind: ONE value, rendered both as
+    the line's --also and as the verb's --manager."""
+    return spec.secrets.tools[MANAGERS[spec.supervision.kind]]
+
+
+def service_line(spec: Any, action: str, *args: str, q: Callable[[str], str] = shlex.quote) -> str:
+    """The typed root line for one row of the writer's service table."""
+    m = manager(spec)
+    return ss.typed_root(spec.secrets, own(spec, "service", "--manager", m, spec.supervision.kind, action, *args), q,
+                         also=[m])
+
+
 def plan(spec: Any, q: Callable[[str], str], steps: str) -> List[str]:
     """The root steps that place the files. Enabling them is NOT here: it is
     the gated start step, which `hub-start-check` prints only on a pass. On
@@ -546,8 +570,8 @@ def plan(spec: Any, q: Callable[[str], str], steps: str) -> List[str]:
     lines = ["# The hub-link router's supervision. First, as the operator: `amap-sandy.py hub-supervise "
              f"--apply` writes the files into {run_dir}. Placing them enables nothing."]
     for label in labels(spec):
-        lines.append(f"{LAUNCHCTL} disable {q('system/' + label)}  # before placing: launchd would load "
-                     "it at the next boot")
+        lines.append("# Before placing: launchd would load it at the next boot.")
+        lines.append(service_line(spec, "disable", label, q=q))
     for path, data in rendered(spec):
         mode = mode_of(spec, path)
         lines.append(f"{steps} place {q(posixpath.join(run_dir, staged(path)))} {q(path)} --sha256 {hr._sha(data)}"
@@ -643,8 +667,8 @@ def verify_enablement(spec: Any, disabled: Any, gate: Callable[[], Any],
         claim = f"{label} is disabled, or every start check passes"
         want = _fact("enablement", True, "placing a plist must not start the router at boot without "
                                          "hub-start-check passing")
-        remedy = (f"run `{LAUNCHCTL} disable system/{label}` (and `{LAUNCHCTL} bootout system/{label}` if "
-                  "it is loaded) until hub-start-check passes, then use the start step it prints")
+        remedy = (f"run `{service_line(spec, 'disable', label)}` (and `{service_line(spec, 'bootout', label)}` "
+                  "if it is loaded) until hub-start-check passes, then use the start step it prints")
         state = disabled if isinstance(disabled, rh.Unresolved) else disabled.get(label)
         if isinstance(state, rh.Unresolved):
             out.append(rh.unknown(claim, want, state.reason, remedy))
@@ -835,6 +859,21 @@ def verify_stop_bound(spec: Any) -> List[rh.Check]:
                      do_not="lower STOP_TIMEOUT_S below the router's join bound to make room")]
 
 
+def verify_service_bound(spec: Any) -> List[rh.Check]:
+    """The writer's one service budget covers a planned restart:
+    the supervisor's stop bound, three barrier lines (the anchor
+    ExecStartPre, `-docker rm` and ExecStart) and the margin."""
+    import host_steps  # the writer, never in the weekly bundle's closure: imported only here
+    claim = (f"the writer's service budget ({host_steps.SERVICE_TIMEOUT_S} s) covers a planned restart: the stop "
+             f"bound ({SUPERVISOR_STOP_S} s), {RESTART_BARRIER_LINES} barrier lines ({BARRIER_S} s each) and "
+             f"{SERVICE_MARGIN_S} s")
+    want = rh.Fact("restart budget", SUPERVISOR_STOP_S + RESTART_BARRIER_LINES * BARRIER_S + SERVICE_MARGIN_S,
+                   "SUPERVISOR_STOP_S + RESTART_BARRIER_LINES × BARRIER_S + SERVICE_MARGIN_S")
+    return [rh.check(claim, want, host_steps.SERVICE_TIMEOUT_S, "raise host_steps.SERVICE_TIMEOUT_S to at least the "
+                     "stop bound plus three barrier lines and the margin", ok=lambda e, a: a >= e,
+                     do_not="lower SUPERVISOR_STOP_S to make room")]
+
+
 def verify_wrapper_status(spec: Any, lstat: Callable, read: Callable[[str], bytes]) -> List[rh.Check]:
     """d3.3 §5 B3, launchd: the wrapper's error stream goes to a root-owned
     place; its status says how the last start ended, and a missing one is a
@@ -892,6 +931,7 @@ def checks(spec: Any, *, lstat: Callable, read: Callable[[str], bytes] = hr.dd.r
         out += verify_wrapper_status(spec, lstat, read)
     out += verify_stop_budget(spec)
     out += verify_stop_bound(spec)
+    out += verify_service_bound(spec)
     out += verify_ancestry(spec, (lambda c, o: ask_ancestor(spec, c, o)) if ancestor is ASK else ancestor,
                            ask_label(spec) if label is ASK else label)
     return out

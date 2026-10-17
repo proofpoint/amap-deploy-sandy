@@ -785,13 +785,15 @@ def live_docker(s: SecretSpec, *, engine: Optional[str] = None) -> List[str]:
 COREDUMP_OFF = "kern.coredump=0"
 
 
-def typed_root(s: SecretSpec, argv: Sequence[str], q: Callable[[str], str], python3: Optional[str] = None) -> str:
+def typed_root(s: SecretSpec, argv: Sequence[str], q: Callable[[str], str], python3: Optional[str] = None,
+               also: Sequence[str] = ()) -> str:
     """One operator-typed root line (d3.3 §5(d)) through the placed writer,
-    with the document's tools. `python3` is the barrier's interpreter when
-    argv runs another than the secrets section's (the partition job's)."""
+    with the document's tools and each `also` trusted-exec judges beside
+    argv[0]. `python3` is the barrier's interpreter when argv runs another
+    than the secrets section's (the partition job's)."""
     return " ".join(q(a) for a in rt.typed_argv(posixpath.join(s.writer_dir, rt.NAME), s.writer_sha256,
                                                 python3 or s.tools["python3"], s.writer, list(s.tools.values()),
-                                                list(argv)))
+                                                list(argv), also=also))
 
 
 def sudo_route(s: SecretSpec, engine: Optional[str]) -> List[str]:

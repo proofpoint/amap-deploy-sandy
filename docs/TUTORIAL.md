@@ -1386,6 +1386,13 @@ systemd's first `ExecStartPre`, whose failure fails the start, and the
 launchd wrapper, which then records `untrusted_tools` and exits 0, so
 launchd does not restart it. Root runs no docker that is not root's alone.
 
+The service manager is called the same way. The secrets section's `tools`
+record it: `systemctl` on Linux, and `launchctl` as `/bin/launchctl` on
+macOS. Each typed line names it twice: as `--also` before `--`, and as
+`service --manager` after it. The writer's `service` verb judges it again
+and runs only a fixed set of its actions. The plan's lines that disable
+both labels before their plists are placed are such lines.
+
 A stop goes through the barrier too, so a refused stop never reaches
 `docker stop`. On macOS the wrapper says "the stop was refused or failed",
 and when launchd's `ExitTimeOut` ends the wrapper, the container is still

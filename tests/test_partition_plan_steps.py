@@ -21,15 +21,14 @@ import partition_job as pj
 import partition_setup as ps
 import root_trust as rt
 from test_hub_runtime import setUpModule, tearDownModule  # noqa: F401 -- the fixture's pins, restored
-from test_hub_supervise import sup_section
+from test_hub_supervise import supervise
 from test_partition_setup import doc
 
 RUNBOOK = Path(__file__).absolute().parents[1] / "docs" / "TUTORIAL.md"
 
 
 def plan(kind):
-    d = doc()
-    d[hv.SECTION] = sup_section(kind)
+    d = supervise(doc(), kind)
     if kind == "launchd":
         d["partition"]["tools"].update({"git": ps.CLT_GIT, "git-remote-https": ps.CLT_GIT_REMOTE_HTTPS})
     spec = hs.load_spec(d)
@@ -104,13 +103,11 @@ class PlanTest(unittest.TestCase):
         for git, helper in (("/usr/bin/git", ps.CLT_GIT_REMOTE_HTTPS),
                             (ps.CLT_GIT, "/usr/local/libexec/git-core/git-remote-https")):
             with self.subTest(git=git, helper=helper):
-                d = doc()
-                d[hv.SECTION] = sup_section("launchd")
+                d = supervise(doc(), "launchd")
                 d["partition"]["tools"].update({"git": git, "git-remote-https": helper})
                 with self.assertRaisesRegex(hs.SpecError, "xcrun shim"):
                     hs.load_spec(d)
-        d = doc()
-        d[hv.SECTION] = sup_section("systemd")
+        d = supervise(doc(), "systemd")
         self.assertEqual(hs.load_spec(d).partition.tools["git"], "/usr/bin/git", "the rule is darwin's alone")
 
     def test_the_git_fact_line_runs_under_exactly_git_env(self):

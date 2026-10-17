@@ -3757,6 +3757,158 @@ def _partition_fetch_main(argv):
     return partition_fetch(got["--exec-root"], got["--pin"], got["--repo"], got["--git"], got["--git-remote-https"])
 
 
+# --- service: the service manager's whitelisted calls, as root (d3.3 §5(d) §4) ---------------
+#
+# argv[0] of the typed line stays the writer's interpreter; the manager is
+# judged by trusted-exec (--also) and again here, on the exact path run, and
+# the argv the manager gets comes only from SERVICE_TABLE. The writer reads
+# no document.
+
+#: The one budget a service call has: restart waits for the supervisor's
+#: stop bound, three barrier lines and a margin (hub_supervise.verify_service_bound).
+SERVICE_TIMEOUT_S = 180
+#: The manager's whole environment: root_trust.PATH and LC_ALL, no pager variable.
+SERVICE_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+LAUNCHD_DIR = "/Library/LaunchDaemons"
+SERVICE_LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+SERVICE_UNIT = re.compile(r"[A-Za-z0-9][A-Za-z0-9@._-]*\.(service|timer)")
+SYSTEMCTL_FLAGS = ("--no-ask-password", "--no-pager")
+MANAGER_NAMES = {"systemd": "systemctl", "launchd": "launchctl"}
+#: launchctl bootout's "Operation now in progress": the job is still going away.
+BOOTOUT_IN_PROGRESS = 36
+#: `launchctl print system/<label>`'s (exit status, output) once the label is
+#: gone, exactly. A Mac fact not yet measured: while it is None, every print
+#: answer is unknown and a bootout is never confirmed.
+LAUNCHD_NOT_FOUND = None
+#: (kind, action): (the argument kinds, the argv after the manager).
+SERVICE_TABLE = {
+    ("launchd", "disable"): (("label",), lambda a: ["disable", f"system/{a[0]}"]),
+    ("launchd", "enable"): (("label",), lambda a: ["enable", f"system/{a[0]}"]),
+    ("launchd", "bootstrap"): (("label", "plist"), lambda a: ["bootstrap", "system", a[1]]),
+    ("launchd", "bootout"): (("label",), lambda a: ["bootout", f"system/{a[0]}"]),
+    ("systemd", "daemon-reload"): ((), lambda a: [*SYSTEMCTL_FLAGS, "daemon-reload"]),
+    ("systemd", "enable-now"): (("unit",), lambda a: [*SYSTEMCTL_FLAGS, "enable", "--now", a[0]]),
+    ("systemd", "restart"): (("service",), lambda a: [*SYSTEMCTL_FLAGS, "restart", a[0]]),
+    ("systemd", "stop"): (("unit",), lambda a: [*SYSTEMCTL_FLAGS, "stop", a[0]]),
+    ("systemd", "reset-failed"): (("service",), lambda a: [*SYSTEMCTL_FLAGS, "reset-failed", a[0]]),
+}
+
+
+def service_argv(manager, kind, action, args):
+    """The manager's argv for one row of SERVICE_TABLE, or Tooling: an
+    action outside the table, an argument outside its row's rule, or a
+    manager that is not the kind's by name (a kind check only)."""
+    if kind not in MANAGER_NAMES or not os.path.isabs(manager or "") \
+            or os.path.basename(manager) != MANAGER_NAMES[kind]:
+        raise Tooling("--manager must be an absolute path to " + MANAGER_NAMES.get(kind, "the kind's manager"))
+    row = SERVICE_TABLE.get((kind, action))
+    if row is None:
+        raise Tooling(f"{kind} {action} is not a service action")
+    kinds, build = row
+    if len(args) != len(kinds):
+        raise Tooling(f"{kind} {action} takes {len(kinds)} argument(s)")
+    for k, a in zip(kinds, args):
+        if k == "label":
+            ok = SERVICE_LABEL.fullmatch(a) is not None
+        elif k == "plist":
+            ok = a == f"{LAUNCHD_DIR}/{args[0]}.plist"
+        elif k == "unit":
+            ok = SERVICE_UNIT.fullmatch(a) is not None
+        else:
+            ok = SERVICE_UNIT.fullmatch(a) is not None and a.endswith(".service")
+        if not ok:
+            raise Tooling(f"{a!r} is not a {k} {kind} {action} accepts")
+    return [manager] + build(list(args))
+
+
+def _plist_problem(plist, platform=None):
+    """The bootstrap plist as root will load it: every directory from / to
+    its own, root's and not writable by others, reached without a link;
+    the plist a regular file, root's, not group- or world-writable, one
+    link, opened without following one; no ACL anywhere on that route."""
+    parent, name = os.path.split(plist)
+    try:
+        pfd = _walk(parent, _ancestor_ok, _ancestor_ok, "the plist's directory")
+    except Tooling as e:
+        return str(e)
+    try:
+        try:
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=pfd)
+        except OSError as e:
+            return f"{plist} cannot be opened without following a link ({e.strerror})"
+        try:
+            st = os.fstat(fd)
+        finally:
+            os.close(fd)
+    finally:
+        os.close(pfd)
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != ROOT_UID or st.st_mode & 0o022 or st.st_nlink != 1:
+        return f"{plist} is not a regular root-owned file, one link, that no one else can write"
+    route = ["/"] + ["/" + "/".join(_parts(parent)[:i + 1]) for i in range(len(_parts(parent)))] + [plist]
+    bad = acl_problems(route, platform=platform)
+    return "; ".join(bad) if bad else None
+
+
+def _timed_out(argv, out):
+    out(f"service: {' '.join(argv)} did not finish in {SERVICE_TIMEOUT_S} s; the manager's job may still be "
+        "running: check `systemctl is-active <unit>` (or `launchctl print system/<label>`) and run verify")
+    return 1
+
+
+def service(manager, kind, action, args, run=subprocess.run, out=print, platform=None, clock=time.monotonic,
+            sleep=time.sleep):
+    """One whitelisted manager call as root: 0 when the manager exited 0
+    (a bootout only once the label is shown gone), 1 when it did not or
+    did not finish, never the manager's own status."""
+    argv = service_argv(manager, kind, action, args)
+    j = judge(sys.executable, also=[manager], recorded=[manager], platform=platform)
+    if j.phase != "clean":
+        raise Untrusted("; ".join(j.problems[:5]))
+    if action == "bootstrap":
+        bad = _plist_problem(args[1], platform)
+        if bad:
+            raise Tooling(bad)
+    env = {"PATH": SERVICE_PATH, "LC_ALL": "C"}
+    end = clock() + SERVICE_TIMEOUT_S
+    try:
+        p = run(argv, shell=False, close_fds=True, stdin=subprocess.DEVNULL, env=env, timeout=SERVICE_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        return _timed_out(argv, out)
+    if action != "bootout":
+        if p.returncode != 0:
+            out(f"service: {' '.join(argv)} exited {p.returncode}")
+            return 1
+        return 0
+    probe = [manager, "print", f"system/{args[0]}"]
+    while True:
+        left = end - clock()
+        if left <= 0:
+            return _timed_out(argv, out)
+        try:
+            q = run(probe, shell=False, close_fds=True, stdin=subprocess.DEVNULL, env=env, timeout=left,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        except subprocess.TimeoutExpired:
+            return _timed_out(argv, out)
+        said = ((q.stdout or b"") + (q.stderr or b"")).decode("utf-8", "replace").strip()
+        if LAUNCHD_NOT_FOUND is not None and (q.returncode, said) == LAUNCHD_NOT_FOUND:
+            return 0
+        if q.returncode == 0 and p.returncode not in (0, BOOTOUT_IN_PROGRESS):
+            out(f"service: {' '.join(argv)} exited {p.returncode}")
+            return 1
+        if LAUNCHD_NOT_FOUND is None or q.returncode != 0:
+            out(f"service: {' '.join(argv)} exited {p.returncode}; bootout could not be confirmed; run the "
+                "NOT-RUNNING check")
+            return 1
+        sleep(min(1.0, max(0.0, end - clock())))
+
+
+def _service_main(argv):
+    """service --manager M <kind> <action> [<name> [<plist>]]"""
+    if len(argv) < 5 or argv[1] != "--manager" or len(argv) > 7:
+        raise Tooling("service --manager M <kind> <action> [<name> [<plist>]]")
+    return service(argv[2], argv[3], argv[4], argv[5:])
+
+
 def _secret_main(argv):
     """The secret steps' dispatch. Any exception at all becomes one fixed
     line and exit 2 through os._exit, so no traceback, repr or message can
@@ -3828,6 +3980,12 @@ def main(argv):
         elif argv and argv[0] == "partition-fetch":
             try:
                 return _partition_fetch_main(argv)
+            except Untrusted as e:
+                print(f"untrusted: {e}", file=sys.stderr)
+                return ROOT_TRUST_EXIT
+        elif argv and argv[0] == "service":
+            try:
+                return _service_main(argv)
             except Untrusted as e:
                 print(f"untrusted: {e}", file=sys.stderr)
                 return ROOT_TRUST_EXIT

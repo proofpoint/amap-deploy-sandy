@@ -29,6 +29,7 @@ from pathlib import Path
 import host_setup as hs
 import hub_runtime as hr
 import hub_supervise as hv
+import root_trust as rt
 import router_health as rh
 from _gate import open_gate
 from test_hub_keys import full_doc as keys_doc
@@ -52,12 +53,22 @@ def sup_section(kind="systemd"):
             "requires": REQ}
 
 
-def spec(kind_="systemd", **over):
-    d = keys_doc()
+#: The manager each kind's host records (hub_supervise.MANAGERS).
+MANAGER = {"systemd": "/usr/bin/systemctl", "launchd": hv.LAUNCHCTL}
+
+
+def supervise(d, kind_="systemd", **over):
+    """`d` with the supervision section of `kind_`, and the secrets section
+    recording that kind's manager, as the spec requires."""
     sec = sup_section(kind_)
     sec.update(over)
     d[hv.SECTION] = sec
-    return hs.load_spec(d)
+    d["secrets"]["tools"][hv.MANAGERS[kind_]] = MANAGER[kind_]
+    return d
+
+
+def spec(kind_="systemd", **over):
+    return hs.load_spec(supervise(keys_doc(), kind_, **over))
 
 
 class LoadTest(unittest.TestCase):
@@ -1021,11 +1032,17 @@ class LaunchdEnablementTest(unittest.TestCase):
 
     def test_the_plan_disables_both_labels_before_placing_anything(self):
         s = spec("launchd")
-        lines = hv.plan(s, lambda x: x, "STEPS")
-        dis = [i for i, l in enumerate(lines) if l.startswith(f"{hv.LAUNCHCTL} disable system/")]
+        lines = hv.plan(s, shlex.quote, "STEPS")
+        dis = [i for i, l in enumerate(lines) if " service --manager " in l and not l.startswith("#")]
         place = [i for i, l in enumerate(lines) if l.startswith("STEPS place ")]
-        self.assertEqual([lines[i].split()[2] for i in dis],
-                         ["system/org.example.hub-probe", "system/org.example.hub"])
+        argvs = [shlex.split(lines[i]) for i in dis]
+        self.assertEqual([a[a.index("--") + 1:][-3:] for a in argvs],
+                         [["launchd", "disable", "org.example.hub-probe"], ["launchd", "disable", "org.example.hub"]])
+        for a in argvs:
+            self.assertEqual(a, rt.typed_argv(hv.rt_path(s), s.secrets.writer_sha256, s.secrets.tools["python3"],
+                                              s.secrets.writer, list(s.secrets.tools.values()),
+                                              hv.own(s, "service", "--manager", hv.LAUNCHCTL, "launchd", "disable",
+                                                     a[-1]), also=[hv.LAUNCHCTL]))
         self.assertTrue(place and max(dis) < min(place))
         self.assertFalse(any("enable" in l.replace("enables nothing", "") and "disable" not in l for l in lines))
 

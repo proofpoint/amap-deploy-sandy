@@ -549,10 +549,8 @@ class StopTargetTest(unittest.TestCase):
         self.assertEqual(out[0].result, rh.UNKNOWN, "an unreadable live config is not proof delegation is off")
 
     def document_spec(self, **drop):
-        import hub_supervise as hv
-        from test_hub_supervise import sup_section
-        d = doc(gate=gate()) if drop.pop("gate", False) else doc()
-        d[hv.SECTION] = sup_section()
+        from test_hub_supervise import supervise
+        d = supervise(doc(gate=gate()) if drop.pop("gate", False) else doc())
         for section in drop:
             d.pop(section, None)
         return hs.load_spec(d)
