@@ -27,7 +27,7 @@ from test_hub_runtime import setUpModule, tearDownModule  # noqa: F401 -- the fi
 
 PY = sys.executable
 UID = os.getuid()
-NOT_FOUND = (113, 'Could not find service "x" in domain for system')
+NOT_FOUND = (113, 'Bad request.\nCould not find service "{label}" in domain for system')
 RUNNING_LINE, IDLE_LINE = "\tstate = running", "\tstate = not running"
 
 SUDO = r'''#!{py} -I
@@ -73,6 +73,7 @@ with open(log, "a") as f:
 args = [a for a in sys.argv[1:] if a != "--no-pager"]
 if args[0] == "print":
     rc, out = cfg.get(args[1].split("/", 1)[1], [1, "unanswered"])
+    out = out.replace("{{label}}", args[1].split("/", 1)[1])
     sys.stdout.write(out + "\n")
     sys.exit(rc)
 ans = cfg.get(args[1], {{}}).get(args[0], [1, "unanswered"])
@@ -271,10 +272,11 @@ class FreshRows(Tree):
         self.cfg["launchctl"]["org.example.hub"] = [0, "system/org.example.hub = {"]
         self.refused(self.run_txn(kind="launchd"), "org.example.hub is loaded")
 
-    def test_fresh_on_launchd_refuses_until_the_not_found_answer_is_measured(self):
-        self.assertIsNone(rt.LAUNCHD_NOT_FOUND)
+    def test_fresh_on_launchd_passes_on_the_measured_answer_and_refuses_while_unmeasured(self):
+        self.assertEqual(rt.LAUNCHD_NOT_FOUND, NOT_FOUND, "E2: the measured Mac answer")
+        self.measured = {"LAUNCHD_NOT_FOUND": None}
         self.refused(self.run_txn(kind="launchd"), "unknown")
-        self.measured = {"LAUNCHD_NOT_FOUND": NOT_FOUND}
+        self.measured = {}
         self.ok(self.run_txn(kind="launchd"), "FRESH")
 
 
@@ -646,13 +648,15 @@ class MeasuredRows(NothingRows):
         for config in configs:
             for rc, out in answers:
                 with self.subTest(config=sorted(config), rc=rc, out=out[:30]):
-                    self.measured = config
+                    self.measured = dict({"LAUNCHD_NOT_FOUND": None, "LAUNCHD_STATE_RUNNING": None,
+                                          "LAUNCHD_STATE_IDLE": None}, **config)
                     p = self.weekly(rc, out)
                     txn = "ok" if p.returncode == 0 else "in progress" if "in progress" in p.stderr else "unknown"
                     with mock.patch.multiple(rt, LAUNCHD_NOT_FOUND=config.get("LAUNCHD_NOT_FOUND"),
                                              LAUNCHD_STATE_RUNNING=config.get("LAUNCHD_STATE_RUNNING"),
                                              LAUNCHD_STATE_IDLE=config.get("LAUNCHD_STATE_IDLE")):
-                        got = hv.weekly_state((rc, out + "\n"))
+                        got = hv.weekly_state((rc, out.replace("{label}", "org.example.hub-probe") + "\n"),
+                                              "org.example.hub-probe")
                     py = "unknown" if isinstance(got, rt_unresolved()) else \
                         "in progress" if got == hv.IN_PROGRESS else "ok"
                     self.assertEqual(txn, py)
@@ -866,6 +870,33 @@ class SingleCaptureRows(Tree):
         self.write(mkdir, b"#!/bin/sh\nexit 1\n", 0o755)
         self.refused(self.run_txn(mkdir=mkdir), "cannot be made: nothing was read")
         self.assertFalse([c for c in self.calls("systemctl") if "is-enabled" in c])
+
+
+class TemplateRows(Tree):
+    """E2: the measured not-found answer names its label; it matches only
+    with the label asked about, as one merged stream, at its status."""
+
+    def test_each_label_answering_its_own_template_passes(self):
+        self.cfg["launchctl"] = {"org.example.hub": list(NOT_FOUND), "org.example.hub-probe": list(NOT_FOUND)}
+        self.ok(self.run_txn(kind="launchd"), "FRESH")
+
+    def test_another_labels_answer_or_part_of_the_answer_is_unknown(self):
+        hub_text = NOT_FOUND[1].replace("{label}", "org.example.hub")
+        probe_text = NOT_FOUND[1].replace("{label}", "org.example.hub-probe")
+        for answer in ([NOT_FOUND[0], probe_text], [NOT_FOUND[0], "Bad request."],
+                       [NOT_FOUND[0], hub_text.split("\n")[1]], [NOT_FOUND[0] - 1, hub_text],
+                       [NOT_FOUND[0], "Could not find service \"org.example.hub\" in domain for system\nBad request."]):
+            with self.subTest(answer=answer):
+                if os.path.exists(self.log("sudo")):
+                    os.unlink(self.log("sudo"))
+                self.cfg["launchctl"] = {"org.example.hub": answer, "org.example.hub-probe": list(NOT_FOUND)}
+                self.refused(self.run_txn(kind="launchd"), "unknown")
+
+    def test_the_template_holds_exactly_one_label(self):
+        for text in ("Could not find service", "{label} and {label}", " "):
+            with self.subTest(text=text):
+                with self.assertRaises(ValueError):
+                    rt.render_txn("launchd", "/usr/bin/systemctl", measured={"LAUNCHD_NOT_FOUND": (113, text)})
 
 
 class LaunchdTupleRows(Tree):

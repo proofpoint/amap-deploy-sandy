@@ -145,7 +145,7 @@ class LaunchdRestartRows(unittest.TestCase):
             with self.subTest(out=out, measured=measured):
                 with mock.patch.object(rt, "LAUNCHD_STATE_IDLE", IDLE if measured else None), \
                         mock.patch.object(rt, "LAUNCHD_STATE_RUNNING", RUNNING if measured else None):
-                    got = hv.weekly_state((0, out))
+                    got = hv.weekly_state((0, out), "org.example.hub-probe")
                 if want is None:
                     self.assertIsInstance(got, rh.Unresolved)
                 else:
@@ -154,14 +154,17 @@ class LaunchdRestartRows(unittest.TestCase):
 
 class NotLoadedRows(unittest.TestCase):
     def test_not_loaded_is_only_the_measured_exact_answer(self):
-        nf = (113, 'Could not find service "x" in domain for system')
+        nf = (113, 'Bad request.\nCould not find service "{label}" in domain for system')
+        answer = nf[1].replace("{label}", "org.example.hub-probe")
         with mock.patch.object(rt, "LAUNCHD_NOT_FOUND", None):
-            self.assertIsInstance(hv.weekly_state((113, nf[1] + "\n")), rh.Unresolved)
+            self.assertIsInstance(hv.weekly_state((113, answer + "\n"), "org.example.hub-probe"), rh.Unresolved)
         with mock.patch.object(rt, "LAUNCHD_NOT_FOUND", nf):
-            self.assertEqual(hv.weekly_state((113, nf[1] + "\n")), hv.NOT_LOADED)
+            self.assertEqual(hv.weekly_state((113, answer + "\n"), "org.example.hub-probe"), hv.NOT_LOADED)
+            self.assertIsInstance(hv.weekly_state((113, answer + "\n"), "org.example.hub"), rh.Unresolved,
+                                  "another label's answer")
             for answer in ((113, "Could not find service"), (114, nf[1]), (113, "could not find service, maybe")):
                 with self.subTest(answer=answer):
-                    self.assertIsInstance(hv.weekly_state(answer), rh.Unresolved)
+                    self.assertIsInstance(hv.weekly_state(answer, "org.example.hub-probe"), rh.Unresolved)
 
 
 class AbsenceReaderRows(unittest.TestCase):
@@ -169,12 +172,13 @@ class AbsenceReaderRows(unittest.TestCase):
     answer: None, a mismatched status or text, and blank-line answers under
     each partial measurement are unknown, and unknown never prints
     NOT-RUNNING or a start line."""
-    NF = (113, 'Could not find service "org.example.hub" in domain for system')
+    NF = (113, 'Bad request.\nCould not find service "{label}" in domain for system')
 
     def answering(self, answers):
         def run(argv, **k):
-            rc, out = answers[argv[-1].split("/", 1)[1]]
-            return rh.Proc(tuple(argv), rc, "", out + "\n")
+            label = argv[-1]
+            rc, out = answers[label]
+            return rh.Proc(tuple(argv), rc, out.replace("{label}", label) + "\n", "")
         p = mock.patch.object(hv.rh, "run", run)
         p.start()
         self.addCleanup(p.stop)

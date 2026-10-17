@@ -3790,10 +3790,11 @@ MANAGER_NAMES = {"systemd": "systemctl", "launchd": "launchctl"}
 BOOTOUT_IN_PROGRESS = 36
 #: `launchctl print system/<label>`'s (exit status, output) once the label is
 #: gone, exactly: stdout and stderr as one stream, trailing newlines dropped,
-#: as TXN captures it (root_trust.LAUNCHD_NOT_FOUND, the same value). A Mac
-#: fact not yet measured: while it is None, every print answer is unknown and
-#: a bootout is never confirmed.
-LAUNCHD_NOT_FOUND = None
+#: as TXN captures it (root_trust.LAUNCHD_NOT_FOUND, the same value). The text
+#: names the label, so `{label}` is replaced by the label asked about first.
+#: While it is None, every print answer is unknown and a bootout is never
+#: confirmed.
+LAUNCHD_NOT_FOUND = (113, 'Bad request.\nCould not find service "{label}" in domain for system')
 #: (kind, action): (the argument kinds, the argv after the manager).
 SERVICE_TABLE = {
     ("launchd", "disable"): (("label",), lambda a: ["disable", f"system/{a[0]}"]),
@@ -3904,7 +3905,8 @@ def service(manager, kind, action, args, run=subprocess.run, out=print, platform
         except subprocess.TimeoutExpired:
             return _timed_out(argv, out)
         said = (q.stdout or b"").decode("utf-8", "replace").rstrip("\n")
-        if LAUNCHD_NOT_FOUND is not None and (q.returncode, said) == LAUNCHD_NOT_FOUND:
+        if LAUNCHD_NOT_FOUND is not None and \
+                (q.returncode, said) == (LAUNCHD_NOT_FOUND[0], LAUNCHD_NOT_FOUND[1].replace("{label}", args[0])):
             return 0
         if q.returncode == 0 and p.returncode not in (0, BOOTOUT_IN_PROGRESS):
             out(f"service: {' '.join(argv)} exited {p.returncode}")

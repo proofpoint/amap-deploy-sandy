@@ -671,16 +671,21 @@ def ask_active(spec: Any, unit: str) -> Any:
     return p.rc, p.out.strip()
 
 
+#: launchctl print with stdout and stderr as ONE stream, in write order: how
+#: its not-found answer was measured, and how TXN and the service verb read it.
+_PRINT_MERGED = 'exec "$0" print "system/$1" 2>&1'
+
+
 def ask_print(label: str) -> Any:
-    """`launchctl print system/<label>`: (rc, its output)."""
+    """`launchctl print system/<label>`: (rc, its output, both streams as one)."""
     try:
-        p = rh.run([LAUNCHCTL, "print", f"system/{label}"])
+        p = rh.run(["/bin/sh", "-c", _PRINT_MERGED, LAUNCHCTL, label])
     except rh.CannotRun as e:
         return rh.Unresolved(str(e))
-    return p.rc, p.out + p.err
+    return p.rc, p.out
 
 
-def weekly_state(answer: Any) -> Any:
+def weekly_state(answer: Any, label: str) -> Any:
     """The weekly label: loaded and idle, a run in progress, not loaded, or
     an Unresolved, by print's MEASURED answers alone, as TXN reads them:
     running and idle by its exact lines (root_trust.LAUNCHD_STATE_RUNNING and
@@ -696,7 +701,7 @@ def weekly_state(answer: Any) -> Any:
         if rt.LAUNCHD_STATE_IDLE is not None and rt.LAUNCHD_STATE_IDLE in lines:
             return LOADED
         return rh.Unresolved("launchctl print's wording for a loaded weekly label is not measured here")
-    absent = launchd_absent(rc, out)
+    absent = launchd_absent(rc, out, label)
     return NOT_LOADED if absent is True else absent
 
 
@@ -947,7 +952,7 @@ def ask_disabled(spec: Any) -> Any:
     return parse_disabled(p.out)
 
 
-def launchd_absent(rc: int, text: str) -> Any:
+def launchd_absent(rc: int, text: str, label: str) -> Any:
     """Whether `launchctl print`'s answer is the MEASURED not-loaded answer:
     True only on the exact (status, output) root_trust.LAUNCHD_NOT_FOUND
     names, trailing newlines dropped as TXN captures it; an Unresolved
@@ -956,7 +961,8 @@ def launchd_absent(rc: int, text: str) -> Any:
     weekly_state and ask_loaded."""
     if rt.LAUNCHD_NOT_FOUND is None:
         return rh.Unresolved("launchctl print's answer for a label that is not loaded is not measured here")
-    if (rc, text.rstrip("\n")) == rt.LAUNCHD_NOT_FOUND:
+    want = rt.LAUNCHD_NOT_FOUND[1].replace(rt.LABEL_SLOT, label)
+    if (rc, text.rstrip("\n")) == (rt.LAUNCHD_NOT_FOUND[0], want):
         return True
     return rh.Unresolved(f"launchctl print answered ({rc}, {text.strip()[:80]!r}), not the measured not-loaded answer")
 
@@ -966,13 +972,13 @@ def ask_loaded(label: str) -> Any:
     system/<label>` exits 0), False only on the measured not-loaded answer
     (launchd_absent), an Unresolved otherwise, including while that answer
     is unmeasured."""
-    try:
-        p = rh.run([LAUNCHCTL, "print", f"system/{label}"])
-    except rh.CannotRun as e:
-        return rh.Unresolved(str(e))
-    if p.rc == 0:
+    answer = ask_print(label)
+    if isinstance(answer, rh.Unresolved):
+        return answer
+    rc, out = answer
+    if rc == 0:
         return True
-    absent = launchd_absent(p.rc, p.out + p.err)
+    absent = launchd_absent(rc, out, label)
     return False if absent is True else absent
 
 

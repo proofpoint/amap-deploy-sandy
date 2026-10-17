@@ -1113,17 +1113,22 @@ class LaunchdEnablementTest(unittest.TestCase):
         self.addCleanup(setattr, hv.rh, "run", hv.rh.run)
         hv.rh.run = fake(0)
         self.assertIs(hv.ask_loaded("org.example.hub"), True)
-        self.assertEqual(calls[-1], [hv.LAUNCHCTL, "print", "system/org.example.hub"])
-        nf = (113, 'Could not find service "org.example.hub" in domain for system')
-        hv.rh.run = fake(nf[0], err=nf[1] + "\n")
-        self.assertIsInstance(hv.ask_loaded("org.example.hub"), rh.Unresolved, "unmeasured: unknown")
-        self.addCleanup(setattr, hv.rt, "LAUNCHD_NOT_FOUND", hv.rt.LAUNCHD_NOT_FOUND)
-        hv.rt.LAUNCHD_NOT_FOUND = nf
+        self.assertEqual(calls[-1], ["/bin/sh", "-c", 'exec "$0" print "system/$1" 2>&1', hv.LAUNCHCTL,
+                                     "org.example.hub"], "one merged stream, as the answer was measured")
+        nf = hv.rt.LAUNCHD_NOT_FOUND
+        answer = nf[1].replace("{label}", "org.example.hub")
+        hv.rh.run = fake(nf[0], out=answer + "\n")
         self.assertIs(hv.ask_loaded("org.example.hub"), False)
-        for rc, err in ((nf[0] + 1, nf[1]), (nf[0], "could not find service"), (nf[0], nf[1] + " (and more)")):
-            hv.rh.run = fake(rc, err=err)
-            self.assertIsInstance(hv.ask_loaded("org.example.hub"), rh.Unresolved, (rc, err))
-        hv.rh.run = fake(5, err="Operation not permitted")
+        self.addCleanup(setattr, hv.rt, "LAUNCHD_NOT_FOUND", hv.rt.LAUNCHD_NOT_FOUND)
+        hv.rt.LAUNCHD_NOT_FOUND = None
+        self.assertIsInstance(hv.ask_loaded("org.example.hub"), rh.Unresolved, "unmeasured: unknown")
+        hv.rt.LAUNCHD_NOT_FOUND = nf
+        other = nf[1].replace("{label}", "org.example.hub-probe")
+        for rc, out in ((nf[0] + 1, answer), (nf[0], "could not find service"), (nf[0], answer + " (and more)"),
+                        (nf[0], other), (nf[0], "Bad request."), (nf[0], answer.split("\n")[1])):
+            hv.rh.run = fake(rc, out=out)
+            self.assertIsInstance(hv.ask_loaded("org.example.hub"), rh.Unresolved, (rc, out))
+        hv.rh.run = fake(5, out="Operation not permitted")
         self.assertIsInstance(hv.ask_loaded("org.example.hub"), rh.Unresolved)
 
     def test_disabled_labels_pass_without_asking_the_gate(self):

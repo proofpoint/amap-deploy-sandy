@@ -25,7 +25,9 @@ from test_hub_runtime import setUpModule, tearDownModule  # noqa: F401 -- the fi
 from test_hub_supervise import MANAGER, spec
 
 SYSTEMCTL, LAUNCHCTL = "/usr/bin/systemctl", "/bin/launchctl"
-NOT_FOUND = (113, "Could not find service \"x\" in domain for system")
+NOT_FOUND = (113, 'Bad request.\nCould not find service "{label}" in domain for system')
+#: NOT_FOUND's answer for the label these rows boot out.
+ANSWER = NOT_FOUND[1].replace("{label}", "org.example.hub")
 
 
 class Proc:
@@ -255,23 +257,30 @@ class BootoutRows(Verb):
         return [argv for argv, _ in self.calls if argv[1] == "print"]
 
     def test_unmeasured_wording_never_confirms_a_bootout(self):
-        self.assertIsNone(hs.LAUNCHD_NOT_FOUND, "the not-found answer is a Mac fact still owed")
+        self.assertEqual(hs.LAUNCHD_NOT_FOUND, NOT_FOUND, "E2: the measured Mac answer")
         self.assertEqual(hs.LAUNCHD_NOT_FOUND, rt.LAUNCHD_NOT_FOUND, "the verb and TXN read one measured answer")
-        rc, _ = self.bootout(Proc(0), Proc(*NOT_FOUND[:1], out=NOT_FOUND[1].encode() + b"\n"))
+        self.patch("LAUNCHD_NOT_FOUND", None)
+        rc, _ = self.bootout(Proc(0), Proc(*NOT_FOUND[:1], out=ANSWER.encode() + b"\n"))
         self.assertEqual(rc, 1)
         self.assertIn("bootout could not be confirmed; run the NOT-RUNNING check", self.said[-1])
 
     def test_a_bootout_in_progress_waits_for_the_measured_not_found_answer(self):
         self.patch("LAUNCHD_NOT_FOUND", NOT_FOUND)
         rc, clock = self.bootout(Proc(hs.BOOTOUT_IN_PROGRESS), Proc(0), Proc(0), Proc(0),
-                                 Proc(NOT_FOUND[0], out=NOT_FOUND[1].encode() + b"\n"))
+                                 Proc(NOT_FOUND[0], out=ANSWER.encode() + b"\n"))
         self.assertEqual(rc, 0)
         self.assertEqual(self.prints(), [[LAUNCHCTL, "print", "system/org.example.hub"]] * 4)
         self.assertEqual(clock.t, 3.0, "polled once a second until gone")
 
+    def test_another_labels_answer_never_confirms(self):
+        self.patch("LAUNCHD_NOT_FOUND", NOT_FOUND)
+        other = NOT_FOUND[1].replace("{label}", "org.example.hub-probe")
+        rc, _ = self.bootout(Proc(0), Proc(NOT_FOUND[0], out=other.encode() + b"\n"))
+        self.assertEqual(rc, 1)
+
     def test_a_label_already_gone_is_confirmed_by_the_poll(self):
         self.patch("LAUNCHD_NOT_FOUND", NOT_FOUND)
-        rc, _ = self.bootout(Proc(3), Proc(NOT_FOUND[0], out=NOT_FOUND[1].encode() + b"\n"))
+        rc, _ = self.bootout(Proc(3), Proc(NOT_FOUND[0], out=ANSWER.encode() + b"\n"))
         self.assertEqual(rc, 0)
 
     def test_a_failed_bootout_with_the_label_still_loaded_is_1(self):
@@ -282,7 +291,7 @@ class BootoutRows(Verb):
 
     def test_another_print_answer_is_unknown_never_success(self):
         self.patch("LAUNCHD_NOT_FOUND", NOT_FOUND)
-        for answer in (Proc(NOT_FOUND[0], out=b"could not find service"), Proc(NOT_FOUND[0] + 1, out=NOT_FOUND[1].encode() + b"\n")):
+        for answer in (Proc(NOT_FOUND[0], out=b"could not find service"), Proc(NOT_FOUND[0] + 1, out=ANSWER.encode() + b"\n")):
             with self.subTest(out=answer.stdout):
                 rc, _ = self.bootout(Proc(0), answer)
                 self.assertEqual(rc, 1)

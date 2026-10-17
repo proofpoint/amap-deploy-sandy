@@ -501,8 +501,13 @@ SIZE = {"systemd": "/usr/bin/stat -L -c %s", "launchd": "/usr/bin/stat -L -f %z"
 HASHWORD = {"systemd": "sha256sum", "launchd": "shasum"}
 #: Facts a host must measure, None until it has (the design's §6). Each
 #: unmeasured answer is unknown, and an unknown answer refuses.
-#: `launchctl print system/<label>` for a label that is not loaded: (status, output).
-LAUNCHD_NOT_FOUND: Optional[Tuple[int, str]] = None
+#: `launchctl print system/<label>` for a label that is not loaded: (status, output), the
+#: output stdout and stderr as ONE stream, trailing newlines dropped. It names the label it
+#: was asked about, so the text is a template with exactly one `{label}`, replaced by that
+#: label (grammar-checked: no quote, newline or format character) before an exact compare.
+LAUNCHD_NOT_FOUND: Optional[Tuple[int, str]] = (113, 'Bad request.\nCould not find service "{label}" in domain for system')
+#: The one variable a LAUNCHD_NOT_FOUND template holds.
+LABEL_SLOT = "{label}"
 #: Its line for a weekly run in progress, and for a loaded, idle label.
 LAUNCHD_STATE_RUNNING: Optional[str] = None
 LAUNCHD_STATE_IDLE: Optional[str] = None
@@ -726,7 +731,7 @@ _t_unknown() { _t_stop "U0: $1 answered ($_t_rc, $_t_out): unknown. Measure the 
 _t_active() { _t_out=$(@SYSTEMCTL@ --no-pager is-active "$1" 2>/dev/null); _t_rc=$?; }
 _t_missing() { [ -n "@SUM_SET@" ] && [ "$_t_rc" = "@SUM_RC@" ] && [ "$_t_out" = @SUM_TEXT@ ]; }
 _t_print() { _t_out=$(@LAUNCHCTL@ print "system/$1" 2>&1); _t_rc=$?; }
-_t_notfound() { [ -n "@LDNF_SET@" ] && [ "$_t_rc" = "@LDNF_RC@" ] && [ "$_t_out" = @LDNF_TEXT@ ]; }
+_t_notfound() { [ -n "@LDNF_SET@" ] && [ "$_t_rc" = "@LDNF_RC@" ] && [ "$_t_out" = @LDNF_PRE@"$1"@LDNF_SUF@ ]; }
 # A fresh capture directory, $run_dir/<prefix>.<UTC time>[-N]: mkdir is the
 # atomic arbiter, so nothing can already be inside it.
 _t_fresh() {
@@ -776,7 +781,7 @@ _t_units() {
     for _t_u in "$hub" "$wlabel"; do
       _t_print "$_t_u"
       [ "$_t_rc" = 0 ] && _t_held "$_t_u is loaded"
-      _t_notfound || _t_unknown "print system/$_t_u"
+      _t_notfound "$_t_u" || _t_unknown "print system/$_t_u"
     done
   fi
 }
@@ -789,7 +794,7 @@ _t_weekly() {
     [ -n "@LD_IDLE_SET@" ] && printf '%s\n' "$_t_out" | grep -Fxq -- @LD_IDLE@ && return 0
     _t_unknown "print system/$wlabel"
   fi
-  _t_notfound || _t_unknown "print system/$wlabel"
+  _t_notfound "$wlabel" || _t_unknown "print system/$wlabel"
 }
 _t_reader() {
   _t_fresh hsc
@@ -882,6 +887,8 @@ def render_txn(kind: str, systemctl: str, root: int = 0, top: str = "", sudo: st
                         else m["SYSTEMD_UNIT_MISSING_ACTIVE"][1])):
         if text is not None and (not isinstance(text, str) or not text.strip()):
             raise ValueError(f"{name}: a measured wording is never empty")
+    if nf is not None and nf[1].count(LABEL_SLOT) != 1:
+        raise ValueError(f"LAUNCHD_NOT_FOUND: its text holds exactly one {LABEL_SLOT}")
     e = ("e" if kind == "launchd" else "") if lsopt is None else lsopt
     subs = {"@KIND@": kind, "@ROOT@": str(int(root)), "@TOP@": top, "@SUDO@": sudo, "@LS@": ls, "@E@": e,
             "@SIZE@": size or SIZE[kind], "@SYSTEMCTL@": shlex.quote(systemctl), "@LAUNCHCTL@": launchctl,
@@ -889,7 +896,8 @@ def render_txn(kind: str, systemctl: str, root: int = 0, top: str = "", sudo: st
             "@TAIL@": tail, "@MKDIR@": mkdir, "@DATE@": date, "@RTNAME@": NAME, "@CONTEXT@": CONTEXT_NAME,
             "@SRCMAX@": str(SOURCE_MAX), "@CAPMAX@": str(CAPTURE_MAX), "@CTXMAX@": str(CONTEXT_BOUND),
             "@LDNF_SET@": _present(nf), "@LDNF_RC@": "" if nf is None else str(int(nf[0])),
-            "@LDNF_TEXT@": _measured(None if nf is None else nf[1]),
+            "@LDNF_PRE@": _measured(None if nf is None else nf[1].split(LABEL_SLOT)[0]),
+            "@LDNF_SUF@": _measured(None if nf is None else nf[1].split(LABEL_SLOT)[-1]),
             "@LD_RUNNING_SET@": _present(m["LAUNCHD_STATE_RUNNING"]), "@LD_RUNNING@": _measured(m["LAUNCHD_STATE_RUNNING"]),
             "@LD_IDLE_SET@": _present(m["LAUNCHD_STATE_IDLE"]), "@LD_IDLE@": _measured(m["LAUNCHD_STATE_IDLE"]),
             "@SUM_SET@": _present(m["SYSTEMD_UNIT_MISSING_ACTIVE"]),

@@ -1627,7 +1627,7 @@ def unit_states(spec: Spec, active: Optional[Callable[[str], Any]] = None,
         states = {"hub": hv.active_state(ask(posixpath.basename(sup.hub["unit"]))),
                   "timer": hv.active_state(ask(posixpath.basename(sup.weekly["timer"])))}
     else:
-        states = {"weekly": hv.weekly_state((print_ or hv.ask_print)(sup.weekly["label"])),
+        states = {"weekly": hv.weekly_state((print_ or hv.ask_print)(sup.weekly["label"]), sup.weekly["label"]),
                   "hub": (loaded or hv.ask_loaded)(sup.hub["label"])}
         if states["hub"] is True:
             states["hub"] = hv.LOADED
