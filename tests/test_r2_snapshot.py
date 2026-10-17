@@ -73,13 +73,15 @@ if a[0] == "inspect":
     for r in refs:
         if r not in cfg:
             sys.exit(1)
+    code = 0
     for r in refs:
         if "Mounts" in fmt:
             for m in cfg[r]["mounts"]:
                 print(m)
         else:
             print(cfg[r]["state"])
-    sys.exit(0)
+        code = code or cfg[r].get("exit", 0)
+    sys.exit(code)
 sys.exit(9)
 """
 
@@ -140,6 +142,14 @@ class R2Snapshot(unittest.TestCase):
         return self.sh(fill(block("r2-restore: STOP"), ST=self.st, INST=self.inst, HOP=hop or self.hop, BK=self.bk,
                             ASIDE=aside, OLD="0123abcd", NEW="amap-router", HUB="hub-link"))
 
+    def wrap(self, tool, script):
+        """`tool`, misbehaving by `script` (sh, with $REAL the real tool) while the marker exists."""
+        real = shutil.which(tool)
+        flag = os.path.join(self.d, f"fail-{tool}")
+        self.put(os.path.join(self.bin, tool),
+                 f"#!/bin/sh\nREAL={real}\nif [ -e '{flag}' ]; then\n{script}\nfi\nexec $REAL \"$@\"\n".encode(), 0o755)
+        return flag
+
     def tar_stub(self, script):
         """A tar that runs `script` (sh, with $REAL the real tar) for the mode it names."""
         self.put(os.path.join(self.bin, "tar"), ("#!/bin/sh\nREAL=" + shutil.which("tar") + "\n" + script).encode(),
@@ -171,19 +181,23 @@ class R2Snapshot(unittest.TestCase):
         data = open(lanes, "rb").read()
         line = [l for l in p.stdout.splitlines() if l.startswith("r2-lanes: OK")]
         self.assertEqual(line, [f"r2-lanes: OK {len(data)} bytes {hashlib.sha256(data).hexdigest()} {lanes} "
-                                "(a point-in-time copy, taken with agents running; tar exit 0)"])
+                                "(best-effort, non-atomic live archive: entries may be omitted or contain changing "
+                                "data; tar exit 0; its warnings in r2-lanes.tar.log)"])
+        self.assertEqual(stat.S_IMODE(os.stat(os.path.join(self.bk, "r2-lanes.tar.log")).st_mode), 0o600)
         listed = subprocess.run(["tar", "-tf", lanes], capture_output=True, text=True, check=True).stdout.split()
         for want in ("alpha/inbox/messages/m1.json", "beta/peer/d1.json", "alpha/outbox/req-0.json"):
             self.assertIn(want, listed)
         self.assertFalse([e for e in listed if "first-seen" in e], "state is not in the lane archive")
 
     def test_a_lane_that_changes_while_read_is_recorded_not_refused(self):
-        self.tar_stub("""case "$*" in *r2-lanes.tar*) $REAL "$@"; exit 1 ;; esac
+        self.tar_stub("""case "$*" in *r2-lanes.tar*) $REAL "$@"; echo 'tar: alpha/outbox/req-0.json: File removed before we read it' >&2; exit 1 ;; esac
 exec $REAL "$@"
 """)
         p = self.snapshot()
         self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertIn("tar exit 1)", p.stdout)
+        self.assertIn("tar exit 1;", p.stdout)
+        self.assertIn("File removed before we read it", open(os.path.join(self.bk, "r2-lanes.tar.log")).read())
+        self.assertIn("File removed before we read it", p.stderr, "the warning is shown, for the run log")
 
     def test_the_restore_never_reads_the_lane_archive(self):
         self.assertEqual(self.snapshot().returncode, 0)
@@ -201,6 +215,80 @@ exec $REAL "$@"
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertNotIn("r2-lanes", open(log).read())
         self.assertEqual(tree(self.inst), lanes_now)
+
+    def test_an_inspection_that_prints_the_answer_and_then_fails_is_refused(self):
+        self.containers["0123abcd"]["exit"] = 23
+        p = self.snapshot()
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("the old router cannot be inspected", p.stderr)
+        self.assertFalse(os.path.exists(self.bk))
+
+    def test_a_listing_that_prints_and_then_fails_is_refused(self):
+        flag = self.wrap("ls", '  case "$*" in *lnAR*) $REAL "$@"; exit 23 ;; esac')
+        self.put(flag, b"")
+        p = self.snapshot()
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("state_dir cannot be listed", p.stderr)
+
+    def test_only_the_first_listing_failing_is_refused(self):
+        """The listing before the tar prints normally and then fails; the one
+        after succeeds. Only the first listing's own status can refuse it."""
+        once = os.path.join(self.d, "ls-once")
+        flag = self.wrap("ls", f'  case "$*" in *lnAR*) if [ ! -e \'{once}\' ]; then : > \'{once}\'; $REAL "$@"; exit 23; fi ;; esac')
+        self.put(flag, b"")
+        p = self.snapshot()
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("state_dir cannot be listed", p.stderr)
+
+    def test_only_the_second_listing_failing_is_refused(self):
+        seen = os.path.join(self.d, "ls-seen")
+        flag = self.wrap("ls", f'  case "$*" in *lnAR*) if [ -e \'{seen}\' ]; then $REAL "$@"; exit 23; fi; : > \'{seen}\' ;; esac')
+        self.put(flag, b"")
+        p = self.snapshot()
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("state_dir cannot be listed", p.stderr)
+
+    def test_a_measure_or_checksum_that_prints_and_then_fails_is_refused(self):
+        for tool, words in (("cut", "sha256 cannot be read"), ("wc", "cannot be measured")):
+            with self.subTest(tool=tool):
+                if os.path.exists(self.bk):
+                    shutil.rmtree(self.bk)
+                flag = self.wrap(tool, '  $REAL "$@"; exit 23')
+                self.put(flag, b"")
+                p = self.snapshot()
+                os.unlink(flag)
+                self.assertEqual(p.returncode, 1)
+                self.assertIn(words, p.stderr)
+                self.assertNotIn("r2-snapshot: OK", p.stdout)
+
+    def test_a_failed_measure_or_checksum_never_reaches_the_ok_line(self):
+        for tool, script, words in (("cut", "  exit 23", "sha256 cannot be read"),
+                                    ("wc", "  exit 23", "cannot be measured")):
+            with self.subTest(tool=tool):
+                if os.path.exists(self.bk):
+                    shutil.rmtree(self.bk)
+                flag = self.wrap(tool, script)
+                self.put(flag, b"")
+                p = self.snapshot()
+                os.unlink(flag)
+                self.assertEqual(p.returncode, 1)
+                self.assertIn(words, p.stderr)
+                self.assertNotIn("r2-snapshot: OK", p.stdout)
+
+    def test_an_absent_hub_link_router_adds_no_mounts_and_an_uninspectable_one_stops(self):
+        hub = self.containers.pop("hub-link")
+        p = self.snapshot()
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("r2-snapshot: no container hub-link: it adds no mounts", p.stdout)
+        shutil.rmtree(self.bk)
+        self.containers["hub-link"] = dict(hub, exit=23)
+        p = self.snapshot()
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("the hub-link router's mounts cannot be read", p.stderr)
+        p = self.sh(fill(block("r2-snapshot: STOP"), ST=self.st, INST=self.inst, HOP=self.hop, BK=self.bk,
+                         OLD="0123abcd", HUB="unlistable"))
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("docker cannot list containers", p.stderr)
 
     def test_an_existing_target_is_refused_and_never_added_to(self):
         os.mkdir(self.bk, 0o700)
@@ -233,6 +321,27 @@ exec $REAL "$@"
                 self.assertEqual(p.returncode, 1)
                 self.assertIn("lies under", p.stderr)
                 self.assertFalse(os.path.exists(bk))
+
+    def test_a_root_mount_source_refuses_before_anything_is_made(self):
+        self.containers["hub-link"]["mounts"].append("/")
+        p = self.snapshot()
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("a mount source is the root directory", p.stderr)
+        self.assertFalse(os.path.exists(self.bk))
+
+    def test_an_unresolvable_mount_source_stops_and_an_existing_file_one_is_fine(self):
+        missing = os.path.join(self.d, "gone")
+        self.containers["hub-link"]["mounts"].append(missing)
+        p = self.snapshot()
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("neither a directory nor a file", p.stderr)
+        self.assertFalse(os.path.exists(self.bk))
+        self.containers["hub-link"]["mounts"].remove(missing)
+        f = os.path.join(self.d, "config.json")
+        self.put(f, b"{}")
+        self.containers["hub-link"]["mounts"].append(f)
+        p = self.snapshot()
+        self.assertEqual(p.returncode, 0, p.stderr)
 
     def test_a_state_dir_and_hop_root_that_overlap_are_refused(self):
         inner = os.path.join(self.st, "hop")
@@ -331,6 +440,47 @@ exec $REAL "$@"
                          ASIDE=aside, OLD="0123abcd", NEW="unlistable", HUB="hub-link"))
         self.assertEqual(p.returncode, 1)
         self.assertIn("docker cannot list containers", p.stderr, "a failed listing is never read as absent")
+
+    def test_the_restore_checks_each_inspections_own_status(self):
+        self.assertEqual(self.snapshot().returncode, 0)
+        self.migrated()
+        state = tree(self.st)
+        aside = os.path.join(self.d, "backup", "aside")
+        for ref, words in (("0123abcd", "the old container cannot be inspected"),
+                           ("amap-router-r2-restored", "the new router cannot be inspected")):
+            with self.subTest(ref=ref):
+                self.containers[ref]["exit"] = 23
+                p = self.restore(aside)
+                del self.containers[ref]["exit"]
+                self.assertEqual(p.returncode, 1)
+                self.assertIn(words, p.stderr)
+                self.assertEqual(tree(self.st), state)
+                self.assertFalse(os.path.exists(aside))
+
+    def test_a_failed_empty_listing_is_never_proof_that_state_dir_is_empty(self):
+        self.assertEqual(self.snapshot().returncode, 0)
+        self.migrated()
+        flag = self.wrap("ls", '  case "$*" in "-A -- "*) exit 23 ;; esac')
+        self.put(flag, b"")
+        p = self.restore(os.path.join(self.d, "backup", "aside"))
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("state_dir cannot be listed", p.stderr)
+        self.assertNotIn("r2-restore: OK", p.stdout)
+
+    def test_the_restore_refuses_a_root_or_unresolvable_mount_source_before_any_move(self):
+        self.assertEqual(self.snapshot().returncode, 0)
+        self.migrated()
+        state = tree(self.st)
+        aside = os.path.join(self.d, "backup", "aside")
+        for source, words in (("/", "the root directory"), (os.path.join(self.d, "gone"), "neither a directory")):
+            with self.subTest(source=source):
+                self.containers["hub-link"]["mounts"].append(source)
+                p = self.restore(aside)
+                self.containers["hub-link"]["mounts"].remove(source)
+                self.assertEqual(p.returncode, 1)
+                self.assertIn(words, p.stderr)
+                self.assertEqual(tree(self.st), state)
+                self.assertFalse(os.path.exists(aside))
 
     def test_a_restored_tree_that_is_not_the_snapshot_is_refused(self):
         self.assertEqual(self.snapshot().returncode, 0)

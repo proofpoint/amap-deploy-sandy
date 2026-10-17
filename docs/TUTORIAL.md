@@ -747,6 +747,11 @@ is never part of an activation window.
 R2 needs:
 - the hop link above: the policy's `hop_link`, so that `install` renders
   `registry_dir`;
+- the hop root, created by the host-setup plan's root steps and owned as
+  its document says. R2's rendered configuration carries the hop keys, and
+  every `docker/run.sh` step from step 6 on binds the hop root: docker would
+  create a missing one owned by root. Step 5's snapshot refuses a missing
+  one;
 - the hop checkout at its pin;
 - the local router's image, built and checked;
 - every configured instance enrolled in the host registry. Step 3 STOPs
@@ -906,67 +911,116 @@ marker and reply ledger carry over, and it drains on the first poll.
    hop root and outside every path a container mounts. It never leaves the host and is never
    attached to a message. Run it as the operator that runs the router, in
    one POSIX shell with GNU coreutils and GNU tar (a Linux host), filling in
-   the six values. It refuses a target under `state_dir`, `instances_dir`,
-   the hop root or any bind source of the old router or the hub-link router,
-   and a `state_dir` and hop root that overlap. It also proves the archive
-   equals the tree (`tar -d`):
+   the six values.
+   - Choosing `BK`, a new directory private to the operator on the host's
+     own disk, which no container mounts, is the operator's precondition.
+     The block supports it but cannot prove it: it refuses a target under
+     `state_dir`, `instances_dir`, the hop root, or any bind source of the
+     old router or the hub-link router (an absent hub-link router adds
+     none), but it cannot see every other container's mounts. A bind
+     source that is the root directory, or that is neither a resolvable
+     directory nor an existing file, stops it.
+   - It refuses a `state_dir` and hop root that overlap, and a missing hop
+     root. Every later `docker/run.sh` step binds the rendered hop root, and
+     docker would create a missing one owned by root, which the router could
+     then never write.
+   - Its before-and-after listing of `state_dir` is a change detector, not
+     proof that the content is unchanged. The snapshot is consistent because
+     the old router is stopped and no router operator verb runs, not because
+     of the listing. `tar -d` then proves the archive equals the tree.
+   - Every observation is checked by its own exit status before its output
+     is believed.
+   - It assumes the router's one operator uid owns the whole state (its
+     0600 files and 0755 directories), so the operator's tar restores bytes
+     and modes. State owned by another uid is outside it.
 
    ```sh
    ( ST='<state_dir>'; INST='<instances_dir>'; HOP='<the hop root: its host path>'
-     BK='<a new directory for the snapshot: outside state_dir, instances_dir, the hop root and every container mount>'
+     BK='<a new, operator-private, host-only directory for the snapshot>'
      OLD='<the old container Id, as step 5 records it>'; HUB='<the hub-link router container>'
      umask 077
      stop() { printf 'r2-snapshot: STOP: %s\n' "$1" >&2; exit 1; }
-     [ "$(docker inspect -f '{{.State.Running}} {{.HostConfig.RestartPolicy.Name}}' "$OLD")" = "false no" ] \
-       || stop "the old router is not shown stopped with restart policy no"
+     s=$(docker inspect -f '{{.State.Running}} {{.HostConfig.RestartPolicy.Name}}' "$OLD") \
+       || stop "the old router cannot be inspected"
+     [ "$s" = "false no" ] || stop "the old router is not shown stopped with restart policy no"
      STP=$(cd -P -- "$ST" && pwd -P) || stop "no state_dir $ST"
      INP=$(cd -P -- "$INST" && pwd -P) || stop "no instances_dir $INST"
      HP=$(cd -P -- "$HOP" && pwd -P) || stop "no hop root $HOP"
+     [ "$STP" != / ] && [ "$HP" != / ] || stop "state_dir or the hop root is the root directory"
      case "$HP/" in "$STP"/*) stop "the hop root lies under state_dir" ;; esac
      case "$STP/" in "$HP"/*) stop "state_dir lies under the hop root" ;; esac
-     MNT=$(docker inspect -f '{{range .Mounts}}{{.Source}}{{"\n"}}{{end}}' "$OLD" "$HUB") \
-       || stop "the containers' mounts cannot be read"
+     MNT=$(docker inspect -f '{{range .Mounts}}{{if eq .Type "bind"}}{{.Source}}{{"\n"}}{{end}}{{end}}' "$OLD") \
+       || stop "the old router's mounts cannot be read"
+     hub=$(docker ps -a -q --no-trunc --filter "name=^/$HUB\$") || stop "docker cannot list containers"
+     if [ -n "$hub" ]; then
+       HM=$(docker inspect -f '{{range .Mounts}}{{if eq .Type "bind"}}{{.Source}}{{"\n"}}{{end}}{{end}}' "$HUB") \
+         || stop "the hub-link router's mounts cannot be read"
+       MNT=$(printf '%s\n%s' "$MNT" "$HM")
+     else
+       printf 'r2-snapshot: no container %s: it adds no mounts\n' "$HUB"
+     fi
      BKD=$(cd -P -- "$(dirname -- "$BK")" && pwd -P) || stop "no parent for $BK"
      BKP=$BKD/$(basename -- "$BK")
-     bad=$(printf '%s\n' "$STP" "$INP" "$HP" "$MNT" | while IFS= read -r m; do
-       [ -n "$m" ] || continue
-       mp=$(cd -P -- "$m" 2>/dev/null && pwd -P) || mp=$m
-       case "$BKP/" in "$mp"/*) printf '%s ' "$m" ;; esac
-     done)
-     [ -z "$bad" ] || stop "$BK lies under $bad"
+     IFS=$(printf '\n.'); IFS=${IFS%.}; set -f
+     for m in $STP $INP $HP $MNT; do
+       if [ -d "$m" ]; then mp=$(cd -P -- "$m" && pwd -P) || stop "the mount source $m cannot be resolved"
+       elif [ -f "$m" ]; then mp=$m
+       else stop "the mount source $m is neither a directory nor a file"; fi
+       [ "$mp" != / ] || stop "a mount source is the root directory: nothing can lie outside it"
+       case "$BKP/" in "$mp"/*) stop "$BK lies under $m" ;; esac
+     done
+     IFS=$(printf ' \t\n.'); IFS=${IFS%.}; set +f
      mkdir -m 0700 -- "$BKP" || stop "$BK already exists, or cannot be made"
-     before=$(cd -- "$STP" && ls -lnAR --full-time . | sha256sum) || stop "state_dir cannot be listed"
+     before=$(cd -- "$STP" && ls -lnAR --full-time .) || stop "state_dir cannot be listed"
      tar --numeric-owner -cpf "$BKP/r2-state.tar" -C "$STP" . || stop "tar failed"
-     after=$(cd -- "$STP" && ls -lnAR --full-time . | sha256sum) || stop "state_dir cannot be listed"
+     after=$(cd -- "$STP" && ls -lnAR --full-time .) || stop "state_dir cannot be listed"
      [ "$before" = "$after" ] || stop "state_dir changed during the tar: something else writes it"
      tar --numeric-owner -dpf "$BKP/r2-state.tar" -C "$STP" > /dev/null || stop "the snapshot is not the tree"
      chmod 0600 -- "$BKP/r2-state.tar" || stop "chmod failed"
      ( cd -- "$BKP" && sha256sum r2-state.tar > r2-state.tar.sha256 ) || stop "sha256sum failed"
      ( cd -- "$BKP" && sha256sum -c --strict --status r2-state.tar.sha256 ) || stop "the snapshot does not read back"
-     printf 'r2-snapshot: OK %s bytes %s %s\n' "$(wc -c < "$BKP/r2-state.tar" | tr -d ' ')" \
-       "$(cut -d' ' -f1 "$BKP/r2-state.tar.sha256")" "$BKP/r2-state.tar"
-     lanes=$(cd -- "$INP" && for d in */inbox */peer */outbox; do [ -d "$d" ] && printf '%s\n' "$d"; done)
+     n=$(wc -c < "$BKP/r2-state.tar") || stop "the snapshot cannot be measured"
+     case $n in ""|*[!0-9]*) stop "the snapshot cannot be measured" ;; esac
+     h=$(cut -d' ' -f1 "$BKP/r2-state.tar.sha256") || stop "the snapshot's sha256 cannot be read"
+     case $h in ""|*[!0-9a-f]*) stop "the snapshot's sha256 cannot be read" ;; esac
+     [ ${#h} -eq 64 ] || stop "the snapshot's sha256 cannot be read"
+     printf 'r2-snapshot: OK %s bytes %s %s\n' "$n" "$h" "$BKP/r2-state.tar"
+     lanes=$(cd -- "$INP" || exit 1; for d in */inbox */peer */outbox; do [ -d "$d" ] && printf '%s\n' "$d"; done; exit 0) \
+       || stop "instances_dir cannot be read"
      [ -n "$lanes" ] || stop "instances_dir holds no lane"
-     ( cd -- "$INP" && printf '%s\n' "$lanes" | tar --numeric-owner -cpf "$BKP/r2-lanes.tar" -T - )
-     rc=$?; [ "$rc" -le 1 ] || stop "the lane archive failed"
+     printf '%s\n' "$lanes" > "$BKP/r2-lanes.list" || stop "the lane list cannot be written"
+     ( cd -- "$INP" && tar --numeric-owner -cpf "$BKP/r2-lanes.tar" -T "$BKP/r2-lanes.list" ) 2> "$BKP/r2-lanes.tar.log"
+     rc=$?
+     cat -- "$BKP/r2-lanes.tar.log" >&2 || stop "tar's warnings cannot be read back"
+     [ "$rc" -le 1 ] || stop "the lane archive failed"
+     rm -- "$BKP/r2-lanes.list" || stop "the lane list cannot be removed"
      chmod 0600 -- "$BKP/r2-lanes.tar" || stop "chmod failed"
      ( cd -- "$BKP" && sha256sum r2-lanes.tar > r2-lanes.tar.sha256 ) || stop "sha256sum failed"
      ( cd -- "$BKP" && sha256sum -c --strict --status r2-lanes.tar.sha256 ) || stop "the lane archive does not read back"
-     printf 'r2-lanes: OK %s bytes %s %s (a point-in-time copy, taken with agents running; tar exit %s)\n' \
-       "$(wc -c < "$BKP/r2-lanes.tar" | tr -d ' ')" "$(cut -d' ' -f1 "$BKP/r2-lanes.tar.sha256")" "$BKP/r2-lanes.tar" "$rc" )
+     n=$(wc -c < "$BKP/r2-lanes.tar") || stop "the lane archive cannot be measured"
+     case $n in ""|*[!0-9]*) stop "the lane archive cannot be measured" ;; esac
+     h=$(cut -d' ' -f1 "$BKP/r2-lanes.tar.sha256") || stop "the lane archive's sha256 cannot be read"
+     case $h in ""|*[!0-9a-f]*) stop "the lane archive's sha256 cannot be read" ;; esac
+     [ ${#h} -eq 64 ] || stop "the lane archive's sha256 cannot be read"
+     printf 'r2-lanes: OK %s bytes %s %s (best-effort, non-atomic live archive: entries may be omitted or contain changing data; tar exit %s; its warnings in r2-lanes.tar.log)\n' \
+       "$n" "$h" "$BKP/r2-lanes.tar" "$rc" )
    ```
 
    It also archives the instance lanes (each `instances/<slug>`'s `inbox/`,
    `peer/` and `outbox/`, the delivered message content) into `r2-lanes.tar`
-   beside the snapshot, under the same rules. The lane archive is a
-   point-in-time copy taken with agents running, so no quiet listing is
-   required of it, and GNU tar's exit 1 (a file changed as it was read) is
-   recorded, not refused. It is an ARCHIVE ONLY, never restore input:
+   beside the snapshot, under the same rules. It is a best-effort,
+   non-atomic live archive taken with agents running: entries may be omitted
+   or contain changing data, and its sha256 proves the archive file's
+   integrity, not complete lane coverage. No quiet listing is required of
+   it. GNU tar's exit 1 (a file changed, or was removed, as it was read) is
+   recorded, not refused, and tar's warnings are kept in `r2-lanes.tar.log`
+   beside it and shown. It is an ARCHIVE ONLY, never restore input:
    restoring the lanes would resurrect requests the router has already
    consumed, and they change under running agents. Back-out R never reads it.
 
    Record its `r2-snapshot: OK` and `r2-lanes: OK` lines (each byte count,
-   sha256 and path) in the run log. Any `STOP` line ends R2 here: take back-out B. It
+   sha256 and path), tar's exit code and any warnings it showed, in the run
+   log. Any `STOP` line ends R2 here: take back-out B. It
    refuses a directory that already exists, so a snapshot is never added
    to or replaced. Run nothing else that writes `state_dir` meanwhile: no
    router operator verb (`reset`, `generation`, `quarantine`).
@@ -1146,8 +1200,9 @@ through back-out R.
      its name back. Keep it; never remove it.
   2. The restore itself, filling in the eight values. It extracts only
      `r2-state.tar`; the lane archive is never restore input. `ASIDE` is a NEW
-     directory, under none of `state_dir`, `instances_dir`, the hop root or
-     any bind source of the two routers, that receives every entry
+     directory, private to the operator and on the host's own disk, which no
+     container mounts (the operator's precondition, which the block supports
+     as the snapshot's does but cannot prove), that receives every entry
      `state_dir` holds now. It is kept, never deleted, and never left inside
      `state_dir`: a `<logical_id>` directory beside a restored `<name>` is
      the pinned router's `state_conflict` if R2 runs again. The block
@@ -1159,40 +1214,52 @@ through back-out R.
      ```sh
      ( ST='<state_dir>'; INST='<instances_dir>'; HOP='<the hop root: its host path>'
        BK='<the snapshot directory step 5 recorded>'
-       ASIDE='<a new directory: outside state_dir, instances_dir, the hop root and every container mount>'
+       ASIDE='<a new, operator-private, host-only directory for the state it replaces>'
        OLD='<the old container Id, as step 5 records it>'; NEW='<router.container>'
        HUB='<the hub-link router container>'
        umask 077
        stop() { printf 'r2-restore: STOP: %s\n' "$1" >&2; exit 1; }
        state() { docker inspect -f '{{.State.Running}} {{.HostConfig.RestartPolicy.Name}}' "$1"; }
        absent() { ids=$(docker ps -a -q --no-trunc --filter "name=^/$1\$") || stop "docker cannot list containers"; [ -z "$ids" ]; }
-       [ "$(state "$OLD")" = "false no" ] || stop "the old container is not shown stopped with restart policy no"
+       s=$(state "$OLD") || stop "the old container cannot be inspected"
+       [ "$s" = "false no" ] || stop "the old container is not shown stopped with restart policy no"
        absent "$NEW" || stop "a container is still named $NEW: set the new router aside first (step 1)"
        if ! absent "$NEW-r2-restored"; then
-         [ "$(state "$NEW-r2-restored")" = "false no" ] || stop "the new router is not shown stopped with restart policy no"
+         s=$(state "$NEW-r2-restored") || stop "the new router cannot be inspected"
+         [ "$s" = "false no" ] || stop "the new router is not shown stopped with restart policy no"
        fi
        STP=$(cd -P -- "$ST" && pwd -P) || stop "no state_dir $ST"
        INP=$(cd -P -- "$INST" && pwd -P) || stop "no instances_dir $INST"
        HP=$(cd -P -- "$HOP" && pwd -P) || stop "no hop root $HOP"
+       [ "$STP" != / ] && [ "$HP" != / ] || stop "state_dir or the hop root is the root directory"
        case "$HP/" in "$STP"/*) stop "the hop root lies under state_dir" ;; esac
        case "$STP/" in "$HP"/*) stop "state_dir lies under the hop root" ;; esac
        ( cd -- "$BK" && sha256sum -c --strict --status r2-state.tar.sha256 ) || stop "the snapshot is not the recorded one"
-       MNT=$(docker inspect -f '{{range .Mounts}}{{.Source}}{{"\n"}}{{end}}' "$OLD" "$HUB") \
-         || stop "the containers' mounts cannot be read"
+       MNT=$(docker inspect -f '{{range .Mounts}}{{if eq .Type "bind"}}{{.Source}}{{"\n"}}{{end}}{{end}}' "$OLD") \
+         || stop "the old container's mounts cannot be read"
+       if ! absent "$HUB"; then
+         HM=$(docker inspect -f '{{range .Mounts}}{{if eq .Type "bind"}}{{.Source}}{{"\n"}}{{end}}{{end}}' "$HUB") \
+           || stop "the hub-link router's mounts cannot be read"
+         MNT=$(printf '%s\n%s' "$MNT" "$HM")
+       fi
        ADD=$(cd -P -- "$(dirname -- "$ASIDE")" && pwd -P) || stop "no parent for $ASIDE"
        ASP=$ADD/$(basename -- "$ASIDE")
-       bad=$(printf '%s\n' "$STP" "$INP" "$HP" "$MNT" | while IFS= read -r m; do
-         [ -n "$m" ] || continue
-         mp=$(cd -P -- "$m" 2>/dev/null && pwd -P) || mp=$m
-         case "$ASP/" in "$mp"/*) printf '%s ' "$m" ;; esac
-       done)
-       [ -z "$bad" ] || stop "$ASIDE lies under $bad"
+       IFS=$(printf '\n.'); IFS=${IFS%.}; set -f
+       for m in $STP $INP $HP $MNT; do
+         if [ -d "$m" ]; then mp=$(cd -P -- "$m" && pwd -P) || stop "the mount source $m cannot be resolved"
+         elif [ -f "$m" ]; then mp=$m
+         else stop "the mount source $m is neither a directory nor a file"; fi
+         [ "$mp" != / ] || stop "a mount source is the root directory: nothing can lie outside it"
+         case "$ASP/" in "$mp"/*) stop "$ASIDE lies under $m" ;; esac
+       done
+       IFS=$(printf ' \t\n.'); IFS=${IFS%.}; set +f
        mkdir -m 0700 -- "$ASP" || stop "$ASIDE already exists, or cannot be made"
        for e in "$STP"/* "$STP"/.[!.]* "$STP"/..?*; do
          [ -e "$e" ] || [ -h "$e" ] || continue
          mv -- "$e" "$ASP"/ || stop "cannot move $e aside"
        done
-       [ -z "$(ls -A -- "$STP")" ] || stop "state_dir is not empty after the move aside"
+       left=$(ls -A -- "$STP") || stop "state_dir cannot be listed"
+       [ -z "$left" ] || stop "state_dir is not empty after the move aside"
        tar --numeric-owner -xpf "$BK/r2-state.tar" -C "$STP" || stop "the extract failed"
        tar --numeric-owner -dpf "$BK/r2-state.tar" -C "$STP" > /dev/null || stop "the restored tree is not the snapshot"
        printf 'r2-restore: OK restored %s; the state it replaced is kept in %s\n' "$STP" "$ASP" )
@@ -1223,8 +1290,9 @@ through back-out R.
   passes, and then removed on the operator's go, by literal paths and Ids,
   never a glob or a variable: `docker rm <the old container's Id>`;
   `rm -- <the snapshot directory>/r2-state.tar <the snapshot directory>/r2-state.tar.sha256`.
-- The lane archive (`r2-lanes.tar` and `r2-lanes.tar.sha256`) is kept
-  indefinitely, in the snapshot directory, which therefore stays.
+- The lane archive (`r2-lanes.tar`, `r2-lanes.tar.sha256` and
+  `r2-lanes.tar.log`) is kept indefinitely, in the snapshot directory, which
+  therefore stays.
 - Record each removal in the run log, with `date -u`, the path or Id, and
   the sha256 the archive had.
 
