@@ -943,7 +943,7 @@ def result(req_id, reason="delivered", digest="0" * 64):
     (outbound.py:2179-2222 at 99329945): digest null for a request the
     router could not read."""
     return json.dumps({"digest": digest, "result": {
-        "contract_version": 2, "req_id": req_id, "outcome": "rejected" if reason != "delivered" else "ok",
+        "contract_version": "2", "req_id": req_id, "outcome": "rejected" if reason != "delivered" else "ok",
         "detail": None, "reason_code": reason, "ts": "2026-10-17T00:00:00Z", "message_id": None, "job_id": None}})
 
 
@@ -1442,6 +1442,21 @@ class EarlyRefusalRows(Base):
         why = self.no_marker()
         self.assertIn("fence-legacy", why)
         self.assertNotIn("poll", why)
+
+    def test_dated_means_the_pin_s_own_parse(self):
+        """RL at b8dd5f75: the pin's parse_utc_ts is strptime with one format,
+        under strict_json: unpadded fields pass; fractional seconds, an
+        impossible date and a duplicate key do not."""
+        for ts, dated in (("2026-1-2T3:4:5Z", True), ("2026-01-02T03:04:05.5Z", False),
+                          ("2026-02-30T03:04:05Z", False)):
+            with self.subTest(approved_ts=ts):
+                (self.state / "alice" / "approval.json").write_text(json.dumps(
+                    {"approved_ts": ts, "declared_root": "/inst/alice", "outbox_snapshot": []}))
+                self.assertEqual(rm.approval_dated(self.state / "alice"), dated)
+        (self.state / "alice" / "approval.json").write_text(
+            '{"approved_ts": "x", "approved_ts": "2026-01-02T03:04:05Z", "declared_root": "/inst/alice", '
+            '"outbox_snapshot": []}')
+        self.assertFalse(rm.approval_dated(self.state / "alice"))
 
     def test_a_by_id_approval_only_instance_gets_no_start_instruction(self):
         """Codex at 8302db87: a name-keyed old router never reads the

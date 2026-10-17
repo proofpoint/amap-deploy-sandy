@@ -33,6 +33,7 @@ refused (STOP), and 2 when it could not run.
 
 import contextlib
 import ctypes
+import datetime
 import errno
 import ctypes.util
 import fcntl
@@ -924,8 +925,17 @@ def quarantined(results: Path) -> List[str]:
     return sorted(out)
 
 
-#: A UTC timestamp as the pin's parse_utc_ts reads an approval's approved_ts.
-UTC_TS = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?Z")
+#: The pin's parse_utc_ts format for an approval's approved_ts (util.py at 99329945).
+UTC_TS_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+
+
+def _utc_ts(v: str) -> bool:
+    """The pin's parse_utc_ts: strptime with its one format, nothing looser."""
+    try:
+        datetime.datetime.strptime(v, UTC_TS_FORMAT)
+    except ValueError:
+        return False
+    return True
 
 
 def approval_dated(d: Path) -> bool:
@@ -933,11 +943,11 @@ def approval_dated(d: Path) -> bool:
     (generations.legacy_marker): an object with a UTC approved_ts, a string
     declared_root and a list outbox_snapshot. Anything unreadable is not."""
     try:
-        doc = json.loads(_regular_bytes(d / "approval.json") or b"")
+        doc = json.loads(_regular_bytes(d / "approval.json") or b"", object_pairs_hook=_no_duplicates)
     except (Stop, ValueError):
         return False
     return (isinstance(doc, dict) and isinstance(doc.get("approved_ts"), str)
-            and UTC_TS.fullmatch(doc["approved_ts"]) is not None and isinstance(doc.get("declared_root"), str)
+            and _utc_ts(doc["approved_ts"]) and isinstance(doc.get("declared_root"), str)
             and isinstance(doc.get("outbox_snapshot"), list))
 
 
