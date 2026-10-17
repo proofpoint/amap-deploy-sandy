@@ -3695,6 +3695,10 @@ def run_render_router(args: argparse.Namespace, home: Path, boxes: List[Dict[str
               f"rendering: {refused}", file=sys.stderr)
         return 2
     names = ", ".join(sorted(members))
+    render_to = getattr(args, "render_to", None)
+    if render_to is not None:
+        return run_render_to(Path(render_to), doc, path, apply=apply, hop=keys is not None,
+                             combined=getattr(args, "prepare", False) or getattr(args, "activate", None) is not None)
     if getattr(args, "prepare", False):
         return run_prepare(args, policy, doc, path, apply=apply, spec=(hop_spec or [None])[0])
     if getattr(args, "activate", None) is not None or getattr(args, "activation_sha256", None) is not None:
@@ -4290,6 +4294,8 @@ def run_sync(args: argparse.Namespace, home: Path, boxes_dir: Path) -> int:
       3. The router's config, a generated sibling of the manifest
          (`router_sibling_path`): written under --apply, compared otherwise.
     """
+    if getattr(args, "render_to", None) is not None:
+        return run_render_only(args, home)
     if getattr(args, "activate", None) is not None or getattr(args, "activation_sha256", None) is not None:
         return run_activate_only(args, home)
     # Before anything is written: the connector checkout the payload is
@@ -4355,6 +4361,39 @@ def run_sync(args: argparse.Namespace, home: Path, boxes_dir: Path) -> int:
         print()
         prov_rc = max(prov_rc, run_install_identity(args, home, policy, boxes, states))
     return prov_rc
+
+
+def run_render_to(out: Path, doc: Dict[str, Any], live: Path, *, apply: bool, hop: bool, combined: bool) -> int:
+    """`install --render-to FILE`: install's own rendering, after every check
+    install makes, written to a NEW file and never to the live config. The
+    runbook's R2 renders the pinned router's config this way while the old
+    router still runs: that router's loader refuses the hop keys, so the live
+    config changes only after it has stopped."""
+    if combined:
+        print("router config: --render-to goes with neither --prepare nor --activate", file=sys.stderr)
+        return 2
+    if not hop:
+        print("router config: --render-to renders a hop host's config, and the policy has no hop_link",
+              file=sys.stderr)
+        return 2
+    want = sibling_text(doc).encode("utf-8")
+    digest = hashlib.sha256(want).hexdigest()
+    if not apply:
+        print(f"router config: would write the rendering (sha256 {digest}) to {out}, never to {live} "
+              f"(pass --apply)")
+        return 0
+    try:
+        fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        print(f"router config: {out} exists; --render-to writes only a new file", file=sys.stderr)
+        return 2
+    except OSError as e:
+        print(f"router config: cannot create {out}: {e.strerror}", file=sys.stderr)
+        return 2
+    with os.fdopen(fd, "wb") as f:
+        f.write(want)
+    print(f"router config: wrote the rendering (sha256 {digest}) to {out}; {live} was not written")
+    return 0
 
 
 def run_prepare(args: argparse.Namespace, policy: Dict[str, Any], doc: Dict[str, Any], path: Path, *,
@@ -4446,6 +4485,22 @@ def run_partition_activate(args: argparse.Namespace, home: Path) -> int:
         print(f"partition-activate: no {policy_path}: install the host first; nothing was written", file=sys.stderr)
         return 2
     args.prepare = True
+    policy = fp.load_policy(policy_path)
+    boxes = discover_sandboxes(args.sandy)
+    return run_render_router(args, home, boxes, policy, apply=args.apply)
+
+
+def run_render_only(args: argparse.Namespace, home: Path) -> int:
+    """`install --render-to FILE` (R2 step 2): nothing but the rendering. The
+    manifest, the payload, the roster, the router's live config and the
+    registry are never written on this path; its one write, the rendering
+    into FILE under --apply, comes after every check install makes, and its
+    exit code is the step's."""
+    policy_path = feature_manifest_path(home)
+    if not policy_path.is_file():
+        print(f"install: cannot render — no {policy_path}: install the host first; nothing was written",
+              file=sys.stderr)
+        return 2
     policy = fp.load_policy(policy_path)
     boxes = discover_sandboxes(args.sandy)
     return run_render_router(args, home, boxes, policy, apply=args.apply)
@@ -5178,6 +5233,9 @@ def build_parser() -> argparse.ArgumentParser:
     install.add_argument("--activation-sha256", metavar="HEX",
                          help="the sha256 A1 printed for its record; compared with the PLACED record, never "
                               "taken from it")
+    install.add_argument("--render-to", metavar="FILE",
+                         help="write the rendering to a NEW file FILE, never to the live config (the runbook's R2: "
+                              "the pinned router's config, rendered while the old router still runs)")
     install.add_argument("--decommission-hop", action="store_true",
                          help="render router.json WITHOUT the hop keys although state_dir holds hop "
                               "state: the explicit removal of a hop link (then restart the router)")
@@ -5343,14 +5401,33 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--step", type=int, choices=(0, 2), help="capture the running local router at activation "
                                                                 "step 0 or 2")
     mode.add_argument("--image", metavar="REF", help="capture an image, run by its immutable Id")
-    mode.add_argument("--match", metavar="FILE", help="match a running capture: MEASURED (0), UNMEASURED (1) "
-                                                      "or UNKNOWN (2)")
+    mode.add_argument("--match", metavar="FILE", help="match a running capture: MEASURED (0), UNMEASURED (1), "
+                                                      "UNKNOWN (2) or MIGRATE (3)")
     mode.add_argument("--verify-image", metavar="FILE", help="check an image capture against --commit: EXACT (0), "
                                                              "DIFFERS (1) or UNKNOWN (2)")
     rfp.add_argument("--commit", help="the commit --verify-image checks against (the hop pin)")
+    rfp.add_argument("--container", help="with --step or --match: the running local router's container name, when it "
+                                         "is not yet the host-setup document's router.container (a router started "
+                                         "before activation)")
     rfp.add_argument("--spec", type=Path, default=None,
                      help="the host-setup document (default: the deployment overlay's host_setup section)")
     rfp.add_argument("--apply", action="store_true", help="capture and write the file (default: show)")
+
+    rmig = sub.add_parser(
+        "router-migrate", help="the runbook's R2: a local router whose state is keyed by instance name, moved to "
+                               "the pinned router's registry layout, each step through the pinned router's own "
+                               "code (map, preview, move, check, adopt, verify). Exit 0 done, 1 STOP, 2 cannot run")
+    rmig.add_argument("step", choices=("map", "preview", "move", "check", "adopt", "verify"))
+    rmig.add_argument("--config", help="the migration config: install --render-to's file before the stop, the "
+                                       "live config after it")
+    rmig.add_argument("--preview", help="the preview step's file, the plan (move and check)")
+    rmig.add_argument("--check", help="the check step's file (adopt and verify)")
+    rmig.add_argument("--reverse", metavar="JOURNAL", help="move: undo that move journal's renames, newest first; "
+                                                          "run again until it completes")
+    rmig.add_argument("--reason", help="why, written to each instance's audit log by the router")
+    rmig.add_argument("--spec", type=Path, default=None,
+                      help="the host-setup document (default: the deployment overlay's host_setup section)")
+    rmig.add_argument("--apply", action="store_true", help="run the step (default: show)")
 
     teardown = sub.add_parser(
         "teardown", help="the fleet back to its pre-install state for a clean rebuild: "
@@ -5426,6 +5503,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         if args.command == "router-fingerprint":
             import router_fingerprint as rfp
             return rfp.run(args)
+
+        if args.command == "router-migrate":
+            import router_migrate as rmig
+            return rmig.run(args)
 
         if args.command == "migrate-registry":
             return run_migrate_registry(args, home)
