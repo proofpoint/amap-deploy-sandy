@@ -134,6 +134,7 @@ def place_step(spec: Any, source: str, final: bytes) -> str:
     """The root step that installs A1 + T at the final path, bound to its
     sha256, through the pinned writer."""
     import shlex
-    writer = posixpath.join(spec.secrets.writer_dir, ss.WRITER)
-    return (f"sudo {shlex.quote(spec.partition.tools['python3'])} -I -S -B {shlex.quote(writer)} place "
-            f"{shlex.quote(source)} {shlex.quote(spec.keys.local_config)} --sha256 {hashlib.sha256(final).hexdigest()}")
+    py = spec.partition.tools["python3"]
+    return ss.typed_root(spec.secrets, [py, "-I", "-S", "-B", spec.secrets.writer, "place", source,
+                                        spec.keys.local_config, "--sha256", hashlib.sha256(final).hexdigest()],
+                         shlex.quote, python3=py)

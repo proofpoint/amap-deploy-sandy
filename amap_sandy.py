@@ -4462,7 +4462,9 @@ def run_prepare(args: argparse.Namespace, policy: Dict[str, Any], doc: Dict[str,
     source = Path(spec.secrets.run_dir) / ps.ACTIVATION
     writer = os.path.join(spec.secrets.writer_dir, ss.WRITER)
     try:
-        steps = list(pj.activation_steps(spec.partition, writer=writer, source=str(source), activation_bytes=record))
+        steps = list(pj.activation_steps(spec.partition, writer=writer, writer_sha256=spec.secrets.writer_sha256,
+                                         tools=list(spec.secrets.tools.values()), source=str(source),
+                                         activation_bytes=record))
         argv = pj.job_argv(spec.partition, writer=writer, writer_sha256=spec.secrets.writer_sha256,
                            host=hsu.partition_host(spec), document=str(overlay),
                            document_bytes=overlay.read_bytes(), activation_bytes=record)

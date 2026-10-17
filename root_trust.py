@@ -34,6 +34,7 @@ supervision wrapper: verify compares the placed bytes with a fresh render.
 """
 
 import os
+import posixpath
 import shlex
 import struct
 from typing import List, Optional
@@ -452,6 +453,19 @@ def root_argv_positional(rt: str, sha256: str, python3: str, writer: str, args: 
     returned argv reaches root_exec as further arguments, after `args`."""
     return anchor(engine) + ["/bin/sh", "-c", POSITIONAL.format(rt=shlex.quote(rt), exit=EXIT), "sh",
                              sha256, python3, writer] + list(args)
+
+
+#: The typed root lines' sudo: the anchor's own (d3.3 §1, §5(d)).
+SUDO = "/usr/bin/sudo"
+
+
+def typed_argv(rt: str, sha256: str, python3: str, writer: str, tools: List[str], argv: List[str]) -> List[str]:
+    """One operator-typed root line (d3.3 §5(d)): the anchor's sudo, then the
+    §3 grammar, trusted-exec with each recorded tool (sudo never among them)
+    and `argv`, whose argv[0] is one of them or `python3` in its one exact
+    vector. sudo prompts as for any typed line: no -n."""
+    recorded = [x for t in sorted(set(tools)) if posixpath.basename(t) != "sudo" for x in ("--tool", t)]
+    return [SUDO] + root_argv_positional(rt, sha256, python3, writer, ["trusted-exec"] + recorded + ["--"] + list(argv))
 
 
 def root_argv(rt: str, sha256: str, python3: str, writer: str, args: List[str],

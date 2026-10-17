@@ -8,6 +8,7 @@ import json
 import os
 import tempfile
 import unittest
+from types import SimpleNamespace
 
 import partition_check as pc
 import partition_evidence as pe
@@ -242,6 +243,22 @@ class RefusalTest(Host):
 class BundleTest(unittest.TestCase):
     """PR-b's new modules stay outside the weekly job's bundle, so the writer
     bundle's digest does not move with them."""
+
+    def test_the_place_step_runs_the_writer_through_the_barrier(self):
+        """d3.3 §5(d): the anchor's sudo, the §3 grammar with the writer's
+        pin, then the writer in trusted-exec's one exact vector."""
+        import shlex
+        import root_trust as rt
+        sec = SimpleNamespace(writer_dir="/opt/ex/libexec", writer="/opt/ex/libexec/host_steps.py",
+                              writer_sha256="b" * 64, tools={"python3": "/usr/bin/python3", "sudo": "/usr/bin/sudo"})
+        spec = SimpleNamespace(secrets=sec, partition=SimpleNamespace(tools={"python3": "/opt/py/bin/python3"}))
+        argv = shlex.split(ppa.place_line(spec, "/srv/op/run/a b", "/opt/ex/ev/x", b"doc"))
+        cut = argv.index("--")
+        self.assertEqual(argv, rt.typed_argv("/opt/ex/libexec/root-trust.sh", "b" * 64, "/opt/py/bin/python3",
+                                             sec.writer, list(sec.tools.values()), argv[cut + 1:]))
+        self.assertEqual(argv[cut + 1:], ["/opt/py/bin/python3", "-I", "-S", "-B", sec.writer, "place",
+                                          "/srv/op/run/a b", "/opt/ex/ev/x", "--sha256",
+                                          hashlib.sha256(b"doc").hexdigest()])
 
     def test_the_new_modules_are_not_in_the_closure(self):
         from pathlib import Path

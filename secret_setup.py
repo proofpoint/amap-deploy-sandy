@@ -49,6 +49,7 @@ import json
 import os
 import posixpath
 import re
+import shlex
 import stat
 import sys
 import time
@@ -780,19 +781,17 @@ def live_docker(s: SecretSpec, *, engine: Optional[str] = None) -> List[str]:
     return sudo_route(s, engine or gate.engine)
 
 
-#: The typed root lines' sudo: the anchor's own (d3.3 §1, §5(d)).
-SUDO = "/usr/bin/sudo"
+#: The setting the coredump check's remedy writes, through the barrier.
+COREDUMP_OFF = "kern.coredump=0"
 
 
-def typed_root(s: SecretSpec, argv: Sequence[str], q: Callable[[str], str]) -> str:
-    """One operator-typed root line (d3.3 §5(d)): sudo, then the §3 grammar,
-    root-trust.sh's root_exec with the writer's pin, trusted-exec with the
-    document's tools, and `argv`, whose argv[0] is one of them. sudo prompts
-    as it would for any typed line; it is never in root's argv."""
-    tools = [x for t in sorted(set(s.tools.values())) if posixpath.basename(t) != "sudo" for x in ("--tool", t)]
-    return " ".join(q(a) for a in [SUDO] + rt.root_argv_positional(
-        posixpath.join(s.writer_dir, rt.NAME), s.writer_sha256, s.tools["python3"], s.writer,
-        ["trusted-exec"] + tools + ["--"] + list(argv)))
+def typed_root(s: SecretSpec, argv: Sequence[str], q: Callable[[str], str], python3: Optional[str] = None) -> str:
+    """One operator-typed root line (d3.3 §5(d)) through the placed writer,
+    with the document's tools. `python3` is the barrier's interpreter when
+    argv runs another than the secrets section's (the partition job's)."""
+    return " ".join(q(a) for a in rt.typed_argv(posixpath.join(s.writer_dir, rt.NAME), s.writer_sha256,
+                                                python3 or s.tools["python3"], s.writer, list(s.tools.values()),
+                                                list(argv)))
 
 
 def sudo_route(s: SecretSpec, engine: Optional[str]) -> List[str]:
@@ -1050,8 +1049,10 @@ def verify_core(s: SecretSpec, platform: str, read: Callable[[str], Any],
         return out
     claim = "the kernel writes no core files (kern.coredump=0)"
     want = _fact("kern.coredump", "0", "a crashing root service holds the value in memory")
-    remedy = "run `sudo sysctl kern.coredump=0` before each write or rotation"
     tool = s.tools.get("sysctl")
+    remedy = (f"run `{typed_root(s, [tool, COREDUMP_OFF], shlex.quote)}` before each write or rotation" if tool
+              else "record tools.sysctl, then run the root line this check prints for it before each write or "
+                   "rotation")
     if tool is None:
         return [rh.unknown(claim, want, "tools has no sysctl to ask", remedy)]
     try:

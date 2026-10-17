@@ -590,6 +590,10 @@ class CoreAndStatusTest(Base):
         found = self.run_checks(s, f=f, platform="darwin", answer=tools_answer({
             lambda a: a[0].endswith("sysctl"): (0, "1\n", "")}))
         self.assertOnly(found, "kern.coredump=0")
+        [c] = [c for c in found if "kern.coredump" in c.claim]
+        self.assertIn(f"`{ss.typed_root(s, ['/usr/sbin/sysctl', 'kern.coredump=0'], shlex.quote)}`", c.remedy,
+                      "the remedy's root line runs through the barrier (d3.3 §5(d))")
+        self.assertNotIn("sudo sysctl", c.remedy)
 
     def test_an_old_status_fails(self):
         found = self.run_checks(files_=files(at=NOW - 9 * 86400, last_ok_at=NOW - 9 * 86400))

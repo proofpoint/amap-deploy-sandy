@@ -62,14 +62,18 @@ def job_argv(p: ps.PartitionSpec, *, writer: str, writer_sha256: str, host: str,
                         ["trusted-exec"] + tools + ["--also", p.tools["docker"], "--"] + step)
 
 
-def activation_steps(p: ps.PartitionSpec, *, writer: str, source: str, activation_bytes: bytes,
-                     q: Callable[[str], str] = shlex.quote) -> List[str]:
+def activation_steps(p: ps.PartitionSpec, *, writer: str, writer_sha256: str, tools: List[str], source: str,
+                     activation_bytes: bytes, q: Callable[[str], str] = shlex.quote) -> List[str]:
     """The operator's root step after A1: place A1's record, checked against
-    the sha256 of the bytes A1 wrote, at its one place (root:root 0444). The
-    unit carrying the same sha256 is then rendered and placed again."""
+    the sha256 of the bytes A1 wrote, at its one place (root:root 0444), by
+    the pinned writer through the barrier (d3.3 §5(d)), as job_argv runs it.
+    The unit carrying the same sha256 is then rendered and placed again."""
+    py = p.tools["python3"]
     return ["# A1's approved record, where the weekly job and verify read it (after every A1):",
-            f"sudo {q(p.tools['python3'])} -I -S -B {q(writer)} place {q(source)} {q(activation_path(p))} "
-            f"--sha256 {hashlib.sha256(activation_bytes).hexdigest()}"]
+            " ".join(q(a) for a in rt.typed_argv(
+                posixpath.join(posixpath.dirname(writer), rt.NAME), writer_sha256, py, writer, tools,
+                [py, "-I", "-S", "-B", writer, "place", source, activation_path(p),
+                 "--sha256", hashlib.sha256(activation_bytes).hexdigest()]))]
 
 
 def _sd(arg: str) -> str:

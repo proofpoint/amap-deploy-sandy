@@ -15,6 +15,7 @@ import unittest
 
 import partition_job as pj
 import partition_setup as ps
+import root_trust as rt
 
 P = ps.PartitionSpec(evidence_dir="/opt/ex/ev", scratch_dir="/opt/ex/scratch", weekday=2, hour=4,
                      exec_root="/opt/ex/exec", tools={"python3": "/usr/bin/python3", "docker": "/usr/bin/docker"})
@@ -70,11 +71,20 @@ class JobTest(unittest.TestCase):
                                 "--activation-sha256": hashlib.sha256(ACT).hexdigest()})
 
     def test_a1s_record_is_placed_at_its_one_place_checked_against_its_digest(self):
-        steps = pj.activation_steps(P, writer="/opt/amap/host_steps.py", source="/home/op/run/activation.json",
-                                    activation_bytes=ACT)
+        steps = pj.activation_steps(P, writer="/opt/amap/host_steps.py", writer_sha256="b" * 64,
+                                    tools=["/usr/bin/python3", "/usr/bin/docker", "/usr/bin/sudo"],
+                                    source="/home/op/run/activation.json", activation_bytes=ACT)
         self.assertIn(f"place /home/op/run/activation.json /opt/ex/ev/activation.json --sha256 "
                       f"{hashlib.sha256(ACT).hexdigest()}", steps[-1])
-        self.assertTrue(steps[-1].startswith("sudo /usr/bin/python3 -I -S -B /opt/amap/host_steps.py place "))
+        argv = shlex.split(steps[-1])
+        self.assertEqual(argv, rt.typed_argv("/opt/amap/root-trust.sh", "b" * 64, "/usr/bin/python3",
+                                             "/opt/amap/host_steps.py", ["/usr/bin/python3", "/usr/bin/docker"],
+                                             argv[argv.index("--") + 1:]))
+        self.assertEqual(argv[argv.index("--") + 1:argv.index("--") + 6],
+                         ["/usr/bin/python3", "-I", "-S", "-B", "/opt/amap/host_steps.py"],
+                         "the writer in trusted-exec's one exact vector (d3.3 §4.1)")
+        self.assertEqual(argv[0], "/usr/bin/sudo")
+        self.assertNotIn("/usr/bin/sudo", argv[1:], "root's argv never holds sudo")
 
     def test_systemd_runs_it_weekly_and_once_after_boot(self):
         files = dict(pj.rendered("systemd", P, ARGV))
