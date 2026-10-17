@@ -343,6 +343,16 @@ class LayoutRows(Base):
             rm.classify(self.state, the_map())
         self.assertIn("resume it with the adopt step", str(cm.exception))
 
+    def test_a_sync_always_fsyncs(self):
+        """Opus's note 6: every sync is an fsync of that descriptor, before
+        any F_FULLFSYNC."""
+        fd = os.open(self.base, os.O_RDONLY)
+        self.addCleanup(os.close, fd)
+        seen = []
+        with mock.patch.object(rm.os, "fsync", lambda f: seen.append(f)):
+            rm._sync(fd)
+        self.assertEqual(seen, [fd])
+
     def test_a_refused_full_fsync_falls_back_to_fsync(self):
         """Opus's N3: a filesystem that refuses F_FULLFSYNC keeps the fsync."""
         import errno as errno_mod
@@ -700,7 +710,7 @@ class BindingRows(Base):
             got = e
         self.assertIsInstance(got, rm.Stop)
         records = [json.loads(p.read_text()) for p in sorted(self.run_dir.glob("router-migrate-adopt-*.json"))]
-        self.assertEqual([(r["root_mismatch"], r["failed"]) for r in records], [("alice", None)])
+        self.assertEqual([(r.get("root_mismatch"), r.get("failed")) for r in records], [("alice", None)])
 
     def test_verify_before_the_start(self):
         self.move(self.pre)

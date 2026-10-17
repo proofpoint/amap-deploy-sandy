@@ -796,12 +796,13 @@ resume.
   - no edit of the live config.
 - Before step 5, pause the scheduled container recreation, the job the
   policy's `container_recreate_interval_hours` drives.
-- Steps 8, 9 and 10 check each root, and the registry binding, against the
-  ones recorded, so a change made anyway stops R2 before step 10's start,
-  on the back-out for that point (D once any adopt has begun; before that,
-  C then B). The one
-  gap left is between step 10's verify and the router's first poll, which
-  only this premise covers. A root recreated there would make the router
+- Steps 8, 9 and 10 detect a change of an instance root, of the registry
+  binding, of the config, or of an instance's state directory, and stop R2
+  before step 10's start, on the back-out for that point: D once any
+  migrated directory holds an adopt's files (`migration.json` or
+  `generations.json`), and C then B before that. The premise covers every
+  other change. The one gap left is between step 10's verify and the
+  router's first poll, which only this premise covers. A root recreated there would make the router
   begin a new generation, with a fresh first sight that quarantines that
   instance's waiting requests.
 
@@ -909,8 +910,10 @@ marker and reply ledger carry over, and it drains on the first poll.
      anchors that remain at this dry run. The check takes N only from this
      dry run's own refusal text, and records it.
 9. **Adopt.** `python3 amap-sandy.py router-migrate adopt --config <the live
-   config> --check <step 8's file> --reason "<text>" --apply`. From here R2
-   only goes forward (back-out D).
+   config> --check <step 8's file> --reason "<text>" --apply`. Once its
+   first adopt has written its files, R2 only goes forward (back-out D); a
+   STOP before that, at the fresh plan or the state check, still has C then
+   B.
    - Before each adopt it takes a fresh read-only plan, which must name the
      checked root, and it checks each instance's state is the recorded one.
    - After the adopts, four records of each root must be one (path,
@@ -962,7 +965,8 @@ old container is never started except through back-out C, then B.
      holds a migration.json or a generations.json: an adopt has begun, and
      back-out D applies.
   2. Then back-out B.
-- D. Once step 9 has begun: forward only. The adopted state is in the
+- D. Once any migrated directory holds a `migration.json` or a
+  `generations.json` (an adopt has begun): forward only. The adopted state is in the
   generation layout under the registry, which the old router never reads.
   Starting the old container now would take a fresh first sight and
   quarantine every waiting request, and leave state under both the name

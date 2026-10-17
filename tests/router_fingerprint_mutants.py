@@ -613,6 +613,9 @@ MUTANTS = [
     ("a capture label left out of the file name", RF,
      "    out(write_capture(spec.secrets.run_dir, f\"{label}-{args.step}\" if label else str(args.step), doc))",
      "    out(write_capture(spec.secrets.run_dir, str(args.step), doc))"),
+    ("a sync without fsync", RM,
+     "    os.fsync(fd)\n    if sys.platform == \"darwin\" and hasattr(fcntl, \"F_FULLFSYNC\"):",
+     "    if sys.platform == \"darwin\" and hasattr(fcntl, \"F_FULLFSYNC\"):"),
 ]
 TESTS = {RF: "test_router_fingerprint", "hygiene_gate.py": "test_router_fingerprint",
          RM: "test_router_migrate", AS: "test_router_migrate"}
