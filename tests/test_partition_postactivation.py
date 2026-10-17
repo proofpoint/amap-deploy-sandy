@@ -250,8 +250,9 @@ class BundleTest(unittest.TestCase):
         import shlex
         import root_trust as rt
         sec = SimpleNamespace(writer_dir="/opt/ex/libexec", writer="/opt/ex/libexec/host_steps.py",
-                              writer_sha256="b" * 64, tools={"python3": "/usr/bin/python3", "sudo": "/usr/bin/sudo"})
-        spec = SimpleNamespace(secrets=sec, partition=SimpleNamespace(tools={"python3": "/opt/py/bin/python3"}))
+                              writer_sha256="b" * 64, tools={"python3": "/usr/bin/python3", "sudo": "/usr/bin/sudo"},
+                              pins={})
+        spec = SimpleNamespace(secrets=sec, partition=SimpleNamespace(tools={"python3": "/opt/py/bin/python3"}, pins={}))
         argv = shlex.split(ppa.place_line(spec, "/srv/op/run/a b", "/opt/ex/ev/x", b"doc"))
         cut = argv.index("--")
         self.assertEqual(argv, rt.typed_argv("/opt/ex/libexec/root-trust.sh", "b" * 64, "/opt/py/bin/python3",

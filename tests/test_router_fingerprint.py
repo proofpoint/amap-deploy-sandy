@@ -1651,7 +1651,7 @@ class CaptureVerb(unittest.TestCase):
         return SimpleNamespace(run_dir=str(self.run_dir), docker_via_sudo=True, writer_dir="/opt/ex/libexec",
                                writer="/opt/ex/libexec/host_steps.py", writer_sha256="b" * 64,
                                tools={"docker": "/usr/bin/docker", "sudo": "/usr/bin/sudo",
-                                      "python3": "/usr/bin/python3"})
+                                      "python3": "/usr/bin/python3"}, pins={})
 
     def test_apply_runs_through_the_barrier_and_a_refusal_runs_nothing(self):
         """Codex at 184acedf (the other executing caller of ss.docker): the

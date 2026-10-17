@@ -128,7 +128,7 @@ class ProbeToolsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as t:
             ran, status = os.path.join(t, "ran"), os.path.join(t, "status.json")
 
-            def untrusted(program, docker):
+            def untrusted(program, docker, docker_sha256=None):
                 raise hs.Tooling("not root's")
             for verify in (untrusted, None):
                 with self.subTest(verify=verify):

@@ -542,7 +542,7 @@ class LockTest(Secret):
         self.assertRefused(self.write(), "concurrent writer")
 
 
-def trusted(program, docker):
+def trusted(program, docker, docker_sha256=None):
     """probe_weekly's tool check, answered "root's alone": these rows are about
     the probe's result, and test_root_tool_trust holds the check itself."""
 

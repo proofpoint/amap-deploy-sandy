@@ -57,13 +57,22 @@ def sup_section(kind="systemd"):
 MANAGER = {"systemd": "/usr/bin/systemctl", "launchd": hv.LAUNCHCTL}
 
 
+#: The hand-placed docker client's pin a launchd document carries (d3.3 §4 C3; host_setup.LAUNCHD_PINNED).
+DOCKER_PIN = "c0" * 32
+
+
 def supervise(d, kind_="systemd", **over):
     """`d` with the supervision section of `kind_`, and the secrets section
-    recording that kind's manager, as the spec requires."""
+    recording that kind's manager, as the spec requires. On launchd each
+    section recording docker pins it, as the spec requires there."""
     sec = sup_section(kind_)
     sec.update(over)
     d[hv.SECTION] = sec
     d["secrets"]["tools"][hv.MANAGERS[kind_]] = MANAGER[kind_]
+    if kind_ == "launchd":
+        for name in ("secrets", "partition"):
+            if name in d:
+                d[name].setdefault("tool_sha256", {})["docker"] = DOCKER_PIN
     return d
 
 
@@ -345,7 +354,8 @@ class WrapperTest(unittest.TestCase):
                 self.assertEqual(rc, 0)
                 s = self.spec_.secrets
                 self.assertEqual(log[0].split(), ["barrier", s.writer_sha256, s.tools["python3"], s.writer, "trusted-exec"]
-                                 + hv.tool_args(self.spec_) + ["--also", s.tools["docker"], "--"]
+                                 + hv.tool_args(self.spec_) + ["--also", s.tools["docker"]]
+                                 + rt.pin_args(s.pins, s.tools["python3"], [s.tools["docker"]]) + ["--"]
                                  + hv.own(self.spec_, hv.NOOP))
                 docker_calls = [l for l in log if not l.startswith("barrier")]
                 barrier_calls = [l for l in log[1:] if l.startswith("barrier")]
@@ -1035,6 +1045,10 @@ class LaunchdEnablementTest(unittest.TestCase):
     def test_the_plan_disables_both_labels_before_placing_anything(self):
         s = spec("launchd")
         lines = hv.plan(s, shlex.quote, "STEPS")
+        repin = hv.repin_steps(s)
+        self.assertTrue(repin, "a launchd document pins docker, so the plan ends with the re-pin order")
+        self.assertEqual(lines[-len(repin):], repin)
+        lines = lines[:-len(repin)]     # the re-pin order's own stop is a later, separate procedure
         dis = [i for i, l in enumerate(lines) if " service --manager " in l and not l.startswith("#")]
         place = [i for i, l in enumerate(lines) if l.startswith("STEPS place ")]
         argvs = [shlex.split(lines[i]) for i in dis]

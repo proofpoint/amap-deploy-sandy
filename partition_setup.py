@@ -3,8 +3,8 @@ the partition evidence lives, where the controls may make throwaway paths,
 when the weekly probe runs, and the conformance harness's passing record
 that, with current evidence, lets `delegation` be rendered at all.
 
-`partition` {evidence_dir, scratch_dir, exec_root, tools{python3, docker},
-weekly{weekday, hour}} is authored
+`partition` {evidence_dir, scratch_dir, exec_root, tools{python3, docker,
+git, git-remote-https}, tool_sha256?, weekly{weekday, hour}} is authored
 with the rest of the overlay. `delegation_gate` {harness_sha, record_sha256,
 record_path} is the operator's alone: install and verify READ it and the
 record, and nothing here writes either. Both have closed member sets, and a
@@ -22,6 +22,9 @@ record, and nothing here writes either. Both have closed member sets, and a
   each run's work directory and the recovery description.
 - `tools`: the interpreter and the docker CLI the weekly job runs as root,
   absolute paths, separate from the secrets section's own tools.
+- `tool_sha256` (optional; required for docker on a launchd host): a pinned
+  sha256 per tool name (d3.3 §4 C3), the same for a path the secrets
+  section also records.
 - `weekly`: the probe job's day and hour only.
 - `record_path`: exactly `<evidence_dir>/gate-record.json`, a regular file,
   root:root 0444, one link, checked and read through ONE descriptor.
@@ -37,10 +40,11 @@ import posixpath
 import re
 import stat
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 import harness_gate as hg
+import root_trust as rt
 import router_health as rh
 
 SECTION = "partition"
@@ -77,6 +81,12 @@ class PartitionSpec:
     hour: int
     exec_root: str
     tools: Dict[str, str]
+    tool_sha256: Dict[str, str] = field(default_factory=dict)  # tool name -> pinned sha256 (C3)
+
+    @property
+    def pins(self) -> Dict[str, str]:
+        """The pinned tools by recorded path (root_trust.tool_pins)."""
+        return rt.tool_pins(self.tools, self.tool_sha256, SECTION)
 
 
 @dataclass(frozen=True)
@@ -101,8 +111,10 @@ def _int(v: Any) -> bool:
 
 
 def load(sec: Any, spec: Any) -> PartitionSpec:
-    if not isinstance(sec, dict) or set(sec) != {"evidence_dir", "scratch_dir", "exec_root", "tools", "weekly"}:
-        raise PartitionSpecError("partition must have exactly evidence_dir, scratch_dir, exec_root, tools and weekly")
+    required = {"evidence_dir", "scratch_dir", "exec_root", "tools", "weekly"}
+    if not isinstance(sec, dict) or not required <= set(sec) or set(sec) - required - {rt.TOOL_SHA256}:
+        raise PartitionSpecError("partition must have exactly evidence_dir, scratch_dir, exec_root, tools and weekly, "
+                                 f"and optionally {rt.TOOL_SHA256}")
     ev, scratch = _abs(sec["evidence_dir"], "partition.evidence_dir"), _abs(sec["scratch_dir"], "partition.scratch_dir")
     ex = _abs(sec["exec_root"], "partition.exec_root")
     t = sec["tools"]
@@ -113,6 +125,10 @@ def load(sec: Any, spec: Any) -> PartitionSpec:
             (tools["git"], tools["git-remote-https"]) != (CLT_GIT, CLT_GIT_REMOTE_HTTPS):
         raise PartitionSpecError(f"on a launchd host, partition.tools.git must be {CLT_GIT} and git-remote-https "
                                  f"{CLT_GIT_REMOTE_HTTPS}: /usr/bin/git is the xcrun shim")
+    try:
+        rt.tool_pins(tools, sec.get(rt.TOOL_SHA256), SECTION)
+    except ValueError as e:
+        raise PartitionSpecError(str(e)) from None
     w = sec["weekly"]
     if not isinstance(w, dict) or set(w) != {"weekday", "hour"} or not _int(w["weekday"]) or not _int(w["hour"]) \
             or not 0 <= w["weekday"] <= 6 or not 0 <= w["hour"] <= 23:
@@ -134,7 +150,7 @@ def load(sec: Any, spec: Any) -> PartitionSpec:
             raise PartitionSpecError(f"partition.exec_root {ex} overlaps {o}; the weekly job's bundle and runs "
                                      "stay apart from every live path and from the controls' scratch")
     return PartitionSpec(evidence_dir=ev, scratch_dir=scratch, weekday=w["weekday"], hour=w["hour"], exec_root=ex,
-                         tools=tools)
+                         tools=tools, tool_sha256=dict(sec.get(rt.TOOL_SHA256) or {}))
 
 
 def load_gate(sec: Any, partition: Optional[PartitionSpec]) -> GateSpec:
@@ -205,7 +221,8 @@ def gate_problems(gs: Optional[GateSpec], *, rl_sha: Any, hop_sha: Any, plugin_s
 def verify(ps: Optional[PartitionSpec], gs: Optional[GateSpec], *, delegation_enabled: bool, lstat: Callable,
            owned_chain: Callable, rl_sha: Any, hop_sha: Any, plugin_sha256: str,
            read: Callable[[str], bytes] = read_record,
-           realpath: Callable[[str], str] = os.path.realpath) -> List[rh.Check]:
+           realpath: Callable[[str], str] = os.path.realpath,
+           digest: Optional[Callable[[str], Any]] = None) -> List[rh.Check]:
     """The two sections against the host. Absent sections are a NOTE (PASS
     with the reason in the claim) where nothing enables delegation, and a
     FAIL where something does."""
@@ -233,7 +250,7 @@ def verify(ps: Optional[PartitionSpec], gs: Optional[GateSpec], *, delegation_en
                        else rh.check(claim, want, got, remedy))
             out.append(owned_chain(f"every directory above {path} is root-owned and not group- or world-writable",
                                    path, (0,), "the partition products are trusted only as root placed them", lstat))
-        out += verify_tools(ps, lstat, owned_chain, realpath)
+        out += verify_tools(ps, lstat, owned_chain, realpath, digest)
     if delegation_enabled or gs is not None:
         bad = gate_problems(gs, rl_sha=rl_sha, hop_sha=hop_sha, plugin_sha256=plugin_sha256, read=read)
         claim = "the conformance harness's gate record holds for this deployment"
@@ -450,10 +467,12 @@ def verify_target(ps: Optional[PartitionSpec], gs: Optional[GateSpec], *, live_c
 
 
 def verify_tools(ps: PartitionSpec, lstat: Callable, owned_chain: Callable,
-                 realpath: Callable[[str], str] = os.path.realpath) -> List[rh.Check]:
+                 realpath: Callable[[str], str] = os.path.realpath,
+                 digest: Optional[Callable[[str], Any]] = None) -> List[rh.Check]:
     """The weekly job's tools as root will run them: each one's realpath a
     regular executable, root-owned and not group- or world-writable, under
-    root-owned directories that are not either. The tripwire half of the
+    root-owned directories that are not either, and a pinned one the client
+    its pin names (secret_setup.tool_pin_row). The tripwire half of the
     design's tool rule; the startup closure is validated at install time,
     with the operating system's own tools."""
     out: List[rh.Check] = []
@@ -463,6 +482,11 @@ def verify_tools(ps: PartitionSpec, lstat: Callable, owned_chain: Callable,
         claim = f"the weekly job's {name} {path} resolves to a root-owned executable no one else can write"
         want = rh.Fact("tool", True, why)
         remedy = f"record a {name} the operating system or its vendor installed, root-owned, as partition.tools.{name}"
+        if name in ps.tool_sha256:
+            import host_setup
+            import secret_setup
+            out.append(secret_setup.tool_pin_row(SECTION, name, path, ps.tool_sha256[name], lstat,
+                                                 digest or host_setup._sha256))
         try:
             real = realpath(path)
             st = lstat(real)

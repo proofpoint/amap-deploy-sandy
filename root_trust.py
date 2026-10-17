@@ -35,9 +35,10 @@ supervision wrapper: verify compares the placed bytes with a fresh render.
 
 import os
 import posixpath
+import re
 import shlex
 import struct
-from typing import Any, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 #: The check's exit: outside PROBE_EXITS, REFUSED, the partition job's codes,
 #: the hub's NO_RESTART (0-11), the engine's 125, the shell's 126-127 and 143.
@@ -459,17 +460,62 @@ def root_argv_positional(rt: str, sha256: str, python3: str, writer: str, args: 
 SUDO = "/usr/bin/sudo"
 
 
-def typed_argv(rt: str, sha256: str, python3: str, writer: str, tools: List[str], argv: List[str],
-               also: Sequence[str] = ()) -> List[str]:
-    """One operator-typed root line (d3.3 §5(d)): the anchor's sudo, then the
-    §3 grammar, trusted-exec with each recorded tool (sudo never among them),
-    each `also` it judges beside argv[0], and `argv`, whose argv[0] is one of
-    them or `python3` in its one exact vector. sudo prompts as for any typed
-    line: no -n."""
+#: The member a section that records tools pins some of them in (d3.3 §4 C3).
+TOOL_SHA256 = "tool_sha256"
+_HEX64 = re.compile(r"[0-9a-f]{64}")
+
+
+def tool_pins(tools: Mapping[str, str], pinned: Any, where: str) -> Dict[str, str]:
+    """A section's `tool_sha256` (d3.3 §4 C3: a hand-placed client's sha256 is
+    pinned in the document, and trusted-exec checks it) as {recorded path:
+    sha256}, the path being the one the section's own name records. ValueError
+    for anything but a map of that section's tool names to 64 lower-case hex,
+    and for two names recording one path with different hashes."""
+    if pinned is None:
+        return {}
+    if not isinstance(pinned, dict):
+        raise ValueError(f"{where}.{TOOL_SHA256} must map {where}.tools names to sha256s")
+    pins: Dict[str, str] = {}
+    for name, h in sorted(pinned.items()):
+        if name not in tools:
+            raise ValueError(f"{where}.{TOOL_SHA256}.{name} pins a tool {where}.tools does not record")
+        if not isinstance(h, str) or not _HEX64.fullmatch(h):
+            raise ValueError(f"{where}.{TOOL_SHA256}.{name} must be 64 lower-case hex digits")
+        if pins.get(tools[name], h) != h:
+            raise ValueError(f"{where}.{TOOL_SHA256} pins {tools[name]} twice, with different sha256s")
+        pins[tools[name]] = h
+    return pins
+
+
+def pin_args(pins: Mapping[str, str], argv0: str, also: Sequence[str] = ()) -> List[str]:
+    """`--sha256 PATH=HEX` once for each pinned path that is exactly this
+    line's argv[0] or one of its `also`: never for another recorded tool,
+    which trusted-exec refuses as a pin outside the command."""
+    out: List[str] = []
+    for t in dict.fromkeys([argv0] + list(also)):
+        if t in pins:
+            out += ["--sha256", f"{t}={pins[t]}"]
+    return out
+
+
+def trusted_exec_args(tools: Sequence[str], argv: Sequence[str], also: Sequence[str] = (),
+                      pins: Optional[Mapping[str, str]] = None) -> List[str]:
+    """The writer's `trusted-exec` and its options for `argv`: `--tool` for
+    each recorded tool (sudo never among them), `--also` for each of `also`,
+    and the pins of the tools it runs (pin_args), then `--` and `argv`."""
     recorded = [x for t in sorted(set(tools)) if posixpath.basename(t) != "sudo" for x in ("--tool", t)]
     extra = [x for t in also for x in ("--also", t)]
-    return [SUDO] + root_argv_positional(rt, sha256, python3, writer,
-                                         ["trusted-exec"] + recorded + extra + ["--"] + list(argv))
+    return ["trusted-exec"] + recorded + extra + pin_args(pins or {}, argv[0], also) + ["--"] + list(argv)
+
+
+def typed_argv(rt: str, sha256: str, python3: str, writer: str, tools: List[str], argv: List[str],
+               also: Sequence[str] = (), pins: Optional[Mapping[str, str]] = None) -> List[str]:
+    """One operator-typed root line (d3.3 §5(d)): the anchor's sudo, then the
+    §3 grammar, trusted-exec with each recorded tool (sudo never among them),
+    each `also` it judges beside argv[0], the pins of those it runs, and
+    `argv`, whose argv[0] is one of them or `python3` in its one exact
+    vector. sudo prompts as for any typed line: no -n."""
+    return [SUDO] + root_argv_positional(rt, sha256, python3, writer, trusted_exec_args(tools, argv, also, pins))
 
 
 def root_argv(rt: str, sha256: str, python3: str, writer: str, args: List[str],

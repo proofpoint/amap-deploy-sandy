@@ -69,10 +69,13 @@ class PlanTest(unittest.TestCase):
                 argv = shlex.split(self.judge_line(lines))
                 cut = argv.index("--")
                 py = p.tools["python3"]
+                pin = ["--docker-sha256", p.tool_sha256["docker"]] if kind == "launchd" else []
                 self.assertEqual(argv[cut + 1:], [py, "-I", "-S", "-B", sec.writer, "partition-judge",
-                                                  "--python3", py, "--docker", p.tools["docker"]])
+                                                  "--python3", py, "--docker", p.tools["docker"]] + pin,
+                                 "the judge checks the partition section's docker pin where it has one")
                 self.assertEqual(argv, rt.typed_argv(sec.writer_dir + "/" + rt.NAME, sec.writer_sha256, py,
-                                                     sec.writer, list(p.tools.values()), argv[cut + 1:]))
+                                                     sec.writer, list(p.tools.values()), argv[cut + 1:],
+                                                     pins=p.pins))
                 self.assertFalse(set(argv[cut + 1:]) & {"/bin/sh", "sh", "bash"})
                 # §1.7's read-only git fact line is the one place xcode-select -p is printed.
                 text = "\n".join(l for l in lines if '"$D/git-exec/git" --version' not in l)

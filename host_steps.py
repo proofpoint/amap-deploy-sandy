@@ -21,7 +21,7 @@ A runtime's secret file, in a directory that only that runtime's uid can open:
   python3 -I -S host_steps.py secret-remove PATH           the file and any crash temp removed
   python3 -I -S host_steps.py stat-secret DIR              its entries' metadata, as one JSON line
   python3 -I -S host_steps.py lock RUN_DIR -- ARGV...      ARGV run under RUN_DIR/oneshot.lock
-  python3 -I -S host_steps.py probe-weekly STATUS RUN_ID [--engine unix:///SOCK] [--docker ABS] -- ARGV...
+  python3 -I -S host_steps.py probe-weekly STATUS RUN_ID [--engine unix:///SOCK] [--docker ABS [--docker-sha256 HEX]] -- ARGV...
                                                   ARGV's one-line result kept in STATUS, refused
                                                   unless this interpreter, the docker client and
                                                   ARGV's program are root's alone
@@ -607,14 +607,14 @@ def _remove_run(docker, run_id):
         pass
 
 
-def probe_weekly(status_path, run_id, argv, now=None, engine=None, docker=None, verify=None):
+def probe_weekly(status_path, run_id, argv, now=None, engine=None, docker=None, verify=None, docker_sha256=None):
     """Run the probe command and keep its result in `status_path`: the class,
     its SMTP code, the time, this run's id, the previous run's class, and
     when the probe last passed. With `engine`, a stopped engine is recorded
     as engine_unavailable without running anything. With `docker` (the
     engine's client argv), a probe that outruns its timeout has its
     containers removed by this run's label, and is recorded as timeout.
-    Exits with the probe's
+    With `docker_sha256`, the client must be the one it pins. Exits with the probe's
     status. Run it under `lock`, never the reverse: a busy lock is the
     wrapper's refusal, not a probe result. Root runs it, so before anything
     runs, `verify` (by default `_verify_probe_tools`) must find this
@@ -624,7 +624,10 @@ def probe_weekly(status_path, run_id, argv, now=None, engine=None, docker=None, 
             or (docker is not None and not (docker and os.path.isabs(docker[0]))):
         raise Refused("probe")
     try:
-        (verify or _verify_probe_tools)(argv[0], docker)
+        if verify is None:
+            _verify_probe_tools(argv[0], docker, docker_sha256)
+        else:
+            verify(argv[0], docker)
     except Tooling:
         raise Refused("tools") from None
     at = int(now if now is not None else time.time())
@@ -681,36 +684,44 @@ def probe_weekly(status_path, run_id, argv, now=None, engine=None, docker=None, 
     return rc
 
 
-def _verify_probe_tools(program, docker):
+def _verify_probe_tools(program, docker, docker_sha256=None):
     """What probe-weekly will run as root, as partition-weekly verifies its
     own: the interpreter running this step, the docker client (`docker`, else
     the program), and the program, each a root-owned executable under
-    root-owned directories, with the startup closure root's alone. Tooling
-    otherwise."""
+    root-owned directories, the client the one `docker_sha256` pins (d3.3 §4
+    C3), and the startup closure root's alone. Tooling otherwise."""
     python = sys.executable
     if not python or not os.path.isabs(python):
         raise Tooling("the running interpreter has no absolute path")
     client = docker[0] if docker else program
     py, dock = _trusted_tool(python), _trusted_tool(client)
     _trusted_tool(program)
+    if docker_sha256 is not None:
+        bad = _pin_problem(client, docker_sha256)
+        if bad:
+            raise Tooling(bad)
     bad = closure_problems(startup_closure(py, dock, (python, client, program)))
     if bad:
         raise Tooling("the startup closure is not root's alone: " + "; ".join(bad[:5]))
 
 
 def _probe_weekly_main(argv):
-    """probe-weekly STATUS RUN_ID [--engine unix:///SOCK] [--docker ABS] -- ARGV"""
+    """probe-weekly STATUS RUN_ID [--engine unix:///SOCK] [--docker ABS [--docker-sha256 HEX]] -- ARGV"""
     cut = argv.index("--", 3)
     opts, rest = argv[3:cut], argv[cut + 1:]
-    engine = docker = None
+    engine = docker = pin = None
     while opts:
         if opts[0] == "--engine" and len(opts) > 1 and engine is None:
             engine, opts = opts[1], opts[2:]
         elif opts[0] == "--docker" and len(opts) > 1 and docker is None:
             docker, opts = [opts[1]], opts[2:]
+        elif opts[0] == "--docker-sha256" and len(opts) > 1 and pin is None and _HEX64.fullmatch(opts[1]):
+            pin, opts = opts[1], opts[2:]
         else:
             raise Refused("usage")
-    return probe_weekly(argv[1], argv[2], rest, engine=engine, docker=docker)
+    if pin is not None and docker is None:
+        raise Refused("usage")
+    return probe_weekly(argv[1], argv[2], rest, engine=engine, docker=docker, docker_sha256=pin)
 
 
 # --- The weekly partition job: its root half -------------------------------------------
@@ -786,6 +797,8 @@ SEALED_PREFIXES = ("/usr/lib/", "/System/Library/")
 
 _HEX40 = re.compile(r"[0-9a-f]{40}")
 _HEX64 = re.compile(r"[0-9a-f]{64}")
+#: The partition section's member pinning its tools (root_trust.TOOL_SHA256; a test holds the two equal).
+TOOL_SHA256 = "tool_sha256"
 _AT = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
 
 # The evidence document's grammar: a copy of partition_evidence's.
@@ -1122,6 +1135,7 @@ def _authority(sec, exec_root):
         part = sec["partition"]
         values = {"evidence_dir": part["evidence_dir"], "exec_root": part["exec_root"],
                   "python3": part["tools"]["python3"], "docker": part["tools"]["docker"],
+                  "docker_sha256": (part.get(TOOL_SHA256) or {}).get("docker"),
                   "engine": sec["supervision"]["engine"], "live_config": sec["keys"]["local_config"],
                   "pin": sec["secrets"]["clones"]["deploy"]["sha"]}
     except (KeyError, TypeError):
@@ -1134,6 +1148,9 @@ def _authority(sec, exec_root):
         _parts(values[k])
     if not isinstance(values["pin"], str) or not _HEX40.fullmatch(values["pin"]):
         raise Handoff("the approved document's deploy pin is not a commit sha")
+    if values["docker_sha256"] is not None and not (isinstance(values["docker_sha256"], str)
+                                                    and _HEX64.fullmatch(values["docker_sha256"])):
+        raise Handoff("the approved document's docker pin is not a sha256")
     roots = [("evidence_dir", values["evidence_dir"]), ("exec_root", exec_root),
              ("the live config's directory", os.path.dirname(values["live_config"]))]
     for i, (a, pa) in enumerate(roots):
@@ -1541,10 +1558,15 @@ def _docker_closure(docker, spelled=None):
             OPTIONAL: []}
 
 
-def _verified_tools(python3, docker):
+def _verified_tools(python3, docker, docker_sha256=None):
     """The interpreter's and docker's realpaths once they and their startup
-    closure are root's alone; Tooling otherwise."""
+    closure are root's alone, and docker is the client `docker_sha256` pins
+    (d3.3 §4 C3), checked before any closure discovery; Tooling otherwise."""
     python, dock = _trusted_tool(python3), _trusted_tool(docker)
+    if docker_sha256 is not None:
+        bad = _pin_problem(docker, docker_sha256)
+        if bad:
+            raise Tooling(bad)
     bad = closure_problems(startup_closure(python, dock, (python3, docker)))
     if bad:
         raise Tooling("the startup closure is not root's alone: " + "; ".join(bad[:5]))
@@ -3081,7 +3103,7 @@ def partition_weekly(exec_root, host, document, sha256, activation, activation_s
             raw, sec = _document(document, sha256)
             values = _authority(sec, exec_root)
             # Everything root will run or write under, verified before any engine call.
-            python, docker = _verified_tools(values["python3"], values["docker"])
+            python, docker = _verified_tools(values["python3"], values["docker"], values["docker_sha256"])
             _engine_socket(values["engine"])
             _verify_bundle(efd, values["pin"])
             os.close(_evidence_dir(values["evidence_dir"]))
@@ -3226,6 +3248,9 @@ def partition_weekly(exec_root, host, document, sha256, activation, activation_s
                 return EXIT_TOOLING
             try:
                 docker = _trusted_tool(recovery["docker"])
+                pinned = _pin_problem(docker, values["docker_sha256"]) if values and values["docker_sha256"] else None
+                if pinned:
+                    raise Tooling(pinned)
                 bad = closure_problems(_docker_closure(docker, values["docker"] if values else None))
                 if bad:
                     raise Tooling("its own startup closure is not root's alone: " + "; ".join(bad[:5]))

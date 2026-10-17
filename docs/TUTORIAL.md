@@ -1495,6 +1495,47 @@ the old docker grant (root through the engine's socket). That entry point is
 a separate, reviewed change, not part of this setup.
 
 
+### A hand-placed docker client is pinned
+
+Nothing manages the bytes of a docker client placed by hand, so the document
+pins its sha256 (d3.3 §4 C3), and every root line that runs it checks the pin
+before anything runs. A launchd host's client is the hand-placed one: its
+document records `tool_sha256` beside `tools` in each section that records
+docker, and the document does not load without it.
+
+```json
+"tools": {"docker": "<the client's absolute path>", "...": "..."},
+"tool_sha256": {"docker": "<the client's sha256>"}
+```
+
+The key is the section's own tool name, and the pin belongs to the path that
+name records. A path recorded by both the secrets and the partition section
+carries the same pin in both. `trusted-exec` receives `--sha256 <path>=<hash>`
+for exactly the tools its line runs, `partition-judge` and the weekly probe
+get `--docker-sha256`, and the weekly job reads the pin from the approved
+document. A client whose bytes differ is refused, exit 12, before anything
+loads it; `verify` reports a mismatch as a problem and an unreadable client
+as UNKNOWN. A package-managed client (a Linux distribution's `docker-ce`)
+takes no pin, so its updates need no document change. A Linux host whose
+client was placed by hand is not covered by this rule: it is pinned only if
+its document says so.
+
+To replace a pinned client, keep this order. The plan prints it with this
+host's lines:
+
+1. Stop [2] through its supervisor, with the writer's service verb
+   (`bootout` on launchd, then `hub-start-check --until-stopped` until it
+   prints NOT-RUNNING; `stop` on systemd), never with a bare `docker stop`.
+2. Replace the client with the reviewed one, root-owned, which no one else
+   can write.
+3. Record its sha256 in the section's `tool_sha256`, and in every other
+   section that records the same path, then render and place everything the
+   plan places again.
+4. Start [2] through `hub-start-check`'s planned path.
+
+A pin moved without the re-render (step 3) leaves every [2] line refused
+with exit 12.
+
 ### The weekly partition job's tools
 
 The weekly partition job runs the host's interpreter and docker as root, so

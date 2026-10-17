@@ -273,7 +273,7 @@ def root_cmd(spec: Any, argv: List[str], also: Sequence[str] = ()) -> List[str]:
     root_exec judging the OS interpreter and the pinned writer, then the
     writer's trusted-exec judging argv and `also`, and exec'ing argv."""
     s = spec.secrets
-    args = ["trusted-exec"] + tool_args(spec) + [x for t in also for x in ("--also", t)] + ["--"] + list(argv)
+    args = rt.trusted_exec_args(s.tools.values(), argv, also, s.pins)
     return rt.root_argv(rt_path(spec), s.writer_sha256, s.tools["python3"], s.writer, args,
                         engine=spec.supervision.engine)
 
@@ -299,8 +299,9 @@ def weekly_argv(spec: Any) -> List[str]:
     s = spec.secrets
     sup = spec.supervision
     status = posixpath.join(s.status_dir, ss.STATUS_FILE)
+    pin = s.pins.get(s.tools["docker"])
     inner = own(spec, "probe-weekly", status, WEEKLY_RUN_ID, "--engine", sup.engine, "--docker", s.tools["docker"],
-                "--") + ss.probe(s, WEEKLY_RUN_ID, root=True)
+                *(["--docker-sha256", pin] if pin else []), "--") + ss.probe(s, WEEKLY_RUN_ID, root=True)
     return root_cmd(spec, own(spec, "lock", s.run_dir, "--") + inner, also=[s.tools["docker"]])
 
 
@@ -360,6 +361,8 @@ def wrapper(spec: Any) -> bytes:
     tools = " ".join(q(a) for a in tool_args(spec))
     image = q(hr.run_spec(spec, spec.hub)["image"])
     s = spec.secrets
+    pin_docker = "".join(" " + q(a) for a in rt.pin_args(s.pins, s.tools["docker"]))
+    pin_noop = "".join(" " + q(a) for a in rt.pin_args(s.pins, s.tools["python3"], [s.tools["docker"]]))
     return f"""#!/bin/sh
 # hub-link-run. Rendered by amap-deploy-sandy hub-supervise from the anchored
 # overlay; placed root 0444 by the pinned writer and run by its LaunchDaemon as
@@ -376,7 +379,7 @@ DOCKER_HOST={q(sup.engine)}
 export DOCKER_HOST
 say() {{ printf '{SAY}%s\\n' "$1" >&2; }}
 # Every docker call root makes goes through the one barrier, in a subshell (root_exec execs).
-root_docker() {{ ( command . "$RT" && command -v root_exec >/dev/null || exit {rt.EXIT}; root_exec "$SHA" "$PY" "$WR" trusted-exec {tools} -- "$DOCKER" "$@" ); }}
+root_docker() {{ ( command . "$RT" && command -v root_exec >/dev/null || exit {rt.EXIT}; root_exec "$SHA" "$PY" "$WR" trusted-exec {tools}{pin_docker} -- "$DOCKER" "$@" ); }}
 record() {{
     printf '%s %s\\n' "$1" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$STATUS.tmp" && mv -f "$STATUS.tmp" "$STATUS"
 }}
@@ -386,7 +389,7 @@ record() {{
 #    it is recorded. A refusal that cannot be recorded removes the last status,
 #    so no earlier result stands for it, and exits 1: launchd retries, and each
 #    retry refuses again.
-if ! ( command . "$RT" && command -v root_exec >/dev/null || exit {rt.EXIT}; root_exec "$SHA" "$PY" "$WR" trusted-exec {tools} --also "$DOCKER" -- "$PY" -I -S -B "$WR" {NOOP} ) >/dev/null; then
+if ! ( command . "$RT" && command -v root_exec >/dev/null || exit {rt.EXIT}; root_exec "$SHA" "$PY" "$WR" trusted-exec {tools} --also "$DOCKER"{pin_noop} -- "$PY" -I -S -B "$WR" {NOOP} ) >/dev/null; then
     if record {UNTRUSTED}; then
         say "docker or python3 is not root's alone: nothing was run"
         exit 0
@@ -603,6 +606,36 @@ def service_line(spec: Any, action: str, *args: str, q: Callable[[str], str] = s
                          also=[m])
 
 
+#: The four steps of replacing a pinned docker client, in their one order (RE): a pin
+#: moved without the re-render leaves every [2] line refused with root_trust.EXIT.
+REPIN_STEPS = (
+    "# 1. Stop [2] through its supervisor, never with a bare `docker stop`:",
+    "# 2. Replace {path} with the reviewed client: root-owned, no one else can write it.",
+    "# 3. Record its sha256 as secrets.tool_sha256.docker, and as partition.tool_sha256.docker where the partition "
+    "section records {path}; then render and place everything this plan places again.",
+    "# 4. Start [2] through hub-start-check's planned path: run hub-start-check, and type only the lines it prints.",
+)
+
+
+def repin_steps(spec: Any, q: Callable[[str], str] = shlex.quote,
+                document: Optional[Tuple[str, str]] = None) -> List[str]:
+    """Where the secrets section pins docker (d3.3 §4 C3), how that client is
+    replaced: REPIN_STEPS, with step 1's stop through the writer's service
+    verb (launchd: bootout, then NOT-RUNNING)."""
+    s, sup = spec.secrets, spec.supervision
+    path = s.tools["docker"]
+    if path not in s.pins:
+        return []
+    if sup.kind == "systemd":
+        stop = [service_line(spec, "stop", posixpath.basename(sup.hub["unit"]), q=q)]
+    else:
+        stop = [service_line(spec, "bootout", sup.hub["label"], q=q), "# Do not go on until this prints NOT-RUNNING:",
+                until_stopped_line(spec, document)]
+    first, *rest = (line.format(path=path) for line in REPIN_STEPS)
+    return [f"# The docker client {path} is pinned (d3.3 §4 C3). To replace it, in this order and no other:",
+            first, *stop, *rest]
+
+
 def plan(spec: Any, q: Callable[[str], str], steps: str) -> List[str]:
     """The root steps that place the files. Enabling them is NOT here: it is
     the gated start step, which `hub-start-check` prints only on a pass. On
@@ -617,7 +650,7 @@ def plan(spec: Any, q: Callable[[str], str], steps: str) -> List[str]:
         mode = mode_of(spec, path)
         lines.append(f"{steps} place {q(posixpath.join(run_dir, staged(path)))} {q(path)} --sha256 {hr._sha(data)}"
                      + (f" --mode {mode:04o}" if mode != FILE_MODE else ""))
-    return lines
+    return lines + repin_steps(spec, q)
 
 
 def start_commands(spec: Any) -> List[str]:

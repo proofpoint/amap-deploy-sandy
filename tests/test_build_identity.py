@@ -1408,7 +1408,7 @@ class InstallAndVerifyTest(unittest.TestCase):
                                   docker_via_sudo=True,
                                   tools={"sudo": "/zz/sudo", "docker": "/zz/docker", "python3": "/zz/python3"},
                                   writer_dir="/zz/libexec", writer="/zz/libexec/host_steps.py",
-                                  writer_sha256="d" * 64, uid=2101, gid=2100)
+                                  writer_sha256="d" * 64, uid=2101, gid=2100, pins={})
         return SimpleNamespace(router=None, hub=SimpleNamespace(dirs={"RELAY_LEDGER_DIR": "/zz/h/ledger"}),
                                secrets=secrets, overlay_path=None, overlay_pin=None,
                                supervision=SimpleNamespace(engine=ENGINE),

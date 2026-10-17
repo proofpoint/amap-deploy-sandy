@@ -138,6 +138,9 @@ UMASKS = {"0027": 0o027, "0022": 0o022}
 DEFAULT_UMASKS = ("0027",)
 #: The lowest openssl the plugin's pkeyutl -rawin fallback may run on.
 OPENSSL_FLOOR_MIN = (3, 0)
+#: The tools a launchd host's document must pin: its docker client is the
+#: hand-placed one (d3.3 §4 C3), and nothing else manages those bytes.
+LAUNCHD_PINNED = ("docker",)
 #: The uid the in-container probes run as. No runtime may run as it, so a
 #: probe's own processes are never read as a runtime's.
 PROBE_UID = 0
@@ -408,6 +411,7 @@ def load_spec(doc: Any) -> Spec:
             spec = dataclasses.replace(spec, gate=ps.load_gate(doc[ps.GATE_SECTION], spec.partition))
     except ps.PartitionSpecError as e:
         raise SpecError(str(e)) from None
+    _tool_pin_rules(spec)
     if fk.SECTION in doc:
         if spec.keys is None:
             raise SpecError(f"the {fk.SECTION} section needs a keys section: the inventory names this host's "
@@ -423,6 +427,30 @@ def load_spec(doc: Any) -> Spec:
                             f"runtime container {declared} ({spec.keys.principal}'s): the checks of the local "
                             f"router would read two different containers")
     return spec
+
+
+def _tool_pin_rules(spec: Spec) -> None:
+    """d3.3 §4 C3 across the sections that record tools. On a launchd host
+    each of them pins LAUNCHD_PINNED. A path pinned in one section is pinned,
+    with the same sha256, in every section that records it, so no line runs
+    that path unpinned. Paths are compared as the document records them:
+    nothing here resolves a host's paths."""
+    sections = [(name, sec) for name, sec in ((ss.SECTION, spec.secrets), (ps.SECTION, spec.partition))
+                if sec is not None]
+    if spec.supervision is not None and spec.supervision.kind == "launchd":
+        for name, sec in sections:
+            for tool in LAUNCHD_PINNED:
+                if tool not in sec.tool_sha256:
+                    raise SpecError(f"on a launchd host, {name}.tool_sha256.{tool} must pin the hand-placed {tool} "
+                                    f"client's sha256 (d3.3 §4 C3): nothing else manages those bytes")
+    for i, (a, sa) in enumerate(sections):
+        for b, sb in sections[i + 1:]:
+            shared = set(sa.tools.values()) & set(sb.tools.values())
+            for path in sorted(shared & (set(sa.pins) | set(sb.pins))):
+                if sa.pins.get(path) != sb.pins.get(path):
+                    raise SpecError(f"{path} is recorded by {a} and {b} but pinned differently ({a}: "
+                                    f"{sa.pins.get(path) or 'no pin'}, {b}: {sb.pins.get(path) or 'no pin'}): pin "
+                                    f"it with the same sha256 in both")
 
 
 def parse_pin(pin: Any) -> Optional[Dict[str, str]]:
@@ -1204,7 +1232,7 @@ def _checks(spec: Spec, *, production: bool, lstat: Callable = os.lstat,
                          owned_chain=ss._owned_chain,
                          rl_sha=p["rl_sha"] if "rl_sha" in p else hp.hop_pin(),
                          hop_sha=(spec.overlay_pin or {}).get("commit", rh.Unresolved("the overlay has no plugin pin")),
-                         plugin_sha256=hp.PLUGIN_SHA256, read=p.get("read", ps.read_record))
+                         plugin_sha256=hp.PLUGIN_SHA256, read=p.get("read", ps.read_record), digest=p.get("digest"))
         out += verify_stop_target(spec, p)
         out += verify_weekly_runs(spec, p)
     return out
