@@ -701,7 +701,7 @@ python3 amap-sandy.py router-fingerprint --verify-image <the file it wrote> --co
 The check must print `EXACT`. Record its image ID as the `digest` (`docker
 image inspect --format '{{.Id}}' <name>`, the engine's content-addressed
 image Id: the config digest on the classic image store, the manifest (list)
-digest on the containerd store; a local build has no registry digest), and
+digest on the containerd store), and
 the commit it was built from. Then:
 
 ```sh
