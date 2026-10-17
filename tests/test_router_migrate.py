@@ -1444,19 +1444,33 @@ class EarlyRefusalRows(Base):
         self.assertNotIn("poll", why)
 
     def test_dated_means_the_pin_s_own_parse(self):
-        """RL at b8dd5f75: the pin's parse_utc_ts is strptime with one format,
-        under strict_json: unpadded fields pass; fractional seconds, an
-        impossible date and a duplicate key do not."""
-        for ts, dated in (("2026-1-2T3:4:5Z", True), ("2026-01-02T03:04:05.5Z", False),
-                          ("2026-02-30T03:04:05Z", False)):
-            with self.subTest(approved_ts=ts):
-                (self.state / "alice" / "approval.json").write_text(json.dumps(
-                    {"approved_ts": ts, "declared_root": "/inst/alice", "outbox_snapshot": []}))
+        """RL and Codex at b8dd5f75: dated is the pin's parse_utc_ts (strptime
+        with one format) under strict_json (strict UTF-8, no duplicate keys),
+        checked on the helper AND on the baseline's remedy text."""
+        def approval(ts):
+            return json.dumps({"approved_ts": ts, "declared_root": "/inst/alice", "outbox_snapshot": []})
+        cases = [
+            ("valid", approval("2026-01-02T03:04:05Z").encode(), True),
+            ("unpadded, which the pin accepts", approval("2026-1-2T3:4:5Z").encode(), True),
+            ("fractional seconds", approval("2026-01-02T03:04:05.5Z").encode(), False),
+            ("month 99", approval("2026-99-02T03:04:05Z").encode(), False),
+            ("2026-02-29, not a leap year", approval("2026-02-29T03:04:05Z").encode(), False),
+            ("second 60", approval("2026-01-02T03:04:60Z").encode(), False),
+            ("a duplicate approved_ts, the last valid",
+             b'{"approved_ts": "x", "approved_ts": "2026-01-02T03:04:05Z", "declared_root": "/inst/alice", '
+             b'"outbox_snapshot": []}', False),
+            ("UTF-16", approval("2026-01-02T03:04:05Z").encode("utf-16"), False),
+        ]
+        for why, raw, dated in cases:
+            with self.subTest(case=why):
+                (self.state / "alice" / "approval.json").write_bytes(raw)
                 self.assertEqual(rm.approval_dated(self.state / "alice"), dated)
-        (self.state / "alice" / "approval.json").write_text(
-            '{"approved_ts": "x", "approved_ts": "2026-01-02T03:04:05Z", "declared_root": "/inst/alice", '
-            '"outbox_snapshot": []}')
-        self.assertFalse(rm.approval_dated(self.state / "alice"))
+                text = self.no_marker()
+                if dated:
+                    self.assertIn("let the old router poll the instance once", text)
+                else:
+                    self.assertIn("fence-legacy", text)
+                    self.assertNotIn("poll", text)
 
     def test_a_by_id_approval_only_instance_gets_no_start_instruction(self):
         """Codex at 8302db87: a name-keyed old router never reads the

@@ -941,10 +941,12 @@ def _utc_ts(v: str) -> bool:
 def approval_dated(d: Path) -> bool:
     """The pin's own test for an approval.json first sight can adopt
     (generations.legacy_marker): an object with a UTC approved_ts, a string
-    declared_root and a list outbox_snapshot. Anything unreadable is not."""
+    declared_root and a list outbox_snapshot, read as the pin's strict_json
+    reads it (strict UTF-8, no duplicate keys). Anything unreadable is not."""
     try:
-        doc = json.loads(_regular_bytes(d / "approval.json") or b"", object_pairs_hook=_no_duplicates)
-    except (Stop, ValueError):
+        text = (_regular_bytes(d / "approval.json") or b"").decode("utf-8")
+        doc = json.loads(text, object_pairs_hook=_no_duplicates)
+    except (Stop, ValueError):     # UnicodeDecodeError is a ValueError
         return False
     return (isinstance(doc, dict) and isinstance(doc.get("approved_ts"), str)
             and _utc_ts(doc["approved_ts"]) and isinstance(doc.get("declared_root"), str)
