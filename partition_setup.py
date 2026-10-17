@@ -49,8 +49,12 @@ GATE_RECORD = "gate-record.json"
 EVIDENCE_MODE = 0o755
 SCRATCH_MODE = 0o700
 EXEC_MODE = 0o700
-#: The tools the weekly job runs as root, and nothing else.
-WEEKLY_TOOLS = ("docker", "python3")
+#: The tools the weekly job runs as root, and the two its bundle is fetched with.
+WEEKLY_TOOLS = ("docker", "python3", "git", "git-remote-https")
+#: On darwin, git and its https helper are the Command Line Tools' own:
+#: /usr/bin/git is the xcrun shim, which execs another git by absolute path.
+CLT_GIT = "/Library/Developer/CommandLineTools/usr/bin/git"
+CLT_GIT_REMOTE_HTTPS = "/Library/Developer/CommandLineTools/usr/libexec/git-core/git-remote-https"
 RECORD_MODE = 0o444
 _HEX40 = re.compile(r"[0-9a-f]{40}")
 _HEX64 = re.compile(r"[0-9a-f]{64}")
@@ -105,6 +109,10 @@ def load(sec: Any, spec: Any) -> PartitionSpec:
     if not isinstance(t, dict) or set(t) != set(WEEKLY_TOOLS):
         raise PartitionSpecError(f"partition.tools must be exactly {', '.join(WEEKLY_TOOLS)}")
     tools = {k: _abs(t[k], f"partition.tools.{k}") for k in WEEKLY_TOOLS}
+    if getattr(getattr(spec, "supervision", None), "kind", None) == "launchd" and \
+            (tools["git"], tools["git-remote-https"]) != (CLT_GIT, CLT_GIT_REMOTE_HTTPS):
+        raise PartitionSpecError(f"on a launchd host, partition.tools.git must be {CLT_GIT} and git-remote-https "
+                                 f"{CLT_GIT_REMOTE_HTTPS}: /usr/bin/git is the xcrun shim")
     w = sec["weekly"]
     if not isinstance(w, dict) or set(w) != {"weekday", "hour"} or not _int(w["weekday"]) or not _int(w["hour"]) \
             or not 0 <= w["weekday"] <= 6 or not 0 <= w["hour"] <= 23:

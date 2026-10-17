@@ -535,7 +535,9 @@ def render_plan(spec: Spec, overlay_source: Optional[Path] = None,
                          "(the host's kind, the deploy pin and the pinned writer).")
         else:
             # The validation of what root will run was printed first, above every other step.
-            lines += pj.provision_steps(spec.partition, spec.secrets.clones["deploy"]["sha"], spec.secrets.writer, q)
+            lines += pj.git_fact_steps(spec.partition, spec.supervision.kind, q)
+            lines += pj.provision_steps(spec.partition, spec.secrets.clones["deploy"]["sha"], spec.secrets.writer,
+                                        spec.secrets.writer_sha256, q)
     lines.append("# Start no runtime until every step above has run: each root exists and is synced "
                  "before a runtime opens it.")
     return lines

@@ -18,7 +18,9 @@ import partition_setup as ps
 import root_trust as rt
 
 P = ps.PartitionSpec(evidence_dir="/opt/ex/ev", scratch_dir="/opt/ex/scratch", weekday=2, hour=4,
-                     exec_root="/opt/ex/exec", tools={"python3": "/usr/bin/python3", "docker": "/usr/bin/docker"})
+                     exec_root="/opt/ex/exec", tools={"python3": "/usr/bin/python3", "docker": "/usr/bin/docker",
+                                                       "git": "/usr/bin/git",
+                                                       "git-remote-https": "/usr/lib/git-core/git-remote-https"})
 DOC = b'{"host_setup": {}}'
 ACT = b'{"approved": "A1"}'
 ARGV = pj.job_argv(P, writer="/opt/amap/host_steps.py", writer_sha256="b" * 64, host="alpha", document="/opt/ov/overlay.json",
@@ -31,13 +33,14 @@ class JobTest(unittest.TestCase):
         self.assertEqual(ARGV[:6], rt.anchor() + ["/bin/sh", "-c"])
         self.assertEqual(len(ARGV), 7, "the anchor, sh -c and one script")
         body = shlex.split(ARGV[6].split("; ", 1)[1])
-        self.assertEqual(body[:13], ["root_exec", "b" * 64, "/usr/bin/python3", "/opt/amap/host_steps.py", "trusted-exec",
-                                     "--tool", "/usr/bin/docker", "--tool", "/usr/bin/python3",
+        self.assertEqual(body[:17], ["root_exec", "b" * 64, "/usr/bin/python3", "/opt/amap/host_steps.py", "trusted-exec",
+                                     "--tool", "/usr/bin/docker", "--tool", "/usr/bin/git", "--tool", "/usr/bin/python3",
+                                     "--tool", "/usr/lib/git-core/git-remote-https",
                                      "--also", "/usr/bin/docker", "--", "/usr/bin/python3"],
                          "d3.3 §4.1: the partition document's whole recorded set as --tool")
         self.assertEqual(ARGV[6].split("; ", 1)[0],
                          "command . /opt/amap/root-trust.sh && command -v root_exec >/dev/null || exit 12")
-        step = body[12:]
+        step = body[16:]
         self.assertEqual(step[:5], ["/usr/bin/python3", "-I", "-S", "-B", "/opt/amap/host_steps.py"])
         opts = dict(zip(step[6::2], step[7::2]))
         self.assertEqual(opts, {"--exec-root": "/opt/ex/exec", "--host": "alpha", "--document": "/opt/ov/overlay.json",
@@ -68,7 +71,8 @@ class JobTest(unittest.TestCase):
         self.assertIn(f"OnBootSec={pj.BOOT_DELAY_S}", timer)
         service = files["/etc/systemd/system/amap-partition-weekly.service"].decode()
         self.assertIn("ExecStart=/usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin LC_ALL=C /bin/sh -c ", service)
-        self.assertIn("trusted-exec --tool /usr/bin/docker --tool /usr/bin/python3 --also /usr/bin/docker -- "
+        self.assertIn("trusted-exec --tool /usr/bin/docker --tool /usr/bin/git --tool /usr/bin/python3 "
+                      "--tool /usr/lib/git-core/git-remote-https --also /usr/bin/docker -- "
                       "/usr/bin/python3 -I -S -B /opt/amap/host_steps.py "
                       "partition-weekly", service)
 
@@ -79,16 +83,28 @@ class JobTest(unittest.TestCase):
                          ("/Library/LaunchDaemons/org.amap.partition-weekly.plist", ARGV, True))
         self.assertEqual(doc["StartCalendarInterval"], {"Weekday": 2, "Hour": 4, "Minute": 0})
 
-    def test_provisioning_clones_the_public_repository_and_archives_exactly_the_closure(self):
-        text = "\n".join(pj.provision_steps(P, "a" * 40, "/opt/amap/host_steps.py"))
-        self.assertIn(f"clone --no-checkout {pj.PUBLIC_REPO} /opt/ex/exec/src.new", text)
+    def test_provisioning_is_one_typed_partition_fetch_line_from_the_public_repository(self):
+        """d3.3 §5(d) §1.1: one line, the barrier grammar, git and its helper
+        as --also and as the verb's own arguments from one value each; no
+        shell, tar, archive or local clone anywhere."""
+        steps = pj.provision_steps(P, "a" * 40, "/opt/amap/host_steps.py", "b" * 64)
+        self.assertEqual(len([l for l in steps if not l.startswith("#")]), 1)
+        argv = shlex.split(steps[-1])
+        cut = argv.index("--")
+        verb = ["/usr/bin/python3", "-I", "-S", "-B", "/opt/amap/host_steps.py", "partition-fetch",
+                "--git", "/usr/bin/git", "--git-remote-https", "/usr/lib/git-core/git-remote-https",
+                "--exec-root", "/opt/ex/exec", "--pin", "a" * 40, "--repo", pj.PUBLIC_REPO]
+        self.assertEqual(argv[cut + 1:], verb)
+        self.assertEqual(argv, rt.typed_argv("/opt/amap/root-trust.sh", "b" * 64, "/usr/bin/python3",
+                                             "/opt/amap/host_steps.py", list(P.tools.values()), verb,
+                                             also=["/usr/bin/git", "/usr/lib/git-core/git-remote-https"]))
+        also = [argv[i + 1] for i in range(cut) if argv[i] == "--also"]
+        self.assertEqual(also, [argv[argv.index("--git") + 1], argv[argv.index("--git-remote-https") + 1]])
         self.assertTrue(pj.PUBLIC_REPO.startswith("https://"))
-        self.assertIn("GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null", text)
-        self.assertIn("-c core.hooksPath=/dev/null -c protocol.allow=never -c protocol.https.allow=always", text)
-        self.assertIn("archive --format=tar " + "a" * 40 + " -- partition_weekly.closure $(", text)
-        self.assertIn("partition-provision /opt/ex/exec", text)
-        self.assertNotIn("file://", text)
-
+        text = steps[-1]
+        for absent in ("archive", "tar ", "file://", "partition-provision", "clone"):
+            self.assertNotIn(absent, text)
+        self.assertNotIn("/bin/sh", argv[cut + 1:])
 
 if __name__ == "__main__":
     unittest.main()

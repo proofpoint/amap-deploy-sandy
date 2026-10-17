@@ -32,6 +32,9 @@ The weekly partition job's root half (see its section below):
                                                   one run of the provisioned bundle, under the job's lock
   python3 -I -S -B host_steps.py partition-provision DIR
                                                   DIR/bundle.new swapped in as the bundle, under the lock
+  python3 -I -S -B host_steps.py partition-fetch --git G --git-remote-https H --exec-root DIR --pin PIN --repo URL
+                                                  the bundle at the pin, from a fresh https clone, swapped
+                                                  in under the job's lock (12 untrusted, 3 handoff, 4 refused)
   python3 -I -S -B host_steps.py partition-judge --python3 PY --docker DOCKER [--docker-sha256 HEX]
                                                   the weekly job's tools judged as trusted-exec judges
                                                   them; END-OF-BLOCK last and 0 when clean, else each
@@ -3277,42 +3280,481 @@ def partition_weekly(exec_root, host, document, sha256, activation, activation_s
 
 def partition_provision(exec_root):
     """Swap `<exec_root>/bundle.new` in as the bundle, under the job's lock,
-    once it verifies (its own PIN is the one it carries). The operator runs
-    this after the printed provisioning commands fill bundle.new."""
+    once it verifies (its own PIN is the one it carries). partition-fetch
+    calls the same core under its own lock; this verb takes it once, after
+    the git.pgid guard, before anything in the staging is touched."""
     efd = _root_dir(exec_root, 0o700)
     lock_fd = None
     try:
         lock_fd = _take_partition_lock(efd)
-        nfd = os.open("bundle.new", _DIR, dir_fd=efd)
-        try:
-            pin = _read_at(nfd, PIN, 64)[0].decode("ascii").strip()
-        finally:
-            os.close(nfd)
-        os.rename("bundle.new", "bundle.check", src_dir_fd=efd, dst_dir_fd=efd)
-        try:
-            os.rename("bundle", "bundle.old", src_dir_fd=efd, dst_dir_fd=efd)
-        except FileNotFoundError:
-            pass
-        os.rename("bundle.check", BUNDLE, src_dir_fd=efd, dst_dir_fd=efd)
-        try:
-            _verify_bundle(efd, pin)
-        except (Tooling, Handoff):
-            os.rename(BUNDLE, "bundle.new", src_dir_fd=efd, dst_dir_fd=efd)
-            try:
-                os.rename("bundle.old", BUNDLE, src_dir_fd=efd, dst_dir_fd=efd)
-            except FileNotFoundError:
-                pass
-            raise
-        try:
-            _remove_tree(efd, "bundle.old")
-        except FileNotFoundError:
-            pass
-        os.fsync(efd)
-        return 0
+        _pgid_guard(efd)
+        return _provision_core(efd, lock_fd)
     finally:
         if lock_fd is not None:
             os.close(lock_fd)
         os.close(efd)
+
+
+def _provision_core(efd, lock_fd):
+    """bundle.new swapped in as the bundle and verified, rolled back on a
+    refusal. It borrows the caller's exec_root descriptor and held lock: it
+    never opens the lock, and closes neither (d3.3 §5(d) §1.5)."""
+    nfd = os.open("bundle.new", _DIR, dir_fd=efd)
+    try:
+        pin = _read_at(nfd, PIN, 64)[0].decode("ascii").strip()
+    finally:
+        os.close(nfd)
+    os.rename("bundle.new", "bundle.check", src_dir_fd=efd, dst_dir_fd=efd)
+    try:
+        os.rename("bundle", "bundle.old", src_dir_fd=efd, dst_dir_fd=efd)
+    except FileNotFoundError:
+        pass
+    os.rename("bundle.check", BUNDLE, src_dir_fd=efd, dst_dir_fd=efd)
+    try:
+        _verify_bundle(efd, pin)
+    except (Tooling, Handoff):
+        os.rename(BUNDLE, "bundle.new", src_dir_fd=efd, dst_dir_fd=efd)
+        try:
+            os.rename("bundle.old", BUNDLE, src_dir_fd=efd, dst_dir_fd=efd)
+        except FileNotFoundError:
+            pass
+        raise
+    try:
+        _remove_tree(efd, "bundle.old")
+    except FileNotFoundError:
+        pass
+    os.fsync(efd)
+    return 0
+
+
+# --- partition-fetch: the bundle from the pinned commit, as root (d3.3 §5(d) §1) -------------
+#
+# git runs under a profile that keeps every program it can find by lookup to
+# the two judged files: PATH and GIT_EXEC_PATH name a private directory this
+# run makes, holding exactly a link to the recorded git and one to its
+# remote helper. The four commands read blobs by their pinned ids; nothing is
+# checked out and nothing is archived (archive would apply the tree's own
+# .gitattributes). Each child runs in its own process group, every stream is
+# capped while it is read, and the group is proven empty before the lock is
+# released, with one exception: a survivor is refused and left recorded.
+
+class Untrusted(Exception):
+    """A judged program is not root's alone: exit ROOT_TRUST_EXIT, nothing run."""
+
+
+class Survivor(Tooling):
+    """A git process group outlived its cleanup: its staging and git.pgid are kept."""
+
+
+PIN_FORM = re.compile(r"[0-9a-f]{40}")
+REPO_FORM = re.compile(r"https://[A-Za-z0-9.-]+(?::[0-9]+)?/[A-Za-z0-9._/-]+")
+MANIFEST_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]*")
+GIT_EXEC, EMPTY_HOME, SRC_NEW, BUNDLE_NEW, PGID_FILE = "git-exec", "empty-home", "src.new", "bundle.new", "git.pgid"
+FETCH_TIMEOUT_S, GIT_LOCAL_TIMEOUT_S, DRAIN_S = 600, 60, 5
+STDERR_MAX = 64 << 10
+#: ls-tree -z's own output for the manifest's names: mode, type, oid and a name per entry.
+LSTREE_MAX = (BUNDLE_MAX_FILES + 2) * 512
+#: `cat-file -t` of a commit, byte for byte; anything else, or an eighth byte, refuses.
+COMMIT_TYPE = b"commit\n"
+#: The one configuration the four commands run under, beside git_env.
+GIT_CONFIG = ("-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "core.attributesFile=/dev/null",
+              "-c", "core.pager=cat", "-c", "core.askPass=", "-c", "core.sshCommand=", "-c", "credential.helper=",
+              "-c", "init.templateDir=", "-c", "protocol.allow=never", "-c", "protocol.https.allow=always",
+              "-c", "uploadpack.packObjectsHook=")
+
+
+def git_env(exec_root):
+    """The whole environment of every git call, built here and inherited from
+    nothing. The plan renders its fact line from this same function."""
+    exec_dir, home = os.path.join(exec_root, GIT_EXEC), os.path.join(exec_root, EMPTY_HOME)
+    return {"PATH": exec_dir, "GIT_EXEC_PATH": exec_dir, "LC_ALL": "C", "HOME": home, "XDG_CONFIG_HOME": home,
+            "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_ATTR_NOSYSTEM": "1",
+            "GIT_TERMINAL_PROMPT": "0", "GIT_NO_REPLACE_OBJECTS": "1", "GIT_EDITOR": ":"}
+
+
+def _pgid_guard(efd):
+    """FIRST, before anything in the staging is removed or replaced: a git
+    process group a previous run left recorded must be gone. A live one is
+    refused, never signalled: its number may now name another group."""
+    try:
+        raw = _read_at(efd, PGID_FILE, 32)[0]
+    except FileNotFoundError:
+        return
+    except (OSError, ValueError) as e:
+        raise Tooling(f"{PGID_FILE} cannot be read ({e}); nothing is removed") from None
+    try:
+        pgid = int(raw.decode("ascii").strip())
+    except (UnicodeDecodeError, ValueError):
+        raise Tooling(f"{PGID_FILE} does not hold a process group id; nothing is removed") from None
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        os.unlink(PGID_FILE, dir_fd=efd)
+        return
+    except PermissionError:
+        pass
+    raise Survivor(f"the git process group {pgid} a previous run recorded in {PGID_FILE} still exists: nothing is "
+                  f"removed; confirm it is git's and gone, then remove {PGID_FILE}")
+
+
+class _Interrupted(Exception):
+    pass
+
+
+def _cleanup_group(child, pgid):
+    """The failure path, within one monotonic deadline: SIGKILL the group
+    only while its leader is unreaped (so the number cannot name another
+    group), drain both pipes, reap with a timed wait, and confirm the group
+    is empty. True when it is; False is the survivor exception."""
+    end = time.monotonic() + DRAIN_S
+    while True:
+        if child.returncode is None:
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        for stream in (child.stdout, child.stderr):
+            if stream is not None and not stream.closed:
+                os.set_blocking(stream.fileno(), False)
+                try:
+                    while time.monotonic() < end and stream.read(1 << 16):
+                        pass
+                except (BlockingIOError, OSError, ValueError):
+                    pass
+        try:
+            child.wait(timeout=max(0.0, min(end - time.monotonic(), 0.2)))
+        except subprocess.TimeoutExpired:
+            pass
+        if _group_gone(pgid):
+            return True
+        if time.monotonic() >= end:
+            return False
+
+
+def _group_gone(pgid):
+    """Signal 0 to the group: True only on ProcessLookupError. An answer
+    that the group exists only ever supports a refusal."""
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        pass
+    return False
+
+
+def _await_empty(pgid):
+    """After a leader exited 0 and was reaped: no signal but 0, until the
+    group is empty or DRAIN_S passes."""
+    end = time.monotonic() + DRAIN_S
+    while not _group_gone(pgid):
+        if time.monotonic() >= end:
+            return False
+        time.sleep(0.02)
+    return True
+
+
+def _git(efd, argv, env, cwd, cap, deadline_s, popen=subprocess.Popen):
+    """One git child in its own process group: stdout read while it runs
+    and refused past `cap`, stderr kept to STDERR_MAX and the rest counted
+    and dropped (never a reason to kill), a deadline on one monotonic
+    clock, SIGINT and SIGTERM taking the failure path. (stdout, stderr,
+    dropped) on exit 0; Tooling otherwise, after the group is proven empty."""
+    import selectors
+    old = {}
+
+    def interrupted(signum, frame):
+        raise _Interrupted(signal.Signals(signum).name)
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        old[sig] = signal.signal(sig, interrupted)
+    child, pgid, why = None, None, None
+    out, err, dropped = bytearray(), bytearray(), 0
+    try:
+        child = popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
+                      cwd=cwd, close_fds=True, start_new_session=True)
+        pgid = child.pid
+        _write_at(efd, PGID_FILE, f"{pgid}\n".encode("ascii"), 0o600)
+        end = time.monotonic() + deadline_s
+        sel = selectors.DefaultSelector()
+        sel.register(child.stdout, selectors.EVENT_READ, "out")
+        sel.register(child.stderr, selectors.EVENT_READ, "err")
+        while sel.get_map():
+            left = end - time.monotonic()
+            if left <= 0:
+                why = f"did not finish within {deadline_s} s"
+                break
+            for key, _ in sel.select(timeout=left):
+                chunk = os.read(key.fileobj.fileno(), 1 << 16)
+                if not chunk:
+                    sel.unregister(key.fileobj)
+                elif key.data == "out":
+                    out += chunk
+                    if len(out) > cap:
+                        why = f"wrote more than {cap} bytes to stdout"
+                        break
+                else:
+                    room = STDERR_MAX - len(err)
+                    err += chunk[:max(0, room)]
+                    dropped += max(0, len(chunk) - max(0, room))
+            if why:
+                break
+        if why is None:
+            try:
+                child.wait(timeout=max(0.0, end - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                why = f"did not finish within {deadline_s} s"
+    except _Interrupted as e:
+        why = f"was interrupted ({e})"
+    except Exception as e:
+        if child is None:
+            raise
+        why = f"could not be followed ({e})"
+    finally:
+        for sig, handler in old.items():
+            signal.signal(sig, handler)
+    if child is None:
+        raise Tooling("git could not be started")
+    what = next((a for a in argv if a in ("clone", "cat-file", "ls-tree")), "git")
+    try:
+        return _git_settle(efd, child, pgid, why, what, out, err, dropped)
+    finally:
+        for stream in (child.stdout, child.stderr):
+            stream.close()
+
+
+def _git_settle(efd, child, pgid, why, what, out, err, dropped):
+    """A finished or abandoned git child: on any failure the group is killed
+    and proven empty first, then the refusal; on exit 0 the group must
+    already be empty. git.pgid is removed only once the group is."""
+    if why is not None or child.returncode != 0:
+        empty = _cleanup_group(child, pgid)
+        if not empty:
+            raise Survivor(f"a git process survived in group {pgid}: {PGID_FILE} is kept and nothing is removed")
+        try:
+            os.unlink(PGID_FILE, dir_fd=efd)
+        except FileNotFoundError:
+            pass
+        tail = bytes(err[-400:]).decode("utf-8", "replace").strip()
+        note = f" ({dropped} stderr bytes dropped)" if dropped else ""
+        raise Tooling(f"git {what} {why or f'exited {child.returncode}'}: {tail}{note}")
+    if not _await_empty(pgid):
+        raise Survivor(f"a git process survived in group {pgid} after its leader exited: {PGID_FILE} is kept and "
+                       "nothing is removed")
+    os.unlink(PGID_FILE, dir_fd=efd)
+    return bytes(out), bytes(err), dropped
+
+
+def _manifest_names(raw):
+    """The manifest's names, by its grammar: UTF-8, no NUL, one name a line,
+    each a plain file name, no repeats, LAUNCHER among them, neither
+    reserved name, room left for the manifest and PIN in the count bound."""
+    if b"\0" in raw:
+        raise Tooling("the closure list holds a NUL")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise Tooling("the closure list is not UTF-8") from None
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    names = []
+    for line in lines:
+        if MANIFEST_NAME.fullmatch(line) is None or line.startswith((".", "-")) or len(line) > 255:
+            raise Tooling(f"the closure list names {line!r}, which is not a plain file name")
+        if line in (CLOSURE, PIN):
+            raise Tooling(f"the closure list names the reserved {line!r}")
+        if line in names:
+            raise Tooling(f"the closure list names {line!r} twice")
+        names.append(line)
+    if LAUNCHER not in names:
+        raise Tooling(f"the closure list does not name {LAUNCHER}")
+    if len(names) > BUNDLE_MAX_FILES - 2:
+        raise Tooling("the closure list names too many files")
+    return names
+
+
+def _tree_entries(raw, names):
+    """ls-tree -z's entries for exactly `names`: each a regular blob, mode
+    100644 or 100755. A link, a gitlink, a tree or a missing name refuses."""
+    seen = {}
+    for entry in raw.split(b"\0"):
+        if not entry:
+            continue
+        try:
+            meta, name = entry.split(b"\t", 1)
+            mode, kind, _oid = meta.split(b" ")
+            name = name.decode("utf-8")
+        except ValueError:
+            raise Tooling("ls-tree printed an entry outside its form") from None
+        if mode not in (b"100644", b"100755") or kind != b"blob":
+            raise Tooling(f"{name!r} is not a regular blob in the pinned tree ({mode.decode()} {kind.decode()})")
+        seen[name] = True
+    if sorted(seen) != sorted(names):
+        raise Tooling("the pinned tree's entries are not exactly the closure list")
+
+
+def partition_fetch(exec_root, pin, repo, git, helper, popen=subprocess.Popen):
+    """The weekly job's bundle at the deploy pin, from a fresh root-owned
+    https clone (d3.3 §5(d) §1), swapped in under the job's lock, which is
+    taken once and held throughout."""
+    if not PIN_FORM.fullmatch(pin or ""):
+        raise Tooling("--pin must be a full 40-hex commit id")
+    if not REPO_FORM.fullmatch(repo or "") or "@" in repo:
+        raise Tooling("--repo must be a plain https:// URL")
+    for path, base in ((git, "git"), (helper, "git-remote-https")):
+        if not os.path.isabs(path) or os.path.basename(path) != base:
+            raise Tooling(f"--{base} must be an absolute path to {base}")
+    efd = _root_dir(exec_root, 0o700)
+    lock_fd, staged = None, False
+    try:
+        lock_fd = _take_partition_lock(efd)
+        # Phase A: the two targets judged in process, before any staging change.
+        j = judge(sys.executable, also=[git, helper], recorded=[git, helper])
+        if j.phase != "clean":
+            raise Untrusted("; ".join(j.problems[:5]))
+        _pgid_guard(efd)
+        staged = True
+        for name in (SRC_NEW, BUNDLE_NEW, GIT_EXEC):
+            try:
+                _remove_tree(efd, name)
+            except FileNotFoundError:
+                pass
+        _empty_home(efd)
+        os.mkdir(GIT_EXEC, 0o700, dir_fd=efd)
+        gfd = os.open(GIT_EXEC, _DIR, dir_fd=efd)
+        try:
+            os.fchmod(gfd, 0o700)
+            made = os.fstat(gfd)
+            os.symlink(git, "git", dir_fd=gfd)
+            os.symlink(helper, "git-remote-https", dir_fd=gfd)
+        finally:
+            os.close(gfd)
+        _phase_b(efd, made, git, helper)
+        _fetch_bundle(efd, exec_root, pin, repo, popen)
+        _provision_core(efd, lock_fd)
+        _fetch_cleanup(efd)
+        return 0
+    except Survivor:
+        staged = False
+        raise
+    except BaseException:
+        if staged:
+            try:
+                _fetch_cleanup(efd)
+            except OSError:
+                pass
+        raise
+    finally:
+        if lock_fd is not None:
+            os.close(lock_fd)
+        os.close(efd)
+
+
+def _empty_home(efd):
+    """empty-home, made or re-checked: root's, 0700, empty."""
+    try:
+        os.mkdir(EMPTY_HOME, 0o700, dir_fd=efd)
+    except FileExistsError:
+        pass
+    hfd = os.open(EMPTY_HOME, _DIR, dir_fd=efd)
+    try:
+        st = os.fstat(hfd)
+        if st.st_uid != ROOT_UID or stat.S_IMODE(st.st_mode) != 0o700 or os.listdir(hfd):
+            raise Tooling(f"{EMPTY_HOME} is not root's alone, 0700 and empty")
+    finally:
+        os.close(hfd)
+
+
+def _phase_b(efd, made, git, helper):
+    """Immediately before the first git call, the writer's own check of the
+    two aliases, through a fresh descriptor for git-exec: the directory this
+    run made (its recorded identity), root's, 0700, holding exactly two links
+    naming the Phase A targets by exact string. judge never sees the alias
+    spellings, so the recorded set does not widen."""
+    try:
+        gfd = os.open(GIT_EXEC, _DIR, dir_fd=efd)
+    except OSError as e:
+        raise Untrusted(f"{GIT_EXEC} cannot be opened as a directory ({e.strerror})") from None
+    try:
+        now = os.fstat(gfd)
+        if ((now.st_dev, now.st_ino) != (made.st_dev, made.st_ino) or now.st_uid != ROOT_UID
+                or stat.S_IMODE(now.st_mode) != 0o700 or sorted(os.listdir(gfd)) != ["git", "git-remote-https"]):
+            raise Untrusted(f"{GIT_EXEC} is not the directory this run made, with only its two links")
+        for alias, target in (("git", git), ("git-remote-https", helper)):
+            if (not stat.S_ISLNK(os.stat(alias, dir_fd=gfd, follow_symlinks=False).st_mode)
+                    or os.readlink(alias, dir_fd=gfd) != target):
+                raise Untrusted(f"{GIT_EXEC}/{alias} does not name {target}")
+    finally:
+        os.close(gfd)
+
+
+def _fetch_bundle(efd, exec_root, pin, repo, popen):
+    """The four commands, then bundle.new: each named blob, the manifest
+    and PIN, written exclusively, within the bundle's bounds."""
+    env, home = git_env(exec_root), os.path.join(exec_root, EMPTY_HOME)
+    g = [os.path.join(exec_root, GIT_EXEC, "git"), *GIT_CONFIG]
+    src = os.path.join(exec_root, SRC_NEW)
+    _git(efd, g + ["clone", "--no-checkout", "--quiet", "--template=", "--", repo, src], env, home, 0,
+         FETCH_TIMEOUT_S, popen)
+    kind = _git(efd, g + ["-C", src, "cat-file", "-t", pin], env, home, len(COMMIT_TYPE), GIT_LOCAL_TIMEOUT_S,
+                popen)[0]
+    if kind != COMMIT_TYPE:
+        raise Tooling(f"the pin does not name a commit (cat-file -t printed {kind!r})")
+    manifest = _git(efd, g + ["-C", src, "cat-file", "blob", f"{pin}:{CLOSURE}"], env, home, BUNDLE_FILE_MAX,
+                    GIT_LOCAL_TIMEOUT_S, popen)[0]
+    names = _manifest_names(manifest)
+    _tree_entries(_git(efd, g + ["-C", src, "ls-tree", "-z", pin, "--", *names], env, home, LSTREE_MAX,
+                       GIT_LOCAL_TIMEOUT_S, popen)[0], names)
+    os.mkdir(BUNDLE_NEW, 0o755, dir_fd=efd)
+    nfd = os.open(BUNDLE_NEW, _DIR, dir_fd=efd)
+    try:
+        total = len(manifest) + len(pin) + 1
+        for name in names:
+            blob = _git(efd, g + ["-C", src, "cat-file", "blob", f"{pin}:{name}"], env, home, BUNDLE_FILE_MAX,
+                        GIT_LOCAL_TIMEOUT_S, popen)[0]
+            total += len(blob)
+            if total > BUNDLE_MAX_BYTES:
+                raise Tooling("the bundle is over its size bound")
+            _write_at(nfd, name, blob, 0o444, exclusive=True)
+        _write_at(nfd, CLOSURE, manifest, 0o444, exclusive=True)
+        _write_at(nfd, PIN, f"{pin}\n".encode("ascii"), 0o444, exclusive=True)
+        os.fchmod(nfd, 0o555)
+        os.fsync(nfd)
+    finally:
+        os.close(nfd)
+
+
+def _fetch_cleanup(efd):
+    """Once every group is proven empty: src.new and git-exec go, and
+    empty-home is emptied. bundle.new, when a refusal left it, stays for a
+    look; the next fetch removes it."""
+    for name in (SRC_NEW, GIT_EXEC):
+        try:
+            _remove_tree(efd, name)
+        except FileNotFoundError:
+            pass
+    try:
+        hfd = os.open(EMPTY_HOME, _DIR, dir_fd=efd)
+    except FileNotFoundError:
+        return
+    try:
+        for n in os.listdir(hfd):
+            _remove_tree(hfd, n)
+    finally:
+        os.close(hfd)
+    os.fsync(efd)
+
+
+def _partition_fetch_main(argv):
+    """partition-fetch --git G --git-remote-https H --exec-root DIR --pin PIN --repo URL"""
+    usage = "partition-fetch --git G --git-remote-https H --exec-root DIR --pin PIN --repo URL"
+    opts = argv[1:]
+    if len(opts) != 10:
+        raise Tooling(usage)
+    got = dict(zip(opts[0::2], opts[1::2]))
+    if set(got) != {"--git", "--git-remote-https", "--exec-root", "--pin", "--repo"}:
+        raise Tooling(usage)
+    return partition_fetch(got["--exec-root"], got["--pin"], got["--repo"], got["--git"], got["--git-remote-https"])
 
 
 def _secret_main(argv):
@@ -3383,6 +3825,12 @@ def main(argv):
                                     opts["--activation"], opts["--activation-sha256"], prospective=len(argv) == 14)
         elif argv and argv[0] == "partition-judge":
             return _partition_judge_main(argv)
+        elif argv and argv[0] == "partition-fetch":
+            try:
+                return _partition_fetch_main(argv)
+            except Untrusted as e:
+                print(f"untrusted: {e}", file=sys.stderr)
+                return ROOT_TRUST_EXIT
         elif len(argv) == 2 and argv[0] == "partition-provision":
             return partition_provision(argv[1])
         elif len(argv) >= 3 and argv[0] == "trusted-exec" and "--" in argv[1:]:

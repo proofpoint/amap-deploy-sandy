@@ -111,27 +111,47 @@ def rendered(kind: str, p: ps.PartitionSpec, argv: List[str]) -> List[Tuple[str,
     raise ValueError(f"no unit kind {kind!r}")
 
 
-def provision_steps(p: ps.PartitionSpec, pin: str, writer: str, q: Callable[[str], str] = shlex.quote) -> List[str]:
-    """The operator's root steps that provision the bundle at the deploy pin,
-    from a fresh root-owned https clone of the public repository, never the
-    operator's clone, and swap it in under the job's lock."""
-    ex, src, new = p.exec_root, posixpath.join(p.exec_root, "src.new"), posixpath.join(p.exec_root, "bundle.new")
-    empty = posixpath.join(p.exec_root, "empty-home")
-    env = f"GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null HOME={q(empty)}"
-    git = f"sudo env {env} git -c core.hooksPath=/dev/null -c protocol.allow=never -c protocol.https.allow=always"
-    return [
-        "# The weekly job's bundle, at the deploy pin, as root (at install and after every pin move):",
-        f"sudo install -d -o 0 -g 0 -m 0700 {q(empty)}",
-        f"{git} clone --no-checkout {PUBLIC_REPO} {q(src)}",
-        f"{git} -C {q(src)} cat-file -e {pin}^{{commit}}",
-        f"sudo install -d -o 0 -g 0 -m 0755 {q(new)}",
-        f"{git} -C {q(src)} archive --format=tar {pin} -- partition_weekly.closure "
-        f"$({git} -C {q(src)} show {pin}:partition_weekly.closure) | sudo tar -x --no-same-owner -C {q(new)}",
-        f"echo {pin} | sudo tee {q(posixpath.join(new, 'PIN'))} >/dev/null",
-        f"sudo chmod 0444 {q(new)}/* && sudo chmod 0555 {q(new)}",
-        f"sudo {q(p.tools['python3'])} -I -S -B {q(writer)} partition-provision {q(ex)}",
-        f"sudo rm -rf {q(src)}",
-    ]
+#: The scratch directory the git fact line makes, as the shell names it.
+FACT_DIR = "$D"
+#: stat's format for the fact line: device and inode, owner, mode, type and name.
+STAT_FORMAT = {"systemd": ["-c", "%d:%i %u %a %F %n"], "launchd": ["-f", "%d:%i %u %Lp %HT %N"]}
+
+
+def git_fact_steps(p: ps.PartitionSpec, kind: str, q: Callable[[str], str] = shlex.quote) -> List[str]:
+    """d3.3 §5(d) §1.7: a read-only line, as the operator, recording which
+    git the fetch will run. It makes a scratch directory holding the same two
+    links in a mktemp directory, runs `git --version` from it under exactly
+    git_env (rendered from host_steps.git_env, so the line and the runtime
+    cannot differ), and stats both targets. No clone, no network, no root."""
+    import host_steps
+    git, helper = p.tools["git"], p.tools["git-remote-https"]
+
+    def value(v: str) -> str:
+        return f'"{v}"' if v.startswith(FACT_DIR) else q(v)
+    env = " ".join(f"{k}={value(v)}" for k, v in host_steps.git_env(FACT_DIR).items())
+    gx, home = posixpath.join(FACT_DIR, host_steps.GIT_EXEC), posixpath.join(FACT_DIR, host_steps.EMPTY_HOME)
+    line = (f'D=$(mktemp -d) && mkdir -m 0700 "{gx}" "{home}" && ln -s {q(git)} "{gx}/git" && '
+            f'ln -s {q(helper)} "{gx}/git-remote-https" && /usr/bin/env -i {env} "{gx}/git" --version; '
+            f"stat {' '.join(q(a) for a in STAT_FORMAT[kind])} {q(git)} {q(helper)}; rm -rf \"$D\"")
+    if kind == "launchd":
+        line = f"{host_steps.XCODE_SELECT} -p; " + line
+    return ["# Which git the bundle's fetch runs, from its private directory under its own environment "
+            "(read-only, as you; record the version per host):", line]
+
+
+def provision_steps(p: ps.PartitionSpec, pin: str, writer: str, writer_sha256: str,
+                    q: Callable[[str], str] = shlex.quote) -> List[str]:
+    """The operator's one root step that provisions the bundle at the deploy
+    pin (d3.3 §5(d) §1): the writer's partition-fetch, through the barrier,
+    with git and its https helper judged by trusted-exec as --also and again
+    in process by the writer, from one rendered value each."""
+    py, git, helper = p.tools["python3"], p.tools["git"], p.tools["git-remote-https"]
+    argv = rt.typed_argv(posixpath.join(posixpath.dirname(writer), rt.NAME), writer_sha256, py, writer,
+                         list(p.tools.values()),
+                         [py, "-I", "-S", "-B", writer, "partition-fetch", "--git", git, "--git-remote-https", helper,
+                          "--exec-root", p.exec_root, "--pin", pin, "--repo", PUBLIC_REPO], also=[git, helper])
+    return ["# The weekly job's bundle, at the deploy pin, as root (at install and after every pin move):",
+            " ".join(q(a) for a in argv)]
 
 
 #: The line partition-judge prints last, and only when its judging found

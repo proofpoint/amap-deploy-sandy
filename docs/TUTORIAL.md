@@ -1457,5 +1457,32 @@ Go on only when its last line is exactly `END-OF-BLOCK` and it exited 0.
 Otherwise it prints each problem as `untrusted: …` and then `phase: tools`
 (a tool's file, route or pin) or `phase: closure` (what the tools load),
 and exits 12. The plan prints this check first among the root lines, and the
-bundle's provisioning (`partition-provision`, under the job's lock) comes
-after it.
+bundle's provisioning comes after it.
+
+### The weekly job's bundle
+
+The bundle is fetched as root, at the deploy pin, by the writer's
+`partition-fetch`, under the job's lock. Run it at install and after every
+pin move. The partition section's `tools` record `git` and
+`git-remote-https` beside `python3` and `docker`. On a launchd host they
+are the Command Line Tools' own,
+`/Library/Developer/CommandLineTools/usr/bin/git` and
+`/Library/Developer/CommandLineTools/usr/libexec/git-core/git-remote-https`,
+never `/usr/bin/git`, which is the xcrun shim. The plan prints the line:
+
+```sh
+/usr/bin/sudo /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin LC_ALL=C /bin/sh -c '<root-trust.sh's root_exec>' sh <pin> <python3> <writer> trusted-exec <the partition tools> --also <git> --also <git-remote-https> -- <python3> -I -S -B <writer> partition-fetch --git <git> --git-remote-https <git-remote-https> --exec-root <exec_root> --pin <the deploy pin> --repo https://github.com/proofpoint/amap-deploy-sandy
+```
+
+The writer judges git and its helper again before it touches anything, then
+runs them through a private directory holding only a link to each, with an
+environment it builds itself. It clones without checking out, reads the
+closure list and each file it names as the pinned blobs, and swaps the
+bundle in only when it verifies. Exit 0 is done. 12: a tool is not root's
+alone, and nothing changed. 3: another run holds the lock; run it again
+when that one ends. 4: git failed, a file in the pinned tree is outside the
+bundle's rules, or a git process outlived its cleanup; the live bundle is
+unchanged. When the message says a git process group survived, leave
+`git.pgid` in the exec root where it is: the next fetch refuses while that
+group exists. Remove `git.pgid` by hand only after you have shown that
+group is git's and gone.

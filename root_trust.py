@@ -37,7 +37,7 @@ import os
 import posixpath
 import shlex
 import struct
-from typing import List, Optional
+from typing import List, Optional, Sequence
 
 #: The check's exit: outside PROBE_EXITS, REFUSED, the partition job's codes,
 #: the hub's NO_RESTART (0-11), the engine's 125, the shell's 126-127 and 143.
@@ -459,13 +459,17 @@ def root_argv_positional(rt: str, sha256: str, python3: str, writer: str, args: 
 SUDO = "/usr/bin/sudo"
 
 
-def typed_argv(rt: str, sha256: str, python3: str, writer: str, tools: List[str], argv: List[str]) -> List[str]:
+def typed_argv(rt: str, sha256: str, python3: str, writer: str, tools: List[str], argv: List[str],
+               also: Sequence[str] = ()) -> List[str]:
     """One operator-typed root line (d3.3 §5(d)): the anchor's sudo, then the
-    §3 grammar, trusted-exec with each recorded tool (sudo never among them)
-    and `argv`, whose argv[0] is one of them or `python3` in its one exact
-    vector. sudo prompts as for any typed line: no -n."""
+    §3 grammar, trusted-exec with each recorded tool (sudo never among them),
+    each `also` it judges beside argv[0], and `argv`, whose argv[0] is one of
+    them or `python3` in its one exact vector. sudo prompts as for any typed
+    line: no -n."""
     recorded = [x for t in sorted(set(tools)) if posixpath.basename(t) != "sudo" for x in ("--tool", t)]
-    return [SUDO] + root_argv_positional(rt, sha256, python3, writer, ["trusted-exec"] + recorded + ["--"] + list(argv))
+    extra = [x for t in also for x in ("--also", t)]
+    return [SUDO] + root_argv_positional(rt, sha256, python3, writer,
+                                         ["trusted-exec"] + recorded + extra + ["--"] + list(argv))
 
 
 def root_argv(rt: str, sha256: str, python3: str, writer: str, args: List[str],

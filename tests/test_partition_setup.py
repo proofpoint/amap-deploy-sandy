@@ -22,7 +22,8 @@ from test_hub_runtime import setUpModule, tearDownModule  # noqa: F401 -- the fi
 EV = "/opt/ex/partition-evidence"
 SCRATCH = "/opt/ex/partition-scratch"
 EXEC = "/opt/ex/partition-exec"
-TOOLS = {"python3": "/usr/bin/python3", "docker": "/usr/local/libexec/amap/docker"}
+TOOLS = {"python3": "/usr/bin/python3", "docker": "/usr/local/libexec/amap/docker", "git": "/usr/bin/git",
+         "git-remote-https": "/usr/lib/git-core/git-remote-https"}
 PART = {"evidence_dir": EV, "scratch_dir": SCRATCH, "exec_root": EXEC, "tools": dict(TOOLS),
         "weekly": {"weekday": 0, "hour": 3}}
 
@@ -59,8 +60,9 @@ class LoadTest(unittest.TestCase):
         self.refuses(doc(partition=dict(PART, extra=1)), "exactly evidence_dir")
         self.refuses(doc(partition={k: v for k, v in PART.items() if k != "weekly"}), "exactly evidence_dir")
         self.refuses(doc(partition={k: v for k, v in PART.items() if k != "exec_root"}), "exactly evidence_dir")
-        self.refuses(doc(partition=dict(PART, tools=dict(TOOLS, git="/usr/bin/git"))), "exactly docker, python3")
-        self.refuses(doc(partition=dict(PART, tools={"python3": "/usr/bin/python3"})), "exactly docker, python3")
+        self.refuses(doc(partition=dict(PART, tools=dict(TOOLS, curl="/usr/bin/curl"))), "exactly docker, python3, git, git-remote-https")
+        self.refuses(doc(partition=dict(PART, tools={k: v for k, v in TOOLS.items() if k != "git-remote-https"})),
+                     "exactly docker, python3, git, git-remote-https")
         self.refuses(doc(partition=dict(PART, tools=dict(TOOLS, docker="docker"))), "absolute")
         self.refuses(doc(gate=dict(gate(), extra=1)), "exactly harness_sha")
         self.refuses(doc(gate={k: v for k, v in gate().items() if k != "record_sha256"}), "exactly harness_sha")
@@ -147,7 +149,8 @@ class GateTest(unittest.TestCase):
         wants it, as lstat shows it; realpath is the identity."""
         d = stat.S_IFDIR
         files = {p: st(d | 0o755) for p in ("/", "/opt", "/opt/ex", "/usr", "/usr/bin", "/usr/local",
-                                              "/usr/local/libexec", "/usr/local/libexec/amap", EV)}
+                                              "/usr/local/libexec", "/usr/local/libexec/amap", "/usr/lib",
+                                              "/usr/lib/git-core", EV)}
         files.update({SCRATCH: st(d | 0o700), EXEC: st(d | 0o700)})
         files.update({t: st(stat.S_IFREG | 0o755) for t in TOOLS.values()})
         return files
