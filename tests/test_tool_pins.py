@@ -347,25 +347,49 @@ class WriterChecksTest(Tmp):
 
 
 class VerifyRowTest(Tmp):
-    def row(self, want, digest=None):
-        return ss.tool_pin_row("secrets", "docker", self.client, want, os.lstat, digest or hs._sha256)
+    def row(self, want, read=None, path=None):
+        return ss.tool_pin_row("secrets", "docker", path or self.client, want, os.lstat, read)
 
     def test_match_mismatch_unreadable_and_link(self):
-        self.assertEqual(self.row(self.good).result, rh.PASS)
+        self.assertEqual(self.row(self.good).result, rh.PASS, "the production reader, a regular file")
         self.assertEqual(self.row(OTHER).result, rh.FAIL)
         self.assertEqual(self.row(self.good, lambda p: rh.Unresolved("cannot read")).result, rh.UNKNOWN)
         link = os.path.join(self.d, "link")
         os.symlink(self.client, link)
-        r = ss.tool_pin_row("secrets", "docker", link, self.good, os.lstat, hs._sha256)
-        self.assertEqual(r.result, rh.FAIL, "trusted-exec reads the pinned path without following a link")
+        self.assertEqual(self.row(self.good, path=link).result, rh.FAIL,
+                         "trusted-exec reads the pinned path without following a link")
+        self.assertIn("is a link", ss.pin_digest(link), "the reader alone refuses the leaf, whatever lstat says")
         r = ss.tool_pin_row("secrets", "docker", os.path.join(self.d, "absent", "docker"), self.good,
-                            lambda p: (_ for _ in ()).throw(PermissionError(13, "denied")), hs._sha256)
+                            lambda p: (_ for _ in ()).throw(PermissionError(13, "denied")))
         self.assertEqual(r.result, rh.UNKNOWN)
+        os.chmod(self.client, 0o000)
+        if os.geteuid() != 0:
+            self.assertEqual(self.row(self.good).result, rh.UNKNOWN, "unreadable bytes are UNKNOWN")
+        os.chmod(self.client, 0o555)
+
+    def test_a_fifo_in_the_pinned_place_is_a_fail_and_never_a_hang(self):
+        """Codex at b6f809b7: the production reader opens without blocking and
+        refuses a non-regular inode, so verify finishes and reports it. Run in
+        a child with a bound, so a regression is a timeout, not a hung suite."""
+        fifo = os.path.join(self.d, "fifo")
+        os.mkfifo(fifo)
+        code = ("import os, sys; sys.path[:0] = [os.getcwd(), os.path.join(os.getcwd(), 'tests')]\n"
+                "import secret_setup as ss, router_health as rh\n"
+                f"r = ss.tool_pin_row('secrets', 'docker', {fifo!r}, {self.good!r}, os.lstat)\n"
+                "print(r.result == rh.FAIL, ss.pin_digest(%r))" % fifo)
+        try:
+            p = subprocess.run([sys.executable, "-B", "-c", code], capture_output=True, text=True, timeout=15,
+                               cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        except subprocess.TimeoutExpired:
+            self.fail("the pin reader blocked on a FIFO")
+        self.assertEqual(p.stdout.split()[0] if p.stdout else p.stderr, "True", p.stderr)
+        self.assertIn("is not a regular file", p.stdout)
 
     def test_verify_tools_adds_the_row_only_for_a_pinned_tool(self):
         spec = load(document("launchd"))
         s = spec.secrets
         rows = ss.verify_tools(s, os.lstat, os.path.realpath, lambda p: DOCKER_PIN)
+        self.assertTrue(all(r.result == rh.PASS for r in rows if "tool_sha256" in r.claim))
         pin_rows = [r for r in rows if "tool_sha256" in r.claim]
         self.assertEqual(len(pin_rows), 1)
         self.assertIn(s.tools["docker"], pin_rows[0].claim)
@@ -387,10 +411,10 @@ class VerifyRowTest(Tmp):
         ss._writer_rows = ok
         self.addCleanup(setattr, ss, "tool_pin_row", ss.tool_pin_row)
         real = ss.tool_pin_row
-        ss.tool_pin_row = lambda sec, n, p, w, lstat, digest: real(sec, n, self.client, w, os.lstat, digest)
+        ss.tool_pin_row = lambda sec, n, p, w, lstat, read=None: real(sec, n, self.client, w, os.lstat)
         got = ss.live_refusal(s, digest=hs._sha256, closure=lambda s_: None)
         self.assertEqual(got, "not run: docker not the client the document pins")
-        ss.tool_pin_row = lambda sec, n, p, w, lstat, digest: real(sec, n, self.client, self.good, os.lstat, digest)
+        ss.tool_pin_row = lambda sec, n, p, w, lstat, read=None: real(sec, n, self.client, self.good, os.lstat)
         self.assertIsNone(ss.live_refusal(s, digest=hs._sha256, closure=lambda s_: None))
 
 

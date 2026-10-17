@@ -1232,7 +1232,7 @@ def _checks(spec: Spec, *, production: bool, lstat: Callable = os.lstat,
                          owned_chain=ss._owned_chain,
                          rl_sha=p["rl_sha"] if "rl_sha" in p else hp.hop_pin(),
                          hop_sha=(spec.overlay_pin or {}).get("commit", rh.Unresolved("the overlay has no plugin pin")),
-                         plugin_sha256=hp.PLUGIN_SHA256, read=p.get("read", ps.read_record), digest=p.get("digest"))
+                         plugin_sha256=hp.PLUGIN_SHA256, read=p.get("read", ps.read_record), pin_read=p.get("pin_read"))
         out += verify_stop_target(spec, p)
         out += verify_weekly_runs(spec, p)
     return out

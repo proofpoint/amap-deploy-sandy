@@ -3247,10 +3247,13 @@ def partition_weekly(exec_root, host, document, sha256, activation, activation_s
                 said.append("no recovery description: no target, nothing stopped")
                 return EXIT_TOOLING
             try:
-                docker = _trusted_tool(recovery["docker"])
-                pinned = _pin_problem(docker, values["docker_sha256"]) if values and values["docker_sha256"] else None
+                # The pin is read at the recorded path, its leaf never followed, as trusted-exec reads it,
+                # and before anything resolves the path or discovers a closure.
+                pinned = (_pin_problem(recovery["docker"], values["docker_sha256"])
+                          if values and values["docker_sha256"] else None)
                 if pinned:
                     raise Tooling(pinned)
+                docker = _trusted_tool(recovery["docker"])
                 bad = closure_problems(_docker_closure(docker, values["docker"] if values else None))
                 if bad:
                     raise Tooling("its own startup closure is not root's alone: " + "; ".join(bad[:5]))

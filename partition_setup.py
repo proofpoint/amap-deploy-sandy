@@ -222,7 +222,7 @@ def verify(ps: Optional[PartitionSpec], gs: Optional[GateSpec], *, delegation_en
            owned_chain: Callable, rl_sha: Any, hop_sha: Any, plugin_sha256: str,
            read: Callable[[str], bytes] = read_record,
            realpath: Callable[[str], str] = os.path.realpath,
-           digest: Optional[Callable[[str], Any]] = None) -> List[rh.Check]:
+           pin_read: Optional[Callable[[str], Any]] = None) -> List[rh.Check]:
     """The two sections against the host. Absent sections are a NOTE (PASS
     with the reason in the claim) where nothing enables delegation, and a
     FAIL where something does."""
@@ -250,7 +250,7 @@ def verify(ps: Optional[PartitionSpec], gs: Optional[GateSpec], *, delegation_en
                        else rh.check(claim, want, got, remedy))
             out.append(owned_chain(f"every directory above {path} is root-owned and not group- or world-writable",
                                    path, (0,), "the partition products are trusted only as root placed them", lstat))
-        out += verify_tools(ps, lstat, owned_chain, realpath, digest)
+        out += verify_tools(ps, lstat, owned_chain, realpath, pin_read)
     if delegation_enabled or gs is not None:
         bad = gate_problems(gs, rl_sha=rl_sha, hop_sha=hop_sha, plugin_sha256=plugin_sha256, read=read)
         claim = "the conformance harness's gate record holds for this deployment"
@@ -468,7 +468,7 @@ def verify_target(ps: Optional[PartitionSpec], gs: Optional[GateSpec], *, live_c
 
 def verify_tools(ps: PartitionSpec, lstat: Callable, owned_chain: Callable,
                  realpath: Callable[[str], str] = os.path.realpath,
-                 digest: Optional[Callable[[str], Any]] = None) -> List[rh.Check]:
+                 pin_read: Optional[Callable[[str], Any]] = None) -> List[rh.Check]:
     """The weekly job's tools as root will run them: each one's realpath a
     regular executable, root-owned and not group- or world-writable, under
     root-owned directories that are not either, and a pinned one the client
@@ -483,10 +483,8 @@ def verify_tools(ps: PartitionSpec, lstat: Callable, owned_chain: Callable,
         want = rh.Fact("tool", True, why)
         remedy = f"record a {name} the operating system or its vendor installed, root-owned, as partition.tools.{name}"
         if name in ps.tool_sha256:
-            import host_setup
             import secret_setup
-            out.append(secret_setup.tool_pin_row(SECTION, name, path, ps.tool_sha256[name], lstat,
-                                                 digest or host_setup._sha256))
+            out.append(secret_setup.tool_pin_row(SECTION, name, path, ps.tool_sha256[name], lstat, pin_read))
         try:
             real = realpath(path)
             st = lstat(real)

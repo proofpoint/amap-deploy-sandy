@@ -45,6 +45,8 @@ What it checks, through router_health's three outcomes:
   previous_class, last_ok_at}, every member required.
 """
 
+import errno
+import hashlib
 import json
 import os
 import posixpath
@@ -721,7 +723,7 @@ def verify_overlay_source(s: SecretSpec, overlay: Optional[str], stat_: Callable
 
 def verify_tools(s: SecretSpec, lstat: Callable,
                  realpath: Callable[[str], str] = os.path.realpath,
-                 digest: Optional[Callable[[str], Any]] = None) -> List[rh.Check]:
+                 pin_read: Optional[Callable[[str], Any]] = None) -> List[rh.Check]:
     """Each tool's real path a regular executable no one else can write, under
     directories no one else can write. A tool root executes (ROOT_EXEC_TOOLS)
     must be root's: its real path and every directory above it, and above the
@@ -731,16 +733,42 @@ def verify_tools(s: SecretSpec, lstat: Callable,
     every = dict(s.tools)
     every.setdefault("uv", s.uv["binary"])
     for name, path in sorted(every.items()):
-        out += _tool_rows(s, name, path, lstat, realpath, digest)
+        out += _tool_rows(s, name, path, lstat, realpath, pin_read or pin_digest)
     return out
 
 
+def pin_digest(path: str) -> Any:
+    """The sha256 of the file at `path`, read as trusted-exec reads a pinned
+    tool: its leaf never followed, and never blocking, so a FIFO in its place
+    is an answer and not a hang. A link or another non-regular file is a
+    sentence (which matches no pin); a file that cannot be read is
+    Unresolved."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError as e:
+        if e.errno == errno.ELOOP:
+            return f"{path} is a link, which trusted-exec refuses to read"
+        return rh.Unresolved(f"cannot read {path}: {e.strerror or e}")
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return f"{path} is not a regular file"
+        h = hashlib.sha256()
+        for chunk in iter(lambda: os.read(fd, 1 << 20), b""):
+            h.update(chunk)
+        return h.hexdigest()
+    except OSError as e:
+        return rh.Unresolved(f"cannot read {path}: {e.strerror or e}")
+    finally:
+        os.close(fd)
+
+
 def tool_pin_row(section: str, name: str, path: str, want_sha256: str, lstat: Callable,
-                 digest: Callable[[str], Any]) -> rh.Check:
+                 read: Optional[Callable[[str], Any]] = None) -> rh.Check:
     """A pinned tool's bytes against its pin (d3.3 §4 C3), read at the recorded
-    path, which trusted-exec opens without following a link: a link there is
-    a FAIL, an unreadable file UNKNOWN. A PASS here stands beside the tool's
-    other rows, never in place of them."""
+    path by `read` (pin_digest), which, like trusted-exec, never follows the
+    leaf and never blocks: a link or another non-regular file is a FAIL, an
+    unreadable file UNKNOWN. A PASS here stands beside the tool's other rows,
+    never in place of them."""
     claim = f"the {section} {name} {path} is the client {section}.{rt.TOOL_SHA256}.{name} pins"
     want = _fact("tool sha256", want_sha256, f"{section}.{rt.TOOL_SHA256}.{name} in the document (d3.3 §4 C3)")
     remedy = (f"stop [2] through its supervisor, place the reviewed client at {path}, record its sha256 as "
@@ -751,14 +779,14 @@ def tool_pin_row(section: str, name: str, path: str, want_sha256: str, lstat: Ca
         return rh.unknown(claim, want, st.reason, remedy)
     if st is not None and stat.S_ISLNK(st.st_mode):
         return rh.check(claim, want, f"{path} is a link, which trusted-exec refuses to read", remedy, do_not=do_not)
-    got = digest(path)
+    got = (read or pin_digest)(path)
     if isinstance(got, rh.Unresolved):
         return rh.unknown(claim, want, got.reason, remedy)
     return rh.check(claim, want, got, remedy, do_not=do_not)
 
 
 def _tool_rows(s: SecretSpec, name: str, path: str, lstat: Callable,
-               realpath: Callable[[str], str], digest: Optional[Callable[[str], Any]] = None) -> List[rh.Check]:
+               realpath: Callable[[str], str], pin_read: Optional[Callable[[str], Any]] = None) -> List[rh.Check]:
     """verify_tools' rows for one tool, with its pin's row where it is pinned."""
     if name in ROOT_EXEC_TOOLS:
         owners, whose, why = (0,), "root", f"root executes {name}"
@@ -781,8 +809,8 @@ def _tool_rows(s: SecretSpec, name: str, path: str, lstat: Callable,
         out.append(_owned_chain(f"every directory above the recorded {path} is owned by root and not group- "
                                 f"or world-writable, so no one else can point it elsewhere", path, owners, why,
                                 lstat))
-    if digest is not None and name in s.tool_sha256:
-        out.append(tool_pin_row(SECTION, name, path, s.tool_sha256[name], lstat, digest))
+    if pin_read is not None and name in s.tool_sha256:
+        out.append(tool_pin_row(SECTION, name, path, s.tool_sha256[name], lstat, pin_read))
     return out
 
 
@@ -833,7 +861,7 @@ def live_refusal(s: SecretSpec, lstat: Callable = os.lstat,
     if bad:
         return f"not run: {' and '.join(bad)} not root's alone"
     not_pinned_client = [n for n in names if n in s.tool_sha256
-                         and tool_pin_row(SECTION, n, s.tools[n], s.tool_sha256[n], lstat, digest).result != rh.PASS]
+                         and tool_pin_row(SECTION, n, s.tools[n], s.tool_sha256[n], lstat).result != rh.PASS]
     if not_pinned_client:
         return f"not run: {' and '.join(not_pinned_client)} not the client the document pins"
     if any(c.result != rh.PASS for c in _writer_rows(s, lstat, digest)):
@@ -1302,7 +1330,7 @@ def checks(s: SecretSpec, *, lstat: Callable = os.lstat, digest: Optional[Callab
     out = verify_overlay_source(s, overlay, stat_, realpath)
     out += verify_pins(s, lstat, digest, read)
     out += verify_clones(s, lstat, read, listdir)
-    out += verify_tools(s, lstat, realpath, digest)
+    out += verify_tools(s, lstat, realpath)
     out += verify_dirs(s, lstat)
     out += verify_ssh(s, lstat)
     out += verify_zsh(s, lstat)
