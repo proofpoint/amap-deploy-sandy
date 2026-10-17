@@ -697,6 +697,10 @@ M = [
      '(LAUNCHD_NOT_FOUND[0], LAUNCHD_NOT_FOUND[1].replace("{label}", args[0])):',
      '(LAUNCHD_NOT_FOUND[0], LAUNCHD_NOT_FOUND[1]):',
      "test_service_verb"),
+    ("hv-is-active-stripped", "hub_supervise.py",
+     '    return p.rc, p.out.rstrip("\\n")',
+     '    return p.rc, p.out.strip()',
+     "test_hub_start_states"),
     # the partition's place lines record the partition section's tools (§0.1)
     ("ai-secrets-tools", "activation_install.py",
      "                         shlex.quote, python3=py, tools=list(spec.partition.tools.values()))",

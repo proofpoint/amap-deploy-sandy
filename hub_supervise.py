@@ -663,12 +663,15 @@ def active_state(answer: Any) -> Any:
 
 
 def ask_active(spec: Any, unit: str) -> Any:
-    """`systemctl --no-pager is-active <unit>`, by the recorded manager, for one unit alone."""
+    """`systemctl --no-pager is-active <unit>`, by the recorded manager, for
+    one unit alone: its stdout with only trailing newlines dropped, as TXN's
+    command substitution reads it, so a space, a CR or a blank line is kept
+    and the answer stays exact."""
     try:
         p = rh.run([manager(spec), "--no-pager", "is-active", unit])
     except rh.CannotRun as e:
         return rh.Unresolved(str(e))
-    return p.rc, p.out.strip()
+    return p.rc, p.out.rstrip("\n")
 
 
 #: launchctl print with stdout and stderr as ONE stream, in write order: how

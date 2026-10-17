@@ -86,6 +86,26 @@ class MissingUnitStateRows(unittest.TestCase):
         with mock.patch.object(rt, "SYSTEMD_UNIT_MISSING_ACTIVE", None):
             self.assertIsInstance(hv.active_state((4, "inactive")), rh.Unresolved)
 
+    def test_the_answer_is_read_through_ask_active_as_txn_reads_it(self):
+        """Only trailing newlines go: a trailing space, a leading space, a CR
+        or a leading blank line keeps the answer unknown, through ask_active
+        and the real not_running path."""
+        s = spec()
+
+        def answering(out, rc=4):
+            return mock.patch.object(hv.rh, "run", lambda argv, **k: rh.Proc(tuple(argv), rc, out, ""))
+        for out in ("inactive \n", " inactive\n", "inactive\r\n", "\ninactive\n"):
+            with self.subTest(out=out):
+                with answering(out):
+                    self.assertIsInstance(hv.active_state(hv.ask_active(s, "hub-link.service")), rh.Unresolved)
+                    last = hv.not_running(s, old_context=False, container=lambda sp: False)
+                self.assertTrue(last.startswith("unknown: "), last)
+        with answering("inactive\n"):
+            self.assertEqual(hv.ask_active(s, "hub-link.service"), (4, "inactive"))
+            self.assertEqual(hv.not_running(s, old_context=False, container=lambda sp: False), "NOT-RUNNING")
+        with answering("inactive\n"), mock.patch.object(rt, "SYSTEMD_UNIT_MISSING_ACTIVE", None):
+            self.assertTrue(hv.not_running(s, old_context=False, container=lambda sp: False).startswith("unknown: "))
+
     def test_not_running_with_every_unit_missing(self):
         last = hv.not_running(spec(), old_context=False, active=lambda u: (4, "inactive"), container=lambda sp: False)
         self.assertEqual(last, "NOT-RUNNING")
