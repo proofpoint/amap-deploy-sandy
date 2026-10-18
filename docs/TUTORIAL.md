@@ -1068,8 +1068,12 @@ registry), plus:
   real paths and their (device, inode) pairs differ, neither contains the
   other, neither lies inside `instances_dir` (resolved physically, so a
   symlinked parent cannot hide it) nor contains it, and no bind source of
-  the old router or the hub-link router contains both. The separation block below checks this at F2 and again at
-  F5. A shared `state_dir` is not a fresh start, and FS refuses it.
+  the old router or the hub-link router contains both. The separation block
+  below checks this at F2 and again at F5. A shared `state_dir` is not a
+  fresh start, and FS refuses it. Make NEW before F2 as the router's
+  account, `mkdir -m 0700 <NEW>`, refusing an existing path: `install`
+  leaves an existing directory's mode alone, and the EMPTY witness at F5
+  requires that account's own 0700.
 - **an old router with no in-flight state.** The quiet block below checks
   both halves: every outbox holds only `results/` and `processed/`, and OLD
   holds no file under a `pending/`, `inflight/`, `dsn-pending/` or
