@@ -477,16 +477,108 @@ def _ancestors(path: str) -> List[str]:
     return ["/" + "/".join(parts[:i]) for i in range(len(parts))] if parts != [""] else []
 
 
+#: Root's own directories the plan places into are made 0755, root's.
+ROOT_DIR_MODE = 0o755
+
+
+def root_leaves(spec: Spec) -> List[str]:
+    """The root-owned directories a later `install -d -o 0 -g 0 -m 0755` line
+    makes: the anchor's and the writer's, and the hub's D7 directory, its D7
+    source's (the file form) and its environment file's. `install -d` follows a
+    link and re-owns and re-modes whatever already sits there, so each is
+    prechecked with root's own directories, never adopted."""
+    out = set()
+    if spec.secrets is not None:
+        out.update((spec.secrets.writer_dir, posixpath.dirname(spec.secrets.anchor)))
+    if spec.hub is not None:
+        out.update((spec.hub.d7_dir, posixpath.dirname(spec.hub.env_file)))
+        if spec.hub.d7_source_sha256 is not None:
+            out.add(posixpath.dirname(spec.hub.d7_source))
+    return sorted(out, key=lambda d: (d.count("/"), d))
+
+
+def root_dirs(spec: Spec) -> List[str]:
+    """The root-owned directories the plan places into but does not make
+    itself, with their parents below the first level, shallow first: the
+    plugin's directory, and the parents of each of root_leaves (each made by
+    its own `install -d`, which would make a missing parent under root's umask,
+    not 0755). The first level (/opt) must already exist; nothing here changes it."""
+    own = [] if spec.overlay_path is None else [posixpath.dirname(spec.overlay_path)]
+    dirs = set(own)
+    for d in own + root_leaves(spec):
+        dirs.update(a for a in _ancestors(d) if a.count("/") >= 2)
+    return sorted(dirs, key=lambda d: (d.count("/"), d))
+
+
+#: find, by the path both supported hosts give it (GNU on Linux, BSD on macOS), never by PATH.
+FIND = "/usr/bin/find"
+#: The shell the precheck runs in as root, by path: one line through sudo, never the operator's own shell.
+ROOT_SH = "/bin/sh"
+
+
+def _dir_safe(var: str, find: str = FIND) -> str:
+    """A POSIX test that "$var" is a real directory, root's (the precheck runs
+    as root, so -O is root), and writable by no group and no other user.
+    find's own status is checked: a find that fails is never an empty answer."""
+    return (f'[ -d "${var}" ] && [ ! -L "${var}" ] && [ -O "${var}" ] && '
+            f'scan=$({find} "${var}" -maxdepth 0 \\( -perm -g+w -o -perm -o+w \\) -print) && [ -z "$scan" ]')
+
+
+def _dir_exact(var: str, find: str, uid: str, gid: str) -> str:
+    """A POSIX test that "$var" is exactly uid:gid 0755 (find's -perm with no
+    prefix is an exact match, special bits included, in GNU and BSD find)."""
+    return (f'scan=$({find} "${var}" -maxdepth 0 -user {uid} -group {gid} -perm {ROOT_DIR_MODE:04o} -print) '
+            f'&& [ "$scan" = "${var}" ]')
+
+
+def precheck_script(find: str = FIND, uid: str = "0", gid: str = "0") -> str:
+    """The precheck, as one constant script over its arguments: the parents,
+    then `--`, then the directories to be made. It holds no single quote, so it
+    is passed whole to `sh -c`; the paths travel as arguments, never inside it."""
+    return ('ok=1; m=0; for d in "$@"; do if [ "$d" = -- ]; then m=1; continue; fi; '
+            f'if [ "$m" = 0 ]; then {{ {_dir_safe("d", find)}; }} || '
+            '{ echo "STOP: $d is not a real root directory, or a group or other user can write it" >&2; '
+            'ok=0; break; }; '
+            f'else {{ [ ! -e "$d" ] && [ ! -L "$d" ]; }} || {{ {_dir_safe("d", find)} && {_dir_exact("d", find, uid, gid)}; }} || '
+            '{ echo "STOP: $d exists and is not exactly a real root 0:0 0755 directory" >&2; ok=0; break; }; fi; '
+            'done; [ "$ok" = 1 ]')
+
+
+def root_dirs_precheck(dirs: List[str], q: Callable[[str], str], parents: Optional[List[str]] = None,
+                       find: str = FIND, sudo: Optional[str] = "/usr/bin/sudo", uid: str = "0",
+                       gid: str = "0") -> str:
+    """One read-only line, run as root through `sudo /bin/sh -c` before root's
+    own directories are made: / and each first-level parent must exist, be
+    root's and be writable by no group or other user; each directory to be
+    made must be absent (not even a dangling link), or already exactly root
+    0:0 0755 (never another owner's or another mode, which the helper or
+    `install -d` would otherwise silently re-own or re-mode). Its status is 1
+    on any STOP (never `exit`), and 0 only when every directory passed.
+    `sudo` None, and `uid`/`gid`, are the suite's stand-ins for root."""
+    if parents is None:
+        parents = ["/"] + sorted({"/" + d.split("/")[1] for d in dirs})
+    script = precheck_script(find, uid, gid)
+    if "'" in script:
+        raise ValueError("the precheck script must hold no single quote: it is passed whole to sh -c")
+    head = f"{sudo} " if sudo else ""
+    return (f"{head}{ROOT_SH} -c '{script}' sh " + " ".join(q(p) for p in parents) + " --"
+            + "".join(" " + q(d) for d in dirs))
+
+
 def render_plan(spec: Spec, overlay_source: Optional[Path] = None,
                 hub: Optional[hr.Rendered] = None) -> List[str]:
     """The root-run steps, in order, as shell lines. Printed, never run.
     `hub` is the hub-link router's rendering, when the document has one."""
     q = shlex.quote
-    steps = f"python3 {q(str(HOST_STEPS))}"
-    lines = ["# Run as root. Each line is one step; nothing here has run. No step follows a "
+    # The interpreter root runs is the one step 1 (the partition's validation) vetted, by its path.
+    py = spec.partition.tools["python3"] if spec.partition is not None else "python3"
+    steps = f"{q(py)} {q(str(HOST_STEPS))}"
+    lines = ["# Run as root. Each line is one step; nothing here has run. No host_steps.py step follows a "
              "symbolic link, and each is safe to run again.",
              f"# Run them from a checkout no sandbox mounts read-write (a fresh clone at the recorded "
-             f"deploy commit), never from an agent's workspace: these steps run {HOST_STEPS.name} as root."]
+             f"deploy commit), never from an agent's workspace: these steps run {HOST_STEPS.name} as root.",
+             "# Run each command line separately. Continue only after checking that its exit status is 0. "
+             "Any STOP or nonzero status ends this run; do not run the following steps."]
     if spec.partition is not None and spec.supervision is not None and spec.secrets is not None:
         # Imported here: host_setup is in the weekly job's bundle, and the job's own installation is not.
         import partition_job as pj
@@ -500,10 +592,21 @@ def render_plan(spec: Spec, overlay_source: Optional[Path] = None,
                        key=lambda d: (-d.count("/"), d))
     lines.append("# The barrier: each root and every ancestor fsynced, deepest first.")
     lines.append(f"{steps} sync " + " ".join(q(d) for d in sync_dirs))
+    made = root_dirs(spec)
+    checked = sorted(set(made) | set(root_leaves(spec)), key=lambda d: (d.count("/"), d))
+    if checked:
+        sudo = (spec.secrets.tools.get("sudo") if spec.secrets is not None else None) or "/usr/bin/sudo"
+        lines.append("# Root's own directories, before anything is placed in them: made 0755 and root's, "
+                     "parents first. A missing one is made fresh; an existing one that is not exactly "
+                     "root 0:0 0755 stops the step. The precheck covers the directories the later "
+                     "`install -d` lines make too, so none of them adopts what is already there.")
+        lines.append(root_dirs_precheck(checked, q, sudo=q(sudo)))
+    for d in made:
+        lines.append(f"{steps} root {q(d)} 0 0 {ROOT_DIR_MODE:04o}")
     if spec.overlay_path is not None and spec.overlay_pin is not None:
         src = q(str(overlay_source)) if overlay_source else "<the pinned plugin artifact>"
-        lines.append(f"{steps} place {src} {q(spec.overlay_path)}"
-                     f"  # the overlay, root-owned 0444; sha256 must be {spec.overlay_pin['sha256']}")
+        lines.append(f"{steps} place {src} {q(spec.overlay_path)} --sha256 {spec.overlay_pin['sha256']}"
+                     f"  # the overlay, root-owned 0444, refused unless its bytes have the pinned sha256")
     for m in spec.mounts:
         if "marker" in m:
             lines.append(f"{steps} marker {q(posixpath.join(m['host'], m['marker']))}"

@@ -177,6 +177,10 @@ def checks(spec: Any, *, pin: Any = None) -> List[rh.Check]:
 # hop constant above, and `hop_link`.
 
 HOP_LINK_KEY = "hop_link"
+#: The policy key that renders `registry_dir` on a host with no hop link:
+#: exactly `true`, its value the overlay's `registry.directory`. The hop
+#: pin's loader reads `registry_dir`; the primary pin's refuses it.
+REGISTRY_POLICY_KEY = "router_registry"
 HOP_LINK_MEMBERS = ("link", "trusted_fleet_hosts", "egress")
 #: The router's own link grammar (its `config.HOP_LINK_RE`).
 LINK_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
@@ -324,11 +328,20 @@ def tunable_problems(doc: Dict[str, Any]) -> List[str]:
 
 def router_principal(spec: Any) -> Tuple[int, int]:
     """[1]'s uid and primary gid: the other end of the hub's hop."""
+    p = _router_principal(spec)
+    return p.uid, p.gids[0]
+
+
+def router_group_add(spec: Any) -> List[str]:
+    """[1]'s groups after its primary, as docker inspect reports HostConfig.GroupAdd."""
+    return [str(g) for g in _router_principal(spec).gids[1:]]
+
+
+def _router_principal(spec: Any) -> Any:
     for name, up, down, _env in spec.hops:
         if name == spec.hub.hop:
             other = up if down == spec.secrets.principal else down
-            p = spec.principals[other]
-            return p.uid, p.gids[0]
+            return spec.principals[other]
     raise HopRenderError(f"the document has no hop named {spec.hub.hop}")
 
 
@@ -505,15 +518,16 @@ def state_problems(state_dir: str, keys: Optional[Dict[str, Any]]) -> List[str]:
     return bad
 
 
-def restart_notice(old: Any, new: Dict[str, Any]) -> Optional[str]:
+def restart_notice(old: Any, new: Dict[str, Any], flags: str = "") -> Optional[str]:
     """The restart the router needs when `hop` or `transport_plugin` change:
-    it refuses a reload that changes either."""
+    it refuses a reload that changes either. `flags` are its principal's
+    run.sh flags (hub_keys.run_sh_flags)."""
     old = old if isinstance(old, dict) else {}
     changed = [k for k in ("hop", "transport_plugin") if old.get(k) != new.get(k)]
     if not changed:
         return None
-    return (f"{' and '.join(changed)} changed: RESTART the router (docker/run.sh from the hop checkout); "
-            "it refuses a reload that changes them")
+    return (f"{' and '.join(changed)} changed: RESTART the router (docker/run.sh --detach{flags} from the hop "
+            "checkout); it refuses a reload that changes them")
 
 
 # --- The running router, checked live (verify, on a hop host) ----------------------
@@ -610,6 +624,13 @@ def live_problems(spec: Any, keys: Dict[str, Any], roots: Any, *, run: Callable 
     if cfg.get("User") != f"{uid}:{gid}":
         bad.append(f"[1] runs as {cfg.get('User')!r}, not its principal's {uid}:{gid}: run docker/run.sh "
                    "as that account")
+    groups = router_group_add(spec)
+    added = host.get("GroupAdd")
+    if added is None and not groups:
+        added = []      # docker reports no added group as null
+    if not (isinstance(added, list) and all(isinstance(g, str) for g in added) and added == groups):
+        bad.append(f"[1] runs with the added groups {host.get('GroupAdd')!r}, not its principal's {groups}: "
+                   f"start it with docker/run.sh" + "".join(f" --group-add {g}" for g in groups))
     if host.get("UsernsMode") not in ("", None, "host"):
         bad.append(f"[1] runs in a remapped user namespace ({host.get('UsernsMode')!r}); the hop trees' "
                    "owners would not be what they seem")

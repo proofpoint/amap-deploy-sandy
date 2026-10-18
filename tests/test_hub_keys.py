@@ -13,6 +13,7 @@ import os
 import stat
 import tempfile
 import time
+import posixpath
 import unittest
 
 import host_setup as hs
@@ -41,11 +42,80 @@ def spec(**over):
     return hs.load_spec(full_doc(**over))
 
 
+class RootDirsTest(unittest.TestCase):
+    def test_the_writer_anchor_and_d7_parents_are_made_but_not_their_own_dirs(self):
+        """Each of those three is made by its own install -d; only the parents
+        above it, below the first level, are the helper's. /opt itself is never touched."""
+        spec = globals()['spec']()
+        dirs = hs.root_dirs(spec)
+        for parent in ("/opt/ex",):
+            self.assertIn(parent, dirs)
+        for own in (spec.secrets.writer_dir, posixpath.dirname(spec.secrets.anchor), spec.hub.d7_dir):
+            if own != posixpath.dirname(spec.overlay_path):
+                self.assertNotIn(own, dirs, own)
+        self.assertIn(posixpath.dirname(spec.overlay_path), dirs)
+        self.assertNotIn("/opt", dirs)
+        self.assertNotIn("/", dirs)
+        self.assertEqual(dirs, sorted(dirs, key=lambda d: (d.count("/"), d)))
+
+    def test_every_install_d_leaf_is_prechecked_and_none_is_made_by_the_helper(self):
+        """Each directory a later `install -d -o 0 -g 0 -m 0755` line makes is an argument of the precheck,
+        after its `--`, so an existing one, or a link, STOPs before install -d could adopt it."""
+        import shlex
+        s = globals()['spec']()
+        plan = hs.render_plan(s)
+        leaves = hs.root_leaves(s)
+        want = {s.secrets.writer_dir, posixpath.dirname(s.secrets.anchor), s.hub.d7_dir,
+                posixpath.dirname(s.hub.env_file)}
+        if s.hub.d7_source_sha256 is not None:
+            want.add(posixpath.dirname(s.hub.d7_source))
+        self.assertEqual(set(leaves), want)
+        [pre] = [l for l in plan if f" {hs.ROOT_SH} -c 'ok=1; m=0; " in l]
+        args = shlex.split(pre)
+        checked = args[args.index("--") + 1:]
+        for leaf in leaves:
+            self.assertIn(leaf, checked)
+        made = [l.split()[3] for l in plan if " root " in l and l.endswith(" 0 0 0755")]
+        self.assertFalse(set(made) & (set(leaves) - set(hs.root_dirs(s))), "the leaves are install -d's own")
+        for d in made:
+            self.assertIn(d, checked)
+        # The activation leg's and the weekly job's own directories are later legs', with their own steps.
+        later = {s.keys.evidence_dir} | ({s.partition.evidence_dir} if s.partition is not None else set())
+        installs = [shlex.split(l.split("#")[0])[-1] for l in plan if " -d -o 0 -g 0 -m 0755 " in l]
+        self.assertTrue(set(installs) - later)
+        self.assertEqual(sorted(set(installs) - later - set(checked)), [])
+
+
 class LoadTest(unittest.TestCase):
     def refuses(self, doc, words):
         with self.assertRaises(hs.SpecError) as e:
             hs.load_spec(doc)
         self.assertIn(words, str(e.exception))
+
+    def test_the_local_routers_added_group_comes_from_its_principal(self):
+        """KeySpec.group_add is the principal's groups after its primary, and
+        run_sh_flags renders one --group-add each; run.sh takes at most one,
+        so a principal with two refuses."""
+        ks = spec().keys
+        self.assertEqual(ks.group_add, (2100,))
+        self.assertEqual(hk.run_sh_flags(ks), " --group-add 2100")
+        d = full_doc()
+        d["groups"]["extra"] = 2300
+        d["principals"]["upstream"]["groups"].append("extra")
+        self.refuses(d, "docker/run.sh adds at most one (--group-add)")
+
+    def test_the_added_group_is_bounded_by_run_shs_own_contract(self):
+        """run.sh refuses 0 and more than ten digits, so the load does too."""
+        for gid in (0, 10000000000):
+            with self.subTest(gid=gid):
+                d = full_doc()
+                hop = d["principals"]["upstream"]["groups"][1]
+                d["groups"][hop] = gid
+                self.refuses(d, "docker/run.sh --group-add takes one decimal gid from 1 to 9999999999")
+        d = full_doc()
+        hop = d["principals"]["upstream"]["groups"][1]
+        d["groups"][hop] = 9999999999
+        self.assertEqual(hs.load_spec(d).keys.group_add, (9999999999,))
 
     def test_the_key_belongs_to_the_hub_hop_s_upstream(self):
         k = spec().keys

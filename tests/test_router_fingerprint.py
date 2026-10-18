@@ -5,7 +5,7 @@ Rows marked SYNTHETIC use a function-level seam or a history no real hop
 checkout produces; every other match row starts from ONE complete MEASURED
 capture and changes one thing. The real-history rows read the hop checkout
 at the pin (`_workspace.HOP_ROUTER_ROOT`), whose first-parent chain from
-99329945 is 70 commits, with 6479a05c at index 11 and 45 router entries at
+52eafa82 is 71 commits, with 6479a05c at index 12 and 45 router entries at
 the target (measured with `git rev-list --first-parent` and `git ls-tree`).
 """
 
@@ -34,7 +34,7 @@ NS = rf.NS
 B = 1_800_000_000          # the synthetic rows' epoch origin, in seconds
 GIT = shutil.which("git") or "git"
 HOP = str(_workspace.HOP_ROUTER_ROOT)
-REAL_TARGET = "99329945edd20adb4b8b83f025ea1ef6382456ff"
+REAL_TARGET = "52eafa82c3f6c621828dffb1b4c2a3a94da73d88"
 REAL_FROM = "6479a05c164b11e2ff38df08b3f93e9e0079d779"
 PLUGIN = hp.PLUGIN_SHA256
 
@@ -808,7 +808,7 @@ class RealHistory(Outcome):
 
     def test_the_measured_shape(self):
         fp = self.h["first_parent"]
-        self.assertEqual((len(fp), fp.index(REAL_FROM), len(self.h["trees"][REAL_TARGET]["router"])), (70, 11, 45))
+        self.assertEqual((len(fp), fp.index(REAL_FROM), len(self.h["trees"][REAL_TARGET]["router"])), (71, 12, 45))
         rl = subprocess.run([GIT, "-C", HOP, "rev-list", "--first-parent", REAL_TARGET], capture_output=True,
                             text=True, check=True).stdout.split()
         self.assertEqual(fp, rl)
@@ -820,7 +820,7 @@ class RealHistory(Outcome):
         raw = subprocess.run([GIT, "-C", HOP, "cat-file", "commit", REAL_TARGET], capture_output=True,
                              check=True).stdout
         self.assertEqual(raw.split(b"\n\n")[0].split(b"\n").count(b" "), 2)
-        self.assertEqual(self.h["first_parent"][1][:8], "7e150f3d")
+        self.assertEqual(self.h["first_parent"][1][:8], "99329945")
 
     def test_measured_at_target_measured_from_and_inside(self):
         bases_bytes = rf.BASES_PATH.read_bytes()
@@ -841,20 +841,20 @@ class RealHistory(Outcome):
         self.assertIn("migration branch", got[3])
 
     def test_the_real_pre_registry_class_is_before_to_from(self):
-        """(a84e0d98, 5e9f84bb]: index 49 to 69, the root, is MIGRATE (the
+        """(a84e0d98, 5e9f84bb]: index 50 to 70, the root, is MIGRATE (the
         router's maintainers rehearsed the migration from each); a84e0d98
-        itself (48) stays `unmeasured`."""
+        itself (49) stays `unmeasured`."""
         bases_bytes = rf.BASES_PATH.read_bytes()
         fp = self.h["first_parent"]
-        for i, outcome, reason in ((48, rf.UNMEASURED, "unmeasured"), (49, rf.MIGRATE, "pre_registry_base"),
-                                   (56, rf.MIGRATE, "pre_registry_base"), (69, rf.MIGRATE, "pre_registry_base")):
+        for i, outcome, reason in ((49, rf.UNMEASURED, "unmeasured"), (50, rf.MIGRATE, "pre_registry_base"),
+                                   (57, rf.MIGRATE, "pre_registry_base"), (70, rf.MIGRATE, "pre_registry_base")):
             with self.subTest(index=i):
                 got = rf.match(b(self.real_capture(fp[i])), bases_bytes, self.h, REAL_TARGET, PLUGIN)
                 self.assertGate(got, outcome, reason)
 
     def test_below_the_range_is_unmeasured(self):
         bases_bytes = rf.BASES_PATH.read_bytes()
-        c = self.h["first_parent"][12]
+        c = self.h["first_parent"][13]
         self.assertGate(rf.match(b(self.real_capture(c)), bases_bytes, self.h, REAL_TARGET, PLUGIN),
                         rf.UNMEASURED, "unmeasured")
 
@@ -2388,7 +2388,7 @@ class Pins(unittest.TestCase):
         p = json.loads(rf.BASES_PATH.read_bytes())["premises"].encode("utf-8")
         self.assertEqual(len(p), 1202)
         self.assertEqual(hashlib.sha256(p).hexdigest(),
-                         "ca45c0ac00df86a5c61b9d06e1313848b3efdd3d19fb134f1cbde83e25b4c67a")
+                         "a06099c03f442596d8801f751ce967c127244b33b41289087cbacfc3abae0e3d")
 
     def test_the_plugin_digest(self):
         self.assertEqual(hp.PLUGIN_SHA256, "f15855c974df021c2ae5c551aff2448d934725a6796fb03434e573305d24fe93")
@@ -2400,7 +2400,7 @@ class Pins(unittest.TestCase):
         self.assertEqual(pre["from"], "5e9f84bb3547c37740b09879fe3a48e082605b0e")
         fp = subprocess.run([GIT, "-C", HOP, "rev-list", "--first-parent", REAL_TARGET], capture_output=True,
                             text=True, check=True).stdout.split()
-        self.assertEqual((fp.index(pre["before"]), fp.index(pre["from"]), len(fp)), (48, 69, 70))
+        self.assertEqual((fp.index(pre["before"]), fp.index(pre["from"]), len(fp)), (49, 70, 71))
 
     def test_the_program_sha256(self):
         self.assertEqual(rf.PROGRAM_SHA256, "153c24c30e444b9284f7122ee1329030d48787fc4a6abbdb1ee5a43f0f6cb157")
