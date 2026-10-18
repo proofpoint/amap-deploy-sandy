@@ -11,6 +11,8 @@ import contextlib
 import io
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -112,6 +114,58 @@ class HopLoaderTest(unittest.TestCase):
         refused = hp.validate_with_hop_router(self.doc("/srv/x/state/registry"), str(HOP_ROUTER_ROOT))
         self.assertIsNotNone(refused)
         self.assertIn("config.registry_dir", refused)
+
+
+class PinMountsTest(unittest.TestCase):
+    """The rendered no-hop config through the HOP pin's own docker/derive-mounts.py (amap-router-local #58,
+    merged at the pin): the registry is mounted read-only at its identity path, beside state_dir and the
+    instances tree, and nothing else: no hop root, no plugin directory, no D7 directory."""
+
+    def setUp(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        self.t = Path(os.path.realpath(td.name))
+        for d in ("state", "inst", "sel", "registry"):
+            (self.t / d).mkdir()
+        (self.t / "sel" / "selected.json").write_text("{}")
+
+    def derive(self, doc):
+        cfg = self.t / "router.json"
+        cfg.write_text(json.dumps(doc))
+        p = subprocess.run([sys.executable, "-I", str(HOP_ROUTER_ROOT / "docker" / "derive-mounts.py"), str(cfg)],
+                           capture_output=True, text=True, timeout=60)
+        return p.returncode, p.stdout, p.stderr
+
+    def doc(self, **over):
+        d = {"state_dir": str(self.t / "state"), "instances_dir": str(self.t / "inst"),
+             "selected_json": str(self.t / "sel" / "selected.json"), "connector_outcome_ids": ["claude-code"],
+             "fleet_domain": "alpha.internal", "task_graph": "all", "registry_dir": str(self.t / "registry")}
+        d.update(over)
+        return d
+
+    def test_the_registry_is_mounted_read_only_and_nothing_hop_is(self):
+        rc, out, err = self.derive(self.doc())
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(out.splitlines(), [f"{self.t / 'state'}\trw", f"{self.t / 'inst'}\trw",
+                                            f"{self.t / 'sel'}\tro", f"{self.t / 'registry'}\tro"])
+
+    def test_the_pins_mount_rules_refuse_a_bad_registry(self):
+        (self.t / "state" / "reg").mkdir()
+        link = self.t / "reglink"
+        link.symlink_to(self.t / "registry")
+        for bad, words in ((str(self.t / "state" / "reg"), "overlaps"), (str(link), "realpath"),
+                           ("rel/registry", "absolute")):
+            with self.subTest(bad=bad):
+                rc, out, err = self.derive(self.doc(registry_dir=bad))
+                self.assertNotEqual(rc, 0, out)
+                self.assertIn(words, err)
+
+    def test_without_registry_dir_the_mount_set_is_unchanged(self):
+        d = self.doc()
+        del d["registry_dir"]
+        rc, out, err = self.derive(d)
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn("registry", out)
 
 
 class RenderTest(unittest.TestCase):
