@@ -1052,6 +1052,542 @@ old container is never started except through back-out C, then B.
     next step. `generation fence-legacy` exists only for an origin that
     cannot be vouched for.
 
+### The local router's fresh start (FS), instead of R2
+
+A fresh start is the other way onto the pinned router, for a host whose
+operator chose it over R2's migration. The pinned router starts on a NEW,
+empty `state_dir`. The old router's `state_dir` (OLD) is never written: it
+is archived while the old router is stopped and kept in place, untouched,
+as the back-out's state. Nothing is mapped, moved or adopted.
+
+Every instance takes a fresh first sight on the new router's first poll,
+and a fresh first sight quarantines whatever request is waiting. So a fresh
+start runs only while every outbox is quiet (F3 and F4b below).
+
+FS needs what R2 needs (the hop link, the hop root, the hop checkout at its
+pin, the router's image, and every configured instance enrolled in the host
+registry), plus:
+- **a router config at its default place.** This section is written for a
+  host whose live config is `install`'s default,
+  `$SANDY_HOME/features/amap/router.json`, with no `--router-config-path`.
+  A host that names its router config elsewhere follows its own reviewed
+  fresh-start plan, which uses this section's blocks, because there the
+  first install that names the path must be a plain `install --apply` (a
+  `--render-to` with an unrecorded path is refused), and its start line is
+  the one its host setup names.
+- **two distinct state directories.** OLD is the `state_dir` the live config
+  names now. NEW is the one the new configuration names
+  (`install --state-dir <NEW>`). They must be physically distinct: their
+  real paths and their (device, inode) pairs differ, neither contains the
+  other, neither lies inside `instances_dir` (resolved physically, so a
+  symlinked parent cannot hide it) nor contains it, and no bind source of
+  the old router or the hub-link router contains both. The separation block
+  below checks this at F2 and again at F5. A shared `state_dir` is not a
+  fresh start, and FS refuses it. Make NEW before F2 as the router's
+  account, `mkdir -m 0700 <NEW>`, refusing an existing path: `install`
+  leaves an existing directory's mode alone, and the EMPTY witness at F5
+  requires that account's own 0700.
+- **an old router with no in-flight state.** The quiet block below checks
+  both halves: every outbox holds only `results/` and `processed/`, and OLD
+  holds no file under a `pending/`, `inflight/`, `dsn-pending/` or
+  `reuse-pending/` directory (a pre-registry router keeps no other
+  work-bearing set). An old router that holds such state is out of FS's
+  scope.
+
+**The quiet predicate.** For every configured instance,
+`instances/<slug>/outbox/` holds, at its top level, only the directories
+`results/` and `processed/`. Any other entry means NOT quiet: a
+`req-*.json`, a `req-*.attachments/`, a connector's temporary file, or
+anything unexpected. Every listing must succeed: an outbox that cannot be
+listed is NOT quiet. Producers, the operator's own traffic included, hold
+from F3 until F7's acceptance passes. That is a coordination premise, not a
+lock: F4b's repeat is what catches a request that arrives after the stop.
+The same block checks FS's scope: OLD holds no file under a `pending/`,
+`inflight/`, `dsn-pending/` or `reuse-pending/` directory: any entry below
+one that is not a directory (a file, a symlink, a socket) is work. It also
+refuses an empty SLUGS, and an outbox under `instances_dir` whose instance
+SLUGS does not name. A search that fails is not an empty one.
+
+```sh
+( OST='<OLD: the state_dir the live config names>'
+  INST='<instances_dir>'; SLUGS='<every configured instance, space separated>'
+  stop() { printf 'fs-quiet: STOP: %s\n' "$1" >&2; exit 1; }
+  [ -n "$SLUGS" ] || stop "no instance named: nothing would be checked"
+  for o in "$INST"/*/outbox; do
+    [ -e "$o" ] || [ -h "$o" ] || continue
+    s=${o%/outbox}; s=${s##*/}
+    case " $SLUGS " in *" $s "*) ;; *) stop "$s has an outbox and is not in SLUGS: it would not be checked" ;; esac
+  done
+  set -f
+  for s in $SLUGS; do
+    o="$INST/$s/outbox"
+    [ -d "$o" ] && [ ! -h "$o" ] || stop "$s: no outbox directory $o"
+    e=$(find "$o" -mindepth 1 -maxdepth 1 ! -name results ! -name processed -print -quit) \
+      || stop "$s: the outbox cannot be listed: not quiet"
+    [ -z "$e" ] || stop "$s: ${e##*/} is waiting: not quiet"
+    e=$(find "$o" -mindepth 1 -maxdepth 1 \( -name results -o -name processed \) ! -type d -print -quit) \
+      || stop "$s: the outbox cannot be listed: not quiet"
+    [ -z "$e" ] || stop "$s: ${e##*/} is not a directory: not quiet"
+  done
+  OP=$(cd -P -- "$OST" && pwd -P) || stop "OLD $OST cannot be resolved: its in-flight state is not established"
+  w=$(find "$OP" ! -type d \( -path '*/pending/*' -o -path '*/inflight/*' -o -path '*/dsn-pending/*' \
+        -o -path '*/reuse-pending/*' \) -print -quit) || stop "OLD cannot be searched: its in-flight state is not established"
+  [ -z "$w" ] || stop "OLD holds in-flight state ($w): outside a fresh start's scope"
+  printf 'fs-quiet: OK every outbox holds only results/ and processed/, and OLD holds no in-flight state\n' )
+```
+
+**The separation check.** It reads NEW by `lstat` alone, so NEW itself
+needs no search permission for the operator: only its parent is resolved.
+It refuses a NEW that is a symlink. NEW is also kept apart from the hop
+root: never the hop root itself, nor inside it, nor containing it, so the
+hop tree holds only the hub-link router's own top-level names. The hop root
+may not exist yet (a host whose hop leg comes later): it is then resolved
+through its parent, the path-wise checks still apply, and only the (device,
+inode) comparison is skipped. The snapshot block and the OLD check resolve
+it the same way.
+
+```sh
+( OST='<OLD: the state_dir the live config names>'; NST='<NEW: the state_dir the new configuration names>'
+  INST='<instances_dir>'; HOP='<the hop root: its host path>'; OLD='<the old container Id>'
+  HUB='<the hub-link router container>'
+  stop() { printf 'fs-separate: STOP: %s\n' "$1" >&2; exit 1; }
+  case "$NST" in /*) ;; *) stop "NEW $NST is not an absolute path" ;; esac
+  case "$NST/" in //|*/./*|*/../*|*//*) stop "NEW $NST is not a normalised path, or is the root directory" ;; esac
+  OP=$(cd -P -- "$OST" && pwd -P) || stop "no OLD $OST"
+  ND=$(cd -P -- "$(dirname -- "$NST")" && pwd -P) || stop "no parent for NEW $NST"
+  NP=$ND/$(basename -- "$NST")
+  [ -d "$NP" ] && [ ! -h "$NP" ] || stop "NEW $NST is not a directory, or is a symlink"
+  [ "$OP" != "$NP" ] || stop "OLD and NEW are the same path: a fresh start needs two"
+  oi=$(stat -c '%d:%i' -- "$OP") || stop "OLD cannot be stat'ed"
+  ni=$(stat -c '%d:%i' -- "$NP") || stop "NEW cannot be stat'ed"
+  [ "$oi" != "$ni" ] || stop "OLD and NEW are one directory under two names"
+  case "$NP/" in "$OP"/*) stop "NEW lies under OLD" ;; esac
+  case "$OP/" in "$NP"/*) stop "OLD lies under NEW" ;; esac
+  INP=$(cd -P -- "$INST" && pwd -P) || stop "no instances_dir $INST"
+  case "$NP/" in "$INP"/*) stop "NEW lies under instances_dir" ;; esac
+  case "$INP/" in "$NP"/*) stop "instances_dir lies under NEW" ;; esac
+  case "$HOP" in /*) ;; *) stop "the hop root $HOP is not an absolute path" ;; esac
+  case "$HOP/" in //|*/./*|*/../*|*//*) stop "the hop root $HOP is not a normalised path, or is the root directory" ;; esac
+  HD=$(cd -P -- "$(dirname -- "$HOP")" && pwd -P) || stop "no parent for the hop root $HOP"
+  HP=$HD/$(basename -- "$HOP"); HPM=
+  if [ -e "$HP" ] || [ -h "$HP" ]; then
+    [ -d "$HP" ] && [ ! -h "$HP" ] || stop "the hop root $HOP is not a directory, or is a symlink"
+    HPM=$HP
+  fi
+  [ "$NP" != "$HP" ] || stop "NEW is the hop root"
+  if [ -n "$HPM" ]; then
+    hi=$(stat -c '%d:%i' -- "$HP") || stop "the hop root cannot be stat'ed"
+    [ "$ni" != "$hi" ] || stop "NEW and the hop root are one directory under two names"
+  fi
+  case "$NP/" in "$HP"/*) stop "NEW lies under the hop root" ;; esac
+  case "$HP/" in "$NP"/*) stop "the hop root lies under NEW" ;; esac
+  MNT=$(docker inspect -f '{{range .Mounts}}{{if eq .Type "bind"}}{{.Source}}{{"\n"}}{{end}}{{end}}' "$OLD") \
+    || stop "the old router's mounts cannot be read"
+  hub=$(docker ps -a -q --no-trunc --filter "name=^/$HUB\$") || stop "docker cannot list containers"
+  if [ -n "$hub" ]; then
+    HM=$(docker inspect -f '{{range .Mounts}}{{if eq .Type "bind"}}{{.Source}}{{"\n"}}{{end}}{{end}}' "$HUB") \
+      || stop "the hub-link router's mounts cannot be read"
+    MNT=$(printf '%s\n%s' "$MNT" "$HM")
+  fi
+  IFS=$(printf '\n.'); IFS=${IFS%.}; set -f
+  for m in $MNT; do
+    [ -d "$m" ] || continue
+    mp=$(cd -P -- "$m" && pwd -P) || stop "the mount source $m cannot be resolved"
+    case "$OP/" in "$mp"/*) case "$NP/" in "$mp"/*) stop "the mount source $m contains both OLD and NEW" ;; esac ;; esac
+  done
+  printf 'fs-separate: OK OLD %s (%s) and NEW %s (%s) are distinct\n' "$OP" "$oi" "$NP" "$ni" )
+```
+
+Run every step as the operator, except where a step names the account that
+runs the router. Each step's STOP ends FS at that point, and the back-out
+for that point (below) applies.
+
+**The ledger's two kinds of line.** Each `printf … >> <run_dir>/fs-ledger.txt`
+below is written in its checked form, `printf … >> <run_dir>/fs-ledger.txt
+|| echo 'STOP: the ledger write failed: run nothing further' >&2`. On that STOP, run nothing further. The form only echoes and never `exit`s, so a line pasted into an interactive shell does not close it.
+- An INTENT line (`F4c started`, `F5 started`, `F6 attempted`) is written
+  BEFORE the action it records. A failed write stops FS before that
+  action, so no action runs unrecorded. Above all, F6's start runs only
+  after `F6 attempted` is written: a start the ledger does not show could
+  otherwise be taken for one that never happened, and offered OLD's
+  back-out.
+- A COMPLETION line (`F4 stopped`, `F4c ok`) is written only AFTER the step
+  it records has succeeded and been checked: `F4 stopped` after the
+  rename, and `F4c ok` after the snapshot block's `fs-snapshot: OK` and
+  `fs-lanes: OK` lines. It is never written early. A missing completion
+  line sends back-out B to the branch before it.
+
+- **F1 Fingerprint.** `python3 amap-sandy.py router-fingerprint --step 0
+  --label fs --apply`, then `python3 amap-sandy.py router-fingerprint
+  --match <the file it wrote>`, each with `--container <its current name>`.
+  The match must print `MIGRATE` and exit 3, as R2's step 1. `MEASURED`
+  means the router is already the pinned one. Any other result names its
+  own remedy, and FS does not start.
+- **F2 Render.** `python3 amap-sandy.py --state-dir <NEW> install --render-to
+  <run_dir>/fs-config.json --apply`, with the sha256 it prints recorded, as
+  R2's step 2. Then the separation block.
+- **F3 Quiet**, with the old router still running: the quiet block. If an
+  outbox is not quiet, wait for the old router's polls and run it again.
+  An outbox that will not settle, or any in-flight state in OLD, stops FS
+  here (back-out A).
+- **F4 Stop.** Fingerprint and match again, with `--step 2 --label fs`. It
+  must print `MIGRATE` with the same reason. Then R2's step 5 stop, at
+  once, with no other step between them: the live config's `sha256sum`,
+  recorded; `cp -p <the live config> <run_dir>/fs-pre-start-config.json`;
+  the recorded `docker inspect` of the old container's name and restart
+  policy; the recorded `docker inspect -f '{{json .Config.Env}} {{json
+  .Mounts}}'` of it, which names its `ROUTER_CONFIG` and the bind source
+  mounted there (the config it was started with); `docker stop`; `docker update --restart no`; and
+  `docker rename <that Id> <router.container>-pre-registry`. Then the
+  ledger's first line, written to a ledger that must not exist yet (each FS
+  attempt uses a new run_dir), `( set -C; printf 'F4 stopped %s %s %s\n'
+  <that Id> <its recorded name> <its recorded policy> > <run_dir>/fs-ledger.txt )
+  || echo 'STOP: the ledger write failed: run nothing further' >&2`. `set -C` refuses an existing ledger rather than truncating it.
+- **F4b Quiet again**, after the stop: the quiet block once more. Not quiet
+  means a request arrived after F3, or OLD holds in-flight state. Clear nothing, start nothing: take
+  back-out B (the old router drains it), then start FS again from F1.
+- **F4c The snapshot**: `printf 'F4c started\n' >> <run_dir>/fs-ledger.txt
+  || echo 'STOP: the ledger write failed: run nothing further' >&2`, then the snapshot block below, of OLD, then, only after its
+  `fs-snapshot: OK` and `fs-lanes: OK` lines, `printf 'F4c ok %s\n' <BK> >>
+  <run_dir>/fs-ledger.txt || echo 'STOP: the ledger write failed: run nothing further' >&2`.
+- **F5 The live config.** `printf 'F5 started\n' >> <run_dir>/fs-ledger.txt
+  || echo 'STOP: the ledger write failed: run nothing further' >&2`, then `python3 amap-sandy.py --state-dir <NEW> install --apply`. Its live config's `sha256sum` must equal F2's. A mismatch stops
+  FS before any start: back-out B. Then the separation block again, and the
+  EMPTY witness: as the account that runs the router,
+  ```sh
+  ( NST='<NEW>'
+    stop() { printf 'fs-empty: STOP: %s\n' "$1" >&2; exit 1; }
+    [ -d "$NST" ] && [ ! -h "$NST" ] || stop "NEW is not a directory, or is a symlink"
+    me=$(id -u) || stop "the account cannot be read"
+    o=$(stat -c '%u %a' -- "$NST") || stop "NEW cannot be stat'ed"
+    [ "$o" = "$me 700" ] || stop "NEW is not private to the router's account ($o, not $me 700)"
+    left=$(ls -A -- "$NST") || stop "NEW cannot be listed: its emptiness is not established"
+    [ -z "$left" ] || stop "NEW is not empty"
+    printf 'fs-empty: OK %s is empty at %s\n' "$NST" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" )
+  ```
+  NEW must be the router account's own 0700 directory, not a symlink, and
+  empty. A listing that fails is never proof of emptiness.
+- **F6 Start.** `printf 'F6 attempted\n' >> <run_dir>/fs-ledger.txt
+  || echo 'STOP: the ledger write failed: run nothing further' >&2`, then
+  `docker/run.sh --config <the live config> --image
+  <router.image.digest> --name <router.container> --detach`, from the hop
+  checkout, as the account that runs the router. After this start there is
+  no automatic back-out (below).
+- **F7 Accept.** Wait for a poll at least 3 s after the start. Then, each
+  read from durable state; a read that fails stops FS:
+  - `router-fingerprint --step 0 --label fs --apply` and its `--match` print
+    `MEASURED` (`measured`);
+  - the router's `status.json`: `registry.state` is `ok`, `registry.held` is
+    `{}`, and every configured instance has a `generations` entry;
+  - each instance's `<logical_id>/generations.json` holds exactly one
+    generation, its reason `first`, and it is the current one;
+  - its `gen-<current>/first-seen.json` has an empty `outbox_snapshot`, and
+    `gen-<current>/results/` holds no `quarantined_pre_approval` result:
+    F3 and F4b proved nothing was waiting;
+  - `python3 amap-sandy.py verify` passes.
+
+  As corroboration only (logs are not durable): `docker logs
+  <router.container> 2>&1 | grep -F "FIRST SIGHT"` shows each instance's
+  first sight with 0 requests.
+- **F8 The old container stays**, stopped, named
+  `<router.container>-pre-registry` with restart policy `no`, through the
+  retention below.
+
+**The snapshot** (F4c). It is OLD whole, taken while the old router is
+stopped, as R2's step 5 snapshot: per instance `first-seen.json`,
+`results/`, `delivered/`, `quarantine/`, `pending/` and `audit/`, plus
+`.router.lock` and `status.json`. It is the record of OLD for back-out B's
+check. The instance lanes are archived beside it into `fs-lanes.tar`, a
+best-effort, non-atomic live archive that is an ARCHIVE ONLY and never
+restore input. Both hold message content, so they stay the operator's
+alone: mode 0600 in a new 0700 directory outside OLD, NEW,
+`instances_dir`, the hop root and every path a container mounts. They never
+leave the host and are never attached to a message. Run it as the operator,
+in one POSIX shell with GNU coreutils and GNU tar (a Linux host), filling in
+the seven values.
+- Choosing `BK`, a new directory private to the operator on the host's own
+  disk, which no container mounts, is the operator's precondition. The block
+  supports it but cannot prove it: it refuses a target under OLD, NEW,
+  `instances_dir`, the hop root, or any bind source of the old router or
+  the hub-link router (an absent hub-link router adds none), but it cannot
+  see every other container's mounts. A bind source that is the root
+  directory, or that is neither a resolvable directory nor an existing
+  file, stops it.
+- Its before-and-after listing of OLD is a change detector, not proof that
+  the content is unchanged. The snapshot is consistent because the old
+  router is stopped and nothing else writes OLD. `tar -d` then proves the
+  archive equals the tree.
+- Every observation is checked by its own exit status before its output is
+  believed.
+- It assumes the router's one operator uid owns the whole of OLD (its 0600
+  files and 0755 directories), so the operator's tar records bytes and
+  modes. State owned by another uid is outside it.
+
+```sh
+( ST='<OLD>'; NST='<NEW>'; INST='<instances_dir>'; HOP='<the hop root: its host path>'
+  BK='<a new, operator-private, host-only directory for the snapshot>'
+  OLD='<the old container Id, as F4 records it>'; HUB='<the hub-link router container>'
+  umask 077
+  stop() { printf 'fs-snapshot: STOP: %s\n' "$1" >&2; exit 1; }
+  manifest() {  # every entry: type, mode, owner, size (link target for a link; none for a directory), name; NUL-ended, sorted
+    ( cd -- "$1" && find . \( -type d -printf '%y %m %U %G - %p\0' \) -o \( -type l -printf '%y %m %U %G %l %p\0' \) \
+        -o -printf '%y %m %U %G %s %p\0' ) > "$2.unsorted" || return 1
+    LC_ALL=C sort -z -o "$2" -- "$2.unsorted" && rm -- "$2.unsorted"
+  }
+  s=$(docker inspect -f '{{.State.Running}} {{.HostConfig.RestartPolicy.Name}}' "$OLD") \
+    || stop "the old router cannot be inspected"
+  [ "$s" = "false no" ] || stop "the old router is not shown stopped with restart policy no"
+  STP=$(cd -P -- "$ST" && pwd -P) || stop "no state_dir $ST"
+  case "$NST" in /*) ;; *) stop "NEW $NST is not an absolute path" ;; esac
+  case "$NST/" in //|*/./*|*/../*|*//*) stop "NEW $NST is not a normalised path, or is the root directory" ;; esac
+  ND=$(cd -P -- "$(dirname -- "$NST")" && pwd -P) || stop "no parent for NEW $NST"
+  NP=$ND/$(basename -- "$NST")
+  INP=$(cd -P -- "$INST" && pwd -P) || stop "no instances_dir $INST"
+  case "$HOP" in /*) ;; *) stop "the hop root $HOP is not an absolute path" ;; esac
+  case "$HOP/" in //|*/./*|*/../*|*//*) stop "the hop root $HOP is not a normalised path, or is the root directory" ;; esac
+  HD=$(cd -P -- "$(dirname -- "$HOP")" && pwd -P) || stop "no parent for the hop root $HOP"
+  HP=$HD/$(basename -- "$HOP"); HPM=
+  if [ -e "$HP" ] || [ -h "$HP" ]; then
+    [ -d "$HP" ] && [ ! -h "$HP" ] || stop "the hop root $HOP is not a directory, or is a symlink"
+    HPM=$HP
+  fi
+  [ "$STP" != / ] || stop "state_dir is the root directory"
+  case "$HP/" in "$STP"/*) stop "the hop root lies under state_dir" ;; esac
+  case "$STP/" in "$HP"/*) stop "state_dir lies under the hop root" ;; esac
+  MNT=$(docker inspect -f '{{range .Mounts}}{{if eq .Type "bind"}}{{.Source}}{{"\n"}}{{end}}{{end}}' "$OLD") \
+    || stop "the old router's mounts cannot be read"
+  hub=$(docker ps -a -q --no-trunc --filter "name=^/$HUB\$") || stop "docker cannot list containers"
+  if [ -n "$hub" ]; then
+    HM=$(docker inspect -f '{{range .Mounts}}{{if eq .Type "bind"}}{{.Source}}{{"\n"}}{{end}}{{end}}' "$HUB") \
+      || stop "the hub-link router's mounts cannot be read"
+    MNT=$(printf '%s\n%s' "$MNT" "$HM")
+  else
+    printf 'fs-snapshot: no container %s: it adds no mounts\n' "$HUB"
+  fi
+  BKD=$(cd -P -- "$(dirname -- "$BK")" && pwd -P) || stop "no parent for $BK"
+  BKP=$BKD/$(basename -- "$BK")
+  case "$BKP/" in "$NP"/*) stop "$BK lies under NEW" ;; esac
+  IFS=$(printf '\n.'); IFS=${IFS%.}; set -f
+  case "$BKP/" in "$HP"/*) stop "$BK lies under the hop root" ;; esac
+  for m in $STP $INP $HPM $MNT; do
+    if [ -d "$m" ]; then mp=$(cd -P -- "$m" && pwd -P) || stop "the mount source $m cannot be resolved"
+    elif [ -f "$m" ]; then mp=$m
+    else stop "the mount source $m is neither a directory nor a file"; fi
+    [ "$mp" != / ] || stop "a mount source is the root directory: nothing can lie outside it"
+    case "$BKP/" in "$mp"/*) stop "$BK lies under $m" ;; esac
+  done
+  IFS=$(printf ' \t\n.'); IFS=${IFS%.}; set +f
+  mkdir -m 0700 -- "$BKP" || stop "$BK already exists, or cannot be made"
+  before=$(cd -- "$STP" && ls -lnAR --full-time .) || stop "state_dir cannot be listed"
+  tar --numeric-owner -cpf "$BKP/fs-state.tar" -C "$STP" . || stop "tar failed"
+  after=$(cd -- "$STP" && ls -lnAR --full-time .) || stop "state_dir cannot be listed"
+  [ "$before" = "$after" ] || stop "state_dir changed during the tar: something else writes it"
+  tar --numeric-owner -dpf "$BKP/fs-state.tar" -C "$STP" > /dev/null || stop "the snapshot is not the tree"
+  manifest "$STP" "$BKP/fs-state.manifest" || stop "the state's manifest cannot be written"
+  ( cd -- "$BKP" && sha256sum fs-state.manifest > fs-state.manifest.sha256 ) || stop "sha256sum failed"
+  chmod 0600 -- "$BKP/fs-state.tar" "$BKP/fs-state.manifest" || stop "chmod failed"
+  ( cd -- "$BKP" && sha256sum fs-state.tar > fs-state.tar.sha256 ) || stop "sha256sum failed"
+  ( cd -- "$BKP" && sha256sum -c --strict --status fs-state.tar.sha256 ) || stop "the snapshot does not read back"
+  n=$(wc -c < "$BKP/fs-state.tar") || stop "the snapshot cannot be measured"
+  case $n in ""|*[!0-9]*) stop "the snapshot cannot be measured" ;; esac
+  h=$(cut -d' ' -f1 "$BKP/fs-state.tar.sha256") || stop "the snapshot's sha256 cannot be read"
+  case $h in ""|*[!0-9a-f]*) stop "the snapshot's sha256 cannot be read" ;; esac
+  [ ${#h} -eq 64 ] || stop "the snapshot's sha256 cannot be read"
+  printf 'fs-snapshot: OK %s bytes %s %s\n' "$n" "$h" "$BKP/fs-state.tar"
+  lanes=$(cd -- "$INP" || exit 1; for d in */inbox */peer */outbox; do [ -d "$d" ] && printf '%s\n' "$d"; done; exit 0) \
+    || stop "instances_dir cannot be read"
+  [ -n "$lanes" ] || stop "instances_dir holds no lane"
+  printf '%s\n' "$lanes" > "$BKP/fs-lanes.list" || stop "the lane list cannot be written"
+  ( cd -- "$INP" && tar --numeric-owner -cpf "$BKP/fs-lanes.tar" -T "$BKP/fs-lanes.list" ) 2> "$BKP/fs-lanes.tar.log"
+  rc=$?
+  cat -- "$BKP/fs-lanes.tar.log" >&2 || stop "tar's warnings cannot be read back"
+  [ "$rc" -le 1 ] || stop "the lane archive failed"
+  rm -- "$BKP/fs-lanes.list" || stop "the lane list cannot be removed"
+  chmod 0600 -- "$BKP/fs-lanes.tar" || stop "chmod failed"
+  ( cd -- "$BKP" && sha256sum fs-lanes.tar > fs-lanes.tar.sha256 ) || stop "sha256sum failed"
+  ( cd -- "$BKP" && sha256sum -c --strict --status fs-lanes.tar.sha256 ) || stop "the lane archive does not read back"
+  n=$(wc -c < "$BKP/fs-lanes.tar") || stop "the lane archive cannot be measured"
+  case $n in ""|*[!0-9]*) stop "the lane archive cannot be measured" ;; esac
+  h=$(cut -d' ' -f1 "$BKP/fs-lanes.tar.sha256") || stop "the lane archive's sha256 cannot be read"
+  case $h in ""|*[!0-9a-f]*) stop "the lane archive's sha256 cannot be read" ;; esac
+  [ ${#h} -eq 64 ] || stop "the lane archive's sha256 cannot be read"
+  printf 'fs-lanes: OK %s bytes %s %s (best-effort, non-atomic live archive: entries may be omitted or contain changing data; tar exit %s; its warnings in fs-lanes.tar.log)\n' \
+    "$n" "$h" "$BKP/fs-lanes.tar" "$rc" )
+```
+
+The lane archive is taken with agents running: entries may be omitted or
+contain changing data, and its sha256 proves the archive file's integrity,
+not complete lane coverage. GNU tar's exit 1 (a file changed, or was
+removed, as it was read) is recorded, not refused, and tar's warnings are
+kept in `fs-lanes.tar.log` and shown. Record the `fs-snapshot: OK` and
+`fs-lanes: OK` lines (each byte count, sha256 and path), tar's exit code and
+any warnings it showed, in the run log. Any `STOP` line ends FS here: take
+back-out B. The block refuses a directory that already exists, so a
+snapshot is never added to or replaced.
+
+**FS's back-outs**, by the point reached:
+- **A. Before F4's stop:** nothing has changed. The run directory's files
+  are inert.
+- **B. After the stop, before F6's start:**
+  1. The phase block, below. It reads the ledger and names the branch:
+     - `BEFORE-VALID-SNAPSHOT` (F4b found work, or F4c did not complete):
+       OLD was never written and no archive is needed. Skip the OLD check.
+     - `AFTER-SNAPSHOT`: the OLD check, below. OLD must still be the
+       snapshot, entry for entry; it restores OLD from the snapshot only
+       when it is not.
+     Any other ledger, an attempted F6, or an old container that is not
+     exactly as F4 left it STOPs for reconciliation.
+  2. If the ledger has `F5 started`, `cp -p <run_dir>/fs-pre-start-config.json
+     <the old container's config: the bind source F4 recorded at its
+     ROUTER_CONFIG>`, and check that `sha256sum` equals F4's record.
+  3. R2's back-out B steps 2-4: `docker rename` the old container to its
+     recorded name, `docker update --restart` its recorded policy, and
+     `docker start` it by its Id.
+
+  NEW is left as it is. Nothing in the lanes is touched.
+- **After F6's start: no automatic back-out.** The pinned router admits
+  every resolved instance on its first poll, and may write the hop root from
+  then on. Stop it, set its restart policy to `no`, rename it
+  `<router.container>-fs-failed`, and keep it with its `docker inspect` and
+  logs. Leave its state, the hop tree and the lanes in place: nothing is
+  wiped, restored or replayed. Any return to the old router is the router's
+  and the hop tree's maintainers' decision, recording what the new router
+  admitted.
+
+**The phase block**, back-out B's step 1:
+
+```sh
+( LEDGER='<fs-ledger.txt in the run directory>'; OLD='<the old container Id, as F4 records it>'; NEW='<router.container>'
+  stop() { printf 'fs-phase: STOP: %s\n' "$1" >&2; exit 1; }
+  absent() { ids=$(docker ps -a -q --no-trunc --filter "name=^/$1\$") || stop "docker cannot list containers"; [ -z "$ids" ]; }
+  [ -f "$LEDGER" ] && [ ! -h "$LEDGER" ] || stop "no ledger $LEDGER: reconcile by hand"
+  seq=$(cut -d' ' -f1,2 -- "$LEDGER") || stop "the ledger cannot be read"
+  seq=$(printf '%s' "$seq" | tr '\n' ';')
+  case $seq in
+    *"F6 attempted"*) stop "F6 was attempted: FS has no automatic back-out" ;;
+    "F4 stopped"|"F4 stopped;F4c started") branch=BEFORE-VALID-SNAPSHOT; cfg=no ;;
+    "F4 stopped;F4c started;F4c ok") branch=AFTER-SNAPSHOT; cfg=no ;;
+    "F4 stopped;F4c started;F4c ok;F5 started") branch=AFTER-SNAPSHOT; cfg=yes ;;
+    *) stop "the ledger is not a recognised phase sequence ($seq): reconcile" ;;
+  esac
+  rid=$(sed -n '1s/^F4 stopped \([^ ]*\) .*/\1/p' -- "$LEDGER") || stop "the ledger cannot be read"
+  [ "$rid" = "$OLD" ] || stop "the ledger names the old container $rid, not $OLD"
+  absent "$NEW" || stop "a container is named $NEW: the new router may have started"
+  absent "$NEW-fs-failed" || stop "a container is named $NEW-fs-failed: the new router started"
+  s=$(docker inspect -f '{{.Name}} {{.State.Running}} {{.HostConfig.RestartPolicy.Name}}' "$OLD") \
+    || stop "the old container cannot be inspected"
+  [ "$s" = "/$NEW-pre-registry false no" ] || stop "the old container is not exactly as F4 left it ($s)"
+  bk=$(sed -n 's/^F4c ok //p' -- "$LEDGER") || stop "the ledger cannot be read"
+  printf 'fs-phase: %s; restore the config: %s%s\n' "$branch" "$cfg" "${bk:+; the OLD check takes BK=$bk}" )
+```
+
+**The OLD check**, back-out B's step 1 on the `AFTER-SNAPSHOT` branch, as the operator in one POSIX shell
+with GNU coreutils and GNU tar. It runs only while no container is named
+`<router.container>` or `<router.container>-fs-failed`: `docker/run.sh`
+creates and starts the router in one step, so either name means F6 ran, and
+the block refuses. A container's absence is a `docker ps -a` that succeeds
+and lists nothing. When OLD still equals the snapshot, entry for entry
+(the snapshot's recorded manifest of every entry's type, mode, owner, size
+and name, and `tar -d` for the contents), it changes nothing. An extra
+entry is a change.
+Otherwise every entry OLD holds now goes into `ASIDE` (a NEW directory,
+private to the operator, on the host's own disk, which no container mounts;
+kept, never deleted, and never left inside OLD) and the snapshot is
+extracted in its place.
+
+```sh
+( ST='<OLD>'; NST='<NEW>'; INST='<instances_dir>'; HOP='<the hop root: its host path>'
+  BK='<the snapshot directory F4c recorded>'
+  ASIDE='<a new, operator-private, host-only directory for what it replaces>'
+  OLD='<the old container Id, as F4 records it>'; NEW='<router.container>'
+  HUB='<the hub-link router container>'
+  umask 077
+  stop() { printf 'fs-restore: STOP: %s\n' "$1" >&2; exit 1; }
+  manifest() {  # every entry: type, mode, owner, size (link target for a link; none for a directory), name; NUL-ended, sorted
+    ( cd -- "$1" && find . \( -type d -printf '%y %m %U %G - %p\0' \) -o \( -type l -printf '%y %m %U %G %l %p\0' \) \
+        -o -printf '%y %m %U %G %s %p\0' ) > "$2.unsorted" || return 1
+    LC_ALL=C sort -z -o "$2" -- "$2.unsorted" && rm -- "$2.unsorted"
+  }
+  absent() { ids=$(docker ps -a -q --no-trunc --filter "name=^/$1\$") || stop "docker cannot list containers"; [ -z "$ids" ]; }
+  absent "$NEW" || stop "a container is named $NEW: the new router started, and FS has no automatic back-out"
+  absent "$NEW-fs-failed" || stop "a container is named $NEW-fs-failed: the new router started, and FS has no automatic back-out"
+  s=$(docker inspect -f '{{.State.Running}} {{.HostConfig.RestartPolicy.Name}}' "$OLD") \
+    || stop "the old container cannot be inspected"
+  [ "$s" = "false no" ] || stop "the old container is not shown stopped with restart policy no"
+  STP=$(cd -P -- "$ST" && pwd -P) || stop "no state_dir $ST"
+  [ "$STP" != / ] || stop "state_dir is the root directory"
+  ( cd -- "$BK" && sha256sum -c --strict --status fs-state.tar.sha256 ) || stop "the snapshot is not the recorded one"
+  ( cd -- "$BK" && sha256sum -c --strict --status fs-state.manifest.sha256 ) || stop "the snapshot's manifest is not the recorded one"
+  NOW=$(mktemp -- "$BK/fs-check.XXXXXX") || stop "no scratch file for the current manifest"
+  manifest "$STP" "$NOW" || stop "the current state's manifest cannot be written"
+  if cmp -s -- "$NOW" "$BK/fs-state.manifest" && tar --numeric-owner -dpf "$BK/fs-state.tar" -C "$STP" > /dev/null 2>&1; then
+    printf 'fs-restore: OK %s is the snapshot, entry for entry; nothing restored\n' "$STP"; exit 0
+  fi
+  INP=$(cd -P -- "$INST" && pwd -P) || stop "no instances_dir $INST"
+  case "$HOP" in /*) ;; *) stop "the hop root $HOP is not an absolute path" ;; esac
+  case "$HOP/" in //|*/./*|*/../*|*//*) stop "the hop root $HOP is not a normalised path, or is the root directory" ;; esac
+  HD=$(cd -P -- "$(dirname -- "$HOP")" && pwd -P) || stop "no parent for the hop root $HOP"
+  HP=$HD/$(basename -- "$HOP"); HPM=
+  if [ -e "$HP" ] || [ -h "$HP" ]; then
+    [ -d "$HP" ] && [ ! -h "$HP" ] || stop "the hop root $HOP is not a directory, or is a symlink"
+    HPM=$HP
+  fi
+  case "$HP/" in "$STP"/*) stop "the hop root lies under state_dir" ;; esac
+  case "$STP/" in "$HP"/*) stop "state_dir lies under the hop root" ;; esac
+  MNT=$(docker inspect -f '{{range .Mounts}}{{if eq .Type "bind"}}{{.Source}}{{"\n"}}{{end}}{{end}}' "$OLD") \
+    || stop "the old container's mounts cannot be read"
+  if ! absent "$HUB"; then
+    HM=$(docker inspect -f '{{range .Mounts}}{{if eq .Type "bind"}}{{.Source}}{{"\n"}}{{end}}{{end}}' "$HUB") \
+      || stop "the hub-link router's mounts cannot be read"
+    MNT=$(printf '%s\n%s' "$MNT" "$HM")
+  fi
+  ADD=$(cd -P -- "$(dirname -- "$ASIDE")" && pwd -P) || stop "no parent for $ASIDE"
+  ASP=$ADD/$(basename -- "$ASIDE")
+  IFS=$(printf '\n.'); IFS=${IFS%.}; set -f
+  case "$ASP/" in "$HP"/*) stop "$ASIDE lies under the hop root" ;; esac
+  ND=$(cd -P -- "$(dirname -- "$NST")" && pwd -P) || stop "no parent for NEW $NST"
+  NP=$ND/$(basename -- "$NST")
+  case "$ASP/" in "$NP"/*) stop "$ASIDE lies under NEW" ;; esac
+  for m in $STP $INP $HPM $MNT; do
+    if [ -d "$m" ]; then mp=$(cd -P -- "$m" && pwd -P) || stop "the mount source $m cannot be resolved"
+    elif [ -f "$m" ]; then mp=$m
+    else stop "the mount source $m is neither a directory nor a file"; fi
+    [ "$mp" != / ] || stop "a mount source is the root directory: nothing can lie outside it"
+    case "$ASP/" in "$mp"/*) stop "$ASIDE lies under $m" ;; esac
+  done
+  IFS=$(printf ' \t\n.'); IFS=${IFS%.}; set +f
+  mkdir -m 0700 -- "$ASP" || stop "$ASIDE already exists, or cannot be made"
+  for e in "$STP"/* "$STP"/.[!.]* "$STP"/..?*; do
+    [ -e "$e" ] || [ -h "$e" ] || continue
+    mv -- "$e" "$ASP"/ || stop "cannot move $e aside"
+  done
+  left=$(ls -A -- "$STP") || stop "state_dir cannot be listed"
+  [ -z "$left" ] || stop "state_dir is not empty after the move aside"
+  tar --numeric-owner -xpf "$BK/fs-state.tar" -C "$STP" || stop "the extract failed"
+  tar --numeric-owner -dpf "$BK/fs-state.tar" -C "$STP" > /dev/null || stop "the restored tree is not the snapshot"
+  manifest "$STP" "$NOW" || stop "the restored state's manifest cannot be written"
+  cmp -s -- "$NOW" "$BK/fs-state.manifest" || stop "the restored tree does not hold exactly the snapshot's entries"
+  printf 'fs-restore: OK restored %s; what it replaced is kept in %s\n' "$STP" "$ASP" )
+```
+
+**FS's retention**, as the operator decided it:
+- OLD, the state snapshot (`fs-state.tar` and its `.sha256`, `fs-state.manifest`
+  and its `.sha256`, and any `fs-check.*` scratch manifest an OLD check left), any `ASIDE`
+  the OLD check made, the old container (stopped,
+  `<router.container>-pre-registry`, restart policy `no`) and any
+  `<router.container>-fs-failed` are kept until 7 days after the canary
+  passes. Then they are removed on the operator's go, by literal paths and
+  Ids, never a glob or a variable: `docker rm <the old container's Id>`;
+  `rm -- <the snapshot directory>/fs-state.tar <the snapshot directory>/fs-state.tar.sha256`;
+  and OLD by its literal path.
+- The lane archive (`fs-lanes.tar`, `fs-lanes.tar.sha256` and
+  `fs-lanes.tar.log`) is kept indefinitely, in the snapshot directory, which
+  therefore stays.
+- NEW, the new router's state, and every container are never removed
+  implicitly.
+- Record each removal in the run log, with `date -u`, the path or Id, and
+  the sha256 the archive had.
+
 ### The local router's delegation: fleet keys and activation
 
 Signed delegation between hosts needs three inputs, and it stays off until
