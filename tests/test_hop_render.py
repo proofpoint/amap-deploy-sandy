@@ -21,6 +21,7 @@ import host_setup as hs
 import hop_router as hp
 from _workspace import HOP_ROUTER_ROOT
 from test_hub_keys import full_doc as keys_doc
+from test_host_setup import GID as HOP_GID   # the fixture's hop group: [1]'s one group after its primary
 from test_hub_runtime import setUpModule, tearDownModule  # noqa: F401 -- the fixture's pins, restored
 
 FLEET_DOMAIN = "sandy.alpha.internal"
@@ -316,6 +317,12 @@ class RestartTest(unittest.TestCase):
         moved["hop"]["peer_uid"] = 9
         self.assertIn("hop changed: RESTART", hp.restart_notice(router_doc(keys), router_doc(moved)))
         self.assertIn("RESTART", hp.restart_notice(router_doc(keys), {"state_dir": "/srv/x/state"}))
+        # The restart line carries the principal's run.sh flags, as A4's does.
+        import hub_keys as hk
+        flags = hk.run_sh_flags(spec().keys)
+        self.assertEqual(flags, f" --group-add {HOP_GID}")
+        self.assertIn(f"docker/run.sh --detach{flags} from the hop checkout",
+                      hp.restart_notice(router_doc(keys), router_doc(moved), flags=flags))
         self.assertIn("RESTART", hp.restart_notice(None, router_doc(keys)))
 
 
@@ -480,7 +487,7 @@ class LiveTest(unittest.TestCase):
             (k["hop"]["root"], True), (k["registry_dir"], False),
             (os.path.dirname(k["delivered_domains_file"]), False),
             (os.path.dirname(k["transport_plugin"]["path"]), False))]
-        c = {"Mounts": mounts, "Config": {"User": "501:20"}, "HostConfig": {"UsernsMode": ""},
+        c = {"Mounts": mounts, "Config": {"User": "501:20"}, "HostConfig": {"UsernsMode": "", "GroupAdd": [str(HOP_GID)]},
              "Image": IMAGE["digest"]}
         c.update(over)
         return c
@@ -512,6 +519,15 @@ class LiveTest(unittest.TestCase):
         self.assertEqual(self.probe(c=self.container(Config={"User": "2101:2201"}), uid=None, gid=None), [])
         self.assertTrue(self.probe(c=self.container(Config={"User": "0:0"}), uid=None, gid=None))
 
+    def test_the_added_groups_are_the_principals_and_the_remedy_names_them(self):
+        """[1] started without its hop group passes the user check but not
+        this one: docker reports HostConfig.GroupAdd null, and the remedy
+        names run.sh --group-add with the principal's own group."""
+        bad = self.probe(c=self.container(HostConfig={"UsernsMode": ""}))
+        self.assertEqual(len(bad), 1, bad)
+        self.assertIn("added groups None", bad[0])
+        self.assertIn(f"docker/run.sh --group-add {HOP_GID}", bad[0])
+
     def test_each_fault_is_named(self):
         k = self.keys
         root = k["hop"]["root"]
@@ -524,7 +540,9 @@ class LiveTest(unittest.TestCase):
                                                                for m in self.container()["Mounts"]]),
             "plugin dir twice": self.container(Mounts=self.container()["Mounts"] + [self.container()["Mounts"][-1]]),
             "another user": self.container(Config={"User": "0:0"}),
-            "remapped": self.container(HostConfig={"UsernsMode": "private"}),
+            "remapped": self.container(HostConfig={"UsernsMode": "private", "GroupAdd": [str(HOP_GID)]}),
+            "the hop group not added": self.container(HostConfig={"UsernsMode": ""}),
+            "another group added": self.container(HostConfig={"UsernsMode": "", "GroupAdd": ["0"]}),
         }
         for what, c in cases.items():
             with self.subTest(what=what):

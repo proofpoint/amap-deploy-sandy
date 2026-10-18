@@ -47,6 +47,18 @@ class LoadTest(unittest.TestCase):
             hs.load_spec(doc)
         self.assertIn(words, str(e.exception))
 
+    def test_the_local_routers_added_group_comes_from_its_principal(self):
+        """KeySpec.group_add is the principal's groups after its primary, and
+        run_sh_flags renders one --group-add each; run.sh takes at most one,
+        so a principal with two refuses."""
+        ks = spec().keys
+        self.assertEqual(ks.group_add, (2100,))
+        self.assertEqual(hk.run_sh_flags(ks), " --group-add 2100")
+        d = full_doc()
+        d["groups"]["extra"] = 2300
+        d["principals"]["upstream"]["groups"].append("extra")
+        self.refuses(d, "docker/run.sh adds at most one (--group-add)")
+
     def test_the_key_belongs_to_the_hub_hop_s_upstream(self):
         k = spec().keys
         self.assertEqual((k.principal, k.uid, k.gid), ("upstream", UP, UPGRP))
