@@ -702,6 +702,9 @@ def place_named_router_config(path: Path, want: str) -> str:
     replace either profile by a rename in the operator's directory, so the
     install back-out after A3 works. Only this file: the manifest, the
     pointer and the payload keep their own writers' modes."""
+    if os.getuid() == 0:
+        raise ProvisionError(f"install runs as root: the named router config {path} is placed only by the "
+                             f"operator (install) or by A3's root place step, never by a root install")
     data = want.encode("utf-8")
     try:
         st: Optional[os.stat_result] = os.lstat(path)
@@ -3958,7 +3961,10 @@ def verify_router_sibling(home: Path, policy: Dict[str, Any], members: Dict[str,
     except OSError as e:
         return [f"router config: cannot read {path}: {e}"]
     if path != feature_root(home) / ROUTER_SIBLING_NAME:
-        st = os.lstat(path)
+        try:
+            st = os.lstat(path)
+        except OSError as e:
+            return [f"router config: cannot stat {path}: {e}"]
         if not named_router_config_profile_ok(st):
             return [f"router config: {path} is uid {st.st_uid} mode {stat.S_IMODE(st.st_mode):04o}, neither the "
                     f"operator's {NAMED_ROUTER_CONFIG_MODE:04o} nor A3's root "

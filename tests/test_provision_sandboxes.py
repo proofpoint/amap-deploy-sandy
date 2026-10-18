@@ -2731,6 +2731,50 @@ class RouterConfigPathTest(_ConnectorFixtureMixin, unittest.TestCase):
         self.assertEqual(len(problems), 1, problems)
         self.assertIn("mode 0440", problems[0])
 
+    def _lstat_as_root(self):
+        """os.lstat answering st_uid 0 for the named file only, so the root
+        half of A3's profile is exercised without running as root."""
+        real = os.lstat
+        named = str(self.named)
+
+        def lstat(p, *a, **k):
+            st = real(p, *a, **k)
+            if str(p) != named:
+                return st
+            return os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, 0, 0, st.st_size,
+                                   int(st.st_atime), int(st.st_mtime), int(st.st_ctime)))
+        prov.os.lstat = lstat
+        self.addCleanup(setattr, prov.os, "lstat", real)
+
+    def test_a_root_owned_0444_file_of_the_same_bytes_is_a3s_place(self):
+        self._fleet()
+        self.assertEqual(self._with_path("--apply")[0], 0)
+        os.chmod(self.named, 0o444)
+        self._lstat_as_root()
+        rc, out = self._with_path("--apply")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("present (A3's root 0444 place)", out)
+        self.assertEqual(self._mode(self.named), 0o444)
+
+    def test_a_root_owned_file_at_any_other_mode_is_refused(self):
+        self._fleet()
+        self.assertEqual(self._with_path("--apply")[0], 0)
+        os.chmod(self.named, 0o644)
+        self._lstat_as_root()
+        rc, out = self._with_path("--apply")
+        self.assertIn("neither this operator's regular file nor A3's root 0444 place", out)
+
+    def test_a_root_install_never_places_the_named_file(self):
+        self._fleet()
+        orig = prov.os.getuid
+        prov.os.getuid = lambda: 0
+        self.addCleanup(setattr, prov.os, "getuid", orig)
+        rc, out = self._with_path("--apply")
+        self.assertIn("install runs as root", out)
+        prov.os.getuid = orig
+        self.assertFalse(self.named.exists())
+        self.assertFalse(prov.router_config_pointer(self.tmp).exists())
+
     def _refuse_render(self):
         def refuse(*a, **k):
             raise prov.ProvisionError("a refused rendering")
