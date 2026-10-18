@@ -180,8 +180,17 @@ def load(sec: Any, spec: Any) -> KeySpec:
     if len(p.gids) > 2:
         raise KeySpecError(f"the local router's principal {local} has {len(p.gids) - 1} groups beyond its "
                            f"primary; docker/run.sh adds at most one (--group-add)")
+    for g in p.gids[1:]:
+        # docker/run.sh's own contract for --group-add: one decimal gid, not 0, at most 10 digits.
+        if isinstance(g, bool) or not isinstance(g, int) or not 0 < g <= RUN_SH_GID_MAX:
+            raise KeySpecError(f"the local router's principal {local} adds the group {g!r}; docker/run.sh "
+                               f"--group-add takes one decimal gid from 1 to {RUN_SH_GID_MAX}")
     return KeySpec(dir=d, file=sec["file"], evidence_dir=ev, local_config=cfg, principal=local, uid=p.uid,
                    gid=p.gids[0], volume=s.volume, group_add=tuple(p.gids[1:]))
+
+
+#: The largest gid docker/run.sh --group-add takes: ten decimal digits.
+RUN_SH_GID_MAX = 9999999999
 
 
 def run_sh_flags(ks: KeySpec) -> str:

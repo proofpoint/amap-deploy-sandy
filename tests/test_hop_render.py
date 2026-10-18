@@ -528,6 +528,22 @@ class LiveTest(unittest.TestCase):
         self.assertIn("added groups None", bad[0])
         self.assertIn(f"docker/run.sh --group-add {HOP_GID}", bad[0])
 
+    def test_group_add_is_compared_as_docker_reports_it_never_coerced(self):
+        """Only a list of strings equal to the principal's groups passes;
+        a dict, a string, false, 0 or a numeric member is named."""
+        for shape in ({str(HOP_GID): True}, str(HOP_GID), False, 0, [HOP_GID], [str(HOP_GID), str(HOP_GID)], []):
+            with self.subTest(shape=shape):
+                bad = self.probe(c=self.container(HostConfig={"UsernsMode": "", "GroupAdd": shape}))
+                self.assertEqual(len(bad), 1, (shape, bad))
+                self.assertIn("added groups", bad[0])
+
+    def test_null_group_add_passes_only_when_the_principal_adds_none(self):
+        orig = hp.router_group_add
+        hp.router_group_add = lambda spec: []
+        self.addCleanup(setattr, hp, "router_group_add", orig)
+        self.assertEqual(self.probe(c=self.container(HostConfig={"UsernsMode": "", "GroupAdd": None})), [])
+        self.assertTrue(self.probe(c=self.container(HostConfig={"UsernsMode": "", "GroupAdd": {}})))
+
     def test_each_fault_is_named(self):
         k = self.keys
         root = k["hop"]["root"]

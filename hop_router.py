@@ -621,7 +621,10 @@ def live_problems(spec: Any, keys: Dict[str, Any], roots: Any, *, run: Callable 
         bad.append(f"[1] runs as {cfg.get('User')!r}, not its principal's {uid}:{gid}: run docker/run.sh "
                    "as that account")
     groups = router_group_add(spec)
-    if list(host.get("GroupAdd") or []) != groups:
+    added = host.get("GroupAdd")
+    if added is None and not groups:
+        added = []      # docker reports no added group as null
+    if not (isinstance(added, list) and all(isinstance(g, str) for g in added) and added == groups):
         bad.append(f"[1] runs with the added groups {host.get('GroupAdd')!r}, not its principal's {groups}: "
                    f"start it with docker/run.sh" + "".join(f" --group-add {g}" for g in groups))
     if host.get("UsernsMode") not in ("", None, "host"):

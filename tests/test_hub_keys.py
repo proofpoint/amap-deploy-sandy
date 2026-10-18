@@ -59,6 +59,19 @@ class LoadTest(unittest.TestCase):
         d["principals"]["upstream"]["groups"].append("extra")
         self.refuses(d, "docker/run.sh adds at most one (--group-add)")
 
+    def test_the_added_group_is_bounded_by_run_shs_own_contract(self):
+        """run.sh refuses 0 and more than ten digits, so the load does too."""
+        for gid in (0, 10000000000):
+            with self.subTest(gid=gid):
+                d = full_doc()
+                hop = d["principals"]["upstream"]["groups"][1]
+                d["groups"][hop] = gid
+                self.refuses(d, "docker/run.sh --group-add takes one decimal gid from 1 to 9999999999")
+        d = full_doc()
+        hop = d["principals"]["upstream"]["groups"][1]
+        d["groups"][hop] = 9999999999
+        self.assertEqual(hs.load_spec(d).keys.group_add, (9999999999,))
+
     def test_the_key_belongs_to_the_hub_hop_s_upstream(self):
         k = spec().keys
         self.assertEqual((k.principal, k.uid, k.gid), ("upstream", UP, UPGRP))
