@@ -624,6 +624,7 @@ class VerifyTest(unittest.TestCase):
         td = tempfile.TemporaryDirectory()
         self.addCleanup(td.cleanup)
         self.t = Path(td.name)
+        os.chmod(self.t, 0o755)  # router.json here is a named config: its directory is the router's to traverse
         for name, value in (("render_router_sibling", lambda *a, **k: {"_doc": {"state_dir": str(self.t / "s")},
                                                                          "_warnings": []}),
                             ("router_sibling_path", lambda home: self.t / "router.json")):
