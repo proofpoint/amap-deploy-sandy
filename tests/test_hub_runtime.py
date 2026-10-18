@@ -56,6 +56,11 @@ def tearDownModule():
         setattr(hr, name, value)
 
 
+#: The uid the local router runs as, measured on its host: deliberately not upstream's declared uid
+#: (2101), so a HOP_PEER_UID derived from the principals cannot pass for it.
+PEER_UID = 2501
+
+
 def hub_sec():
     return {"host_label": "alpha", "own_domain": "alpha.internal",
             "login": {"local": "rt", "domain": "logins.internal"},
@@ -64,7 +69,7 @@ def hub_sec():
             "d7": {"dir": "/opt/ex/d7", "file": "d7.json", "source": "gen/d7.json"},
             "env_file": "/opt/ex/env/hub.env",
             "hop": {"name": "h1", "root": "/srv/example/a/b", "registry_dir": "/srv/example/registry",
-                    "registry_uid": 2300, "link": "link-a"},
+                    "registry_uid": 2300, "peer_uid": PEER_UID, "link": "link-a"},
             "dirs": dict(PRIVATE, lock_file="relay.lock"),
             "prefix_template": "/opt/ex/tmpl/prefix.json", "config_uid": 0}
 
@@ -209,6 +214,18 @@ class LoadTest(unittest.TestCase):
     def test_an_unknown_member_refuses(self):
         self.refuses(full_doc(extra=1), "must have")
 
+    def test_the_peer_uid_is_required_and_never_defaulted(self):
+        h = dict(hub_sec()["hop"])
+        del h["peer_uid"]
+        self.refuses(full_doc(hop=h), "hub.hop must have")
+
+    def test_a_peer_uid_that_is_not_a_measured_non_root_uid_refuses(self):
+        h = hub_sec()["hop"]
+        for bad in (0, -1, True, "2501", 2501.0, None, hr.PEER_UID_MAX + 1):
+            with self.subTest(bad=bad):
+                self.refuses(full_doc(hop=dict(h, peer_uid=bad)), "hub.hop.peer_uid")
+        self.assertEqual(hs.load_spec(full_doc(hop=dict(h, peer_uid=hr.PEER_UID_MAX))).hub.peer_uid, hr.PEER_UID_MAX)
+
     def test_no_secrets_probe_refuses(self):
         d = full_doc()
         del d[ss.SECTION]["probe"]
@@ -245,8 +262,13 @@ class RenderingTest(unittest.TestCase):
         self.assertEqual(self.env["RELAY_LOCK"], "/down/lock/relay.lock")
         self.assertEqual(self.env["HOP_ROOT"], "/data/root")
 
-    def test_the_peer_uid_is_the_upstream_s(self):
-        self.assertEqual(self.env["HOP_PEER_UID"], "2101")
+    def test_the_peer_uid_is_the_measured_one_never_the_principal_s(self):
+        self.assertNotEqual(PEER_UID, self.spec.principals["upstream"].uid)
+        self.assertEqual(self.env["HOP_PEER_UID"], str(PEER_UID))
+
+    def test_the_plan_names_the_same_peer_uid_as_the_environment(self):
+        lines = hs.render_plan(self.spec)
+        self.assertIn(f"# downstream's runtime environment: {self.spec.hops[0][3]}={PEER_UID}", lines)
 
     def test_the_d7_owner_is_root(self):
         self.assertEqual((self.env["HUB_D7_CONFIG"], self.env["HUB_D7_UID"]), ("/opt/ex/d7/d7.json", "0"))

@@ -509,6 +509,8 @@ def render_plan(spec: Spec, overlay_source: Optional[Path] = None,
             lines.append(f"{steps} marker {q(posixpath.join(m['host'], m['marker']))}"
                          f"  # {m['principal']}'s root marker: random, root-owned, read-only")
     for (name, env), uid in sorted(peer_uids(spec).items()):
+        if spec.hub is not None and spec.secrets is not None and name == spec.secrets.principal:
+            uid = spec.hub.peer_uid      # the hub-link router's HOP_PEER_UID is the measured uid
         lines.append(f"# {name}'s runtime environment: {env}={uid}")
     for r in spec.runtimes:
         lines.append(f"# {r['principal']}'s runtime ({r['container']}) starts under umask {r['umask']:04o}: "
