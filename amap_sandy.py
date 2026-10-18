@@ -3668,7 +3668,8 @@ def activation_sequence(spec: Any, source: str, final: bytes, path: Path, pre_ac
         f"1. done: the activation config is {source} (sha256 {final_sha})",
         f"2. as root: {ai.place_step(spec, source, final)}",
         f"3. the host's {path} is byte for byte that file: sha256 {final_sha}",
-        f"4. A4: restart the local router: docker/run.sh --config {path} --detach, from the hop checkout",
+        f"4. A4: restart the local router: docker/run.sh --config {path} --detach{hk.run_sh_flags(spec.keys)}, "
+        f"from the hop checkout",
         ("5. A5: python3 amap-sandy.py verify --a5; every check must PASS except the signing check's UNKNOWN for "
          "the VM file share, which --a5 excuses only by its exact reason"
          if spec.supervision is not None and spec.supervision.kind == hv.KINDS[1] else
@@ -3762,7 +3763,9 @@ def run_render_router(args: argparse.Namespace, home: Path, boxes: List[Dict[str
     except OSError as e:
         print(f"router config: cannot read {path}: {e}", file=sys.stderr)
         return 2
-    notice = hp.restart_notice(_read_json(path) if have is not None else None, doc)
+    notice = hp.restart_notice(_read_json(path) if have is not None else None, doc,
+                               flags=hk.run_sh_flags(hop_spec[0].keys) if hop_spec and hop_spec[0] is not None
+                               and getattr(hop_spec[0], "keys", None) is not None else "")
     if apply:
         if have == want:
             print(f"router config current: {path} — {len(members)} instance(s): {names}")

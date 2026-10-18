@@ -121,6 +121,7 @@ class KeySpec:
     uid: int
     gid: int
     volume: str               # the secret volume, the one mount the probe drops
+    group_add: Tuple[int, ...] = ()   # the principal's other groups: docker/run.sh --group-add
 
     @property
     def path(self) -> str:
@@ -176,8 +177,26 @@ def load(sec: Any, spec: Any) -> KeySpec:
         if _related(ev, o):
             raise KeySpecError(f"keys.evidence_dir {ev} overlaps {o}; no runtime may reach the evidence")
     p = spec.principals[local]
+    if len(p.gids) > 2:
+        raise KeySpecError(f"the local router's principal {local} has {len(p.gids) - 1} groups beyond its "
+                           f"primary; docker/run.sh adds at most one (--group-add)")
+    for g in p.gids[1:]:
+        # docker/run.sh's own contract for --group-add: one decimal gid, not 0, at most 10 digits.
+        if isinstance(g, bool) or not isinstance(g, int) or not 0 < g <= RUN_SH_GID_MAX:
+            raise KeySpecError(f"the local router's principal {local} adds the group {g!r}; docker/run.sh "
+                               f"--group-add takes one decimal gid from 1 to {RUN_SH_GID_MAX}")
     return KeySpec(dir=d, file=sec["file"], evidence_dir=ev, local_config=cfg, principal=local, uid=p.uid,
-                   gid=p.gids[0], volume=s.volume)
+                   gid=p.gids[0], volume=s.volume, group_add=tuple(p.gids[1:]))
+
+
+#: The largest gid docker/run.sh --group-add takes: ten decimal digits.
+RUN_SH_GID_MAX = 9999999999
+
+
+def run_sh_flags(ks: KeySpec) -> str:
+    """The local router's run.sh flags beyond --config and --detach, from its
+    principal's groups: one --group-add per group after the primary."""
+    return "".join(f" --group-add {g}" for g in ks.group_add)
 
 
 # --- The probe ------------------------------------------------------------------
@@ -603,7 +622,8 @@ def verify_signing(ks: KeySpec, raw: Any, bind: rh.Check, sg: Signing) -> rh.Che
     section = status.get("classification") if isinstance(status, dict) else None
     if isinstance(section, dict) and section.get("config_reload_failed") is True:
         return rh.check(claim, want, "the running router refused its config file and runs an older one",
-                        f"correct {ks.local_config}, then restart the local router with docker/run.sh --detach (A4)",
+                        f"correct {ks.local_config}, then restart the local router with docker/run.sh --detach"
+                        f"{run_sh_flags(ks)} (A4)",
                         do_not="never read the file as what the router runs while the flag is set")
     unknown_inputs = [v.reason for v in (sg.policy_on, sg.gate_ok) if isinstance(v, rh.Unresolved)]
     seen = {_verdict(doc, p, g, sg)
@@ -757,8 +777,8 @@ def inode_problem(host: Dict[str, Any], seen: Dict[str, Any]) -> str:
     sha256 is of the bytes read through the descriptor it stat'ed."""
     if (host.get("dev"), host.get("ino"), host.get("ctime_ns"), host.get("sha256")) \
             != (seen["dev"], seen["ino"], seen["ctime_ns"], seen["sha256"]):
-        return ("the local router binds a replaced inode, or one changed since; recreate it with "
-                "docker/run.sh --detach (A4)")
+        return ("the local router binds a replaced inode, or one changed since; recreate it with A4's "
+                "printed docker/run.sh line, its --group-add included")
     return ""
 
 
@@ -843,7 +863,7 @@ def _status_witness(claim: str, want: rh.Fact, why: str, ks: KeySpec, sg: Signin
         return rh.check(claim, want, True, remedy)
     if result == rh.FAIL:
         return rh.check(claim, want, reason, f"correct {ks.local_config}, then restart the local router with "
-                                             "docker/run.sh --detach (A4)")
+                                             f"docker/run.sh --detach{run_sh_flags(ks)} (A4)")
     return rh.unknown(claim, want, f"{why}; {reason}", "start the local router, or let it run, then run verify again")
 
 
@@ -884,8 +904,8 @@ def _bind(ks: KeySpec, live: Any, read_bytes_: Callable[[str], bytes]) -> Tuple[
     bind_want = _fact("live config", (ks.local_config, host_sha if isinstance(host_sha, str) else None),
                       "keys.local_config, which install binds to the router.json it renders, and its bytes "
                       "on the host")
-    bind_remedy = (f"start the local router with docker/run.sh --config {ks.local_config}, the file install "
-                   "renders, and never a copy")
+    bind_remedy = (f"start the local router with docker/run.sh --config {ks.local_config}{run_sh_flags(ks)}, "
+                   "the file install renders, and never a copy")
     if isinstance(host_sha, rh.Unresolved):
         return raw, rh.unknown(bind_claim, bind_want, host_sha.reason, "render and place the local router's config")
     if live is None or isinstance(live, rh.Unresolved):

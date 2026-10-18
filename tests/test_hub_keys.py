@@ -92,6 +92,31 @@ class LoadTest(unittest.TestCase):
             hs.load_spec(doc)
         self.assertIn(words, str(e.exception))
 
+    def test_the_local_routers_added_group_comes_from_its_principal(self):
+        """KeySpec.group_add is the principal's groups after its primary, and
+        run_sh_flags renders one --group-add each; run.sh takes at most one,
+        so a principal with two refuses."""
+        ks = spec().keys
+        self.assertEqual(ks.group_add, (2100,))
+        self.assertEqual(hk.run_sh_flags(ks), " --group-add 2100")
+        d = full_doc()
+        d["groups"]["extra"] = 2300
+        d["principals"]["upstream"]["groups"].append("extra")
+        self.refuses(d, "docker/run.sh adds at most one (--group-add)")
+
+    def test_the_added_group_is_bounded_by_run_shs_own_contract(self):
+        """run.sh refuses 0 and more than ten digits, so the load does too."""
+        for gid in (0, 10000000000):
+            with self.subTest(gid=gid):
+                d = full_doc()
+                hop = d["principals"]["upstream"]["groups"][1]
+                d["groups"][hop] = gid
+                self.refuses(d, "docker/run.sh --group-add takes one decimal gid from 1 to 9999999999")
+        d = full_doc()
+        hop = d["principals"]["upstream"]["groups"][1]
+        d["groups"][hop] = 9999999999
+        self.assertEqual(hs.load_spec(d).keys.group_add, (9999999999,))
+
     def test_the_key_belongs_to_the_hub_hop_s_upstream(self):
         k = spec().keys
         self.assertEqual((k.principal, k.uid, k.gid), ("upstream", UP, UPGRP))
