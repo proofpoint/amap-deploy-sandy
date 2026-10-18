@@ -283,6 +283,9 @@ ROUTER_CONFIG_POINTER = "router-config.path"
 # A named router config's mode: the router's principal and the pin read it
 # through the other bits, whatever the operator's umask.
 NAMED_ROUTER_CONFIG_MODE = 0o644
+# The same file after A3's root place: the pinned writer's `place` makes it
+# root's, 0444 (host_steps.OWNER_UID and OVERLAY_MODE). World-readable too.
+NAMED_ROUTER_CONFIG_PLACED = (0, 0o444)
 # The verdict file's own `schema`. It carries its own number so it can move
 # independently of the manifest and the CLI schema. An OPAQUE token like the
 # others: a file with any other value is refused by name, never read with this
@@ -683,11 +686,22 @@ def record_router_config(home: Path, *, dry_run: bool) -> Optional[str]:
                        label=ROUTER_CONFIG_POINTER)
 
 
+def named_router_config_profile_ok(st: os.stat_result) -> bool:
+    """One of the two owner-and-mode profiles the named file may have: the
+    operator's NAMED_ROUTER_CONFIG_MODE (install), or root's 0444 (A3's place,
+    NAMED_ROUTER_CONFIG_PLACED). Both are readable through the other bits."""
+    prof = (st.st_uid, stat.S_IMODE(st.st_mode))
+    return stat.S_ISREG(st.st_mode) and prof in ((os.getuid(), NAMED_ROUTER_CONFIG_MODE),
+                                                 NAMED_ROUTER_CONFIG_PLACED)
+
+
 def place_named_router_config(path: Path, want: str) -> str:
     """The named router config, placed atomically at NAMED_ROUTER_CONFIG_MODE
-    whatever the umask, and read back. Equal bytes still get the mode. An
-    existing file must be the operator's regular file. Only this file: the
-    manifest, the pointer and the payload keep their own writers' modes."""
+    whatever the umask, and read back. Equal bytes still get the mode, except
+    that A3's root 0444 place of those bytes is left as it is. New bytes
+    replace either profile by a rename in the operator's directory, so the
+    install back-out after A3 works. Only this file: the manifest, the
+    pointer and the payload keep their own writers' modes."""
     data = want.encode("utf-8")
     try:
         st: Optional[os.stat_result] = os.lstat(path)
@@ -695,8 +709,11 @@ def place_named_router_config(path: Path, want: str) -> str:
         st = None
     except OSError as e:
         raise ProvisionError(f"cannot stat {path}: {e}") from None
-    if st is not None and (not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid()):
-        raise ProvisionError(f"{path} is not a regular file owned by this operator: not replaced")
+    placed = st is not None and stat.S_ISREG(st.st_mode) \
+        and (st.st_uid, stat.S_IMODE(st.st_mode)) == NAMED_ROUTER_CONFIG_PLACED
+    if st is not None and (not stat.S_ISREG(st.st_mode) or (st.st_uid != os.getuid() and not placed)):
+        raise ProvisionError(f"{path} is neither this operator's regular file nor A3's root 0444 place: "
+                             f"not replaced")
     try:
         if st is None or path.read_bytes() != data:
             tmp = path.with_name(f".{path.name}.tmp")
@@ -715,6 +732,8 @@ def place_named_router_config(path: Path, want: str) -> str:
                 tmp.unlink(missing_ok=True)
                 raise
             verb = "updated" if st is not None else "created"
+        elif placed:
+            verb = "present (A3's root 0444 place)"
         elif stat.S_IMODE(st.st_mode) != NAMED_ROUTER_CONFIG_MODE:
             fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
             try:
@@ -728,10 +747,12 @@ def place_named_router_config(path: Path, want: str) -> str:
         back = path.read_bytes()
     except OSError as e:
         raise ProvisionError(f"cannot place {path}: {e}") from None
-    if not stat.S_ISREG(after.st_mode) or after.st_uid != os.getuid() \
-            or stat.S_IMODE(after.st_mode) != NAMED_ROUTER_CONFIG_MODE or back != data:
-        raise ProvisionError(f"{path} did not read back as the rendering, the operator's, mode "
-                             f"{NAMED_ROUTER_CONFIG_MODE:04o}")
+    kept = verb.startswith("present (")
+    want_prof = NAMED_ROUTER_CONFIG_PLACED if kept else (os.getuid(), NAMED_ROUTER_CONFIG_MODE)
+    if not stat.S_ISREG(after.st_mode) or (after.st_uid, stat.S_IMODE(after.st_mode)) != want_prof \
+            or back != data:
+        raise ProvisionError(f"{path} did not read back as the rendering, uid {want_prof[0]} mode "
+                             f"{want_prof[1]:04o}")
     return verb
 
 
@@ -3938,10 +3959,11 @@ def verify_router_sibling(home: Path, policy: Dict[str, Any], members: Dict[str,
         return [f"router config: cannot read {path}: {e}"]
     if path != feature_root(home) / ROUTER_SIBLING_NAME:
         st = os.lstat(path)
-        if stat.S_IMODE(st.st_mode) != NAMED_ROUTER_CONFIG_MODE or st.st_uid != os.getuid():
-            return [f"router config: {path} is uid {st.st_uid} mode {stat.S_IMODE(st.st_mode):04o}, not the "
-                    f"operator's {NAMED_ROUTER_CONFIG_MODE:04o}: the router's principal reads it through the "
-                    f"other bits — re-run install --apply"]
+        if not named_router_config_profile_ok(st):
+            return [f"router config: {path} is uid {st.st_uid} mode {stat.S_IMODE(st.st_mode):04o}, neither the "
+                    f"operator's {NAMED_ROUTER_CONFIG_MODE:04o} nor A3's root "
+                    f"{NAMED_ROUTER_CONFIG_PLACED[1]:04o}: the router's principal reads it through the other "
+                    f"bits — re-run install --apply"]
     if have == sibling_text(doc):
         return []
     existing = _read_json(path)

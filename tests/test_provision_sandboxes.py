@@ -2687,6 +2687,50 @@ class RouterConfigPathTest(_ConnectorFixtureMixin, unittest.TestCase):
             self.tmp, fp.load_policy(prov.feature_manifest_path(self.tmp)), prov.load_membership(self.tmp, boxes),
             prov.sibling_state_dir(self.tmp, None), {b["name"]: Path(b["path"]) for b in boxes}), [])
 
+    def _as_a3_placed(self):
+        """A3's root place is staged as this test's own uid at 0444: the
+        suite never runs as root, so the profile's uid is set to ours."""
+        orig = prov.NAMED_ROUTER_CONFIG_PLACED
+        prov.NAMED_ROUTER_CONFIG_PLACED = (os.getuid(), 0o444)
+        self.addCleanup(setattr, prov, "NAMED_ROUTER_CONFIG_PLACED", orig)
+
+    def test_a3s_root_0444_place_of_the_same_bytes_is_left_as_it_is(self):
+        self._fleet()
+        self.assertEqual(self._with_path("--apply")[0], 0)
+        self._as_a3_placed()
+        os.chmod(self.named, 0o444)
+        rc, out = self._with_path("--apply")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("present (A3's root 0444 place)", out)
+        self.assertEqual(self._mode(self.named), 0o444)
+
+    def test_new_bytes_replace_a3s_place_as_the_operators_0644(self):
+        """The install back-out after A3: the rendering replaces the activated
+        file by a rename in the operator's directory."""
+        self._fleet()
+        self.assertEqual(self._with_path("--apply")[0], 0)
+        self._as_a3_placed()
+        self.named.write_text('{"activated": true}\n')
+        os.chmod(self.named, 0o444)
+        rc, out = self._with_path("--apply")
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn("activated", self.named.read_text())
+        self.assertEqual(self._mode(self.named), prov.NAMED_ROUTER_CONFIG_MODE)
+
+    def test_verify_accepts_a3s_place_and_still_names_any_other_profile(self):
+        boxes = self._fleet()
+        self.assertEqual(self._with_path("--apply")[0], 0)
+        prov._ROUTER_CONFIG_OVERRIDE = None
+        self._as_a3_placed()
+        args = (self.tmp, fp.load_policy(prov.feature_manifest_path(self.tmp)), prov.load_membership(self.tmp, boxes),
+                prov.sibling_state_dir(self.tmp, None), {b["name"]: Path(b["path"]) for b in boxes})
+        os.chmod(self.named, 0o444)
+        self.assertEqual(prov.verify_router_sibling(*args), [])
+        os.chmod(self.named, 0o440)
+        problems = prov.verify_router_sibling(*args)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("mode 0440", problems[0])
+
     def _refuse_render(self):
         def refuse(*a, **k):
             raise prov.ProvisionError("a refused rendering")
