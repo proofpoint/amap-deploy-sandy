@@ -13,6 +13,7 @@ import os
 import stat
 import tempfile
 import time
+import posixpath
 import unittest
 
 import host_setup as hs
@@ -39,6 +40,23 @@ def full_doc(**keys_over):
 
 def spec(**over):
     return hs.load_spec(full_doc(**over))
+
+
+class RootDirsTest(unittest.TestCase):
+    def test_the_writer_anchor_and_d7_parents_are_made_but_not_their_own_dirs(self):
+        """Each of those three is made by its own install -d; only the parents
+        above it, below the first level, are the helper's. /opt itself is never touched."""
+        spec = globals()['spec']()
+        dirs = hs.root_dirs(spec)
+        for parent in ("/opt/ex",):
+            self.assertIn(parent, dirs)
+        for own in (spec.secrets.writer_dir, posixpath.dirname(spec.secrets.anchor), spec.hub.d7_dir):
+            if own != posixpath.dirname(spec.overlay_path):
+                self.assertNotIn(own, dirs, own)
+        self.assertIn(posixpath.dirname(spec.overlay_path), dirs)
+        self.assertNotIn("/opt", dirs)
+        self.assertNotIn("/", dirs)
+        self.assertEqual(dirs, sorted(dirs, key=lambda d: (d.count("/"), d)))
 
 
 class LoadTest(unittest.TestCase):

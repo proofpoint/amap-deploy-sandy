@@ -477,6 +477,31 @@ def _ancestors(path: str) -> List[str]:
     return ["/" + "/".join(parts[:i]) for i in range(len(parts))] if parts != [""] else []
 
 
+#: Root's own directories the plan places into are made 0755, root's.
+ROOT_DIR_MODE = 0o755
+
+
+def root_dirs(spec: Spec) -> List[str]:
+    """The root-owned directories the plan places into but does not make
+    itself, with their parents below the first level, shallow first: the
+    plugin's directory, and the parents of the writer's, the anchor's and
+    D7's (each of those three is made by its own `install -d`, which would
+    make a missing parent under root's umask, not 0755). The first level (/opt)
+    must already exist; nothing here changes it."""
+    placed = []
+    if spec.overlay_path is not None:
+        placed.append(posixpath.dirname(spec.overlay_path))
+    own = [] if spec.overlay_path is None else [posixpath.dirname(spec.overlay_path)]
+    if spec.secrets is not None:
+        placed += [spec.secrets.writer_dir, posixpath.dirname(spec.secrets.anchor)]
+    if spec.hub is not None:
+        placed.append(spec.hub.d7_dir)
+    dirs = set(own)
+    for d in placed:
+        dirs.update(a for a in _ancestors(d) if a.count("/") >= 2)
+    return sorted(dirs, key=lambda d: (d.count("/"), d))
+
+
 def render_plan(spec: Spec, overlay_source: Optional[Path] = None,
                 hub: Optional[hr.Rendered] = None) -> List[str]:
     """The root-run steps, in order, as shell lines. Printed, never run.
@@ -500,6 +525,13 @@ def render_plan(spec: Spec, overlay_source: Optional[Path] = None,
                        key=lambda d: (-d.count("/"), d))
     lines.append("# The barrier: each root and every ancestor fsynced, deepest first.")
     lines.append(f"{steps} sync " + " ".join(q(d) for d in sync_dirs))
+    made = root_dirs(spec)
+    if made:
+        lines.append("# Root's own directories, before anything is placed in them: made 0755 and root's, "
+                     "parents first. A missing one is made fresh; an existing one another owner holds, and "
+                     "that is not empty, stops the step.")
+    for d in made:
+        lines.append(f"{steps} root {q(d)} 0 0 {ROOT_DIR_MODE:04o}")
     if spec.overlay_path is not None and spec.overlay_pin is not None:
         src = q(str(overlay_source)) if overlay_source else "<the pinned plugin artifact>"
         lines.append(f"{steps} place {src} {q(spec.overlay_path)}"

@@ -14,6 +14,7 @@ import json
 import os
 import stat
 import tempfile
+import posixpath
 import unittest
 from collections import namedtuple
 
@@ -287,6 +288,15 @@ class PlanTest(unittest.TestCase):
     def test_each_side_gets_the_other_sides_uid(self):
         self.assertIn(f"# downstream's runtime environment: EX_PEER_UID={UP}", self.plan)
         self.assertIn(f"# upstream's runtime environment: EX_PEER_UID={DOWN}", self.plan)
+
+    def test_roots_own_directories_are_made_before_anything_is_placed_in_them(self):
+        """The plugin's directory and its parents below the first level are
+        made by the helper, root's 0755, shallow first, before the place."""
+        made = [l for l in self.plan if l.startswith(f"{self.steps} root ") and l.endswith(" 0 0 0755")]
+        self.assertEqual(made, [f"{self.steps} root /srv/example 0 0 0755",
+                                f"{self.steps} root /srv/example/overlay 0 0 0755"])
+        place = next(i for i, l in enumerate(self.plan) if l.startswith(f"{self.steps} place "))
+        self.assertLess(max(self.plan.index(l) for l in made), place)
 
     def test_the_overlay_is_placed_and_names_its_digest(self):
         line = next(l for l in self.plan if l.startswith(f"{self.steps} place "))
