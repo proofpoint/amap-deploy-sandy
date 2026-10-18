@@ -145,12 +145,12 @@ class FreshStart(unittest.TestCase):
         return self.sh(fill(block("fs-restore: STOP"), ST=self.st, INST=self.inst, HOP=hop or self.hop, BK=self.bk,
                             ASIDE=aside, OLD="0123abcd", NEW="amap-router", HUB="hub-link"))
 
-    def separate(self, ost=None, nst=None):
-        return self.sh(fill(block("fs-separate: STOP"), OST=ost or self.st, NST=nst or self.new, OLD="0123abcd",
-                            HUB="hub-link"))
+    def separate(self, ost=None, nst=None, hop=None):
+        return self.sh(fill(block("fs-separate: STOP"), OST=ost or self.st, NST=nst or self.new, HOP=hop or self.hop,
+                            OLD="0123abcd", HUB="hub-link"))
 
     def quiet(self, slugs="alpha beta"):
-        return self.sh(fill(block("fs-quiet: STOP"), INST=self.inst, SLUGS=slugs))
+        return self.sh(fill(block("fs-quiet: STOP"), OST=self.st, INST=self.inst, SLUGS=slugs))
 
     def empty(self, nst=None):
         return self.sh(fill(block("fs-empty: STOP"), NST=nst or self.new))
@@ -445,6 +445,40 @@ exec $REAL "$@"
         self.assertEqual(p.returncode, 1)
         self.assertIn("OLD lies under NEW", p.stderr)
 
+    def test_new_and_the_hop_root_are_kept_apart(self):
+        """NEW is never the hop root, never inside it, never around it: the
+        hop tree's top level is the hub-link router's alone."""
+        inner_new = os.path.join(self.hop, "state")
+        os.mkdir(inner_new)
+        inner_hop = os.path.join(self.new, "hop")
+        os.mkdir(inner_hop)
+        for name, nst, hop, words in (("NEW is H", self.hop, None, "NEW is the hop root"),
+                                      ("NEW under H", inner_new, None, "NEW lies under the hop root"),
+                                      ("H under NEW", None, inner_hop, "the hop root lies under NEW")):
+            with self.subTest(name=name):
+                p = self.separate(nst=nst, hop=hop)
+                self.assertEqual(p.returncode, 1)
+                self.assertIn(words, p.stderr)
+        p = self.separate(hop=os.path.join(self.d, "no-hop"))
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("no hop root", p.stderr)
+
+    def test_the_old_check_refuses_a_state_dir_overlapping_the_hop_root(self):
+        self.assertEqual(self.snapshot().returncode, 0)
+        self.damaged()
+        state = tree(self.st)
+        inner = os.path.join(self.st, "hop")
+        os.mkdir(inner)
+        state = tree(self.st)
+        aside = os.path.join(self.d, "backup", "aside")
+        for hop, words in ((inner, "the hop root lies under state_dir"), (self.d, "state_dir lies under the hop root")):
+            with self.subTest(hop=hop):
+                p = self.restore(aside, hop=hop)
+                self.assertEqual(p.returncode, 1)
+                self.assertIn(words, p.stderr)
+                self.assertEqual(tree(self.st), state, "nothing moved")
+                self.assertFalse(os.path.exists(aside))
+
     def test_a_mount_source_containing_both_is_refused(self):
         self.containers["hub-link"]["mounts"].append(self.d)
         p = self.separate()
@@ -472,7 +506,8 @@ exec $REAL "$@"
         self.drained()
         p = self.quiet()
         self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertEqual(p.stdout, "fs-quiet: OK every outbox holds only results/ and processed/\n")
+        self.assertEqual(p.stdout, "fs-quiet: OK every outbox holds only results/ and processed/, and OLD holds "
+                                   "no in-flight state\n")
 
     def test_a_waiting_request_is_not_quiet(self):
         p = self.quiet()
@@ -504,7 +539,7 @@ exec $REAL "$@"
 
     def test_an_outbox_that_cannot_be_listed_or_is_missing_is_not_quiet(self):
         self.drained()
-        flag = self.wrap("ls", '  case "$*" in *alpha/outbox*) exit 23 ;; esac')
+        flag = self.wrap("find", '  case "$*" in *alpha/outbox*) exit 23 ;; esac')
         self.put(flag, b"")
         p = self.quiet()
         self.assertEqual(p.returncode, 1)
@@ -513,6 +548,29 @@ exec $REAL "$@"
         p = self.quiet("alpha gamma")
         self.assertEqual(p.returncode, 1)
         self.assertIn("gamma: no outbox directory", p.stderr)
+
+    def test_in_flight_state_in_old_is_outside_the_scope(self):
+        """FS's scope, checked at F3 and F4b: OLD holds no work-bearing file."""
+        for sub in ("pending", "inflight", "dsn-pending", "reuse-pending"):
+            with self.subTest(sub=sub):
+                self.drained()
+                d = os.path.join(self.st, "alpha", sub)
+                os.makedirs(d, exist_ok=True)
+                f = os.path.join(d, "w.json")
+                self.put(f, b"{}")
+                p = self.quiet()
+                os.unlink(f)
+                self.assertEqual(p.returncode, 1)
+                self.assertIn("OLD holds in-flight state", p.stderr)
+                self.assertIn(f"/{sub}/w.json", p.stderr)
+
+    def test_an_old_that_cannot_be_searched_is_not_quiet(self):
+        self.drained()
+        flag = self.wrap("find", f'  case "$*" in "{self.st} "*) exit 23 ;; esac')
+        self.put(flag, b"")
+        p = self.quiet()
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("its in-flight state is not established", p.stderr)
 
     # --- the EMPTY witness ---
 

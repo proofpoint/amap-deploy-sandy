@@ -1054,6 +1054,14 @@ start runs only while every outbox is quiet (F3 and F4b below).
 FS needs what R2 needs (the hop link, the hop root, the hop checkout at its
 pin, the router's image, and every configured instance enrolled in the host
 registry), plus:
+- **a router config at its default place.** This section is written for a
+  host whose live config is `install`'s default,
+  `$SANDY_HOME/features/amap/router.json`, with no `--router-config-path`.
+  A host that names its router config elsewhere follows its own reviewed
+  fresh-start plan, which uses this section's blocks, because there the
+  first install that names the path must be a plain `install --apply` (a
+  `--render-to` with an unrecorded path is refused), and its start line is
+  the one its host setup names.
 - **two distinct state directories.** OLD is the `state_dir` the live config
   names now. NEW is the one the new configuration names
   (`install --state-dir <NEW>`). They must be physically distinct: their
@@ -1075,32 +1083,40 @@ anything unexpected. Every listing must succeed: an outbox that cannot be
 listed is NOT quiet. Producers, the operator's own traffic included, hold
 from F3 until F7's acceptance passes. That is a coordination premise, not a
 lock: F4b's repeat is what catches a request that arrives after the stop.
+The same block checks FS's scope: OLD holds no file under a `pending/`,
+`inflight/`, `dsn-pending/` or `reuse-pending/` directory. A search that
+fails is not an empty one.
 
 ```sh
-( INST='<instances_dir>'; SLUGS='<every configured instance, space separated>'
+( OST='<OLD: the state_dir the live config names>'
+  INST='<instances_dir>'; SLUGS='<every configured instance, space separated>'
   stop() { printf 'fs-quiet: STOP: %s\n' "$1" >&2; exit 1; }
   set -f
   for s in $SLUGS; do
     o="$INST/$s/outbox"
     [ -d "$o" ] && [ ! -h "$o" ] || stop "$s: no outbox directory $o"
-    ls=$(ls -A -- "$o") || stop "$s: the outbox cannot be listed: not quiet"
-    IFS=$(printf '\n.'); IFS=${IFS%.}
-    for e in $ls; do
-      case $e in results|processed) [ -d "$o/$e" ] && [ ! -h "$o/$e" ] || stop "$s: $e is not a directory: not quiet" ;;
-        *) stop "$s: $e is waiting: not quiet" ;; esac
-    done
-    IFS=$(printf ' \t\n.'); IFS=${IFS%.}
+    e=$(find "$o" -mindepth 1 -maxdepth 1 ! -name results ! -name processed -print -quit) \
+      || stop "$s: the outbox cannot be listed: not quiet"
+    [ -z "$e" ] || stop "$s: ${e##*/} is waiting: not quiet"
+    e=$(find "$o" -mindepth 1 -maxdepth 1 \( -name results -o -name processed \) ! -type d -print -quit) \
+      || stop "$s: the outbox cannot be listed: not quiet"
+    [ -z "$e" ] || stop "$s: ${e##*/} is not a directory: not quiet"
   done
-  printf 'fs-quiet: OK every outbox holds only results/ and processed/\n' )
+  w=$(find "$OST" -type f \( -path '*/pending/*' -o -path '*/inflight/*' -o -path '*/dsn-pending/*' \
+        -o -path '*/reuse-pending/*' \) -print -quit) || stop "OLD cannot be searched: its in-flight state is not established"
+  [ -z "$w" ] || stop "OLD holds in-flight state ($w): outside a fresh start's scope"
+  printf 'fs-quiet: OK every outbox holds only results/ and processed/, and OLD holds no in-flight state\n' )
 ```
 
 **The separation check.** It reads NEW by `lstat` alone, so NEW itself
 needs no search permission for the operator: only its parent is resolved.
-It refuses a NEW that is a symlink.
+It refuses a NEW that is a symlink. NEW is also kept apart from the hop
+root: never the hop root itself, nor inside it, nor containing it, so the
+hop tree holds only the hub-link router's own top-level names.
 
 ```sh
 ( OST='<OLD: the state_dir the live config names>'; NST='<NEW: the state_dir the new configuration names>'
-  OLD='<the old container Id>'; HUB='<the hub-link router container>'
+  HOP='<the hop root: its host path>'; OLD='<the old container Id>'; HUB='<the hub-link router container>'
   stop() { printf 'fs-separate: STOP: %s\n' "$1" >&2; exit 1; }
   OP=$(cd -P -- "$OST" && pwd -P) || stop "no OLD $OST"
   ND=$(cd -P -- "$(dirname -- "$NST")" && pwd -P) || stop "no parent for NEW $NST"
@@ -1112,6 +1128,12 @@ It refuses a NEW that is a symlink.
   [ "$oi" != "$ni" ] || stop "OLD and NEW are one directory under two names"
   case "$NP/" in "$OP"/*) stop "NEW lies under OLD" ;; esac
   case "$OP/" in "$NP"/*) stop "OLD lies under NEW" ;; esac
+  HP=$(cd -P -- "$HOP" && pwd -P) || stop "no hop root $HOP"
+  [ "$NP" != "$HP" ] || stop "NEW is the hop root"
+  hi=$(stat -c '%d:%i' -- "$HP") || stop "the hop root cannot be stat'ed"
+  [ "$ni" != "$hi" ] || stop "NEW and the hop root are one directory under two names"
+  case "$NP/" in "$HP"/*) stop "NEW lies under the hop root" ;; esac
+  case "$HP/" in "$NP"/*) stop "the hop root lies under NEW" ;; esac
   MNT=$(docker inspect -f '{{range .Mounts}}{{if eq .Type "bind"}}{{.Source}}{{"\n"}}{{end}}{{end}}' "$OLD") \
     || stop "the old router's mounts cannot be read"
   hub=$(docker ps -a -q --no-trunc --filter "name=^/$HUB\$") || stop "docker cannot list containers"
@@ -1142,18 +1164,21 @@ for that point (below) applies.
 - **F2 Render.** `python3 amap-sandy.py --state-dir <NEW> install --render-to
   <run_dir>/fs-config.json --apply`, with the sha256 it prints recorded, as
   R2's step 2. Then the separation block.
-- **F3 Quiet**, with the old router still running: the quiet block. If it
-  is not quiet, wait for the old router's polls and run it again. An outbox
-  that will not settle stops FS here (back-out A).
+- **F3 Quiet**, with the old router still running: the quiet block. If an
+  outbox is not quiet, wait for the old router's polls and run it again.
+  An outbox that will not settle, or any in-flight state in OLD, stops FS
+  here (back-out A).
 - **F4 Stop.** Fingerprint and match again, with `--step 2 --label fs`. It
   must print `MIGRATE` with the same reason. Then R2's step 5 stop, at
   once, with no other step between them: the live config's `sha256sum`,
   recorded; `cp -p <the live config> <run_dir>/fs-pre-start-config.json`;
   the recorded `docker inspect` of the old container's name and restart
-  policy; `docker stop`; `docker update --restart no`; and
+  policy; the recorded `docker inspect -f '{{json .Config.Env}} {{json
+  .Mounts}}'` of it, which names its `ROUTER_CONFIG` and the bind source
+  mounted there (the config it was started with); `docker stop`; `docker update --restart no`; and
   `docker rename <that Id> <router.container>-pre-registry`.
 - **F4b Quiet again**, after the stop: the quiet block once more. Not quiet
-  means a request arrived after F3. Clear nothing, start nothing: take
+  means a request arrived after F3, or OLD holds in-flight state. Clear nothing, start nothing: take
   back-out B (the old router drains it), then start FS again from F1.
 - **F4c The snapshot**: the snapshot block below, of OLD.
 - **F5 The live config.** `python3 amap-sandy.py --state-dir <NEW> install
@@ -1314,8 +1339,9 @@ snapshot is never added to or replaced.
   1. The OLD check, below: OLD must still be the snapshot. It restores OLD
      from the snapshot only when it is not, and refuses once the new router
      has been created.
-  2. If F5 ran, `cp -p <run_dir>/fs-pre-start-config.json <the live
-     config>`, and check that `sha256sum` equals F4's record.
+  2. If F5 ran, `cp -p <run_dir>/fs-pre-start-config.json <the old
+     container's config: the bind source F4 recorded at its
+     ROUTER_CONFIG>`, and check that `sha256sum` equals F4's record.
   3. R2's back-out B steps 2-4: `docker rename` the old container to its
      recorded name, `docker update --restart` its recorded policy, and
      `docker start` it by its Id.
@@ -1363,6 +1389,9 @@ extracted in its place.
   fi
   INP=$(cd -P -- "$INST" && pwd -P) || stop "no instances_dir $INST"
   HP=$(cd -P -- "$HOP" && pwd -P) || stop "no hop root $HOP"
+  [ "$HP" != / ] || stop "the hop root is the root directory"
+  case "$HP/" in "$STP"/*) stop "the hop root lies under state_dir" ;; esac
+  case "$STP/" in "$HP"/*) stop "state_dir lies under the hop root" ;; esac
   MNT=$(docker inspect -f '{{range .Mounts}}{{if eq .Type "bind"}}{{.Source}}{{"\n"}}{{end}}{{end}}' "$OLD") \
     || stop "the old container's mounts cannot be read"
   if ! absent "$HUB"; then
