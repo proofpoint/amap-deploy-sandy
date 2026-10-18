@@ -349,6 +349,15 @@ def probe(s: SecretSpec, run_id: str, root: bool = False) -> List[str]:
     return argv + [s.image, "probe-login"]
 
 
+
+def _hash_check(hash_cmd: str, path: str, sha256: str, q: Callable[[str], str]) -> str:
+    """One line that COMPARES a file's sha256 with the pin and STOPs on any
+    difference, an unreadable file or a failed hash tool (it never merely
+    prints the hash). It ends in `false`, never `exit`, so a typed line
+    leaves the operator's shell open."""
+    return (f"h=$({hash_cmd} {q(path)}) && [ \"${{h%% *}}\" = {q(sha256)} ] || "
+            f"{{ echo 'STOP: {path} is not the pinned writer {sha256}; place nothing' >&2; false; }}")
+
 def render(s: SecretSpec, q: Callable[[str], str]) -> List[str]:
     """The secret's root-run steps, as shell lines, in order. Printed, never run."""
     t = s.tools
@@ -364,11 +373,11 @@ def render(s: SecretSpec, q: Callable[[str], str]) -> List[str]:
         f"{sudo} {install} -d -o 0 -g 0 -m 0755 {q(etc)}",
         f"{sudo} {install} -o 0 -g 0 -m 0444 <a file holding the approved overlay sha> {q(s.anchor)}",
         f"# The writer, never by running the file being installed: its sha256 must be {s.writer_sha256}.",
-        f"{hash_cmd} {q(posixpath.join(s.clones['deploy']['path'], WRITER))}",
+        _hash_check(hash_cmd, posixpath.join(s.clones['deploy']['path'], WRITER), s.writer_sha256, q),
         f"{sudo} {install} -d -o 0 -g 0 -m 0755 {q(s.writer_dir)}",
         f"{sudo} {install} -o 0 -g 0 -m 0444 {q(posixpath.join(s.clones['deploy']['path'], WRITER))} "
         f"{q(s.writer)}",
-        f"{hash_cmd} {q(s.writer)}",
+        _hash_check(hash_cmd, s.writer, s.writer_sha256, q),
         "# As the operator, before any one-shot: the run directory and the lock files the one-shots, "
         "verify and the runbook share.",
         f"{install} -d -m 0700 {q(s.run_dir)}",

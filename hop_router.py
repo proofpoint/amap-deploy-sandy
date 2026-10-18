@@ -177,6 +177,10 @@ def checks(spec: Any, *, pin: Any = None) -> List[rh.Check]:
 # hop constant above, and `hop_link`.
 
 HOP_LINK_KEY = "hop_link"
+#: The policy key that renders `registry_dir` on a host with no hop link:
+#: exactly `true`, its value the overlay's `registry.directory`. The hop
+#: pin's loader reads `registry_dir`; the primary pin's refuses it.
+REGISTRY_POLICY_KEY = "router_registry"
 HOP_LINK_MEMBERS = ("link", "trusted_fleet_hosts", "egress")
 #: The router's own link grammar (its `config.HOP_LINK_RE`).
 LINK_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
