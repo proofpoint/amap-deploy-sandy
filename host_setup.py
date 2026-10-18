@@ -507,7 +507,9 @@ def render_plan(spec: Spec, overlay_source: Optional[Path] = None,
     """The root-run steps, in order, as shell lines. Printed, never run.
     `hub` is the hub-link router's rendering, when the document has one."""
     q = shlex.quote
-    steps = f"python3 {q(str(HOST_STEPS))}"
+    # The interpreter root runs is the one step 1 (the partition's validation) vetted, by its path.
+    py = spec.partition.tools["python3"] if spec.partition is not None else "python3"
+    steps = f"{q(py)} {q(str(HOST_STEPS))}"
     lines = ["# Run as root. Each line is one step; nothing here has run. No step follows a "
              "symbolic link, and each is safe to run again.",
              f"# Run them from a checkout no sandbox mounts read-write (a fresh clone at the recorded "
@@ -534,8 +536,8 @@ def render_plan(spec: Spec, overlay_source: Optional[Path] = None,
         lines.append(f"{steps} root {q(d)} 0 0 {ROOT_DIR_MODE:04o}")
     if spec.overlay_path is not None and spec.overlay_pin is not None:
         src = q(str(overlay_source)) if overlay_source else "<the pinned plugin artifact>"
-        lines.append(f"{steps} place {src} {q(spec.overlay_path)}"
-                     f"  # the overlay, root-owned 0444; sha256 must be {spec.overlay_pin['sha256']}")
+        lines.append(f"{steps} place {src} {q(spec.overlay_path)} --sha256 {spec.overlay_pin['sha256']}"
+                     f"  # the overlay, root-owned 0444, refused unless its bytes have the pinned sha256")
     for m in spec.mounts:
         if "marker" in m:
             lines.append(f"{steps} marker {q(posixpath.join(m['host'], m['marker']))}"

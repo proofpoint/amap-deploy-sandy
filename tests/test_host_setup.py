@@ -301,7 +301,8 @@ class PlanTest(unittest.TestCase):
     def test_the_overlay_is_placed_and_names_its_digest(self):
         line = next(l for l in self.plan if l.startswith(f"{self.steps} place "))
         self.assertIn("/srv/example/overlay/plugin.py", line)
-        self.assertIn(hs.STUB_SHA256, line)
+        self.assertIn(f" --sha256 {hs.STUB_SHA256}", line.split("#")[0],
+                      "the pin is the place's own argument, so a wrong file is refused, not only commented")
 
     def test_the_marker_is_created_by_the_helper(self):
         x = doc()
