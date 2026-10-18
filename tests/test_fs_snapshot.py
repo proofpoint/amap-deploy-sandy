@@ -473,9 +473,50 @@ exec $REAL "$@"
                 p = self.separate(nst=nst, hop=hop)
                 self.assertEqual(p.returncode, 1)
                 self.assertIn(words, p.stderr)
-        p = self.separate(hop=os.path.join(self.d, "no-hop"))
+        p = self.separate(hop=os.path.join(self.d, "absent-parent", "hop"))
         self.assertEqual(p.returncode, 1)
-        self.assertIn("no hop root", p.stderr)
+        self.assertIn("no parent for the hop root", p.stderr)
+
+    def test_an_absent_hop_root_is_checked_path_wise(self):
+        """A host whose hop leg comes later: H does not exist yet. Its parent
+        resolves it; the path-wise checks hold; only dev:ino is skipped."""
+        absent = os.path.join(self.d, "hop-later")
+        p = self.separate(hop=absent)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        p = self.separate(nst=self.new, hop=os.path.join(self.new, "hop"))
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("the hop root lies under NEW", p.stderr)
+        p = self.separate(nst=self.new, hop=os.path.dirname(self.new) + "/new")
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("NEW is the hop root", p.stderr)
+        for nst in ("relative/hop", absent + "/..", "/"):
+            with self.subTest(hop=nst):
+                p = self.separate(hop=nst)
+                self.assertEqual(p.returncode, 1)
+                self.assertIn("the hop root", p.stderr)
+        link = os.path.join(self.d, "hop-link")
+        os.symlink(self.hop, link)
+        p = self.separate(hop=link)
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("is not a directory, or is a symlink", p.stderr)
+
+    def test_the_snapshot_and_the_old_check_run_with_an_absent_hop_root(self):
+        absent = os.path.join(self.d, "hop-later")
+        p = self.snapshot(hop=absent)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        shutil.rmtree(self.bk)
+        p = self.snapshot(bk=absent, hop=absent)  # the snapshot at the future hop root's own path
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("lies under the hop root", p.stderr)
+        p = self.snapshot()
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.damaged()
+        p = self.restore(absent, hop=absent)
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("lies under the hop root", p.stderr)
+        p = self.restore(os.path.join(self.d, "backup", "aside"), hop=absent)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("fs-restore: OK restored", p.stdout)
 
     def test_the_old_check_refuses_a_state_dir_overlapping_the_hop_root(self):
         self.assertEqual(self.snapshot().returncode, 0)

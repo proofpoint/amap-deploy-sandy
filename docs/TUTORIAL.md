@@ -1114,7 +1114,11 @@ fails is not an empty one.
 needs no search permission for the operator: only its parent is resolved.
 It refuses a NEW that is a symlink. NEW is also kept apart from the hop
 root: never the hop root itself, nor inside it, nor containing it, so the
-hop tree holds only the hub-link router's own top-level names.
+hop tree holds only the hub-link router's own top-level names. The hop root
+may not exist yet (a host whose hop leg comes later): it is then resolved
+through its parent, the path-wise checks still apply, and only the (device,
+inode) comparison is skipped. The snapshot block and the OLD check resolve
+it the same way.
 
 ```sh
 ( OST='<OLD: the state_dir the live config names>'; NST='<NEW: the state_dir the new configuration names>'
@@ -1132,10 +1136,19 @@ hop tree holds only the hub-link router's own top-level names.
   [ "$oi" != "$ni" ] || stop "OLD and NEW are one directory under two names"
   case "$NP/" in "$OP"/*) stop "NEW lies under OLD" ;; esac
   case "$OP/" in "$NP"/*) stop "OLD lies under NEW" ;; esac
-  HP=$(cd -P -- "$HOP" && pwd -P) || stop "no hop root $HOP"
+  case "$HOP" in /*) ;; *) stop "the hop root $HOP is not an absolute path" ;; esac
+  case "$HOP/" in //|*/./*|*/../*|*//*) stop "the hop root $HOP is not a normalised path, or is the root directory" ;; esac
+  HD=$(cd -P -- "$(dirname -- "$HOP")" && pwd -P) || stop "no parent for the hop root $HOP"
+  HP=$HD/$(basename -- "$HOP"); HPM=
+  if [ -e "$HP" ] || [ -h "$HP" ]; then
+    [ -d "$HP" ] && [ ! -h "$HP" ] || stop "the hop root $HOP is not a directory, or is a symlink"
+    HPM=$HP
+  fi
   [ "$NP" != "$HP" ] || stop "NEW is the hop root"
-  hi=$(stat -c '%d:%i' -- "$HP") || stop "the hop root cannot be stat'ed"
-  [ "$ni" != "$hi" ] || stop "NEW and the hop root are one directory under two names"
+  if [ -n "$HPM" ]; then
+    hi=$(stat -c '%d:%i' -- "$HP") || stop "the hop root cannot be stat'ed"
+    [ "$ni" != "$hi" ] || stop "NEW and the hop root are one directory under two names"
+  fi
   case "$NP/" in "$HP"/*) stop "NEW lies under the hop root" ;; esac
   case "$HP/" in "$NP"/*) stop "the hop root lies under NEW" ;; esac
   MNT=$(docker inspect -f '{{range .Mounts}}{{if eq .Type "bind"}}{{.Source}}{{"\n"}}{{end}}{{end}}' "$OLD") \
@@ -1277,8 +1290,15 @@ the seven values.
   ND=$(cd -P -- "$(dirname -- "$NST")" && pwd -P) || stop "no parent for NEW $NST"
   NP=$ND/$(basename -- "$NST")
   INP=$(cd -P -- "$INST" && pwd -P) || stop "no instances_dir $INST"
-  HP=$(cd -P -- "$HOP" && pwd -P) || stop "no hop root $HOP"
-  [ "$STP" != / ] && [ "$HP" != / ] || stop "state_dir or the hop root is the root directory"
+  case "$HOP" in /*) ;; *) stop "the hop root $HOP is not an absolute path" ;; esac
+  case "$HOP/" in //|*/./*|*/../*|*//*) stop "the hop root $HOP is not a normalised path, or is the root directory" ;; esac
+  HD=$(cd -P -- "$(dirname -- "$HOP")" && pwd -P) || stop "no parent for the hop root $HOP"
+  HP=$HD/$(basename -- "$HOP"); HPM=
+  if [ -e "$HP" ] || [ -h "$HP" ]; then
+    [ -d "$HP" ] && [ ! -h "$HP" ] || stop "the hop root $HOP is not a directory, or is a symlink"
+    HPM=$HP
+  fi
+  [ "$STP" != / ] || stop "state_dir is the root directory"
   case "$HP/" in "$STP"/*) stop "the hop root lies under state_dir" ;; esac
   case "$STP/" in "$HP"/*) stop "state_dir lies under the hop root" ;; esac
   MNT=$(docker inspect -f '{{range .Mounts}}{{if eq .Type "bind"}}{{.Source}}{{"\n"}}{{end}}{{end}}' "$OLD") \
@@ -1295,7 +1315,8 @@ the seven values.
   BKP=$BKD/$(basename -- "$BK")
   case "$BKP/" in "$NP"/*) stop "$BK lies under NEW" ;; esac
   IFS=$(printf '\n.'); IFS=${IFS%.}; set -f
-  for m in $STP $INP $HP $MNT; do
+  case "$BKP/" in "$HP"/*) stop "$BK lies under the hop root" ;; esac
+  for m in $STP $INP $HPM $MNT; do
     if [ -d "$m" ]; then mp=$(cd -P -- "$m" && pwd -P) || stop "the mount source $m cannot be resolved"
     elif [ -f "$m" ]; then mp=$m
     else stop "the mount source $m is neither a directory nor a file"; fi
@@ -1449,8 +1470,14 @@ extracted in its place.
     printf 'fs-restore: OK %s is the snapshot, entry for entry; nothing restored\n' "$STP"; exit 0
   fi
   INP=$(cd -P -- "$INST" && pwd -P) || stop "no instances_dir $INST"
-  HP=$(cd -P -- "$HOP" && pwd -P) || stop "no hop root $HOP"
-  [ "$HP" != / ] || stop "the hop root is the root directory"
+  case "$HOP" in /*) ;; *) stop "the hop root $HOP is not an absolute path" ;; esac
+  case "$HOP/" in //|*/./*|*/../*|*//*) stop "the hop root $HOP is not a normalised path, or is the root directory" ;; esac
+  HD=$(cd -P -- "$(dirname -- "$HOP")" && pwd -P) || stop "no parent for the hop root $HOP"
+  HP=$HD/$(basename -- "$HOP"); HPM=
+  if [ -e "$HP" ] || [ -h "$HP" ]; then
+    [ -d "$HP" ] && [ ! -h "$HP" ] || stop "the hop root $HOP is not a directory, or is a symlink"
+    HPM=$HP
+  fi
   case "$HP/" in "$STP"/*) stop "the hop root lies under state_dir" ;; esac
   case "$STP/" in "$HP"/*) stop "state_dir lies under the hop root" ;; esac
   MNT=$(docker inspect -f '{{range .Mounts}}{{if eq .Type "bind"}}{{.Source}}{{"\n"}}{{end}}{{end}}' "$OLD") \
@@ -1463,7 +1490,8 @@ extracted in its place.
   ADD=$(cd -P -- "$(dirname -- "$ASIDE")" && pwd -P) || stop "no parent for $ASIDE"
   ASP=$ADD/$(basename -- "$ASIDE")
   IFS=$(printf '\n.'); IFS=${IFS%.}; set -f
-  for m in $STP $INP $HP $MNT; do
+  case "$ASP/" in "$HP"/*) stop "$ASIDE lies under the hop root" ;; esac
+  for m in $STP $INP $HPM $MNT; do
     if [ -d "$m" ]; then mp=$(cd -P -- "$m" && pwd -P) || stop "the mount source $m cannot be resolved"
     elif [ -f "$m" ]; then mp=$m
     else stop "the mount source $m is neither a directory nor a file"; fi
