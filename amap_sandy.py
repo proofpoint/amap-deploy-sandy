@@ -668,12 +668,43 @@ def router_sibling_path(home: Path) -> Path:
     return recorded if recorded is not None else feature_root(home) / ROUTER_SIBLING_NAME
 
 
+def named_router_config_dir_problem(d: Path) -> Optional[str]:
+    """What is wrong with a named router config's directory, or None. It
+    must be a real directory, owned by the operator or root, writable by
+    no group and no other user (or anyone could rename over the file), and
+    searchable by others (the router's principal reaches the file through
+    it)."""
+    try:
+        st = os.lstat(d)
+    except FileNotFoundError:
+        return f"the router config's directory {d} does not exist: make it first (owned by the operator, mode 0755)"
+    except OSError as e:
+        return f"cannot stat the router config's directory {d}: {e}"
+    mode = stat.S_IMODE(st.st_mode)
+    if not stat.S_ISDIR(st.st_mode):
+        return f"the router config's directory {d} is not a directory"
+    if st.st_uid not in (os.getuid(), 0):
+        return f"the router config's directory {d} is uid {st.st_uid}, neither this operator's nor root's"
+    if mode & (stat.S_IWGRP | stat.S_IWOTH):
+        return (f"the router config's directory {d} is mode {mode:04o}: a group or other user could replace "
+                f"the file; make it 0755")
+    if not mode & stat.S_IXOTH:
+        return (f"the router config's directory {d} is mode {mode:04o}: the router's principal cannot reach "
+                f"the file through it; make it 0755")
+    return None
+
+
 def check_router_config_dir() -> None:
-    """A named router config's directory must exist before anything is
+    """A named router config's directory must be sound before anything is
     written: install never makes it."""
-    if _ROUTER_CONFIG_OVERRIDE is not None and not _ROUTER_CONFIG_OVERRIDE.parent.is_dir():
-        raise ProvisionError(f"the router config's directory {_ROUTER_CONFIG_OVERRIDE.parent} does not exist: "
-                             f"make it first (owned by the operator, mode 0755)")
+    if _ROUTER_CONFIG_OVERRIDE is not None:
+        if os.getuid() == 0:
+            raise ProvisionError(f"install runs as root: the named router config {_ROUTER_CONFIG_OVERRIDE} is "
+                                 f"placed only by the operator (install) or by A3's root place step, never by a "
+                                 f"root install")
+        why = named_router_config_dir_problem(_ROUTER_CONFIG_OVERRIDE.parent)
+        if why:
+            raise ProvisionError(why)
 
 
 def record_router_config(home: Path, *, dry_run: bool) -> Optional[str]:
@@ -721,7 +752,8 @@ def place_named_router_config(path: Path, want: str) -> str:
         if st is None or path.read_bytes() != data:
             tmp = path.with_name(f".{path.name}.tmp")
             try:
-                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+                tmp.unlink(missing_ok=True)
+                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
                 try:
                     os.fchmod(fd, NAMED_ROUTER_CONFIG_MODE)
                     view = memoryview(data)
@@ -731,6 +763,11 @@ def place_named_router_config(path: Path, want: str) -> str:
                 finally:
                     os.close(fd)
                 os.replace(tmp, path)
+                dfd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(dfd)
+                finally:
+                    os.close(dfd)
             except OSError:
                 tmp.unlink(missing_ok=True)
                 raise
@@ -3961,6 +3998,9 @@ def verify_router_sibling(home: Path, policy: Dict[str, Any], members: Dict[str,
     except OSError as e:
         return [f"router config: cannot read {path}: {e}"]
     if path != feature_root(home) / ROUTER_SIBLING_NAME:
+        why = named_router_config_dir_problem(path.parent)
+        if why:
+            return [f"router config: {why} — fix the directory, then re-run install --apply"]
         try:
             st = os.lstat(path)
         except OSError as e:

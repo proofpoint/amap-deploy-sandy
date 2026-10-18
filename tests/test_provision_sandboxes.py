@@ -2540,6 +2540,7 @@ class RouterConfigPathTest(_ConnectorFixtureMixin, unittest.TestCase):
         super().setUp()
         import tempfile
         self.outside = Path(tempfile.mkdtemp())
+        os.chmod(self.outside, 0o755)
         self.addCleanup(shutil.rmtree, self.outside, True)
         self.named = self.outside / "router.json"
         self.addCleanup(setattr, prov, "_ROUTER_CONFIG_OVERRIDE", None)
@@ -2774,6 +2775,89 @@ class RouterConfigPathTest(_ConnectorFixtureMixin, unittest.TestCase):
         prov.os.getuid = orig
         self.assertFalse(self.named.exists())
         self.assertFalse(prov.router_config_pointer(self.tmp).exists())
+
+    def test_a_parent_the_router_cannot_traverse_or_others_can_write_is_refused(self):
+        for mode, words in ((0o700, "cannot reach the file through it"), (0o770, "could replace the file"),
+                            (0o777, "could replace the file")):
+            with self.subTest(mode=oct(mode)):
+                os.chmod(self.outside, mode)
+                self.addCleanup(os.chmod, self.outside, 0o755)
+                self._fleet()
+                rc, out = self._with_path("--apply")
+                self.assertNotEqual(rc, 0, out)
+                self.assertIn(words, out)
+                self.assertFalse(prov.router_config_pointer(self.tmp).exists(), out)
+                self.assertFalse(self.named.exists())
+        os.chmod(self.outside, 0o755)
+
+    def test_a_parent_owned_by_another_user_is_refused(self):
+        """Staged by os.lstat answering another uid for the directory only:
+        the suite cannot chown."""
+        self._fleet()
+        real, d = os.lstat, str(self.outside)
+
+        def lstat(p, *a, **k):
+            st = real(p, *a, **k)
+            if str(p) != d:
+                return st
+            return os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, os.getuid() + 1, 0, st.st_size,
+                                   int(st.st_atime), int(st.st_mtime), int(st.st_ctime)))
+        prov.os.lstat = lstat
+        self.addCleanup(setattr, prov.os, "lstat", real)
+        rc, out = self._with_path("--apply")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("neither this operator's nor root's", out)
+        self.assertFalse(prov.router_config_pointer(self.tmp).exists())
+
+    def test_verify_names_a_parent_that_went_unsound(self):
+        boxes = self._fleet()
+        os.chmod(self.outside, 0o755)
+        self.assertEqual(self._with_path("--apply")[0], 0)
+        prov._ROUTER_CONFIG_OVERRIDE = None
+        args = (self.tmp, fp.load_policy(prov.feature_manifest_path(self.tmp)), prov.load_membership(self.tmp, boxes),
+                prov.sibling_state_dir(self.tmp, None), {b["name"]: Path(b["path"]) for b in boxes})
+        self.assertEqual(prov.verify_router_sibling(*args), [])
+        for mode, words in ((0o700, "cannot reach"), (0o777, "could replace")):
+            with self.subTest(mode=oct(mode)):
+                os.chmod(self.outside, mode)
+                self.addCleanup(os.chmod, self.outside, 0o755)
+                problems = prov.verify_router_sibling(*args)
+                self.assertEqual(len(problems), 1, problems)
+                self.assertIn(words, problems[0])
+                self.assertIn(str(self.outside), problems[0])
+        os.chmod(self.outside, 0o755)
+
+    def test_staging_with_activate_and_an_unrecorded_path_refuses(self):
+        """install has --render-to and --activate as staging verbs (no
+        --prepare); the render-to row is above."""
+        self._fleet()
+        for extra in (["--activate", "run-1", "--activation-sha256", "0" * 64],):
+            with self.subTest(extra=extra[0]):
+                rc, out = self._with_path("--apply", *extra)
+                self.assertEqual(rc, 2, out)
+                self.assertIn("recorded only by the install --apply that places it", out)
+                self.assertFalse(prov.router_config_pointer(self.tmp).exists())
+
+    def test_staging_with_a_recorded_path_passes_the_pointer_gate(self):
+        """With the path recorded, --render-to goes on to its own checks (this
+        fixture has no hop_link, so render-to then refuses for that reason)."""
+        self._fleet()
+        self.assertEqual(self._with_path("--apply")[0], 0)
+        staged = self.outside / "staged.json"
+        rc, out = self._with_path("--apply", "--render-to", str(staged))
+        self.assertNotIn("recorded only by", out)
+        self.assertIn("--render-to renders a hop host's config", out)
+
+    def test_a_stale_symlink_temporary_is_replaced_never_followed(self):
+        self._fleet()
+        victim = self.outside / "victim"
+        victim.write_text("untouched\n")
+        (self.outside / ".router.json.tmp").symlink_to(victim)
+        rc, out = self._with_path("--apply")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(victim.read_text(), "untouched\n")
+        self.assertFalse((self.outside / ".router.json.tmp").exists())
+        self.assertEqual(self._mode(self.named), prov.NAMED_ROUTER_CONFIG_MODE)
 
     def _refuse_render(self):
         def refuse(*a, **k):
