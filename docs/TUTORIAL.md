@@ -1066,8 +1066,9 @@ registry), plus:
   names now. NEW is the one the new configuration names
   (`install --state-dir <NEW>`). They must be physically distinct: their
   real paths and their (device, inode) pairs differ, neither contains the
-  other, and no bind source of the old router or the hub-link router
-  contains both. The separation block below checks this at F2 and again at
+  other, neither lies inside `instances_dir` (resolved physically, so a
+  symlinked parent cannot hide it) nor contains it, and no bind source of
+  the old router or the hub-link router contains both. The separation block below checks this at F2 and again at
   F5. A shared `state_dir` is not a fresh start, and FS refuses it.
 - **an old router with no in-flight state.** The quiet block below checks
   both halves: every outbox holds only `results/` and `processed/`, and OLD
@@ -1085,13 +1086,21 @@ listed is NOT quiet. Producers, the operator's own traffic included, hold
 from F3 until F7's acceptance passes. That is a coordination premise, not a
 lock: F4b's repeat is what catches a request that arrives after the stop.
 The same block checks FS's scope: OLD holds no file under a `pending/`,
-`inflight/`, `dsn-pending/` or `reuse-pending/` directory. A search that
-fails is not an empty one.
+`inflight/`, `dsn-pending/` or `reuse-pending/` directory: any entry below
+one that is not a directory (a file, a symlink, a socket) is work. It also
+refuses an empty SLUGS, and an outbox under `instances_dir` whose instance
+SLUGS does not name. A search that fails is not an empty one.
 
 ```sh
 ( OST='<OLD: the state_dir the live config names>'
   INST='<instances_dir>'; SLUGS='<every configured instance, space separated>'
   stop() { printf 'fs-quiet: STOP: %s\n' "$1" >&2; exit 1; }
+  [ -n "$SLUGS" ] || stop "no instance named: nothing would be checked"
+  for o in "$INST"/*/outbox; do
+    [ -e "$o" ] || [ -h "$o" ] || continue
+    s=${o%/outbox}; s=${s##*/}
+    case " $SLUGS " in *" $s "*) ;; *) stop "$s has an outbox and is not in SLUGS: it would not be checked" ;; esac
+  done
   set -f
   for s in $SLUGS; do
     o="$INST/$s/outbox"
@@ -1104,7 +1113,7 @@ fails is not an empty one.
     [ -z "$e" ] || stop "$s: ${e##*/} is not a directory: not quiet"
   done
   OP=$(cd -P -- "$OST" && pwd -P) || stop "OLD $OST cannot be resolved: its in-flight state is not established"
-  w=$(find "$OP" -type f \( -path '*/pending/*' -o -path '*/inflight/*' -o -path '*/dsn-pending/*' \
+  w=$(find "$OP" ! -type d \( -path '*/pending/*' -o -path '*/inflight/*' -o -path '*/dsn-pending/*' \
         -o -path '*/reuse-pending/*' \) -print -quit) || stop "OLD cannot be searched: its in-flight state is not established"
   [ -z "$w" ] || stop "OLD holds in-flight state ($w): outside a fresh start's scope"
   printf 'fs-quiet: OK every outbox holds only results/ and processed/, and OLD holds no in-flight state\n' )
@@ -1122,7 +1131,8 @@ it the same way.
 
 ```sh
 ( OST='<OLD: the state_dir the live config names>'; NST='<NEW: the state_dir the new configuration names>'
-  HOP='<the hop root: its host path>'; OLD='<the old container Id>'; HUB='<the hub-link router container>'
+  INST='<instances_dir>'; HOP='<the hop root: its host path>'; OLD='<the old container Id>'
+  HUB='<the hub-link router container>'
   stop() { printf 'fs-separate: STOP: %s\n' "$1" >&2; exit 1; }
   case "$NST" in /*) ;; *) stop "NEW $NST is not an absolute path" ;; esac
   case "$NST/" in //|*/./*|*/../*|*//*) stop "NEW $NST is not a normalised path, or is the root directory" ;; esac
@@ -1136,6 +1146,9 @@ it the same way.
   [ "$oi" != "$ni" ] || stop "OLD and NEW are one directory under two names"
   case "$NP/" in "$OP"/*) stop "NEW lies under OLD" ;; esac
   case "$OP/" in "$NP"/*) stop "OLD lies under NEW" ;; esac
+  INP=$(cd -P -- "$INST" && pwd -P) || stop "no instances_dir $INST"
+  case "$NP/" in "$INP"/*) stop "NEW lies under instances_dir" ;; esac
+  case "$INP/" in "$NP"/*) stop "instances_dir lies under NEW" ;; esac
   case "$HOP" in /*) ;; *) stop "the hop root $HOP is not an absolute path" ;; esac
   case "$HOP/" in //|*/./*|*/../*|*//*) stop "the hop root $HOP is not a normalised path, or is the root directory" ;; esac
   HD=$(cd -P -- "$(dirname -- "$HOP")" && pwd -P) || stop "no parent for the hop root $HOP"
@@ -1173,8 +1186,8 @@ runs the router. Each step's STOP ends FS at that point, and the back-out
 for that point (below) applies.
 
 **The ledger's two kinds of line.** Each `printf … >> <run_dir>/fs-ledger.txt`
-below has its own exit status checked
-(`|| { echo 'STOP: the ledger write failed'; exit 1; }`).
+below is written in its checked form, `printf … >> <run_dir>/fs-ledger.txt
+|| echo 'STOP: the ledger write failed: run nothing further' >&2`. On that STOP, run nothing further. The form only echoes and never `exit`s, so a line pasted into an interactive shell does not close it.
 - An INTENT line (`F4c started`, `F5 started`, `F6 attempted`) is written
   BEFORE the action it records. A failed write stops FS before that
   action, so no action runs unrecorded. Above all, F6's start runs only
@@ -1209,28 +1222,36 @@ below has its own exit status checked
   .Mounts}}'` of it, which names its `ROUTER_CONFIG` and the bind source
   mounted there (the config it was started with); `docker stop`; `docker update --restart no`; and
   `docker rename <that Id> <router.container>-pre-registry`. Then the
-  ledger's first line, `printf 'F4 stopped %s %s %s\n' <that Id> <its
-  recorded name> <its recorded policy> > <run_dir>/fs-ledger.txt`.
+  ledger's first line, written to a ledger that must not exist yet (each FS
+  attempt uses a new run_dir), `( set -C; printf 'F4 stopped %s %s %s\n'
+  <that Id> <its recorded name> <its recorded policy> > <run_dir>/fs-ledger.txt )
+  || echo 'STOP: the ledger write failed: run nothing further' >&2`. `set -C` refuses an existing ledger rather than truncating it.
 - **F4b Quiet again**, after the stop: the quiet block once more. Not quiet
   means a request arrived after F3, or OLD holds in-flight state. Clear nothing, start nothing: take
   back-out B (the old router drains it), then start FS again from F1.
-- **F4c The snapshot**: `printf 'F4c started\n' >> <run_dir>/fs-ledger.txt`,
-  then the snapshot block below, of OLD, then, only after its `fs-snapshot:
-  OK` and `fs-lanes: OK` lines, `printf 'F4c ok %s\n' <BK> >>
-  <run_dir>/fs-ledger.txt`.
-- **F5 The live config.** `printf 'F5 started\n' >> <run_dir>/fs-ledger.txt`,
-  then `python3 amap-sandy.py --state-dir <NEW> install --apply`. Its live config's `sha256sum` must equal F2's. A mismatch stops
+- **F4c The snapshot**: `printf 'F4c started\n' >> <run_dir>/fs-ledger.txt
+  || echo 'STOP: the ledger write failed: run nothing further' >&2`, then the snapshot block below, of OLD, then, only after its
+  `fs-snapshot: OK` and `fs-lanes: OK` lines, `printf 'F4c ok %s\n' <BK> >>
+  <run_dir>/fs-ledger.txt || echo 'STOP: the ledger write failed: run nothing further' >&2`.
+- **F5 The live config.** `printf 'F5 started\n' >> <run_dir>/fs-ledger.txt
+  || echo 'STOP: the ledger write failed: run nothing further' >&2`, then `python3 amap-sandy.py --state-dir <NEW> install --apply`. Its live config's `sha256sum` must equal F2's. A mismatch stops
   FS before any start: back-out B. Then the separation block again, and the
   EMPTY witness: as the account that runs the router,
   ```sh
   ( NST='<NEW>'
     stop() { printf 'fs-empty: STOP: %s\n' "$1" >&2; exit 1; }
+    [ -d "$NST" ] && [ ! -h "$NST" ] || stop "NEW is not a directory, or is a symlink"
+    me=$(id -u) || stop "the account cannot be read"
+    o=$(stat -c '%u %a' -- "$NST") || stop "NEW cannot be stat'ed"
+    [ "$o" = "$me 700" ] || stop "NEW is not private to the router's account ($o, not $me 700)"
     left=$(ls -A -- "$NST") || stop "NEW cannot be listed: its emptiness is not established"
     [ -z "$left" ] || stop "NEW is not empty"
     printf 'fs-empty: OK %s is empty at %s\n' "$NST" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" )
   ```
-  A listing that fails is never proof of emptiness.
-- **F6 Start.** `printf 'F6 attempted\n' >> <run_dir>/fs-ledger.txt`, then
+  NEW must be the router account's own 0700 directory, not a symlink, and
+  empty. A listing that fails is never proof of emptiness.
+- **F6 Start.** `printf 'F6 attempted\n' >> <run_dir>/fs-ledger.txt
+  || echo 'STOP: the ledger write failed: run nothing further' >&2`, then
   `docker/run.sh --config <the live config> --image
   <router.image.digest> --name <router.container> --detach`, from the hop
   checkout, as the account that runs the router. After this start there is
@@ -1439,7 +1460,8 @@ snapshot is never added to or replaced.
   s=$(docker inspect -f '{{.Name}} {{.State.Running}} {{.HostConfig.RestartPolicy.Name}}' "$OLD") \
     || stop "the old container cannot be inspected"
   [ "$s" = "/$NEW-pre-registry false no" ] || stop "the old container is not exactly as F4 left it ($s)"
-  printf 'fs-phase: %s; restore the config: %s\n' "$branch" "$cfg" )
+  bk=$(sed -n 's/^F4c ok //p' -- "$LEDGER") || stop "the ledger cannot be read"
+  printf 'fs-phase: %s; restore the config: %s%s\n' "$branch" "$cfg" "${bk:+; the OLD check takes BK=$bk}" )
 ```
 
 **The OLD check**, back-out B's step 1 on the `AFTER-SNAPSHOT` branch, as the operator in one POSIX shell
@@ -1457,7 +1479,7 @@ kept, never deleted, and never left inside OLD) and the snapshot is
 extracted in its place.
 
 ```sh
-( ST='<OLD>'; INST='<instances_dir>'; HOP='<the hop root: its host path>'
+( ST='<OLD>'; NST='<NEW>'; INST='<instances_dir>'; HOP='<the hop root: its host path>'
   BK='<the snapshot directory F4c recorded>'
   ASIDE='<a new, operator-private, host-only directory for what it replaces>'
   OLD='<the old container Id, as F4 records it>'; NEW='<router.container>'
@@ -1506,6 +1528,9 @@ extracted in its place.
   ASP=$ADD/$(basename -- "$ASIDE")
   IFS=$(printf '\n.'); IFS=${IFS%.}; set -f
   case "$ASP/" in "$HP"/*) stop "$ASIDE lies under the hop root" ;; esac
+  ND=$(cd -P -- "$(dirname -- "$NST")" && pwd -P) || stop "no parent for NEW $NST"
+  NP=$ND/$(basename -- "$NST")
+  case "$ASP/" in "$NP"/*) stop "$ASIDE lies under NEW" ;; esac
   for m in $STP $INP $HPM $MNT; do
     if [ -d "$m" ]; then mp=$(cd -P -- "$m" && pwd -P) || stop "the mount source $m cannot be resolved"
     elif [ -f "$m" ]; then mp=$m
@@ -1529,7 +1554,8 @@ extracted in its place.
 ```
 
 **FS's retention**, as the operator decided it:
-- OLD, the state snapshot (`fs-state.tar` and its `.sha256`), any `ASIDE`
+- OLD, the state snapshot (`fs-state.tar` and its `.sha256`, `fs-state.manifest`
+  and its `.sha256`, and any `fs-check.*` scratch manifest an OLD check left), any `ASIDE`
   the OLD check made, the old container (stopped,
   `<router.container>-pre-registry`, restart policy `no`) and any
   `<router.container>-fs-failed` are kept until 7 days after the canary

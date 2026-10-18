@@ -142,12 +142,12 @@ class FreshStart(unittest.TestCase):
                             HOP=hop or self.hop, BK=bk or self.bk, OLD="0123abcd", HUB="hub-link"))
 
     def restore(self, aside, hop=None):
-        return self.sh(fill(block("fs-restore: STOP"), ST=self.st, INST=self.inst, HOP=hop or self.hop, BK=self.bk,
-                            ASIDE=aside, OLD="0123abcd", NEW="amap-router", HUB="hub-link"))
+        return self.sh(fill(block("fs-restore: STOP"), ST=self.st, NST=self.new, INST=self.inst, HOP=hop or self.hop,
+                            BK=self.bk, ASIDE=aside, OLD="0123abcd", NEW="amap-router", HUB="hub-link"))
 
     def separate(self, ost=None, nst=None, hop=None):
-        return self.sh(fill(block("fs-separate: STOP"), OST=ost or self.st, NST=nst or self.new, HOP=hop or self.hop,
-                            OLD="0123abcd", HUB="hub-link"))
+        return self.sh(fill(block("fs-separate: STOP"), OST=ost or self.st, NST=nst or self.new, INST=self.inst,
+                            HOP=hop or self.hop, OLD="0123abcd", HUB="hub-link"))
 
     def quiet(self, slugs="alpha beta"):
         return self.sh(fill(block("fs-quiet: STOP"), OST=self.st, INST=self.inst, SLUGS=slugs))
@@ -534,6 +534,32 @@ exec $REAL "$@"
                 self.assertEqual(tree(self.st), state, "nothing moved")
                 self.assertFalse(os.path.exists(aside))
 
+    def test_new_and_instances_dir_are_kept_apart_physically(self):
+        lexical = os.path.join(self.inst, "newstate")
+        os.mkdir(lexical)
+        via = os.path.join(self.d, "via-inst")
+        os.symlink(self.inst, via)
+        inner = os.path.join(self.new, "instances")
+        for name, nst, words in (("lexical", lexical, "NEW lies under instances_dir"),
+                                 ("through a symlinked parent", os.path.join(via, "newstate"),
+                                  "NEW lies under instances_dir")):
+            with self.subTest(name=name):
+                p = self.separate(nst=nst)
+                self.assertEqual(p.returncode, 1)
+                self.assertIn(words, p.stderr)
+        os.mkdir(inner)
+        p = self.sh(fill(block("fs-separate: STOP"), OST=self.st, NST=self.new, INST=inner, HOP=self.hop,
+                         OLD="0123abcd", HUB="hub-link"))
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("instances_dir lies under NEW", p.stderr)
+
+    def test_old_and_new_with_one_device_and_inode_are_refused(self):
+        flag = self.wrap("stat", "  case \"$*\" in *'%d:%i'*) echo '1:1'; exit 0 ;; esac")
+        self.put(flag, b"")
+        p = self.separate()
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("OLD and NEW are one directory under two names", p.stderr)
+
     def test_a_mount_source_containing_both_is_refused(self):
         self.containers["hub-link"]["mounts"].append(self.d)
         p = self.separate()
@@ -600,7 +626,7 @@ exec $REAL "$@"
         self.assertEqual(p.returncode, 1)
         self.assertIn("alpha: the outbox cannot be listed: not quiet", p.stderr)
         os.unlink(flag)
-        p = self.quiet("alpha gamma")
+        p = self.quiet("alpha beta gamma")
         self.assertEqual(p.returncode, 1)
         self.assertIn("gamma: no outbox directory", p.stderr)
 
@@ -643,12 +669,70 @@ exec $REAL "$@"
         self.assertEqual(p.returncode, 1)
         self.assertIn("its in-flight state is not established", p.stderr)
 
+    def test_an_empty_slugs_is_refused_not_passed_vacuously(self):
+        self.drained()
+        p = self.quiet("")
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("no instance named: nothing would be checked", p.stderr)
+        self.assertNotIn("fs-quiet: OK", p.stdout)
+
+    def test_an_outbox_slugs_does_not_name_is_refused(self):
+        self.drained()
+        os.makedirs(os.path.join(self.inst, "gamma", "outbox"))
+        self.put(os.path.join(self.inst, "gamma", "outbox", "req-0.json"), b"{}")
+        p = self.quiet("alpha beta")
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("gamma has an outbox and is not in SLUGS", p.stderr)
+
+    def test_a_non_regular_entry_under_an_in_flight_set_is_work(self):
+        self.drained()
+        d = os.path.join(self.st, "alpha", "pending")
+        link = os.path.join(d, "w.json")
+        os.symlink("/nonexistent", link)
+        p = self.quiet()
+        os.unlink(link)
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("OLD holds in-flight state", p.stderr)
+        os.makedirs(os.path.join(d, "req-1.attachments"))
+        self.assertEqual(self.quiet().returncode, 0, "an empty directory alone is not work")
+
+    def test_a_symlinked_outbox_is_refused(self):
+        self.drained()
+        o = os.path.join(self.inst, "alpha", "outbox")
+        shutil.rmtree(o)
+        real = os.path.join(self.d, "quiet-outbox")
+        os.makedirs(os.path.join(real, "results"))
+        os.symlink(real, o)
+        p = self.quiet()
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("alpha: no outbox directory", p.stderr)
+
     # --- the EMPTY witness ---
 
     def test_an_empty_new_is_witnessed_with_its_time(self):
         p = self.empty()
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertRegex(p.stdout, r"^fs-empty: OK .* is empty at \d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\n$")
+
+    def test_a_new_that_is_not_private_is_refused(self):
+        os.chmod(self.new, 0o777)
+        self.addCleanup(os.chmod, self.new, 0o700)
+        p = self.empty()
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("NEW is not private to the router's account", p.stderr)
+        os.chmod(self.new, 0o700)
+        flag = self.wrap("stat", f"  case \"$*\" in *'%u %a'*) echo '{os.getuid() + 1} 700'; exit 0 ;; esac")
+        self.put(flag, b"")
+        p = self.empty()
+        self.assertEqual(p.returncode, 1)
+        self.assertIn(f"({os.getuid() + 1} 700, not {os.getuid()} 700)", p.stderr)
+
+    def test_a_symlinked_new_fails_the_witness(self):
+        link = os.path.join(self.d, "new-link")
+        os.symlink(self.new, link)
+        p = self.empty(nst=link)
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("NEW is not a directory, or is a symlink", p.stderr)
 
     def test_a_non_empty_new_is_refused(self):
         self.put(os.path.join(self.new, ".router.lock"), b"")
@@ -702,6 +786,26 @@ exec $REAL "$@"
         self.assertIn("lid-alpha", os.listdir(aside), "what it replaced is kept, outside state_dir")
         self.assertEqual(tree(self.inst), lanes_now, "the lanes are never touched")
 
+    def test_an_aside_under_new_is_refused(self):
+        self.assertEqual(self.snapshot().returncode, 0)
+        self.damaged()
+        state = tree(self.st)
+        aside = os.path.join(self.new, "aside")
+        p = self.restore(aside)
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("lies under NEW", p.stderr)
+        self.assertEqual(tree(self.st), state)
+        self.assertFalse(os.path.exists(aside))
+
+    def test_a_lane_archive_that_fails_outright_stops(self):
+        self.tar_stub("""case "$*" in *fs-lanes.tar*) case "$*" in *-cpf*) exit 2 ;; esac ;; esac
+exec $REAL "$@"
+""")
+        p = self.snapshot()
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("the lane archive failed", p.stderr)
+        self.assertNotIn("fs-lanes: OK", p.stdout)
+
     def test_the_restore_never_reads_the_lane_archive(self):
         self.assertEqual(self.snapshot().returncode, 0)
         self.damaged()
@@ -733,8 +837,8 @@ exec $REAL "$@"
                 self.assertIn(f"a container is named {name}: the new router started", p.stderr)
                 self.assertEqual(tree(self.st), state, "nothing moved")
                 self.assertFalse(os.path.exists(aside))
-        p = self.sh(fill(block("fs-restore: STOP"), ST=self.st, INST=self.inst, HOP=self.hop, BK=self.bk,
-                         ASIDE=aside, OLD="0123abcd", NEW="unlistable", HUB="hub-link"))
+        p = self.sh(fill(block("fs-restore: STOP"), ST=self.st, NST=self.new, INST=self.inst, HOP=self.hop,
+                         BK=self.bk, ASIDE=aside, OLD="0123abcd", NEW="unlistable", HUB="hub-link"))
         self.assertEqual(p.returncode, 1)
         self.assertIn("docker cannot list containers", p.stderr, "a failed listing is never read as absent")
 
@@ -847,6 +951,11 @@ exec $REAL "$@"
         self.assertLess(f4c.index("F4c started"), f4c.index("the snapshot block"))
         self.assertLess(f4c.index("the snapshot block"), f4c.index("F4c ok"))
         self.assertIn("F6's start runs only after `F6 attempted` is written", " ".join(fs.split()).replace("` F6", "`F6"))
+        for marker in ("F4c started", "F4c ok %s", "F5 started", "F6 attempted"):
+            i = fs.index(f"printf '{marker}")
+            self.assertIn("|| echo 'STOP: the ledger write failed: run nothing further' >&2",
+                          " ".join(fs[i:i + 260].split()), marker)
+        self.assertIn("( set -C; printf 'F4 stopped", " ".join(fs.split()))
         f6 = fs[fs.index("- **F6 Start.**"):]
         self.assertLess(f6.index("F6 attempted"), f6.index("docker/run.sh"))
 
@@ -888,10 +997,10 @@ exec $REAL "$@"
 
     def test_a_completed_snapshot_and_install_take_the_after_branch(self):
         p = self.phase([self.F4, "F4c started", f"F4c ok {self.bk}"])
-        self.assertEqual(p.stdout, "fs-phase: AFTER-SNAPSHOT; restore the config: no\n")
+        self.assertEqual(p.stdout, f"fs-phase: AFTER-SNAPSHOT; restore the config: no; the OLD check takes BK={self.bk}\n")
         p = self.phase([self.F4, "F4c started", f"F4c ok {self.bk}", "F5 started"])
         self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertEqual(p.stdout, "fs-phase: AFTER-SNAPSHOT; restore the config: yes\n")
+        self.assertEqual(p.stdout, f"fs-phase: AFTER-SNAPSHOT; restore the config: yes; the OLD check takes BK={self.bk}\n")
 
     def test_an_attempted_start_or_an_unknown_ledger_stops(self):
         for lines, words in (([self.F4, "F4c started", f"F4c ok {self.bk}", "F5 started", "F6 attempted"],
