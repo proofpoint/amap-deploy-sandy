@@ -18,7 +18,11 @@ The host-setup document's `hub` section names, all operator data:
   source's path inside the secrets section's producer clone;
 - `env_file`: where the root-owned environment file is placed;
 - `hop`: the hop it serves (one of the document's hops), its root, the
-  registry directory and its owner, and the link name;
+  registry directory and its owner, the link name, and `peer_uid`: the uid
+  the local router writes in the hop root AS, measured on the host. It is
+  the runtime's HOP_PEER_UID, required, and never derived from the
+  document's principals (the local router's declared uid can differ from
+  the uid it runs as);
 - `dirs`: the roots the runtime's mailbox root, ledger, lock and inbound
   state live in, each a declared root owned by the runtime, mode 0700,
   and the lock file's name;
@@ -156,6 +160,7 @@ class HubSpec:
     hop_root: str
     registry_dir: str
     registry_uid: int
+    peer_uid: int                     # HOP_PEER_UID: the uid [1] writes in the hop root as, measured
     link: str
     dirs: Dict[str, str]              # DIR_KEYS -> host path
     lock_file: str
@@ -205,6 +210,17 @@ def _pin(v: Any) -> str:
 def _uint(v: Any, what: str) -> int:
     if isinstance(v, bool) or not isinstance(v, int) or v < 0:
         raise HubSpecError(f"hub.{what} must be a non-negative integer")
+    return v
+
+
+#: The largest uid HOP_PEER_UID may name (a 32-bit signed uid_t's range).
+PEER_UID_MAX = 2 ** 31 - 1
+
+
+def _peer_uid(v: Any) -> int:
+    if isinstance(v, bool) or not isinstance(v, int) or not 0 < v <= PEER_UID_MAX:
+        raise HubSpecError(f"hub.hop.peer_uid must be the measured uid of the local router, an integer in "
+                           f"1..{PEER_UID_MAX} (never root)")
     return v
 
 
@@ -267,7 +283,7 @@ def load(sec: Any, spec: Any) -> HubSpec:
             or src.split("/")[0] == "..":
         raise HubSpecError("hub.d7.source must be a path inside the producer clone, or "
                            "{path, sha256, commit, from}")
-    hop = _exact(sec["hop"], ("name", "root", "registry_dir", "registry_uid", "link"), "hop")
+    hop = _exact(sec["hop"], ("name", "root", "registry_dir", "registry_uid", "peer_uid", "link"), "hop")
     if hop["name"] not in {h[0] for h in spec.hops}:
         raise HubSpecError(f"hub.hop.name {hop['name']!r} is not one of the document's hops")
     if not isinstance(hop["link"], str) or not _LINK.fullmatch(hop["link"]):
@@ -301,7 +317,8 @@ def load(sec: Any, spec: Any) -> HubSpec:
         d7_source=src, d7_source_sha256=src_sha, d7_source_commit=src_commit, d7_source_from=src_from,
         env_file=_abs(sec["env_file"], "env_file"), hop=hop["name"], hop_root=hop["root"],
         registry_dir=_abs(hop["registry_dir"], "hop.registry_dir"),
-        registry_uid=_uint(hop["registry_uid"], "hop.registry_uid"), link=hop["link"], dirs=paths,
+        registry_uid=_uint(hop["registry_uid"], "hop.registry_uid"), peer_uid=_peer_uid(hop["peer_uid"]),
+        link=hop["link"], dirs=paths,
         lock_file=dirs["lock_file"], prefix_template=_abs(sec["prefix_template"], "prefix_template"),
         config_uid=_uint(sec["config_uid"], "config_uid"), log_driver=log, candidate_carriage=carriage)
     if hs.username != s.probe["username"]:
@@ -348,10 +365,9 @@ def environment(spec: Any, hs: HubSpec) -> List[Tuple[str, str]]:
     s = spec.secrets
     p = s.probe
     inside = {k: _in_container(spec, s.principal, v) for k, v in hs.dirs.items()}
-    peers = [uid for (who, _env), uid in _peer_uids(spec).items() if who == s.principal]
+    peers = [env for (who, env) in _peer_uids(spec) if who == s.principal]
     if len(peers) != 1:
         raise HubSpecError(f"{s.principal} has {len(peers)} hop peers; the hub-link router needs exactly one")
-    peer = peers[0]
     env = [
         ("RELAY_LINK_ROLE", ROLE),
         ("SMTP_AUTH_METHOD", AUTH_METHOD),
@@ -372,7 +388,7 @@ def environment(spec: Any, hs: HubSpec) -> List[Tuple[str, str]]:
         ("RELAY_LOCK", posixpath.join(inside["lock"], hs.lock_file)),
         ("HUB_INBOUND_STATE_DIR", inside["HUB_INBOUND_STATE_DIR"]),
         ("HOP_ROOT", _in_container(spec, s.principal, hs.hop_root)),
-        ("HOP_PEER_UID", str(peer)),
+        ("HOP_PEER_UID", str(hs.peer_uid)),
         ("HOP_LINK", hs.link),
         ("HOP_REGISTRY_DIR", hs.registry_dir),
         ("HOP_REGISTRY_UID", str(hs.registry_uid)),
