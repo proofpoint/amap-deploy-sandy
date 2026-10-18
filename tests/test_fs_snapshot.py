@@ -823,6 +823,28 @@ exec $REAL "$@"
         self.assertIn(b"f 600 %d %d 0 ./.router.lock" % (os.getuid(), os.getgid()), entries)
         self.assertTrue(os.path.exists(os.path.join(self.bk, "fs-state.manifest.sha256")))
 
+    def test_an_extra_entry_appearing_after_the_extract_is_refused(self):
+        """Something writes OLD between the extract and its check: tar -d
+        sees only archived members, so the post-restore manifest is what
+        refuses the extra entry (Codex's post-extract contamination row)."""
+        self.assertEqual(self.snapshot().returncode, 0)
+        self.damaged()
+        self.tar_stub(f"""case "$*" in *-xpf*) $REAL "$@" || exit 1; printf x > '{self.st}/contaminant.json'; exit 0 ;; esac
+exec $REAL "$@"
+""")
+        p = self.restore(os.path.join(self.d, "backup", "aside"))
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("does not hold exactly the snapshot's entries", p.stderr)
+        self.assertNotIn("fs-restore: OK", p.stdout)
+
+    def test_the_operator_flow_writes_each_ledger_line_before_its_action(self):
+        text = RUNBOOK.read_text()
+        fs = text[text.index("### The local router's fresh start (FS)"):text.index("**FS's back-outs**")]
+        self.assertIn("BEFORE the action\nit records", fs)
+        self.assertIn("F6's start runs only after `F6 attempted` is written", " ".join(fs.split()).replace("` F6", "`F6"))
+        f6 = fs[fs.index("- **F6 Start.**"):]
+        self.assertLess(f6.index("F6 attempted"), f6.index("docker/run.sh"))
+
     def test_a_changed_manifest_is_refused(self):
         self.assertEqual(self.snapshot().returncode, 0)
         self.damaged()

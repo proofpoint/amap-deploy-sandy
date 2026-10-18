@@ -1172,6 +1172,14 @@ Run every step as the operator, except where a step names the account that
 runs the router. Each step's STOP ends FS at that point, and the back-out
 for that point (below) applies.
 
+**The ledger is written first.** Each `printf … >> <run_dir>/fs-ledger.txt`
+below runs, and its own exit status is checked
+(`|| { echo 'STOP: the ledger write failed'; exit 1; }`), BEFORE the action
+it records. A failed write stops FS before that action, so no action runs
+unrecorded. Above all, F6's start runs only after `F6 attempted` is written:
+a start the ledger does not show could otherwise be taken for one that
+never happened, and offered OLD's back-out.
+
 - **F1 Fingerprint.** `python3 amap-sandy.py router-fingerprint --step 0
   --label fs --apply`, then `python3 amap-sandy.py router-fingerprint
   --match <the file it wrote>`, each with `--container <its current name>`.
