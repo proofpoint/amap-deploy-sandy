@@ -543,10 +543,10 @@ def render_plan(spec: Spec, overlay_source: Optional[Path] = None,
     steps = f"{q(py)} {q(str(HOST_STEPS))}"
     lines = ["# Run as root. Each line is one step; nothing here has run. No step follows a "
              "symbolic link, and each is safe to run again.",
-             "# Run each command line separately. Continue only after checking that its exit status is 0. "
-             "Any STOP or nonzero status ends this run; do not run the following steps.",
              f"# Run them from a checkout no sandbox mounts read-write (a fresh clone at the recorded "
-             f"deploy commit), never from an agent's workspace: these steps run {HOST_STEPS.name} as root."]
+             f"deploy commit), never from an agent's workspace: these steps run {HOST_STEPS.name} as root.",
+             "# Run each command line separately. Continue only after checking that its exit status is 0. "
+             "Any STOP or nonzero status ends this run; do not run the following steps."]
     if spec.partition is not None and spec.supervision is not None and spec.secrets is not None:
         # Imported here: host_setup is in the weekly job's bundle, and the job's own installation is not.
         import partition_job as pj
