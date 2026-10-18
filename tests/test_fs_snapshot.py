@@ -840,7 +840,12 @@ exec $REAL "$@"
     def test_the_operator_flow_writes_each_ledger_line_before_its_action(self):
         text = RUNBOOK.read_text()
         fs = text[text.index("### The local router's fresh start (FS)"):text.index("**FS's back-outs**")]
-        self.assertIn("BEFORE the action\nit records", fs)
+        flat = " ".join(fs.split())
+        self.assertIn("An INTENT line (`F4c started`, `F5 started`, `F6 attempted`) is written BEFORE the action it records", flat)
+        self.assertIn("A COMPLETION line (`F4 stopped`, `F4c ok`) is written only AFTER the step it records has succeeded", flat)
+        f4c = fs[fs.index("- **F4c The snapshot**"):fs.index("- **F5 The live config.**")]
+        self.assertLess(f4c.index("F4c started"), f4c.index("the snapshot block"))
+        self.assertLess(f4c.index("the snapshot block"), f4c.index("F4c ok"))
         self.assertIn("F6's start runs only after `F6 attempted` is written", " ".join(fs.split()).replace("` F6", "`F6"))
         f6 = fs[fs.index("- **F6 Start.**"):]
         self.assertLess(f6.index("F6 attempted"), f6.index("docker/run.sh"))
