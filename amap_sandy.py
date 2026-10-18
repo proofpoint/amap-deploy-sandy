@@ -3792,7 +3792,7 @@ def run_render_router(args: argparse.Namespace, home: Path, boxes: List[Dict[str
 
 def verify_router_sibling(home: Path, policy: Dict[str, Any], members: Dict[str, dict],
                           state_dir: Path, sandbox_paths: Dict[str, Path],
-                          overlay: Optional[Path] = None) -> List[str]:
+                          overlay: Optional[Path] = None, notes: Optional[List[str]] = None) -> List[str]:
     """`verify`'s half: the file on disk is byte for byte the rendering.
     Absent is a problem (the router has nothing to start from), a hand edit
     is drift with the re-sync as remedy. On a hop host the rendering carries
@@ -3814,14 +3814,22 @@ def verify_router_sibling(home: Path, policy: Dict[str, Any], members: Dict[str,
         doc = dict(doc, **registry)
     if keys is None:
         # A document that configures the hub-link router while the policy
-        # names no hop link is a host half set up.
+        # names no hop link is a host half set up. Under router_registry it
+        # is the one expected stage: the router resolves through the registry
+        # and the link comes later, so it is a note, and the rendering (with
+        # registry_dir and no hop key) is still compared byte for byte below.
         try:
             hub_doc = hsu.read_spec(None, overlay) if overlay is not None else None
         except ValueError:
             hub_doc = None
         if isinstance(hub_doc, dict) and hub_doc.get(hsu.hr.SECTION) is not None:
-            return [f"router config: the host-setup document configures the hub-link router, and the "
-                    f"policy has no {hp.HOP_LINK_KEY}: add it, or remove the hub section"]
+            if registry is None:
+                return [f"router config: the host-setup document configures the hub-link router, and the "
+                        f"policy has no {hp.HOP_LINK_KEY}: add it, or remove the hub section"]
+            if notes is not None:
+                notes.append(f"router config: hop link pending: the host-setup document configures the "
+                             f"hub-link router, and the policy has no {hp.HOP_LINK_KEY} yet; "
+                             f"{hp.REGISTRY_POLICY_KEY} renders registry_dir only")
     else:
         doc = dict(doc, **keys)
         roots = hp.loader_roots(doc, hp.hop_checkout())
@@ -4191,7 +4199,7 @@ def run_verify(args: argparse.Namespace, servers: Dict[str, dict], home: Path,
     # rendering, byte for byte.
     state_dir = sibling_state_dir(home, args.state_dir)
     problems += verify_router_sibling(home, policy, enrolled, state_dir, boxes,
-                                      ha.overlay_path(getattr(args, "overlay", None)))
+                                      ha.overlay_path(getattr(args, "overlay", None)), notes=notes)
 
     # THE ROUTER PROCESS, last: its container and its health, three-valued
     # (router_health). Nothing here starts it — the remedy names the

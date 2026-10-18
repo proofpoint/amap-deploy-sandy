@@ -185,6 +185,50 @@ class RenderTest(unittest.TestCase):
         self.assertIn(hp.REGISTRY_POLICY_KEY, said)
 
 
+class HopLinkPendingTest(unittest.TestCase):
+    """verify's half-set-up rule against a host-setup document with a hub
+    section and no hop link: a problem, except under router_registry, where
+    it is a note and the registry rendering is still compared."""
+
+    def setUp(self):
+        from test_hop_render import doc as setup_doc
+        import host_setup as hs
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        self.t = Path(os.path.realpath(td.name))
+        self.reg = self.t / "registry"
+        self.reg.mkdir()
+        self.ov = self.t / "overlay.json"
+        self.ov.write_text(json.dumps({ha.OVERLAY_SECTION: dict(IDS, directory=str(self.reg)),
+                                       hs.OVERLAY_SECTION: setup_doc()}))
+        self.base = {"state_dir": str(self.t / "s")}
+        for (mod, name), value in {
+                (prov, "render_router_sibling"): lambda *a, **k: {"_doc": dict(self.base), "_warnings": []},
+                (prov, "router_sibling_path"): lambda home: self.t / "router.json",
+                (hp, "checkout_problems"): lambda path, pin: []}.items():
+            self.addCleanup(setattr, mod, name, getattr(mod, name))
+            setattr(mod, name, value)
+
+    def verify(self, policy, on_disk):
+        (self.t / "router.json").write_text(json.dumps(on_disk, indent=2) + "\n")
+        notes = []
+        return prov.verify_router_sibling(self.t, policy, {}, self.t / "s", {}, self.ov, notes=notes), notes
+
+    def test_under_router_registry_the_pending_link_is_a_note(self):
+        problems, notes = self.verify({hp.REGISTRY_POLICY_KEY: True}, dict(self.base, registry_dir=str(self.reg)))
+        self.assertEqual(problems, [])
+        self.assertTrue(any("hop link pending" in n for n in notes), notes)
+
+    def test_without_router_registry_it_is_still_a_problem(self):
+        problems, notes = self.verify({}, self.base)
+        self.assertTrue(problems and "hub-link router" in problems[0], problems)
+        self.assertEqual(notes, [])
+
+    def test_the_note_never_excuses_the_rendering(self):
+        problems, notes = self.verify({hp.REGISTRY_POLICY_KEY: True}, self.base)
+        self.assertTrue(problems and "registry_dir" in problems[0] and "drift" in problems[0], problems)
+
+
 class VerifyTest(unittest.TestCase):
     """verify_router_sibling compares the file with the registry render."""
 
