@@ -280,6 +280,9 @@ ROUTER_SIBLING_NAME = "router.json"
 # The feature root's one-line record of a router config named outside
 # $SANDY_HOME (`--router-config-path`), so every later consumer finds it.
 ROUTER_CONFIG_POINTER = "router-config.path"
+# A named router config's mode: the router's principal and the pin read it
+# through the other bits, whatever the operator's umask.
+NAMED_ROUTER_CONFIG_MODE = 0o644
 # The verdict file's own `schema`. It carries its own number so it can move
 # independently of the manifest and the CLI schema. An OPAQUE token like the
 # others: a file with any other value is refused by name, never read with this
@@ -662,16 +665,74 @@ def router_sibling_path(home: Path) -> Path:
     return recorded if recorded is not None else feature_root(home) / ROUTER_SIBLING_NAME
 
 
-def record_router_config(home: Path, *, dry_run: bool) -> Optional[str]:
-    """Under --apply, write the pointer for `--router-config-path` (absent
-    when no path was named). The router config's directory must exist."""
-    if _ROUTER_CONFIG_OVERRIDE is None:
-        return None
-    if not _ROUTER_CONFIG_OVERRIDE.parent.is_dir():
+def check_router_config_dir() -> None:
+    """A named router config's directory must exist before anything is
+    written: install never makes it."""
+    if _ROUTER_CONFIG_OVERRIDE is not None and not _ROUTER_CONFIG_OVERRIDE.parent.is_dir():
         raise ProvisionError(f"the router config's directory {_ROUTER_CONFIG_OVERRIDE.parent} does not exist: "
                              f"make it first (owned by the operator, mode 0755)")
+
+
+def record_router_config(home: Path, *, dry_run: bool) -> Optional[str]:
+    """Write the pointer for `--router-config-path` (None when no path was
+    named). Called only once the named file is placed and read back, so a
+    refused or staging-only run leaves the prior pointer as it was."""
+    if _ROUTER_CONFIG_OVERRIDE is None:
+        return None
     return _write_file(router_config_pointer(home), f"{_ROUTER_CONFIG_OVERRIDE}\n", dry_run=dry_run,
                        label=ROUTER_CONFIG_POINTER)
+
+
+def place_named_router_config(path: Path, want: str) -> str:
+    """The named router config, placed atomically at NAMED_ROUTER_CONFIG_MODE
+    whatever the umask, and read back. Equal bytes still get the mode. An
+    existing file must be the operator's regular file. Only this file: the
+    manifest, the pointer and the payload keep their own writers' modes."""
+    data = want.encode("utf-8")
+    try:
+        st: Optional[os.stat_result] = os.lstat(path)
+    except FileNotFoundError:
+        st = None
+    except OSError as e:
+        raise ProvisionError(f"cannot stat {path}: {e}") from None
+    if st is not None and (not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid()):
+        raise ProvisionError(f"{path} is not a regular file owned by this operator: not replaced")
+    try:
+        if st is None or path.read_bytes() != data:
+            tmp = path.with_name(f".{path.name}.tmp")
+            try:
+                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+                try:
+                    os.fchmod(fd, NAMED_ROUTER_CONFIG_MODE)
+                    view = memoryview(data)
+                    while view:
+                        view = view[os.write(fd, view):]
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+                os.replace(tmp, path)
+            except OSError:
+                tmp.unlink(missing_ok=True)
+                raise
+            verb = "updated" if st is not None else "created"
+        elif stat.S_IMODE(st.st_mode) != NAMED_ROUTER_CONFIG_MODE:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+            try:
+                os.fchmod(fd, NAMED_ROUTER_CONFIG_MODE)
+            finally:
+                os.close(fd)
+            verb = f"mode set to {NAMED_ROUTER_CONFIG_MODE:04o}"
+        else:
+            verb = "present"
+        after = os.lstat(path)
+        back = path.read_bytes()
+    except OSError as e:
+        raise ProvisionError(f"cannot place {path}: {e}") from None
+    if not stat.S_ISREG(after.st_mode) or after.st_uid != os.getuid() \
+            or stat.S_IMODE(after.st_mode) != NAMED_ROUTER_CONFIG_MODE or back != data:
+        raise ProvisionError(f"{path} did not read back as the rendering, the operator's, mode "
+                             f"{NAMED_ROUTER_CONFIG_MODE:04o}")
+    return verb
 
 
 def feature_roster_dir(home: Path) -> Path:
@@ -3719,9 +3780,21 @@ def run_render_router(args: argparse.Namespace, home: Path, boxes: List[Dict[str
     was not written; 2 when it cannot be rendered at all. Prints one line per
     outcome; sibling tools parse them, so their spelling moves by agreement."""
     path = router_sibling_path(home)
-    note = record_router_config(home, dry_run=not apply)
-    if note:
-        print(f"router config path: {note}")
+    check_router_config_dir()
+    staging = (getattr(args, "render_to", None) is not None or getattr(args, "prepare", False)
+               or getattr(args, "activate", None) is not None
+               or getattr(args, "activation_sha256", None) is not None)
+    if staging and _ROUTER_CONFIG_OVERRIDE is not None and recorded_router_config(home) is None:
+        print(f"router config: --router-config-path {_ROUTER_CONFIG_OVERRIDE} is recorded only by the "
+              f"install --apply that places it; run that first, then this one", file=sys.stderr)
+        return 2
+    named = path != feature_root(home) / ROUTER_SIBLING_NAME
+
+    def pointer(dry_run: bool) -> None:
+        note = record_router_config(home, dry_run=dry_run)
+        if note:
+            print(f"router config path: {note}")
+
     members = load_membership(home, boxes)
     state_dir = sibling_state_dir(home, args.state_dir)
     sandbox_paths = {b["name"]: Path(b["path"]) for b in boxes if b.get("name") and b.get("path")}
@@ -3786,14 +3859,22 @@ def run_render_router(args: argparse.Namespace, home: Path, boxes: List[Dict[str
         return 2
     notice = hp.restart_notice(_read_json(path) if have is not None else None, doc)
     if apply:
-        if have == want:
+        if named:
+            verb = place_named_router_config(path, want)
+            pointer(False)
+            if have == want:
+                print(f"router config current: {path} ({verb}) — {len(members)} instance(s): {names}")
+                return 0
+        elif have == want:
             print(f"router config current: {path} — {len(members)} instance(s): {names}")
             return 0
-        _write_file(path, want, dry_run=False, label=ROUTER_SIBLING_NAME)
+        else:
+            _write_file(path, want, dry_run=False, label=ROUTER_SIBLING_NAME)
         print(f"wrote {path} — {len(members)} instance(s): {names}")
         if notice:
             print(f"router config: {notice}")
         return 0
+    pointer(True)
     if have is None:
         print(f"router config absent: would write {path} — {len(members)} instance(s): "
               f"{names} (pass --apply)")
@@ -3855,6 +3936,12 @@ def verify_router_sibling(home: Path, policy: Dict[str, Any], members: Dict[str,
                 f"by --config and has nothing to start from without it"]
     except OSError as e:
         return [f"router config: cannot read {path}: {e}"]
+    if path != feature_root(home) / ROUTER_SIBLING_NAME:
+        st = os.lstat(path)
+        if stat.S_IMODE(st.st_mode) != NAMED_ROUTER_CONFIG_MODE or st.st_uid != os.getuid():
+            return [f"router config: {path} is uid {st.st_uid} mode {stat.S_IMODE(st.st_mode):04o}, not the "
+                    f"operator's {NAMED_ROUTER_CONFIG_MODE:04o}: the router's principal reads it through the "
+                    f"other bits — re-run install --apply"]
     if have == sibling_text(doc):
         return []
     existing = _read_json(path)

@@ -2636,6 +2636,110 @@ class RouterConfigPathTest(_ConnectorFixtureMixin, unittest.TestCase):
         self.assertFalse(self.named.exists())
         self.assertFalse(prov.router_config_pointer(self.tmp).exists())
 
+    def _mode(self, path):
+        return stat.S_IMODE(os.lstat(path).st_mode)
+
+    def _umask(self, mask):
+        old = os.umask(mask)
+        self.addCleanup(os.umask, old)
+
+    def test_the_named_file_is_0644_under_umask_077(self):
+        """The router's principal reads the named file through the other
+        bits, so the operator's private umask must not reach it."""
+        self._fleet()
+        self._umask(0o077)
+        rc, out = self._with_path("--apply")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self._mode(self.named), prov.NAMED_ROUTER_CONFIG_MODE)
+        self.assertEqual(os.lstat(self.named).st_uid, os.getuid())
+
+    def test_an_equal_bytes_0600_file_is_made_0644(self):
+        self._fleet()
+        self.assertEqual(self._with_path("--apply")[0], 0)
+        before = self.named.read_bytes()
+        os.chmod(self.named, 0o600)
+        self._umask(0o077)
+        rc, out = self._with_path("--apply")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("router config current", out)
+        self.assertEqual(self.named.read_bytes(), before)
+        self.assertEqual(self._mode(self.named), prov.NAMED_ROUTER_CONFIG_MODE)
+
+    def test_the_mode_is_only_the_named_files(self):
+        """The manifest and the pointer keep their own writers' modes."""
+        self._fleet()
+        self._umask(0o077)
+        self.assertEqual(self._with_path("--apply")[0], 0)
+        self.assertEqual(self._mode(prov.router_config_pointer(self.tmp)), 0o600)
+
+    def test_verify_names_a_named_file_that_is_not_0644(self):
+        boxes = self._fleet()
+        self.assertEqual(self._with_path("--apply")[0], 0)
+        prov._ROUTER_CONFIG_OVERRIDE = None
+        os.chmod(self.named, 0o600)
+        problems = prov.verify_router_sibling(
+            self.tmp, fp.load_policy(prov.feature_manifest_path(self.tmp)), prov.load_membership(self.tmp, boxes),
+            prov.sibling_state_dir(self.tmp, None), {b["name"]: Path(b["path"]) for b in boxes})
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("mode 0600", problems[0])
+        os.chmod(self.named, 0o644)
+        self.assertEqual(prov.verify_router_sibling(
+            self.tmp, fp.load_policy(prov.feature_manifest_path(self.tmp)), prov.load_membership(self.tmp, boxes),
+            prov.sibling_state_dir(self.tmp, None), {b["name"]: Path(b["path"]) for b in boxes}), [])
+
+    def _refuse_render(self):
+        def refuse(*a, **k):
+            raise prov.ProvisionError("a refused rendering")
+        orig = prov.render_router_sibling
+        prov.render_router_sibling = refuse
+        self.addCleanup(setattr, prov, "render_router_sibling", orig)
+
+    def test_a_refused_render_records_no_pointer(self):
+        self._fleet()
+        self._refuse_render()
+        out = self._with_path("--apply")[1]
+        self.assertIn("router config: cannot render — a refused rendering", out)
+        self.assertFalse(prov.router_config_pointer(self.tmp).exists(), out)
+        self.assertFalse(self.named.exists())
+
+    def test_a_refused_render_keeps_the_prior_pointer_bytes(self):
+        self._fleet()
+        self.assertEqual(self._with_path("--apply")[0], 0)
+        ptr = prov.router_config_pointer(self.tmp)
+        before = (ptr.read_bytes(), os.lstat(ptr).st_ino)
+        self._refuse_render()
+        out = self._with_path("--apply")[1]
+        self.assertIn("router config: cannot render — a refused rendering", out)
+        self.assertEqual((ptr.read_bytes(), os.lstat(ptr).st_ino), before)
+
+    def test_staging_only_with_an_unrecorded_path_refuses_and_records_nothing(self):
+        self._fleet()
+        staged = self.outside / "staged.json"
+        rc, out = self._with_path("--apply", "--render-to", str(staged))
+        self.assertEqual(rc, 2, out)
+        self.assertIn("recorded only by the install --apply that places it", out)
+        self.assertFalse(prov.router_config_pointer(self.tmp).exists())
+        self.assertFalse(staged.exists())
+        self.assertFalse(self.named.exists())
+
+    def test_a_dry_run_records_no_pointer(self):
+        self._fleet()
+        rc, out = self._with_path()
+        self.assertIn("would create", out)
+        self.assertFalse(prov.router_config_pointer(self.tmp).exists())
+        self.assertFalse(self.named.exists())
+
+    def test_a_successful_placement_is_reused(self):
+        self._fleet()
+        self.assertEqual(self._with_path("--apply")[0], 0)
+        ptr = prov.router_config_pointer(self.tmp)
+        before = (ptr.read_bytes(), os.lstat(ptr).st_ino, self.named.read_bytes(), os.lstat(self.named).st_ino)
+        rc, out = self._with_path("--apply")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("router config current", out)
+        self.assertEqual((ptr.read_bytes(), os.lstat(ptr).st_ino, self.named.read_bytes(),
+                          os.lstat(self.named).st_ino), before)
+
 
 def _ctx_with_home(home):
     class _Ctx:
