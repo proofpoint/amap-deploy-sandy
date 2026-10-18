@@ -502,6 +502,31 @@ def root_dirs(spec: Spec) -> List[str]:
     return sorted(dirs, key=lambda d: (d.count("/"), d))
 
 
+def _dir_safe(var: str) -> str:
+    """A POSIX test that "$var" is a real directory, root's (the plan runs as
+    root, so -O is root), and writable by no group and no other user."""
+    return (f'[ -d "${var}" ] && [ ! -L "${var}" ] && [ -O "${var}" ] && '
+            f'[ -z "$(find "${var}" -maxdepth 0 \\( -perm -g+w -o -perm -o+w \\) -print)" ]')
+
+
+def root_dirs_precheck(dirs: List[str], q: Callable[[str], str], parents: Optional[List[str]] = None) -> str:
+    """One read-only line, run as root before root's own directories are made:
+    / and each first-level parent must exist, be root's and be writable by no
+    group or other user; each directory to be made must be absent, or already
+    exactly that (never another owner's, even empty, which the helper would
+    otherwise re-own). Its status is 1 on any STOP (never `exit`, so a typed
+    line leaves the shell open), and 0 only when every directory passed."""
+    if parents is None:
+        parents = ["/"] + sorted({"/" + d.split("/")[1] for d in dirs})
+    return (f"ok=1; for d in {' '.join(q(f) for f in parents)}; do {{ {_dir_safe('d')}; }} || "
+            f"{{ echo \"STOP: $d is not root's real directory, or a group or other user can write it\" >&2; "
+            f"ok=0; break; }}; done; "
+            f"[ \"$ok\" = 1 ] && for d in {' '.join(q(d) for d in dirs)}; do "
+            f"{{ [ ! -e \"$d\" ] && [ ! -L \"$d\" ]; }} || {{ {_dir_safe('d')}; }} || "
+            f"{{ echo \"STOP: $d exists and is not root's real directory, or a group or other user can write it\" >&2; "
+            f"ok=0; break; }}; done; [ \"$ok\" = 1 ]")
+
+
 def render_plan(spec: Spec, overlay_source: Optional[Path] = None,
                 hub: Optional[hr.Rendered] = None) -> List[str]:
     """The root-run steps, in order, as shell lines. Printed, never run.
@@ -532,6 +557,7 @@ def render_plan(spec: Spec, overlay_source: Optional[Path] = None,
         lines.append("# Root's own directories, before anything is placed in them: made 0755 and root's, "
                      "parents first. A missing one is made fresh; an existing one another owner holds, and "
                      "that is not empty, stops the step.")
+        lines.append(root_dirs_precheck(made, q))
     for d in made:
         lines.append(f"{steps} root {q(d)} 0 0 {ROOT_DIR_MODE:04o}")
     if spec.overlay_path is not None and spec.overlay_pin is not None:

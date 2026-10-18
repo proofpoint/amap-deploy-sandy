@@ -281,6 +281,13 @@ class PlanTest(unittest.TestCase):
 
     def test_every_step_goes_through_the_no_follow_helper(self):
         for line in self.plan:
+            if line.startswith("ok=1; for d in "):
+                # The one exception: root's directories' precheck, read-only (it tests and prints).
+                import re
+                self.assertIsNone(re.search(r"(^|[\s;{|&(])(mkdir|chmod|chown|rm|mv|install|tee)\s",
+                                            line), line)
+                self.assertNotIn(">", line.replace(">&2", ""), line)
+                continue
             if not line.startswith("#"):
                 self.assertTrue(line.startswith(self.steps), line)
         self.assertFalse(any(l.startswith(("install ", "sh -c", "chown", "chmod")) for l in self.plan))
@@ -297,6 +304,18 @@ class PlanTest(unittest.TestCase):
                                 f"{self.steps} root /srv/example/overlay 0 0 0755"])
         place = next(i for i, l in enumerate(self.plan) if l.startswith(f"{self.steps} place "))
         self.assertLess(max(self.plan.index(l) for l in made), place)
+
+    def test_the_precheck_comes_before_roots_own_directories(self):
+        made = [i for i, l in enumerate(self.plan) if l.startswith(f"{self.steps} root ") and l.endswith(" 0 0 0755")]
+        pre = [i for i, l in enumerate(self.plan) if l.startswith("ok=1; for d in / /srv;")]
+        self.assertEqual(len(pre), 1, self.plan)
+        self.assertLess(pre[0], made[0])
+
+    def test_a_missing_intermediate_is_made_too_shallow_first(self):
+        x = doc()
+        x["overlay"]["path"] = "/srv/example/one/two/plugin.py"
+        dirs = hs.root_dirs(hs.load_spec(x))
+        self.assertEqual(dirs, ["/srv/example", "/srv/example/one", "/srv/example/one/two"])
 
     def test_the_overlay_is_placed_and_names_its_digest(self):
         line = next(l for l in self.plan if l.startswith(f"{self.steps} place "))
@@ -1084,3 +1103,47 @@ class VerifyRunsTheHostSetupTest(unittest.TestCase):
                                                "verify (2/2): the checks the install cannot make\n"))
         rc, out = self.verify(self.write({"registry": {}}))
         self.assertEqual(rc, 0, out)
+
+
+
+class RootDirsPrecheckTest(unittest.TestCase):
+    """The precheck line, executed by /bin/sh as printed. The fixture stands in
+    for / and the first level (the suite never runs as root, so -O is the
+    test's own uid)."""
+
+    def setUp(self):
+        import tempfile
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        self.top = os.path.join(os.path.realpath(d.name), "top")
+        os.makedirs(os.path.join(self.top, "amap"))
+        for p in (os.path.realpath(d.name), self.top, os.path.join(self.top, "amap")):
+            os.chmod(p, 0o755)
+        self.dirs = [os.path.join(self.top, "amap"), os.path.join(self.top, "amap", "plugin")]
+
+    def run_line(self):
+        import shlex
+        import subprocess
+        line = hs.root_dirs_precheck(self.dirs, shlex.quote, parents=[self.top])
+        return subprocess.run(["/bin/sh", "-c", line], capture_output=True, text=True)
+
+    def test_an_existing_safe_parent_and_an_absent_dir_pass(self):
+        p = self.run_line()
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+    def test_each_unsafe_state_stops_with_status_1(self):
+        amap, plugin = self.dirs
+        cases = (("a group-writable existing dir", lambda: os.chmod(amap, 0o775), amap),
+                 ("a world-writable parent", lambda: os.chmod(self.top, 0o757), self.top),
+                 ("a symlink where a dir is to be made", lambda: os.symlink(amap, plugin), plugin),
+                 ("a file where a dir is to be made", lambda: open(plugin, "w").close(), plugin))
+        for name, make, where in cases:
+            with self.subTest(name=name):
+                make()
+                p = self.run_line()
+                self.assertEqual(p.returncode, 1, (p.stdout, p.stderr))
+                self.assertIn(f"STOP: {where}", p.stderr)
+                os.chmod(amap, 0o755)
+                os.chmod(self.top, 0o755)
+                if os.path.lexists(plugin):
+                    os.unlink(plugin)
