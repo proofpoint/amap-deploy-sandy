@@ -730,6 +730,19 @@ Three changes are refused rather than rendered:
   `python3 amap-sandy.py install --decommission-hop --apply`, then restart
   the router.
 
+### The registry without a hop link
+
+A host whose local router resolves its instances through the registry, but
+has no hop link yet, names it in the policy: `"router_registry": true` in the
+manifest's `feature` section. Only `true` is accepted. `install` then renders
+`registry_dir`, and no hop key, from the overlay's `registry.directory`.
+That value is never defaulted: it must be an existing directory, named by
+its own physical spelling. Only the hop checkout's router reads
+`registry_dir`, so the hop checkout's loader validates the rendering, and
+`--render-to` takes it as it takes a hop host's. Run that router as the hop
+section says. With a hop link as well, the link's `registry_dir` must be the
+same directory. Without the key, the rendering is unchanged.
+
 ### The local router's migration to the generation layout (R2)
 
 A local router whose state is keyed by instance name (any router that ran

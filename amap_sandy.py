@@ -3587,6 +3587,40 @@ def hop_router_keys(policy: Dict[str, Any], state_dir: Path, overlay: Optional[P
     return keys, problems
 
 
+def registry_router_keys(policy: Dict[str, Any], overlay: Optional[Path],
+                         hop_keys: Optional[Dict[str, Any]]) -> Tuple[Optional[Dict[str, Any]], List[str]]:
+    """`registry_dir` for a host whose policy names `router_registry` and no
+    hop link, and every problem that stops it. The trigger is the policy;
+    the value is the overlay's `registry.directory`, never defaulted, an
+    existing directory spelled physically (the router mounts it by that
+    spelling). With a hop link the hop keys already carry `registry_dir`,
+    and the overlay's must be the same directory: one host, one registry.
+    Without the trigger nothing is rendered and nothing is checked."""
+    if hp.REGISTRY_POLICY_KEY not in policy:
+        return None, []
+    if policy[hp.REGISTRY_POLICY_KEY] is not True:
+        return None, [f"the policy's {hp.REGISTRY_POLICY_KEY} must be true; it has no other value"]
+    try:
+        directory = ha.load_identifiers(overlay).directory
+    except ha.OverlayError as e:
+        return None, [f"{hp.REGISTRY_POLICY_KEY}: {e}"]
+    if directory is None:
+        return None, [f"{hp.REGISTRY_POLICY_KEY}: the overlay names no registry.directory, and it is "
+                      f"never defaulted"]
+    if os.path.realpath(directory) != directory:
+        return None, [f"{hp.REGISTRY_POLICY_KEY}: registry.directory {directory} is not its own physical "
+                      f"spelling ({os.path.realpath(directory)}); name the real path"]
+    if not os.path.isdir(directory):
+        return None, [f"{hp.REGISTRY_POLICY_KEY}: registry.directory {directory} is not a directory"]
+    if hop_keys is not None:
+        if hop_keys.get("registry_dir") != directory:
+            return None, [f"{hp.REGISTRY_POLICY_KEY}: the hop link's registry_dir "
+                          f"{hop_keys.get('registry_dir')} is not the overlay's registry.directory "
+                          f"{directory}: one host has one registry"]
+        return None, []
+    return {"registry_dir": directory}, hp.checkout_problems(hp.hop_checkout(), hp.hop_pin())
+
+
 def run_activation(args: argparse.Namespace, policy: Dict[str, Any], doc: Dict[str, Any], path: Path, *,
                    apply: bool, spec: Any) -> int:
     """A3 (activation_install): the activation config into the operator's
@@ -3673,11 +3707,19 @@ def run_render_router(args: argparse.Namespace, home: Path, boxes: List[Dict[str
     keys, hop_problems = hop_router_keys(policy, state_dir, ha.overlay_path(getattr(args, "overlay", None)),
                                          decommission=getattr(args, "decommission_hop", False), rendered=path,
                                          spec_out=hop_spec)
+    registry, registry_problems = registry_router_keys(policy, ha.overlay_path(getattr(args, "overlay", None)),
+                                                       keys)
+    hop_problems = hop_problems + registry_problems
     for p in hop_problems:
         print(f"router config: cannot render — {p}", file=sys.stderr)
     if hop_problems:
         return 2
-    if keys is not None:
+    if registry is not None:
+        # The registry without the hop block: only the hop pin's loader reads
+        # registry_dir, so it is the loader that validates.
+        doc = dict(doc, **registry)
+        refused = hp.validate_with_hop_router(doc, hp.hop_checkout())
+    elif keys is not None:
         # A hop host: the rendering is validated by the HOP pin's loader, the
         # code its router runs; the primary pin's loader refuses these keys.
         doc = dict(doc, **keys)
@@ -3697,7 +3739,7 @@ def run_render_router(args: argparse.Namespace, home: Path, boxes: List[Dict[str
     names = ", ".join(sorted(members))
     render_to = getattr(args, "render_to", None)
     if render_to is not None:
-        return run_render_to(Path(render_to), doc, path, apply=apply, hop=keys is not None,
+        return run_render_to(Path(render_to), doc, path, apply=apply, hop=keys is not None or registry is not None,
                              combined=getattr(args, "prepare", False) or getattr(args, "activate", None) is not None)
     if getattr(args, "prepare", False):
         return run_prepare(args, policy, doc, path, apply=apply, spec=(hop_spec or [None])[0])
@@ -3765,6 +3807,11 @@ def verify_router_sibling(home: Path, policy: Dict[str, Any], members: Dict[str,
     keys, hop_problems = hop_router_keys(policy, state_dir, overlay, spec_out=spec_out, rendered=path)
     if hop_problems:
         return [f"router config: {p}" for p in hop_problems]
+    registry, registry_problems = registry_router_keys(policy, overlay, keys)
+    if registry_problems:
+        return [f"router config: {p}" for p in registry_problems]
+    if registry is not None:
+        doc = dict(doc, **registry)
     if keys is None:
         # A document that configures the hub-link router while the policy
         # names no hop link is a host half set up.
@@ -4377,8 +4424,8 @@ def run_render_to(out: Path, doc: Dict[str, Any], live: Path, *, apply: bool, ho
         print("router config: --render-to goes with neither --prepare nor --activate", file=sys.stderr)
         return 2
     if not hop:
-        print("router config: --render-to renders a hop host's config, and the policy has no hop_link",
-              file=sys.stderr)
+        print(f"router config: --render-to renders the hop pin's config, and the policy has neither "
+              f"hop_link nor {hp.REGISTRY_POLICY_KEY}", file=sys.stderr)
         return 2
     want = sibling_text(doc).encode("utf-8")
     digest = hashlib.sha256(want).hexdigest()
