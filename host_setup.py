@@ -502,14 +502,20 @@ def root_dirs(spec: Spec) -> List[str]:
     return sorted(dirs, key=lambda d: (d.count("/"), d))
 
 
-def _dir_safe(var: str) -> str:
+#: find, by the path both supported hosts give it (GNU on Linux, BSD on macOS), never by PATH.
+FIND = "/usr/bin/find"
+
+
+def _dir_safe(var: str, find: str = FIND) -> str:
     """A POSIX test that "$var" is a real directory, root's (the plan runs as
-    root, so -O is root), and writable by no group and no other user."""
+    root, so -O is root), and writable by no group and no other user. find's
+    own status is checked: a find that fails is never an empty answer."""
     return (f'[ -d "${var}" ] && [ ! -L "${var}" ] && [ -O "${var}" ] && '
-            f'[ -z "$(find "${var}" -maxdepth 0 \\( -perm -g+w -o -perm -o+w \\) -print)" ]')
+            f'scan=$({find} "${var}" -maxdepth 0 \\( -perm -g+w -o -perm -o+w \\) -print) && [ -z "$scan" ]')
 
 
-def root_dirs_precheck(dirs: List[str], q: Callable[[str], str], parents: Optional[List[str]] = None) -> str:
+def root_dirs_precheck(dirs: List[str], q: Callable[[str], str], parents: Optional[List[str]] = None,
+                       find: str = FIND) -> str:
     """One read-only line, run as root before root's own directories are made:
     / and each first-level parent must exist, be root's and be writable by no
     group or other user; each directory to be made must be absent, or already
@@ -518,11 +524,11 @@ def root_dirs_precheck(dirs: List[str], q: Callable[[str], str], parents: Option
     line leaves the shell open), and 0 only when every directory passed."""
     if parents is None:
         parents = ["/"] + sorted({"/" + d.split("/")[1] for d in dirs})
-    return (f"ok=1; for d in {' '.join(q(f) for f in parents)}; do {{ {_dir_safe('d')}; }} || "
+    return (f"ok=1; for d in {' '.join(q(f) for f in parents)}; do {{ {_dir_safe('d', find)}; }} || "
             f"{{ echo \"STOP: $d is not root's real directory, or a group or other user can write it\" >&2; "
             f"ok=0; break; }}; done; "
             f"[ \"$ok\" = 1 ] && for d in {' '.join(q(d) for d in dirs)}; do "
-            f"{{ [ ! -e \"$d\" ] && [ ! -L \"$d\" ]; }} || {{ {_dir_safe('d')}; }} || "
+            f"{{ [ ! -e \"$d\" ] && [ ! -L \"$d\" ]; }} || {{ {_dir_safe('d', find)}; }} || "
             f"{{ echo \"STOP: $d exists and is not root's real directory, or a group or other user can write it\" >&2; "
             f"ok=0; break; }}; done; [ \"$ok\" = 1 ]")
 
@@ -537,6 +543,8 @@ def render_plan(spec: Spec, overlay_source: Optional[Path] = None,
     steps = f"{q(py)} {q(str(HOST_STEPS))}"
     lines = ["# Run as root. Each line is one step; nothing here has run. No step follows a "
              "symbolic link, and each is safe to run again.",
+             "# Run each command line separately. Continue only after checking that its exit status is 0. "
+             "Any STOP or nonzero status ends this run; do not run the following steps.",
              f"# Run them from a checkout no sandbox mounts read-write (a fresh clone at the recorded "
              f"deploy commit), never from an agent's workspace: these steps run {HOST_STEPS.name} as root."]
     if spec.partition is not None and spec.supervision is not None and spec.secrets is not None:

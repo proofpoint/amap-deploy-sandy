@@ -305,6 +305,10 @@ class PlanTest(unittest.TestCase):
         place = next(i for i, l in enumerate(self.plan) if l.startswith(f"{self.steps} place "))
         self.assertLess(max(self.plan.index(l) for l in made), place)
 
+    def test_the_plan_says_to_run_each_line_alone_and_stop_on_any_failure(self):
+        self.assertIn("# Run each command line separately. Continue only after checking that its exit status is 0. "
+                      "Any STOP or nonzero status ends this run; do not run the following steps.", self.plan[:3])
+
     def test_the_precheck_comes_before_roots_own_directories(self):
         made = [i for i, l in enumerate(self.plan) if l.startswith(f"{self.steps} root ") and l.endswith(" 0 0 0755")]
         pre = [i for i, l in enumerate(self.plan) if l.startswith("ok=1; for d in / /srv;")]
@@ -1121,11 +1125,38 @@ class RootDirsPrecheckTest(unittest.TestCase):
             os.chmod(p, 0o755)
         self.dirs = [os.path.join(self.top, "amap"), os.path.join(self.top, "amap", "plugin")]
 
-    def run_line(self):
+    def run_line(self, parents=None, find=hs.FIND):
         import shlex
         import subprocess
-        line = hs.root_dirs_precheck(self.dirs, shlex.quote, parents=[self.top])
+        line = hs.root_dirs_precheck(self.dirs, shlex.quote, parents=parents or [self.top], find=find)
         return subprocess.run(["/bin/sh", "-c", line], capture_output=True, text=True)
+
+    def test_a_failing_find_is_never_an_empty_answer(self):
+        """find's status is checked: a find that fails, printing nothing, STOPs
+        even on a group-writable directory it would have named."""
+        os.chmod(self.dirs[0], 0o775)
+        self.addCleanup(os.chmod, self.dirs[0], 0o755)
+        stub = os.path.join(self.top, "..", "find-fails")
+        with open(stub, "w") as f:
+            f.write("#!/bin/sh\nexit 1\n")
+        os.chmod(stub, 0o755)
+        p = self.run_line(find=os.path.realpath(stub))
+        self.assertEqual(p.returncode, 1, (p.stdout, p.stderr))
+        self.assertIn("STOP:", p.stderr)
+
+    def test_a_parent_not_owned_by_the_running_uid_stops(self):
+        """/ is root's and the suite never runs as root, so -O refuses it."""
+        if os.geteuid() == 0:
+            self.skipTest("as root, / is the running uid's")
+        p = self.run_line(parents=["/"])
+        self.assertEqual(p.returncode, 1, (p.stdout, p.stderr))
+        self.assertIn("STOP: / is not root's real directory", p.stderr)
+
+    def test_find_is_named_by_its_absolute_path(self):
+        import shlex
+        line = hs.root_dirs_precheck(self.dirs, shlex.quote)
+        self.assertIn("scan=$(/usr/bin/find ", line)
+        self.assertNotIn("$(find ", line)
 
     def test_an_existing_safe_parent_and_an_absent_dir_pass(self):
         p = self.run_line()
