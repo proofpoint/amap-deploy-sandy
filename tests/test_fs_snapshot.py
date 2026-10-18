@@ -445,6 +445,20 @@ exec $REAL "$@"
         self.assertEqual(p.returncode, 1)
         self.assertIn("OLD lies under NEW", p.stderr)
 
+    def test_a_non_normalised_or_root_new_is_refused(self):
+        """NST=<dir>/new/.. resolves to the fixture root, around OLD and H."""
+        for nst in (os.path.join(self.new, ".."), os.path.join(self.new, "."), self.new + "/", "/",
+                    os.path.join(self.d, "x", "..", "new"), "relative/new"):
+            with self.subTest(nst=nst):
+                p = self.separate(nst=nst)
+                self.assertEqual(p.returncode, 1)
+                self.assertTrue("is not a normalised path" in p.stderr or "is not an absolute path" in p.stderr,
+                                p.stderr)
+        p = self.snapshot(new=os.path.join(self.new, ".."))
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("is not a normalised path", p.stderr)
+        self.assertFalse(os.path.exists(self.bk))
+
     def test_new_and_the_hop_root_are_kept_apart(self):
         """NEW is never the hop root, never inside it, never around it: the
         hop tree's top level is the hub-link router's alone."""
@@ -564,6 +578,22 @@ exec $REAL "$@"
                 self.assertIn("OLD holds in-flight state", p.stderr)
                 self.assertIn(f"/{sub}/w.json", p.stderr)
 
+    def test_a_symlinked_old_is_searched_as_its_real_tree(self):
+        """find does not descend a symlink start; the block resolves OLD first."""
+        self.drained()
+        d = os.path.join(self.st, "alpha", "pending")
+        self.put(os.path.join(d, "work.json"), b"{}")
+        link = os.path.join(self.d, "state-link")
+        os.symlink(self.st, link)
+        p = self.sh(fill(block("fs-quiet: STOP"), OST=link, INST=self.inst, SLUGS="alpha beta"))
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("OLD holds in-flight state", p.stderr)
+        self.assertIn("/pending/work.json", p.stderr)
+        p = self.sh(fill(block("fs-quiet: STOP"), OST=os.path.join(self.d, "gone"), INST=self.inst,
+                         SLUGS="alpha beta"))
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("cannot be resolved", p.stderr)
+
     def test_an_old_that_cannot_be_searched_is_not_quiet(self):
         self.drained()
         flag = self.wrap("find", f'  case "$*" in "{self.st} "*) exit 23 ;; esac')
@@ -613,7 +643,7 @@ exec $REAL "$@"
         aside = os.path.join(self.d, "backup", "aside")
         p = self.restore(aside)
         self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertIn("is the snapshot; nothing restored", p.stdout)
+        self.assertIn("is the snapshot, entry for entry; nothing restored", p.stdout)
         self.assertEqual(tree(self.st), before)
         self.assertFalse(os.path.exists(aside), "nothing is moved aside when nothing needs restoring")
 
@@ -730,6 +760,102 @@ exec $REAL "$@"
         self.assertEqual(p.returncode, 1)
         self.assertIn("not the recorded one", p.stderr)
         self.assertEqual(tree(self.st), state)
+
+    def test_an_extra_entry_alone_is_a_change_and_is_restored(self):
+        """No archived member changed; one new file. tar -d alone would call it
+        equal: the manifest makes it a change."""
+        before = tree(self.st)
+        self.assertEqual(self.snapshot().returncode, 0)
+        self.put(os.path.join(self.st, "beta", "new-work.json"), b"{}")
+        aside = os.path.join(self.d, "backup", "aside")
+        p = self.restore(aside)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("fs-restore: OK restored", p.stdout)
+        self.assertEqual(tree(self.st), before)
+        self.assertTrue(os.path.exists(os.path.join(aside, "beta", "new-work.json")), "the extra entry is kept aside")
+
+    def test_the_snapshot_records_its_manifest(self):
+        self.assertEqual(self.snapshot().returncode, 0)
+        m = os.path.join(self.bk, "fs-state.manifest")
+        self.assertEqual(stat.S_IMODE(os.stat(m).st_mode), 0o600)
+        entries = open(m, "rb").read().split(b"\0")
+        self.assertIn(b"f 600 %d %d 0 ./.router.lock" % (os.getuid(), os.getgid()), entries)
+        self.assertTrue(os.path.exists(os.path.join(self.bk, "fs-state.manifest.sha256")))
+
+    def test_a_changed_manifest_is_refused(self):
+        self.assertEqual(self.snapshot().returncode, 0)
+        self.damaged()
+        state = tree(self.st)
+        m = os.path.join(self.bk, "fs-state.manifest")
+        with open(m, "ab") as f:
+            f.write(b"x")
+        p = self.restore(os.path.join(self.d, "backup", "aside"))
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("the snapshot's manifest is not the recorded one", p.stderr)
+        self.assertEqual(tree(self.st), state)
+
+    # --- the phase block (back-out B's step 1) ---
+
+    def phase(self, lines, old_state="/amap-router-pre-registry false no"):
+        led = os.path.join(self.d, "fs-ledger.txt")
+        with open(led, "w") as f:
+            f.write("".join(l + "\n" for l in lines))
+        self.containers["0123abcd"]["state"] = old_state
+        return self.sh(fill(block("fs-phase: STOP"), LEDGER=led, OLD="0123abcd", NEW="amap-router"))
+
+    F4 = "F4 stopped 0123abcd amap-router unless-stopped"
+
+    def test_an_f4b_arrival_takes_the_before_snapshot_branch(self):
+        """F4b found work: no snapshot exists, OLD is untouched, and no archive is needed."""
+        self.assertFalse(os.path.exists(self.bk))
+        p = self.phase([self.F4])
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(p.stdout, "fs-phase: BEFORE-VALID-SNAPSHOT; restore the config: no\n")
+
+    def test_a_snapshot_that_did_not_complete_takes_the_before_snapshot_branch(self):
+        os.makedirs(self.bk)  # a partial attempt: the directory, no recorded archive
+        p = self.phase([self.F4, "F4c started"])
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(p.stdout, "fs-phase: BEFORE-VALID-SNAPSHOT; restore the config: no\n")
+
+    def test_a_completed_snapshot_and_install_take_the_after_branch(self):
+        p = self.phase([self.F4, "F4c started", f"F4c ok {self.bk}"])
+        self.assertEqual(p.stdout, "fs-phase: AFTER-SNAPSHOT; restore the config: no\n")
+        p = self.phase([self.F4, "F4c started", f"F4c ok {self.bk}", "F5 started"])
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(p.stdout, "fs-phase: AFTER-SNAPSHOT; restore the config: yes\n")
+
+    def test_an_attempted_start_or_an_unknown_ledger_stops(self):
+        for lines, words in (([self.F4, "F4c started", f"F4c ok {self.bk}", "F5 started", "F6 attempted"],
+                              "F6 was attempted"),
+                             (["F4c started"], "not a recognised phase sequence"),
+                             ([self.F4, "F5 started"], "not a recognised phase sequence"),
+                             ([self.F4, "F4c ok x"], "not a recognised phase sequence"),
+                             (["F4 stopped ffff amap-router no"], "names the old container ffff")):
+            with self.subTest(lines=lines):
+                p = self.phase(lines)
+                self.assertEqual(p.returncode, 1)
+                self.assertIn(words, p.stderr)
+
+    def test_an_old_container_not_as_f4_left_it_stops(self):
+        for state in ("/amap-router-pre-registry true no", "/amap-router false no",
+                      "/amap-router-pre-registry false always"):
+            with self.subTest(state=state):
+                p = self.phase([self.F4], old_state=state)
+                self.assertEqual(p.returncode, 1)
+                self.assertIn("not exactly as F4 left it", p.stderr)
+
+    def test_a_new_router_container_stops_the_phase_block(self):
+        self.containers["amap-router-fs-failed"] = {"state": "false no", "mounts": []}
+        p = self.phase([self.F4])
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("amap-router-fs-failed: the new router started", p.stderr)
+
+    def test_a_missing_ledger_stops(self):
+        p = self.sh(fill(block("fs-phase: STOP"), LEDGER=os.path.join(self.d, "none.txt"), OLD="0123abcd",
+                         NEW="amap-router"))
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("no ledger", p.stderr)
 
     # --- retention ---
 
