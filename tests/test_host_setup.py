@@ -12,6 +12,7 @@ import copy
 import hashlib
 import json
 import os
+import shlex
 import stat
 import tempfile
 import posixpath
@@ -281,7 +282,7 @@ class PlanTest(unittest.TestCase):
 
     def test_every_step_goes_through_the_no_follow_helper(self):
         for line in self.plan:
-            if line.startswith("ok=1; for d in "):
+            if f" {hs.ROOT_SH} -c 'ok=1; m=0; " in line:
                 # The one exception: root's directories' precheck, read-only (it tests and prints).
                 import re
                 self.assertIsNone(re.search(r"(^|[\s;{|&(])(mkdir|chmod|chown|rm|mv|install|tee)\s",
@@ -311,9 +312,20 @@ class PlanTest(unittest.TestCase):
 
     def test_the_precheck_comes_before_roots_own_directories(self):
         made = [i for i, l in enumerate(self.plan) if l.startswith(f"{self.steps} root ") and l.endswith(" 0 0 0755")]
-        pre = [i for i, l in enumerate(self.plan) if l.startswith("ok=1; for d in / /srv;")]
+        pre = [i for i, l in enumerate(self.plan) if f" {hs.ROOT_SH} -c 'ok=1; m=0; " in l]
         self.assertEqual(len(pre), 1, self.plan)
         self.assertLess(pre[0], made[0])
+        self.assertTrue(self.plan[pre[0]].endswith("' sh / /srv -- /srv/example /srv/example/overlay"),
+                        self.plan[pre[0]])
+
+    def test_the_precheck_runs_whole_in_roots_shell(self):
+        """One line through sudo: `sudo /bin/sh -c '<script>' sh <parents> -- <dirs>`. The script holds no
+        single quote, so the operator's shell passes it whole; a bare `sudo <line>` would elevate only its
+        first command."""
+        [line] = [l for l in self.plan if f" {hs.ROOT_SH} -c 'ok=1; m=0; " in l]
+        self.assertTrue(line.startswith(f"/usr/bin/sudo {hs.ROOT_SH} -c '"), line)
+        self.assertNotIn("'", hs.precheck_script())
+        self.assertEqual(shlex.split(line)[3], hs.precheck_script())
 
     def test_a_missing_intermediate_is_made_too_shallow_first(self):
         x = doc()
@@ -1125,22 +1137,26 @@ class RootDirsPrecheckTest(unittest.TestCase):
             os.chmod(p, 0o755)
         self.dirs = [os.path.join(self.top, "amap"), os.path.join(self.top, "amap", "plugin")]
 
-    def run_line(self, parents=None, find=hs.FIND):
+    def run_line(self, parents=None, find=hs.FIND, dirs=None):
         import shlex
         import subprocess
-        line = hs.root_dirs_precheck(self.dirs, shlex.quote, parents=parents or [self.top], find=find)
+        line = hs.root_dirs_precheck(dirs or self.dirs, shlex.quote, parents=parents or [self.top], find=find,
+                                     sudo=None, uid=str(os.geteuid()), gid=str(os.stat(self.dirs[0]).st_gid))
         return subprocess.run(["/bin/sh", "-c", line], capture_output=True, text=True)
+
+    def stub_find(self, body):
+        stub = os.path.join(os.path.dirname(self.top), "find-stub")
+        with open(stub, "w") as f:
+            f.write("#!/bin/sh\n" + body + "\n")
+        os.chmod(stub, 0o755)
+        return stub
 
     def test_a_failing_find_is_never_an_empty_answer(self):
         """find's status is checked: a find that fails, printing nothing, STOPs
         even on a group-writable directory it would have named."""
         os.chmod(self.dirs[0], 0o775)
         self.addCleanup(os.chmod, self.dirs[0], 0o755)
-        stub = os.path.join(self.top, "..", "find-fails")
-        with open(stub, "w") as f:
-            f.write("#!/bin/sh\nexit 1\n")
-        os.chmod(stub, 0o755)
-        p = self.run_line(find=os.path.realpath(stub))
+        p = self.run_line(find=self.stub_find("exit 1"))
         self.assertEqual(p.returncode, 1, (p.stdout, p.stderr))
         self.assertIn("STOP:", p.stderr)
 
@@ -1150,7 +1166,7 @@ class RootDirsPrecheckTest(unittest.TestCase):
             self.skipTest("as root, / is the running uid's")
         p = self.run_line(parents=["/"])
         self.assertEqual(p.returncode, 1, (p.stdout, p.stderr))
-        self.assertIn("STOP: / is not root's real directory", p.stderr)
+        self.assertIn("STOP: / is not a real root directory", p.stderr)
 
     def test_find_is_named_by_its_absolute_path(self):
         import shlex
@@ -1167,14 +1183,53 @@ class RootDirsPrecheckTest(unittest.TestCase):
         cases = (("a group-writable existing dir", lambda: os.chmod(amap, 0o775), amap),
                  ("a world-writable parent", lambda: os.chmod(self.top, 0o757), self.top),
                  ("a symlink where a dir is to be made", lambda: os.symlink(amap, plugin), plugin),
+                 ("a dangling symlink where a dir is to be made",
+                  lambda: os.symlink(os.path.join(self.top, "nowhere"), plugin), plugin),
+                 ("an existing dir of the right owner but mode 0700", lambda: os.mkdir(plugin, 0o700), plugin),
+                 ("an existing dir of the right owner but mode 0750", lambda: (os.mkdir(plugin), os.chmod(plugin, 0o750)),
+                  plugin),
+                 ("an existing dir that is setgid 2755", lambda: (os.mkdir(plugin), os.chmod(plugin, 0o2755)), plugin),
                  ("a file where a dir is to be made", lambda: open(plugin, "w").close(), plugin))
         for name, make, where in cases:
             with self.subTest(name=name):
                 make()
-                p = self.run_line()
+                try:
+                    p = self.run_line()
+                finally:
+                    os.chmod(amap, 0o755)
+                    os.chmod(self.top, 0o755)
+                    if os.path.islink(plugin) or os.path.isfile(plugin):
+                        os.unlink(plugin)
+                    elif os.path.isdir(plugin):
+                        os.rmdir(plugin)
                 self.assertEqual(p.returncode, 1, (p.stdout, p.stderr))
                 self.assertIn(f"STOP: {where}", p.stderr)
-                os.chmod(amap, 0o755)
-                os.chmod(self.top, 0o755)
-                if os.path.lexists(plugin):
-                    os.unlink(plugin)
+
+    def test_an_existing_dir_that_is_exactly_root_0755_passes(self):
+        os.mkdir(self.dirs[1])
+        os.chmod(self.dirs[1], 0o755)
+        p = self.run_line()
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+    def test_a_link_is_never_a_safe_directory_even_when_find_says_nothing(self):
+        """`[ ! -L ]` itself, not find, refuses a live link to a safe directory: a find stub that prints
+        nothing and exits 0 would pass every find test."""
+        link = os.path.join(os.path.dirname(self.top), "top-link")
+        os.symlink(self.top, link)
+        p = self.run_line(parents=[link], find=self.stub_find("exit 0"))
+        self.assertEqual(p.returncode, 1, (p.stdout, p.stderr))
+        self.assertIn(f"STOP: {link} is not a real root directory", p.stderr)
+
+    def test_a_leaf_link_is_refused_where_install_d_would_follow_it(self):
+        """A leaf a later `install -d` makes, as a link to a directory or a dangling link: STOP, never
+        adopted (install -d follows the link and re-modes, as root re-owns, its target)."""
+        leaf = os.path.join(self.dirs[0], "etc")
+        target = os.path.join(self.top, "elsewhere")
+        os.mkdir(target, 0o700)
+        for name, dest in (("a link to a directory", target), ("a dangling link", target + "-gone")):
+            with self.subTest(name=name):
+                os.symlink(dest, leaf)
+                p = self.run_line(dirs=self.dirs + [leaf])
+                os.unlink(leaf)
+                self.assertEqual(p.returncode, 1, (p.stdout, p.stderr))
+                self.assertIn(f"STOP: {leaf} exists", p.stderr)
