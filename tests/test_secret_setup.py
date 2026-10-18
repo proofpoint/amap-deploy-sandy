@@ -910,3 +910,59 @@ class PlanTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+import os  # noqa: E402 -- the hash-line rows read real files
+
+
+class WriterHashLineTest(unittest.TestCase):
+    """The plan's writer hash lines, executed as printed: each COMPARES the
+    file's sha256 with the pin and STOPs (status 1, never `exit`) on a
+    mismatch, a missing file or a failed hash tool; a match is status 0."""
+
+    def run_line(self, path, pin, tool="/usr/bin/sha256sum"):
+        import shlex
+        import subprocess
+        line = ss._hash_check(tool, path, pin, shlex.quote)
+        return subprocess.run(["/bin/sh", "-c", line], capture_output=True, text=True)
+
+    def setUp(self):
+        import hashlib
+        import tempfile
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        self.path = os.path.join(d.name, "host_steps.py")
+        with open(self.path, "wb") as f:
+            f.write(b"print('writer')\n")
+        self.pin = hashlib.sha256(b"print('writer')\n").hexdigest()
+
+    def test_the_pinned_bytes_pass(self):
+        if not os.path.exists("/usr/bin/sha256sum"):
+            self.skipTest("no GNU sha256sum here")
+        p = self.run_line(self.path, self.pin)
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+    def test_other_bytes_a_missing_file_and_a_failed_tool_each_stop(self):
+        if not os.path.exists("/usr/bin/sha256sum"):
+            self.skipTest("no GNU sha256sum here")
+        for name, path, pin, tool in (("other bytes", self.path, "0" * 64, "/usr/bin/sha256sum"),
+                                      ("missing", self.path + ".gone", self.pin, "/usr/bin/sha256sum"),
+                                      ("no tool", self.path, self.pin, "/nonexistent/sha256sum")):
+            with self.subTest(name=name):
+                p = self.run_line(path, pin, tool)
+                self.assertEqual(p.returncode, 1)
+                self.assertIn("STOP:", p.stderr)
+                self.assertIn("place nothing", p.stderr)
+
+    def test_the_plan_prints_the_compare_before_and_after_the_install(self):
+        import shlex
+        s = spec()
+        lines = ss.render(s, shlex.quote)
+        checks = [i for i, l in enumerate(lines) if "is not the pinned writer" in l]
+        install = next(i for i, l in enumerate(lines) if l.endswith(shlex.quote(s.writer))
+                       and " -m 0444 " in l)
+        self.assertEqual(len(checks), 2, lines)
+        self.assertLess(checks[0], install)
+        self.assertLess(install, checks[1])
+        self.assertIn(s.writer_sha256, lines[checks[0]])
+        self.assertIn(shlex.quote(s.writer), lines[checks[1]])

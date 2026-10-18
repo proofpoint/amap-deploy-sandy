@@ -76,7 +76,10 @@ class PlanTest(unittest.TestCase):
                     re.escape(n) for n in {py, os.path.realpath(py)}))
                 self.assertEqual([l for l in run[:three[0]] if names.search(l)], [])
                 later = [l for l in run[three[0]:] if names.search(l)]
-                self.assertTrue([l for l in later if l.startswith("python3 ")], "the plan's own root steps, after")
+                self.assertTrue([l for l in later if l.startswith(f"{py} ")],
+                                "the plan's own root steps, after, by the interpreter step 1 vetted")
+                self.assertFalse([l for l in run if l.startswith("python3 ")],
+                                 "no root step names a bare python3: PATH would choose it")
                 self.assertTrue([l for l in later if "partition-provision" in l], "the provisioning, after")
 
     def test_the_validation_is_the_plans_first_step(self):
