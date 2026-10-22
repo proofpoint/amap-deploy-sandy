@@ -2528,3 +2528,394 @@ class CadenceAndTeardownVerbsTest(_ConnectorFixtureMixin, unittest.TestCase):
         self.assertFalse((lane / "notice-1.json").exists())
         self.assertTrue(lane.is_dir(), "the directory is sandy's and stays")
         self.assertIn("1 file(s) from the instance lanes", out)
+
+
+class RouterConfigPathTest(_ConnectorFixtureMixin, unittest.TestCase):
+    """`--router-config-path`: install renders the router's config at a named
+    path outside $SANDY_HOME and records it beside the manifest, so every later
+    consumer (router_sibling_path: the render, verify, teardown, health)
+    finds the same one file without the flag."""
+
+    def setUp(self):
+        super().setUp()
+        import tempfile
+        self.outside = Path(tempfile.mkdtemp())
+        os.chmod(self.outside, 0o755)
+        self.addCleanup(shutil.rmtree, self.outside, True)
+        self.named = self.outside / "router.json"
+        self.addCleanup(setattr, prov, "_ROUTER_CONFIG_OVERRIDE", None)
+
+    _policy, _sync, _fleet = SyncTest._policy, SyncTest._sync, SyncTest._fleet
+
+    def _with_path(self, *extra, path=None):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = prov.main(["--router-config-path", str(path or self.named)] + self._base_args()
+                           + ["install", *extra])
+        return rc, out.getvalue() + err.getvalue()
+
+    def test_install_renders_at_the_named_path_and_records_it(self):
+        self._fleet()
+        rc, out = self._with_path("--apply")
+        self.assertEqual(rc, 0, out)
+        self.assertTrue(self.named.is_file(), out)
+        self.assertFalse((prov.feature_root(self.tmp) / prov.ROUTER_SIBLING_NAME).exists(),
+                         "nothing is rendered beside the manifest")
+        self.assertEqual(prov.router_config_pointer(self.tmp).read_text(), f"{self.named}\n")
+
+    def test_later_consumers_find_it_without_the_flag(self):
+        self._fleet()
+        self.assertEqual(self._with_path("--apply")[0], 0)
+        prov._ROUTER_CONFIG_OVERRIDE = None
+        self.assertEqual(prov.router_sibling_path(self.tmp), self.named)
+        rc, out = self._sync(None)
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn(str(prov.feature_root(self.tmp) / prov.ROUTER_SIBLING_NAME), out)
+        import router_health as rh
+        self.assertEqual(Path(rh._f_router_config(_ctx_with_home(self.tmp))[0]), self.named)
+
+    def test_a_path_under_sandy_home_refuses(self):
+        self._fleet()
+        rc, out = self._with_path("--apply", path=self.tmp / "elsewhere" / "router.json")
+        self.assertNotEqual(rc, 0)
+        self.assertIn("lies under $SANDY_HOME", out)
+        self.assertFalse(prov.router_config_pointer(self.tmp).exists())
+
+    def test_a_relative_path_refuses(self):
+        self._fleet()
+        rc, out = self._with_path("--apply", path="rel/router.json")
+        self.assertNotEqual(rc, 0)
+        self.assertIn("absolute, normalised", out)
+
+    def test_a_flag_disagreeing_with_the_record_refuses(self):
+        self._fleet()
+        self.assertEqual(self._with_path("--apply")[0], 0)
+        other = self.outside / "other.json"
+        rc, out = self._with_path("--apply", path=other)
+        self.assertNotEqual(rc, 0)
+        self.assertIn("is not the recorded", out)
+        self.assertFalse(other.exists())
+
+    def test_a_symlinked_component_refuses(self):
+        """The router's ROUTER_CONFIG is compared as the exact string the
+        container reports, so the named path must be the real one."""
+        self._fleet()
+        link = self.outside / "link"
+        real = self.outside / "real"
+        real.mkdir()
+        link.symlink_to(real)
+        rc, out = self._with_path("--apply", path=link / "router.json")
+        self.assertNotEqual(rc, 0)
+        self.assertIn("symlinked component", out)
+
+    def test_a_missing_directory_refuses(self):
+        self._fleet()
+        rc, out = self._with_path("--apply", path=self.outside / "absent" / "router.json")
+        self.assertNotEqual(rc, 0)
+        self.assertIn("does not exist", out)
+
+    def test_a_corrupted_record_under_sandy_home_refuses(self):
+        self._fleet()
+        p = prov.router_config_pointer(self.tmp)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(f"{self.tmp / 'x.json'}\n")
+        with self.assertRaises(prov.ProvisionError):
+            prov.router_sibling_path(self.tmp)
+
+    def test_unset_is_beside_the_manifest(self):
+        self.assertEqual(prov.router_sibling_path(self.tmp),
+                         prov.feature_root(self.tmp) / prov.ROUTER_SIBLING_NAME)
+
+    def test_teardown_removes_the_named_file_and_the_record(self):
+        self._fleet()
+        self.assertEqual(self._with_path("--apply")[0], 0)
+        prov._ROUTER_CONFIG_OVERRIDE = None
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = prov.main(self._base_args() + ["teardown", "--apply"])
+        self.assertEqual(rc, 0, out.getvalue() + err.getvalue())
+        self.assertFalse(self.named.exists())
+        self.assertFalse(prov.router_config_pointer(self.tmp).exists())
+
+    def _mode(self, path):
+        return stat.S_IMODE(os.lstat(path).st_mode)
+
+    def _umask(self, mask):
+        old = os.umask(mask)
+        self.addCleanup(os.umask, old)
+
+    def test_the_named_file_is_0644_under_umask_077(self):
+        """The router's principal reads the named file through the other
+        bits, so the operator's private umask must not reach it."""
+        self._fleet()
+        self._umask(0o077)
+        rc, out = self._with_path("--apply")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self._mode(self.named), prov.NAMED_ROUTER_CONFIG_MODE)
+        self.assertEqual(os.lstat(self.named).st_uid, os.getuid())
+
+    def test_an_equal_bytes_0600_file_is_made_0644(self):
+        self._fleet()
+        self.assertEqual(self._with_path("--apply")[0], 0)
+        before = self.named.read_bytes()
+        os.chmod(self.named, 0o600)
+        self._umask(0o077)
+        rc, out = self._with_path("--apply")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("router config current", out)
+        self.assertEqual(self.named.read_bytes(), before)
+        self.assertEqual(self._mode(self.named), prov.NAMED_ROUTER_CONFIG_MODE)
+
+    def test_the_mode_is_only_the_named_files(self):
+        """The manifest and the pointer keep their own writers' modes."""
+        self._fleet()
+        self._umask(0o077)
+        self.assertEqual(self._with_path("--apply")[0], 0)
+        self.assertEqual(self._mode(prov.router_config_pointer(self.tmp)), 0o600)
+
+    def test_verify_names_a_named_file_that_is_not_0644(self):
+        boxes = self._fleet()
+        self.assertEqual(self._with_path("--apply")[0], 0)
+        prov._ROUTER_CONFIG_OVERRIDE = None
+        os.chmod(self.named, 0o600)
+        problems = prov.verify_router_sibling(
+            self.tmp, fp.load_policy(prov.feature_manifest_path(self.tmp)), prov.load_membership(self.tmp, boxes),
+            prov.sibling_state_dir(self.tmp, None), {b["name"]: Path(b["path"]) for b in boxes})
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("mode 0600", problems[0])
+        os.chmod(self.named, 0o644)
+        self.assertEqual(prov.verify_router_sibling(
+            self.tmp, fp.load_policy(prov.feature_manifest_path(self.tmp)), prov.load_membership(self.tmp, boxes),
+            prov.sibling_state_dir(self.tmp, None), {b["name"]: Path(b["path"]) for b in boxes}), [])
+
+    def _as_a3_placed(self):
+        """A3's root place is staged as this test's own uid at 0444: the
+        suite never runs as root, so the profile's uid is set to ours."""
+        orig = prov.NAMED_ROUTER_CONFIG_PLACED
+        prov.NAMED_ROUTER_CONFIG_PLACED = (os.getuid(), 0o444)
+        self.addCleanup(setattr, prov, "NAMED_ROUTER_CONFIG_PLACED", orig)
+
+    def test_a3s_root_0444_place_of_the_same_bytes_is_left_as_it_is(self):
+        self._fleet()
+        self.assertEqual(self._with_path("--apply")[0], 0)
+        self._as_a3_placed()
+        os.chmod(self.named, 0o444)
+        rc, out = self._with_path("--apply")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("present (A3's root 0444 place)", out)
+        self.assertEqual(self._mode(self.named), 0o444)
+
+    def test_new_bytes_replace_a3s_place_as_the_operators_0644(self):
+        """The install back-out after A3: the rendering replaces the activated
+        file by a rename in the operator's directory."""
+        self._fleet()
+        self.assertEqual(self._with_path("--apply")[0], 0)
+        self._as_a3_placed()
+        self.named.write_text('{"activated": true}\n')
+        os.chmod(self.named, 0o444)
+        rc, out = self._with_path("--apply")
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn("activated", self.named.read_text())
+        self.assertEqual(self._mode(self.named), prov.NAMED_ROUTER_CONFIG_MODE)
+
+    def test_verify_accepts_a3s_place_and_still_names_any_other_profile(self):
+        boxes = self._fleet()
+        self.assertEqual(self._with_path("--apply")[0], 0)
+        prov._ROUTER_CONFIG_OVERRIDE = None
+        self._as_a3_placed()
+        args = (self.tmp, fp.load_policy(prov.feature_manifest_path(self.tmp)), prov.load_membership(self.tmp, boxes),
+                prov.sibling_state_dir(self.tmp, None), {b["name"]: Path(b["path"]) for b in boxes})
+        os.chmod(self.named, 0o444)
+        self.assertEqual(prov.verify_router_sibling(*args), [])
+        os.chmod(self.named, 0o440)
+        problems = prov.verify_router_sibling(*args)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("mode 0440", problems[0])
+
+    def _lstat_as_root(self):
+        """os.lstat answering st_uid 0 for the named file only, so the root
+        half of A3's profile is exercised without running as root."""
+        real = os.lstat
+        named = str(self.named)
+
+        def lstat(p, *a, **k):
+            st = real(p, *a, **k)
+            if str(p) != named:
+                return st
+            return os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, 0, 0, st.st_size,
+                                   int(st.st_atime), int(st.st_mtime), int(st.st_ctime)))
+        prov.os.lstat = lstat
+        self.addCleanup(setattr, prov.os, "lstat", real)
+
+    def test_a_root_owned_0444_file_of_the_same_bytes_is_a3s_place(self):
+        self._fleet()
+        self.assertEqual(self._with_path("--apply")[0], 0)
+        os.chmod(self.named, 0o444)
+        self._lstat_as_root()
+        rc, out = self._with_path("--apply")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("present (A3's root 0444 place)", out)
+        self.assertEqual(self._mode(self.named), 0o444)
+
+    def test_a_root_owned_file_at_any_other_mode_is_refused(self):
+        self._fleet()
+        self.assertEqual(self._with_path("--apply")[0], 0)
+        os.chmod(self.named, 0o644)
+        self._lstat_as_root()
+        rc, out = self._with_path("--apply")
+        self.assertIn("neither this operator's regular file nor A3's root 0444 place", out)
+
+    def test_a_root_install_never_places_the_named_file(self):
+        self._fleet()
+        orig = prov.os.getuid
+        prov.os.getuid = lambda: 0
+        self.addCleanup(setattr, prov.os, "getuid", orig)
+        rc, out = self._with_path("--apply")
+        self.assertIn("install runs as root", out)
+        prov.os.getuid = orig
+        self.assertFalse(self.named.exists())
+        self.assertFalse(prov.router_config_pointer(self.tmp).exists())
+
+    def test_a_parent_the_router_cannot_traverse_or_others_can_write_is_refused(self):
+        for mode, words in ((0o700, "cannot reach the file through it"), (0o770, "could replace the file"),
+                            (0o777, "could replace the file")):
+            with self.subTest(mode=oct(mode)):
+                os.chmod(self.outside, mode)
+                self.addCleanup(os.chmod, self.outside, 0o755)
+                self._fleet()
+                rc, out = self._with_path("--apply")
+                self.assertNotEqual(rc, 0, out)
+                self.assertIn(words, out)
+                self.assertFalse(prov.router_config_pointer(self.tmp).exists(), out)
+                self.assertFalse(self.named.exists())
+        os.chmod(self.outside, 0o755)
+
+    def test_a_parent_owned_by_another_user_is_refused(self):
+        """Staged by os.lstat answering another uid for the directory only:
+        the suite cannot chown."""
+        self._fleet()
+        real, d = os.lstat, str(self.outside)
+
+        def lstat(p, *a, **k):
+            st = real(p, *a, **k)
+            if str(p) != d:
+                return st
+            return os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, os.getuid() + 1, 0, st.st_size,
+                                   int(st.st_atime), int(st.st_mtime), int(st.st_ctime)))
+        prov.os.lstat = lstat
+        self.addCleanup(setattr, prov.os, "lstat", real)
+        rc, out = self._with_path("--apply")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("neither this operator's nor root's", out)
+        self.assertFalse(prov.router_config_pointer(self.tmp).exists())
+
+    def test_verify_names_a_parent_that_went_unsound(self):
+        boxes = self._fleet()
+        os.chmod(self.outside, 0o755)
+        self.assertEqual(self._with_path("--apply")[0], 0)
+        prov._ROUTER_CONFIG_OVERRIDE = None
+        args = (self.tmp, fp.load_policy(prov.feature_manifest_path(self.tmp)), prov.load_membership(self.tmp, boxes),
+                prov.sibling_state_dir(self.tmp, None), {b["name"]: Path(b["path"]) for b in boxes})
+        self.assertEqual(prov.verify_router_sibling(*args), [])
+        for mode, words in ((0o700, "cannot reach"), (0o777, "could replace")):
+            with self.subTest(mode=oct(mode)):
+                os.chmod(self.outside, mode)
+                self.addCleanup(os.chmod, self.outside, 0o755)
+                problems = prov.verify_router_sibling(*args)
+                self.assertEqual(len(problems), 1, problems)
+                self.assertIn(words, problems[0])
+                self.assertIn(str(self.outside), problems[0])
+        os.chmod(self.outside, 0o755)
+
+    def test_staging_with_activate_and_an_unrecorded_path_refuses(self):
+        """install has --render-to and --activate as staging verbs (no
+        --prepare); the render-to row is above."""
+        self._fleet()
+        for extra in (["--activate", "run-1", "--activation-sha256", "0" * 64],):
+            with self.subTest(extra=extra[0]):
+                rc, out = self._with_path("--apply", *extra)
+                self.assertEqual(rc, 2, out)
+                self.assertIn("recorded only by the install --apply that places it", out)
+                self.assertFalse(prov.router_config_pointer(self.tmp).exists())
+
+    def test_staging_with_a_recorded_path_passes_the_pointer_gate(self):
+        """With the path recorded, --render-to goes on to its own checks (this
+        fixture has no hop_link, so render-to then refuses for that reason)."""
+        self._fleet()
+        self.assertEqual(self._with_path("--apply")[0], 0)
+        staged = self.outside / "staged.json"
+        rc, out = self._with_path("--apply", "--render-to", str(staged))
+        self.assertNotIn("recorded only by", out)
+        self.assertIn("--render-to renders a hop host's config", out)
+
+    def test_a_stale_symlink_temporary_is_replaced_never_followed(self):
+        self._fleet()
+        victim = self.outside / "victim"
+        victim.write_text("untouched\n")
+        (self.outside / ".router.json.tmp").symlink_to(victim)
+        rc, out = self._with_path("--apply")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(victim.read_text(), "untouched\n")
+        self.assertFalse((self.outside / ".router.json.tmp").exists())
+        self.assertEqual(self._mode(self.named), prov.NAMED_ROUTER_CONFIG_MODE)
+
+    def _refuse_render(self):
+        def refuse(*a, **k):
+            raise prov.ProvisionError("a refused rendering")
+        orig = prov.render_router_sibling
+        prov.render_router_sibling = refuse
+        self.addCleanup(setattr, prov, "render_router_sibling", orig)
+
+    def test_a_refused_render_records_no_pointer(self):
+        self._fleet()
+        self._refuse_render()
+        out = self._with_path("--apply")[1]
+        self.assertIn("router config: cannot render — a refused rendering", out)
+        self.assertFalse(prov.router_config_pointer(self.tmp).exists(), out)
+        self.assertFalse(self.named.exists())
+
+    def test_a_refused_render_keeps_the_prior_pointer_bytes(self):
+        self._fleet()
+        self.assertEqual(self._with_path("--apply")[0], 0)
+        ptr = prov.router_config_pointer(self.tmp)
+        before = (ptr.read_bytes(), os.lstat(ptr).st_ino)
+        self._refuse_render()
+        out = self._with_path("--apply")[1]
+        self.assertIn("router config: cannot render — a refused rendering", out)
+        self.assertEqual((ptr.read_bytes(), os.lstat(ptr).st_ino), before)
+
+    def test_staging_only_with_an_unrecorded_path_refuses_and_records_nothing(self):
+        self._fleet()
+        staged = self.outside / "staged.json"
+        rc, out = self._with_path("--apply", "--render-to", str(staged))
+        self.assertEqual(rc, 2, out)
+        self.assertIn("recorded only by the install --apply that places it", out)
+        self.assertFalse(prov.router_config_pointer(self.tmp).exists())
+        self.assertFalse(staged.exists())
+        self.assertFalse(self.named.exists())
+
+    def test_a_dry_run_records_no_pointer(self):
+        self._fleet()
+        rc, out = self._with_path()
+        self.assertIn("would create", out)
+        self.assertFalse(prov.router_config_pointer(self.tmp).exists())
+        self.assertFalse(self.named.exists())
+
+    def test_a_successful_placement_is_reused(self):
+        self._fleet()
+        self.assertEqual(self._with_path("--apply")[0], 0)
+        ptr = prov.router_config_pointer(self.tmp)
+        before = (ptr.read_bytes(), os.lstat(ptr).st_ino, self.named.read_bytes(), os.lstat(self.named).st_ino)
+        rc, out = self._with_path("--apply")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("router config current", out)
+        self.assertEqual((ptr.read_bytes(), os.lstat(ptr).st_ino, self.named.read_bytes(),
+                          os.lstat(self.named).st_ino), before)
+
+
+def _ctx_with_home(home):
+    class _Ctx:
+        def value(self, name):
+            assert name == "sandy_home", name
+            return str(home)
+    return _Ctx()
