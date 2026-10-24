@@ -90,8 +90,12 @@ class RolloutTest(unittest.TestCase):
                 "amap-connector-claude": repo(amap / "amap-connector-claude", {"README": "c"}),
                 "amap-connector-codex": repo(amap / "amap-connector-codex", CODEX_FILES)}
         hop = repo(amap / HOP_DIR, {"README": "hop"})
-        siblings = {"schema": 1, "siblings": [{"name": n, "commit": c} for n, c in pins.items()]
-                    + [{"name": "amap-router-local", "commit": hop, "dir": HOP_DIR}]}
+        overrides = {"amap-router-local": "AMAP_ROUTER_REPO", "amap-connector-claude": "AMAP_CONNECTOR_REPO",
+                     "amap-connector-codex": "AMAP_CODEX_CONNECTOR_REPO"}
+        siblings = {"schema": 1, "siblings": [{"name": n, "commit": c, "override": overrides[n]}
+                                               for n, c in pins.items()]
+                    + [{"name": "amap-router-local", "commit": hop, "dir": HOP_DIR,
+                        "override": "AMAP_HOP_ROUTER_REPO"}]}
         self.ds_commit = repo(amap / "amap-deploy-sandy", {"siblings.json": json.dumps(siblings),
                                                           "amap-sandy.py": STUB_INSTALL})
         self.home = self.root / "sandy-home"
@@ -109,7 +113,8 @@ class RolloutTest(unittest.TestCase):
         self.sandy.write_text(STUB_SANDY)
         self.sandy.chmod(0o755)
         self.calls = self.root / "calls"
-        self.env = {"AMAP_ROOT": str(amap), "SANDY_HOME": str(self.home), "STUB_CALLS": str(self.calls),
+        self.env = {**{v: "" for v in (*overrides.values(), "AMAP_HOP_ROUTER_REPO")},
+                    "AMAP_ROOT": str(amap), "SANDY_HOME": str(self.home), "STUB_CALLS": str(self.calls),
                     "SANDY_BIN": str(self.sandy), "AMAP_EXPECT_DS_COMMIT": self.ds_commit,
                     "STUB_SCHEMA": json.dumps({"manifest": {"top_level_keys": ["schema", "agent_wrapper"]}})}
 
@@ -216,6 +221,16 @@ class RolloutTest(unittest.TestCase):
         doc = json.loads((self.amap / "amap-deploy-sandy" / "siblings.json").read_text())
         doc["siblings"] = [s for s in doc["siblings"] if s["name"] != cr.CODEX_SIBLING]
         self._refused("pins no amap-connector-codex", AMAP_EXPECT_DS_COMMIT=self._ds_siblings(json.dumps(doc)))
+
+    def test_a_source_override_pointing_elsewhere_refuses(self):
+        """install honours AMAP_CODEX_CONNECTOR_REPO; it must name the checked checkout or be unset."""
+        other = self.root / "other-codex"
+        other.mkdir()
+        self._refused("AMAP_CODEX_CONNECTOR_REPO is set to", AMAP_CODEX_CONNECTOR_REPO=str(other))
+
+    def test_a_source_override_naming_the_checked_checkout_is_accepted(self):
+        r = self.run_("check", AMAP_CODEX_CONNECTOR_REPO=str(self.amap / "amap-connector-codex"))
+        self.assertEqual(r.returncode, 0, r.stderr)
 
     def test_a_sandy_without_agent_wrapper_refuses(self):
         self._refused("does not list agent_wrapper",

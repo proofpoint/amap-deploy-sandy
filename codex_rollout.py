@@ -18,6 +18,10 @@ only, so it runs the same on Linux and Darwin.
 - every file install will copy out of the Codex connector checkout is one of
   those committed files, so no untracked extra is deployed (untracked files
   install does not copy are left alone);
+- no source override install would honour (the `override` variable
+  siblings.json names for each sibling, such as AMAP_CODEX_CONNECTOR_REPO)
+  points anywhere but the checkout this check holds, so install reads exactly
+  what was checked;
 - the sandy named by SANDY_BIN (default `sandy`) lists `agent_wrapper` in
   --print-schema's manifest.top_level_keys.
 
@@ -134,18 +138,28 @@ def exact_at(top: Path, commit: str, label: str) -> Dict[str, Tuple[bytes, bytes
     return tracked
 
 
-def sibling_pins(ds: Path) -> List[Tuple[str, str]]:
+def sibling_pins(ds: Path) -> List[Tuple[str, str, Optional[str]]]:
+    """(directory, commit, override variable or None) for every sibling."""
     try:
         doc = json.loads((ds / "siblings.json").read_text())
-        rows = [(s.get("dir", s["name"]), s["commit"]) for s in doc["siblings"]]
-    except (OSError, ValueError, KeyError, TypeError) as e:
+        rows = [(s.get("dir", s["name"]), s["commit"], s.get("override")) for s in doc["siblings"]]
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as e:
         raise Refused(f"cannot read the sibling pins from {ds / 'siblings.json'}: {e}")
     if not rows:
         raise Refused(f"{ds / 'siblings.json'} names no sibling")
-    for d, c in rows:
-        if not isinstance(d, str) or not DIR_RE.fullmatch(d) or not isinstance(c, str) or not SHA_RE.fullmatch(c):
+    for d, c, o in rows:
+        if not isinstance(d, str) or not DIR_RE.fullmatch(d) or not isinstance(c, str) or not SHA_RE.fullmatch(c) \
+                or not (o is None or isinstance(o, str)):
             raise Refused(f"{ds / 'siblings.json'}: bad sibling entry {d!r} {c!r}")
     return rows
+
+
+def override_agrees(var: Optional[str], checked: Path) -> None:
+    """An override install would follow names the checked checkout, or is unset."""
+    value = os.environ.get(var) if var else None
+    if value and Path(value).resolve() != checked.resolve():
+        raise Refused(f"{var} is set to {value}, so install would read that checkout instead of the "
+                      f"checked {checked}; unset it for the rollout")
 
 
 def deployed_closure(top: Path, tracked: Dict[str, Tuple[bytes, bytes]]) -> None:
@@ -179,8 +193,9 @@ def checks(root: Path, ds: Path, sandy: str) -> None:
         raise Refused("AMAP_EXPECT_DS_COMMIT is not a full commit sha")
     exact_at(ds, expect, "amap-deploy-sandy")
     seen_codex = False
-    for d, commit in sibling_pins(ds):
+    for d, commit, override in sibling_pins(ds):
         tracked = exact_at(root / d, commit, d)
+        override_agrees(override, root / d)
         if d == CODEX_SIBLING:
             deployed_closure(root / d, tracked)
             seen_codex = True
