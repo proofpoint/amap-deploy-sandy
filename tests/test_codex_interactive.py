@@ -53,7 +53,8 @@ if [ "$1" = "-m" ] && [ "$2" = "amap_codex.cli" ]; then
   printf '%s\\n' "$@" >> "$SHIM_CALLS"
   for a in "$@"; do
     case "$a" in
-      activity) [ -n "$SHIM_ACTIVITY_RC" ] && { echo "activity broke" >&2; exit "$SHIM_ACTIVITY_RC"; }
+      activity) [ -n "$SHIM_ACTIVITY_SLEEP" ] && sleep "$SHIM_ACTIVITY_SLEEP"
+                [ -n "$SHIM_ACTIVITY_RC" ] && { echo "activity broke" >&2; exit "$SHIM_ACTIVITY_RC"; }
                 printf '%s\\n' "$SHIM_ACTIVITY"; exit 0 ;;
       interactive) printf '%s\\0' "$@" > "$SHIM_INTERACTIVE"
                 [ -n "$SHIM_INTERACTIVE_RC" ] && { echo "unsupported native option or subcommand" >&2; exit "$SHIM_INTERACTIVE_RC"; }
@@ -214,6 +215,76 @@ class InteractiveLaunchTest(unittest.TestCase):
         self._refused("the connector activity check failed (exit 4)", SHIM_ACTIVITY_RC="4")
         self._refused("carries no readiness this launcher reads", SHIM_ACTIVITY="not json")
         self._refused("carries no readiness this launcher reads", SHIM_ACTIVITY=json.dumps({"heartbeat": "fresh"}))
+
+    def test_anything_at_the_hold_path_is_a_hold(self):
+        """B1: a directory, a dangling link or an unreadable file there refuses, like a hold record."""
+        self.box.ready()
+        hold = self.box.state / "hold.json"
+        hold.mkdir()
+        self._refused("something other than a hold record occupies")
+        hold.rmdir()
+        hold.symlink_to(self.box.state / "nowhere")
+        self._refused("something other than a hold record occupies")
+        hold.unlink()
+        hold.symlink_to(self.box.state / "controller.toml")
+        self._refused("something other than a hold record occupies")
+        hold.unlink()
+        hold.write_text(json.dumps({"reason": "x"}))
+        hold.chmod(0o000)
+        self.addCleanup(hold.chmod, 0o600)
+        if os.access(hold, os.R_OK):
+            self.skipTest("running as a user that reads any file")
+        self._refused("its hold record is unreadable")
+
+    def test_a_configuration_that_is_not_a_regular_file_refuses(self):
+        (self.box.state / "controller.toml").symlink_to(self.box.root / "elsewhere.toml")
+        (self.box.root / "elsewhere.toml").write_text("x\n")
+        self._refused("the supervisor has not written")
+
+    def test_the_wait_is_a_finite_bounded_number_of_seconds(self):
+        """B9: nan, inf, negative, over the cap and non-numbers refuse before any check runs."""
+        self.box.ready()
+        for bad in ("nan", "inf", "-inf", "-1", "3601", "1e9", "soon"):
+            r = self.box.run("interactive-launch", *NATIVE, AMAP_CODEX_LAUNCH_WAIT_SECONDS=bad)
+            self.assertNotEqual(r.returncode, 0, bad)
+            self.assertIn("is not a number of seconds from 0 to 3600", r.stderr, bad)
+            self.assertIsNone(self.box.interactive(), bad)
+        self.assertNotIn("activity", self.box.calls(), "a check ran under an invalid wait")
+        # Empty is unset, so the default applies (and a ready supervisor starts).
+        r = self.box.run("interactive-launch", *NATIVE, AMAP_CODEX_LAUNCH_WAIT_SECONDS="")
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_a_check_that_hangs_is_cut_off_within_the_wait(self):
+        """B9: the activity check gets only the remaining time; a hung one is not waited for."""
+        self.box.ready()
+        start = time.monotonic()
+        r = self.box.run("interactive-launch", *NATIVE, AMAP_CODEX_LAUNCH_WAIT_SECONDS="2", SHIM_ACTIVITY_SLEEP="30")
+        elapsed = time.monotonic() - start
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("did not answer within the wait", r.stderr)
+        self.assertLess(elapsed, 10, "a hung check held the launch past its wait")
+
+    def test_a_short_wait_is_not_stretched_by_a_whole_pause(self):
+        """B9, isolated: with 0.2 s left, the pause is 0.2 s, not a full second."""
+        self.box.ready()
+        start = time.monotonic()
+        r = self.box.run("interactive-launch", *NATIVE, AMAP_CODEX_LAUNCH_WAIT_SECONDS="0.2",
+                         SHIM_ACTIVITY=snapshot("not_ready", thread_bound="fail"))
+        elapsed = time.monotonic() - start
+        self.assertNotEqual(r.returncode, 0)
+        self.assertLess(elapsed, 0.95, "a pause outlasted the remaining wait")
+
+    def test_no_pause_outlasts_the_wait(self):
+        """B9: a supervisor that never becomes ready is refused once the wait is spent, not later."""
+        self.box.ready()
+        start = time.monotonic()
+        r = self.box.run("interactive-launch", *NATIVE, AMAP_CODEX_LAUNCH_WAIT_SECONDS="1.5",
+                         SHIM_ACTIVITY=snapshot("not_ready", thread_bound="fail"))
+        elapsed = time.monotonic() - start
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("the supervisor is not_ready", r.stderr)
+        self.assertLess(elapsed, 5)
+        self.assertGreaterEqual(self.box.calls().count("activity"), 2, "it did not keep checking inside the wait")
 
     def test_it_waits_for_the_supervisor_within_its_bound(self):
         proc = subprocess.Popen(["/bin/sh", str(self.box.payload / "interactive-launch"), *NATIVE],

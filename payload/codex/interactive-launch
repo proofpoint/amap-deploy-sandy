@@ -17,10 +17,13 @@
 # Ready means the connector's own read-only `activity` snapshot reports
 # `readiness.state` "ready" (its checks: heartbeat, configuration and build,
 # thread binding, held claims and their owner, no unresolved dispatch, no
-# operational error, no blocked request), the supervisor configuration exists,
-# and this entry has written no hold record. It is waited for up to
-# AMAP_CODEX_LAUNCH_WAIT_SECONDS (default 60); after that the pane shows the
-# checks that did not pass and Codex is not started.
+# operational error, no blocked request), the supervisor configuration is a
+# regular file, and nothing at all occupies the hold record's path (a
+# directory, a link or an unreadable file there is a hold too). It is waited
+# for up to AMAP_CODEX_LAUNCH_WAIT_SECONDS (default 60, at most 3600); each
+# check is given the time that remains (at least a second), no pause outlasts
+# it, and after that the pane shows the checks that did not pass and Codex is
+# not started.
 #
 # The arguments travel as an array: nothing is joined into a shell command or
 # split on whitespace. This file sits behind the read-only payload mount.
@@ -40,23 +43,36 @@ esac
 : "${AMAP_OUTBOX_DIR:?interactive-launch: no AMAP_OUTBOX_DIR in this pane; the outbox lane is not mounted}"
 export PYTHONPATH="$SELF_DIR/src"
 python3 -c '
-import json, os, subprocess, sys, time
+import json, math, os, stat, subprocess, sys, time
 
 state, wait, outbox = sys.argv[1], sys.argv[2], sys.argv[3]
 config = os.path.join(state, "controller.toml")
 hold = os.path.join(state, "hold.json")
+MAX_WAIT = 3600
 
-def not_ready():
-    if os.path.isfile(hold):
+def is_regular(path):
+    try:
+        return stat.S_ISREG(os.lstat(path).st_mode)
+    except OSError:
+        return False
+
+def not_ready(remaining):
+    if os.path.lexists(hold):
+        if not is_regular(hold):
+            return "something other than a hold record occupies %s; the supervisor is treated as holding" % hold
         try:
-            return "the supervisor holds: " + json.load(open(hold)).get("reason", "no reason recorded")
+            with open(hold) as f:
+                return "the supervisor holds: " + json.load(f).get("reason", "no reason recorded")
         except (OSError, ValueError, AttributeError):
             return "the supervisor holds, and its hold record is unreadable"
-    if not os.path.isfile(config):
+    if not is_regular(config):
         return "the supervisor has not written %s" % config
-    r = subprocess.run(["python3", "-m", "amap_codex.cli", "--config", config, "activity", "--limit", "1",
-                        "--outbox-dir", outbox],
-                       stdin=subprocess.DEVNULL, capture_output=True, text=True)
+    try:
+        r = subprocess.run(["python3", "-m", "amap_codex.cli", "--config", config, "activity", "--limit", "1",
+                            "--outbox-dir", outbox],
+                           stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=remaining)
+    except subprocess.TimeoutExpired:
+        return "the connector activity check did not answer within the wait"
     if r.returncode != 0:
         return "the connector activity check failed (exit %d): %s" % (r.returncode, r.stderr.strip()[-200:])
     try:
@@ -71,15 +87,20 @@ def not_ready():
     return "the supervisor is %s (%s)" % (ready, ", ".join(open_checks) or "no checks reported")
 
 try:
-    deadline = time.monotonic() + float(wait)
+    budget = float(wait)
 except ValueError:
-    sys.exit("interactive-launch: AMAP_CODEX_LAUNCH_WAIT_SECONDS is not a number; not starting Codex")
+    budget = float("nan")
+if not (math.isfinite(budget) and 0 <= budget <= MAX_WAIT):
+    sys.exit("interactive-launch: AMAP_CODEX_LAUNCH_WAIT_SECONDS is not a number of seconds from 0 to %d; "
+             "not starting Codex" % MAX_WAIT)
+deadline = time.monotonic() + budget
 while True:
-    why = not_ready()
+    why = not_ready(max(deadline - time.monotonic(), 1))
     if why is None:
         sys.exit(0)
-    if time.monotonic() >= deadline:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
         sys.exit("interactive-launch: %s; not starting Codex" % why)
-    time.sleep(1)
+    time.sleep(min(1, remaining))
 ' "$STATE" "${AMAP_CODEX_LAUNCH_WAIT_SECONDS:-60}" "$AMAP_OUTBOX_DIR"
 exec python3 -m amap_codex.cli --config "$STATE/controller.toml" interactive --outbox-dir "$AMAP_OUTBOX_DIR" -- "$@"
