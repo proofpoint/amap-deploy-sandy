@@ -14,11 +14,13 @@
 # bare Codex. The supervisor this sandbox's entry runs stays the only owner
 # of the incoming lanes and of its thread.
 #
-# Ready means, from the connector's own read-only `activity` snapshot: a fresh
-# heartbeat, a bound thread, every enabled lane's claim live, no uncertain
-# dispatch, and no hold record. It is waited for up to
-# AMAP_CODEX_LAUNCH_WAIT_SECONDS (default 60); after that the pane shows why
-# and Codex is not started.
+# Ready means the connector's own read-only `activity` snapshot reports
+# `readiness.state` "ready" (its checks: heartbeat, configuration and build,
+# thread binding, held claims and their owner, no unresolved dispatch, no
+# operational error, no blocked request), the supervisor configuration exists,
+# and this entry has written no hold record. It is waited for up to
+# AMAP_CODEX_LAUNCH_WAIT_SECONDS (default 60); after that the pane shows the
+# checks that did not pass and Codex is not started.
 #
 # The arguments travel as an array: nothing is joined into a shell command or
 # split on whitespace. This file sits behind the read-only payload mount.
@@ -40,7 +42,7 @@ export PYTHONPATH="$SELF_DIR/src"
 python3 -c '
 import json, os, subprocess, sys, time
 
-state, wait = sys.argv[1], sys.argv[2]
+state, wait, outbox = sys.argv[1], sys.argv[2], sys.argv[3]
 config = os.path.join(state, "controller.toml")
 hold = os.path.join(state, "hold.json")
 
@@ -52,30 +54,21 @@ def not_ready():
             return "the supervisor holds, and its hold record is unreadable"
     if not os.path.isfile(config):
         return "the supervisor has not written %s" % config
-    r = subprocess.run(["python3", "-m", "amap_codex.cli", "--config", config, "activity", "--limit", "1"],
+    r = subprocess.run(["python3", "-m", "amap_codex.cli", "--config", config, "activity", "--limit", "1",
+                        "--outbox-dir", outbox],
                        stdin=subprocess.DEVNULL, capture_output=True, text=True)
     if r.returncode != 0:
         return "the connector activity check failed (exit %d): %s" % (r.returncode, r.stderr.strip()[-200:])
     try:
-        snap = json.loads(r.stdout)
-        status = snap["status"]
-        beat, thread = snap.get("heartbeat"), status.get("thread_id")
-        lanes, claims = status.get("enabled_lanes"), status.get("claim_state")
-        uncertain = status.get("uncertain_count")
-    except (ValueError, KeyError, TypeError, AttributeError):
-        return "the connector activity snapshot is not one this launcher reads"
-    if beat != "fresh":
-        return "the supervisor heartbeat is %s" % beat
-    if not isinstance(thread, str) or not thread:
-        return "the supervisor has no bound thread"
-    if not isinstance(lanes, list) or not lanes or not isinstance(claims, dict):
-        return "the supervisor reports no enabled lanes"
-    held = [l for l in lanes if claims.get(l) != "live"]
-    if held:
-        return "lane claims are not live: " + ", ".join("%s=%s" % (l, claims.get(l)) for l in held)
-    if uncertain != 0:
-        return "the supervisor has %r uncertain dispatches; resolve them first" % (uncertain,)
-    return None
+        readiness = json.loads(r.stdout)["readiness"]
+        ready, checks = readiness["state"], readiness.get("checks") or {}
+    except (ValueError, KeyError, TypeError):
+        return "the connector activity snapshot carries no readiness this launcher reads"
+    if ready == "ready":
+        return None
+    open_checks = sorted("%s=%s" % (k, v) for k, v in checks.items() if v != "pass") \
+        if isinstance(checks, dict) else []
+    return "the supervisor is %s (%s)" % (ready, ", ".join(open_checks) or "no checks reported")
 
 try:
     deadline = time.monotonic() + float(wait)
@@ -88,11 +81,5 @@ while True:
     if time.monotonic() >= deadline:
         sys.exit("interactive-launch: %s; not starting Codex" % why)
     time.sleep(1)
-' "$STATE" "${AMAP_CODEX_LAUNCH_WAIT_SECONDS:-60}"
-set -- -- "$@"
-if [ -d "$AMAP_OUTBOX_DIR/results" ]; then
-    set -- --outbox-dir "$AMAP_OUTBOX_DIR" "$@"
-else
-    echo "interactive-launch: $AMAP_OUTBOX_DIR has no results/ yet (none before the first send); outbound activity is not shown in this session" >&2
-fi
-exec python3 -m amap_codex.cli --config "$STATE/controller.toml" interactive "$@"
+' "$STATE" "${AMAP_CODEX_LAUNCH_WAIT_SECONDS:-60}" "$AMAP_OUTBOX_DIR"
+exec python3 -m amap_codex.cli --config "$STATE/controller.toml" interactive --outbox-dir "$AMAP_OUTBOX_DIR" -- "$@"
