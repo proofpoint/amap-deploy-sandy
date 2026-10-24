@@ -1,0 +1,98 @@
+#!/bin/sh
+# payload/codex/interactive-launch — shipped by amap-deploy-sandy and copied
+# VERBATIM onto the feature payload. It is sandy's `agent_wrapper` for codex:
+# in an interactive pane, sandy runs it with its complete native command line
+# (the binary first) as the arguments.
+#
+# Once the supervisor is ready it execs the Codex connector's `interactive`
+# (amap-connector-codex) with that command line after `--`. The connector
+# keeps sandy's native options, adds the three trusted AMAP MCP servers, the
+# read-only `amap_fleet` activity server and the operator policy, and execs
+# Codex. It refuses what it cannot launch as a NEW local conversation
+# (resume, fork, a profile, an option it does not know), and that refusal is
+# shown in the pane as it is: nothing here drops a token or falls back to a
+# bare Codex. The supervisor this sandbox's entry runs stays the only owner
+# of the incoming lanes and of its thread.
+#
+# Ready means, from the connector's own read-only `activity` snapshot: a fresh
+# heartbeat, a bound thread, every enabled lane's claim live, no uncertain
+# dispatch, and no hold record. It is waited for up to
+# AMAP_CODEX_LAUNCH_WAIT_SECONDS (default 60); after that the pane shows why
+# and Codex is not started.
+#
+# The arguments travel as an array: nothing is joined into a shell command or
+# split on whitespace. This file sits behind the read-only payload mount.
+set -e
+SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+STATE=/opt/sandy/feature-state/amap/codex
+[ "$#" -ge 1 ] || { echo "interactive-launch: sandy passed no native command line" >&2; exit 2; }
+# The Codex supervisor serves a sandbox with codex and no claude, by the rule
+# payload/relay applies to SANDY_AGENT. Where claude is present, the Claude
+# daemon serves the sandbox, no Codex supervisor runs, and this pane is
+# sandy's native codex, unchanged.
+case ",${SANDY_AGENT:-}," in
+    *,claude,*)
+        echo "interactive-launch: the Claude daemon serves this sandbox; starting codex without the AMAP interactive tools" >&2
+        exec "$@" ;;
+esac
+: "${AMAP_OUTBOX_DIR:?interactive-launch: no AMAP_OUTBOX_DIR in this pane; the outbox lane is not mounted}"
+export PYTHONPATH="$SELF_DIR/src"
+python3 -c '
+import json, os, subprocess, sys, time
+
+state, wait = sys.argv[1], sys.argv[2]
+config = os.path.join(state, "controller.toml")
+hold = os.path.join(state, "hold.json")
+
+def not_ready():
+    if os.path.isfile(hold):
+        try:
+            return "the supervisor holds: " + json.load(open(hold)).get("reason", "no reason recorded")
+        except (OSError, ValueError, AttributeError):
+            return "the supervisor holds, and its hold record is unreadable"
+    if not os.path.isfile(config):
+        return "the supervisor has not written %s" % config
+    r = subprocess.run(["python3", "-m", "amap_codex.cli", "--config", config, "activity", "--limit", "1"],
+                       stdin=subprocess.DEVNULL, capture_output=True, text=True)
+    if r.returncode != 0:
+        return "the connector activity check failed (exit %d): %s" % (r.returncode, r.stderr.strip()[-200:])
+    try:
+        snap = json.loads(r.stdout)
+        status = snap["status"]
+        beat, thread = snap.get("heartbeat"), status.get("thread_id")
+        lanes, claims = status.get("enabled_lanes"), status.get("claim_state")
+        uncertain = status.get("uncertain_count")
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return "the connector activity snapshot is not one this launcher reads"
+    if beat != "fresh":
+        return "the supervisor heartbeat is %s" % beat
+    if not isinstance(thread, str) or not thread:
+        return "the supervisor has no bound thread"
+    if not isinstance(lanes, list) or not lanes or not isinstance(claims, dict):
+        return "the supervisor reports no enabled lanes"
+    held = [l for l in lanes if claims.get(l) != "live"]
+    if held:
+        return "lane claims are not live: " + ", ".join("%s=%s" % (l, claims.get(l)) for l in held)
+    if uncertain != 0:
+        return "the supervisor has %r uncertain dispatches; resolve them first" % (uncertain,)
+    return None
+
+try:
+    deadline = time.monotonic() + float(wait)
+except ValueError:
+    sys.exit("interactive-launch: AMAP_CODEX_LAUNCH_WAIT_SECONDS is not a number; not starting Codex")
+while True:
+    why = not_ready()
+    if why is None:
+        sys.exit(0)
+    if time.monotonic() >= deadline:
+        sys.exit("interactive-launch: %s; not starting Codex" % why)
+    time.sleep(1)
+' "$STATE" "${AMAP_CODEX_LAUNCH_WAIT_SECONDS:-60}"
+set -- -- "$@"
+if [ -d "$AMAP_OUTBOX_DIR/results" ]; then
+    set -- --outbox-dir "$AMAP_OUTBOX_DIR" "$@"
+else
+    echo "interactive-launch: $AMAP_OUTBOX_DIR has no results/ yet (none before the first send); outbound activity is not shown in this session" >&2
+fi
+exec python3 -m amap_codex.cli --config "$STATE/controller.toml" interactive "$@"

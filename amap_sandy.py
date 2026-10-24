@@ -133,7 +133,8 @@ CODEX_CONNECTOR_BINARIES = ("inbox-mcp-vol", "inbox-submit", "_inboxlib.py")
 CODEX_INSTRUCTIONS = "operator-instructions.md"
 # What payload/codex/ ships from THIS checkout, `(name, executable)`.
 CODEX_PAYLOAD_FILES = (("relay", True), ("mcp.toml", False), ("mcp-reader", True),
-                       ("mcp-submit", True), ("kickoff", True), ("status", True))
+                       ("mcp-submit", True), ("kickoff", True), ("status", True),
+                       ("interactive-launch", True), ("activity", True))
 # The agent names sandy reports, and which connector serves a sandbox: the
 # Claude daemon wherever claude is among its agents, the Codex supervisor
 # where codex is and claude is not. payload/relay applies the same rule.
@@ -1010,6 +1011,31 @@ def sandy_accepts_receives(sandy_bin: str = "sandy") -> Optional[bool]:
             and isinstance(values, list) and RECEIVES_CROSS_SESSION in values)
 
 
+def sandy_accepts_agent_wrapper(sandy_bin: str = "sandy") -> Optional[bool]:
+    """Does this sandy's manifest parser accept `agent_wrapper`? MEMBERSHIP
+    of the key in `--print-schema`'s `manifest.top_level_keys`, never a
+    version. None when the schema cannot be read."""
+    schema = _sandy_json(sandy_bin, "--print-schema")
+    if not isinstance(schema, dict):
+        return None
+    manifest = schema.get("manifest")
+    if not isinstance(manifest, dict):
+        return False
+    keys = manifest.get("top_level_keys")
+    return isinstance(keys, list) and AGENT_WRAPPER_KEY in keys
+
+
+def codex_agent_wrapper(sandy_bin: str, codex_src: Path) -> Optional[bool]:
+    """Whether the manifest wraps codex panes with the Codex connector's
+    launcher: only where this sandy accepts the key AND the payload carries
+    the launcher (sandy fails a launch whose wrapper file is missing). None
+    when sandy's answer is unknown."""
+    accepts = sandy_accepts_agent_wrapper(sandy_bin)
+    if accepts is None:
+        return None
+    return bool(accepts and codex_payload_sources(codex_src))
+
+
 def require_manifest_capable(sandy_bin: str = "sandy") -> None:
     """Refuse to install against a sandy whose feature manifests this
     deployment cannot use.
@@ -1261,8 +1287,16 @@ def install_router_state_dir(state_dir: Path, *, dry_run: bool) -> str:
 # key or value refuses the whole manifest.
 RECEIVES_KEY = "receives"
 RECEIVES_CROSS_SESSION = "cross_session"
+# `agent_wrapper` puts the Codex connector's launcher in front of an
+# interactive codex pane: sandy runs the named payload file with its own
+# complete native command line, and the file ends by exec'ing it. Rendered
+# only where this host's sandy lists the key and the payload carries the
+# launcher (`codex_agent_wrapper`).
+AGENT_WRAPPER_KEY = "agent_wrapper"
+CODEX_LAUNCHER_NAME = "interactive-launch"
+AGENT_WRAPPER = {AGENT_CODEX: f"{FEATURE_PAYLOAD_SUBDIR}/{CODEX_PAYLOAD_SUBDIR}/{CODEX_LAUNCHER_NAME}"}
 ADAPTER_OWNED_KEYS = ("schema", "create", "mounts", "entry", "expose", AGENT_ARGS_KEY,
-                      RECEIVES_KEY)
+                      RECEIVES_KEY, AGENT_WRAPPER_KEY)
 
 
 def agent_args_for_manifest() -> Dict[str, List[str]]:
@@ -1295,11 +1329,13 @@ EXIT_POLICY_UNRATIFIED = 3
 
 
 def render_manifest(policy: Dict[str, Any], *, receives: Optional[bool] = None,
-                    identity_schema: Optional[str] = None) -> Dict[str, Any]:
+                    identity_schema: Optional[str] = None,
+                    agent_wrapper: Optional[bool] = None) -> Dict[str, Any]:
     """The manifest document for `policy`: selection verbatim; the lane
     tree under `create`; sibling lane mounts with their exports; the domain
     as an `expose` export; `receives` when `receives` is True (this host's
-    sandy accepts it: `sandy_accepts_receives`); the policy itself (minus the
+    sandy accepts it: `sandy_accepts_receives`); `agent_wrapper` when
+    `agent_wrapper` is True (`codex_agent_wrapper`); the policy itself (minus the
     selection blocks the manifest carries at top level, and the loader's own
     marker) as `feature`. This is the TEMPLATE a first install writes, and
     the source of the deployment-owned blocks every later install repairs."""
@@ -1337,6 +1373,8 @@ def render_manifest(policy: Dict[str, Any], *, receives: Optional[bool] = None,
     }
     if receives:
         doc[RECEIVES_KEY] = [RECEIVES_CROSS_SESSION]
+    if agent_wrapper:
+        doc[AGENT_WRAPPER_KEY] = dict(AGENT_WRAPPER)
     domain = policy.get(fp.FLEET_DOMAIN_KEY)
     if domain is not None:
         doc["expose"][EXPOSE_FLEET_DOMAIN] = domain
@@ -1400,17 +1438,21 @@ def _check_manifest_names(doc: Dict[str, Any]) -> None:
 
 
 def manifest_text(policy: Dict[str, Any], *, receives: Optional[bool] = None,
-                  identity_schema: Optional[str] = None) -> str:
-    return json.dumps(render_manifest(policy, receives=receives,
-                                      identity_schema=identity_schema), indent=2) + "\n"
+                  identity_schema: Optional[str] = None,
+                  agent_wrapper: Optional[bool] = None) -> str:
+    return json.dumps(render_manifest(policy, receives=receives, identity_schema=identity_schema,
+                                      agent_wrapper=agent_wrapper), indent=2) + "\n"
 
 
-def _owned_keys(receives: Optional[bool]) -> Tuple[str, ...]:
+def _owned_keys(receives: Optional[bool],
+                agent_wrapper: Optional[bool] = None) -> Tuple[str, ...]:
     """The deployment-owned keys an install repairs and `verify` compares.
-    `receives` is left out when this sandy's answer is unknown: rendering it
-    either way would be a guess, and the capability check reports the
-    unreadable schema."""
-    return tuple(k for k in ADAPTER_OWNED_KEYS if not (k == RECEIVES_KEY and receives is None))
+    `receives` and `agent_wrapper` are each left out when this sandy's answer
+    is unknown: rendering one either way would be a guess, and the capability
+    check reports the unreadable schema."""
+    unknown = {k for k, v in ((RECEIVES_KEY, receives), (AGENT_WRAPPER_KEY, agent_wrapper))
+               if v is None}
+    return tuple(k for k in ADAPTER_OWNED_KEYS if k not in unknown)
 
 
 def _read_manifest(path: Path) -> Any:
@@ -1422,7 +1464,8 @@ def _read_manifest(path: Path) -> Any:
 
 def install_manifest(home: Path, policy: Dict[str, Any], *, dry_run: bool,
                      receives: Optional[bool] = None,
-                     identity_schema: Optional[str] = None) -> str:
+                     identity_schema: Optional[str] = None,
+                     agent_wrapper: Optional[bool] = None) -> str:
     """Write the manifest when it is ABSENT (the template rendered from
     `policy` — on a fresh host the default policy), or REPAIR the
     deployment-owned blocks of the one that is there, leaving the operator's keys and
@@ -1435,16 +1478,18 @@ def install_manifest(home: Path, policy: Dict[str, Any], *, dry_run: bool,
         if not isinstance(existing, dict):
             raise ProvisionError(f"{path} exists but is not a JSON object — it is the authored "
                                  f"policy, so it is not overwritten; fix it by hand")
-        rendered = render_manifest(policy, receives=receives, identity_schema=identity_schema)
+        rendered = render_manifest(policy, receives=receives, identity_schema=identity_schema,
+                                   agent_wrapper=agent_wrapper)
         doc = dict(existing)
-        for key in _owned_keys(receives):
+        for key in _owned_keys(receives, agent_wrapper):
             if key in rendered:
                 doc[key] = rendered[key]
             else:
                 doc.pop(key, None)
         want = json.dumps(doc, indent=2) + "\n"
     else:
-        want = manifest_text(policy, receives=receives, identity_schema=identity_schema)
+        want = manifest_text(policy, receives=receives, identity_schema=identity_schema,
+                             agent_wrapper=agent_wrapper)
     return _write_file(path, want, dry_run=dry_run, label=FEATURE_MANIFEST_NAME)
 
 
@@ -1468,7 +1513,8 @@ def manifest_changed_at(home: Path) -> Optional[str]:
 
 def verify_manifest(home: Path, policy: Dict[str, Any], *,
                     receives: Optional[bool] = None,
-                    identity_schema: Optional[str] = None) -> List[str]:
+                    identity_schema: Optional[str] = None,
+                    agent_wrapper: Optional[bool] = None) -> List[str]:
     """The manifest on disk is current: its deployment-owned blocks equal
     what this deployment renders for its own policy, its `feature` section is an
     object (the policy loads — `policy` is that load), and its own `expose`
@@ -1490,8 +1536,9 @@ def verify_manifest(home: Path, policy: Dict[str, Any], *,
     if not isinstance(doc, dict) or not isinstance(doc.get("feature"), dict):
         return [f"manifest drift: {path} carries no `feature` object — the policy lives there"]
     problems = []
-    rendered = render_manifest(policy, receives=receives, identity_schema=identity_schema)
-    stale = [k for k in _owned_keys(receives) if doc.get(k) != rendered.get(k)]
+    rendered = render_manifest(policy, receives=receives, identity_schema=identity_schema,
+                               agent_wrapper=agent_wrapper)
+    stale = [k for k in _owned_keys(receives, agent_wrapper) if doc.get(k) != rendered.get(k)]
     if stale:
         problems.append(f"manifest drift: {path}: {', '.join(stale)} differ from what this "
                         f"adapter renders — those blocks are the adapter's; re-run install "
@@ -1509,7 +1556,9 @@ def manifest_problems(home: Path, policy: Dict[str, Any], args: argparse.Namespa
     except ProvisionError as e:
         return [f"identity: {e}; the manifest is not compared until it is fixed"]
     return verify_manifest(home, policy, receives=sandy_accepts_receives(args.sandy),
-                           identity_schema=identity_schema)
+                           identity_schema=identity_schema,
+                           agent_wrapper=codex_agent_wrapper(
+                               args.sandy, getattr(args, "codex_connector_src", DEFAULT_CODEX_CONNECTOR_SRC)))
 
 
 VERDICT_AT_UNKNOWN = "?"     # sandy stamps `?` when its clock call fails; never ordered
@@ -1883,7 +1932,9 @@ def run_provision(
     try:
         report = install_manifest(home, policy, dry_run=dry,
                                   receives=sandy_accepts_receives(args.sandy),
-                                  identity_schema=identity_schema_for(policy, args))
+                                  identity_schema=identity_schema_for(policy, args),
+                                  agent_wrapper=codex_agent_wrapper(args.sandy,
+                                                                    args.codex_connector_src))
     except ProvisionError as e:
         print(f"  FAIL  manifest {feature_manifest_path(home)}: {e}", file=sys.stderr)
         failed += 1
