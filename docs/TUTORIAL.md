@@ -323,6 +323,35 @@ The supervisor uses the agent's own model, `model` in the sandbox's
 there, not with sandy's `CODEX_MODEL`, which reaches only the pane; the
 supervisor picks it up on its next start.
 
+**Talk to Codex yourself.** Where your sandy lists `agent_wrapper` in
+`sandy --print-schema`'s `manifest.top_level_keys`, `install` renders
+`"agent_wrapper": {"codex": "payload/codex/interactive-launch"}`, and a Codex
+pane starts through the connector's `interactive`. That pane is a NEW
+conversation with the AMAP tools (`inbox_submit.peers` finds fleet peers,
+`submit` sends, `amap_fleet.activity` shows the supervisor). It is separate
+from the supervisor's thread, which still owns everything incoming. Launch it
+fresh, because a resumed or forked session is refused:
+
+```sh
+cd ~/amap-demo/gamma && sandy --new
+```
+
+The pane waits up to `AMAP_CODEX_LAUNCH_WAIT_SECONDS` (60) for the supervisor
+to be ready (a fresh heartbeat, a bound thread, live lane claims, nothing
+uncertain, no hold), and otherwise shows why and does not start Codex. Watch
+the supervisor beside it, from a second terminal:
+
+```sh
+sandy --exec --workspace ~/amap-demo/gamma -- /opt/sandy/features/amap/codex/activity
+```
+
+Confirm the pane was wrapped (`{}` means this launch was not, `null` that the
+sandbox's marker predates the field):
+
+```sh
+sandy --print-state | jq -e '.sandboxes[] | select(.workspace_path=="'"$HOME"'/amap-demo/gamma") | .agent_wrappers.codex.feature == "amap"'
+```
+
 **Verify.** `python3 amap-sandy.py verify` checks the Codex sandbox through
 the supervisor's own status: both lanes claimed, a thread bound, nothing
 UNCERTAIN, no hold.
