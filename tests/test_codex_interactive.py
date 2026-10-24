@@ -13,10 +13,9 @@
 The connector is a `python3` shim: `-m amap_codex.cli activity` prints the
 snapshot the test sets, and `interactive` records its arguments NUL-separated
 and exits as the test sets; every other python3 call runs for real. The
-snapshot's fields are the connector's own: `heartbeat` from
-amap_codex/interactive.py `read_activity`, and `status` from amap_codex/cli.py
-`read_status` (`instance_id`, `enabled_lanes`, `thread_id`, `claim_state` per
-lane, `uncertain_count`), at the pinned commit.
+snapshot's `readiness` is the connector's own shape, amap_codex/interactive.py
+`supervisor_readiness` at the pinned commit: `state` (`ready`, `not_ready`,
+`not_started`, `unknown`) and `checks`, each label `pass`, `fail` or `unknown`.
 """
 from __future__ import annotations
 
@@ -67,12 +66,17 @@ exec @PYTHON@ "$@"
 """
 
 
-def snapshot(**status):
-    base = {"instance_id": "codex-1", "enabled_lanes": ["mail", "peer"], "thread_id": "thr-1",
-            "claim_state": {"mail": "live", "peer": "live"}, "uncertain_count": 0, "pending_count": 0}
-    heartbeat = status.pop("heartbeat", "fresh")
-    base.update(status)
-    return json.dumps({"heartbeat": heartbeat, "status": base, "events": []})
+CHECKS = ("fresh_heartbeat", "configuration_matches", "codex_build_matches", "thread_bound",
+          "snapshot_matches_binding", "live_claims_match_snapshot_owner", "dispatch_resolved",
+          "operational_error_clear", "blocked_requests_clear")
+
+
+def snapshot(state="ready", **labels):
+    checks = {k: "pass" for k in CHECKS}
+    checks.update(labels)
+    return json.dumps({"heartbeat": "fresh", "status": {"instance_id": "codex-1"}, "events": [],
+                       "readiness": {"state": state, "checks": checks, "meaning": "local startup evidence"},
+                       "outbound": {"state": "no_results_yet"}})
 
 
 class _Sandbox:
@@ -150,6 +154,9 @@ class InteractiveLaunchTest(unittest.TestCase):
                          ["-m", "amap_codex.cli", "--config", str(self.box.state / "controller.toml"),
                           "interactive", "--outbox-dir", str(self.box.outbox), "--", *NATIVE])
         self.assertIsNone(self.box.execd(), "the launcher started codex itself")
+        calls = self.box.calls()
+        i = calls.index("activity")
+        self.assertEqual(calls[i + 1:i + 5], ["--limit", "1", "--outbox-dir", str(self.box.outbox)])
 
     def test_the_connectors_refusal_is_the_launchers_exit_and_nothing_is_dropped(self):
         self.box.ready()
@@ -183,32 +190,30 @@ class InteractiveLaunchTest(unittest.TestCase):
         (self.box.state / "hold.json").write_text(json.dumps({"reason": "codex is not logged in"}))
         self._refused("the supervisor holds: codex is not logged in")
 
-    def test_a_stale_heartbeat_refuses(self):
+    def test_not_ready_refuses_and_names_the_checks_that_did_not_pass(self):
         self.box.ready()
-        self._refused("the supervisor heartbeat is stale", SHIM_ACTIVITY=snapshot(heartbeat="stale"))
+        self._refused("the supervisor is not_ready (live_claims_match_snapshot_owner=fail, thread_bound=fail)",
+                      SHIM_ACTIVITY=snapshot("not_ready", thread_bound="fail",
+                                             live_claims_match_snapshot_owner="fail"))
 
-    def test_no_bound_thread_refuses(self):
+    def test_unknown_and_not_started_refuse(self):
         self.box.ready()
-        self._refused("no bound thread", SHIM_ACTIVITY=snapshot(thread_id=None))
+        self._refused("the supervisor is unknown (blocked_requests_clear=unknown)",
+                      SHIM_ACTIVITY=snapshot("unknown", blocked_requests_clear="unknown"))
+        self._refused("the supervisor is not_started", SHIM_ACTIVITY=snapshot("not_started"))
 
-    def test_a_lane_claim_that_is_not_live_refuses_and_names_it(self):
+    def test_ready_is_the_state_not_the_labels(self):
+        """A `ready` state is the connector's verdict; DS does not re-derive it from the labels."""
         self.box.ready()
-        self._refused("peer=stale", SHIM_ACTIVITY=snapshot(claim_state={"mail": "live", "peer": "stale"}))
-        self._refused("peer=None", SHIM_ACTIVITY=snapshot(claim_state={"mail": "live"}))
-
-    def test_no_enabled_lane_refuses(self):
-        self.box.ready()
-        self._refused("no enabled lanes", SHIM_ACTIVITY=snapshot(enabled_lanes=[]))
-
-    def test_an_uncertain_dispatch_refuses(self):
-        self.box.ready()
-        self._refused("1 uncertain dispatches", SHIM_ACTIVITY=snapshot(uncertain_count=1))
+        self._refused("the supervisor is not_ready", SHIM_ACTIVITY=snapshot("not_ready"))
+        r = self.box.run("interactive-launch", *NATIVE, SHIM_ACTIVITY=snapshot("ready"))
+        self.assertEqual(r.returncode, 0, r.stderr)
 
     def test_a_failed_or_unreadable_activity_check_refuses(self):
         self.box.ready()
         self._refused("the connector activity check failed (exit 4)", SHIM_ACTIVITY_RC="4")
-        self._refused("not one this launcher reads", SHIM_ACTIVITY="not json")
-        self._refused("not one this launcher reads", SHIM_ACTIVITY=json.dumps({"heartbeat": "fresh"}))
+        self._refused("carries no readiness this launcher reads", SHIM_ACTIVITY="not json")
+        self._refused("carries no readiness this launcher reads", SHIM_ACTIVITY=json.dumps({"heartbeat": "fresh"}))
 
     def test_it_waits_for_the_supervisor_within_its_bound(self):
         proc = subprocess.Popen(["/bin/sh", str(self.box.payload / "interactive-launch"), *NATIVE],
@@ -221,12 +226,13 @@ class InteractiveLaunchTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, err)
         self.assertEqual(self.box.interactive()[-len(NATIVE) - 1:], ["--", *NATIVE])
 
-    def test_before_the_first_send_it_starts_without_outbound_activity_and_says_so(self):
+    def test_before_the_first_send_the_outbox_is_still_passed(self):
+        """The connector reports a missing results/ as `no_results_yet`; the launcher
+        always names the outbox."""
         self.box.ready()
         (self.box.outbox / "results").rmdir()
-        r = self._ok(*NATIVE)
-        self.assertNotIn("--outbox-dir", self.box.interactive())
-        self.assertIn("has no results/ yet", r.stderr)
+        self._ok(*NATIVE)
+        self.assertEqual(self.box.interactive()[5:7], ["--outbox-dir", str(self.box.outbox)])
 
     def test_without_the_outbox_lane_it_refuses(self):
         self.box.ready()
@@ -243,7 +249,7 @@ class ActivityTest(unittest.TestCase):
     def setUp(self):
         self.box = _Sandbox(self)
 
-    def test_it_follows_with_the_outbox_once_results_exist(self):
+    def test_it_follows_with_the_outbox(self):
         self.box.ready()
         r = self.box.run("activity", "--limit", "5")
         self.assertEqual(r.returncode, 0, r.stderr)
@@ -251,13 +257,21 @@ class ActivityTest(unittest.TestCase):
         i = calls.index("activity")
         self.assertEqual(calls[i + 1:], ["--follow", "--limit", "5", "--outbox-dir", str(self.box.outbox), ""])
 
-    def test_before_the_first_send_it_follows_without_the_outbox(self):
+    def test_before_the_first_send_it_still_follows_the_outbox(self):
         self.box.ready()
         (self.box.outbox / "results").rmdir()
         r = self.box.run("activity")
         self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("--outbox-dir", self.box.calls())
+
+    def test_without_the_outbox_lane_it_follows_without_send_results_and_says_so(self):
+        self.box.ready()
+        env = {k: v for k, v in self.box.env.items() if k != "AMAP_OUTBOX_DIR"}
+        r = subprocess.run(["/bin/sh", str(self.box.payload / "activity")], env=env,
+                           capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
         self.assertNotIn("--outbox-dir", self.box.calls())
-        self.assertIn("no results/ yet", r.stderr)
+        self.assertIn("no AMAP_OUTBOX_DIR", r.stderr)
 
     def test_without_a_supervisor_configuration_it_says_so(self):
         r = self.box.run("activity")
