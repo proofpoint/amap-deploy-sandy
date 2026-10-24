@@ -205,14 +205,15 @@ def checks(root: Path, ds: Path, sandy: str) -> None:
 
 
 def inventory(base: Path, names: Sequence[str]) -> Dict[str, List]:
-    """Every entry under each present name: relative path -> [type, mode, link target or sha256]."""
+    """Every entry under each present name: relative path -> [type, mode, link target or sha256].
+    A link's own mode is not recorded: it controls nothing, and platforms differ on it."""
     out: Dict[str, List] = {}
 
     def one(path: Path, rel: str) -> None:
         st = os.lstat(path)
         mode = stat.S_IMODE(st.st_mode)
         if stat.S_ISLNK(st.st_mode):
-            out[rel] = ["l", mode, os.readlink(path)]
+            out[rel] = ["l", None, os.readlink(path)]
         elif stat.S_ISDIR(st.st_mode):
             out[rel] = ["d", mode, None]
             for child in sorted(os.listdir(path)):
@@ -233,12 +234,22 @@ def inventory(base: Path, names: Sequence[str]) -> Dict[str, List]:
 
 
 def copy_entry(src: Path, dest: Path) -> None:
-    if src.is_symlink():
+    """Copy one entry exactly: a link as a link (no metadata call that could
+    follow it, so its target may not exist yet), a file with its mode and
+    times, a directory's contents before its own mode (so a directory that is
+    not writable is still filled)."""
+    st = os.lstat(src)
+    if stat.S_ISLNK(st.st_mode):
         os.symlink(os.readlink(src), dest)
-    elif src.is_dir():
-        shutil.copytree(src, dest, symlinks=True, copy_function=shutil.copy2)
+    elif stat.S_ISDIR(st.st_mode):
+        os.mkdir(dest)
+        for child in sorted(os.listdir(src)):
+            copy_entry(src / child, dest / child)
+        os.chmod(dest, stat.S_IMODE(st.st_mode))
+    elif stat.S_ISREG(st.st_mode):
+        shutil.copy2(src, dest)
     else:
-        shutil.copy2(src, dest, follow_symlinks=False)
+        raise Refused(f"{src} is neither a file, a directory nor a link")
 
 
 def new_dir(path: Path) -> Path:

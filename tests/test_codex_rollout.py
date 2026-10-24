@@ -104,7 +104,11 @@ class RolloutTest(unittest.TestCase):
         launcher = self.feature / "payload" / "codex" / "interactive-launch"
         launcher.write_text("old launcher\n")
         launcher.chmod(0o755)
+        # The link sorts before nothing it needs, and points at a sibling copied after it
+        # ("a-link" < "interactive-launch"), so a copier that follows links fails here.
         (self.feature / "payload" / "codex" / "relay-link").symlink_to("interactive-launch")
+        (self.feature / "payload" / "codex" / "a-link").symlink_to("interactive-launch")
+        (self.feature / "payload" / "codex").chmod(0o750)
         (self.feature / "feature.json").write_text('{"schema": 1}\n')
         (self.feature / "router.json").write_text('{"instances": {}}\n')
         bindir = self.root / "bin"
@@ -272,6 +276,28 @@ class RolloutTest(unittest.TestCase):
         self.assertEqual(len(aside), 1)
         self.assertEqual((aside[0] / "payload/codex/interactive-launch").read_text(), "new launcher\n")
 
+    def test_a_link_copied_before_its_target_and_a_directory_mode_survive_the_round_trip(self):
+        # Copying a link's own metadata is not portable: in a reviewer's confined workspace
+        # it resolved the link, so a link copied before its target raised ENOENT. Which
+        # entry a directory walk reaches first is not fixed, so here every such call
+        # fails, and the copy must make none.
+        real = shutil.copystat
+
+        def strict(src, dst, *, follow_symlinks=True):
+            if not follow_symlinks and os.path.islink(dst):
+                raise FileNotFoundError(2, "No such file or directory", str(dst))
+            return real(src, dst, follow_symlinks=follow_symlinks)
+        with mock.patch("shutil.copystat", strict):
+            rc, out, err = self.main_("apply")
+            self.assertEqual(rc, 0, err)
+            b, = self.backups()
+            self.assertEqual(os.readlink(b / "payload/codex/a-link"), "interactive-launch")
+            self.assertEqual(stat.S_IMODE((b / "payload/codex").stat().st_mode), 0o750)
+            rc, out, err = self.main_("rollback", str(b))
+            self.assertEqual(rc, 0, err)
+        self.assertEqual(os.readlink(self.feature / "payload/codex/a-link"), "interactive-launch")
+        self.assertEqual(stat.S_IMODE((self.feature / "payload/codex").stat().st_mode), 0o750)
+
     def test_the_backup_keeps_modes_under_a_restrictive_umask(self):
         r = subprocess.run(["sh", "-c", f'umask 077 && exec "{sys.executable}" "{LAUNCHER}" apply'],
                            env={**os.environ, **self.env}, capture_output=True, text=True, timeout=60)
@@ -327,7 +353,7 @@ class RolloutTest(unittest.TestCase):
     def test_a_copy_that_drops_a_link_stops_before_install(self):
         def dereferencing(src, dest):
             shutil.copytree(src, dest, symlinks=False) if Path(src).is_dir() else shutil.copy2(src, dest)
-        self._backup_refused("does not match the live files (payload/codex/relay-link)",
+        self._backup_refused("does not match the live files (payload/codex/a-link, payload/codex/relay-link)",
                              **{"codex_rollout.copy_entry": dereferencing})
 
     def test_a_hash_that_fails_stops_before_install(self):
