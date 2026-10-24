@@ -1,0 +1,25 @@
+#!/bin/sh
+# payload/codex/activity — shipped by amap-deploy-sandy and copied VERBATIM
+# onto the feature payload. The visible companion to an interactive Codex
+# pane: the Codex supervisor's activity as it changes (amap-connector-codex
+# `activity --follow`, read-only: it claims nothing, resumes nothing and
+# dispatches nothing). One JSON line per substantive change: incoming events
+# and their turn states, operator runs, the supervisor's heartbeat and
+# readiness, and the outbox's recent send results (`no_results_yet` before the
+# first). No message body is shown.
+# Run it in its own window inside the Codex sandbox:
+#
+#   /opt/sandy/features/amap/codex/activity
+#
+# Extra arguments (--limit N, --interval S) pass through to the connector.
+set -e
+SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+STATE=/opt/sandy/feature-state/amap/codex
+[ -r "$STATE/controller.toml" ] || { echo "activity: no supervisor configuration at $STATE; is this the Codex sandbox, and has its entry started?" >&2; exit 1; }
+set -- --follow "$@"
+if [ -n "${AMAP_OUTBOX_DIR:-}" ]; then
+    set -- "$@" --outbox-dir "$AMAP_OUTBOX_DIR"
+else
+    echo "activity: no AMAP_OUTBOX_DIR here; send results are not shown" >&2
+fi
+PYTHONPATH="$SELF_DIR/src" exec python3 -m amap_codex.cli --config "$STATE/controller.toml" activity "$@"
