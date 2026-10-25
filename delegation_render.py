@@ -25,7 +25,15 @@ its path, as `hop_router.validate_with_hop_router` does:
    `check_delegation`, `make_peer_codec({})`, the codec's methods, reason
    sets and candidate view, `load_key_table` on the peers and on this host's
    own entry (built as activate builds it), the signing key_id among the
-   peers', and the own key's selection and length.
+   peers', and the own key's selection and length. The peer table must be
+   non-empty, each runtime with exactly one key, and every configured peer
+   key is selected from the table the gate returned, at one UTC instant,
+   with the same public bytes and, where the table exposes them, the same
+   runtime and domains: a gate that loads without error is not enough.
+
+`render_block` itself refuses a block with no peer runtime, a runtime that is
+not its peer's (name, runtime, domains) with exactly that peer's one key, and
+this host's own entry rendered as a peer.
 `read_seed`, `make_signer` and `make_verifier` are never called. An audit
 hook in that process refuses any open of the signing key or of anything in
 its directory, so the check cannot read the key even by accident. The own
@@ -38,7 +46,7 @@ router's, when it starts (A4).
 import json
 import subprocess
 import sys
-from typing import Any, Dict, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 import fleet_keys as fk
 
@@ -59,10 +67,29 @@ def parse_policy(raw: Any) -> Optional[bool]:
     return raw["inbound"]
 
 
+def _check_runtimes(runtimes: List[Dict[str, Any]], me: fk.Host, peers: Sequence[fk.Host]) -> None:
+    """Each rendered runtime is its peer's, carrying exactly that peer's one
+    key; there is at least one, and none is this host's own signing entry."""
+    if not runtimes:
+        raise DelegationRenderError("the block has no peer runtime: it would verify nothing")
+    if len(runtimes) != len(peers):
+        raise DelegationRenderError(f"{len(runtimes)} runtimes rendered for {len(peers)} peers")
+    for r, p in zip(runtimes, peers):
+        if p.name == me.name or p.key_id == me.key_id:
+            raise DelegationRenderError(f"the runtime {p.name!r} is this host's own signing entry, not a peer")
+        if (r.get("name"), r.get("runtime"), r.get("domains")) != (p.name, p.runtime, list(p.domains)):
+            raise DelegationRenderError(f"the runtime rendered for {p.name!r} is not that peer's name, runtime "
+                                        "and domains")
+        if r.get("keys") != [{"key_id": p.key_id, "public_key": p.public_key}]:
+            raise DelegationRenderError(f"the runtime {p.name!r} must carry exactly its one inventory key")
+
+
 def render_block(*, key_path: str, me: fk.Host, peers: Sequence[fk.Host], inbound: bool) -> Dict[str, Any]:
+    runtimes = [p.table_entry() for p in peers]
+    _check_runtimes(runtimes, me, peers)
     block: Dict[str, Any] = {
         "signing_key": {"path": key_path, "key_id": me.key_id, "public_key": me.public_key},
-        "runtimes": [p.table_entry() for p in peers],
+        "runtimes": runtimes,
         "crypto": dict(CRYPTO),
     }
     if inbound:
@@ -134,14 +161,44 @@ def gate(peers, what):
             refused(e.reason, "%s: %s" % (what, e))
         raise
 
-gate(dc.key_table_input(), "delegation.runtimes")
+now = datetime.datetime.now(datetime.timezone.utc)
+# The loader accepts an empty runtimes list and an empty keys list, and the
+# gate loads either as a table that verifies nothing.
+if not dc.runtimes:
+    refused("no_peer", "delegation.runtimes is empty: the key table would verify nothing")
+for r in dc.runtimes:
+    if len(r.keys) != 1:
+        refused("key_malformed", "the runtime %r carries %d keys, not its one" % (r.name, len(r.keys)))
+table = gate(dc.key_table_input(), "delegation.runtimes")
 if dc.signing_key_id in {k["key_id"] for r in dc.runtimes for k in r.keys}:
     refused("duplicate_key_id", "the signing key_id %r is also a peer's" % dc.signing_key_id)
+# Every configured peer key is selected from the table the gate returned, so
+# a gate that drops or alters a key refuses here rather than at first use.
+for r in dc.runtimes:
+    k = r.keys[0]
+    try:
+        want = bytes.fromhex(k["public_key"])
+    except ValueError:
+        refused("key_malformed", "the runtime %r public_key is not hex" % r.name)
+    try:
+        got = table.select(k["key_id"], now)
+    except Exception as e:
+        if P.error_kind(probe, e) == "CodecError":
+            refused("peer_key_unselectable", "the runtime %r key %r cannot be selected: %s"
+                    % (r.name, k["key_id"], e.reason))
+        raise
+    if not (type(getattr(got, "public_key", None)) is bytes and got.public_key == want):
+        refused("peer_key_mismatch", "the key table gives the runtime %r key %r other public bytes"
+                % (r.name, k["key_id"]))
+    if hasattr(got, "runtime") and got.runtime != r.runtime:
+        refused("peer_key_mismatch", "the key table binds the runtime %r key to %r" % (r.name, got.runtime))
+    if hasattr(got, "domains") and tuple(got.domains) != tuple(r.domains):
+        refused("peer_key_mismatch", "the key table binds the runtime %r key to other domains" % r.name)
 own = gate([{"name": "self", "runtime": C.router_runtime(cfg.fleet_domain), "domains": [cfg.fleet_domain or ""],
              "keys": [{"key_id": dc.signing_key_id, "public_key": dc.signing_public_key}]}],
            "delegation.signing_key")
 try:
-    pub = own.select(dc.signing_key_id, datetime.datetime.now(datetime.timezone.utc)).public_key
+    pub = own.select(dc.signing_key_id, now).public_key
 except Exception as e:
     if P.error_kind(probe, e) == "CodecError":
         refused("signing_key_mismatch", "the signing key cannot be selected: %s" % e.reason)
