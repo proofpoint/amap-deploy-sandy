@@ -26,7 +26,13 @@ The host-setup document's `hub` section names, all operator data:
 - `dirs`: the roots the runtime's mailbox root, ledger, lock and inbound
   state live in, each a declared root owned by the runtime, mode 0700,
   and the lock file's name;
-- the prefix template and its owner; optionally the log driver.
+- the prefix template and its owner; optionally the log driver;
+- `candidate_carriage`: exactly `on` or `off`, required and never defaulted.
+  It is the runtime's HUB_CANDIDATE_CARRIAGE: whether inbound peer and
+  control statements arriving over the hub link are carried, or park as
+  candidates. The runtime reads it once at start and reports no effective
+  value, so this rendering is the source of truth, and verify compares it like
+  every other rendered variable.
 
 The login's local part and domain and the probe's domain are frozen by the
 hub design: the overlay names them, and each must hash to its pin here.
@@ -97,6 +103,11 @@ SWITCHES_OFF = ("HUB_UNKNOWN_TARGET_DSN", "HUB_INTAKE_SWEEP")
 #: verify compares. It must stay below the local router's dedup horizon.
 RECOVERY_ENV = "HUB_INBOUND_RECOVERY_MAX_DAYS"
 RECOVERY_DAYS = 29
+#: The runtime's inbound candidate carriage, from the document's
+#: `candidate_carriage`. The runtime also accepts an empty value; this
+#: rendering never writes one.
+CARRIAGE_ENV = "HUB_CANDIDATE_CARRIAGE"
+CARRIAGE_VALUES = ("on", "off")
 DIR_KEYS = ("MAILBOX_ROOT_DIR", "RELAY_LEDGER_DIR", "HUB_INBOUND_STATE_DIR", "lock")
 _LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
 _OWN = re.compile(rf"({_LABEL})\.internal")
@@ -156,6 +167,7 @@ class HubSpec:
     prefix_template: str
     config_uid: int
     log_driver: Optional[str]
+    candidate_carriage: str           # CARRIAGE_ENV's value: exactly "on" or "off"
     #: The file form: the D7 source's pinned sha256, `d7_source` then being
     #: the absolute path of that one file on this host. None: the clone form.
     d7_source_sha256: Optional[str] = None
@@ -220,7 +232,7 @@ def load(sec: Any, spec: Any) -> HubSpec:
     if s is None or s.probe is None:
         raise HubSpecError("the hub section needs a secrets section with its probe settings")
     keys = ("host_label", "own_domain", "login", "probe_domain", "statement", "fleet_hosts", "d7",
-            "env_file", "hop", "dirs", "prefix_template", "config_uid")
+            "env_file", "hop", "dirs", "prefix_template", "config_uid", "candidate_carriage")
     sec = _exact(sec, keys, "(the section)", ("log_driver", "excluded_domains"))
     m = _OWN.fullmatch(sec["own_domain"]) if isinstance(sec["own_domain"], str) else None
     if m is None:
@@ -289,6 +301,10 @@ def load(sec: Any, spec: Any) -> HubSpec:
         paths[k] = p
     if not isinstance(dirs["lock_file"], str) or not _NAME.fullmatch(dirs["lock_file"]):
         raise HubSpecError("hub.dirs.lock_file must be one file name")
+    carriage = sec["candidate_carriage"]
+    if not isinstance(carriage, str) or carriage not in CARRIAGE_VALUES:
+        raise HubSpecError("hub.candidate_carriage must be exactly \"on\" or \"off\": it has no default, "
+                           "and no other spelling or case is accepted")
     log = sec.get("log_driver")
     if log is not None and (not isinstance(log, str) or not _NAME.fullmatch(log)):
         raise HubSpecError("hub.log_driver must be a driver name")
@@ -304,7 +320,7 @@ def load(sec: Any, spec: Any) -> HubSpec:
         registry_uid=_uint(hop["registry_uid"], "hop.registry_uid"), peer_uid=_peer_uid(hop["peer_uid"]),
         link=hop["link"], dirs=paths,
         lock_file=dirs["lock_file"], prefix_template=_abs(sec["prefix_template"], "prefix_template"),
-        config_uid=_uint(sec["config_uid"], "config_uid"), log_driver=log)
+        config_uid=_uint(sec["config_uid"], "config_uid"), log_driver=log, candidate_carriage=carriage)
     if hs.username != s.probe["username"]:
         raise HubSpecError("the secrets section's probe username is not the login hub derives from own_domain")
     if posixpath.dirname(hs.env_file) == hs.d7_dir or hs.d7_dir in (posixpath.dirname(spec.overlay_path),):
@@ -386,6 +402,7 @@ def environment(spec: Any, hs: HubSpec) -> List[Tuple[str, str]]:
     ]
     env += [(k, "off") for k in SWITCHES_OFF]
     env.append((RECOVERY_ENV, str(RECOVERY_DAYS)))
+    env.append((CARRIAGE_ENV, hs.candidate_carriage))
     for k, v in env:
         if "\n" in v or "\r" in v or "\0" in v:
             raise HubSpecError(f"{k}'s value cannot be written to an environment file")

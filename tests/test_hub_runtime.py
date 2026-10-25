@@ -71,7 +71,7 @@ def hub_sec():
             "hop": {"name": "h1", "root": "/srv/example/a/b", "registry_dir": "/srv/example/registry",
                     "registry_uid": 2300, "peer_uid": PEER_UID, "link": "link-a"},
             "dirs": dict(PRIVATE, lock_file="relay.lock"),
-            "prefix_template": "/opt/ex/tmpl/prefix.json", "config_uid": 0}
+            "prefix_template": "/opt/ex/tmpl/prefix.json", "config_uid": 0, "candidate_carriage": "on"}
 
 
 def full_doc(**hub_over):
@@ -152,6 +152,22 @@ class LoadTest(unittest.TestCase):
 
     def test_the_probe_domain_is_always_excluded(self):
         self.assertIn("probe-x.internal", spec().hub.excluded)
+
+    def test_a_section_without_candidate_carriage_refuses(self):
+        d = full_doc()
+        del d[hr.SECTION]["candidate_carriage"]
+        self.refuses(d, "must have")
+
+    def test_candidate_carriage_takes_only_on_or_off_exactly(self):
+        # The runtime itself also accepts "", which this document never may: no default, no case-folding.
+        for bad in ("", "ON", "Off", "true", "1", None, True, ["on"]):
+            with self.subTest(value=bad):
+                self.refuses(full_doc(candidate_carriage=bad), "candidate_carriage")
+
+    def test_candidate_carriage_on_and_off_both_load(self):
+        for good in hr.CARRIAGE_VALUES:
+            with self.subTest(value=good):
+                self.assertEqual(spec(candidate_carriage=good).hub.candidate_carriage, good)
 
     def test_a_section_without_the_probe_domain_refuses(self):
         d = full_doc()
@@ -265,6 +281,13 @@ class RenderingTest(unittest.TestCase):
     def test_the_peer_uid_is_the_measured_one_never_the_principal_s(self):
         self.assertNotEqual(PEER_UID, self.spec.principals["upstream"].uid)
         self.assertEqual(self.env["HOP_PEER_UID"], str(PEER_UID))
+
+    def test_candidate_carriage_is_rendered_from_the_document_never_defaulted(self):
+        for value in hr.CARRIAGE_VALUES:
+            with self.subTest(value=value):
+                s = spec(candidate_carriage=value)
+                env = hr.environment(s, s.hub)
+                self.assertEqual([v for k, v in env if k == hr.CARRIAGE_ENV], [value])
 
     def test_the_plan_names_the_same_peer_uid_as_the_environment(self):
         lines = hs.render_plan(self.spec)
@@ -420,6 +443,20 @@ class CompareTest(unittest.TestCase):
         live["Config"]["Env"] = [e if not e.startswith("SMTP_PORT=") else "SMTP_PORT=25"
                                  for e in live["Config"]["Env"]]
         self.assertEqual(hr.compare(live, self.rendered, []), ["SMTP_PORT differs from the rendering and the image"])
+
+    def test_a_running_carriage_other_than_the_rendered_one_is_named(self):
+        # The runtime reports no effective value, so the rendering is the truth and the running env is held to it.
+        live = copy.deepcopy(self.rendered)
+        live["Config"]["Env"] = [e if not e.startswith(hr.CARRIAGE_ENV + "=") else hr.CARRIAGE_ENV + "=off"
+                                 for e in live["Config"]["Env"]]
+        self.assertEqual(hr.compare(live, self.rendered, []),
+                         [f"{hr.CARRIAGE_ENV} differs from the rendering and the image"])
+
+    def test_a_running_container_without_the_carriage_is_named(self):
+        live = copy.deepcopy(self.rendered)
+        live["Config"]["Env"] = [e for e in live["Config"]["Env"] if not e.startswith(hr.CARRIAGE_ENV + "=")]
+        self.assertEqual(hr.compare(live, self.rendered, []),
+                         [f"{hr.CARRIAGE_ENV} differs from the rendering and the image"])
 
     def test_an_extra_mount_is_named(self):
         live = copy.deepcopy(self.rendered)
