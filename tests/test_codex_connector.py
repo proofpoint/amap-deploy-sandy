@@ -244,7 +244,27 @@ class CodexRelayTest(unittest.TestCase):
     def _start(self, **env):
         return subprocess.Popen(["/bin/sh", str(self.payload / "codex/relay")],
                                 env={**self.env, **env}, stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, text=True, start_new_session=True)
+                                stderr=subprocess.PIPE, text=True, start_new_session=True,
+                                cwd=self.root)
+
+    def test_installed_renderer_requires_its_installed_helper_from_unrelated_cwd(self):
+        (self.root / "logged-in").write_text("")
+        helper = self.payload / "codex/codex_transition.py"
+        raw, mode = helper.read_bytes(), stat.S_IMODE(helper.stat().st_mode)
+        helper.unlink()
+        proc = self._start()
+        _, error = proc.communicate(timeout=30)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("No module named 'codex_transition'", error)
+        self.assertFalse((self.state / "codex/controller.toml").exists())
+        self.assertFalse((self.root / "argv").exists())
+        helper.write_bytes(raw)
+        helper.chmod(mode)
+        proc = self._start()
+        _, error = proc.communicate(timeout=30)
+        self.assertEqual(proc.returncode, 0, error)
+        self.assertTrue((self.state / "codex/controller.toml").is_file())
+        self.assertTrue((self.root / "argv").is_file())
 
     def _hold_reason(self, proc):
         hold = self.state / prov.CODEX_STATE_SUBDIR / prov.CODEX_HOLD_NAME
@@ -284,7 +304,7 @@ class CodexRelayTest(unittest.TestCase):
         env = dict(self.env)
         del env["AMAP_FLEET_DOMAIN"]
         proc = subprocess.run(["/bin/sh", str(self.payload / "codex/relay")], env=env,
-                              capture_output=True, text=True, timeout=30)
+                              capture_output=True, text=True, timeout=30, cwd=self.root)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         config = Config.load(self.state / "codex/controller.toml")
         self.assertIsNone(config.self_address)
@@ -481,7 +501,7 @@ esac
         proc = subprocess.run(["/bin/sh", str(self.payload / "codex/relay")],
                               env={**self.env, "AMAP_CODEX_MODEL": "gpt-env",
                                    "CODEX_MODEL": "gpt-env"},
-                              capture_output=True, text=True, timeout=30)
+                              capture_output=True, text=True, timeout=30, cwd=self.root)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(Config.load(self.state / "codex/controller.toml").codex_model,
                          "gpt-test")
@@ -503,7 +523,7 @@ esac
         self.codex_config.write_text('sandbox_mode = "danger-full-access"\n')
         proc = subprocess.run(["/bin/sh", str(self.payload / "codex/relay")],
                               env={**self.env, "CODEX_MODEL": "pane-only-model"},
-                              capture_output=True, text=True, timeout=30)
+                              capture_output=True, text=True, timeout=30, cwd=self.root)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         controller = self.state / "codex/controller.toml"
         self.assertNotIn("codex_model", controller.read_text())
@@ -537,7 +557,7 @@ esac
         (self.root / "logged-in").write_text("")
         proc = subprocess.run(["/bin/sh", str(self.payload / "codex/relay")],
                               env={**self.env, "FAKE_CODEX_VERSION": "codex-cli 9.9.9"},
-                              capture_output=True, text=True, timeout=30)
+                              capture_output=True, text=True, timeout=30, cwd=self.root)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         config = Config.load(self.state / "codex/controller.toml")
         self.assertEqual(config.codex_version, "codex-cli 9.9.9")
