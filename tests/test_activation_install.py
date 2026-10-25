@@ -8,8 +8,11 @@ A1's record by partition_activation.activation_record, A2's evidence by
 partition_evidence.build, the staged bytes by partition_activation.staged_bytes.
 """
 
+import ast
 import hashlib
+import inspect
 import json
+import os
 import unittest
 
 import activation_install as ai
@@ -188,6 +191,39 @@ class CliTest(unittest.TestCase):
                                              {}, {}, None, apply=True, spec=None)
                 self.assertEqual(rc, 2)
                 self.assertIn("go together", err.getvalue())
+
+
+class ProductionReaderTest(unittest.TestCase):
+    """Every production read of the inventory goes through fk._read: the
+    activation entry points default to it, and every call outside the tests
+    that names a reader names fk._read or passes its own parameter on."""
+
+    def test_the_entry_points_default_to_the_no_follow_reader(self):
+        for f in (ai.render_staged, ai.activate):
+            self.assertIs(inspect.signature(f).parameters["read_inventory"].default, fk._read, f.__name__)
+
+    def test_no_production_call_supplies_another_reader(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        seen = []
+        for name in sorted(os.listdir(root)):
+            if not name.endswith(".py"):
+                continue
+            tree = ast.parse(open(os.path.join(root, name), encoding="utf-8").read())
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                for kw in node.keywords:
+                    if kw.arg in ("read_inventory", "read_bytes"):
+                        v = ast.unparse(kw.value)
+                        seen.append((name, v))
+                        self.assertIn(v, ("fk._read", "read_inventory"), f"{name}: {kw.arg}={v}")
+                fn = ast.unparse(node.func)
+                if fn in ("fk.read", "fleet_keys.read") and len(node.args) > 1:
+                    v = ast.unparse(node.args[1])
+                    seen.append((name, v))
+                    self.assertIn(v, ("fk._read", "read_inventory"), f"{name}: {fn}(..., {v})")
+        self.assertIn(("amap_sandy.py", "fk._read"), seen)
+        self.assertIn(("activation_install.py", "read_inventory"), seen)
 
 
 if __name__ == "__main__":
