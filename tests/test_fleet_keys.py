@@ -118,6 +118,27 @@ class SelectTest(unittest.TestCase):
             fk.select(self.hosts, "alpha.example.org", [])
         self.assertIn("'beta'", str(cm.exception))
 
+    def test_each_host_selects_the_other(self):
+        me, peers = fk.select(self.hosts, "beta.example.org", ["alpha.example.org"])
+        self.assertEqual((me.name, [p.name for p in peers]), ("beta", ["alpha"]))
+
+    def test_an_inventory_of_this_host_alone_parses_and_is_refused_at_selection(self):
+        one = fk.parse(raw(doc(host("alpha", ["alpha.example.org"], 1))))
+        self.assertEqual([h.name for h in one], ["alpha"])
+        with self.assertRaises(fk.FleetKeysError) as cm:
+            fk.select(one, "alpha.example.org", ["beta.example.org"])
+        self.assertIn("lists only this host ('alpha')", str(cm.exception))
+
+    def test_a_trusted_host_with_no_entry_refuses_by_domain(self):
+        with self.assertRaises(fk.FleetKeysError) as cm:
+            fk.select(self.hosts, "alpha.example.org", ["beta.example.org", "gamma.example.org"])
+        self.assertIn("gamma.example.org", str(cm.exception))
+        self.assertNotIn("beta.example.org", str(cm.exception))
+
+    def test_this_hosts_own_domain_among_the_trusted_is_not_a_counterpart(self):
+        me, peers = fk.select(self.hosts, "alpha.example.org", ["alpha.example.org", "beta.example.org"])
+        self.assertEqual([p.name for p in peers], ["beta"])
+
 
 class SectionTest(unittest.TestCase):
     """The section in a host-setup document, through host_setup.load_spec."""

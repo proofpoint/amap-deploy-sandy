@@ -187,8 +187,13 @@ def read(pin: FleetKeysPin, read_bytes: Callable[[str], bytes] = _read) -> Tuple
 
 
 def select(hosts: Sequence[Host], fleet_domain: str, trusted: Sequence[str]) -> Tuple[Host, Tuple[Host, ...]]:
-    """(this host, its peers). This host is the one entry listing the fleet
-    domain; every other entry is a peer whose domains must all be trusted."""
+    """(this host, its peers), for a delegation block. This host is the one
+    entry listing the fleet domain; every other entry is a peer whose domains
+    must all be trusted. The peers must be the counterpart the hop link
+    names: at least one, and every trusted fleet host listed by exactly one
+    peer. A block with no peer runtime would load as an empty key table and
+    verify nothing, so an inventory listing only this host is refused here,
+    where staging starts. `parse` still reads such an inventory."""
     own = [h for h in hosts if fleet_domain in h.domains]
     if len(own) != 1:
         raise FleetKeysError(f"{len(own)} inventory entries list this host's fleet domain {fleet_domain}; "
@@ -201,4 +206,12 @@ def select(hosts: Sequence[Host], fleet_domain: str, trusted: Sequence[str]) -> 
         if outside:
             raise FleetKeysError(f"the inventory entry {p.name!r} lists {', '.join(outside)}, which this host "
                                  "does not trust (hop_link.trusted_fleet_hosts)")
+    if not peers:
+        raise FleetKeysError(f"the inventory lists only this host ({me.name!r}): a delegation block with no "
+                             "peer runtime verifies nothing")
+    listed = {d for p in peers for d in p.domains}
+    missing = sorted(allowed - listed - set(me.domains))
+    if missing:
+        raise FleetKeysError(f"no inventory entry lists the trusted fleet host(s) {', '.join(missing)}; "
+                             "every host this router trusts needs its peer key")
     return me, peers
