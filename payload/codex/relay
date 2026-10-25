@@ -49,6 +49,20 @@ hold_until() {
     rm -f "$HOLD"
 }
 
+export AMAP_CODEX_PAUSE_PATH="$STATE/adapter-pause.json"
+wait_operator_pause() {
+    hold_until "operator maintenance pause; no automatic service restart" \
+        'test ! -e "$AMAP_CODEX_PAUSE_PATH" && test ! -L "$AMAP_CODEX_PAUSE_PATH"'
+}
+wait_transition() {
+    while ! mode=$(python3 "$SELF_DIR/transition" --state "$STATE" entry-mode --model "$MODEL" --version "$CODEX_VERSION" 2>&1); do
+        hold_record "$mode"
+        sleep 30
+    done
+    rm -f "$HOLD"
+}
+
+wait_operator_pause
 hold_until "codex is not logged in; run sandy --login codex" "codex login status"
 
 # Any Codex build runs; the supervisor reports whether the connector has
@@ -104,9 +118,12 @@ fi
 
 # The connector's outcome directory sits in its own extension space; it
 # creates the leaf, and its parent must exist.
+wait_operator_pause
+wait_transition
 mkdir -p "$AMAP_OUTBOX_DIR/ext/codex"
 mkdir -p "$STATE/claims"
 
+if [ "$mode" = separate ]; then
 python3 - "$STATE/controller.toml" "$sandbox_name" "$self_address" "$MODEL" "$CODEX_VERSION" "$workspace" "$STATE" "$SELF_DIR" <<'PY'
 import json, os, sys
 path, name, address, model, version, workspace, state, payload = sys.argv[1:]
@@ -143,6 +160,9 @@ with open(tmp, "w") as f:
 os.chmod(tmp, 0o600)
 os.replace(tmp, path)
 PY
+elif [ "$mode" != unified ]; then
+    hold_until "the adapter reported no recognized conversation mode" false
+fi
 
 # The supervisor runs as a child, never exec'd: a supervisor that fails to
 # start (an app-server that will not come up, an MCP registry that is not
@@ -154,6 +174,8 @@ trap 'stopping=1; [ -n "$supervisor" ] && kill -TERM "$supervisor" 2>/dev/null' 
 stopping=""
 backoff=30
 while :; do
+    wait_operator_pause
+    wait_transition
     rm -f "$HOLD"
     python3 -m amap_codex.cli --config "$STATE/controller.toml" run &
     supervisor=$!

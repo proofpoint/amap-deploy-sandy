@@ -72,6 +72,8 @@ DEFAULT_SERVERS = PAYLOAD_DIR / "mcp-servers.json"
 import launchd_job as lj   # the recreation cadence: renders and reads, never loads
 import router_health as rh  # the router process: its container and its health, read only
 import verify_report as vr  # how verify prints: one row per condition, its workspaces beside it
+import codex_assets as ca   # protected Codex assets retain their original-path inputs
+import codex_unified_status as cus  # unified readiness requires matching fresh evidence
 
 # `fleet_policy.py` sits beside this module. Guarded rather than bare: this
 # module is imported by its tests and by its sibling tools, where HERE is not
@@ -1080,6 +1082,8 @@ def codex_payload_sources(codex_src: Path) -> Tuple[Tuple[str, Path, bool], ...]
     sub = CODEX_PAYLOAD_SUBDIR
     parts = [(f"{sub}/{name}", PAYLOAD_DIR / sub / name, executable)
              for name, executable in CODEX_PAYLOAD_FILES]
+    parts += [(f"{sub}/codex_assets.py", Path(__file__).parent / "codex_assets.py", False),
+              (f"{sub}/transition", Path(__file__).parent / "codex_transition.py", True)]
     parts.append((f"{sub}/{SUBMIT_SERVER_NAME}", PAYLOAD_DIR / SUBMIT_SERVER_NAME, True))
     parts += [(f"{sub}/src/{CODEX_PACKAGE}/{p.name}", p, False)
               for p in sorted(package.glob("*.py"))]
@@ -1104,7 +1108,17 @@ def install_feature_payload(home: Path, connector_src: Path, *, dry_run: bool,
     dest = feature_payload_dir(home)
     parts = []
     codex = codex_payload_sources(codex_src) if codex_src is not None else ()
+    if codex:
+        try:
+            parts.append(ca.install(dest / CODEX_PAYLOAD_SUBDIR,
+                                    Path(codex_src) / "config" / CODEX_INSTRUCTIONS,
+                                    PAYLOAD_DIR / CODEX_PAYLOAD_SUBDIR / "mcp.toml",
+                                    dry_run=dry_run))
+        except (OSError, ValueError) as exc:
+            raise ProvisionError(str(exc)) from exc
     for rel, src_file, executable in payload_sources(connector_src, servers_path) + codex:
+        if codex and rel in {f"{CODEX_PAYLOAD_SUBDIR}/{name}" for name in ca.ASSETS}:
+            continue
         try:
             data = src_file.read_text(encoding="utf-8")
         except OSError as e:
@@ -1641,7 +1655,14 @@ def verify_feature_payload(home: Path, connector_src: Optional[Path],
                 f"sandy mounts nothing for a selected sandbox until it does"]
     sources = payload_sources(connector_src, servers_path) if connector_src is not None else ()
     sources += codex_payload_sources(codex_src) if codex_src is not None else ()
+    has_codex = codex_src is not None and bool(codex_payload_sources(codex_src))
+    if has_codex:
+        problems += ca.findings(dest / CODEX_PAYLOAD_SUBDIR,
+                                Path(codex_src) / "config" / CODEX_INSTRUCTIONS,
+                                PAYLOAD_DIR / CODEX_PAYLOAD_SUBDIR / "mcp.toml")
     for rel, src_file, executable in sources:
+        if has_codex and rel in {f"{CODEX_PAYLOAD_SUBDIR}/{name}" for name in ca.ASSETS}:
+            continue
         path = dest / rel
         if path.is_symlink():
             problems.append(f"payload drift: {path} is a symlink — real files only")
@@ -2756,6 +2777,10 @@ def verify_codex_supervisor(home: Path, slug: str, record: Optional[dict], *,
                          f"MCP registry per thread, protocol errors that fail loudly)")
     if not running:
         return problems, notes
+    if os.path.lexists(state / "adapter-pause.json"):
+        problems.append(f"codex supervisor holding: {slug}: explicit operator maintenance pause; inspect adapter-pause.json")
+    if os.path.lexists(state / "adapter-transition.json") or (isinstance(status, dict) and status.get("mode") == "unified"):
+        problems += [f"codex unified UNKNOWN: {slug}: {reason}" for reason in cus.problems(state, status, now=now)]
     hold = _read_json(state / CODEX_HOLD_NAME)
     if isinstance(hold, dict):
         problems.append(f"codex supervisor holding: {slug}: {hold.get('reason')!r} — nothing is "
