@@ -15,6 +15,18 @@ PREVIOUS = "adapter-previous.toml"
 PAUSE = "adapter-pause.json"
 
 
+def snapshot_current(state):
+    """Retain exact controller bytes before a separate-mode entry re-renders."""
+    path = state / "controller.toml"
+    if not os.path.lexists(path):
+        return None
+    assets.directory(state)
+    raw = assets.regular(path)
+    snapshot = state / "controller-history" / (assets.digest(raw) + ".toml")
+    assets.place(snapshot, raw, mode=0o600)
+    return snapshot
+
+
 def toml_bytes(doc):
     lines = []
 
@@ -167,10 +179,10 @@ def prepare(state, payload, thread, *, apply=False):
         if assets.regular(path) != current:
             raise ValueError("configuration changed while acquiring controller ownership")
         matching_status(config, fingerprint=config.fingerprint())
-        assets.place(state / PREVIOUS, previous)
-        assets.place(state / RECORD, assets.encoded(planned))
+        assets.place(state / PREVIOUS, previous, mode=0o600)
+        assets.place(state / RECORD, assets.encoded(planned), mode=0o600)
         if current != target:
-            assets.place(path, target, replace=True)
+            assets.place(path, target, replace=True, mode=0o600)
     return {**planned, "apply": True, "next": "doctor, unified-adopt at controller.toml, then confirm"}
 
 
@@ -192,7 +204,7 @@ def confirm(state, *, apply=False):
         record["state"] = "confirmed"
         raw = assets.encoded(record)
         if assets.regular(state / RECORD) != raw:
-            assets.place(state / RECORD, raw, replace=True)
+            assets.place(state / RECORD, raw, replace=True, mode=0o600)
     return {**record, "apply": True}
 
 
@@ -230,7 +242,7 @@ def pause(state, note, *, apply=False):
     config_at(state)
     record = {"schema": 1, "state": "paused", "note": note}
     if apply:
-        assets.place(state / PAUSE, assets.encoded(record))
+        assets.place(state / PAUSE, assets.encoded(record), mode=0o600)
     return {**record, "apply": apply, "next": "operator stops service and native clients; pause itself stops nothing"}
 
 

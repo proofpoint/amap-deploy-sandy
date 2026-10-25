@@ -193,7 +193,11 @@ mkdir -p "$STATE/claims"
 if [ "$mode" = separate ]; then
 python3 - "$STATE/controller.toml" "$sandbox_name" "$self_address" "$MODEL" "$CODEX_VERSION" "$workspace" "$STATE" "$SELF_DIR" <<'PY'
 import json, os, sys
+from pathlib import Path
 path, name, address, model, version, workspace, state, payload = sys.argv[1:]
+sys.path.insert(0, payload)
+from codex_transition import snapshot_current
+snapshot_current(Path(state))
 env = os.environ
 q = json.dumps  # a JSON string is a valid TOML basic string
 lines = [
