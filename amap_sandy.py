@@ -1182,6 +1182,7 @@ def codex_payload_sources(codex_src: Path) -> Tuple[Tuple[str, Path, bool], ...]
     parts += [(f"{sub}/codex_assets.py", Path(__file__).parent / "codex_assets.py", False),
               (f"{sub}/codex_settings.py", Path(__file__).parent / "codex_settings.py", False),
               (f"{sub}/codex_bootstrap_pause.py", Path(__file__).parent / "codex_bootstrap_pause.py", False),
+              (f"{sub}/codex_transition.py", Path(__file__).parent / "codex_transition.py", False),
               (f"{sub}/transition", Path(__file__).parent / "codex_transition.py", True)]
     parts.append((f"{sub}/{SUBMIT_SERVER_NAME}", PAYLOAD_DIR / SUBMIT_SERVER_NAME, True))
     parts += [(f"{sub}/src/{CODEX_PACKAGE}/{p.name}", p, False)
