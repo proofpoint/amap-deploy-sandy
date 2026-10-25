@@ -127,6 +127,27 @@ class UnifiedEvidenceTest(unittest.TestCase):
         (self.fixture.state / "adapter-transition.json").write_text("[]")
         self.assertTrue(any("not confirmed" in p for p in verifier.problems(self.fixture.state, self.status)))
 
+    def test_malformed_entry_roots_are_unknown_through_actual_host_caller(self):
+        import amap_sandy as prov
+        home = self.fixture.root / "host-home"
+        relay = prov.feature_payload_dir(home) / "codex/relay"
+        relay.parent.mkdir(parents=True)
+        relay.write_text("fixture relay")
+        record = {prov.FEATURE_ENTRIES_KEY: {prov.FEATURE_NAME: {"state_dir": str(self.fixture.state.parent)}}}
+        path = self.fixture.state / settings.RECEIPT
+        valid = path.read_bytes()
+        self.assertEqual(prov.verify_codex_supervisor(home, "codex-test", record,
+                                                    running=True, now=self.now)[0], [])
+        for value in ([], None, "malformed", 42, True):
+            with self.subTest(root=value):
+                path.write_text(json.dumps(value))
+                problems, _ = prov.verify_codex_supervisor(home, "codex-test", record,
+                                                          running=True, now=self.now)
+                self.assertTrue(any("entry" in p and ("malformed" in p or "unknown" in p) for p in problems), problems)
+        path.write_bytes(valid)
+        self.assertEqual(prov.verify_codex_supervisor(home, "codex-test", record,
+                                                    running=True, now=self.now)[0], [])
+
     def test_entry_model_and_permissions_mismatch_are_reported_by_host_verify(self):
         receipt = json.loads((self.fixture.state / settings.RECEIPT).read_text())
         for key, value, name in (("selected_model", "foreign-model", "model differs"),

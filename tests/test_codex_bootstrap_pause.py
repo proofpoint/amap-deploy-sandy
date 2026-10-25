@@ -1,5 +1,8 @@
 """First-upgrade stdlib evidence and stale-input refusal, without lifecycle."""
 import os
+import shlex
+import shutil
+import subprocess
 from pathlib import Path
 import sys
 from tempfile import TemporaryDirectory
@@ -47,6 +50,61 @@ class BootstrapPauseTest(unittest.TestCase):
         (self.state / "controller.toml").write_bytes(self.raw+b'instance_id = "different"\n')
         with self.assertRaisesRegex(ValueError, "inputs changed"):
             bootstrap.verify(self.state)
+
+    def test_verify_requires_capture_and_the_exact_pause_without_writes(self):
+        with self.assertRaises(OSError):
+            bootstrap.verify_pause(self.state, "maintenance")
+        bootstrap.pause(self.state, "maintenance", apply=True)
+        before = {p: p.read_bytes() for p in self.state.rglob("*") if p.is_file()}
+        self.assertTrue(bootstrap.verify_pause(self.state, "maintenance")["verified"])
+        with self.assertRaisesRegex(ValueError, "pause is absent or differs"):
+            bootstrap.verify_pause(self.state, "other note")
+        (self.state / "adapter-pause.json").unlink()
+        with self.assertRaises(OSError):
+            bootstrap.verify_pause(self.state, "maintenance")
+        self.assertEqual({p: p.read_bytes() for p in self.state.rglob("*") if p.is_file()},
+                         {p: raw for p, raw in before.items() if p.name != "adapter-pause.json"})
+
+    def test_shipped_bootstrap_block_refuses_missing_empty_or_changed_source(self):
+        tutorial = (HERE / "docs/TUTORIAL.md").read_text()
+        start = tutorial.index("(\n  set -e\n  BOOTSTRAP_SHA256=")
+        script = tutorial[start:tutorial.index("\n```", start)]
+        script = script.replace("BOOTSTRAP_STATE=/opt/sandy/feature-state/amap/codex",
+                                "BOOTSTRAP_STATE=" + shlex.quote(str(self.state)))
+        source = self.root / "codex_bootstrap_pause.py"
+        bindir = self.root / "bin"
+        bindir.mkdir()
+        sandy = bindir / "sandy"
+        sandy.write_text('#!/bin/sh\nprintf invoked >> "$EXEC_CALLS"\nwhile [ "$1" != -- ]; do shift; done\nshift\nexec "$@"\n')
+        sandy.chmod(0o755)
+        calls = self.root / "exec-calls"
+        env = {**os.environ, "PATH": str(bindir) + os.pathsep + os.environ["PATH"],
+               "EXEC_CALLS": str(calls), "WORKSPACE": str(self.root)}
+        for data in (None, b"", b"raise SystemExit(0)\n"):
+            with self.subTest(source=data):
+                if data is not None:
+                    source.write_bytes(data)
+                result = subprocess.run(["/bin/sh", "-c", script], cwd=self.root, env=env,
+                                        capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(calls.exists(), "unverified source reached the exec boundary")
+                self.assertFalse((self.state / bootstrap.RECORD).exists())
+                self.assertFalse((self.state / "adapter-pause.json").exists())
+        shutil.copyfile(HERE / "codex_bootstrap_pause.py", source)
+        command = sandy.read_text()
+        sandy.write_text(command.replace('exec "$@"', 'for arg do [ "$arg" != --apply ] || exit 0; done\nexec "$@"'))
+        result = subprocess.run(["/bin/sh", "-c", script], cwd=self.root, env=env,
+                                capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0, "missing capture must fail the final verification")
+        self.assertFalse((self.state / bootstrap.RECORD).exists())
+        self.assertFalse((self.state / "adapter-pause.json").exists())
+        calls.unlink()
+        sandy.write_text(command)
+        result = subprocess.run(["/bin/sh", "-c", script], cwd=self.root, env=env,
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(calls.read_text(), "invoked" * 3)
+        self.assertTrue(bootstrap.verify_pause(self.state, "Operator selected stopped-service maintenance")["verified"])
 
     def test_history_symlink_refuses_without_writing_its_target(self):
         other = self.root / "other"

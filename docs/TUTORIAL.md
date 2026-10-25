@@ -435,9 +435,32 @@ operator acceptance. Run the candidate from the reviewed adapter checkout,
 with the existing absolute `WORKSPACE`:
 
 ```sh
-sandy --exec --workspace "$WORKSPACE" -- python3 -I -S -c "$(cat codex_bootstrap_pause.py)" --note 'Operator selected stopped-service maintenance'
-sandy --exec --workspace "$WORKSPACE" -- python3 -I -S -c "$(cat codex_bootstrap_pause.py)" --note 'Operator selected stopped-service maintenance' --apply
+(
+  set -e
+  BOOTSTRAP_SHA256=b48b6f9222937f5c2da3b220bf08e7fdb19401d5ed7939474e525dd4b84b63d6
+  BOOTSTRAP_STATE=/opt/sandy/feature-state/amap/codex
+  BOOTSTRAP_SOURCE=$(
+    python3 -I -S - "$BOOTSTRAP_SHA256" <<'PY'
+import hashlib, pathlib, sys
+raw = pathlib.Path("codex_bootstrap_pause.py").read_bytes()
+if not raw or hashlib.sha256(raw).hexdigest() != sys.argv[1]:
+    sys.exit("HOLD: bootstrap source is empty or differs from the reviewed bytes")
+sys.stdout.write(raw.decode("utf-8"))
+PY
+  ) || { echo 'HOLD: bootstrap source capture failed' >&2; exit 1; }
+  : "${BOOTSTRAP_SOURCE:?HOLD: bootstrap source is empty}"
+  sandy --exec --workspace "$WORKSPACE" -- python3 -I -S -c "$BOOTSTRAP_SOURCE" --state "$BOOTSTRAP_STATE" --note 'Operator selected stopped-service maintenance'
+  sandy --exec --workspace "$WORKSPACE" -- python3 -I -S -c "$BOOTSTRAP_SOURCE" --state "$BOOTSTRAP_STATE" --note 'Operator selected stopped-service maintenance' --apply
+  sandy --exec --workspace "$WORKSPACE" -- python3 -I -S -c "$BOOTSTRAP_SOURCE" --state "$BOOTSTRAP_STATE" --note 'Operator selected stopped-service maintenance' --verify
+)
 ```
+
+This block captures the checked, nonempty reviewed source once and reuses those
+exact bytes. Its final read-only verification requires both the immutable input
+receipt and the expected pause note. A missing, empty, changed or unreadable
+source, failed exec or absent receipt stops the block. Do not continue to stop
+or install after any failure; retain partial evidence for inspection. The hash
+names this adapter candidate and must match the separately reviewed artifact.
 
 The old relay does not honor the new marker. Identify whether the old session
 is daemon or foreground. `sandy --stop` targets daemon-labelled sessions only:
