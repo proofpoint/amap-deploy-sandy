@@ -141,14 +141,26 @@ def pause(state, note, *, apply=False):
             "pause": marker, "service_stopped": False}
 
 
+def verify_pause(state, note):
+    record = verify(state)
+    marker = {"schema": 1, "state": "paused", "note": note}
+    if json.loads(read(state / "adapter-pause.json")) != marker:
+        raise ValueError("expected bootstrap pause is absent or differs; retain evidence")
+    return {"verified": True, "controller_sha256": record["controller_sha256"],
+            "pause": marker, "service_stopped": False}
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--state", type=Path, default=Path("/opt/sandy/feature-state/amap/codex"))
     parser.add_argument("--note", required=True)
-    parser.add_argument("--apply", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--apply", action="store_true")
+    mode.add_argument("--verify", action="store_true")
     args = parser.parse_args(argv)
     try:
-        print(json.dumps(pause(args.state, args.note, apply=args.apply), indent=2))
+        result = verify_pause(args.state, args.note) if args.verify else pause(args.state, args.note, apply=args.apply)
+        print(json.dumps(result, indent=2))
         return 0
     except (OSError, ValueError) as exc:
         print("codex bootstrap pause: " + str(exc), file=sys.stderr)

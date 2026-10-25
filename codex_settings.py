@@ -113,6 +113,8 @@ def startup_request(state, config, thread, generation):
 
 def startup_problems(request, receipt, record, entry):
     import re
+    if not isinstance(entry, dict):
+        return ["entry model/permission evidence has a malformed root"]
     expected = {"schema": 1, "scope": "protected_wrapper_argv", "instance_id": record["instance_id"],
                 "validator_sha256": validator_digest(),
                 "controller_sha256": record["target_sha256"], "selected_model": record["codex_model"],
