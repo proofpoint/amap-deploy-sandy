@@ -312,12 +312,14 @@ connector's `docs/DESIGN.md` §1.2.
   codex-cli 0.160.1 and 0.161.0), so the lane exports travel through `env_vars` and
   the wrappers beside it translate them. The connector refuses to dispatch
   unless a thread's effective registry is exactly these three servers.
-- **The model is the agent's own**: `model` in its `~/.codex/config.toml`,
-  as a Claude agent's model is its pane's. The policy and the manifest
-  carry none. No model there leaves the choice to Codex's default, as for
-  the pane. A change takes effect when the supervisor next starts, and the
-  connector's journal audits it. A `CODEX_MODEL` in sandy's config reaches
-  only the pane (as `codex -m`), not the supervisor.
+- **The model follows the pane selection**: nonempty forwarded `CODEX_MODEL`,
+  then `model` in the native `CODEX_HOME/config.toml` (normally
+  `~/.codex/config.toml`), then Codex's default. The policy and manifest carry
+  none. The separate entry renders that selection at startup; an established
+  unified instance holds a conflicting selection for an explicit transition.
+  The connector audits model changes separately from the protected fingerprint.
+  The entry receipt names the model source with entry-environment scope; it
+  does not attest arbitrary later native argv or host acceptance.
 - **verify reads the supervisor's own snapshot**, `status.json` in the
   entry's state directory, which the connector rewrites on every poll.
   Fixtures for it are written by the connector's real `Supervisor`.
