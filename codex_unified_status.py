@@ -8,11 +8,25 @@ import sqlite3
 import time
 
 import codex_assets as assets
+import codex_settings as settings
 
 REQUIRED = {"backend_live", "canonical_binding", "configuration_matches", "protected_tools",
             "native_reconciled", "publication_resolved"}
 SANDBOX_TYPES = {"read-only": "readOnly", "workspace-write": "workspaceWrite",
                  "danger-full-access": "dangerFullAccess"}
+
+
+def selection_note(state):
+    try:
+        record = json.loads(assets.regular(Path(state) / "adapter-transition.json"))
+        receipt = json.loads(assets.regular(Path(state) / settings.RECEIPT))
+        if settings.evidence_problems(receipt, record):
+            return None
+        source = {"CODEX_MODEL": "CODEX_MODEL", "native_config": "native config.toml",
+                  "native_default": "native Codex default"}[receipt["model_source"]]
+        return "recorded entry model source is " + source + " (entry environment scope)"
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
 
 
 def number(value):
@@ -113,6 +127,9 @@ def problems(state, status, *, now=None):
         if assets.digest(assets.regular(state / "adapter-previous.toml")) != record["previous_sha256"]:
             raise ValueError("retained previous controller differs")
         descriptor = json.loads(assets.regular(state / "unified.json"))
+        entry_selection = json.loads(assets.regular(state / settings.RECEIPT))
+        startup = json.loads(assets.regular(state / settings.STARTUP))
+        pane_selection = json.loads(assets.regular(state / settings.PANE_SELECTION))
         journal = state / "journal.sqlite3"
         if journal.is_symlink() or not journal.is_file():
             raise ValueError("journal is unavailable or a symlink")
@@ -123,6 +140,8 @@ def problems(state, status, *, now=None):
                              "WHERE i.instance_id=?", (record["instance_id"],)).fetchone()
         if row is None:
             raise ValueError("durable unified binding is unavailable")
-        return evidence_problems(status, descriptor, record, dict(row), now=time.time() if now is None else now)
+        return (settings.evidence_problems(entry_selection, record)
+                + settings.startup_problems(startup, pane_selection, record, entry_selection)
+                + evidence_problems(status, descriptor, record, dict(row), now=time.time() if now is None else now))
     except (OSError, ValueError, KeyError, TypeError, sqlite3.Error) as exc:
         return ["unified evidence unavailable: " + str(exc)]

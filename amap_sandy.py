@@ -1180,6 +1180,8 @@ def codex_payload_sources(codex_src: Path) -> Tuple[Tuple[str, Path, bool], ...]
     parts = [(f"{sub}/{name}", PAYLOAD_DIR / sub / name, executable)
              for name, executable in CODEX_PAYLOAD_FILES]
     parts += [(f"{sub}/codex_assets.py", Path(__file__).parent / "codex_assets.py", False),
+              (f"{sub}/codex_settings.py", Path(__file__).parent / "codex_settings.py", False),
+              (f"{sub}/codex_bootstrap_pause.py", Path(__file__).parent / "codex_bootstrap_pause.py", False),
               (f"{sub}/transition", Path(__file__).parent / "codex_transition.py", True)]
     parts.append((f"{sub}/{SUBMIT_SERVER_NAME}", PAYLOAD_DIR / SUBMIT_SERVER_NAME, True))
     parts += [(f"{sub}/src/{CODEX_PACKAGE}/{p.name}", p, False)
@@ -3131,6 +3133,9 @@ def verify_codex_supervisor(home: Path, slug: str, record: Optional[dict], *,
         problems.append(f"codex supervisor holding: {slug}: explicit operator maintenance pause; inspect adapter-pause.json")
     if os.path.lexists(state / "adapter-transition.json") or (isinstance(status, dict) and status.get("mode") == "unified"):
         problems += [f"codex unified UNKNOWN: {slug}: {reason}" for reason in cus.problems(state, status, now=now)]
+        model_note = cus.selection_note(state)
+        if model_note is not None:
+            notes.append(f"{slug}: {model_note}")
     hold = _read_json(state / CODEX_HOLD_NAME)
     if isinstance(hold, dict):
         problems.append(f"codex supervisor holding: {slug}: {hold.get('reason')!r} — nothing is "

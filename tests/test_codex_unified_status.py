@@ -1,6 +1,7 @@
 """Unified verify evidence from the connector's shipped write_status producer."""
 import copy
 import json
+import os
 from pathlib import Path
 import sys
 import time
@@ -12,6 +13,7 @@ import test_codex_transition as transition_tests
 from amap_codex.journal import Journal
 from amap_codex.unified import UnifiedService
 import codex_transition as transition
+import codex_settings as settings
 import codex_unified_status as verifier
 
 
@@ -24,6 +26,12 @@ class UnifiedEvidenceTest(unittest.TestCase):
         f.commit_adoption_fixture()
         transition.confirm(f.state, apply=True)
         config = transition.config_at(f.state)
+        self.entry_generation = settings.environment_generation()
+        settings.capture(f.state, config.instance_id, settings.resolve(os.environ), generation=self.entry_generation)
+        with self.assertRaisesRegex(ValueError, "full native argv selection is pending"):
+            transition.startup_gate(f.state, self.entry_generation, apply=True)
+        transition.select_pane(f.state, ["codex", "--model", "test-model", "-s", "danger-full-access", "-a", "never"], apply=True)
+        transition.startup_gate(f.state, self.entry_generation, apply=True)
         journal = Journal(f.state, config.instance_id, config.fingerprint(), config.codex_version, config.codex_model)
         self.addCleanup(journal.close)
         generation = "a" * 32
@@ -107,6 +115,8 @@ class UnifiedEvidenceTest(unittest.TestCase):
         record = {prov.FEATURE_ENTRIES_KEY: {prov.FEATURE_NAME: {"state_dir": str(self.fixture.state.parent)}}}
         self.assertEqual(prov.verify_codex_supervisor(home, "codex-test", record,
                                                     running=True, now=self.now)[0], [])
+        self.assertTrue(any("model source is native config.toml" in note for note in
+            prov.verify_codex_supervisor(home, "codex-test", record, running=True, now=self.now)[1]))
         descriptor = copy.deepcopy(self.descriptor)
         descriptor["updated_at"] = self.now - 60
         (self.fixture.state / "unified.json").write_text(json.dumps(descriptor))
@@ -116,6 +126,15 @@ class UnifiedEvidenceTest(unittest.TestCase):
     def test_malformed_transition_is_unknown(self):
         (self.fixture.state / "adapter-transition.json").write_text("[]")
         self.assertTrue(any("not confirmed" in p for p in verifier.problems(self.fixture.state, self.status)))
+
+    def test_entry_model_and_permissions_mismatch_are_reported_by_host_verify(self):
+        receipt = json.loads((self.fixture.state / settings.RECEIPT).read_text())
+        for key, value, name in (("selected_model", "foreign-model", "model differs"),
+                                 ("skip_permissions", "false", "SANDY_SKIP_PERMISSIONS"),
+                                 ("controller_sha256", "foreign-controller", "another controller")):
+            with self.subTest(key=key):
+                (self.fixture.state / settings.RECEIPT).write_text(json.dumps({**receipt, key: value}))
+                self.assertTrue(any(name in p for p in verifier.problems(self.fixture.state, self.status)), key)
 
 
 if __name__ == "__main__":

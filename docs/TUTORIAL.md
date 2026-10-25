@@ -318,10 +318,15 @@ Log Codex in inside the sandbox if it is not already. Until it is, the
 supervisor waits, and `verify` reports it as holding with the reason. Any
 Codex build runs; `verify` notes one the connector has not reviewed.
 
-The supervisor uses the agent's own model, `model` in the sandbox's
-`~/.codex/config.toml`, or Codex's default where that names none. Change it
-there, not with sandy's `CODEX_MODEL`, which reaches only the pane; the
-supervisor picks it up on its next start.
+The supervisor uses nonempty `CODEX_MODEL` from the launcher environment first,
+then `model` in the native `CODEX_HOME/config.toml` (normally
+`~/.codex/config.toml`), then Codex's default. The policy and manifest carry no
+model. This precedence is an explicit operator decision for review:
+`CODEX_MODEL`, when nonempty, overrides the native config model for the
+supervisor. The forwarding contract is supported by Sandy source excerpts,
+not a measurement of the current host. A separate supervisor picks up changes
+when its entry next renders; an established unified instance holds conflicting
+settings for an explicit transition.
 
 **Talk to Codex yourself.** Where your sandy lists `agent_wrapper` in
 `sandy --print-schema`'s `manifest.top_level_keys`, `install` renders
@@ -370,9 +375,11 @@ way as to any agent: ask alpha to task gamma's address.
 
 ### Experimental unified conversation: existing-instance transition
 
-This procedure is an engineering draft. Source approval, an immutable reviewed
-Codex connector pin, the launcher model/permission facts and the service-only
-stop procedure are still required before an operator can execute it end to end.
+This procedure is an engineering draft. The local candidate pin is the reviewed
+connector commit `8496849064283c58a12abf0c1c4355f1bcfeed0a`; it remains an
+unmerged engineering candidate. The final merged pin, the operator's model
+precedence decision, actual-host acceptance and the paused-restart command
+contract are still required before end-to-end execution.
 The default remains separate. Installing new payload files selects no instance
 for unified mode. No command here merges two saved conversations.
 
@@ -413,28 +420,87 @@ exact bytes at `controller-history/<content-sha256>.toml` in the private state.
 These snapshots preserve the original protected-file references; no snapshot is
 automatically selected or restored for adoption.
 
-**Stop step OWED:** obtain the isolation launcher's supported procedure to stop
-the feature entry's service/backend and every native client while keeping the
-execution environment available for maintenance. Neither `sandy --stop` followed
-by `sandy --exec`, nor killing only the supervisor, is an established procedure.
-The old relay retries failed children. A newly installed relay file does not
-replace an already-running old relay process. The operator must establish that
-the old service/backend and clients have exited and their controller/lane
-ownership is released. Do not install or transition while that fact is unknown.
-
-For an instance already running the pause-aware adapter, the following commands
-write an explicit pause; they stop no process. The first command is a dry run:
+For a separate instance already running the pause-aware adapter, its pause
+command can replace the bootstrap pause below. It stops no process; the first
+command is a dry run:
 
 ```sh
 sandy --exec --workspace "$WORKSPACE" -- python3 /opt/sandy/features/amap/codex/transition pause --note 'Operator selected stopped-service maintenance'
 sandy --exec --workspace "$WORKSPACE" -- python3 /opt/sandy/features/amap/codex/transition pause --note 'Operator selected stopped-service maintenance' --apply
 ```
 
-`adapter-pause.json` lives in the private entry state, alongside the controller.
-The relay checks its presence before rendering and before every child retry,
-including after a relay restart. The terminal wrapper refuses attachment while
-paused. Establish quiescence separately, then run the approved installation from
-the correct adapter checkout:
+**First-upgrade candidate, source-supported; host acceptance OWED.** Maintenance
+can use a new paused environment rather than keep the old environment running.
+Before stopping the old environment, capture its controller and original
+protected inputs and persist a pause using the reviewed standalone stdlib writer.
+It requires no new adapter imports and stops nothing. Its private immutable
+`bootstrap-inputs.json` records controller/protected hashes, and preparation
+compares them again before changing the controller. A re-render race or changed
+protected file refuses, even if the connector fingerprint happens to be equal.
+
+The supplied launcher excerpts preserve command arguments and stdin and leave
+the interactive pane shell waiting after wrapper refusal. These are source
+facts; current-host custody, old-container absence and held restart remain
+operator acceptance. Run the candidate from the reviewed adapter checkout,
+with the existing absolute `WORKSPACE`:
+
+```sh
+sandy --exec --workspace "$WORKSPACE" -- python3 -I -S -c "$(cat codex_bootstrap_pause.py)" --note 'Operator selected stopped-service maintenance'
+sandy --exec --workspace "$WORKSPACE" -- python3 -I -S -c "$(cat codex_bootstrap_pause.py)" --note 'Operator selected stopped-service maintenance' --apply
+```
+
+The old relay does not honor the new marker. Identify whether the old session
+is daemon or foreground. `sandy --stop` targets daemon-labelled sessions only:
+
+```sh
+(cd "$WORKSPACE" && sandy --stop)
+```
+
+Exit 4 means no daemon session; it does not establish that a foreground session
+is gone. Exit a foreground session through its normal session exit instead.
+Establish actual old-container absence from a successful read of the launcher's
+container state, including both daemon-labelled and exact foreground identity;
+an unavailable Docker/state read is UNKNOWN. The new-container `--exec -- true`
+preflight below is not an absence check for the old one. Keep the procedure held
+if the matching old container is still present or cannot be checked. Do not
+guess process-tree kill commands. The normal stop/exit must establish that the
+service/backend and every native client have stopped. Identify and record the
+exact full `OLD_CONTAINER_ID` before stopping, using the existing workspace
+resolution and read-only inventory:
+
+```sh
+sandy --exec --workspace "$WORKSPACE" --dry-run -- true
+docker ps --no-trunc --format '{{.ID}} {{.Names}}'
+```
+
+Use one matching old environment, identified by the dry-run container ID and
+its workspace/name/daemon labels; ambiguous inventory holds the procedure. Keep
+the verified Docker context/daemon unchanged throughout. After normal daemon
+stop or foreground exit, require successful all-container enumeration and
+absence of that full ID; no daemon exit code substitutes for this check:
+
+```sh
+(
+  set -e
+  : "${OLD_CONTAINER_ID:?Set the exact full old container ID from preflight}"
+  old_ids=$(docker ps --all --quiet --no-trunc) || { echo 'UNKNOWN: container enumeration failed' >&2; exit 1; }
+  python3 -c 'import re, sys
+old, listing = sys.argv[1:]
+ids = listing.splitlines()
+if not re.fullmatch("[0-9a-f]{64}", old) or any(not re.fullmatch("[0-9a-f]{64}", v) for v in ids):
+    sys.exit("UNKNOWN: full container identity is unavailable")
+if old in ids:
+    sys.exit("HOLD: old container still exists")
+print("Old container absent on the enumerated daemon")' "$OLD_CONTAINER_ID" "$old_ids"
+)
+```
+
+A failed read, switched daemon/context or surviving old container holds the
+procedure. This is a source-derived operator check, not an already measured
+host result. Preserve all
+mounts/native history. Install reviewed payload while stopped, retaining legacy
+protected bytes. From the reviewed adapter checkout, check the sibling pin and
+preview/apply the installation before restarting anything:
 
 ```sh
 AMAP_CODEX=1 python3 amap-siblings.py
@@ -442,19 +508,53 @@ python3 amap-sandy.py install
 python3 amap-sandy.py install --apply
 ```
 
+Keep `adapter-pause.json` present in retained private state. Start the new
+environment only after the installation completes:
+
+```sh
+(cd "$WORKSPACE" && sandy --start)
+sandy --exec --workspace "$WORKSPACE" -- true
+```
+
+The new relay checks pause before rendering or running a service, and its pane
+wrapper refuses native startup. Source inspection suggests a refused wrapper
+leaves a waiting pane shell; this must be verified on the target. Successful
+`--exec -- true` establishes exec availability, not service quiescence or
+adoption success. If that preflight or absence of old/new native clients is
+unknown, retain the pause and stop the procedure. No process-tree kill or
+service-stop API is assumed. The shipped old/new relay controls prove marker
+and controller preservation in fixtures, not Sandy lifecycle acceptance.
+
 The sibling check must report the approved source, and the installation must
 complete without restarting any selected service. The installed baseline
 connector lacks `unified-adopt`; adoption therefore follows code installation.
 Do not substitute adopt-before-install or change old protected paths to copies.
 
-The target inherits the previous explicit model and permission settings. Until
-the generic launcher exports its resolved model, `CODEX_MODEL` must be unset or
-equal to the model in the native Codex configuration. That condition is an
-operator preflight obligation, not a measured host fact. A different explicit
-pane model/permission flag refuses at attachment. A changed native configuration
-model or build holds the relay; automatic re-rendering is disabled in unified
-mode. Settings transitions beyond this first separate-to-unified adoption
-require their own reviewed procedure.
+Preparation resolves the same model as the relay: nonempty forwarded
+`CODEX_MODEL`, native config model, then native default. The retained previous
+controller keeps its original model bytes; the target records the selected
+model and its source. Supported unified permissions require explicit
+`SANDY_SKIP_PERMISSIONS=true` and the retained `danger-full-access`/`never`
+profile. Missing, false or other choices refuse; no alternate permission mapping
+is assumed. The pane wrapper checks the environment selection again, and a
+different explicit model/permission argv flag refuses at attachment. An
+established unified instance holds changed model/build selections; its controller
+is never automatically re-rendered. Settings transitions beyond this first
+adoption require their own reviewed procedure.
+
+The relay writes `entry-settings.json` with entry-environment scope, the selected
+model/source and permission choice, bound to the controller bytes. Host verify
+names that source and reports unknown, foreign or mismatched entry evidence as
+a problem. The receipt is not proof of arbitrary later native argv, nor current
+host acceptance. The operator still verifies the target environment and pane.
+
+Before a unified incoming service starts, the relay publishes a config-bound
+`pane-startup.json` for its private entry generation. The protected pane wrapper
+checks its complete native argv, including explicit model/approval/sandbox
+choices, then writes matching `pane-selection.json`. A conflicting `-a
+on-request` refuses even with `SANDY_SKIP_PERMISSIONS=true`; unsupported profiles,
+provider/config/effort overrides and foreign resume choices also refuse before
+incoming execution. Environment evidence alone never releases this startup gate.
 
 Prepare the selected instance while stopped. The first command previews only:
 
@@ -499,12 +599,37 @@ sandy --exec --workspace "$WORKSPACE" -- python3 /opt/sandy/features/amap/codex/
 sandy --exec --workspace "$WORKSPACE" -- python3 /opt/sandy/features/amap/codex/transition unpause --apply
 ```
 
-The pause-aware relay may resume at its next poll. If the entry was stopped,
-use the isolation launcher's reviewed service-start procedure (still OWED).
-Unified attachment then delegates directly to the connector's single bounded
-wait. It targets the registered canonical thread and private generation; it
+After unpause, incoming work remains held until a protected native wrapper
+launch records the complete matching argv for that entry generation. The exact
+host terminal launch after paused restart remains part of launcher acceptance.
+First check that the current selection request is available (this does not
+claim backend readiness):
+
+```sh
+sandy --exec --workspace "$WORKSPACE" -- python3 /opt/sandy/features/amap/codex/transition selection-ready
+```
+
+Once that succeeds, the operator can launch the actual protected wrapper from a
+real terminal with the explicitly reviewed full-access/never profile. The exec
+source keeps a TTY only when the calling stdin is a TTY. This command selects
+its complete native argv; it does not fabricate a receipt or copy an ambient
+profile/per-agent argument string:
+
+```sh
+sandy --exec --workspace "$WORKSPACE" -- sh -c 'if [ -n "${CODEX_MODEL:-}" ]; then set -- --model "$CODEX_MODEL"; else set --; fi; exec /opt/sandy/features/amap/codex/interactive-launch codex --sandbox danger-full-access --ask-for-approval never "$@"'
+```
+
+The wrapper then delegates
+directly to the connector's single bounded wait. It targets the registered
+canonical thread and private generation; it
 never starts a substitute conversation. Detaching the terminal leaves the
-service running. `kickoff` is disabled; human work enters through the native pane.
+service running. Retries within that same adapter entry generation retain the
+selection proof. Relay-process and backend retries in the same execution
+environment retain proof without requiring a terminal relaunch. The Sandy
+adapter derives environment identity from kernel boot UUID, PID namespace and
+PID1 start identity; unavailable facts hold unified startup. A different
+execution environment, controller or validator code requires fresh wrapper
+selection. `kickoff` is disabled; human work enters through the native pane.
 
 `verify` requires matching fresh status and descriptor evidence, the current
 configuration and durable canonical/policy binding, all named readiness checks,

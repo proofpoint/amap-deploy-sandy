@@ -35,6 +35,13 @@ class TransitionTest(unittest.TestCase):
         tmp = TemporaryDirectory(prefix=".ct-", dir=os.environ.get("AMAP_TEST_TMPDIR", HERE))
         self.addCleanup(tmp.cleanup)
         self.root = Path(tmp.name)
+        self.native_home = self.root / "native-home"
+        self.native_home.mkdir()
+        (self.native_home / "config.toml").write_text('model = "test-model"\n')
+        environment = mock.patch.dict(os.environ, {"CODEX_HOME": str(self.native_home),
+            "CODEX_MODEL": "", "SANDY_SKIP_PERMISSIONS": "true"})
+        environment.start()
+        self.addCleanup(environment.stop)
         self.state = self.root / "codex"
         self.state.mkdir(mode=0o700)
         self.payload = self.root / "payload"
@@ -184,6 +191,74 @@ class TransitionTest(unittest.TestCase):
         self.doc.update(conversation_mode="unified", unified_argv=["codex"], operator_kickoff_enabled=False)
         (self.state / "controller.toml").write_bytes(transition.toml_bytes(self.doc))
         with self.assertRaisesRegex(ValueError, "lacks explicit"):
+            transition.entry_mode(self.state)
+
+    def test_prepare_selects_forwarded_pane_model_before_native_config_and_old_controller(self):
+        with mock.patch.dict(os.environ, {"CODEX_MODEL": "selected-pane-model"}):
+            result = self.prepare(apply=True)
+            self.assertEqual(result["model_source"], "CODEX_MODEL")
+            self.assertEqual(transition.config_at(self.state).codex_model, "selected-pane-model")
+            self.assertEqual(Config.load(self.state / transition.PREVIOUS).codex_model, "test-model")
+            self.commit_adoption_fixture()
+            transition.confirm(self.state, apply=True)
+            self.assertEqual(transition.entry_mode(self.state, check_pane_settings=True), "unified")
+        with self.assertRaisesRegex(ValueError, "pane CODEX_MODEL/native model differs"):
+            transition.entry_mode(self.state, check_pane_settings=True)
+
+    def test_unified_unknown_or_conflicting_permissions_refuse_before_writing(self):
+        for value in ("", "false", "unknown"):
+            with self.subTest(value=value), mock.patch.dict(os.environ, {"SANDY_SKIP_PERMISSIONS": value}):
+                with self.assertRaisesRegex(ValueError, "permissions are unknown or conflicting"):
+                    self.prepare(apply=True)
+                self.assertEqual((self.state / "controller.toml").read_bytes(), self.previous_raw)
+                self.assertFalse((self.state / transition.RECORD).exists())
+
+    def test_full_argv_selection_precedes_service_and_is_entry_generation_bound(self):
+        import codex_settings as settings
+        self.prepare(apply=True)
+        self.commit_adoption_fixture()
+        transition.confirm(self.state, apply=True)
+        selection = settings.resolve(os.environ)
+        generation = settings.environment_generation()
+        settings.capture(self.state, self.previous.instance_id, selection, generation=generation)
+        with self.assertRaisesRegex(ValueError, "full native argv selection is pending"):
+            transition.startup_gate(self.state, generation, apply=True)
+        for argv in (["codex", "-a", "on-request"], ["codex", "-m", "foreign"],
+                     ["codex"], ["codex", "-s", "danger-full-access"], ["codex", "-a", "never"],
+                     ["codex", "--profile", "custom"], ["codex", "-c", 'model_reasoning_effort="high"']):
+            with self.subTest(argv=argv), self.assertRaises(ValueError):
+                transition.select_pane(self.state, argv, apply=True)
+            self.assertFalse((self.state / settings.PANE_SELECTION).exists())
+        transition.select_pane(self.state, ["codex", "--model", "test-model", "--sandbox", "danger-full-access", "-a", "never"], apply=True)
+        self.assertTrue(transition.startup_gate(self.state, generation, apply=True)["selected"])
+        settings.capture(self.state, self.previous.instance_id, selection, generation="b" * 32)
+        with self.assertRaisesRegex(ValueError, "generation differs"):
+            transition.startup_gate(self.state, "b" * 32, apply=True)
+
+    def test_first_upgrade_stale_capture_refuses_even_when_fingerprint_is_unchanged(self):
+        import codex_bootstrap_pause as bootstrap
+        bootstrap.pause(self.state, "first upgrade", apply=True)
+        path = self.state / "controller.toml"
+        path.write_bytes(self.previous_raw + b"\n# another entry rendering\n")
+        self.assertEqual(Config.load(path).fingerprint(), self.previous.fingerprint())
+        with self.assertRaisesRegex(ValueError, "inputs changed"):
+            self.prepare(apply=True)
+        self.assertFalse((self.state / transition.RECORD).exists())
+
+    def test_protected_drift_after_prepare_cannot_confirm_a_different_target(self):
+        self.prepare(apply=True)
+        target = transition.config_at(self.state)
+        target.operator_instructions.write_text("changed protected target")
+        self.assertNotEqual(target.fingerprint(), transition.read_record(self.state)["fingerprint"])
+        # Model the connector's valid adoption of the changed current target.
+        self.commit_adoption_fixture()
+        with self.assertRaisesRegex(ValueError, "differs"):
+            transition.confirm(self.state, apply=True)
+        record = transition.read_record(self.state)
+        self.assertEqual(record["state"], "prepared")
+        record.update(state="confirmed", policy_hash="a" * 64)
+        assets.place(self.state / transition.RECORD, assets.encoded(record), replace=True, mode=0o600)
+        with self.assertRaisesRegex(ValueError, "differs"):
             transition.entry_mode(self.state)
 
     def test_pause_is_explicit_does_not_stop_and_blocks_unpause_during_transition(self):
