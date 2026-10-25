@@ -153,6 +153,10 @@ def install(payload, policy, mcp, *, dry_run=True):
             raise AssetError("immutable protected asset differs: %s" % path)
     pointer = payload / SELECTED_RECORD
     previous = regular(pointer) if os.path.lexists(pointer) else None
+    settled = (os.path.lexists(payload / LEGACY_RECORD) and previous == encoded(selected)
+               and all(os.path.lexists(version_dir / name) for name in ASSETS))
+    if settled:
+        return "Codex protected assets present"
     if dry_run:
         return "would preserve legacy Codex assets and select protected version " + selected["version"]
     for name in ASSETS:
@@ -163,7 +167,7 @@ def install(payload, policy, mcp, *, dry_run=True):
         place(version_dir / name, raw[name])
     if previous != encoded(selected):
         place(pointer, encoded(selected), replace=True)
-    return "retained legacy Codex assets; protected version " + selected["version"]
+    return "installed Codex protected version " + selected["version"] + " (legacy bytes retained)"
 
 
 def findings(payload, policy, mcp):
