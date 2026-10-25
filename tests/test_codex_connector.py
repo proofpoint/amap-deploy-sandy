@@ -362,6 +362,9 @@ class CodexRelayTest(unittest.TestCase):
         f = tt.TransitionTest()
         f.setUp()
         self.addCleanup(f.doCleanups)
+        export = unittest.mock.patch.dict(os.environ, {"CODEX_MODEL": "unified-pane-model"})
+        export.start()
+        self.addCleanup(export.stop)
         f.prepare(apply=True)
         f.commit_adoption_fixture()
         transition.confirm(f.state, apply=True)
@@ -369,7 +372,8 @@ class CodexRelayTest(unittest.TestCase):
         (self.root / "sandy-session.json").write_text(json.dumps({"sandbox_name": f.previous.instance_id,
                                                                "workspace": str(f.root)}))
         proc = self._start(SANDY_FEATURE_STATE=str(f.state.parent), CODEX_HOME=str(f.native_home),
-                           SANDY_SKIP_PERMISSIONS="true", FAKE_CODEX_VERSION=f.previous.codex_version)
+                           CODEX_MODEL="unified-pane-model", SANDY_SKIP_PERMISSIONS="true",
+                           FAKE_CODEX_VERSION=f.previous.codex_version)
         try:
             deadline = time.monotonic() + 20
             while time.monotonic() < deadline and not (f.state / "pane-startup.json").exists():
@@ -379,7 +383,7 @@ class CodexRelayTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "model or permissions differ"):
                 transition.select_pane(f.state, ["codex", "-a", "on-request"], apply=True)
             self.assertFalse((self.root / "argv").exists())
-            transition.select_pane(f.state, ["codex", "-s", "danger-full-access", "-a", "never", "-m", "test-model"], apply=True)
+            transition.select_pane(f.state, ["codex", "-s", "danger-full-access", "-a", "never", "-m", "unified-pane-model"], apply=True)
             _, err = proc.communicate(timeout=20)
             self.assertEqual(proc.returncode, 0, err)
             self.assertTrue((self.root / "argv").exists())
@@ -387,7 +391,8 @@ class CodexRelayTest(unittest.TestCase):
             # the selected policy without a new terminal or silent fleet hold.
             before = json.loads((f.state / "pane-startup.json").read_text())
             proc = self._start(SANDY_FEATURE_STATE=str(f.state.parent), CODEX_HOME=str(f.native_home),
-                               SANDY_SKIP_PERMISSIONS="true", FAKE_CODEX_VERSION=f.previous.codex_version)
+                               CODEX_MODEL="unified-pane-model", SANDY_SKIP_PERMISSIONS="true",
+                               FAKE_CODEX_VERSION=f.previous.codex_version)
             _, err = proc.communicate(timeout=20)
             self.assertEqual(proc.returncode, 0, err)
             self.assertEqual(json.loads((f.state / "pane-startup.json").read_text()), before)
@@ -470,8 +475,8 @@ esac
         self.assertFalse((self.root / "argv").exists())
         self.assertEqual((state / "controller.toml").read_bytes(), previous)
 
-    def test_forwarded_codex_model_overrides_native_config_and_unrelated_model_exports(self):
-        """Sandy forwards CODEX_MODEL to the environment and native --model."""
+    def test_separate_entry_keeps_native_model_despite_forwarded_pane_exports(self):
+        """The separate supervisor keeps its native-config model contract."""
         (self.root / "logged-in").write_text("")
         proc = subprocess.run(["/bin/sh", str(self.payload / "codex/relay")],
                               env={**self.env, "AMAP_CODEX_MODEL": "gpt-env",
@@ -479,9 +484,9 @@ esac
                               capture_output=True, text=True, timeout=30)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(Config.load(self.state / "codex/controller.toml").codex_model,
-                         "gpt-env")
+                         "gpt-test")
         receipt = json.loads((self.state / "codex/entry-settings.json").read_text())
-        self.assertEqual((receipt["selected_model"], receipt["model_source"]), ("gpt-env", "CODEX_MODEL"))
+        self.assertEqual((receipt["selected_model"], receipt["model_source"]), ("gpt-test", "native_config"))
 
     def test_empty_codex_model_uses_native_configuration_and_records_its_source(self):
         (self.root / "logged-in").write_text("")
@@ -496,7 +501,8 @@ esac
     def test_no_model_in_the_agents_config_leaves_the_choice_to_codex(self):
         (self.root / "logged-in").write_text("")
         self.codex_config.write_text('sandbox_mode = "danger-full-access"\n')
-        proc = subprocess.run(["/bin/sh", str(self.payload / "codex/relay")], env=self.env,
+        proc = subprocess.run(["/bin/sh", str(self.payload / "codex/relay")],
+                              env={**self.env, "CODEX_MODEL": "pane-only-model"},
                               capture_output=True, text=True, timeout=30)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         controller = self.state / "codex/controller.toml"

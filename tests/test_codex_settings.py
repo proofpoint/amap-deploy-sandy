@@ -48,6 +48,20 @@ class SharedSettingsTest(unittest.TestCase):
         (native / "config.toml").write_text('model = "home-model"\n')
         self.assertEqual(settings.resolve({"HOME": str(self.root)})["selected_model"], "home-model")
 
+    def test_entry_preserves_separate_native_model_until_explicit_transition(self):
+        state = self.root / "state"
+        state.mkdir()
+        env = {**self.env, "CODEX_MODEL": "unified-pane-model"}
+        selected = settings.entry_selection(env, state)
+        self.assertEqual((selected["selected_model"], selected["model_source"]),
+                         ("configured-model", "native_config"))
+        self.config.unlink()
+        self.assertEqual(settings.entry_selection(env, state)["model_source"], "native_default")
+        (state / "adapter-transition.json").write_text("prepared transition fixture")
+        selected = settings.entry_selection(env, state)
+        self.assertEqual((selected["selected_model"], selected["model_source"]),
+                         ("unified-pane-model", "CODEX_MODEL"))
+
     def test_bad_native_model_facts_refuse_instead_of_guessing_default(self):
         for raw in ('model = 42\n', 'model = ""\n', 'model = [\n'):
             with self.subTest(raw=raw):

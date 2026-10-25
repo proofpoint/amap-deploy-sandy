@@ -308,15 +308,19 @@ Log Codex in inside the sandbox if it is not already. Until it is, the
 supervisor waits, and `verify` reports it as holding with the reason. Any
 Codex build runs; `verify` notes one the connector has not reviewed.
 
-The supervisor uses nonempty `CODEX_MODEL` from the launcher environment first,
-then `model` in the native `CODEX_HOME/config.toml` (normally
-`~/.codex/config.toml`), then Codex's default. The policy and manifest carry no
-model. This precedence is an explicit operator decision for review:
-`CODEX_MODEL`, when nonempty, overrides the native config model for the
-supervisor. The forwarding contract is supported by Sandy source excerpts,
-not a measurement of the current host. A separate supervisor picks up changes
-when its entry next renders; an established unified instance holds conflicting
-settings for an explicit transition.
+The default separate supervisor uses `model` in the native
+`CODEX_HOME/config.toml` (normally `~/.codex/config.toml`), then Codex's default.
+`CODEX_MODEL` reaches the pane without changing that separate-supervisor
+selection. The policy and manifest carry no model. A separate supervisor picks
+up native config changes when its entry next renders.
+
+Explicit unified preparation and entry propose sharing the pane selection:
+nonempty `CODEX_MODEL` first, then the native config model, then Codex's default.
+This is an explicit operator decision for review: `CODEX_MODEL`, when nonempty,
+overrides the native config model for the unified supervisor. It does not change
+default separate mode. The forwarding contract rests on Sandy source excerpts,
+not a measurement of the current host. An established unified instance holds
+conflicting settings for an explicit transition.
 
 **Talk to Codex yourself.** Where your sandy lists `agent_wrapper` in
 `sandy --print-schema`'s `manifest.top_level_keys`, `install` renders
@@ -543,7 +547,7 @@ complete without restarting any selected service. The installed baseline
 connector lacks `unified-adopt`; adoption therefore follows code installation.
 Do not substitute adopt-before-install or change old protected paths to copies.
 
-Preparation resolves the same model as the relay: nonempty forwarded
+Explicit unified preparation and entry resolve the same model: nonempty forwarded
 `CODEX_MODEL`, native config model, then native default. The retained previous
 controller keeps its original model bytes; the target records the selected
 model and its source. Supported unified permissions require explicit
