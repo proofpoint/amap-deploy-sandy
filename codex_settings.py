@@ -72,6 +72,15 @@ def require_unified_permissions(selection, config):
                          "SANDY_SKIP_PERMISSIONS=true and the retained full-access/never profile")
 
 
+def entry_selection(env, state):
+    """Separate entry keeps native config selection; explicit transitions share the pane."""
+    if os.path.lexists(state / "adapter-transition.json"):
+        return resolve(env)
+    native = dict(env)
+    native.pop("CODEX_MODEL", None)
+    return resolve(native)
+
+
 def capture(state, instance_id, selection, *, generation=None):
     path = state / "controller.toml"
     fingerprint = assets.digest(assets.regular(path)) if os.path.lexists(path) else None
@@ -189,12 +198,15 @@ def main(argv=None):
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--generation")
     parser.add_argument("--environment-generation", action="store_true")
+    parser.add_argument("--for-entry", action="store_true")
     args = parser.parse_args(argv)
     try:
         if args.environment_generation:
             print(environment_generation())
             return 0
-        selection = resolve(os.environ)
+        if args.for_entry and args.state is None:
+            raise ValueError("entry model selection requires a state directory")
+        selection = entry_selection(os.environ, args.state) if args.for_entry else resolve(os.environ)
         if args.apply:
             if args.state is None or not args.state.is_dir() or not args.instance:
                 raise ValueError("entry capture requires an existing state directory and instance")
