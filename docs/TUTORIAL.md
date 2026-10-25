@@ -398,6 +398,10 @@ retains `codex/operator-instructions.md` and `codex/mcp.toml` byte for byte at
 their original paths, records their hashes in `legacy-protected.json`, and
 appends immutable files under `codex/protected/<content-sha256>/`. It refuses
 later changes to recorded legacy bytes or an existing immutable version.
+Before each separate-mode entry replaces a controller, it durably retains its
+exact bytes at `controller-history/<content-sha256>.toml` in the private state.
+These snapshots preserve the original protected-file references; no snapshot is
+automatically selected or restored for adoption.
 
 **Stop step OWED:** obtain the isolation launcher's supported procedure to stop
 the feature entry's service/backend and every native client while keeping the

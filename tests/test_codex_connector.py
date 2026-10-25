@@ -26,6 +26,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import stat
 import shutil
 import signal
 import subprocess
@@ -288,6 +289,33 @@ class CodexRelayTest(unittest.TestCase):
         config = Config.load(self.state / "codex/controller.toml")
         self.assertIsNone(config.self_address)
         self.assertEqual([l.name for l in config.lanes], ["mail"])
+
+    def test_entry_retains_the_previous_controller_before_replacing_it(self):
+        import hashlib
+        (self.root / "logged-in").write_text("")
+        proc = self._start()
+        _, err = proc.communicate(timeout=30)
+        self.assertEqual(proc.returncode, 0, err)
+        path = self.state / "codex/controller.toml"
+        previous = path.read_bytes()
+        snapshot = path.parent / "controller-history" / (hashlib.sha256(previous).hexdigest() + ".toml")
+        archived_at = None
+        for _ in range(2):
+            proc = self._start()
+            _, err = proc.communicate(timeout=30)
+            self.assertEqual(proc.returncode, 0, err)
+            self.assertEqual(list(snapshot.parent.glob("*.toml")), [snapshot])
+            if archived_at is not None:
+                self.assertEqual(snapshot.stat().st_mtime_ns, archived_at)
+            archived_at = snapshot.stat().st_mtime_ns
+        self.codex_config.write_text('model = "different-model"\n')
+        proc = self._start()
+        _, err = proc.communicate(timeout=30)
+        self.assertEqual(proc.returncode, 0, err)
+        self.assertEqual(snapshot.read_bytes(), previous)
+        self.assertEqual(stat.S_IMODE(snapshot.stat().st_mode), 0o600)
+        self.assertNotEqual(path.read_bytes(), previous)
+        self.assertEqual(Config.load(snapshot).fingerprint(), Config.load(path).fingerprint())
 
     def test_not_logged_in_holds_with_the_reason(self):
         self.assertIn("not logged in", self._hold_reason(self._start()))

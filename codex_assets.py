@@ -69,7 +69,7 @@ def sync_directory(path):
         os.close(fd)
 
 
-def place(path, raw, *, replace=False):
+def place(path, raw, *, replace=False, mode=0o644):
     """Durable same-directory placement; immutable files are never replaced."""
     directory(path.parent)
     if os.path.lexists(path):
@@ -83,7 +83,7 @@ def place(path, raw, *, replace=False):
         with os.fdopen(fd, "wb") as stream:
             stream.write(raw)
             stream.flush()
-            os.fchmod(stream.fileno(), 0o644)
+            os.fchmod(stream.fileno(), mode)
             os.fsync(stream.fileno())
         if replace:
             os.replace(temporary, path)
