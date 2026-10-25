@@ -6,7 +6,12 @@ raw key), so the module's comparison is checked against an independent
 computation, never against itself."""
 
 import hashlib
+import inspect
 import json
+import os
+import shutil
+import signal
+import tempfile
 import unittest
 
 import fleet_keys as fk
@@ -153,6 +158,68 @@ class SectionTest(unittest.TestCase):
         with self.assertRaises(hs.SpecError) as cm:
             hs.load_spec(d)
         self.assertIn("needs a keys section", str(cm.exception))
+
+
+class ReadFromDiskTest(unittest.TestCase):
+    """`_read`, the production reader, on real files: the descriptor it opens
+    must be a regular file with one link, reached without following a link,
+    and the bytes it returns are the ones `read` hashes."""
+
+    def setUp(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d)
+        self.dir = d
+        self.data = raw(TWO)
+        self.path = os.path.join(d, "fleet-keys.json")
+        with open(self.path, "wb") as f:
+            f.write(self.data)
+        self.pin = fk.FleetKeysPin(self.path, hashlib.sha256(self.data).hexdigest())
+
+    def refuses(self, path, words):
+        with self.assertRaises(fk.FleetKeysError) as cm:
+            fk.read(fk.FleetKeysPin(path, self.pin.sha256))
+        self.assertIn(words, str(cm.exception))
+
+    def test_a_regular_single_link_file_reads_and_hashes_to_its_pin(self):
+        self.assertEqual(fk._read(self.path), self.data)
+        self.assertEqual([h.name for h in fk.read(self.pin)], ["alpha", "beta"])
+
+    def test_a_symlink_to_the_inventory_is_not_followed(self):
+        link = os.path.join(self.dir, "link.json")
+        os.symlink(self.path, link)
+        self.refuses(link, "cannot read the inventory")
+
+    def test_a_second_link_to_the_inventory_refuses(self):
+        os.link(self.path, os.path.join(self.dir, "second.json"))
+        self.refuses(self.path, "has 2 links")
+
+    def test_a_fifo_refuses_without_blocking(self):
+        fifo = os.path.join(self.dir, "fifo.json")
+        os.mkfifo(fifo)
+
+        def blocked(signum, frame):
+            raise AssertionError("the open of a FIFO with no writer blocked")
+
+        previous = signal.signal(signal.SIGALRM, blocked)
+        self.addCleanup(signal.signal, signal.SIGALRM, previous)
+        signal.alarm(5)
+        self.addCleanup(signal.alarm, 0)
+        self.refuses(fifo, "not a regular file")
+
+    def test_a_directory_refuses(self):
+        self.refuses(self.dir, "not a regular file")
+
+    def test_bytes_past_the_bound_are_read_and_refused_by_parse(self):
+        with open(self.path, "wb") as f:
+            f.write(b" " * (fk.MAX_BYTES + 10))
+        self.assertEqual(len(fk._read(self.path)), fk.MAX_BYTES + 1)
+        big = fk.FleetKeysPin(self.path, hashlib.sha256(b" " * (fk.MAX_BYTES + 1)).hexdigest())
+        with self.assertRaises(fk.FleetKeysError) as cm:
+            fk.read(big)
+        self.assertIn("more than", str(cm.exception))
+
+    def test_read_defaults_to_the_production_reader(self):
+        self.assertIs(inspect.signature(fk.read).parameters["read_bytes"].default, fk._read)
 
 
 if __name__ == "__main__":

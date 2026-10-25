@@ -28,8 +28,10 @@ fleet hosts, which is the local router's own rule for a runtime it verifies.
 
 import hashlib
 import json
+import os
 import posixpath
 import re
+import stat
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Sequence, Tuple
 
@@ -169,13 +171,33 @@ def parse(raw: bytes) -> Tuple[Host, ...]:
 
 
 def _read(path: str) -> bytes:
-    with open(path, "rb") as f:
-        return f.read(MAX_BYTES + 1)
+    """The inventory's bytes, from one descriptor: opened without following a
+    link (and without blocking on a FIFO), and read only when that descriptor
+    is a regular file with exactly one link. The digest `read` checks is of
+    the bytes this descriptor gave, so the file checked is the file hashed."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise FleetKeysError(f"the inventory {path} is not a regular file")
+        if st.st_nlink != 1:
+            raise FleetKeysError(f"the inventory {path} has {st.st_nlink} links; it must have exactly one")
+        chunks, n = [], 0
+        while n <= MAX_BYTES:
+            b = os.read(fd, MAX_BYTES + 1 - n)
+            if not b:
+                break
+            chunks.append(b)
+            n += len(b)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
 
 
 def read(pin: FleetKeysPin, read_bytes: Callable[[str], bytes] = _read) -> Tuple[Host, ...]:
     """The pinned inventory: its bytes must hash to the pin before anything
-    in them is parsed."""
+    in them is parsed. Every production caller reads through `_read`; the
+    `read_bytes` seam is for tests that supply bytes without a file."""
     try:
         raw = read_bytes(pin.path)
     except OSError as e:
