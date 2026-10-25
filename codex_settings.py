@@ -76,9 +76,18 @@ def entry_selection(env, state):
     """Separate entry keeps native config selection; explicit transitions share the pane."""
     if os.path.lexists(state / "adapter-transition.json"):
         return resolve(env)
-    native = dict(env)
-    native.pop("CODEX_MODEL", None)
-    return resolve(native)
+    import tomllib
+    native_home = env.get("CODEX_HOME") or str(Path(env["HOME"]) / ".codex")
+    try:
+        with (Path(native_home) / "config.toml").open("rb") as stream:
+            model = tomllib.load(stream).get("model")
+    except (OSError, ValueError):
+        model = None
+    if not isinstance(model, str) or not model:
+        model = None
+    return {"selected_model": model,
+            "model_source": "native_config" if model is not None else "native_default",
+            "skip_permissions": env.get("SANDY_SKIP_PERMISSIONS")}
 
 
 def capture(state, instance_id, selection, *, generation=None):
