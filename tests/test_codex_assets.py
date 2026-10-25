@@ -42,9 +42,10 @@ class ProtectedAssetsTest(unittest.TestCase):
         self.assertEqual(assets.findings(self.payload, self.policy, self.mcp), [])
         before = self.snapshot()
         directories = {str(p): p.stat().st_mtime_ns for p in self.root.rglob("*") if p.is_dir()}
-        self.install(dry_run=False)
+        self.assertIn("present", self.install(dry_run=False))
         self.assertEqual(self.snapshot(), before)
         self.assertEqual({str(p): p.stat().st_mtime_ns for p in self.root.rglob("*") if p.is_dir()}, directories)
+        self.assertIn("present", self.install())
 
     def test_upgrade_keeps_original_paths_and_old_versions_byte_stable(self):
         self.install(dry_run=False)
