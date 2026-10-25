@@ -312,14 +312,16 @@ connector's `docs/DESIGN.md` §1.2.
   codex-cli 0.160.1 and 0.161.0), so the lane exports travel through `env_vars` and
   the wrappers beside it translate them. The connector refuses to dispatch
   unless a thread's effective registry is exactly these three servers.
-- **The model follows the pane selection**: nonempty forwarded `CODEX_MODEL`,
-  then `model` in the native `CODEX_HOME/config.toml` (normally
-  `~/.codex/config.toml`), then Codex's default. The policy and manifest carry
-  none. The separate entry renders that selection at startup; an established
-  unified instance holds a conflicting selection for an explicit transition.
-  The connector audits model changes separately from the protected fingerprint.
-  The entry receipt names the model source with entry-environment scope; it
-  does not attest arbitrary later native argv or host acceptance.
+- **Separate supervisors use the native model**: `model` in the native
+  `CODEX_HOME/config.toml` (normally `~/.codex/config.toml`), then Codex's
+  default. `CODEX_MODEL` reaches the pane without overriding a separate
+  supervisor. The policy and manifest carry no model. Explicit unified
+  preparation and entry share the pane selection: nonempty forwarded
+  `CODEX_MODEL`, then the native config model, then Codex's default. An
+  established unified instance holds a conflicting selection for an explicit
+  transition. The connector audits model changes separately from the protected
+  fingerprint. The entry receipt names the model source with entry-environment
+  scope; it does not attest arbitrary later native argv or host acceptance.
 - **verify reads the supervisor's own snapshot**, `status.json` in the
   entry's state directory, which the connector rewrites on every poll.
   Fixtures for it are written by the connector's real `Supervisor`.
