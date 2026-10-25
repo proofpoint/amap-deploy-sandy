@@ -315,6 +315,49 @@ class InteractiveLaunchTest(unittest.TestCase):
         self.assertIn("no AMAP_OUTBOX_DIR", r.stderr)
 
 
+@unittest.skipUnless(sys.version_info >= (3, 11), "connector execution requires Python 3.11")
+class UnifiedLaunchTest(unittest.TestCase):
+    def setUp(self):
+        import test_codex_transition as tt
+        self.box = _Sandbox(self)
+        self.fixture = tt.TransitionTest()
+        self.fixture.setUp()
+        self.addCleanup(self.fixture.doCleanups)
+        self.fixture.prepare(apply=True)
+        launcher = self.box.payload / "interactive-launch"
+        launcher.write_text(launcher.read_text().replace("STATE=" + str(self.box.state),
+                                                       "STATE=" + str(self.fixture.state)))
+
+    def test_unified_uses_one_connector_attach_without_the_separate_wait(self):
+        import codex_transition as transition
+        self.fixture.commit_adoption_fixture()
+        transition.confirm(self.fixture.state, apply=True)
+        native = ["codex", "--model", "test-model", "--dangerously-bypass-approvals-and-sandbox"]
+        result = self.box.run("interactive-launch", *native,
+                              AMAP_CODEX_LAUNCH_WAIT_SECONDS="invalid-separate-budget", SHIM_ACTIVITY_RC="99")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.box.interactive()[-len(native) - 1:], ["--", *native])
+        self.assertNotIn("activity", self.box.calls())
+        self.assertIsNone(self.box.execd())
+
+    def test_prepared_transition_refuses_instead_of_launching_a_new_conversation(self):
+        result = self.box.run("interactive-launch", "codex")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("adoption is pending", result.stderr)
+        self.assertIsNone(self.box.interactive())
+        self.assertIsNone(self.box.execd())
+
+    def test_operator_pause_blocks_attachment_even_after_confirmation(self):
+        import codex_transition as transition
+        self.fixture.commit_adoption_fixture()
+        transition.confirm(self.fixture.state, apply=True)
+        transition.pause(self.fixture.state, "operator maintenance", apply=True)
+        result = self.box.run("interactive-launch", "codex")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("maintenance pause", result.stderr)
+        self.assertIsNone(self.box.interactive())
+
+
 class ActivityTest(unittest.TestCase):
 
     def setUp(self):

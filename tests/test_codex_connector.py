@@ -77,6 +77,10 @@ esac
 PYTHON_SHIM = """#!/bin/sh
 if [ "$1" = "-m" ] && [ "$2" = "amap_codex.cli" ]; then
   printf '%s\\n' "$@" > "$SHIM_ARGV"
+  if [ -n "$SHIM_PAUSE_AFTER_RUN" ]; then
+    echo run >> "$SHIM_RUN_RECORD"
+    echo '{{}}' > "$SHIM_PAUSE_AFTER_RUN"
+  fi
   if [ -n "$SHIM_RUN_UNTIL_TERM" ]; then
     trap 'echo stopped > "$SHIM_RUN_UNTIL_TERM"; exit 0' TERM
     while :; do sleep 1; done
@@ -346,6 +350,40 @@ class CodexRelayTest(unittest.TestCase):
 
     def test_not_logged_in_holds_with_the_reason(self):
         self.assertIn("not logged in", self._hold_reason(self._start()))
+
+    def test_operator_pause_holds_before_login_or_supervisor_start(self):
+        state = self.state / prov.CODEX_STATE_SUBDIR
+        state.mkdir()
+        (state / "adapter-pause.json").write_text('{"schema":1,"state":"paused"}')
+        self.assertIn("operator maintenance pause", self._hold_reason(self._start()))
+        self.assertFalse((self.root / "argv").exists())
+        self.assertFalse((state / "controller.toml").exists())
+
+    def test_operator_pause_blocks_the_next_automatic_child_retry(self):
+        (self.root / "logged-in").write_text("")
+        sleep = self.root / "bin/sleep"
+        sleep.write_text('#!/bin/sh\nexec ' + sys.executable + ' -c "import time; time.sleep(.02)"\n')
+        sleep.chmod(0o755)
+        state = self.state / prov.CODEX_STATE_SUBDIR
+        record = self.root / "run-record"
+        proc = self._start(SHIM_RC="1", SHIM_PAUSE_AFTER_RUN=str(state / "adapter-pause.json"),
+                           SHIM_RUN_RECORD=str(record))
+        try:
+            deadline = time.monotonic() + 20
+            reason = ""
+            while time.monotonic() < deadline:
+                hold = state / prov.CODEX_HOLD_NAME
+                if hold.is_file():
+                    reason = json.loads(hold.read_text()).get("reason", "")
+                    if "operator maintenance pause" in reason:
+                        break
+                time.sleep(.05)
+            self.assertIn("operator maintenance pause", reason)
+            time.sleep(.1)
+            self.assertEqual(record.read_text().splitlines(), ["run"])
+        finally:
+            os.killpg(proc.pid, signal.SIGKILL)
+            proc.communicate()
 
     def test_the_model_is_the_agents_own_and_nothing_else(self):
         """An AMAP_CODEX_MODEL or CODEX_MODEL in the environment is not a

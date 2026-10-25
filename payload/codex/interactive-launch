@@ -42,6 +42,19 @@ case ",${SANDY_AGENT:-}," in
 esac
 : "${AMAP_OUTBOX_DIR:?interactive-launch: no AMAP_OUTBOX_DIR in this pane; the outbox lane is not mounted}"
 export PYTHONPATH="$SELF_DIR/src"
+if [ -e "$STATE/adapter-pause.json" ] || [ -L "$STATE/adapter-pause.json" ]; then
+    echo "interactive-launch: operator maintenance pause; not starting Codex" >&2
+    exit 1
+fi
+if mode=$(python3 "$SELF_DIR/transition" --state "$STATE" entry-mode); then
+    :
+else
+    echo "interactive-launch: explicit adapter configuration is holding; not starting Codex" >&2
+    exit 1
+fi
+if [ "$mode" = unified ]; then
+    exec python3 -m amap_codex.cli --config "$STATE/controller.toml" interactive --outbox-dir "$AMAP_OUTBOX_DIR" -- "$@"
+fi
 python3 -c '
 import json, math, os, stat, subprocess, sys, time
 

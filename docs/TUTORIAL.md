@@ -368,6 +368,157 @@ The thread submits the delegation and finishes its turn. alpha's reply
 arrives as a later turn on the same thread. **Delegate to Codex** the same
 way as to any agent: ask alpha to task gamma's address.
 
+### Experimental unified conversation: existing-instance transition
+
+This procedure is an engineering draft. Source approval, an immutable reviewed
+Codex connector pin, the launcher model/permission facts and the service-only
+stop procedure are still required before an operator can execute it end to end.
+The default remains separate. Installing new payload files selects no instance
+for unified mode. No command here merges two saved conversations.
+
+Use the deployment checkout under the existing `AMAP_ROOT` (normally `~/amap`),
+on the approved adapter commit for the host's line. The development base is
+`7c4b766fcb9947fe39fc2c78b9a58ff43a55207c`; the deployed release branch
+`release/amap-2026-10-10` starts at
+`8346e9d7beb030bff5a7fd1b8f52830f77e3a972`. These are bases, not the unified
+installation commits. No Git tag is assumed. Keep the router and Claude pins
+on that line. The Codex pin must name the corrected, independently reviewed
+source reachable from its forge; the supplied experimental source is not a
+deployment approval.
+
+Before installation, retain a verified copy of the entire feature payload,
+feature manifest and router configuration, and separately preserve each selected
+instance's entry state and native Codex home. Preserve permissions, original
+paths, the delivery journal and native history; do not copy credentials into
+reports or source control. Do not run an ordinary rollout rollback after any
+instance has a transition record. The rollout tool and this transition are
+separate operations.
+
+Set `WORKSPACE` to one existing absolute workspace path and `THREAD` to the
+explicit saved native UUID the operator selected. Inspect unresolved AMAP and
+operator work before stopping anything. Select one history, retaining the other.
+Resolve unfinished delivery/publication through its existing audited workflow.
+Do not infer completion from queue admission, a smaller queue, or a submit
+receipt.
+
+The installation order is: preserve existing inputs; quiesce the service and
+native clients; install reviewed code without restarting the entry; prepare;
+adopt; confirm; explicitly release the pause; attach and verify. The installer
+retains `codex/operator-instructions.md` and `codex/mcp.toml` byte for byte at
+their original paths, records their hashes in `legacy-protected.json`, and
+appends immutable files under `codex/protected/<content-sha256>/`. It refuses
+later changes to recorded legacy bytes or an existing immutable version.
+
+**Stop step OWED:** obtain the isolation launcher's supported procedure to stop
+the feature entry's service/backend and every native client while keeping the
+execution environment available for maintenance. Neither `sandy --stop` followed
+by `sandy --exec`, nor killing only the supervisor, is an established procedure.
+The old relay retries failed children. A newly installed relay file does not
+replace an already-running old relay process. The operator must establish that
+the old service/backend and clients have exited and their controller/lane
+ownership is released. Do not install or transition while that fact is unknown.
+
+For an instance already running the pause-aware adapter, the following commands
+write an explicit pause; they stop no process. The first command is a dry run:
+
+```sh
+sandy --exec --workspace "$WORKSPACE" -- python3 /opt/sandy/features/amap/codex/transition pause --note 'Operator selected stopped-service maintenance'
+sandy --exec --workspace "$WORKSPACE" -- python3 /opt/sandy/features/amap/codex/transition pause --note 'Operator selected stopped-service maintenance' --apply
+```
+
+`adapter-pause.json` lives in the private entry state, alongside the controller.
+The relay checks its presence before rendering and before every child retry,
+including after a relay restart. The terminal wrapper refuses attachment while
+paused. Establish quiescence separately, then run the approved installation from
+the correct adapter checkout:
+
+```sh
+AMAP_CODEX=1 python3 amap-siblings.py
+python3 amap-sandy.py install
+python3 amap-sandy.py install --apply
+```
+
+The sibling check must report the approved source, and the installation must
+complete without restarting any selected service. The installed baseline
+connector lacks `unified-adopt`; adoption therefore follows code installation.
+Do not substitute adopt-before-install or change old protected paths to copies.
+
+The target inherits the previous explicit model and permission settings. Until
+the generic launcher exports its resolved model, `CODEX_MODEL` must be unset or
+equal to the model in the native Codex configuration. That condition is an
+operator preflight obligation, not a measured host fact. A different explicit
+pane model/permission flag refuses at attachment. A changed native configuration
+model or build holds the relay; automatic re-rendering is disabled in unified
+mode. Settings transitions beyond this first separate-to-unified adoption
+require their own reviewed procedure.
+
+Prepare the selected instance while stopped. The first command previews only:
+
+```sh
+sandy --exec --workspace "$WORKSPACE" -- python3 /opt/sandy/features/amap/codex/transition prepare --thread "$THREAD"
+sandy --exec --workspace "$WORKSPACE" -- python3 /opt/sandy/features/amap/codex/transition prepare --thread "$THREAD" --apply
+```
+
+Preparation takes the connector's controller and lane ownership, preserves
+`adapter-previous.toml`, durably records `adapter-transition.json` as `prepared`,
+then writes the target at its final `controller.toml` pathname. Original
+protected references in the previous snapshot remain unchanged. The target
+renders unified mode, the owned native argv and kickoff disabled. An interrupted
+prepare can be repeated for the same thread and unchanged assets. A different
+target, foreign controller or changed snapshot refuses. The prepared record
+blocks automatic entry startup even if the native adoption has already happened.
+
+Validate and adopt at that exact final pathname, in the same execution
+environment. `doctor` below is static; do not add `--probe`:
+
+```sh
+sandy --exec --workspace "$WORKSPACE" -- sh -c 'export PYTHONPATH=/opt/sandy/features/amap/codex/src; python3 -m amap_codex.cli --config /opt/sandy/feature-state/amap/codex/controller.toml doctor'
+sandy --exec --workspace "$WORKSPACE" -- sh -c 'export PYTHONPATH=/opt/sandy/features/amap/codex/src; python3 -m amap_codex.cli --config /opt/sandy/feature-state/amap/codex/controller.toml unified-adopt --previous-config /opt/sandy/feature-state/amap/codex/adapter-previous.toml --thread "$1" --note "Operator selected this saved conversation for unified delivery"' sh "$THREAD"
+sandy --exec --workspace "$WORKSPACE" -- python3 /opt/sandy/features/amap/codex/transition confirm
+sandy --exec --workspace "$WORKSPACE" -- python3 /opt/sandy/features/amap/codex/transition confirm --apply
+```
+
+The connector's protected activity tool includes the configuration pathname in
+its policy binding. Do not adopt through a temporary pathname and then rename
+it. Confirmation requires the committed native adoption, retained-history hash,
+matching previous/target fingerprints and selected thread, matching protected
+policy hashes and effective model. It releases no pause and starts nothing.
+If acknowledgement was lost after native adoption committed, run confirmation;
+do not create another history or replay model input. If native maintenance is
+still planned, retain the hold and follow its explicit same-command recovery.
+
+Only after confirmation, release the adapter pause, with the service still
+stopped:
+
+```sh
+sandy --exec --workspace "$WORKSPACE" -- python3 /opt/sandy/features/amap/codex/transition unpause
+sandy --exec --workspace "$WORKSPACE" -- python3 /opt/sandy/features/amap/codex/transition unpause --apply
+```
+
+The pause-aware relay may resume at its next poll. If the entry was stopped,
+use the isolation launcher's reviewed service-start procedure (still OWED).
+Unified attachment then delegates directly to the connector's single bounded
+wait. It targets the registered canonical thread and private generation; it
+never starts a substitute conversation. Detaching the terminal leaves the
+service running. `kickoff` is disabled; human work enters through the native pane.
+
+`verify` requires matching fresh status and descriptor evidence, the current
+configuration and durable canonical/policy binding, all named readiness checks,
+matching model/permissions and known scheduler/queue/client facts. Missing,
+stale, foreign and malformed evidence is UNKNOWN and exits nonzero. Protected
+tool validation is a generation-bound startup fact, not continuous tool health.
+The operator must additionally measure both directions of a Codex/Claude round
+trip with accepted-send correlation, busy-human queueing, detach/reattach and a
+safe restart in the actual unified pane. Synthetic source controls establish
+none of these host acceptance results.
+
+At any failed or uncertain step, preserve the pause, transition record, logs,
+previous configuration, journal and native history. A `prepared` record can
+cover an uncertain native side effect. After any native adoption, restoring an
+old payload/configuration is not a valid rollback; remain stopped for an audited
+reverse transition. No reset, deletion, implicit cancellation or automatic
+replay is part of this procedure.
+
 ## 10. A hop deployment's host setup
 
 A hop deployment runs each side of a hop as its own uid, against roots the
