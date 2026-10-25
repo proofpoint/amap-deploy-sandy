@@ -71,6 +71,21 @@ class SharedSettingsTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "single-line"):
             settings.resolve({**self.env, "CODEX_MODEL": "model\n"})
 
+    def test_separate_keeps_baseline_fallback_while_unified_refuses_unknown_native_model(self):
+        state = self.root / "state"
+        state.mkdir()
+        for raw in ('model = 42\n', 'model = ""\n', 'model = [\n'):
+            with self.subTest(raw=raw):
+                self.config.write_text(raw)
+                self.assertEqual(settings.entry_selection(self.env, state)["model_source"], "native_default")
+                with self.assertRaises(ValueError):
+                    settings.resolve(self.env)
+        self.config.unlink()
+        self.config.mkdir()
+        self.assertEqual(settings.entry_selection(self.env, state)["model_source"], "native_default")
+        with self.assertRaises(ValueError):
+            settings.resolve(self.env)
+
     def test_unified_permissions_require_explicit_supported_selection_and_retained_profile(self):
         config = SimpleNamespace(sandbox="danger-full-access", approval_policy="never")
         selected = settings.resolve(self.env)
