@@ -55,7 +55,12 @@ if [ "$1" = "-m" ] && [ "$2" = "amap_codex.cli" ]; then
     case "$a" in
       activity) [ -n "$SHIM_ACTIVITY_SLEEP" ] && sleep "$SHIM_ACTIVITY_SLEEP"
                 [ -n "$SHIM_ACTIVITY_RC" ] && { echo "activity broke" >&2; exit "$SHIM_ACTIVITY_RC"; }
+                [ -n "$SHIM_PAUSE_AFTER_ACTIVITY" ] && echo '{}' > "$SHIM_PAUSE_AFTER_ACTIVITY"
                 printf '%s\\n' "$SHIM_ACTIVITY"; exit 0 ;;
+      interactive-args) printf '%s\\0' "$@" > "$SHIM_INTERACTIVE"
+                [ -n "$SHIM_PAUSE_AFTER_ARGS" ] && echo '{}' > "$SHIM_PAUSE_AFTER_ARGS"
+                if [ -n "$SHIM_NATIVE_ARGV" ]; then printf '%s\\n' "$SHIM_NATIVE_ARGV"; else echo '["codex"]'; fi
+                exit 0 ;;
       interactive) printf '%s\\0' "$@" > "$SHIM_INTERACTIVE"
                 [ -n "$SHIM_INTERACTIVE_RC" ] && { echo "unsupported native option or subcommand" >&2; exit "$SHIM_INTERACTIVE_RC"; }
                 exit 0 ;;
@@ -191,6 +196,10 @@ class InteractiveLaunchTest(unittest.TestCase):
         (self.box.state / "hold.json").write_text(json.dumps({"reason": "codex is not logged in"}))
         self._refused("the supervisor holds: codex is not logged in")
 
+    def test_pause_arriving_inside_readiness_check_prevents_native_launch(self):
+        self.box.ready()
+        self._refused("operator maintenance pause", SHIM_PAUSE_AFTER_ACTIVITY=str(self.box.state / "adapter-pause.json"))
+
     def test_not_ready_refuses_and_names_the_checks_that_did_not_pass(self):
         self.box.ready()
         self._refused("the supervisor is not_ready (live_claims_match_snapshot_owner=fail, thread_bound=fail)",
@@ -324,21 +333,32 @@ class UnifiedLaunchTest(unittest.TestCase):
         self.fixture.setUp()
         self.addCleanup(self.fixture.doCleanups)
         self.fixture.prepare(apply=True)
+        self.box.env.update(CODEX_HOME=str(self.fixture.native_home), SANDY_SKIP_PERMISSIONS="true")
         launcher = self.box.payload / "interactive-launch"
         launcher.write_text(launcher.read_text().replace("STATE=" + str(self.box.state),
                                                        "STATE=" + str(self.fixture.state)))
+
+    def _startup_challenge(self):
+        import codex_settings as settings
+        import codex_transition as transition
+        generation = settings.environment_generation()
+        settings.capture(self.fixture.state, self.fixture.previous.instance_id,
+                         settings.resolve(os.environ), generation=generation)
+        with self.assertRaisesRegex(ValueError, "full native argv selection is pending"):
+            transition.startup_gate(self.fixture.state, generation, apply=True)
 
     def test_unified_uses_one_connector_attach_without_the_separate_wait(self):
         import codex_transition as transition
         self.fixture.commit_adoption_fixture()
         transition.confirm(self.fixture.state, apply=True)
+        self._startup_challenge()
         native = ["codex", "--model", "test-model", "--dangerously-bypass-approvals-and-sandbox"]
         result = self.box.run("interactive-launch", *native,
                               AMAP_CODEX_LAUNCH_WAIT_SECONDS="invalid-separate-budget", SHIM_ACTIVITY_RC="99")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.box.interactive()[-len(native) - 1:], ["--", *native])
         self.assertNotIn("activity", self.box.calls())
-        self.assertIsNone(self.box.execd())
+        self.assertEqual(self.box.execd(), [])
 
     def test_prepared_transition_refuses_instead_of_launching_a_new_conversation(self):
         result = self.box.run("interactive-launch", "codex")
@@ -356,6 +376,29 @@ class UnifiedLaunchTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("maintenance pause", result.stderr)
         self.assertIsNone(self.box.interactive())
+
+    def test_forwarded_model_or_permissions_conflict_refuses_before_attachment(self):
+        import codex_transition as transition
+        self.fixture.commit_adoption_fixture()
+        transition.confirm(self.fixture.state, apply=True)
+        for env, reason in (({"CODEX_MODEL": "foreign"}, "pane CODEX_MODEL/native model differs"),
+                            ({"SANDY_SKIP_PERMISSIONS": "false"}, "permissions are unknown or conflicting")):
+            with self.subTest(env=env):
+                result = self.box.run("interactive-launch", "codex", **env)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(reason, result.stderr)
+                self.assertIsNone(self.box.interactive())
+
+    def test_pause_arriving_inside_connector_attachment_wait_prevents_native_exec(self):
+        import codex_transition as transition
+        self.fixture.commit_adoption_fixture()
+        transition.confirm(self.fixture.state, apply=True)
+        self._startup_challenge()
+        result = self.box.run("interactive-launch", "codex", "-s", "danger-full-access", "-a", "never",
+                              SHIM_PAUSE_AFTER_ARGS=str(self.fixture.state / transition.PAUSE))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("operator maintenance pause after attachment wait", result.stderr)
+        self.assertIsNone(self.box.execd())
 
 
 class ActivityTest(unittest.TestCase):

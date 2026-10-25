@@ -7,8 +7,11 @@ import os
 from pathlib import Path
 import re
 import sys
+import time
+import subprocess
 
 import codex_assets as assets
+import codex_settings as settings
 
 RECORD = "adapter-transition.json"
 PREVIOUS = "adapter-previous.toml"
@@ -94,6 +97,7 @@ def confirmed_adoption(config, record):
     if (adoption is None or binding is None or adoption["state"] != "confirmed"
             or adoption["thread_id"] != record["thread"] or binding["thread_id"] != record["thread"]
             or adoption["fingerprint"] != config.fingerprint()
+            or adoption["fingerprint"] != record["fingerprint"]
             or adoption["previous_fingerprint"] != previous.fingerprint()
             or adoption["policy_hash"] != binding["policy_hash"]
             or not re.fullmatch("[a-f0-9]{64}", adoption["policy_hash"])
@@ -132,6 +136,9 @@ def prepare(state, payload, thread, *, apply=False):
     else:
         previous = current
         record = None
+    if os.path.lexists(state / "bootstrap-inputs.json"):
+        from codex_bootstrap_pause import verify
+        verify(state, previous)
     doc = tomllib.loads(previous.decode())
     if doc.get("conversation_mode", "separate") != "separate" or doc.get("launcher_control_argv"):
         raise ValueError("transition requires the existing in-environment separate instance")
@@ -151,9 +158,16 @@ def prepare(state, payload, thread, *, apply=False):
     doc.update(conversation_mode="unified", unified_argv=["codex"], operator_kickoff_enabled=False,
                operator_instructions=str(protected / assets.ASSETS[0]),
                trusted_config_file=str(protected / assets.ASSETS[1]))
-    target = toml_bytes(doc)
     config = (Config.load(state / PREVIOUS, create_state=False) if record is not None else config_at(state))
+    selection = settings.resolve(os.environ)
+    settings.require_unified_permissions(selection, config)
+    if selection["selected_model"] is None:
+        doc.pop("codex_model", None)
+    else:
+        doc["codex_model"] = selection["selected_model"]
+    target = toml_bytes(doc)
     candidate = replace(config, conversation_mode="unified", unified_argv=["codex"],
+                        codex_model=selection["selected_model"],
                         operator_kickoff_enabled=False, operator_instructions=protected / assets.ASSETS[0],
                         trusted_config_file=protected / assets.ASSETS[1])
     candidate.validate(create_state=False)
@@ -161,6 +175,7 @@ def prepare(state, payload, thread, *, apply=False):
                "previous_sha256": assets.digest(previous), "target_sha256": assets.digest(target),
                "fingerprint": candidate.fingerprint(), "instance_id": candidate.instance_id,
                "codex_model": candidate.codex_model, "codex_version": candidate.codex_version,
+               "model_source": selection["model_source"],
                "sandbox": candidate.sandbox, "approval_policy": candidate.approval_policy,
                "state_dir": str(candidate.state_dir), "poll_interval_ms": candidate.poll_interval_ms}
     if record is not None and planned != record:
@@ -191,15 +206,18 @@ def confirm(state, *, apply=False):
     record = read_record(state)
     config = config_at(state)
     if (config.conversation_mode != "unified"
+            or config.fingerprint() != record["fingerprint"]
             or assets.digest(assets.regular(state / "controller.toml")) != record.get("target_sha256")
             or assets.digest(assets.regular(state / PREVIOUS)) != record.get("previous_sha256")):
         raise ValueError("transition target or retained previous configuration differs")
     if not apply:
-        matching_status(config, fingerprint=config.fingerprint(), thread=record["thread"])
+        matching_status(config, fingerprint=record["fingerprint"], thread=record["thread"])
         confirmed_adoption(config, record)
         return {**record, "apply": False}
     with Ownership(config):
-        matching_status(config, fingerprint=config.fingerprint(), thread=record["thread"])
+        if config.fingerprint() != record["fingerprint"]:
+            raise ValueError("prepared target fingerprint differs; retain the transition hold")
+        matching_status(config, fingerprint=record["fingerprint"], thread=record["thread"])
         record["policy_hash"] = confirmed_adoption(config, record)
         record["state"] = "confirmed"
         raw = assets.encoded(record)
@@ -208,7 +226,7 @@ def confirm(state, *, apply=False):
     return {**record, "apply": True}
 
 
-def entry_mode(state, *, selected_model=None, observed_version=None):
+def entry_mode(state, *, selected_model=None, observed_version=None, check_pane_settings=False):
     """Read-only gate, used before relay rendering and terminal attachment."""
     if not os.path.lexists(state / RECORD):
         path = state / "controller.toml"
@@ -226,13 +244,19 @@ def entry_mode(state, *, selected_model=None, observed_version=None):
         raise ValueError("explicit unified adoption is pending; retain controller and previous configuration")
     config = config_at(state)
     if (config.conversation_mode != "unified"
+            or config.fingerprint() != record["fingerprint"]
             or assets.digest(assets.regular(state / "controller.toml")) != record.get("target_sha256")):
         raise ValueError("confirmed target configuration differs; no automatic re-render")
     if selected_model is not None and config.codex_model != (selected_model or None):
         raise ValueError("native configuration model changed; explicit shared-settings transition required")
     if observed_version is not None and config.codex_version != observed_version:
         raise ValueError("native build changed; explicit configuration update required")
-    matching_status(config, fingerprint=config.fingerprint(), thread=record["thread"])
+    if check_pane_settings:
+        selection = settings.resolve(os.environ)
+        settings.require_unified_permissions(selection, config)
+        if selection["selected_model"] != config.codex_model:
+            raise ValueError("pane CODEX_MODEL/native model differs from the canonical configuration")
+    matching_status(config, fingerprint=record["fingerprint"], thread=record["thread"])
     return "unified"
 
 
@@ -260,6 +284,78 @@ def unpause(state, *, apply=False):
     return {"apply": apply, "mode": mode, "next": "relay may resume after its pause check"}
 
 
+def startup_gate(state, generation, *, apply=False):
+    entry_mode(state, check_pane_settings=True)
+    if generation != settings.environment_generation():
+        raise ValueError("execution-environment generation differs; fresh native selection required")
+    config = config_at(state)
+    record = read_record(state)
+    request = settings.startup_request(state, config, record["thread"], generation)
+    if apply:
+        assets.place(state / settings.STARTUP, assets.encoded(request), replace=True, mode=0o600)
+    try:
+        saved = json.loads(assets.regular(state / settings.STARTUP))
+        receipt = json.loads(assets.regular(state / settings.PANE_SELECTION))
+        entry = json.loads(assets.regular(state / settings.RECEIPT))
+    except (OSError, ValueError) as exc:
+        raise ValueError("full native argv selection is pending; incoming service remains stopped") from exc
+    problems = settings.startup_problems(saved, receipt, record, entry)
+    problems += settings.evidence_problems(entry, record)
+    if saved != request or problems:
+        raise ValueError("; ".join(problems) or "native selection request differs")
+    return {"selected": True, "entry_generation": generation}
+
+
+def select_pane(state, argv, *, apply=False):
+    if os.path.lexists(state / PAUSE):
+        raise ValueError("operator maintenance pause; native selection refused")
+    entry_mode(state, check_pane_settings=True)
+    config = config_at(state)
+    record = read_record(state)
+    request = json.loads(assets.regular(state / settings.STARTUP))
+    entry = json.loads(assets.regular(state / settings.RECEIPT))
+    if settings.evidence_problems(entry, record):
+        raise ValueError("entry selection evidence differs from the canonical configuration")
+    if not isinstance(request, dict) or request != settings.startup_request(state, config, record["thread"], entry.get("entry_generation")):
+        raise ValueError("native selection challenge differs from the canonical configuration")
+    if request["entry_generation"] != settings.environment_generation():
+        raise ValueError("native selection challenge belongs to another execution environment")
+    receipt = {**request, "argv_sha256": settings.validate_native_argv(config, record["thread"], argv),
+               "validated_at": time.time()}
+    if apply:
+        if os.path.lexists(state / PAUSE):
+            raise ValueError("operator maintenance pause; native selection refused")
+        assets.place(state / settings.PANE_SELECTION, assets.encoded(receipt), replace=True, mode=0o600)
+    return receipt
+
+
+def launch_pane(state, argv):
+    select_pane(state, argv, apply=True)
+    result = subprocess.run(["python3", "-m", "amap_codex.cli", "--config", str(state / "controller.toml"),
+                             "interactive-args", "--", *argv], capture_output=True, text=True, timeout=35)
+    if result.returncode:
+        raise ValueError(result.stderr.strip() or "connector attachment preparation failed")
+    selected = json.loads(result.stdout)
+    if (not isinstance(selected, list) or not selected or not all(isinstance(a, str) and "\x00" not in a for a in selected)
+            or selected[0] != config_at(state).unified_argv[0]):
+        raise ValueError("connector returned no valid native argument vector")
+    entry_mode(state, check_pane_settings=True)
+    if os.path.lexists(state / PAUSE):
+        raise ValueError("operator maintenance pause after attachment wait; not starting Codex")
+    os.execvp(selected[0], selected)
+
+
+def selection_ready(state):
+    entry_mode(state, check_pane_settings=True)
+    config = config_at(state)
+    record = read_record(state)
+    request = json.loads(assets.regular(state / settings.STARTUP))
+    expected = settings.startup_request(state, config, record["thread"], settings.environment_generation())
+    if request != expected or os.path.lexists(state / PAUSE):
+        raise ValueError("native selection request is not current or the operator pause remains")
+    return {"selection_ready": True, "scope": "startup selection, not backend readiness"}
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--state", type=Path, default=Path("/opt/sandy/feature-state/amap/codex"))
@@ -278,6 +374,16 @@ def main(argv=None):
     entry = commands.add_parser("entry-mode")
     entry.add_argument("--model")
     entry.add_argument("--version")
+    entry.add_argument("--check-pane-settings", action="store_true")
+    startup = commands.add_parser("startup-gate")
+    startup.add_argument("--generation", required=True)
+    startup.add_argument("--apply", action="store_true")
+    pane = commands.add_parser("select-pane")
+    pane.add_argument("--apply", action="store_true")
+    pane.add_argument("native_argv", nargs=argparse.REMAINDER)
+    launch = commands.add_parser("launch-pane")
+    launch.add_argument("native_argv", nargs=argparse.REMAINDER)
+    commands.add_parser("selection-ready")
     args = parser.parse_args(argv)
     sys.path.insert(0, str(args.payload / "src"))
     try:
@@ -289,12 +395,24 @@ def main(argv=None):
             result = pause(args.state, args.note, apply=args.apply)
         elif args.command == "unpause":
             result = unpause(args.state, apply=args.apply)
+        elif args.command == "startup-gate":
+            result = startup_gate(args.state, args.generation, apply=args.apply)
+        elif args.command == "selection-ready":
+            result = selection_ready(args.state)
+        elif args.command in {"select-pane", "launch-pane"}:
+            if len(args.native_argv) < 2 or args.native_argv[0] != "--":
+                raise ValueError("native argv must follow -- and include the executable")
+            if args.command == "launch-pane":
+                launch_pane(args.state, args.native_argv[1:])
+                return 0
+            result = select_pane(args.state, args.native_argv[1:], apply=args.apply)
         else:
-            print(entry_mode(args.state, selected_model=args.model, observed_version=args.version))
+            print(entry_mode(args.state, selected_model=args.model, observed_version=args.version,
+                             check_pane_settings=args.check_pane_settings))
             return 0
         print(json.dumps(result, indent=2))
         return 0
-    except (OSError, ValueError, RuntimeError) as exc:
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
         print("codex transition: " + str(exc), file=sys.stderr)
         return 1
 
