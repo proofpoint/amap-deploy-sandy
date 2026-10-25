@@ -80,6 +80,15 @@ class RenderTest(unittest.TestCase):
         self.assertIs(keys["egress"], True)
         self.assertFalse(set(keys) & set(hp.ATTACHMENT_TUNABLES))
 
+    def test_egress_false_is_rendered_explicitly_and_reaches_the_file(self):
+        # An absent egress would mean false to the router too, but the deployed value is a decision, and
+        # verify and the config digest must see it written, not inferred from a missing key.
+        s = spec()
+        keys = hp.hop_keys(s, link(egress=False), FLEET_DOMAIN)
+        self.assertIn("egress", keys)
+        self.assertIs(keys["egress"], False)
+        self.assertIn('"egress": false', prov.sibling_text(dict(keys)))
+
     def test_refusals(self):
         import dataclasses
         s = spec()
