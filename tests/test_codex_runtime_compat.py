@@ -67,6 +67,36 @@ class RuntimeBoundaryTest(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     transition.entry_mode(self.state)
 
+    def test_unicode_comment_and_string_characters_do_not_create_physical_lines(self):
+        for separator in ("\u0085", "\u2028", "\u2029"):
+            for mode in ("separate", "unified", "foreign"):
+                prefixes = ("# comment" + separator + "[lanes.mail]\n",
+                            'instance_id = "host" # comment' + separator + "[lanes.mail]\n",
+                            'instance_id = "literal' + separator + '[lanes.mail]"\n')
+                for prefix in prefixes:
+                    raw = (prefix + 'conversation_mode = "' + mode + '"\n').encode()
+                    if sys.version_info >= (3, 11):
+                        import tomllib
+                        self.assertEqual(tomllib.loads(raw.decode())["conversation_mode"], mode)
+                    with self.subTest(separator=repr(separator), prefix=prefix, mode=mode), self.host39():
+                        self.controller.write_bytes(raw)
+                        self.assertEqual(transition.configuration_mode(raw), mode)
+                        if mode == "separate":
+                            self.assertEqual(transition.entry_mode(self.state), "separate")
+                        else:
+                            with self.assertRaises(ValueError):
+                                transition.entry_mode(self.state)
+
+    def test_crlf_is_supported_and_nonphysical_controls_refuse(self):
+        with self.host39():
+            self.controller.write_bytes(b'instance_id = "host"\r\nconversation_mode = "separate"\r\n')
+            self.assertEqual(transition.entry_mode(self.state), "separate")
+            for control in ("\r", "\x0b", "\x0c", "\x1c", "\x1d", "\x1e", "\x7f"):
+                with self.subTest(control=repr(control)):
+                    self.controller.write_text('# comment' + control + '[lanes.mail]\nconversation_mode = "unified"\n')
+                    with self.assertRaises(ValueError):
+                        transition.entry_mode(self.state)
+
     def test_transition_record_requires_native_runtime_before_loading_connector(self):
         self.controller.write_text('conversation_mode = "unified"\n')
         for raw in ('{}', '{"state":"prepared"}', '{"state":"confirmed"}'):
@@ -134,6 +164,14 @@ else:
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('explicit adapter transition', result.stderr)
         self.assertEqual(box.calls(), calls)
+        for separator in ("\u0085", "\u2028", "\u2029"):
+            with self.subTest(hidden_header=repr(separator)):
+                (box.state / 'controller.toml').write_text('# comment' + separator + '[lanes.mail]\nconversation_mode = "unified"\n')
+                result = box.run('interactive-launch', *surface.NATIVE)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('explicit adapter transition', result.stderr)
+                self.assertIsNone(box.interactive())
+                self.assertEqual(box.calls(), calls)
         (box.state / transition.RECORD).write_text('{"state":"confirmed"}')
         result = box.run('interactive-launch', *surface.NATIVE)
         self.assertNotEqual(result.returncode, 0)
