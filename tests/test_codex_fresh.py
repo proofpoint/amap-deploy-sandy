@@ -769,6 +769,41 @@ class FreshBirthTest(unittest.TestCase):
         self.assertEqual(fresh.read_json(state / fresh.BIRTH)["identity"], self.born["identity"])
         self.assertFalse((state / "journal.sqlite3").exists())
 
+    def test_installed_inspect_validates_ready_binding_without_source_checkout_imports(self):
+        home = self.root / "installed-home"
+        prov.install_feature_payload(home, prov.DEFAULT_CONNECTOR_SRC, dry_run=False,
+                                     codex_src=_workspace.CODEX_CONNECTOR_ROOT)
+        self.payload = prov.feature_payload_dir(home) / "codex"
+        self.context["payload"] = str(self.payload)
+        self.prepare()
+        self.select()
+        other = self.root / "unrelated"
+        other.mkdir()
+        bootstrap = """import pathlib, sys
+payload = pathlib.Path(sys.argv[1])
+sys.path[:0] = [str(payload), str(payload / 'src')]
+import codex_fresh
+raise SystemExit(codex_fresh.main(['--state', sys.argv[2], '--payload', str(payload), 'inspect']))
+"""
+        with self.runtime():
+            async def check():
+                service = fresh.service_class()(fresh.config_at(self.state), self.state / "controller.toml")
+                try:
+                    await service.start()
+                    result = subprocess.run([sys.executable, "-I", "-S", "-c", bootstrap,
+                                             str(self.payload), str(self.state)],
+                                            env=self.env, cwd=other, capture_output=True,
+                                            text=True, timeout=10)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    inspected = json.loads(result.stdout)
+                    self.assertTrue(inspected["ready"])
+                    self.assertEqual(inspected["canonical_thread_id"], service.journal.thread_id)
+                    self.assertEqual(self.protocol.starts, 1)
+                    self.assertEqual(self.protocol.model_requests, 0)
+                finally:
+                    await service.close()
+            asyncio.run(check())
+
 
     def test_production_run_loop_pause_and_read_gap_hold_without_closing_active_backend(self):
         import codex_transition as transition
@@ -1061,6 +1096,30 @@ class FreshBirthTest(unittest.TestCase):
 
 
 class FreshHostBoundaryTest(unittest.TestCase):
+    def test_installed_readiness_imports_on_host_without_checkout_or_site_packages(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            prov.install_feature_payload(root / "home", prov.DEFAULT_CONNECTOR_SRC, dry_run=False,
+                                         codex_src=_workspace.CODEX_CONNECTOR_ROOT)
+            installed = prov.feature_payload_dir(root / "home") / "codex"
+            other = root / "unrelated"
+            other.mkdir()
+            bootstrap = """import json, pathlib, sys
+payload = pathlib.Path(sys.argv[1])
+sys.path[:0] = [str(payload), str(payload / 'src')]
+import codex_fresh
+problems = codex_fresh.evidence_problems(pathlib.Path(sys.argv[2]), {})
+assert problems, 'missing state must remain unknown'
+import codex_unified_status
+assert pathlib.Path(codex_unified_status.__file__).parent == payload
+print(json.dumps(problems))
+"""
+            result = subprocess.run([sys.executable, "-I", "-S", "-c", bootstrap,
+                                     str(installed), str(root / "absent")],
+                                    cwd=other, capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("fresh unified evidence unavailable", result.stdout)
+
     def test_shipped_wrapper_validates_empty_and_unknown_modes_before_mixed_bypass(self):
         import test_codex_interactive as surface
         box = surface._Sandbox(self)

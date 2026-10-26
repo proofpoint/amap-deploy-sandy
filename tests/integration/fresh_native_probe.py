@@ -19,7 +19,10 @@ from unittest import mock
 
 
 async def probe(args):
-    sys.path[:0] = [str(args.adapter), str(args.connector / 'src'),
+    runtime_src = args.adapter / 'src'
+    if not (runtime_src / 'amap_codex').is_dir():
+        runtime_src = args.connector / 'src'
+    sys.path[:0] = [str(args.adapter), str(runtime_src),
                    str(args.connector / 'tests/integration')]
     import codex_assets as assets
     import codex_fleet as fleet
@@ -42,7 +45,7 @@ async def probe(args):
                        original.trusted_config_file, dry_run=False)
         env = dict(provider.env, CODEX_MODEL='synthetic-model',
                    SANDY_SKIP_PERMISSIONS='true',
-                   PYTHONPATH=str(args.connector / 'src'))
+                   PYTHONPATH=str(runtime_src))
         env[fleet.EXPORT] = 'unified'
         env.update(AMAP_INBOX_DIR=str(root / 'mail'),
                    AMAP_PEER_DIR=str(root / 'peer'),
