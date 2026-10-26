@@ -24,6 +24,7 @@ records the final `exec` instead of running it.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
 import stat
@@ -37,6 +38,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 HERE = Path(__file__).resolve().parents[1]
+LEGACY_RELAY_BASELINE = "8346e9d7beb030bff5a7fd1b8f52830f77e3a972"
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 import _workspace  # noqa: E402
@@ -469,8 +471,16 @@ esac
 
     def test_first_upgrade_bootstrap_runs_without_adapter_imports_and_new_relay_holds(self):
         original_relay = (self.payload / "codex/relay").read_text()
-        old = subprocess.check_output(["git", "-C", str(HERE), "show",
-            "7c4b766fcb9947fe39fc2c78b9a58ff43a55207c:payload/codex/relay"], text=True)
+        fixture = HERE / "tests/fixtures/codex-separate-relay.sh"
+        binding = json.loads(fixture.with_suffix(".json").read_text())
+        raw = fixture.read_bytes()
+        self.assertEqual(binding["baseline_commit"], LEGACY_RELAY_BASELINE)
+        self.assertEqual(binding["git_mode"], "100755")
+        self.assertEqual(binding["path"], "payload/codex/relay")
+        self.assertEqual(hashlib.sha256(raw).hexdigest(), binding["sha256"])
+        self.assertEqual(hashlib.sha1(b"blob " + str(len(raw)).encode() + b"\0" + raw).hexdigest(),
+                         binding["git_blob"])
+        old = raw.decode()
         old = old.replace(SESSION_LINE, "SANDY_SESSION_FILE=" + str(self.root / "sandy-session.json"))
         (self.payload / "codex/relay").write_text(old)
         (self.root / "logged-in").write_text("")
