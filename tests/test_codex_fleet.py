@@ -46,7 +46,10 @@ class FleetChoiceTest(unittest.TestCase):
         self.assertEqual(doc["feature"][fleet.POLICY_KEY], "unified")
         self.assertEqual(doc["expose"][fleet.EXPORT], "unified")
         self.assertEqual(doc[prov.AGENT_WRAPPER_KEY]["codex"], "payload/codex/interactive-launch")
-        self.assertEqual(doc[fp.AGENTS_KEY], fp.selection(self.policy)[fp.AGENTS_KEY])
+        self.assertIn("codex", doc[fp.AGENTS_KEY]["include"])
+        self.assertIn("claude", doc[fp.AGENTS_KEY]["include"])
+        self.assertNotIn("codex", self.policy[fp.AGENTS_KEY]["include"])
+        self.assertEqual(doc[fp.AGENTS_KEY]["exclude"], self.policy[fp.AGENTS_KEY]["exclude"])
 
     def test_explicit_install_choice_previews_then_authors_only_its_field(self):
         self.policy["unrelated_operator_policy"] = {"retain": ["literal"]}
@@ -69,6 +72,16 @@ class FleetChoiceTest(unittest.TestCase):
         saved = path.read_bytes()
         prov.install_manifest(self.home, loaded, dry_run=False, agent_wrapper=True)
         self.assertEqual(path.read_bytes(), saved)
+
+    def test_explicit_unified_choice_adds_codex_once_and_preserves_authored_exclusions(self):
+        self.policy[fp.AGENTS_KEY]["exclude"] = ["retained-agent-pattern"]
+        self.policy[fp.SANDBOXES_KEY]["exclude"] = ["retained-workspace-pattern"]
+        chosen = fleet.select(self.policy, "unified")
+        self.assertEqual(chosen[fp.AGENTS_KEY]["include"].count("codex"), 1)
+        self.assertEqual(fleet.select(chosen, "unified"), chosen)
+        self.assertEqual(chosen[fp.AGENTS_KEY]["exclude"], ["retained-agent-pattern"])
+        self.assertEqual(chosen[fp.SANDBOXES_KEY], self.policy[fp.SANDBOXES_KEY])
+        self.assertNotIn("codex", self.policy[fp.AGENTS_KEY]["include"])
 
     def test_manifest_drift_reports_an_export_disagreeing_with_authored_choice(self):
         policy = fleet.select(self.policy, "unified")

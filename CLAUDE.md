@@ -312,10 +312,21 @@ connector's `docs/DESIGN.md` §1.2.
   codex-cli 0.160.1 and 0.161.0), so the lane exports travel through `env_vars` and
   the wrappers beside it translate them. The connector refuses to dispatch
   unless a thread's effective registry is exactly these three servers.
+- **Fresh unified mode is an explicit fleet choice**: `install --codex-mode
+  unified` authors `codex_conversation_mode`, includes Codex in agent selection
+  while retaining exclusions, and renders the choice into the manifest exports.
+  Other hosts keep separate mode. A fresh birth is distinct from adoption:
+  private state and local empty mailboxes precede controller publication, full
+  native argv preselection precedes service startup, and the connector's real
+  canonical binding plus readiness precede attachment. Unknown or retained
+  state holds; no migration, history deletion or fabricated journal is automatic.
+  The adapter uses the existing core scheduler. Router reset and target-host
+  lifecycle acceptance remain operator work.
 - **Separate supervisors use the native model**: `model` in the native
   `CODEX_HOME/config.toml` (normally `~/.codex/config.toml`), then Codex's
   default. `CODEX_MODEL` reaches the pane without overriding a separate
-  supervisor. The policy and manifest carry no model. Explicit unified
+  supervisor. A separate model change takes effect when the supervisor next
+  starts. The policy and manifest carry no model. Explicit unified
   preparation and entry share the pane selection: nonempty forwarded
   `CODEX_MODEL`, then the native config model, then Codex's default. An
   established unified instance holds a conflicting selection for an explicit

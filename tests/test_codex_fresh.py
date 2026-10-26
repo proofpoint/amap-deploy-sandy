@@ -8,6 +8,8 @@ import json
 import os
 from pathlib import Path
 import shutil
+import shlex
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -163,6 +165,97 @@ class FreshBirthTest(unittest.TestCase):
                 if name:
                     (other / name).unlink()
 
+    def test_retained_mailbox_work_blocks_first_birth_but_new_work_after_birth_is_retained(self):
+        notice = Path(self.env["AMAP_INBOX_DIR"]) / "notices" / "retained.json"
+        notice.write_bytes(b"retained work; never replay automatically")
+        other = self.root / "b"
+        with self.assertRaisesRegex(ValueError, "retained mailbox entries"):
+            fresh.birth(other, self.session, self.env)
+        self.assertFalse(other.exists())
+        self.assertEqual(notice.read_bytes(), b"retained work; never replay automatically")
+        self.assertEqual(fresh.birth(self.state, self.session, self.env), self.born)
+        self.assertEqual(notice.read_bytes(), b"retained work; never replay automatically")
+        notice.unlink()
+        target = self.root / "outside"
+        target.mkdir()
+        (Path(self.env["AMAP_OUTBOX_DIR"]) / "link").symlink_to(target, target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, "retained mailbox entries"):
+            fresh.birth(other, self.session, self.env)
+        self.assertEqual(list(target.iterdir()), [])
+
+    def test_partial_birth_cannot_enter_the_legacy_separate_helper(self):
+        import codex_transition as transition
+        for mode in (None, "separate"):
+            with self.subTest(mode=mode), mock.patch.dict(os.environ):
+                if mode is None:
+                    os.environ.pop(fleet.EXPORT, None)
+                else:
+                    os.environ[fleet.EXPORT] = mode
+                with self.assertRaisesRegex(ValueError, "cannot enter"):
+                    transition.entry_mode(self.state)
+        separate = self.root / "legacy"
+        separate.mkdir(mode=0o700)
+        self.assertEqual(transition.entry_mode(separate), "separate")
+        self.assertEqual(list(separate.iterdir()), [])
+
+    def test_shipped_separate_or_absent_mode_preserves_partial_fresh_birth_without_renderer(self):
+        home = self.root / "h"
+        prov.install_feature_payload(home, prov.DEFAULT_CONNECTOR_SRC, dry_run=False,
+                                     codex_src=_workspace.CODEX_CONNECTOR_ROOT)
+        installed = prov.feature_payload_dir(home) / "codex"
+        session = self.root / "session.json"
+        session.write_text(json.dumps(self.session))
+        relay = installed / "relay"
+        relay.write_text(relay.read_text().replace("SANDY_SESSION_FILE=/etc/sandy-session.json",
+                                                  "SANDY_SESSION_FILE=" + str(session)))
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir()
+        (bin_dir / "codex").write_text("#!/bin/sh\necho called >> \"$NATIVE_CALLS\"\ncase \"$1\" in\n"
+            "login) exit 0 ;;\n--version) echo 'codex-cli 0.164.0'; exit 0 ;;\n*) exit 9 ;;\nesac\n")
+        (bin_dir / "python3").write_text("#!/bin/sh\nif [ \"$1\" = -m ] && [ \"$2\" = amap_codex.cli ]; then "
+            "echo legacy >> \"$LEGACY_RUNS\"; exit 0; fi\nexec " + shlex.quote(sys.executable) + " \"$@\"\n")
+        for name in ("codex", "python3"):
+            (bin_dir / name).chmod(0o755)
+        case = 0
+        for with_plan in (False, True):
+            for mode in (None, "separate", "", "foreign"):
+                with self.subTest(plan=with_plan, mode=mode):
+                    parent = self.root / ("e" + str(case))
+                    parent.mkdir()
+                    state = parent / "codex"
+                    calls = self.root / ("calls" + str(case))
+                    legacy = self.root / ("runs" + str(case))
+                    case += 1
+                    fresh.birth(state, self.session, self.env)
+                    if with_plan:
+                        (state / fresh.PLAN).write_text("{}")
+                    env = dict(self.env, PATH=str(bin_dir) + os.pathsep + self.env["PATH"],
+                               SANDY_FEATURE_STATE=str(parent), SANDY_AGENT="codex", NATIVE_CALLS=str(calls),
+                               LEGACY_RUNS=str(legacy))
+                    if mode is None:
+                        env.pop(fleet.EXPORT, None)
+                    else:
+                        env[fleet.EXPORT] = mode
+                    before = {p.name: p.read_bytes() for p in state.iterdir()}
+                    log = self.root / "entry-error"
+                    with log.open("w") as error:
+                        proc = subprocess.Popen(["/bin/sh", str(relay)], cwd=self.root, env=env,
+                                                stdout=subprocess.DEVNULL, stderr=error, start_new_session=True)
+                        try:
+                            until = time.monotonic() + 3
+                            expected = "unknown fleet conversation mode" if mode in {"", "foreign"} else "cannot downgrade"
+                            while time.monotonic() < until and expected not in log.read_text() and proc.poll() is None:
+                                time.sleep(.02)
+                            self.assertIsNone(proc.poll())
+                            self.assertIn(expected, log.read_text())
+                            self.assertEqual({p.name: p.read_bytes() for p in state.iterdir()}, before)
+                            self.assertFalse(calls.exists())
+                            self.assertFalse(legacy.exists())
+                        finally:
+                            if proc.poll() is None:
+                                os.killpg(proc.pid, signal.SIGTERM)
+                            proc.wait(timeout=5)
+
     def test_foreign_birth_and_unexplained_files_cannot_get_a_controller(self):
         (self.state / "unexplained").write_bytes(b"retain")
         with self.assertRaisesRegex(ValueError, "unexplained"):
@@ -206,6 +299,11 @@ class FreshBirthTest(unittest.TestCase):
         self.select()
         fresh.selection_guard(self.state, self.env)
         self.assertFalse((self.state / "journal.sqlite3").exists())
+        inspected = fresh.inspect(self.state, self.env)
+        self.assertFalse(inspected["ready"])
+        self.assertIsNone(inspected["canonical_thread_id"])
+        self.assertEqual(inspected["initialization_phase"], "prepared")
+        self.assertFalse((self.state / "journal.sqlite3").exists())
         with self.assertRaisesRegex(ValueError, "not readiness"):
             fresh.require_initialized(self.state, self.env)
         for suffix in (["resume", "--last"], ["resume", str(uuid.uuid4())]):
@@ -233,6 +331,15 @@ class FreshBirthTest(unittest.TestCase):
         (self.state / fresh.SELECTION).write_text(json.dumps(receipt))
         with self.assertRaisesRegex(ValueError, "another environment"):
             fresh.selection_guard(self.state, self.env)
+
+    def test_forged_birth_kind_cannot_publish_configuration(self):
+        value = fresh.read_json(self.state / fresh.BIRTH)
+        value["kind"] = "foreign"
+        (self.state / fresh.BIRTH).write_text(json.dumps(value))
+        with self.assertRaisesRegex(ValueError, "birth evidence is malformed"):
+            self.prepare()
+        self.assertFalse((self.state / "controller.toml").exists())
+        self.assertFalse((self.state / fresh.PLAN).exists())
 
     def test_full_argv_and_policy_drift_guards_fire(self):
         self.prepare()
@@ -282,6 +389,9 @@ class FreshBirthTest(unittest.TestCase):
                         plan, config, bound = fresh.require_initialized(self.state, self.env)
                         self.assertEqual(bound["thread_id"], self.protocol.thread)
                         self.assertEqual(fresh.evidence_problems(self.state, service.status), [])
+                        inspected = fresh.inspect(self.state, self.env)
+                        self.assertTrue(inspected["ready"])
+                        self.assertEqual(inspected["canonical_thread_id"], self.protocol.thread)
                         self.assertEqual(service.journal.db.execute("SELECT COUNT(*) FROM events").fetchone()[0], 0)
                         self.assertEqual(self.protocol.model_requests, 0)
                         await service.tick()
@@ -302,11 +412,14 @@ class FreshBirthTest(unittest.TestCase):
                 first = kind(fresh.config_at(self.state), self.state / "controller.toml")
                 try:
                     with mock.patch.object(fresh, "finalize", side_effect=OSError("fixture lost adapter receipt")):
-                        with self.assertRaisesRegex(OSError, "lost adapter receipt"):
-                            await first.start()
+                        await first.start()
+                    self.assertFalse(first.stop_requested.is_set())
+                    self.assertIsNone(first.backend.process.returncode)
+                    self.assertFalse(first.gate.accepting)
                 finally:
                     await first.close()
                 self.assertEqual(fresh.read_json(self.state / fresh.INITIALIZATION)["phase"], "start_attempted")
+                fresh.select_pane(self.state, NATIVE + ["resume", "--last"], self.env)
                 second = kind(fresh.config_at(self.state), self.state / "controller.toml")
                 try:
                     await second.start()
@@ -360,6 +473,113 @@ class FreshBirthTest(unittest.TestCase):
         self.assertFalse((state / "journal.sqlite3").exists())
 
 
+    def test_production_run_loop_pause_and_read_gap_hold_without_closing_active_backend(self):
+        import codex_transition as transition
+        self.prepare()
+        self.select()
+        with self.runtime():
+            self.protocol.active = True
+            async def check():
+                service = fresh.service_class()(fresh.config_at(self.state), self.state / "controller.toml")
+                task = asyncio.create_task(service.run())
+                try:
+                    until = time.monotonic() + 5
+                    while time.monotonic() < until and fresh.read_json(self.state / fresh.INITIALIZATION)["phase"] != "initialized":
+                        await asyncio.sleep(.02)
+                    self.assertEqual(fresh.read_json(self.state / fresh.INITIALIZATION)["phase"], "initialized")
+                    transition.pause(self.state, "Fixture active work remains owned", apply=True)
+                    await asyncio.sleep(1.1)
+                    self.assertFalse(task.done(), "pause ended the production run loop")
+                    self.assertFalse(service.stop_requested.is_set())
+                    self.assertIsNone(service.backend.process.returncode)
+                    self.assertFalse(self.protocol.closed)
+                    self.assertFalse(service.gate.accepting)
+                    self.assertEqual(service.status["readiness"]["state"], "holding")
+                    self.assertIn("maintenance pause", service.status["last_error"])
+                    (self.state / "adapter-pause.json").unlink()
+                    receipt = self.state / fresh.SELECTION
+                    raw = receipt.read_bytes()
+                    receipt.unlink()
+                    await asyncio.sleep(1.1)
+                    self.assertFalse(task.done(), "missing observation killed owned work")
+                    self.assertFalse(service.stop_requested.is_set())
+                    self.assertIsNone(service.backend.process.returncode)
+                    self.assertFalse(self.protocol.closed)
+                    self.assertFalse(service.gate.accepting)
+                    receipt.write_bytes(raw)
+                    await asyncio.sleep(1.1)
+                    self.assertFalse(task.done())
+                    self.assertEqual(self.protocol.starts, 1)
+                    self.assertEqual(service.status["scheduler_state"], "active")
+                finally:
+                    service.stop_requested.set()
+                    await asyncio.gather(task, return_exceptions=True)
+            asyncio.run(check())
+
+    def test_failed_holding_publication_does_not_close_owned_backend(self):
+        self.prepare()
+        self.select()
+        with self.runtime():
+            async def check():
+                import amap_codex.supervisor as supervisor
+                service = fresh.service_class()(fresh.config_at(self.state), self.state / "controller.toml")
+                try:
+                    await service.start()
+                    (self.state / "adapter-pause.json").write_text("{}")
+                    with mock.patch.object(supervisor, "atomic_json", side_effect=OSError("fixture status write unavailable")):
+                        await service.tick()
+                    self.assertFalse(service.stop_requested.is_set())
+                    self.assertIsNone(service.backend.process.returncode)
+                    self.assertFalse(service.gate.accepting)
+                    self.assertEqual(service.status["readiness"]["state"], "holding")
+                finally:
+                    await service.close()
+            asyncio.run(check())
+
+    def test_host_alias_uses_recorded_runtime_endpoint_namespace(self):
+        self.prepare()
+        self.select()
+        with self.runtime():
+            async def check():
+                service = fresh.service_class()(fresh.config_at(self.state), self.state / "controller.toml")
+                try:
+                    await service.start()
+                    host_alias = self.root / "host-view"
+                    shutil.copytree(self.state, host_alias)
+                    self.assertNotEqual(str(host_alias), str(self.state))
+                    self.assertEqual(fresh.evidence_problems(host_alias, service.status), [])
+                finally:
+                    await service.close()
+            asyncio.run(check())
+
+    def test_existing_pause_controls_resume_only_known_matching_fresh_state(self):
+        import codex_transition as transition
+        self.prepare()
+        self.select()
+        with self.runtime():
+            async def check():
+                service = fresh.service_class()(fresh.config_at(self.state), self.state / "controller.toml")
+                try:
+                    await service.start()
+                finally:
+                    await service.close()
+            asyncio.run(check())
+        canonical = self.protocol.thread
+        before = list(self.protocol.calls)
+        transition.pause(self.state, "Fixture operator maintenance", apply=True)
+        with self.assertRaisesRegex(ValueError, "maintenance pause"):
+            fresh.current_guard(self.state, self.env)
+        transition.unpause(self.state)
+        self.assertTrue((self.state / transition.PAUSE).exists())
+        with mock.patch.dict(os.environ, {"CODEX_MODEL": "foreign"}):
+            with self.assertRaisesRegex(ValueError, "drifted"):
+                transition.unpause(self.state, apply=True)
+        self.assertTrue((self.state / transition.PAUSE).exists())
+        transition.unpause(self.state, apply=True)
+        self.assertFalse((self.state / transition.PAUSE).exists())
+        self.assertEqual(self.protocol.thread, canonical)
+        self.assertEqual(self.protocol.calls, before)
+
     def test_binding_corruption_holds_before_any_more_core_observation(self):
         self.prepare()
         self.select()
@@ -371,8 +591,12 @@ class FreshBirthTest(unittest.TestCase):
                     before = list(self.protocol.calls)
                     with sqlite3.connect(self.state / "journal.sqlite3") as db:
                         db.execute("UPDATE unified_binding SET policy_hash=?", ("b" * 64,))
-                    with self.assertRaisesRegex(ValueError, "initialized binding changed"):
-                        await service.tick()
+                    await service.tick()
+                    self.assertIn("initialized binding changed", service.status["last_error"])
+                    self.assertEqual(service.status["readiness"]["state"], "holding")
+                    self.assertFalse(service.gate.accepting)
+                    self.assertFalse(service.stop_requested.is_set())
+                    self.assertIsNone(service.backend.process.returncode)
                     self.assertEqual(self.protocol.calls, before)
                 finally:
                     await service.close()
@@ -398,8 +622,11 @@ class FreshBirthTest(unittest.TestCase):
                     receipt = fresh.read_json(self.state / fresh.SELECTION)
                     receipt["entry_generation"] = "f" * 32
                     (self.state / fresh.SELECTION).write_text(json.dumps(receipt))
-                    with self.assertRaisesRegex(ValueError, "another environment"):
-                        await service.tick()
+                    await service.tick()
+                    self.assertIn("another environment", service.status["last_error"])
+                    self.assertFalse(service.gate.accepting)
+                    self.assertFalse(service.stop_requested.is_set())
+                    self.assertIsNone(service.backend.process.returncode)
                     self.assertEqual(self.protocol.calls, before)
                 finally:
                     await service.close()
@@ -468,7 +695,97 @@ class FreshBirthTest(unittest.TestCase):
             asyncio.run(check())
 
 
+    def test_shipped_fresh_entry_waits_for_wrapper_argv_and_never_fabricates_readiness(self):
+        home = self.root / "h"
+        prov.install_feature_payload(home, prov.DEFAULT_CONNECTOR_SRC, dry_run=False,
+                                     codex_src=_workspace.CODEX_CONNECTOR_ROOT)
+        installed = prov.feature_payload_dir(home) / "codex"
+        feature_state = self.root / "e"
+        feature_state.mkdir()
+        state = feature_state / "codex"
+        self.assertLessEqual(len(os.fsencode(state / ("u-" + "0" * 32) / "b")), 100)
+        session = self.root / "session.json"
+        session.write_text(json.dumps(self.session))
+        relay = installed / "relay"
+        relay.write_text(relay.read_text().replace("SANDY_SESSION_FILE=/etc/sandy-session.json",
+                                                  "SANDY_SESSION_FILE=" + str(session)))
+        wrapper = installed / "interactive-launch"
+        wrapper.write_text(wrapper.read_text().replace("STATE=/opt/sandy/feature-state/amap/codex",
+                                                       "STATE=" + str(state)))
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir()
+        native_calls = self.root / "native-calls"
+        (bin_dir / "codex").write_text("#!/bin/sh\ncase \"$1\" in\n"
+            "login) exit 0 ;;\n--version) echo 'codex-cli 0.164.0'; exit 0 ;;\n"
+            "*) echo backend >> \"$NATIVE_CALLS\"; exit 9 ;;\nesac\n")
+        (bin_dir / "codex").chmod(0o755)
+        (bin_dir / "python3").write_text("#!/bin/sh\nexec " + shlex.quote(sys.executable) + " \"$@\"\n")
+        (bin_dir / "python3").chmod(0o755)
+        env = dict(self.env, PATH=str(bin_dir) + os.pathsep + self.env["PATH"],
+                   SANDY_FEATURE_STATE=str(feature_state), SANDY_AGENT="codex", NATIVE_CALLS=str(native_calls),
+                   AMAP_CODEX_LAUNCH_WAIT_SECONDS="2")
+        env.pop("AMAP_IDENTITY", None)
+        env.pop("AMAP_IDENTITY_DIR", None)
+        env.pop("AMAP_FLEET_DOMAIN", None)
+        proc = subprocess.Popen(["/bin/sh", str(relay)], cwd=self.root, env=env,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+        try:
+            until = time.monotonic() + 10
+            while time.monotonic() < until and not (state / fresh.REQUEST).exists():
+                if proc.poll() is not None:
+                    self.fail("shipped entry exited before preselection: " + proc.communicate()[1])
+                time.sleep(.05)
+            self.assertTrue((state / fresh.REQUEST).exists())
+            self.assertFalse(native_calls.exists())
+            self.assertFalse((state / "journal.sqlite3").exists())
+            self.assertEqual(fresh.read_json(state / fresh.INITIALIZATION)["phase"], "prepared")
+            result = subprocess.run(["/bin/sh", str(wrapper), *NATIVE], cwd=self.root, env=env,
+                                    capture_output=True, text=True, timeout=10)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("fresh canonical attachment remains held", result.stderr)
+            self.assertTrue((state / fresh.SELECTION).exists())
+            until = time.monotonic() + 5
+            while time.monotonic() < until and not native_calls.exists():
+                time.sleep(.05)
+            self.assertEqual(native_calls.read_text().splitlines(), ["backend"])
+            self.assertEqual(fresh.read_json(state / fresh.INITIALIZATION)["phase"], "start_attempted")
+            self.assertFalse((state / "adapter-transition.json").exists())
+            time.sleep(1.1)
+            self.assertEqual(native_calls.read_text().splitlines(), ["backend"])
+        finally:
+            if proc.poll() is None:
+                os.killpg(proc.pid, signal.SIGTERM)
+            try:
+                proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.communicate()
+
+
 class FreshHostBoundaryTest(unittest.TestCase):
+    def test_shipped_wrapper_validates_empty_and_unknown_modes_before_mixed_bypass(self):
+        import test_codex_interactive as surface
+        box = surface._Sandbox(self)
+        for agents in ("codex", "claude,codex"):
+            for mode in ("", "foreign"):
+                with self.subTest(agents=agents, mode=mode):
+                    result = box.run("interactive-launch", "/bin/echo", "UNWRAPPED", SANDY_AGENT=agents,
+                                     AMAP_CODEX_CONVERSATION_MODE=mode)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("unknown fleet conversation mode", result.stderr)
+                    self.assertNotIn("UNWRAPPED", result.stdout)
+        for mode in (None, "separate"):
+            extra = {} if mode is None else {fleet.EXPORT: mode}
+            result = box.run("interactive-launch", "/bin/echo", "LEGACY", SANDY_AGENT="claude,codex", **extra)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), "LEGACY")
+        result = box.run("interactive-launch", "/bin/echo", "UNWRAPPED", SANDY_AGENT="claude,codex",
+                         AMAP_CODEX_CONVERSATION_MODE="unified")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("does not support", result.stderr)
+        self.assertNotIn("UNWRAPPED", result.stdout)
+
+
     def test_host_can_import_and_report_unknown_without_connector_or_native_toml(self):
         import builtins
         real = builtins.__import__

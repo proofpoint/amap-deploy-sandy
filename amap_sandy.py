@@ -1408,6 +1408,8 @@ def install_manifest(home: Path, policy: Dict[str, Any], *, dry_run: bool,
             feature = dict(doc.get("feature", {}))
             feature[cf.POLICY_KEY] = cf.mode(cf.select(policy, codex_mode))
             doc["feature"] = feature
+            if codex_mode == "unified":
+                doc[fp.AGENTS_KEY] = policy[fp.AGENTS_KEY]
         want = json.dumps(doc, indent=2) + "\n"
     else:
         want = manifest_text(policy, receives=receives, agent_wrapper=agent_wrapper)

@@ -20,5 +20,14 @@ def select(policy, requested):
     selected = dict(policy)
     if requested is not None:
         selected[POLICY_KEY] = requested
+    if requested == "unified":
+        agents = selected.get("agents")
+        if not isinstance(agents, dict) or not isinstance(agents.get("include"), list):
+            raise ValueError("explicit unified choice requires the loaded fleet agent selection")
+        agents = dict(agents)
+        agents["include"] = list(agents["include"])
+        if "codex" not in agents["include"]:
+            agents["include"].append("codex")
+        selected["agents"] = agents
     mode(selected)
     return selected
