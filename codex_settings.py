@@ -161,6 +161,8 @@ def validate_native_argv(config, thread, argv):
         raise ValueError("startup native executable/profile/configuration must match the protected backend")
     if Path(cwd).resolve() != Path(config.cwd).resolve():
         raise ValueError("startup native workspace differs")
+    if resume and not thread:
+        raise ValueError("startup resume requires an already owned canonical history")
     if resume and resume[0] != "--last" and resume[0].lower() != thread.lower():
         raise ValueError("startup resume selects another history")
     index, seen = 0, set()

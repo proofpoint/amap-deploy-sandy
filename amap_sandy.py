@@ -1083,7 +1083,9 @@ def codex_payload_sources(codex_src: Path) -> Tuple[Tuple[str, Path, bool], ...]
     sub = CODEX_PAYLOAD_SUBDIR
     parts = [(f"{sub}/{name}", PAYLOAD_DIR / sub / name, executable)
              for name, executable in CODEX_PAYLOAD_FILES]
-    parts += [(f"{sub}/codex_assets.py", Path(__file__).parent / "codex_assets.py", False),
+    parts += [(f"{sub}/codex_fleet.py", Path(__file__).parent / "codex_fleet.py", False),
+              (f"{sub}/codex_fresh.py", Path(__file__).parent / "codex_fresh.py", False),
+              (f"{sub}/codex_assets.py", Path(__file__).parent / "codex_assets.py", False),
               (f"{sub}/codex_settings.py", Path(__file__).parent / "codex_settings.py", False),
               (f"{sub}/codex_bootstrap_pause.py", Path(__file__).parent / "codex_bootstrap_pause.py", False),
               (f"{sub}/codex_transition.py", Path(__file__).parent / "codex_transition.py", False),
@@ -2435,6 +2437,7 @@ def verify_selection(slug: str, box: Optional[dict]) -> List[str]:
 
 
 def verify_feature_env(slug: str, container: str, *, fleet_domain: Optional[str],
+                       codex_mode: Optional[str] = None,
                        docker_bin: str = "docker") -> List[str]:
     """The manifest's exports, read back from the RUNNING container's
     environment — the only in-container evidence a feature was applied at
@@ -2463,6 +2466,10 @@ def verify_feature_env(slug: str, container: str, *, fleet_domain: Optional[str]
                         f"{EXPOSE_FLEET_DOMAIN}={env.get(EXPOSE_FLEET_DOMAIN)!r}, the policy "
                         f"declares {fleet_domain!r} — the wrapper computes the daemon's address "
                         f"from the former; relaunch after install --apply")
+    if codex_mode is not None and env.get(cf.EXPORT, "separate") != codex_mode:
+        problems.append(f"Codex fleet mode drift: {slug}: running export disagrees with authored "
+                        f"{cf.POLICY_KEY}; relaunch after the explicit fleet installation")
+
     return problems
 
 
@@ -2759,7 +2766,8 @@ def codex_state_dir(record: Optional[dict]) -> Optional[Path]:
 
 
 def verify_codex_supervisor(home: Path, slug: str, record: Optional[dict], *,
-                            running: bool, now: Optional[float] = None) -> Tuple[List[str], List[str]]:
+                            running: bool, now: Optional[float] = None,
+                            expected_mode: str = "separate") -> Tuple[List[str], List[str]]:
     """`(problems, notes)` for a sandbox the Codex supervisor serves
     (`serving_connector`), read host-side from the files the supervisor and
     its relay keep in the entry's state directory.
@@ -2803,7 +2811,14 @@ def verify_codex_supervisor(home: Path, slug: str, record: Optional[dict], *,
         return problems, notes
     if os.path.lexists(state / "adapter-pause.json"):
         problems.append(f"codex supervisor holding: {slug}: explicit operator maintenance pause; inspect adapter-pause.json")
-    if os.path.lexists(state / "adapter-transition.json") or (isinstance(status, dict) and status.get("mode") == "unified"):
+    fresh_birth = os.path.lexists(state / "fresh-birth.json")
+    if expected_mode == "unified" and not fresh_birth:
+        problems.append(f"codex unified HOLD: {slug}: fleet mode requires fresh initialization; "
+                        f"operator recreation is required for legacy or unknown state; nothing is automatically erased")
+    if fresh_birth and expected_mode != "unified":
+        problems.append(f"codex unified HOLD: {slug}: authored fleet mode differs from the fresh instance; "
+                        f"no automatic downgrade is allowed")
+    if fresh_birth or os.path.lexists(state / "adapter-transition.json") or (isinstance(status, dict) and status.get("mode") == "unified"):
         problems += [f"codex unified UNKNOWN: {slug}: {reason}" for reason in cus.problems(state, status, now=now)]
         model_note = cus.selection_note(state)
         if model_note is not None:
@@ -3554,7 +3569,7 @@ def run_verify(args: argparse.Namespace, servers: Dict[str, dict], home: Path,
         # own state stands in for both (verify_codex_supervisor).
         if connector == AGENT_CODEX:
             _codex_problems, _codex_notes = verify_codex_supervisor(
-                home, slug, records.get(slug), running=slug in running)
+                home, slug, records.get(slug), running=slug in running, expected_mode=cf.mode(policy))
             problems += _codex_problems
             notes += _codex_notes
         else:
@@ -3581,7 +3596,8 @@ def run_verify(args: argparse.Namespace, servers: Dict[str, dict], home: Path,
             problems += verify_feature_mount(home, slug, running[slug])
             problems += verify_roster_mount(home, slug, running[slug])
             problems += verify_feature_env(slug, running[slug],
-                                           fleet_domain=policy.get(fp.FLEET_DOMAIN_KEY))
+                                           fleet_domain=policy.get(fp.FLEET_DOMAIN_KEY),
+                                           codex_mode=cf.mode(policy))
             if connector != AGENT_CODEX:
                 problems += verify_relay_alive(sandbox_dir, slug, container=running[slug])
 
