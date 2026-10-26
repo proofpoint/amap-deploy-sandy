@@ -369,11 +369,11 @@ way as to any agent: ask alpha to task gamma's address.
 
 ### Experimental unified conversation: existing-instance transition
 
-This procedure is an engineering draft. The local candidate pin is the reviewed
-connector commit `8496849064283c58a12abf0c1c4355f1bcfeed0a`; it remains an
-unmerged engineering candidate. The final merged pin, the operator's model
-precedence decision, actual-host acceptance and the paused-restart command
-contract are still required before end-to-end execution.
+The Codex pin names merged connector main commit
+`e10eb2cf22a1056d1506938ef0669bfde582ff75`. Before end-to-end execution,
+require the approved deployment commit for the host's line, full exact-pin
+suite and canary evidence, the operator's unified-model precedence decision,
+and actual-host acceptance of the paused-restart procedure below.
 The default remains separate. Installing new payload files selects no instance
 for unified mode. No command here merges two saved conversations.
 
