@@ -12,6 +12,7 @@ import sys
 import time
 
 import codex_assets as assets
+import codex_fleet as fleet
 
 RECEIPT = "entry-settings.json"
 STARTUP = "pane-startup.json"
@@ -74,6 +75,8 @@ def require_unified_permissions(selection, config):
 
 def entry_selection(env, state):
     """Separate entry keeps native config selection; explicit transitions share the pane."""
+    if any(os.path.lexists(path) for path in fleet.fresh_markers(state, env.get("AMAP_OUTBOX_DIR"))):
+        raise ValueError("fresh unified state uses its protected fresh settings path; no separate capture")
     if os.path.lexists(state / "adapter-transition.json"):
         return resolve(env)
     import tomllib
@@ -161,6 +164,8 @@ def validate_native_argv(config, thread, argv):
         raise ValueError("startup native executable/profile/configuration must match the protected backend")
     if Path(cwd).resolve() != Path(config.cwd).resolve():
         raise ValueError("startup native workspace differs")
+    if resume and not thread:
+        raise ValueError("startup resume requires an already owned canonical history")
     if resume and resume[0] != "--last" and resume[0].lower() != thread.lower():
         raise ValueError("startup resume selects another history")
     index, seen = 0, set()
