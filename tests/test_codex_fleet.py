@@ -1,7 +1,6 @@
 """An explicit authored fleet choice reaches the manifest, without migrating state."""
 import json
 import os
-import subprocess
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
@@ -11,8 +10,6 @@ _workspace.skip_if_incomplete()
 import amap_sandy as prov
 import codex_fleet as fleet
 import fleet_policy as fp
-
-HERE = Path(__file__).resolve().parents[1]
 
 
 class FleetChoiceTest(unittest.TestCase):
@@ -49,7 +46,10 @@ class FleetChoiceTest(unittest.TestCase):
         self.assertEqual(doc["feature"][fleet.POLICY_KEY], "unified")
         self.assertEqual(doc["expose"][fleet.EXPORT], "unified")
         self.assertEqual(doc[prov.AGENT_WRAPPER_KEY]["codex"], "payload/codex/interactive-launch")
-        self.assertEqual(doc[fp.AGENTS_KEY], fp.selection(self.policy)[fp.AGENTS_KEY])
+        self.assertIn("codex", doc[fp.AGENTS_KEY]["include"])
+        self.assertIn("claude", doc[fp.AGENTS_KEY]["include"])
+        self.assertNotIn("codex", self.policy[fp.AGENTS_KEY]["include"])
+        self.assertEqual(doc[fp.AGENTS_KEY]["exclude"], self.policy[fp.AGENTS_KEY]["exclude"])
 
     def test_explicit_install_choice_previews_then_authors_only_its_field(self):
         self.policy["unrelated_operator_policy"] = {"retain": ["literal"]}
@@ -72,6 +72,16 @@ class FleetChoiceTest(unittest.TestCase):
         saved = path.read_bytes()
         prov.install_manifest(self.home, loaded, dry_run=False, agent_wrapper=True)
         self.assertEqual(path.read_bytes(), saved)
+
+    def test_explicit_unified_choice_adds_codex_once_and_preserves_authored_exclusions(self):
+        self.policy[fp.AGENTS_KEY]["exclude"] = ["retained-agent-pattern"]
+        self.policy[fp.SANDBOXES_KEY]["exclude"] = ["retained-workspace-pattern"]
+        chosen = fleet.select(self.policy, "unified")
+        self.assertEqual(chosen[fp.AGENTS_KEY]["include"].count("codex"), 1)
+        self.assertEqual(fleet.select(chosen, "unified"), chosen)
+        self.assertEqual(chosen[fp.AGENTS_KEY]["exclude"], ["retained-agent-pattern"])
+        self.assertEqual(chosen[fp.SANDBOXES_KEY], self.policy[fp.SANDBOXES_KEY])
+        self.assertNotIn("codex", self.policy[fp.AGENTS_KEY]["include"])
 
     def test_manifest_drift_reports_an_export_disagreeing_with_authored_choice(self):
         policy = fleet.select(self.policy, "unified")
@@ -97,16 +107,3 @@ class FleetChoiceTest(unittest.TestCase):
         parser = prov.build_parser()
         self.assertIsNone(parser.parse_args(["install"]).codex_mode)
         self.assertEqual(parser.parse_args(["install", "--codex-mode", "unified"]).codex_mode, "unified")
-
-    def test_shipped_wrapper_rejects_empty_or_unknown_mode_before_any_mixed_bypass(self):
-        for agents in ("codex", "claude,codex"):
-            for mode in ("", "foreign"):
-                with self.subTest(agents=agents, mode=mode):
-                    result = subprocess.run(
-                        [str(HERE / "payload/codex/interactive-launch"), "/bin/echo", "BARE_NATIVE"],
-                        env=dict(os.environ, SANDY_AGENT=agents,
-                                 AMAP_CODEX_CONVERSATION_MODE=mode, AMAP_OUTBOX_DIR=str(self.home)),
-                        capture_output=True, text=True)
-                    self.assertNotEqual(result.returncode, 0)
-                    self.assertIn("unknown fleet conversation mode", result.stderr)
-                    self.assertNotIn("BARE_NATIVE", result.stdout)

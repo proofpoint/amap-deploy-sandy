@@ -8,6 +8,7 @@ import sqlite3
 import time
 
 import codex_assets as assets
+import codex_fleet as fleet
 import codex_settings as settings
 
 REQUIRED = {"backend_live", "canonical_binding", "configuration_matches", "protected_tools",
@@ -117,7 +118,7 @@ def evidence_problems(status, descriptor, record, binding, *, now):
 
 def problems(state, status, *, now=None):
     state = Path(state)
-    if (state / "fresh-birth.json").exists():
+    if any(path.exists() or path.is_symlink() for path in fleet.fresh_markers(state)):
         import codex_fresh
         return codex_fresh.evidence_problems(state, status, now=now)
     try:
