@@ -72,6 +72,7 @@ DEFAULT_SERVERS = PAYLOAD_DIR / "mcp-servers.json"
 import launchd_job as lj   # the recreation cadence: renders and reads, never loads
 import router_health as rh  # the router process: its container and its health, read only
 import verify_report as vr  # how verify prints: one row per condition, its workspaces beside it
+import codex_fleet as cf    # explicit fleet conversation policy keeps other hosts separate
 import codex_assets as ca   # protected Codex assets retain their original-path inputs
 import codex_unified_status as cus  # unified readiness requires matching fresh evidence
 
@@ -1252,6 +1253,12 @@ def render_manifest(policy: Dict[str, Any], *,
     selection blocks the manifest carries at top level, and the loader's own
     marker) as `feature`. This is the TEMPLATE a first install writes, and
     the source of the deployment-owned blocks every later install repairs."""
+    try:
+        codex_mode = cf.mode(policy)
+    except ValueError as exc:
+        raise ProvisionError(str(exc)) from exc
+    if codex_mode == "unified" and agent_wrapper is not True:
+        raise ProvisionError("unified fleet mode requires Sandy's protected Codex agent_wrapper capability")
     selection = fp.selection(policy)
     create = [f"{FEATURE_INSTANCES_SUBDIR}/{MANIFEST_SLUG}/{lane}/{leaf}"
               for lane in FEATURE_LANES for leaf in FEATURE_LANE_LEAVES[lane]]
@@ -1283,6 +1290,8 @@ def render_manifest(policy: Dict[str, Any], *,
     domain = policy.get(fp.FLEET_DOMAIN_KEY)
     if domain is not None:
         doc["expose"][EXPOSE_FLEET_DOMAIN] = domain
+    if cf.POLICY_KEY in policy:
+        doc["expose"][cf.EXPORT] = codex_mode
     _check_manifest_names(doc)
     return doc
 
@@ -1366,13 +1375,18 @@ def _read_manifest(path: Path) -> Any:
 
 def install_manifest(home: Path, policy: Dict[str, Any], *, dry_run: bool,
                      receives: Optional[bool] = None,
-                     agent_wrapper: Optional[bool] = None) -> str:
+                     agent_wrapper: Optional[bool] = None,
+                     codex_mode: Optional[str] = None) -> str:
     """Write the manifest when it is ABSENT (the template rendered from
     `policy` — on a fresh host the default policy), or REPAIR the
     deployment-owned blocks of the one that is there, leaving the operator's keys and
     their order untouched. A present file that does not parse is refused,
     never overwritten: it is the operator's, and the repair would destroy
     the edit that broke it."""
+    try:
+        policy = cf.select(policy, codex_mode)
+    except ValueError as exc:
+        raise ProvisionError(str(exc)) from exc
     path = feature_manifest_path(home)
     if path.exists():
         existing = _read_manifest(path)
@@ -1386,6 +1400,12 @@ def install_manifest(home: Path, policy: Dict[str, Any], *, dry_run: bool,
                 doc[key] = rendered[key]
             else:
                 doc.pop(key, None)
+        if codex_mode is not None:
+            if not isinstance(doc.get("feature", {}), dict):
+                raise ProvisionError("manifest feature policy is not an object; explicit choice does not repair it")
+            feature = dict(doc.get("feature", {}))
+            feature[cf.POLICY_KEY] = cf.mode(cf.select(policy, codex_mode))
+            doc["feature"] = feature
         want = json.dumps(doc, indent=2) + "\n"
     else:
         want = manifest_text(policy, receives=receives, agent_wrapper=agent_wrapper)
@@ -1823,7 +1843,8 @@ def run_provision(
         report = install_manifest(home, policy, dry_run=dry,
                                   receives=sandy_accepts_receives(args.sandy),
                                   agent_wrapper=codex_agent_wrapper(args.sandy,
-                                                                    args.codex_connector_src))
+                                                                    args.codex_connector_src),
+                                  codex_mode=getattr(args, "codex_mode", None))
     except ProvisionError as e:
         print(f"  FAIL  manifest {feature_manifest_path(home)}: {e}", file=sys.stderr)
         failed += 1
@@ -3726,6 +3747,10 @@ def run_sync(args: argparse.Namespace, home: Path, boxes_dir: Path) -> int:
     """
     policy_path = feature_manifest_path(home)
     policy = fp.load_policy(policy_path)
+    try:
+        policy = cf.select(policy, getattr(args, "codex_mode", None))
+    except ValueError as exc:
+        raise ProvisionError(str(exc)) from exc
     base = getattr(args, "fleet_domain_base", None)
     if policy.get(fp.SOURCE_KEY) == fp.SOURCE_DEFAULT:
         policy[fp.FLEET_DOMAIN_KEY] = derived_fleet_domain(base)
@@ -3940,6 +3965,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "router's config beside the manifest — the whole install, once per "
                         "host; sandy applies it to each sandbox at its launch")
     install.add_argument("--apply", action="store_true", help="write (default: report only)")
+    install.add_argument("--codex-mode", choices=cf.MODES,
+                         help="author one fleet-wide Codex conversation mode; unified requires fresh "
+                              "Codex-served instances and never migrates or erases existing state")
     install.add_argument("--fleet-domain-base", metavar="BASE",
                          help="a fresh host's template gets fleet_domain sandy.<host>.BASE "
                               "(default: internal, non-routable); a domain you control is "
