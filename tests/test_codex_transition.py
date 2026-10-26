@@ -32,7 +32,7 @@ OLD_THREAD = "22222222-2222-4222-8222-222222222222"
 
 class TransitionTest(unittest.TestCase):
     def setUp(self):
-        tmp = TemporaryDirectory(prefix=".ct-", dir=os.environ.get("AMAP_TEST_TMPDIR", HERE))
+        tmp = TemporaryDirectory(prefix=".ct-", dir=os.environ.get("AMAP_TEST_TMPDIR"))
         self.addCleanup(tmp.cleanup)
         self.root = Path(tmp.name)
         self.native_home = self.root / "native-home"
@@ -77,6 +77,18 @@ class TransitionTest(unittest.TestCase):
 
     def prepare(self, **kw):
         return transition.prepare(self.state, self.payload, THREAD, **kw)
+
+    def test_complete_endpoint_path_has_valid_fixture_and_long_state_refuses_before_writes(self):
+        endpoint = self.state / ("u-" + "0" * 32) / "b"
+        with self.subTest(endpoint=str(endpoint), path_bytes=len(os.fsencode(str(endpoint)))):
+            self.prepare()
+        long_state = self.root / ("state-" + "x" * 120)
+        long_state.mkdir(mode=0o700)
+        endpoint = long_state / ("u-" + "0" * 32) / "b"
+        with self.subTest(endpoint=str(endpoint), path_bytes=len(os.fsencode(str(endpoint)))):
+            with self.assertRaisesRegex(ValueError, "native Unix endpoint path bound"):
+                transition.prepare(long_state, self.payload, THREAD, apply=True)
+        self.assertEqual(list(long_state.iterdir()), [])
 
     def commit_adoption_fixture(self, *, policy_matches=True, confirmed=True):
         """Populate exactly the fields committed atomically by the connector."""
