@@ -65,6 +65,10 @@ def intent_path(state):
     return state.parent / (".fresh-intent-" + state.name + ".json")
 
 
+def custody_path(record):
+    return Path(record["identity"]["lanes"]["AMAP_OUTBOX_DIR"]) / fleet.CUSTODY
+
+
 def load_birth(state):
     private_state(state)
     value = read_json(state / BIRTH)
@@ -72,11 +76,15 @@ def load_birth(state):
             or value.get("kind") != "fresh_unified_birth"
             or not isinstance(value.get("birth_id"), str) or not re.fullmatch("[a-f0-9]{32}", value["birth_id"])
             or not isinstance(value.get("identity"), dict)
+            or not isinstance(value.get("native_home"), str) or not Path(value["native_home"]).is_absolute()
             or not isinstance(value.get("runtime_state_dir"), str) or not Path(value["runtime_state_dir"]).is_absolute()
-            or value.get("mailbox_birth_scope") != "local_empty_observation_not_router_retirement"):
+            or value.get("mailbox_birth_scope") != "local_negative_checks_not_native_or_router_freshness_proof"):
         raise ValueError(RECREATE + "; exclusive birth evidence is malformed")
-    if str(state) == value["runtime_state_dir"] and read_json(intent_path(state)) != value:
-        raise ValueError(RECREATE + "; durable birth intent differs")
+    if str(state) == value["runtime_state_dir"]:
+        if read_json(intent_path(state)) != value:
+            raise ValueError(RECREATE + "; durable birth intent differs")
+        if read_json(custody_path(value)) != value:
+            raise ValueError(RECREATE + "; retained namespace custody differs")
     return value
 
 
@@ -99,15 +107,15 @@ def identity(session, env):
             "fleet_mode": "unified", "lanes": lanes}
 
 
-def require_empty_birth_lanes(lanes):
-    """First birth cannot reinterpret retained mailbox work as fresh input.
+def guard_birth_inputs(lanes, env):
+    """Reject local prior-state evidence while retaining newly queued inbound work.
 
-    This local empty observation does not retire router-owned state or prove
-    external custody. Same-address recreation still needs the router reset.
+    These are conservative local negative checks, not certification of a native
+    home or a router epoch. Provisioning/custody remain operator preconditions.
     """
     visited = 0
-    for root in lanes.values():
-        root = Path(root)
+    for key, value in lanes.items():
+        root = Path(value)
         assets.directory(root)
         if not root.is_dir():
             raise ValueError("fresh birth lane root is unavailable")
@@ -118,9 +126,34 @@ def require_empty_birth_lanes(lanes):
                 if visited > 10000:
                     raise ValueError("fresh birth mailbox inventory exceeds its bound")
                 info = entry.lstat()
-                if not stat.S_ISDIR(info.st_mode):
-                    raise ValueError("fresh birth refuses retained mailbox entries; operator work disposition and router reset are required")
-                pending.append(entry)
+                if stat.S_ISDIR(info.st_mode):
+                    pending.append(entry)
+                elif key == "AMAP_OUTBOX_DIR":
+                    raise ValueError("fresh birth refuses retained outbound state; operator work disposition and router reset are required")
+                elif not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                    raise ValueError("fresh birth inbound custody is unknown; links and special files are refused")
+    home = Path(env.get("CODEX_HOME") or str(Path(env["HOME"]) / ".codex"))
+    assets.directory(home)
+    if home.exists():
+        if not home.is_dir():
+            raise ValueError("native home is not a real directory")
+        bootstrap_files = {"config.toml", "auth.json"}
+        for entry in home.iterdir():
+            info = entry.lstat()
+            if entry.name in bootstrap_files and stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
+                continue
+            if entry.name == "skills" and stat.S_ISDIR(info.st_mode):
+                for skill in entry.iterdir():
+                    skill_info = skill.lstat()
+                    if (skill.name not in {"md2pdf", "md2doc", "md2html", "md2email", "screenshot"}
+                            or not stat.S_ISDIR(skill_info.st_mode)):
+                        raise ValueError("native home contains an unrecognized bootstrap skill")
+                    for leaf in skill.iterdir():
+                        leaf_info = leaf.lstat()
+                        if leaf.name != "SKILL.md" or not stat.S_ISREG(leaf_info.st_mode) or leaf_info.st_nlink != 1:
+                            raise ValueError("native home contains an unrecognized bootstrap skill leaf")
+                continue
+            raise ValueError("fresh birth refuses prior or unrecognized native state; operator fresh provisioning is required")
 
 
 def birth(state, session, env):
@@ -139,13 +172,21 @@ def birth(state, session, env):
             raise ValueError(RECREATE) from exc
         if record["identity"] != expected or record["runtime_state_dir"] != str(state):
             raise ValueError(RECREATE + "; birth identity differs")
+        native_home = str(Path(env.get("CODEX_HOME") or str(Path(env["HOME"]) / ".codex")).absolute())
+        if record.get("native_home") != native_home:
+            raise ValueError(RECREATE + "; native home differs")
         return record
     if os.path.lexists(intent_path(state)):
         raise ValueError(RECREATE + "; interrupted birth intent requires inspection")
-    require_empty_birth_lanes(expected["lanes"])
+    custody = Path(expected["lanes"]["AMAP_OUTBOX_DIR"]) / fleet.CUSTODY
+    if os.path.lexists(custody):
+        raise ValueError(RECREATE + "; retained namespace custody forbids another birth")
+    guard_birth_inputs(expected["lanes"], env)
     record = {"schema": 1, "kind": "fresh_unified_birth", "birth_id": uuid.uuid4().hex,
               "identity": expected, "runtime_state_dir": str(state),
-              "mailbox_birth_scope": "local_empty_observation_not_router_retirement"}
+              "mailbox_birth_scope": "local_negative_checks_not_native_or_router_freshness_proof",
+              "native_home": str(Path(env.get("CODEX_HOME") or str(Path(env["HOME"]) / ".codex")).absolute())}
+    publish(state, custody, assets.encoded(record), mode=0o600)
     publish(state, intent_path(state), assets.encoded(record), mode=0o600)
     try:
         state.mkdir(mode=0o700)
@@ -183,7 +224,8 @@ def native_config_digest(env):
 
 def validator_digest():
     return assets.digest(assets.encoded({"settings": settings.validator_digest(),
-                                       "fresh": assets.digest(Path(__file__).read_bytes())}))
+                                       "fresh": assets.digest(Path(__file__).read_bytes()),
+                                       "fleet": assets.digest(Path(fleet.__file__).read_bytes())}))
 
 
 def selected_assets(payload):
@@ -328,6 +370,10 @@ def current_guard(state, env, *, allow_pause=False):
     plan = load_plan(state, allow_pause=allow_pause)
     if fleet.environment(env) != "unified" or settings.resolve(env) != plan["selection"]:
         raise ValueError("fresh fleet model or permissions drifted")
+    born = load_birth(state)
+    native_home = str(Path(env.get("CODEX_HOME") or str(Path(env["HOME"]) / ".codex")).absolute())
+    if native_home != born.get("native_home"):
+        raise ValueError("fresh native home changed")
     if native_config_digest(env) != plan["native_config_sha256"]:
         raise ValueError("fresh native configuration changed")
     selected, _ = selected_assets(Path(plan["context"]["payload"]))

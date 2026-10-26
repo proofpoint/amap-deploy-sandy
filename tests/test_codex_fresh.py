@@ -44,6 +44,15 @@ class NativeProtocol:
         self.sequence = 0
         self.calls = []
         self.active = False
+        self.pending = []
+        self.turns = []
+        self.adds = 0
+
+    def complete_pending(self):
+        queued = self.pending.pop(0)
+        self.turns.append({"id": "turn" + str(len(self.turns) + 1), "status": "completed", "items": [
+            {"id": "input" + str(len(self.turns) + 1), "type": "userMessage",
+             "clientId": queued["clientUserMessageId"], "content": queued["input"]}]})
 
     def reserve_id(self):
         self.sequence += 1
@@ -73,8 +82,18 @@ class NativeProtocol:
                              [{"name": "amap_fleet", "tools": {"activity": {}}}]}
         elif method == "thread/read":
             return {"thread": {"id": self.thread, "status": {"type": "active" if self.active else "idle"}}}
-        elif method in {"thread/turns/list", "thread/items/list", "thread/queue/list"}:
-            return {"data": []}
+        elif method == "thread/turns/list":
+            return {"data": [{"id": t["id"], "status": t["status"]} for t in self.turns]}
+        elif method == "thread/items/list":
+            return {"data": [{"turnId": t["id"], "item": item} for t in self.turns for item in t["items"]]}
+        elif method == "thread/queue/list":
+            return {"data": json.loads(json.dumps(self.pending))}
+        elif method == "thread/queue/add":
+            self.adds += 1
+            queued = {"id": "queued" + str(self.adds), "clientUserMessageId": params["clientUserMessageId"],
+                      "input": params["input"]}
+            self.pending.append(queued)
+            return {"queuedSubmission": queued}
         else:
             self.model_requests += 1
             raise AssertionError("unexpected native/model request: " + method)
@@ -122,6 +141,12 @@ class FreshBirthTest(unittest.TestCase):
         self.context = {**self.born["identity"], "payload": str(self.payload), "codex_version": "codex-cli 0.164.0",
                         "self_address": "fresh@example.org"}
 
+    def remove_unused_fixture_birth(self):
+        # Fixture-only reset before any native/core start; production never clears custody.
+        shutil.rmtree(self.state)
+        fresh.intent_path(self.state).unlink()
+        fresh.custody_path(self.born).unlink()
+
     def prepare(self):
         return fresh.prepare(self.state, self.payload, self.context, self.env)
 
@@ -167,6 +192,7 @@ class FreshBirthTest(unittest.TestCase):
 
     def test_durable_parent_intent_closes_the_mkdir_before_birth_record_crash_gap(self):
         import codex_transition as transition
+        self.remove_unused_fixture_birth()
         state = self.root / "interrupted"
         real = assets.place
         def interrupted(path, raw, **kwargs):
@@ -184,23 +210,203 @@ class FreshBirthTest(unittest.TestCase):
             transition.entry_mode(state)
         self.assertFalse((state / "controller.toml").exists())
 
-    def test_retained_mailbox_work_blocks_first_birth_but_new_work_after_birth_is_retained(self):
-        notice = Path(self.env["AMAP_INBOX_DIR"]) / "notices" / "retained.json"
-        notice.write_bytes(b"retained work; never replay automatically")
+    def test_prior_outbound_native_or_unknown_custody_blocks_new_birth_without_deletion(self):
+        self.assertEqual(fresh.birth(self.state, self.session, self.env), self.born)
+        self.remove_unused_fixture_birth()
+        retained = Path(self.env["AMAP_OUTBOX_DIR"]) / "processed" / "retained.json"
+        retained.parent.mkdir()
+        retained.write_bytes(b"prior delivery evidence")
         other = self.root / "b"
-        with self.assertRaisesRegex(ValueError, "retained mailbox entries"):
+        with self.assertRaisesRegex(ValueError, "retained outbound state"):
             fresh.birth(other, self.session, self.env)
         self.assertFalse(other.exists())
-        self.assertEqual(notice.read_bytes(), b"retained work; never replay automatically")
-        self.assertEqual(fresh.birth(self.state, self.session, self.env), self.born)
-        self.assertEqual(notice.read_bytes(), b"retained work; never replay automatically")
-        notice.unlink()
+        self.assertEqual(retained.read_bytes(), b"prior delivery evidence")
+        retained.unlink()
+        history = self.native / "sessions"
+        history.mkdir()
+        native_record = history / "retained.jsonl"
+        native_record.write_bytes(b"prior native history")
+        with self.assertRaisesRegex(ValueError, "prior or unrecognized native state"):
+            fresh.birth(other, self.session, self.env)
+        self.assertFalse(other.exists())
+        self.assertEqual(native_record.read_bytes(), b"prior native history")
         target = self.root / "outside"
         target.mkdir()
-        (Path(self.env["AMAP_OUTBOX_DIR"]) / "link").symlink_to(target, target_is_directory=True)
-        with self.assertRaisesRegex(ValueError, "retained mailbox entries"):
+        (Path(self.env["AMAP_INBOX_DIR"]) / "link").symlink_to(target, target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, "inbound custody is unknown"):
             fresh.birth(other, self.session, self.env)
         self.assertEqual(list(target.iterdir()), [])
+
+    def test_custody_is_durable_before_parent_intent_and_survives_supported_reset(self):
+        import codex_transition as transition
+        self.remove_unused_fixture_birth()
+        real = assets.place
+        def interrupted(path, raw, **kwargs):
+            if path == fresh.intent_path(self.state):
+                raise OSError("fixture crash before private parent intent")
+            return real(path, raw, **kwargs)
+        with mock.patch.object(assets, "place", side_effect=interrupted):
+            with self.assertRaisesRegex(OSError, "before private parent"):
+                fresh.birth(self.state, self.session, self.env)
+        custody = Path(self.env["AMAP_OUTBOX_DIR"]) / fleet.CUSTODY
+        original = custody.read_bytes()
+        self.assertFalse(self.state.exists())
+        self.assertFalse(fresh.intent_path(self.state).exists())
+        with self.assertRaisesRegex(ValueError, "retained namespace custody"):
+            fresh.birth(self.state, self.session, self.env)
+        for mode in (None, "separate", "", "foreign"):
+            with self.subTest(mode=mode), mock.patch.dict(os.environ):
+                if mode is None:
+                    os.environ.pop(fleet.EXPORT, None)
+                else:
+                    os.environ[fleet.EXPORT] = mode
+                with self.assertRaisesRegex(ValueError, "cannot enter"):
+                    transition.entry_mode(self.state)
+                with self.assertRaisesRegex(ValueError, "no separate capture"):
+                    settings.entry_selection(dict(os.environ), self.state)
+        self.assertFalse(self.state.exists())
+        self.assertEqual(custody.read_bytes(), original)
+
+    def test_host_verify_checks_retained_custody_before_and_after_private_state_reset(self):
+        home = self.root / "host"
+        relay = prov.feature_payload_dir(home) / "codex/relay"
+        relay.parent.mkdir(parents=True)
+        relay.write_text("fixture payload")
+        custody = prov.feature_instance_dir(home, "fresh-fixture") / "outbox" / fleet.CUSTODY
+        custody.parent.mkdir(parents=True)
+        custody.write_bytes(fresh.custody_path(self.born).read_bytes())
+        state = self.root / "host-entry/codex"
+        record = {prov.FEATURE_ENTRIES_KEY: {prov.FEATURE_NAME: {"state_dir": str(state.parent)}}}
+        for running in (False, True):
+            problems, _ = prov.verify_codex_supervisor(home, "fresh-fixture", record, running=running)
+            self.assertTrue(any("retained namespace custody requires" in p for p in problems))
+            self.assertFalse(state.exists())
+        self.prepare()
+        self.select()
+        with self.runtime():
+            async def check():
+                service = fresh.service_class()(fresh.config_at(self.state), self.state / "controller.toml")
+                try:
+                    await service.start()
+                    state.parent.mkdir()
+                    shutil.copytree(self.state, state)
+                    problems, _ = prov.verify_codex_supervisor(home, "fresh-fixture", record,
+                                                             running=True, expected_mode="unified")
+                    self.assertEqual(problems, [])
+                    custody.write_text("{}")
+                    problems, _ = prov.verify_codex_supervisor(home, "fresh-fixture", record,
+                                                             running=True, expected_mode="unified")
+                    self.assertTrue(any("custody differs" in p for p in problems))
+                finally:
+                    await service.close()
+            asyncio.run(check())
+
+    def test_native_bootstrap_inventory_accepts_source_shapes_and_holds_unknown_bytes(self):
+        self.remove_unused_fixture_birth()
+        (self.native / "auth.json").write_bytes(b"opaque fixture; never parsed")
+        for name in ("md2pdf", "md2doc", "md2html", "md2email", "screenshot"):
+            skill = self.native / "skills" / name
+            skill.mkdir(parents=True)
+            (skill / "SKILL.md").write_bytes(b"fixture generated skill")
+        born = fresh.birth(self.state, self.session, self.env)
+        self.assertEqual(fresh.birth(self.state, self.session, self.env), born)
+        self.born = born
+        self.remove_unused_fixture_birth()
+        unknown = self.native / "config.toml.sandy-launch.old"
+        unknown.write_bytes(b"retain failed launch")
+        with self.assertRaisesRegex(ValueError, "prior or unrecognized native state"):
+            fresh.birth(self.state, self.session, self.env)
+        self.assertEqual(unknown.read_bytes(), b"retain failed launch")
+        self.assertFalse(self.state.exists())
+        unknown.unlink()
+        unknown = self.native / "skills/md2pdf/retained.jsonl"
+        unknown.write_bytes(b"retain unknown leaf")
+        with self.assertRaisesRegex(ValueError, "unrecognized bootstrap skill leaf"):
+            fresh.birth(self.state, self.session, self.env)
+        self.assertEqual(unknown.read_bytes(), b"retain unknown leaf")
+        self.assertFalse(self.state.exists())
+
+    def test_valid_inbound_before_birth_waits_for_argv_and_executes_once_on_owned_canonical(self):
+        # Same notice/body shape as the portable core producer in
+        # tests/integration/unified_runtime_probe.py:publish.
+        notice_id = "before-birth"
+        name = "notice-" + notice_id + ".json"
+        notice = {"contract_version": "2", "notice_id": notice_id, "ts": "2026-10-25T00:00:00Z",
+                  "kind": "peer", "message": {"id": "message_before_birth", "from": "peer@example.org",
+                  "mailbox": "peer", "subject": "Queued before entry", "preview": "Synthetic pending work"}}
+        body = {"contract_version": "2", "notice_id": notice_id, "body_text": "Synthetic pending work",
+                "to": self.context["self_address"], "from": "peer@example.org", "subject": "Queued before entry",
+                "id": notice["message"]["id"], "date": "2026-10-25T00:00:00Z"}
+        paths = [Path(self.env["AMAP_PEER_DIR"]) / "notices" / name,
+                 Path(self.env["AMAP_PEER_DIR"]) / "messages" / name]
+        paths[0].write_text(json.dumps(notice))
+        paths[1].write_text(json.dumps(body))
+        original = [p.read_bytes() for p in paths]
+        self.remove_unused_fixture_birth()
+        self.state = self.root / "b"
+        self.born = fresh.birth(self.state, self.session, self.env)
+        self.context = {**self.born["identity"], "payload": str(self.payload), "codex_version": "codex-cli 0.164.0",
+                        "self_address": "fresh@example.org"}
+        self.prepare()
+        fresh.publish_request(self.state, self.env)
+        self.assertFalse((self.state / "journal.sqlite3").exists())
+        self.assertEqual([p.read_bytes() for p in paths], original)
+        with self.runtime():
+            async def check():
+                kind = fresh.service_class()
+                before_selection = kind(fresh.config_at(self.state), self.state / "controller.toml")
+                try:
+                    with self.assertRaises(OSError):
+                        await before_selection.start()
+                finally:
+                    await before_selection.close()
+                self.assertEqual((self.protocol.starts, self.protocol.adds), (0, 0))
+                self.assertFalse((self.state / "journal.sqlite3").exists())
+                self.select()
+                first = kind(fresh.config_at(self.state), self.state / "controller.toml")
+                try:
+                    await first.start()
+                    canonical = self.protocol.thread
+                    self.assertEqual(self.protocol.adds, 0)
+                    await first.tick()
+                    self.assertEqual(self.protocol.adds, 1)
+                    event = first.journal.db.execute("SELECT event_id,state FROM events").fetchone()
+                    self.assertEqual(event["state"], "queued")
+                    self.protocol.complete_pending()
+                    await first.tick()
+                    self.assertEqual(first.journal.event(event["event_id"])["state"], "finished")
+                    await first.tick()
+                    self.assertEqual(self.protocol.adds, 1)
+                finally:
+                    await first.close()
+                second = kind(fresh.config_at(self.state), self.state / "controller.toml")
+                try:
+                    await second.start()
+                    await second.tick()
+                    self.assertEqual(self.protocol.thread, canonical)
+                    self.assertEqual((self.protocol.starts, self.protocol.adds), (1, 1))
+                finally:
+                    await second.close()
+                (self.state / "journal.sqlite3").unlink()
+                missing_journal = kind(fresh.config_at(self.state), self.state / "controller.toml")
+                try:
+                    with self.assertRaises(OSError):
+                        await missing_journal.start()
+                finally:
+                    await missing_journal.close()
+                self.assertEqual((self.protocol.starts, self.protocol.adds), (1, 1))
+            asyncio.run(check())
+        self.assertEqual([p.read_bytes() for p in paths], original)
+        custody = fresh.custody_path(self.born)
+        retained_custody = custody.read_bytes()
+        shutil.rmtree(self.state)
+        fresh.intent_path(self.state).unlink()
+        with self.assertRaisesRegex(ValueError, "retained namespace custody"):
+            fresh.birth(self.state, self.session, self.env)
+        self.assertFalse(self.state.exists())
+        self.assertEqual(custody.read_bytes(), retained_custody)
+        self.assertEqual([p.read_bytes() for p in paths], original)
+        self.assertEqual((self.protocol.starts, self.protocol.adds), (1, 1))
 
     def test_partial_birth_cannot_enter_the_legacy_separate_helper(self):
         import codex_transition as transition
@@ -214,7 +420,9 @@ class FreshBirthTest(unittest.TestCase):
                     transition.entry_mode(self.state)
         separate = self.root / "legacy"
         separate.mkdir(mode=0o700)
-        self.assertEqual(transition.entry_mode(separate), "separate")
+        with mock.patch.dict(os.environ):
+            os.environ.pop("AMAP_OUTBOX_DIR", None)
+            self.assertEqual(transition.entry_mode(separate), "separate")
         self.assertEqual(list(separate.iterdir()), [])
 
     def test_shipped_separate_or_absent_mode_preserves_partial_fresh_birth_without_renderer(self):
@@ -236,7 +444,7 @@ class FreshBirthTest(unittest.TestCase):
         for name in ("codex", "python3"):
             (bin_dir / name).chmod(0o755)
         case = 0
-        for with_plan in (False, True):
+        for with_plan in (False, True, "reset"):
             for mode in (None, "separate", "", "foreign"):
                 with self.subTest(plan=with_plan, mode=mode):
                     parent = self.root / ("e" + str(case))
@@ -245,17 +453,30 @@ class FreshBirthTest(unittest.TestCase):
                     calls = self.root / ("calls" + str(case))
                     legacy = self.root / ("runs" + str(case))
                     case += 1
-                    fresh.birth(state, self.session, self.env)
-                    if with_plan:
+                    outbox = self.root / ("out-case-" + str(case))
+                    outbox.mkdir()
+                    case_env = dict(self.env, AMAP_OUTBOX_DIR=str(outbox))
+                    fresh.birth(state, self.session, case_env)
+                    if with_plan == "reset":
+                        shutil.rmtree(state)
+                        fresh.intent_path(state).unlink()
+                    elif with_plan:
                         (state / fresh.PLAN).write_text("{}")
-                    env = dict(self.env, PATH=str(bin_dir) + os.pathsep + self.env["PATH"],
+                    env = dict(case_env, PATH=str(bin_dir) + os.pathsep + self.env["PATH"],
                                SANDY_FEATURE_STATE=str(parent), SANDY_AGENT="codex", NATIVE_CALLS=str(calls),
                                LEGACY_RUNS=str(legacy))
                     if mode is None:
                         env.pop(fleet.EXPORT, None)
                     else:
                         env[fleet.EXPORT] = mode
-                    before = {p.name: p.read_bytes() for p in state.iterdir()}
+                    before = {p.name: p.read_bytes() for p in state.iterdir()} if state.exists() else None
+                    wrapper = installed / "interactive-launch"
+                    wrapper.write_text((HERE / "payload/codex/interactive-launch").read_text().replace(
+                        "STATE=/opt/sandy/feature-state/amap/codex", "STATE=" + str(state)))
+                    wrapped = subprocess.run(["/bin/sh", str(wrapper), str(bin_dir / "codex")],
+                                             cwd=self.root, env=env, capture_output=True, text=True, timeout=5)
+                    self.assertNotEqual(wrapped.returncode, 0)
+                    self.assertFalse(calls.exists())
                     log = self.root / "entry-error"
                     with log.open("w") as error:
                         proc = subprocess.Popen(["/bin/sh", str(relay)], cwd=self.root, env=env,
@@ -267,7 +488,7 @@ class FreshBirthTest(unittest.TestCase):
                                 time.sleep(.02)
                             self.assertIsNone(proc.poll())
                             self.assertIn(expected, log.read_text())
-                            self.assertEqual({p.name: p.read_bytes() for p in state.iterdir()}, before)
+                            self.assertEqual({p.name: p.read_bytes() for p in state.iterdir()} if state.exists() else None, before)
                             self.assertFalse(calls.exists())
                             self.assertFalse(legacy.exists())
                         finally:
@@ -385,9 +606,13 @@ class FreshBirthTest(unittest.TestCase):
             self.prepare()
         (self.state / "adapter-pause.json").unlink()
         long = self.root / ("long-" + "x" * 100)
-        fresh.birth(long, self.session, self.env)
+        other_outbox = self.root / "long-out"
+        other_outbox.mkdir()
+        other_env = dict(self.env, AMAP_OUTBOX_DIR=str(other_outbox))
+        other_born = fresh.birth(long, self.session, other_env)
+        context = dict(self.context, lanes=other_born["identity"]["lanes"])
         with self.assertRaisesRegex(ValueError, "Unix socket length"):
-            fresh.prepare(long, self.payload, self.context, self.env)
+            fresh.prepare(long, self.payload, context, other_env)
         self.assertFalse((long / "controller.toml").exists())
         self.assertFalse((long / "journal.sqlite3").exists())
         self.prepare()
@@ -474,6 +699,7 @@ class FreshBirthTest(unittest.TestCase):
         self.assertEqual(fresh.read_json(self.state / fresh.INITIALIZATION)["phase"], "start_attempted")
 
     def test_installed_birth_helper_runs_from_unrelated_working_directory(self):
+        self.remove_unused_fixture_birth()
         home = self.root / "h"
         prov.install_feature_payload(home, prov.DEFAULT_CONNECTOR_SRC, dry_run=False,
                                      codex_src=_workspace.CODEX_CONNECTOR_ROOT)
@@ -716,6 +942,7 @@ class FreshBirthTest(unittest.TestCase):
 
 
     def test_shipped_fresh_entry_waits_for_wrapper_argv_and_never_fabricates_readiness(self):
+        self.remove_unused_fixture_birth()
         home = self.root / "h"
         prov.install_feature_payload(home, prov.DEFAULT_CONNECTOR_SRC, dry_run=False,
                                      codex_src=_workspace.CODEX_CONNECTOR_ROOT)

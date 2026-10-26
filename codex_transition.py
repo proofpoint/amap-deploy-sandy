@@ -274,7 +274,7 @@ def confirm(state, *, apply=False):
 
 def entry_mode(state, *, selected_model=None, observed_version=None, check_pane_settings=False):
     """Read-only gate, used before relay rendering and terminal attachment."""
-    if any(os.path.lexists(path) for path in fleet.fresh_markers(state)):
+    if any(os.path.lexists(path) for path in fleet.fresh_markers(state, os.environ.get("AMAP_OUTBOX_DIR"))):
         raise ValueError("fresh unified state cannot enter the separate/adoption path; use the protected fresh launcher")
     if not os.path.lexists(state / RECORD):
         path = state / "controller.toml"

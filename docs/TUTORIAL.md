@@ -382,11 +382,23 @@ way as to any agent: ask alpha to task gamma's address.
 An explicit fleet choice makes newly created, selected Codex-served sandboxes
 use one persistent conversation for the pane and incoming work. Hosts without
 this choice keep separate mode. Use the approved deployment commit for the
-host's main or release line, with its pinned siblings:
+host's main or release line, with its pinned siblings. For the release host,
+set `APPROVED_DEPLOYMENT_HEAD` to the final approved fresh-default release
+commit; the existing deployment baseline does not contain this feature. A
+missing approval or dirty checkout holds installation:
 
 ```sh
+set -e
+AMAP_ROOT="$HOME/amap"
+: "${APPROVED_DEPLOYMENT_HEAD:?Set the full final approved release commit}"
 cd "$AMAP_ROOT/amap-deploy-sandy"
+test -z "$(git status --porcelain)"
+git fetch origin
+git switch release/amap-2026-10-10
+git merge --ff-only "$APPROVED_DEPLOYMENT_HEAD"
+test "$(git rev-parse HEAD)" = "$APPROVED_DEPLOYMENT_HEAD"
 AMAP_CODEX=1 python3 amap-siblings.py --apply
+AMAP_CODEX=1 python3 amap-siblings.py
 python3 amap-sandy.py install --codex-mode unified
 python3 amap-sandy.py install --codex-mode unified --apply
 ```
@@ -418,8 +430,27 @@ conversation implementations.
 
 The entry durably records birth intent in its private parent before exclusively
 creating the birth directory, so an interrupted directory creation cannot fall
-back to separate mode. This precedes controller publication or backend startup. First birth requires empty local mailbox
-contents; retained work is held for operator disposition. A durable fresh plan
+back to separate mode. Before either write, a durable custody marker in the
+retained outbox namespace binds birth, instance, workspace, native home and
+runtime state. A supported reset that removes private state but retains lanes
+therefore holds instead of starting another history, including if fleet mode
+is absent or changed to separate. The custody marker is not a router request.
+
+New inbound notices may arrive before entry startup. They remain unchanged
+until the full native argv is validated, then the connector's normal journal
+and queue process them once on the owned canonical conversation. First birth
+rejects any retained outbound artifact and unknown native-home state; it never
+deletes either. Expected bootstrap shapes are opaque `config.toml`, optional
+`auth.json`, and Sandy's generated `skills/{md2pdf,md2doc,md2html,md2email,screenshot}/SKILL.md`.
+An additional skill, cache, history, stale launch file or other unknown path
+requires a reviewed provisioning decision. Authentication bytes are not read
+for this classification.
+
+These local negative checks do not certify router freshness or prove native
+home exclusion. No prior native owner may still use the home. A reused
+address requires the explicit work disposition, quiescence and router reset
+below. Arbitrary deletion of every custody/native/router witness is unsupported;
+absence alone cannot recover its provenance. A durable fresh plan
 binds instance, workspace, lanes, protected version, native configuration and
 model/permission selection. The wrapper validates its full argv against a
 canonical selector before the incoming service can start. The existing connector
@@ -482,7 +513,17 @@ successful inspection showing it stopped, in the same Docker context:
 ```sh
 sandy --stop --workspace "$WORKSPACE"
 docker stop "$ROUTER_CONTAINER_ID"
-test "$(docker inspect --format '{{.State.Running}}' "$ROUTER_CONTAINER_ID")" = false
+router_running=$(docker inspect --format '{{.State.Running}}' "$ROUTER_CONTAINER_ID") || exit 1
+test "$router_running" = false
+: "${OLD_CONTAINER_ID:?Record the full old sandbox container ID before stop}"
+old_ids=$(docker ps --all --quiet --no-trunc) || exit 1
+python3 -c 'import re, sys
+old, listing = sys.argv[1:]
+ids = listing.splitlines()
+if not re.fullmatch("[0-9a-f]{64}", old) or any(not re.fullmatch("[0-9a-f]{64}", v) for v in ids):
+    sys.exit("UNKNOWN: full container identity is unavailable")
+if old in ids:
+    sys.exit("HOLD: old container still exists")' "$OLD_CONTAINER_ID" "$old_ids"
 ```
 
 Run the reset as the router's operator UID, from its exact pinned checkout. Its
@@ -490,9 +531,17 @@ config paths are identity-mounted by `docker/run.sh`, so this host CLI addresses
 the same roots. Review the dry-run plan before the explicit destructive form:
 
 ```sh
+AMAP_PRIMARY_STATE_DIR=$(python3 -I -S -c 'import json, pathlib, sys
+p = pathlib.Path(json.loads(pathlib.Path(sys.argv[1]).read_text())["state_dir"])
+if not p.is_absolute():
+    sys.exit("HOLD: primary state_dir is not absolute")
+print(p)' "$HOME/.sandy/features/amap/router.json")
 cd "$AMAP_ROOT/amap-router-local"
+test "$(git rev-parse HEAD)" = 972cb7096bf4110811cbafc20a6a8019d7408576
 python3 -m router --config "$HOME/.sandy/features/amap/router.json" reset "$SLUG" --dry-run
 python3 -m router --config "$HOME/.sandy/features/amap/router.json" reset "$SLUG" --yes
+test ! -e "$AMAP_PRIMARY_STATE_DIR/$SLUG/first-seen.json"
+test ! -L "$AMAP_PRIMARY_STATE_DIR/$SLUG/first-seen.json"
 sandy --remove-sandbox --workspace "$WORKSPACE" --dry-run
 sandy --remove-sandbox --workspace "$WORKSPACE" --yes
 ```
@@ -516,10 +565,34 @@ python3 amap-sandy.py verify
 
 Require a new first-sight snapshot for this slug after the reset and successful
 verification before the first send. Keep prompts and fleet traffic held until
-that observation; otherwise first-sight quarantine can retain fresh requests.
+this read-only check succeeds; a missing marker requires waiting for a router
+poll and rerunning, never manufacturing a marker:
+
+```sh
+python3 -I -S - "$AMAP_PRIMARY_STATE_DIR" "$SLUG" <<'PYFIRST'
+import json, pathlib, sys
+value = json.loads((pathlib.Path(sys.argv[1]) / sys.argv[2] / "first-seen.json").read_text())
+if (value.get("instance") != sys.argv[2] or value.get("outbox_snapshot") != []
+        or not isinstance(value.get("first_seen_ts"), str)):
+    sys.exit("HOLD: new first-sight proof is missing or has quarantined requests")
+print("New first sight:", value["instance"], value["first_seen_ts"])
+PYFIRST
+```
+
+A nonempty snapshot requires explicit work disposition. Do not edit it to clear
+quarantine.
 If mount paths or the mount set changed, use a separately verified router
 recreation procedure. Do not reuse a stale mount map or invoke `docker/run.sh`
 under an existing stopped container's name.
+
+Pilot acceptance records the final deployment/core source, native build, model
+and actual host observations: initialized/ready with canonical ID; idle restart
+before any prompt retaining that ID; a human turn plus incoming peer work in the
+same pane; mail while detached; Claude-to-Codex and Codex-to-Claude round trips;
+`resume --last` retaining history; and unknown/partial/reset state holding.
+The reproducible `tests/integration/fresh_native_probe.py` uses a disposable
+local synthetic provider for active pause and queued-before-birth/restart
+checks; its results do not establish target-host acceptance.
 
 ### Experimental unified conversation: existing-instance transition
 
