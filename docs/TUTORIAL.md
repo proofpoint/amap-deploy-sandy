@@ -458,6 +458,10 @@ creates and names the persistent native conversation and commits its real
 journal binding. Only then can native readiness release attachment. No UUID
 selection, adoption confirmation or hand-edited controller is required.
 
+Native configuration is compared as TOML settings. Codex's automatic boolean
+`tui.screen_reader_detection_done` stamp and formatting changes do not hold the
+conversation; other native settings remain bound to the startup plan.
+
 A preselection receipt is not backend readiness. The read-only proof is:
 
 ```sh

@@ -214,12 +214,23 @@ def locked(state, name):
 
 
 def native_config_digest(env):
+    """Bind native settings without Codex's automatic terminal-detection stamp."""
+    import tomllib
     home = Path(env.get("CODEX_HOME") or str(Path(env["HOME"]) / ".codex"))
     path = home / "config.toml"
     try:
-        return assets.digest(assets.regular(path))
+        document = tomllib.loads(assets.regular(path).decode("utf-8"))
     except FileNotFoundError:
-        return None
+        document = {}
+    tui = document.get("tui")
+    if isinstance(tui, dict):
+        if "screen_reader_detection_done" in tui:
+            if type(tui["screen_reader_detection_done"]) is not bool:
+                raise ValueError("native screen reader detection marker is not boolean")
+            del tui["screen_reader_detection_done"]
+        if not tui:
+            del document["tui"]
+    return assets.digest(assets.encoded(document))
 
 
 def validator_digest():
