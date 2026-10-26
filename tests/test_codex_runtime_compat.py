@@ -91,11 +91,11 @@ class RuntimeBoundaryTest(unittest.TestCase):
         with self.host39():
             self.controller.write_bytes(b'instance_id = "host"\r\nconversation_mode = "separate"\r\n')
             self.assertEqual(transition.entry_mode(self.state), "separate")
-            for control in ("\r", "\x0b", "\x0c", "\x1c", "\x1d", "\x1e", "\x7f"):
-                with self.subTest(control=repr(control)):
-                    self.controller.write_text('# comment' + control + '[lanes.mail]\nconversation_mode = "unified"\n')
-                    with self.assertRaises(ValueError):
-                        transition.entry_mode(self.state)
+        for control in ("\r", "\x0b", "\x0c", "\x1c", "\x1d", "\x1e", "\x7f"):
+            with self.subTest(control=repr(control)), self.host39():
+                self.controller.write_text('# comment' + control + '[lanes.mail]\nconversation_mode = "unified"\n')
+                with self.assertRaises(ValueError):
+                    transition.entry_mode(self.state)
 
     def test_transition_record_requires_native_runtime_before_loading_connector(self):
         self.controller.write_text('conversation_mode = "unified"\n')
