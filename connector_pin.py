@@ -25,12 +25,14 @@ its path passes this check unchanged.
 
 import json
 import os
+import stat
 import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, List, Optional, Sequence
 
+import safe_io
 import siblings
 
 CONNECTOR = "amap-connector-claude"
@@ -142,7 +144,6 @@ def guard(connector_src: Path, *, override: Optional[str], apply: bool, log_dir:
     out(f"  WARN  connector {c.checkout}: {c.why}; installing anyway under {OVERRIDE_FLAG} "
         f"({override!r})")
     if apply:
-        log.parent.mkdir(parents=True, exist_ok=True)
         append_line(log, json.dumps(record, sort_keys=True) + "\n")
         out(f"  recorded in {log}")
     else:
@@ -152,9 +153,23 @@ def guard(connector_src: Path, *, override: Optional[str], apply: bool, log_dir:
 
 def append_line(path: Path, line: str) -> None:
     """Append one line and make it durable: never through a symbolic link at
-    `path`, and fsynced before returning."""
-    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o644)
+    `path` or at any directory from `/` down to it, never to a file with a
+    second hard link (an append would write through it), missing directories
+    created, and fsynced before returning."""
+    path = Path(path)
+    dfd = safe_io.open_dir(path.parent, create=True)
     try:
+        fd = os.open(path.name, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
+                     0o644, dir_fd=dfd)
+    finally:
+        os.close(dfd)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise safe_io.SafeIOError(f"{path} is not a regular file; nothing was appended")
+        if st.st_nlink != 1:
+            raise safe_io.SafeIOError(f"{path} has {st.st_nlink} links; it must have exactly one, so "
+                                      f"nothing was appended")
         data = line.encode("utf-8")
         while data:
             data = data[os.write(fd, data):]

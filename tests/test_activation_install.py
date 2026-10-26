@@ -8,8 +8,11 @@ A1's record by partition_activation.activation_record, A2's evidence by
 partition_evidence.build, the staged bytes by partition_activation.staged_bytes.
 """
 
+import ast
 import hashlib
+import inspect
 import json
+import os
 import unittest
 
 import activation_install as ai
@@ -46,6 +49,7 @@ class A3(unittest.TestCase):
         d["overlay"]["pin"]["sha256"] = hp.PLUGIN_SHA256
         self.inv = inventory_bytes()
         d[fk.SECTION] = {"path": "/opt/ex/fleet-keys.json", "sha256": hashlib.sha256(self.inv).hexdigest()}
+        self.spec_doc = d
         self.spec = hs.load_spec(d)
         self.link = link(delegation={"inbound": False})
         self.doc = router_doc(hp.hop_keys(self.spec, self.link, FLEET_DOMAIN))
@@ -134,6 +138,30 @@ class ActivateTest(A3):
     def test_a_changed_rendering_since_a1_refuses(self):
         self.refused("(d)", inbound=True)
 
+    def self_only(self):
+        """The spec pinned to an inventory listing only this host, by its own
+        sha256, so the refusal is the peer rule's and not the pin's."""
+        one = json.loads(self.inv)
+        one["hosts"] = [h for h in one["hosts"] if h["name"] == HOST]
+        inv = json.dumps(one, sort_keys=True, separators=(",", ":")).encode()
+        d = json.loads(json.dumps(self.spec_doc))
+        d[fk.SECTION]["sha256"] = hashlib.sha256(inv).hexdigest()
+        return hs.load_spec(d), inv
+
+    def test_a1_refuses_an_inventory_of_this_host_alone_before_anything_is_staged(self):
+        spec1, inv = self.self_only()
+        self.validated.clear()
+        with self.assertRaises(fk.FleetKeysError) as cm:
+            ai.render_staged(spec=spec1, doc=self.doc, fleet_domain=FLEET_DOMAIN, trusted=self.link.trusted,
+                             inbound=False, validate=self.no_seed, read_inventory=lambda p: inv)
+        self.assertIn("lists only this host", str(cm.exception))
+        self.assertEqual(self.validated, [])
+
+    def test_a3_refuses_an_inventory_of_this_host_alone_at_its_fresh_rendering(self):
+        spec1, inv = self.self_only()
+        why = self.refused("(d)", spec=spec1, read_inventory=lambda p: inv)
+        self.assertIn("lists only this host", why)
+
     def test_a_third_state_at_the_final_path_refuses(self):
         self.final_now = b'{"hand": "edited"}\n'
         self.refused("(e)")
@@ -163,6 +191,39 @@ class CliTest(unittest.TestCase):
                                              {}, {}, None, apply=True, spec=None)
                 self.assertEqual(rc, 2)
                 self.assertIn("go together", err.getvalue())
+
+
+class ProductionReaderTest(unittest.TestCase):
+    """Every production read of the inventory goes through fk._read: the
+    activation entry points default to it, and every call outside the tests
+    that names a reader names fk._read or passes its own parameter on."""
+
+    def test_the_entry_points_default_to_the_no_follow_reader(self):
+        for f in (ai.render_staged, ai.activate):
+            self.assertIs(inspect.signature(f).parameters["read_inventory"].default, fk._read, f.__name__)
+
+    def test_no_production_call_supplies_another_reader(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        seen = []
+        for name in sorted(os.listdir(root)):
+            if not name.endswith(".py"):
+                continue
+            tree = ast.parse(open(os.path.join(root, name), encoding="utf-8").read())
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                for kw in node.keywords:
+                    if kw.arg in ("read_inventory", "read_bytes"):
+                        v = ast.unparse(kw.value)
+                        seen.append((name, v))
+                        self.assertIn(v, ("fk._read", "read_inventory"), f"{name}: {kw.arg}={v}")
+                fn = ast.unparse(node.func)
+                if fn in ("fk.read", "fleet_keys.read") and len(node.args) > 1:
+                    v = ast.unparse(node.args[1])
+                    seen.append((name, v))
+                    self.assertIn(v, ("fk._read", "read_inventory"), f"{name}: {fn}(..., {v})")
+        self.assertIn(("amap_sandy.py", "fk._read"), seen)
+        self.assertIn(("activation_install.py", "read_inventory"), seen)
 
 
 if __name__ == "__main__":
