@@ -33,14 +33,17 @@ def configuration_mode(raw):
     # defaults an uninspectable document to separate mode.
     mode, section, seen = "separate", "", set()
     decoder = json.JSONDecoder()
-    for line in raw.decode().splitlines():
-        line = line.strip()
+    text = raw.decode().replace("\r\n", "\n")
+    if any(ord(char) < 32 and char not in "\t\n" or char == "\x7f" for char in text):
+        raise ValueError("noncanonical controller inspection requires Python 3.11 or newer")
+    for line in text.split("\n"):
+        line = line.strip(" \t")
         if not line or line.startswith("#"):
             continue
         if re.fullmatch(r"\[lanes\.[A-Za-z0-9_-]+\]", line):
             section = line
             continue
-        assignment = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+)", line)
+        assignment = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)[ \t]*=[ \t]*(.+)", line)
         if assignment is None:
             raise ValueError("noncanonical controller inspection requires Python 3.11 or newer")
         key, encoded = assignment.groups()
@@ -52,7 +55,7 @@ def configuration_mode(raw):
         if not (type(value) in {str, bool, int}
                 or isinstance(value, list) and all(isinstance(item, str) for item in value)):
             raise ValueError("noncanonical controller inspection requires Python 3.11 or newer")
-        tail = encoded[end:].strip()
+        tail = encoded[end:].strip(" \t")
         if tail and not tail.startswith("#"):
             raise ValueError("noncanonical controller inspection requires Python 3.11 or newer")
         if not section and key == "conversation_mode":
