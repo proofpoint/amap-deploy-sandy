@@ -110,6 +110,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import stat
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
@@ -364,6 +365,67 @@ def is_manifest(raw: Dict[str, Any]) -> bool:
     return isinstance(raw.get("feature"), dict) and any(k in raw for k in MANIFEST_ONLY_KEYS)
 
 
+_POLICY_MAX_BYTES = 16 * 1024 * 1024  # far past any policy; a bound, not a size
+_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
+
+
+def _policy_dir_fd(parent: Path) -> int:
+    """A descriptor for `parent`, walked from `/` with every component
+    opened relative to its verified parent with `O_DIRECTORY | O_NOFOLLOW`.
+    A missing component is `FileNotFoundError` (the policy is absent); a
+    link or a non-directory is a `PolicyError`."""
+    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY | _CLOEXEC)
+    try:
+        where = ""
+        for name in [p for p in os.path.abspath(parent).split(os.sep) if p]:
+            where = f"{where}/{name}"
+            try:
+                nxt = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | _CLOEXEC, dir_fd=fd)
+            except FileNotFoundError:
+                raise
+            except OSError as e:
+                raise PolicyError(f"{where} is a symlink or not a directory ({e.strerror}); the policy "
+                                  f"is never read through a link") from None
+            os.close(fd)
+            fd = nxt
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _read_policy_text(dfd: int, name: str, path: Path) -> str:
+    """The policy file's text, read through one descriptor opened relative
+    to its verified directory without following a link or blocking,
+    required to be a regular file with one link, and bounded. A decoding
+    failure names the file only: Python's own message carries the offending
+    byte. This is `safe_io`'s read, kept here because this module's
+    importers (another repository, and the weekly job's pinned closure)
+    take it alone."""
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | _CLOEXEC, dir_fd=dfd)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise OSError(f"{path} is not a regular file")
+        if st.st_nlink != 1:
+            raise OSError(f"{path} has {st.st_nlink} links; it must have exactly one")
+        chunks, n = [], 0
+        while n <= _POLICY_MAX_BYTES:
+            b = os.read(fd, _POLICY_MAX_BYTES + 1 - n)
+            if not b:
+                break
+            chunks.append(b)
+            n += len(b)
+    finally:
+        os.close(fd)
+    if n > _POLICY_MAX_BYTES:
+        raise OSError(f"{path} is larger than {_POLICY_MAX_BYTES} bytes")
+    try:
+        return b"".join(chunks).decode("utf-8")
+    except UnicodeDecodeError:
+        raise OSError(f"{path} is not UTF-8 text") from None
+
+
 def load_policy(path: Path) -> Dict[str, Any]:
     """Load and validate `path`. Missing file -> `default_policy()`, marked
     with `SOURCE_KEY = SOURCE_DEFAULT` so a caller can emit the "no policy
@@ -385,15 +447,31 @@ def load_policy(path: Path) -> Dict[str, Any]:
     policy file itself); that half of validation lives in `resolve_peers`.
     """
     path = Path(path)
-    if not path.is_file():
-        default = default_policy()
-        default[SOURCE_KEY] = SOURCE_DEFAULT
-        return default
-
     try:
-        text = path.read_text()
-    except OSError as e:
-        raise PolicyError(f"cannot read {path}: {e}")
+        dfd = _policy_dir_fd(path.parent)
+    except FileNotFoundError:
+        dfd = None
+    try:
+        st = None
+        if dfd is not None:
+            try:
+                st = os.stat(path.name, dir_fd=dfd, follow_symlinks=False)
+            except FileNotFoundError:
+                st = None
+        if st is not None and stat.S_ISLNK(st.st_mode):
+            raise PolicyError(f"{path} is a symlink; the policy is read only from a regular file, "
+                              f"never through a link")
+        if st is None or not stat.S_ISREG(st.st_mode):
+            default = default_policy()
+            default[SOURCE_KEY] = SOURCE_DEFAULT
+            return default
+        try:
+            text = _read_policy_text(dfd, path.name, path)
+        except OSError as e:
+            raise PolicyError(f"cannot read {path}: {e}")
+    finally:
+        if dfd is not None:
+            os.close(dfd)
     try:
         raw = json.loads(text)
     except json.JSONDecodeError as e:
