@@ -18,6 +18,11 @@ SANDBOX_TYPES = {"read-only": "readOnly", "workspace-write": "workspaceWrite",
 
 def selection_note(state):
     try:
+        if (Path(state) / "fresh-birth.json").exists():
+            plan = json.loads(assets.regular(Path(state) / "fresh-plan.json"))
+            source = {"CODEX_MODEL": "CODEX_MODEL", "native_config": "native config.toml",
+                      "native_default": "native Codex default"}[plan["selection"]["model_source"]]
+            return "recorded fresh entry model source is " + source + " (entry environment scope)"
         record = json.loads(assets.regular(Path(state) / "adapter-transition.json"))
         receipt = json.loads(assets.regular(Path(state) / settings.RECEIPT))
         if settings.evidence_problems(receipt, record):
@@ -112,6 +117,9 @@ def evidence_problems(status, descriptor, record, binding, *, now):
 
 def problems(state, status, *, now=None):
     state = Path(state)
+    if (state / "fresh-birth.json").exists():
+        import codex_fresh
+        return codex_fresh.evidence_problems(state, status, now=now)
     try:
         assets.directory(state)
         if state.stat().st_mode & 0o077:

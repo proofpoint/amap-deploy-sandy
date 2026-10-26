@@ -30,6 +30,17 @@ SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 : "${SANDY_FEATURE_STATE:?codex relay: sandy exported no SANDY_FEATURE_STATE; this sandy predates per-entry state}"
 
 STATE="$SANDY_FEATURE_STATE/codex"
+SANDY_SESSION_FILE=/etc/sandy-session.json
+case "${AMAP_CODEX_CONVERSATION_MODE:-separate}" in
+    unified)
+        while ! python3 "$SELF_DIR/codex_fresh.py" --state "$STATE" birth --session "$SANDY_SESSION_FILE"; do
+            echo "codex relay: fresh unified birth held; retain existing state for operator inspection" >&2
+            sleep 30
+        done ;;
+    separate) : ;;
+    *) echo "codex relay: unknown fleet conversation mode; not starting Codex" >&2
+       while :; do sleep 30; done ;;
+esac
 mkdir -p "$STATE"
 chmod 700 "$STATE"
 HOLD="$STATE/hold.json"
@@ -129,7 +140,6 @@ CODEX_VERSION=$(python3 -c "$AMAP_CODEX_BUILD")
 # transition selects the shared pane model. The entry capture binds selection
 # to its controller; it is not a claim about arbitrary later pane argv.
 
-SANDY_SESSION_FILE=/etc/sandy-session.json
 if [ ! -r "$SANDY_SESSION_FILE" ]; then
     echo "codex relay: $SANDY_SESSION_FILE is missing or unreadable; sandy composes it before launch" >&2
     exit 1
@@ -209,6 +219,11 @@ if [ -n "${AMAP_IDENTITY+x}" ] || [ -n "${AMAP_IDENTITY_DIR+x}" ]; then
 elif [ -n "${AMAP_FLEET_DOMAIN+x}" ]; then
     : "${AMAP_FLEET_DOMAIN:?codex relay: AMAP_FLEET_DOMAIN is exported but empty; re-run amap-sandy.py install --apply}"
     self_address="$sandbox_name@$AMAP_FLEET_DOMAIN"
+fi
+
+if [ "${AMAP_CODEX_CONVERSATION_MODE:-separate}" = unified ]; then
+    exec python3 "$SELF_DIR/codex_fresh.py" --state "$STATE" --payload "$SELF_DIR" relay \
+        --instance "$sandbox_name" --workspace "$workspace" --address "$self_address" --version "$CODEX_VERSION"
 fi
 
 # The connector's outcome directory sits in its own extension space; it
