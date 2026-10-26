@@ -2814,13 +2814,14 @@ def verify_codex_supervisor(home: Path, slug: str, record: Optional[dict], *,
     if os.path.lexists(state / "adapter-pause.json"):
         problems.append(f"codex supervisor holding: {slug}: explicit operator maintenance pause; inspect adapter-pause.json")
     fresh_birth = os.path.lexists(state / "fresh-birth.json")
+    fresh_evidence = any(os.path.lexists(path) for path in cf.fresh_markers(state))
     if expected_mode == "unified" and not fresh_birth:
         problems.append(f"codex unified HOLD: {slug}: fleet mode requires fresh initialization; "
                         f"operator recreation is required for legacy or unknown state; nothing is automatically erased")
-    if fresh_birth and expected_mode != "unified":
+    if fresh_evidence and expected_mode != "unified":
         problems.append(f"codex unified HOLD: {slug}: authored fleet mode differs from the fresh instance; "
                         f"no automatic downgrade is allowed")
-    if fresh_birth or os.path.lexists(state / "adapter-transition.json") or (isinstance(status, dict) and status.get("mode") == "unified"):
+    if fresh_evidence or os.path.lexists(state / "adapter-transition.json") or (isinstance(status, dict) and status.get("mode") == "unified"):
         problems += [f"codex unified UNKNOWN: {slug}: {reason}" for reason in cus.problems(state, status, now=now)]
         model_note = cus.selection_note(state)
         if model_note is not None:

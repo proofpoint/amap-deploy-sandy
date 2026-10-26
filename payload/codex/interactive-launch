@@ -38,6 +38,10 @@ STATE=/opt/sandy/feature-state/amap/codex
 [ "$#" -ge 1 ] || { echo "interactive-launch: sandy passed no native command line" >&2; exit 2; }
 case "${AMAP_CODEX_CONVERSATION_MODE-separate}" in
     separate)
+        if [ -e "${STATE%/*}/.fresh-intent-${STATE##*/}.json" ] || [ -L "${STATE%/*}/.fresh-intent-${STATE##*/}.json" ]; then
+            echo "interactive-launch: fresh unified state cannot downgrade to separate; durable birth intent remains" >&2
+            exit 1
+        fi
         for evidence in fresh-birth.json fresh-plan.json fresh-initialization.json fresh-startup.json fresh-selection.json; do
             if [ -e "$STATE/$evidence" ] || [ -L "$STATE/$evidence" ]; then
                 echo "interactive-launch: fresh unified state cannot downgrade to separate" >&2

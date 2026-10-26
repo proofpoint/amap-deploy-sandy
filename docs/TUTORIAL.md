@@ -406,8 +406,9 @@ Claude/Codex sandboxes are Claude-served and are refused by the unified Codex
 wrapper; use a Codex-served sandbox. This setting does not change other agents'
 conversation implementations.
 
-The entry exclusively creates its private birth directory before writing a
-controller or starting a backend. First birth requires empty local mailbox
+The entry durably records birth intent in its private parent before exclusively
+creating the birth directory, so an interrupted directory creation cannot fall
+back to separate mode. This precedes controller publication or backend startup. First birth requires empty local mailbox
 contents; retained work is held for operator disposition. A durable fresh plan
 binds instance, workspace, lanes, protected version, native configuration and
 model/permission selection. The wrapper validates its full argv against a
@@ -431,7 +432,9 @@ a changed policy/model/permission selection or inconsistent evidence is never
 erased, adopted or downgraded automatically. A pause or temporary proof-read
 failure blocks new incoming dispatch and attachment while keeping owned active
 native work alive; a marker is not evidence of quiescence. Keep retained state
-until the operator chooses the supported remedy.
+until the operator chooses the supported remedy. Do not use ordinary rollout
+rollback after fresh intent or initialization exists; recovery of this state
+requires its own reviewed procedure.
 
 #### Recreating existing Codex-only sandboxes deliberately
 

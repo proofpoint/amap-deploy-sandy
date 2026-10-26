@@ -61,6 +61,10 @@ def private_state(state):
         raise ValueError("fresh state is not private and owned by the current user")
 
 
+def intent_path(state):
+    return state.parent / (".fresh-intent-" + state.name + ".json")
+
+
 def load_birth(state):
     private_state(state)
     value = read_json(state / BIRTH)
@@ -71,6 +75,8 @@ def load_birth(state):
             or not isinstance(value.get("runtime_state_dir"), str) or not Path(value["runtime_state_dir"]).is_absolute()
             or value.get("mailbox_birth_scope") != "local_empty_observation_not_router_retirement"):
         raise ValueError(RECREATE + "; exclusive birth evidence is malformed")
+    if str(state) == value["runtime_state_dir"] and read_json(intent_path(state)) != value:
+        raise ValueError(RECREATE + "; durable birth intent differs")
     return value
 
 
@@ -118,7 +124,7 @@ def require_empty_birth_lanes(lanes):
 
 
 def birth(state, session, env):
-    """An exclusive new directory is the fence; an unexplained directory holds."""
+    """Parent intent precedes exclusive mkdir, so even its crash gap cannot downgrade."""
     native_runtime()
     state = Path(state)
     if not state.is_absolute():
@@ -126,29 +132,28 @@ def birth(state, session, env):
     expected = identity(session, env)
     assets.directory(state.parent)
     unpaused(state)
-    if not os.path.lexists(state):
-        require_empty_birth_lanes(expected["lanes"])
-    try:
-        state.mkdir(mode=0o700)
-    except FileExistsError:
-        private_state(state)
+    if os.path.lexists(state):
         try:
             record = load_birth(state)
         except (OSError, ValueError) as exc:
             raise ValueError(RECREATE) from exc
-        if (record.get("schema") != 1 or type(record.get("schema")) is not int
-                or record.get("kind") != "fresh_unified_birth" or record.get("identity") != expected
-                or record.get("runtime_state_dir") != str(state)
-                or not isinstance(record.get("birth_id"), str)
-                or not re.fullmatch("[a-f0-9]{32}", record["birth_id"])):
+        if record["identity"] != expected or record["runtime_state_dir"] != str(state):
             raise ValueError(RECREATE + "; birth identity differs")
         return record
-    assets.sync_directory(state.parent)
+    if os.path.lexists(intent_path(state)):
+        raise ValueError(RECREATE + "; interrupted birth intent requires inspection")
+    require_empty_birth_lanes(expected["lanes"])
     record = {"schema": 1, "kind": "fresh_unified_birth", "birth_id": uuid.uuid4().hex,
-              "identity": expected, "runtime_state_dir": str(state), "mailbox_birth_scope": "local_empty_observation_not_router_retirement"}
+              "identity": expected, "runtime_state_dir": str(state),
+              "mailbox_birth_scope": "local_empty_observation_not_router_retirement"}
+    publish(state, intent_path(state), assets.encoded(record), mode=0o600)
+    try:
+        state.mkdir(mode=0o700)
+    except FileExistsError as exc:
+        raise ValueError(RECREATE + "; another object appeared during exclusive birth") from exc
+    assets.sync_directory(state.parent)
     publish(state, state / BIRTH, assets.encoded(record), mode=0o600)
     return record
-
 
 @contextmanager
 def locked(state, name):
