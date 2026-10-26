@@ -596,9 +596,60 @@ class FreshBirthTest(unittest.TestCase):
             with self.subTest(key=key):
                 with self.assertRaisesRegex(ValueError, "drifted"):
                     fresh.current_guard(self.state, dict(self.env, **{key: value}))
-        (self.native / "config.toml").write_text('model = "fixture-model"\n# changed controls\n')
+        (self.native / "config.toml").write_text('model = "fixture-model"\nmodel_provider = "foreign"\n')
         with self.assertRaisesRegex(ValueError, "native configuration changed"):
             fresh.current_guard(self.state, self.env)
+
+    def test_native_terminal_detection_preserves_owned_service_and_canonical(self):
+        self.prepare()
+        self.select()
+        path = self.native / "config.toml"
+        with self.runtime():
+            async def check():
+                service = fresh.service_class()(fresh.config_at(self.state), self.state / "controller.toml")
+                try:
+                    await service.start()
+                    canonical = service.journal.thread_id
+                    # The real 0.164 TUI writes this after remote attachment.
+                    for flag in ("true", "false"):
+                        path.write_text('model="fixture-model"\n[tui]\nscreen_reader_detection_done=' + flag + '\n')
+                        await service.tick()
+                        self.assertEqual(service.status["readiness"]["state"], "ready")
+                        self.assertEqual(service.journal.thread_id, canonical)
+                        self.assertTrue(service.gate.accepting)
+                    path.write_text('model="fixture-model"\n[tui]\n')
+                    fresh.current_guard(self.state, self.env)
+                    path.write_text('model="fixture-model"\n# formatting does not change native settings\n')
+                    fresh.current_guard(self.state, self.env)
+                    for controls in ('model_provider="foreign"\n',
+                                     'approval_policy="on-request"\n',
+                                     '[mcp_servers.foreign]\ncommand="foreign"\n',
+                                     '[tui]\nscreen_reader_detection_done=true\ntheme="foreign"\n'):
+                        with self.subTest(controls=controls):
+                            path.write_text('model="fixture-model"\n' + controls)
+                            await service.tick()
+                            self.assertEqual(service.status["readiness"]["state"], "holding")
+                            self.assertIn("native configuration changed", service.status["last_error"])
+                            self.assertFalse(service.gate.accepting)
+                            self.assertFalse(service.stop_requested.is_set())
+                            self.assertIsNone(service.backend.process.returncode)
+                            self.assertEqual(service.journal.thread_id, canonical)
+                    path.write_text('model="fixture-model"\n[tui]\nscreen_reader_detection_done=1\n')
+                    with self.assertRaisesRegex(ValueError, "not boolean"):
+                        fresh.current_guard(self.state, self.env)
+                finally:
+                    await service.close()
+            asyncio.run(check())
+        self.assertEqual(self.protocol.starts, 1)
+
+    def test_native_terminal_detection_can_create_an_otherwise_empty_config(self):
+        path = self.native / "config.toml"
+        path.unlink()
+        self.prepare()
+        self.select()
+        path.write_text('[tui]\nscreen_reader_detection_done=true\n')
+        fresh.current_guard(self.state, self.env)
+        self.assertFalse((self.state / "journal.sqlite3").exists())
 
     def test_pause_and_endpoint_bound_refuse_before_runtime(self):
         (self.state / "adapter-pause.json").write_text("{}")

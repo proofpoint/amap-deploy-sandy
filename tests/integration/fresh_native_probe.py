@@ -87,6 +87,10 @@ async def probe(args):
                 service.tick = observed_tick
                 task = asyncio.create_task(service.run())
                 await until(provider.arrived.is_set, terminal)
+                # Queued AMAP work can start before the terminal attaches.
+                # Pause only after attachment; a new attachment during pause
+                # is correctly refused and cannot test preservation of one.
+                await until(lambda: service.gate.client_count == 1, terminal)
                 evidence['real_protected_wrapper_started_owned_turn'] = True
                 evidence['owned_turn_source'] = 'queued_peer' if pending else 'human'
                 evidence['initialization_phase'] = fresh.initialization(
@@ -139,6 +143,12 @@ async def probe(args):
                 args.output.write_text(json.dumps(evidence, indent=2) + '\n')
         except BaseException as exc:
             evidence['failure'] = type(exc).__name__ + ': ' + str(exc)
+            if terminal:
+                terminal.poll()
+                evidence['terminal_exit'] = terminal.process.poll()
+                evidence['terminal_output'] = terminal.output.decode(errors='replace')[-6000:]
+            if service:
+                evidence['service_status'] = service.status
             args.output.write_text(json.dumps(evidence, indent=2) + '\n')
             raise
         finally:
