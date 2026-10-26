@@ -377,6 +377,227 @@ The thread submits the delegation and finishes its turn. alpha's reply
 arrives as a later turn on the same thread. **Delegate to Codex** the same
 way as to any agent: ask alpha to task gamma's address.
 
+### Fleet choice: fresh unified Codex conversations
+
+An explicit fleet choice makes newly created, selected Codex-served sandboxes
+use one persistent conversation for the pane and incoming work. Hosts without
+this choice keep separate mode. Use the approved deployment commit for the
+host's main or release line, with its pinned siblings. For the release host,
+set `APPROVED_DEPLOYMENT_HEAD` to the final approved fresh-default release
+commit; the existing deployment baseline does not contain this feature. A
+missing approval or dirty checkout holds installation:
+
+```sh
+set -e
+AMAP_ROOT="$HOME/amap"
+: "${APPROVED_DEPLOYMENT_HEAD:?Set the full final approved release commit}"
+cd "$AMAP_ROOT/amap-deploy-sandy"
+test -z "$(git status --porcelain)"
+git fetch origin
+git switch release/amap-2026-10-10
+git merge --ff-only "$APPROVED_DEPLOYMENT_HEAD"
+test "$(git rev-parse HEAD)" = "$APPROVED_DEPLOYMENT_HEAD"
+AMAP_CODEX=1 python3 amap-siblings.py --apply
+AMAP_CODEX=1 python3 amap-siblings.py
+python3 amap-sandy.py install --codex-mode unified
+python3 amap-sandy.py install --codex-mode unified --apply
+```
+
+`AMAP_ROOT` is the directory containing the deployment and its sibling checkouts
+(normally `~/amap`). The explicit install choice authors
+`feature.codex_conversation_mode = "unified"`, adds `codex` to the agent include
+list and renders `AMAP_CODEX_CONVERSATION_MODE=unified` into the existing manifest
+exports. Sandbox selection and all exclusion rules remain authored constraints.
+The host must support the protected Codex `agent_wrapper`; an unavailable
+capability refuses the choice. An ordinary later install preserves it. The
+export reaches entries and panes when their containers are created.
+
+For a genuinely new workspace, use an existing absolute `WORKSPACE` directory.
+With the router and fleet already verified, launch normally:
+
+```sh
+unset SANDY_EFFORT
+SANDY_SKIP_PERMISSIONS=true sandy --new --agent codex --workspace "$WORKSPACE"
+```
+
+The initial supported profile requires literal `SANDY_SKIP_PERMISSIONS=true`
+and native full-access/never argv. Avoid profile, config and effort overrides;
+unsupported controls hold. Nonempty `CODEX_MODEL` selects the shared model,
+otherwise native configuration and then the native default apply. Mixed
+Claude/Codex sandboxes are Claude-served and are refused by the unified Codex
+wrapper; use a Codex-served sandbox. This setting does not change other agents'
+conversation implementations.
+
+The entry durably records birth intent in its private parent before exclusively
+creating the birth directory, so an interrupted directory creation cannot fall
+back to separate mode. Before either write, a durable custody marker in the
+retained outbox namespace binds birth, instance, workspace, native home and
+runtime state. A supported reset that removes private state but retains lanes
+therefore holds instead of starting another history, including if fleet mode
+is absent or changed to separate. The custody marker is not a router request.
+
+New inbound notices may arrive before entry startup. They remain unchanged
+until the full native argv is validated, then the connector's normal journal
+and queue process them once on the owned canonical conversation. First birth
+rejects any retained outbound artifact and unknown native-home state; it never
+deletes either. Expected bootstrap shapes are opaque `config.toml`, optional
+`auth.json`, and Sandy's generated `skills/{md2pdf,md2doc,md2html,md2email,screenshot}/SKILL.md`.
+An additional skill, cache, history, stale launch file or other unknown path
+requires a reviewed provisioning decision. Authentication bytes are not read
+for this classification.
+
+These local negative checks do not certify router freshness or prove native
+home exclusion. No prior native owner may still use the home. A reused
+address requires the explicit work disposition, quiescence and router reset
+below. Arbitrary deletion of every custody/native/router witness is unsupported;
+absence alone cannot recover its provenance. A durable fresh plan
+binds instance, workspace, lanes, protected version, native configuration and
+model/permission selection. The wrapper validates its full argv against a
+canonical selector before the incoming service can start. The existing connector
+creates and names the persistent native conversation and commits its real
+journal binding. Only then can native readiness release attachment. No UUID
+selection, adoption confirmation or hand-edited controller is required.
+
+Native configuration is compared as TOML settings. Codex's automatic boolean
+`tui.screen_reader_detection_done` stamp and formatting changes do not hold the
+conversation; other native settings remain bound to the startup plan.
+
+A preselection receipt is not backend readiness. The read-only proof is:
+
+```sh
+sandy --exec --workspace "$WORKSPACE" -- python3 /opt/sandy/features/amap/codex/codex_fresh.py --state /opt/sandy/feature-state/amap/codex inspect
+```
+
+Require `ready: true`, `initialization_phase: "initialized"` and a verified
+canonical ID. Idle restart before the first human input, detach and retry retain
+that canonical conversation. A lost adapter receipt can recover a complete real
+binding. An attempted native start with no complete binding holds instead of
+creating another history. Unknown existing state, a previous separate controller,
+a changed policy/model/permission selection or inconsistent evidence is never
+erased, adopted or downgraded automatically. A pause or temporary proof-read
+failure blocks new incoming dispatch and attachment while keeping owned active
+native work alive; a marker is not evidence of quiescence. Keep retained state
+until the operator chooses the supported remedy. Do not use ordinary rollout
+rollback after fresh intent or initialization exists; recovery of this state
+requires its own reviewed procedure.
+
+#### Recreating existing Codex-only sandboxes deliberately
+
+Removal discards native homes/history, feature entry state and mailbox contents;
+it preserves the workspace source directory. Inventory and retain the material
+the operator needs before choosing any destructive disposition. There is no safe
+universal batch selector. Sandy's `agents` field describes the last launch, so
+this is only a candidate list, with mixed and unknown records excluded:
+
+```sh
+sandy --print-state | jq -r '.sandboxes[] | select(.agents==["codex"]) | [.name,.workspace_path,.workspace_exists] | @tsv'
+```
+
+For each explicitly selected `SLUG` and `WORKSPACE`, resolve pending work,
+publication outcomes and router/chain custody with their owners. Do not process
+old notices again in a new empty journal. The local birth fence does not retire
+router-owned state. Primary router pin `972cb7096bf4110811cbafc20a6a8019d7408576`
+is common to both deployment lines; the additional main hop pin is a separate
+runtime. Hop, hub and other per-address state need their own verified owner
+procedure. Unknown custody holds recreation.
+
+The supported order is: stop the selected agent and router; prove quiescence;
+reset the still-discovered, still-selected slug through the primary router;
+remove that sandbox; install the fleet choice; create the fresh sandbox; restart
+the existing router; establish fresh first sight and verify before sending work.
+Never remove first and improvise deletion of orphan router state.
+
+`sandy --stop` stops a daemon; foreground sessions require ordinary exit. Its
+exit status, including 4, does not prove absence. Use the successful same-daemon
+full-container-ID absence check in the transition procedure below for the old
+sandbox. Removal's own Docker-unavailable check fails open, so it cannot replace
+that check. Stop the primary router by its verified full container ID and require
+successful inspection showing it stopped, in the same Docker context:
+
+```sh
+sandy --stop --workspace "$WORKSPACE"
+docker stop "$ROUTER_CONTAINER_ID"
+router_running=$(docker inspect --format '{{.State.Running}}' "$ROUTER_CONTAINER_ID") || exit 1
+test "$router_running" = false
+: "${OLD_CONTAINER_ID:?Record the full old sandbox container ID before stop}"
+old_ids=$(docker ps --all --quiet --no-trunc) || exit 1
+python3 -c 'import re, sys
+old, listing = sys.argv[1:]
+ids = listing.splitlines()
+if not re.fullmatch("[0-9a-f]{64}", old) or any(not re.fullmatch("[0-9a-f]{64}", v) for v in ids):
+    sys.exit("UNKNOWN: full container identity is unavailable")
+if old in ids:
+    sys.exit("HOLD: old container still exists")' "$OLD_CONTAINER_ID" "$old_ids"
+```
+
+Run the reset as the router's operator UID, from its exact pinned checkout. Its
+config paths are identity-mounted by `docker/run.sh`, so this host CLI addresses
+the same roots. Review the dry-run plan before the explicit destructive form:
+
+```sh
+AMAP_PRIMARY_STATE_DIR=$(python3 -I -S -c 'import json, pathlib, sys
+p = pathlib.Path(json.loads(pathlib.Path(sys.argv[1]).read_text())["state_dir"])
+if not p.is_absolute():
+    sys.exit("HOLD: primary state_dir is not absolute")
+print(p)' "$HOME/.sandy/features/amap/router.json")
+cd "$AMAP_ROOT/amap-router-local"
+test "$(git rev-parse HEAD)" = 972cb7096bf4110811cbafc20a6a8019d7408576
+python3 -m router --config "$HOME/.sandy/features/amap/router.json" reset "$SLUG" --dry-run
+python3 -m router --config "$HOME/.sandy/features/amap/router.json" reset "$SLUG" --yes
+test ! -e "$AMAP_PRIMARY_STATE_DIR/$SLUG/first-seen.json"
+test ! -L "$AMAP_PRIMARY_STATE_DIR/$SLUG/first-seen.json"
+sandy --remove-sandbox --workspace "$WORKSPACE" --dry-run
+sandy --remove-sandbox --workspace "$WORKSPACE" --yes
+```
+
+The reset requires a known selected slug, clears mailbox and primary-router
+state while retaining audit, and acquires the router state lock. Lock refusal
+stops the procedure. Successful host-side lock acquisition is not proof of
+VM/container quiescence; Mac file-sharing lock behavior remains target-host
+acceptance. `--reset-sandbox` and `--new` alone preserve enrollment/lanes and do
+not perform this reset. No command above targets the separate hop runtime.
+
+Apply the fleet install choice above, then use the ordinary fresh launch in a
+second terminal. With unchanged verified router roots/mounts, restart the same
+stopped container, whose instance-root mount includes new children:
+
+```sh
+docker start "$ROUTER_CONTAINER_ID"
+cd "$AMAP_ROOT/amap-deploy-sandy"
+python3 amap-sandy.py verify
+```
+
+Require a new first-sight snapshot for this slug after the reset and successful
+verification before the first send. Keep prompts and fleet traffic held until
+this read-only check succeeds; a missing marker requires waiting for a router
+poll and rerunning, never manufacturing a marker:
+
+```sh
+python3 -I -S - "$AMAP_PRIMARY_STATE_DIR" "$SLUG" <<'PYFIRST'
+import json, pathlib, sys
+value = json.loads((pathlib.Path(sys.argv[1]) / sys.argv[2] / "first-seen.json").read_text())
+if (value.get("instance") != sys.argv[2] or value.get("outbox_snapshot") != []
+        or not isinstance(value.get("first_seen_ts"), str)):
+    sys.exit("HOLD: new first-sight proof is missing or has quarantined requests")
+print("New first sight:", value["instance"], value["first_seen_ts"])
+PYFIRST
+```
+
+A nonempty snapshot requires explicit work disposition. Do not edit it to clear
+quarantine.
+If mount paths or the mount set changed, use a separately verified router
+recreation procedure. Do not reuse a stale mount map or invoke `docker/run.sh`
+under an existing stopped container's name.
+
+Pilot acceptance records the final deployment/core source, native build, model
+and actual host observations: initialized/ready with canonical ID; idle restart
+before any prompt retaining that ID; a human turn plus incoming peer work in the
+same pane; mail while detached; Claude-to-Codex and Codex-to-Claude round trips;
+`resume --last` retaining history; and unknown/partial/reset state holding.
+The reproducible `tests/integration/fresh_native_probe.py` uses a disposable
+local synthetic provider for active pause and queued-before-birth/restart
+checks; its results do not establish target-host acceptance.
+
 ### Experimental unified conversation: existing-instance transition
 
 The Codex pin names merged connector main commit

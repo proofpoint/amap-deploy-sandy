@@ -11,6 +11,7 @@ import time
 import subprocess
 
 import codex_assets as assets
+import codex_fleet as fleet
 import codex_settings as settings
 
 RECORD = "adapter-transition.json"
@@ -273,6 +274,8 @@ def confirm(state, *, apply=False):
 
 def entry_mode(state, *, selected_model=None, observed_version=None, check_pane_settings=False):
     """Read-only gate, used before relay rendering and terminal attachment."""
+    if any(os.path.lexists(path) for path in fleet.fresh_markers(state, os.environ.get("AMAP_OUTBOX_DIR"))):
+        raise ValueError("fresh unified state cannot enter the separate/adoption path; use the protected fresh launcher")
     if not os.path.lexists(state / RECORD):
         path = state / "controller.toml"
         if os.path.lexists(path):
@@ -316,6 +319,9 @@ def pause(state, note, *, apply=False):
 
 
 def unpause(state, *, apply=False):
+    if os.path.lexists(state / "fresh-birth.json"):
+        import codex_fresh
+        return codex_fresh.unpause(state, apply=apply)
     from amap_codex.supervisor import Ownership
     mode = entry_mode(state)
     record = json.loads(assets.regular(state / PAUSE))
