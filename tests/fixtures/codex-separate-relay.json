@@ -1,0 +1,8 @@
+{
+  "baseline_commit": "8346e9d7beb030bff5a7fd1b8f52830f77e3a972",
+  "path": "payload/codex/relay",
+  "git_blob": "64e49566f4355634c126001931ef014c17bbd4ef",
+  "git_mode": "100755",
+  "sha256": "8afc87349129dcb7ba6b56cbee2ebb0b64014f4fcc079106010ac0181bfea17b",
+  "purpose": "Actual shipped separate relay for first-upgrade input capture and pause behavior control; fixture avoids requiring full Git history in CI"
+}

@@ -33,22 +33,78 @@ STATE="$SANDY_FEATURE_STATE/codex"
 mkdir -p "$STATE"
 chmod 700 "$STATE"
 HOLD="$STATE/hold.json"
+ENTRY_GENERATION=$(python3 -c 'import uuid; print(uuid.uuid4().hex)')
+ENVIRONMENT_GENERATION=""
 
-# hold REASON: record why the supervisor is not running, then wait until
-# CHECK (a shell command) succeeds, re-checking every 30 seconds.
+# hold_record REASON: record why the supervisor is not running, once per
+# change of reason.
+hold_record() {
+    if [ ! -f "$HOLD" ] || ! grep -qF "\"$1\"" "$HOLD"; then
+        python3 -c 'import json, sys, time; print(json.dumps({"reason": sys.argv[1], "since": int(time.time())}))' "$1" > "$HOLD.tmp"
+        mv "$HOLD.tmp" "$HOLD"
+        echo "codex relay: holding: $1" >&2
+    fi
+}
+
+# hold_until REASON CHECK: record REASON, then wait until CHECK (a shell
+# command) succeeds, re-checking every 30 seconds.
 hold_until() {
     reason=$1; check=$2
     while ! sh -c "$check" >/dev/null 2>&1; do
-        if [ ! -f "$HOLD" ] || ! grep -qF "\"$reason\"" "$HOLD"; then
-            python3 -c 'import json, sys, time; print(json.dumps({"reason": sys.argv[1], "since": int(time.time())}))' "$reason" > "$HOLD.tmp"
-            mv "$HOLD.tmp" "$HOLD"
-            echo "codex relay: holding: $reason" >&2
-        fi
+        hold_record "$reason"
         sleep 30
     done
     rm -f "$HOLD"
 }
 
+export AMAP_CODEX_PAUSE_PATH="$STATE/adapter-pause.json"
+wait_operator_pause() {
+    if [ -e "$AMAP_CODEX_PAUSE_PATH" ] || [ -L "$AMAP_CODEX_PAUSE_PATH" ]; then
+        while [ -e "$AMAP_CODEX_PAUSE_PATH" ] || [ -L "$AMAP_CODEX_PAUSE_PATH" ]; do
+            hold_record "operator maintenance pause; no automatic service restart"
+            sleep 1
+        done
+        rm -f "$HOLD"
+    fi
+}
+wait_transition() {
+    while :; do
+        wait_operator_pause
+        if MODEL=$(python3 "$SELF_DIR/codex_settings.py" --for-entry --state "$STATE" --instance "$sandbox_name" --generation "$ENTRY_GENERATION" --apply 2>&1); then
+            if mode=$(python3 "$SELF_DIR/transition" --state "$STATE" entry-mode --model "$MODEL" --version "$CODEX_VERSION" --check-pane-settings 2>&1); then
+                if [ -e "$AMAP_CODEX_PAUSE_PATH" ] || [ -L "$AMAP_CODEX_PAUSE_PATH" ]; then continue; fi
+                if [ "$mode" != unified ]; then break; fi
+                if [ -z "$ENVIRONMENT_GENERATION" ]; then
+                    if ENVIRONMENT_GENERATION=$(python3 "$SELF_DIR/codex_settings.py" --environment-generation 2>&1); then
+                        ENTRY_GENERATION=$ENVIRONMENT_GENERATION
+                    else
+                        hold_record "$ENVIRONMENT_GENERATION"
+                        ENVIRONMENT_GENERATION=""
+                        sleep 1
+                        continue
+                    fi
+                    if ! MODEL=$(python3 "$SELF_DIR/codex_settings.py" --for-entry --state "$STATE" --instance "$sandbox_name" --generation "$ENTRY_GENERATION" --apply 2>&1); then
+                        hold_record "$MODEL"
+                        continue
+                    fi
+                fi
+                if selection=$(python3 "$SELF_DIR/transition" --state "$STATE" startup-gate --generation "$ENTRY_GENERATION" --apply 2>&1); then
+                    if [ -e "$AMAP_CODEX_PAUSE_PATH" ] || [ -L "$AMAP_CODEX_PAUSE_PATH" ]; then continue; fi
+                    break
+                fi
+                hold_record "$selection"
+            else
+                hold_record "$mode"
+            fi
+        else
+            hold_record "$MODEL"
+        fi
+        sleep 1
+    done
+    rm -f "$HOLD"
+}
+
+wait_operator_pause
 hold_until "codex is not logged in; run sandy --login codex" "codex login status"
 
 # Any Codex build runs; the supervisor reports whether the connector has
@@ -69,17 +125,9 @@ export AMAP_CODEX_BUILD
 hold_until "codex --version reports no build; the image's Codex install is broken (rebuild it)" 'python3 -c "$AMAP_CODEX_BUILD"'
 CODEX_VERSION=$(python3 -c "$AMAP_CODEX_BUILD")
 
-# The model is the one the agent's own Codex uses: `model` in its
-# config.toml, as a Claude agent's model is its pane's. None there leaves the
-# choice to Codex's own default, as it does for the pane. It takes effect
-# when the supervisor starts.
-MODEL=$(python3 -c '
-import sys, tomllib
-try:
-    model = tomllib.load(open(sys.argv[1], "rb")).get("model")
-except (OSError, ValueError):
-    model = None
-print(model if isinstance(model, str) else "")' "${CODEX_HOME:-$HOME/.codex}/config.toml")
+# Separate entry keeps the native configuration's model. An explicit adapter
+# transition selects the shared pane model. The entry capture binds selection
+# to its controller; it is not a claim about arbitrary later pane argv.
 
 SANDY_SESSION_FILE=/etc/sandy-session.json
 if [ ! -r "$SANDY_SESSION_FILE" ]; then
@@ -104,12 +152,23 @@ fi
 
 # The connector's outcome directory sits in its own extension space; it
 # creates the leaf, and its parent must exist.
+wait_operator_pause
+wait_transition
 mkdir -p "$AMAP_OUTBOX_DIR/ext/codex"
 mkdir -p "$STATE/claims"
 
+render_controller() {
 python3 - "$STATE/controller.toml" "$sandbox_name" "$self_address" "$MODEL" "$CODEX_VERSION" "$workspace" "$STATE" "$SELF_DIR" <<'PY'
 import json, os, sys
+from pathlib import Path
 path, name, address, model, version, workspace, state, payload = sys.argv[1:]
+sys.path.insert(0, payload)
+from codex_transition import snapshot_current
+if os.path.lexists(Path(state) / 'adapter-pause.json'):
+    sys.exit(75)
+if os.path.lexists(Path(state) / 'adapter-transition.json'):
+    sys.exit(76)
+snapshot_current(Path(state))
 env = os.environ
 q = json.dumps  # a JSON string is a valid TOML basic string
 lines = [
@@ -141,8 +200,33 @@ tmp = path + ".tmp"
 with open(tmp, "w") as f:
     f.write("\n".join(lines) + "\n")
 os.chmod(tmp, 0o600)
+if os.path.lexists(Path(state) / 'adapter-pause.json'):
+    os.unlink(tmp)
+    sys.exit(75)
+if os.path.lexists(Path(state) / 'adapter-transition.json'):
+    os.unlink(tmp)
+    sys.exit(76)
 os.replace(tmp, path)
 PY
+}
+while :; do
+    wait_operator_pause
+    wait_transition
+    if [ -e "$AMAP_CODEX_PAUSE_PATH" ] || [ -L "$AMAP_CODEX_PAUSE_PATH" ]; then continue; fi
+    if [ "$mode" = separate ]; then
+        render_rc=0
+        render_controller || render_rc=$?
+        case "$render_rc" in
+            0) break ;;
+            75|76) continue ;;
+            *) exit "$render_rc" ;;
+        esac
+    elif [ "$mode" = unified ]; then
+        break
+    else
+        hold_until "the adapter reported no recognized conversation mode" false
+    fi
+done
 
 # The supervisor runs as a child, never exec'd: a supervisor that fails to
 # start (an app-server that will not come up, an MCP registry that is not
@@ -154,7 +238,11 @@ trap 'stopping=1; [ -n "$supervisor" ] && kill -TERM "$supervisor" 2>/dev/null' 
 stopping=""
 backoff=30
 while :; do
+    wait_operator_pause
+    wait_transition
+    if [ -e "$AMAP_CODEX_PAUSE_PATH" ] || [ -L "$AMAP_CODEX_PAUSE_PATH" ]; then continue; fi
     rm -f "$HOLD"
+    if [ -e "$AMAP_CODEX_PAUSE_PATH" ] || [ -L "$AMAP_CODEX_PAUSE_PATH" ]; then continue; fi
     python3 -m amap_codex.cli --config "$STATE/controller.toml" run &
     supervisor=$!
     rc=0
