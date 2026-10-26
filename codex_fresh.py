@@ -61,6 +61,33 @@ def private_state(state):
         raise ValueError("fresh state is not private and owned by the current user")
 
 
+def intent_path(state):
+    return state.parent / (".fresh-intent-" + state.name + ".json")
+
+
+def custody_path(record):
+    return Path(record["identity"]["lanes"]["AMAP_OUTBOX_DIR"]) / fleet.CUSTODY
+
+
+def load_birth(state):
+    private_state(state)
+    value = read_json(state / BIRTH)
+    if (type(value.get("schema")) is not int or value.get("schema") != 1
+            or value.get("kind") != "fresh_unified_birth"
+            or not isinstance(value.get("birth_id"), str) or not re.fullmatch("[a-f0-9]{32}", value["birth_id"])
+            or not isinstance(value.get("identity"), dict)
+            or not isinstance(value.get("native_home"), str) or not Path(value["native_home"]).is_absolute()
+            or not isinstance(value.get("runtime_state_dir"), str) or not Path(value["runtime_state_dir"]).is_absolute()
+            or value.get("mailbox_birth_scope") != "local_negative_checks_not_native_or_router_freshness_proof"):
+        raise ValueError(RECREATE + "; exclusive birth evidence is malformed")
+    if str(state) == value["runtime_state_dir"]:
+        if read_json(intent_path(state)) != value:
+            raise ValueError(RECREATE + "; durable birth intent differs")
+        if read_json(custody_path(value)) != value:
+            raise ValueError(RECREATE + "; retained namespace custody differs")
+    return value
+
+
 def identity(session, env):
     name, workspace = session.get("sandbox_name"), session.get("workspace")
     if (not isinstance(name, str) or not name or not isinstance(workspace, str)
@@ -74,12 +101,63 @@ def identity(session, env):
         if not isinstance(value, str) or not Path(value).is_absolute():
             raise ValueError("fresh birth requires explicit absolute lane mounts")
         lanes[key] = value
+    if len(set(lanes.values())) != len(lanes) or not Path(workspace).is_dir():
+        raise ValueError("fresh birth requires distinct lane roots and an existing workspace")
     return {"instance_id": name, "workspace": str(Path(workspace).resolve()),
             "fleet_mode": "unified", "lanes": lanes}
 
 
+def guard_birth_inputs(lanes, env):
+    """Reject local prior-state evidence while retaining newly queued inbound work.
+
+    These are conservative local negative checks, not certification of a native
+    home or a router epoch. Provisioning/custody remain operator preconditions.
+    """
+    visited = 0
+    for key, value in lanes.items():
+        root = Path(value)
+        assets.directory(root)
+        if not root.is_dir():
+            raise ValueError("fresh birth lane root is unavailable")
+        pending = [root]
+        while pending:
+            for entry in pending.pop().iterdir():
+                visited += 1
+                if visited > 10000:
+                    raise ValueError("fresh birth mailbox inventory exceeds its bound")
+                info = entry.lstat()
+                if stat.S_ISDIR(info.st_mode):
+                    pending.append(entry)
+                elif key == "AMAP_OUTBOX_DIR":
+                    raise ValueError("fresh birth refuses retained outbound state; operator work disposition and router reset are required")
+                elif not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                    raise ValueError("fresh birth inbound custody is unknown; links and special files are refused")
+    home = Path(env.get("CODEX_HOME") or str(Path(env["HOME"]) / ".codex"))
+    assets.directory(home)
+    if home.exists():
+        if not home.is_dir():
+            raise ValueError("native home is not a real directory")
+        bootstrap_files = {"config.toml", "auth.json"}
+        for entry in home.iterdir():
+            info = entry.lstat()
+            if entry.name in bootstrap_files and stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
+                continue
+            if entry.name == "skills" and stat.S_ISDIR(info.st_mode):
+                for skill in entry.iterdir():
+                    skill_info = skill.lstat()
+                    if (skill.name not in {"md2pdf", "md2doc", "md2html", "md2email", "screenshot"}
+                            or not stat.S_ISDIR(skill_info.st_mode)):
+                        raise ValueError("native home contains an unrecognized bootstrap skill")
+                    for leaf in skill.iterdir():
+                        leaf_info = leaf.lstat()
+                        if leaf.name != "SKILL.md" or not stat.S_ISREG(leaf_info.st_mode) or leaf_info.st_nlink != 1:
+                            raise ValueError("native home contains an unrecognized bootstrap skill leaf")
+                continue
+            raise ValueError("fresh birth refuses prior or unrecognized native state; operator fresh provisioning is required")
+
+
 def birth(state, session, env):
-    """An exclusive new directory is the fence; an unexplained directory holds."""
+    """Parent intent precedes exclusive mkdir, so even its crash gap cannot downgrade."""
     native_runtime()
     state = Path(state)
     if not state.is_absolute():
@@ -87,26 +165,36 @@ def birth(state, session, env):
     expected = identity(session, env)
     assets.directory(state.parent)
     unpaused(state)
-    try:
-        state.mkdir(mode=0o700)
-    except FileExistsError:
-        private_state(state)
+    if os.path.lexists(state):
         try:
-            record = read_json(state / BIRTH)
+            record = load_birth(state)
         except (OSError, ValueError) as exc:
             raise ValueError(RECREATE) from exc
-        if (record.get("schema") != 1 or type(record.get("schema")) is not int
-                or record.get("kind") != "fresh_unified_birth" or record.get("identity") != expected
-                or not isinstance(record.get("birth_id"), str)
-                or not re.fullmatch("[a-f0-9]{32}", record["birth_id"])):
+        if record["identity"] != expected or record["runtime_state_dir"] != str(state):
             raise ValueError(RECREATE + "; birth identity differs")
+        native_home = str(Path(env.get("CODEX_HOME") or str(Path(env["HOME"]) / ".codex")).absolute())
+        if record.get("native_home") != native_home:
+            raise ValueError(RECREATE + "; native home differs")
         return record
-    assets.sync_directory(state.parent)
+    if os.path.lexists(intent_path(state)):
+        raise ValueError(RECREATE + "; interrupted birth intent requires inspection")
+    custody = Path(expected["lanes"]["AMAP_OUTBOX_DIR"]) / fleet.CUSTODY
+    if os.path.lexists(custody):
+        raise ValueError(RECREATE + "; retained namespace custody forbids another birth")
+    guard_birth_inputs(expected["lanes"], env)
     record = {"schema": 1, "kind": "fresh_unified_birth", "birth_id": uuid.uuid4().hex,
-              "identity": expected}
+              "identity": expected, "runtime_state_dir": str(state),
+              "mailbox_birth_scope": "local_negative_checks_not_native_or_router_freshness_proof",
+              "native_home": str(Path(env.get("CODEX_HOME") or str(Path(env["HOME"]) / ".codex")).absolute())}
+    publish(state, custody, assets.encoded(record), mode=0o600)
+    publish(state, intent_path(state), assets.encoded(record), mode=0o600)
+    try:
+        state.mkdir(mode=0o700)
+    except FileExistsError as exc:
+        raise ValueError(RECREATE + "; another object appeared during exclusive birth") from exc
+    assets.sync_directory(state.parent)
     publish(state, state / BIRTH, assets.encoded(record), mode=0o600)
     return record
-
 
 @contextmanager
 def locked(state, name):
@@ -136,7 +224,8 @@ def native_config_digest(env):
 
 def validator_digest():
     return assets.digest(assets.encoded({"settings": settings.validator_digest(),
-                                       "fresh": assets.digest(Path(__file__).read_bytes())}))
+                                       "fresh": assets.digest(Path(__file__).read_bytes()),
+                                       "fleet": assets.digest(Path(fleet.__file__).read_bytes())}))
 
 
 def selected_assets(payload):
@@ -173,14 +262,16 @@ def controller_document(state, payload, context, selection):
     return doc, selected
 
 
-def load_plan(state):
+def load_plan(state, *, allow_pause=False):
     private_state(state)
-    unpaused(state)
+    if not allow_pause:
+        unpaused(state)
     plan = read_json(state / PLAN)
-    born = read_json(state / BIRTH)
+    born = load_birth(state)
     if (plan.get("schema") != 1 or type(plan.get("schema")) is not int
             or plan.get("kind") != "fresh_unified_plan" or plan.get("birth_id") != born.get("birth_id")
-            or plan.get("identity") != born.get("identity") or born.get("kind") != "fresh_unified_birth"
+            or plan.get("identity") != born.get("identity")
+            or plan.get("runtime_state_dir") != born.get("runtime_state_dir") or born.get("kind") != "fresh_unified_birth"
             or type(born.get("schema")) is not int or born.get("schema") != 1
             or not isinstance(born.get("birth_id"), str) or not re.fullmatch("[a-f0-9]{32}", born["birth_id"])):
         raise ValueError("fresh plan does not belong to this birth")
@@ -190,9 +281,6 @@ def load_plan(state):
         raise ValueError("fresh birth and adoption evidence cannot be combined")
     if plan.get("validator_sha256") != validator_digest():
         raise ValueError("protected fresh validator changed; retain the hold")
-    if (not isinstance(plan.get("runtime_state_dir"), str)
-            or not Path(plan["runtime_state_dir"]).is_absolute()):
-        raise ValueError("fresh runtime state path is unknown")
     return plan
 
 
@@ -218,8 +306,9 @@ def prepare(state, payload, context, env):
     native_runtime()
     state, payload = Path(state), Path(payload)
     unpaused(state)
-    born = read_json(state / BIRTH)
-    if born.get("identity") != {k: context[k] for k in ("instance_id", "workspace", "fleet_mode", "lanes")}:
+    born = load_birth(state)
+    if (born.get("identity") != {k: context[k] for k in ("instance_id", "workspace", "fleet_mode", "lanes")}
+            or born.get("runtime_state_dir") != str(state)):
         raise ValueError("fresh context differs from its exclusive birth")
     selection = settings.resolve(env)
     if selection["skip_permissions"] != "true":
@@ -230,8 +319,8 @@ def prepare(state, payload, context, env):
     doc, selected = controller_document(state, payload, context, selection)
     raw = toml_bytes(doc)
     plan = {"schema": 1, "kind": "fresh_unified_plan", "birth_id": born["birth_id"],
-            "identity": born["identity"], "context": context, "selection": selection,
-            "runtime_state_dir": doc["state_dir"],
+            "identity": born["identity"], "runtime_state_dir": born["runtime_state_dir"],
+            "context": context, "selection": selection,
             "controller_sha256": assets.digest(raw), "protected_assets": selected,
             "native_config_sha256": native_config_digest(env), "validator_sha256": validator_digest()}
     with locked(state, "fresh-init.lock"):
@@ -241,6 +330,15 @@ def prepare(state, payload, context, env):
                 raise ValueError(RECREATE + "; unexplained files precede fresh preparation")
         elif read_json(state / PLAN) != plan:
             raise ValueError("fresh policy, settings, workspace or protected inputs changed; retain the hold")
+        if not os.path.lexists(state / INITIALIZATION):
+            allowed = {BIRTH, PLAN, "fresh-init.lock", "hold.json", "claims", "controller.toml"}
+            if set(p.name for p in state.iterdir()) - allowed:
+                raise ValueError(RECREATE + "; unexplained partial preparation files")
+            claims = state / "claims"
+            if os.path.lexists(claims):
+                assets.directory(claims)
+                if any(claims.iterdir()):
+                    raise ValueError(RECREATE + "; retained claims precede initialization")
         publish(state, state / PLAN, assets.encoded(plan), mode=0o600)
         (state / "claims").mkdir(mode=0o700, exist_ok=True)
         assets.directory(state / "claims")
@@ -268,21 +366,32 @@ def request_for(plan, generation):
             "selector": "owned_canonical_only"}
 
 
-def current_guard(state, env):
-    plan = load_plan(state)
+def current_guard(state, env, *, allow_pause=False):
+    plan = load_plan(state, allow_pause=allow_pause)
     if fleet.environment(env) != "unified" or settings.resolve(env) != plan["selection"]:
         raise ValueError("fresh fleet model or permissions drifted")
+    born = load_birth(state)
+    native_home = str(Path(env.get("CODEX_HOME") or str(Path(env["HOME"]) / ".codex")).absolute())
+    if native_home != born.get("native_home"):
+        raise ValueError("fresh native home changed")
     if native_config_digest(env) != plan["native_config_sha256"]:
         raise ValueError("fresh native configuration changed")
     selected, _ = selected_assets(Path(plan["context"]["payload"]))
     if selected != plan["protected_assets"]:
         raise ValueError("fresh protected version changed")
     config = config_at(state)
-    if str(config.state_dir) != plan["runtime_state_dir"]:
-        raise ValueError("fresh runtime state path differs from its controller")
-    if initialization(state, plan).get("fingerprint") != config.fingerprint():
+    if str(config.state_dir) != plan["runtime_state_dir"] or str(state) != plan["runtime_state_dir"]:
+        raise ValueError("fresh runtime namespace differs from its exclusive birth")
+    if not os.path.lexists(state / INITIALIZATION) and allow_pause:
+        if os.path.lexists(state / "journal.sqlite3"):
+            raise ValueError("fresh initialization receipt is missing beside a journal")
+    elif initialization(state, plan).get("fingerprint") != config.fingerprint():
         raise ValueError("fresh protected configuration fingerprint changed")
     return plan, config
+
+
+class BindingUnavailable(ValueError):
+    pass
 
 
 def binding(state, plan, config):
@@ -298,8 +407,10 @@ def binding(state, plan, config):
         db.row_factory = sqlite3.Row
         rows = db.execute("SELECT i.instance_id,i.thread_id,i.fingerprint,i.codex_version,b.policy_hash,b.effective_model "
                           "FROM instance i JOIN unified_binding b ON i.instance_id=b.instance_id AND i.thread_id=b.thread_id").fetchall()
+    if not rows:
+        raise BindingUnavailable("real fresh canonical binding is unavailable")
     if len(rows) != 1:
-        raise ValueError("real fresh canonical binding is unavailable")
+        raise ValueError("real fresh canonical binding is ambiguous")
     value = dict(rows[0])
     if (value["instance_id"] != config.instance_id or value["fingerprint"] != config.fingerprint()
             or value["codex_version"] != config.codex_version or not isinstance(value["thread_id"], str)
@@ -317,6 +428,18 @@ def binding(state, plan, config):
     return value
 
 
+def selected_canonical(state, plan, config):
+    record = initialization(state, plan)
+    if record["phase"] == "initialized":
+        return binding(state, plan, config)["thread_id"]
+    if record["phase"] == "start_attempted":
+        try:
+            return binding(state, plan, config)["thread_id"]
+        except (FileNotFoundError, BindingUnavailable):
+            return None
+    return None
+
+
 def selection_guard(state, env):
     plan, config = current_guard(state, env)
     expected = request_for(plan, settings.environment_generation())
@@ -328,22 +451,12 @@ def selection_guard(state, env):
             or receipt["validated_at"] <= 0 or not isinstance(receipt.get("argv"), list)
             or not receipt["argv"] or not all(isinstance(v, str) and "\x00" not in v for v in receipt["argv"])):
         raise ValueError("fresh native argv receipt is malformed")
-    thread = selection_thread(state, plan, config)
+    record = initialization(state, plan)
+    thread = selected_canonical(state, plan, config)
     if settings.validate_native_argv(config, thread, receipt["argv"]) != receipt.get("argv_sha256"):
         raise ValueError("fresh native argv preselection digest differs")
     unpaused(state)
     return plan, config
-
-
-def selection_thread(state, plan, config):
-    """A committed core binding can authorize selection before adapter finalization."""
-    record = initialization(state, plan)
-    if (record["phase"] == "initialized"
-            or record["phase"] == "start_attempted" and os.path.lexists(state / "journal.sqlite3")):
-        return binding(state, plan, config)["thread_id"]
-    if os.path.lexists(state / "journal.sqlite3"):
-        raise ValueError(RECREATE + "; unexplained journal before first service start")
-    return None
 
 
 def publish_request(state, env):
@@ -360,7 +473,8 @@ def select_pane(state, argv, env):
     expected = request_for(plan, settings.environment_generation())
     if read_json(state / REQUEST) != expected:
         raise ValueError("fresh native selection request is unavailable or foreign")
-    thread = selection_thread(state, plan, config)
+    record = initialization(state, plan)
+    thread = selected_canonical(state, plan, config)
     receipt = {**expected, "argv": list(argv), "argv_sha256": settings.validate_native_argv(config, thread, argv),
                "validated_at": time.time()}
     with locked(state, "fresh-init.lock"):
@@ -404,21 +518,43 @@ def service_class():
                     binding(state, plan, self.config)
             selection_guard(state, os.environ)
             await super().start()
-            finalize(state, plan, self.config)
-            selection_guard(state, os.environ)
+            self.gate.accepting = False
+            try:
+                finalize(state, plan, self.config)
+                require_initialized(state, os.environ)
+            except (OSError, ValueError, KeyError, TypeError, sqlite3.Error) as exc:
+                self.adapter_hold(str(exc))
+            else:
+                self.gate.accepting = self.status["readiness"]["state"] == "ready"
+
+        def adapter_hold(self, reason):
+            # Existing native work keeps its owner and frontend. No new AMAP
+            # scan/dispatch or attachment is authorized by an observation gap.
+            from amap_codex.supervisor import atomic_json
+            self.gate.accepting = False
+            value = dict(self.status)
+            value.update(updated_at=time.time(), last_error="adapter hold: " + reason,
+                         attached_client_count=self.gate.client_count, scheduler_state="holding",
+                         queue_depth=None, queue_sources=None)
+            checks = dict.fromkeys(value["readiness"]["checks"], "unknown")
+            checks["backend_live"] = "pass" if self.backend.process.returncode is None and not self.backend.client.closed else "fail"
+            value["readiness"] = {"state": "holding", "checks": checks}
+            self.status = value
+            try:
+                atomic_json(self.config.state_dir / "unified.json", value)
+                atomic_json(self.config.state_dir / "status.json", value)
+            except (OSError, ValueError, TypeError) as exc:
+                print("codex fresh: holding publication unavailable: " + str(exc), file=sys.stderr, flush=True)
 
         async def tick(self):
+            state = self.config.state_dir
             try:
-                require_initialized(self.config.state_dir, os.environ)
+                plan, _ = selection_guard(state, os.environ)
+                if initialization(state, plan)["phase"] == "start_attempted":
+                    finalize(state, plan, self.config)
+                require_initialized(state, os.environ)
             except (OSError, ValueError, KeyError, TypeError, sqlite3.Error) as exc:
-                self.gate.accepting = False
-                try:
-                    self.journal.operational_error("fresh startup evidence is held: " + str(exc))
-                    self.write_status(False, None, None)
-                except (OSError, ValueError, sqlite3.Error):
-                    # Missing durable evidence leaves new attachment/dispatch held.
-                    # Existing authorized native work still belongs to this backend.
-                    pass
+                self.adapter_hold(str(exc))
                 return
             await super().tick()
 
@@ -512,6 +648,41 @@ def launch_pane(state, argv, env, *, wait=60):
     os.execvp(native[0], native)
 
 
+def unpause(state, *, apply=False):
+    """Existing pause controls also preserve a fresh instance's real binding."""
+    from amap_codex.supervisor import Ownership
+    plan, config = current_guard(state, os.environ, allow_pause=True)
+    pause = read_json(state / "adapter-pause.json")
+    if type(pause.get("schema")) is not int or pause.get("schema") != 1 or pause.get("state") != "paused":
+        raise ValueError("invalid operator pause record; retain for inspection")
+    if os.path.lexists(state / INITIALIZATION) and initialization(state, plan)["phase"] == "initialized":
+        binding(state, plan, config)
+    if apply:
+        with locked(state, "fresh-init.lock"), Ownership(config):
+            current_guard(state, os.environ, allow_pause=True)
+            os.unlink(state / "adapter-pause.json")
+            assets.sync_directory(state)
+    return {"apply": apply, "mode": "unified", "scope": "fresh_initialization", "next": "relay rechecks full argv before service startup"}
+
+
+def inspect(state, env):
+    """Report proof scope without starting a native client or selecting a UUID."""
+    plan = load_plan(state)
+    record = initialization(state, plan)
+    result = {"scope": "fresh_unified_read_only", "initialization_phase": record["phase"],
+              "ready": False, "canonical_thread_id": None}
+    try:
+        _, _, bound = require_initialized(state, env)
+        status = read_json(state / "status.json")
+        problems = evidence_problems(state, status)
+        if problems:
+            raise ValueError("; ".join(problems))
+        result.update(ready=True, canonical_thread_id=bound["thread_id"])
+    except (OSError, ValueError, KeyError, TypeError, sqlite3.Error) as exc:
+        result["hold_reason"] = str(exc)
+    return result
+
+
 def hold(state, reason):
     print("codex fresh: holding: " + reason, file=sys.stderr, flush=True)
     if state.exists() and os.path.lexists(state / BIRTH):
@@ -551,9 +722,11 @@ def main(argv=None):
     entry.add_argument("--workspace", required=True)
     entry.add_argument("--address", default="")
     entry.add_argument("--version", required=True)
+    commands.add_parser("inspect")
     pane = commands.add_parser("launch-pane")
     pane.add_argument("native_argv", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
+    sys.path.insert(0, str(args.payload / "src"))
     try:
         native_runtime()
         if args.command == "birth":
@@ -566,6 +739,10 @@ def main(argv=None):
             if (args.instance != context["instance_id"] or str(Path(args.workspace).resolve()) != context["workspace"]):
                 raise ValueError("entry identity differs from the fresh birth")
             relay(args.state, args.payload, context, os.environ)
+        elif args.command == "inspect":
+            result = inspect(args.state, os.environ)
+            print(json.dumps(result, sort_keys=True))
+            return 0 if result["ready"] else 1
         else:
             native = args.native_argv[1:] if args.native_argv[:1] == ["--"] else args.native_argv
             raw_wait = os.environ.get("AMAP_CODEX_LAUNCH_WAIT_SECONDS", "60")

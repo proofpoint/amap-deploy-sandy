@@ -37,7 +37,21 @@ case "${AMAP_CODEX_CONVERSATION_MODE-separate}" in
             echo "codex relay: fresh unified birth held; retain existing state for operator inspection" >&2
             sleep 30
         done ;;
-    separate) : ;;
+    separate)
+        if [ -n "${AMAP_OUTBOX_DIR-}" ] && { [ -e "$AMAP_OUTBOX_DIR/.codex-unified-custody.json" ] || [ -L "$AMAP_OUTBOX_DIR/.codex-unified-custody.json" ]; }; then
+            echo "codex relay: fresh unified custody cannot downgrade to separate" >&2
+            while :; do sleep 30; done
+        fi
+        if [ -e "$SANDY_FEATURE_STATE/.fresh-intent-codex.json" ] || [ -L "$SANDY_FEATURE_STATE/.fresh-intent-codex.json" ]; then
+            echo "codex relay: fresh unified state cannot downgrade to separate; durable birth intent remains" >&2
+            while :; do sleep 30; done
+        fi
+        for evidence in fresh-birth.json fresh-plan.json fresh-initialization.json fresh-startup.json fresh-selection.json; do
+            if [ -e "$STATE/$evidence" ] || [ -L "$STATE/$evidence" ]; then
+                echo "codex relay: fresh unified state cannot downgrade to separate; retain it for operator inspection" >&2
+                while :; do sleep 30; done
+            fi
+        done ;;
     *) echo "codex relay: unknown fleet conversation mode; not starting Codex" >&2
        while :; do sleep 30; done ;;
 esac

@@ -8,6 +8,8 @@ import json
 import os
 from pathlib import Path
 import shutil
+import shlex
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -42,6 +44,15 @@ class NativeProtocol:
         self.sequence = 0
         self.calls = []
         self.active = False
+        self.pending = []
+        self.turns = []
+        self.adds = 0
+
+    def complete_pending(self):
+        queued = self.pending.pop(0)
+        self.turns.append({"id": "turn" + str(len(self.turns) + 1), "status": "completed", "items": [
+            {"id": "input" + str(len(self.turns) + 1), "type": "userMessage",
+             "clientId": queued["clientUserMessageId"], "content": queued["input"]}]})
 
     def reserve_id(self):
         self.sequence += 1
@@ -71,8 +82,18 @@ class NativeProtocol:
                              [{"name": "amap_fleet", "tools": {"activity": {}}}]}
         elif method == "thread/read":
             return {"thread": {"id": self.thread, "status": {"type": "active" if self.active else "idle"}}}
-        elif method in {"thread/turns/list", "thread/items/list", "thread/queue/list"}:
-            return {"data": []}
+        elif method == "thread/turns/list":
+            return {"data": [{"id": t["id"], "status": t["status"]} for t in self.turns]}
+        elif method == "thread/items/list":
+            return {"data": [{"turnId": t["id"], "item": item} for t in self.turns for item in t["items"]]}
+        elif method == "thread/queue/list":
+            return {"data": json.loads(json.dumps(self.pending))}
+        elif method == "thread/queue/add":
+            self.adds += 1
+            queued = {"id": "queued" + str(self.adds), "clientUserMessageId": params["clientUserMessageId"],
+                      "input": params["input"]}
+            self.pending.append(queued)
+            return {"queuedSubmission": queued}
         else:
             self.model_requests += 1
             raise AssertionError("unexpected native/model request: " + method)
@@ -120,6 +141,12 @@ class FreshBirthTest(unittest.TestCase):
         self.context = {**self.born["identity"], "payload": str(self.payload), "codex_version": "codex-cli 0.164.0",
                         "self_address": "fresh@example.org"}
 
+    def remove_unused_fixture_birth(self):
+        # Fixture-only reset before any native/core start; production never clears custody.
+        shutil.rmtree(self.state)
+        fresh.intent_path(self.state).unlink()
+        fresh.custody_path(self.born).unlink()
+
     def prepare(self):
         return fresh.prepare(self.state, self.payload, self.context, self.env)
 
@@ -162,6 +189,312 @@ class FreshBirthTest(unittest.TestCase):
                 self.assertEqual({p.name: p.read_bytes() for p in other.iterdir()}, before)
                 if name:
                     (other / name).unlink()
+
+    def test_durable_parent_intent_closes_the_mkdir_before_birth_record_crash_gap(self):
+        import codex_transition as transition
+        self.remove_unused_fixture_birth()
+        state = self.root / "interrupted"
+        real = assets.place
+        def interrupted(path, raw, **kwargs):
+            if path == state / fresh.BIRTH:
+                raise OSError("fixture crash before child birth receipt")
+            return real(path, raw, **kwargs)
+        with mock.patch.object(assets, "place", side_effect=interrupted):
+            with self.assertRaisesRegex(OSError, "before child birth"):
+                fresh.birth(state, self.session, self.env)
+        self.assertTrue(fresh.intent_path(state).is_file())
+        self.assertEqual(list(state.iterdir()), [])
+        with self.assertRaisesRegex(ValueError, "operator recreation"):
+            fresh.birth(state, self.session, self.env)
+        with self.assertRaisesRegex(ValueError, "cannot enter"):
+            transition.entry_mode(state)
+        self.assertFalse((state / "controller.toml").exists())
+
+    def test_prior_outbound_native_or_unknown_custody_blocks_new_birth_without_deletion(self):
+        self.assertEqual(fresh.birth(self.state, self.session, self.env), self.born)
+        self.remove_unused_fixture_birth()
+        retained = Path(self.env["AMAP_OUTBOX_DIR"]) / "processed" / "retained.json"
+        retained.parent.mkdir()
+        retained.write_bytes(b"prior delivery evidence")
+        other = self.root / "b"
+        with self.assertRaisesRegex(ValueError, "retained outbound state"):
+            fresh.birth(other, self.session, self.env)
+        self.assertFalse(other.exists())
+        self.assertEqual(retained.read_bytes(), b"prior delivery evidence")
+        retained.unlink()
+        history = self.native / "sessions"
+        history.mkdir()
+        native_record = history / "retained.jsonl"
+        native_record.write_bytes(b"prior native history")
+        with self.assertRaisesRegex(ValueError, "prior or unrecognized native state"):
+            fresh.birth(other, self.session, self.env)
+        self.assertFalse(other.exists())
+        self.assertEqual(native_record.read_bytes(), b"prior native history")
+        target = self.root / "outside"
+        target.mkdir()
+        (Path(self.env["AMAP_INBOX_DIR"]) / "link").symlink_to(target, target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, "inbound custody is unknown"):
+            fresh.birth(other, self.session, self.env)
+        self.assertEqual(list(target.iterdir()), [])
+
+    def test_custody_is_durable_before_parent_intent_and_survives_supported_reset(self):
+        import codex_transition as transition
+        self.remove_unused_fixture_birth()
+        real = assets.place
+        def interrupted(path, raw, **kwargs):
+            if path == fresh.intent_path(self.state):
+                raise OSError("fixture crash before private parent intent")
+            return real(path, raw, **kwargs)
+        with mock.patch.object(assets, "place", side_effect=interrupted):
+            with self.assertRaisesRegex(OSError, "before private parent"):
+                fresh.birth(self.state, self.session, self.env)
+        custody = Path(self.env["AMAP_OUTBOX_DIR"]) / fleet.CUSTODY
+        original = custody.read_bytes()
+        self.assertFalse(self.state.exists())
+        self.assertFalse(fresh.intent_path(self.state).exists())
+        with self.assertRaisesRegex(ValueError, "retained namespace custody"):
+            fresh.birth(self.state, self.session, self.env)
+        for mode in (None, "separate", "", "foreign"):
+            with self.subTest(mode=mode), mock.patch.dict(os.environ):
+                if mode is None:
+                    os.environ.pop(fleet.EXPORT, None)
+                else:
+                    os.environ[fleet.EXPORT] = mode
+                with self.assertRaisesRegex(ValueError, "cannot enter"):
+                    transition.entry_mode(self.state)
+                with self.assertRaisesRegex(ValueError, "no separate capture"):
+                    settings.entry_selection(dict(os.environ), self.state)
+        self.assertFalse(self.state.exists())
+        self.assertEqual(custody.read_bytes(), original)
+
+    def test_host_verify_checks_retained_custody_before_and_after_private_state_reset(self):
+        home = self.root / "host"
+        relay = prov.feature_payload_dir(home) / "codex/relay"
+        relay.parent.mkdir(parents=True)
+        relay.write_text("fixture payload")
+        custody = prov.feature_instance_dir(home, "fresh-fixture") / "outbox" / fleet.CUSTODY
+        custody.parent.mkdir(parents=True)
+        custody.write_bytes(fresh.custody_path(self.born).read_bytes())
+        state = self.root / "host-entry/codex"
+        record = {prov.FEATURE_ENTRIES_KEY: {prov.FEATURE_NAME: {"state_dir": str(state.parent)}}}
+        for running in (False, True):
+            problems, _ = prov.verify_codex_supervisor(home, "fresh-fixture", record, running=running)
+            self.assertTrue(any("retained namespace custody requires" in p for p in problems))
+            self.assertFalse(state.exists())
+        self.prepare()
+        self.select()
+        with self.runtime():
+            async def check():
+                service = fresh.service_class()(fresh.config_at(self.state), self.state / "controller.toml")
+                try:
+                    await service.start()
+                    state.parent.mkdir()
+                    shutil.copytree(self.state, state)
+                    problems, _ = prov.verify_codex_supervisor(home, "fresh-fixture", record,
+                                                             running=True, expected_mode="unified")
+                    self.assertEqual(problems, [])
+                    custody.write_text("{}")
+                    problems, _ = prov.verify_codex_supervisor(home, "fresh-fixture", record,
+                                                             running=True, expected_mode="unified")
+                    self.assertTrue(any("custody differs" in p for p in problems))
+                finally:
+                    await service.close()
+            asyncio.run(check())
+
+    def test_native_bootstrap_inventory_accepts_source_shapes_and_holds_unknown_bytes(self):
+        self.remove_unused_fixture_birth()
+        (self.native / "auth.json").write_bytes(b"opaque fixture; never parsed")
+        for name in ("md2pdf", "md2doc", "md2html", "md2email", "screenshot"):
+            skill = self.native / "skills" / name
+            skill.mkdir(parents=True)
+            (skill / "SKILL.md").write_bytes(b"fixture generated skill")
+        born = fresh.birth(self.state, self.session, self.env)
+        self.assertEqual(fresh.birth(self.state, self.session, self.env), born)
+        self.born = born
+        self.remove_unused_fixture_birth()
+        unknown = self.native / "config.toml.sandy-launch.old"
+        unknown.write_bytes(b"retain failed launch")
+        with self.assertRaisesRegex(ValueError, "prior or unrecognized native state"):
+            fresh.birth(self.state, self.session, self.env)
+        self.assertEqual(unknown.read_bytes(), b"retain failed launch")
+        self.assertFalse(self.state.exists())
+        unknown.unlink()
+        unknown = self.native / "skills/md2pdf/retained.jsonl"
+        unknown.write_bytes(b"retain unknown leaf")
+        with self.assertRaisesRegex(ValueError, "unrecognized bootstrap skill leaf"):
+            fresh.birth(self.state, self.session, self.env)
+        self.assertEqual(unknown.read_bytes(), b"retain unknown leaf")
+        self.assertFalse(self.state.exists())
+
+    def test_valid_inbound_before_birth_waits_for_argv_and_executes_once_on_owned_canonical(self):
+        # Same notice/body shape as the portable core producer in
+        # tests/integration/unified_runtime_probe.py:publish.
+        notice_id = "before-birth"
+        name = "notice-" + notice_id + ".json"
+        notice = {"contract_version": "2", "notice_id": notice_id, "ts": "2026-10-25T00:00:00Z",
+                  "kind": "peer", "message": {"id": "message_before_birth", "from": "peer@example.org",
+                  "mailbox": "peer", "subject": "Queued before entry", "preview": "Synthetic pending work"}}
+        body = {"contract_version": "2", "notice_id": notice_id, "body_text": "Synthetic pending work",
+                "to": self.context["self_address"], "from": "peer@example.org", "subject": "Queued before entry",
+                "id": notice["message"]["id"], "date": "2026-10-25T00:00:00Z"}
+        paths = [Path(self.env["AMAP_PEER_DIR"]) / "notices" / name,
+                 Path(self.env["AMAP_PEER_DIR"]) / "messages" / name]
+        paths[0].write_text(json.dumps(notice))
+        paths[1].write_text(json.dumps(body))
+        original = [p.read_bytes() for p in paths]
+        self.remove_unused_fixture_birth()
+        self.state = self.root / "b"
+        self.born = fresh.birth(self.state, self.session, self.env)
+        self.context = {**self.born["identity"], "payload": str(self.payload), "codex_version": "codex-cli 0.164.0",
+                        "self_address": "fresh@example.org"}
+        self.prepare()
+        fresh.publish_request(self.state, self.env)
+        self.assertFalse((self.state / "journal.sqlite3").exists())
+        self.assertEqual([p.read_bytes() for p in paths], original)
+        with self.runtime():
+            async def check():
+                kind = fresh.service_class()
+                before_selection = kind(fresh.config_at(self.state), self.state / "controller.toml")
+                try:
+                    with self.assertRaises(OSError):
+                        await before_selection.start()
+                finally:
+                    await before_selection.close()
+                self.assertEqual((self.protocol.starts, self.protocol.adds), (0, 0))
+                self.assertFalse((self.state / "journal.sqlite3").exists())
+                self.select()
+                first = kind(fresh.config_at(self.state), self.state / "controller.toml")
+                try:
+                    await first.start()
+                    canonical = self.protocol.thread
+                    self.assertEqual(self.protocol.adds, 0)
+                    await first.tick()
+                    self.assertEqual(self.protocol.adds, 1)
+                    event = first.journal.db.execute("SELECT event_id,state FROM events").fetchone()
+                    self.assertEqual(event["state"], "queued")
+                    self.protocol.complete_pending()
+                    await first.tick()
+                    self.assertEqual(first.journal.event(event["event_id"])["state"], "finished")
+                    await first.tick()
+                    self.assertEqual(self.protocol.adds, 1)
+                finally:
+                    await first.close()
+                second = kind(fresh.config_at(self.state), self.state / "controller.toml")
+                try:
+                    await second.start()
+                    await second.tick()
+                    self.assertEqual(self.protocol.thread, canonical)
+                    self.assertEqual((self.protocol.starts, self.protocol.adds), (1, 1))
+                finally:
+                    await second.close()
+                (self.state / "journal.sqlite3").unlink()
+                missing_journal = kind(fresh.config_at(self.state), self.state / "controller.toml")
+                try:
+                    with self.assertRaises(OSError):
+                        await missing_journal.start()
+                finally:
+                    await missing_journal.close()
+                self.assertEqual((self.protocol.starts, self.protocol.adds), (1, 1))
+            asyncio.run(check())
+        self.assertEqual([p.read_bytes() for p in paths], original)
+        custody = fresh.custody_path(self.born)
+        retained_custody = custody.read_bytes()
+        shutil.rmtree(self.state)
+        fresh.intent_path(self.state).unlink()
+        with self.assertRaisesRegex(ValueError, "retained namespace custody"):
+            fresh.birth(self.state, self.session, self.env)
+        self.assertFalse(self.state.exists())
+        self.assertEqual(custody.read_bytes(), retained_custody)
+        self.assertEqual([p.read_bytes() for p in paths], original)
+        self.assertEqual((self.protocol.starts, self.protocol.adds), (1, 1))
+
+    def test_partial_birth_cannot_enter_the_legacy_separate_helper(self):
+        import codex_transition as transition
+        for mode in (None, "separate"):
+            with self.subTest(mode=mode), mock.patch.dict(os.environ):
+                if mode is None:
+                    os.environ.pop(fleet.EXPORT, None)
+                else:
+                    os.environ[fleet.EXPORT] = mode
+                with self.assertRaisesRegex(ValueError, "cannot enter"):
+                    transition.entry_mode(self.state)
+        separate = self.root / "legacy"
+        separate.mkdir(mode=0o700)
+        with mock.patch.dict(os.environ):
+            os.environ.pop("AMAP_OUTBOX_DIR", None)
+            self.assertEqual(transition.entry_mode(separate), "separate")
+        self.assertEqual(list(separate.iterdir()), [])
+
+    def test_shipped_separate_or_absent_mode_preserves_partial_fresh_birth_without_renderer(self):
+        home = self.root / "h"
+        prov.install_feature_payload(home, prov.DEFAULT_CONNECTOR_SRC, dry_run=False,
+                                     codex_src=_workspace.CODEX_CONNECTOR_ROOT)
+        installed = prov.feature_payload_dir(home) / "codex"
+        session = self.root / "session.json"
+        session.write_text(json.dumps(self.session))
+        relay = installed / "relay"
+        relay.write_text(relay.read_text().replace("SANDY_SESSION_FILE=/etc/sandy-session.json",
+                                                  "SANDY_SESSION_FILE=" + str(session)))
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir()
+        (bin_dir / "codex").write_text("#!/bin/sh\necho called >> \"$NATIVE_CALLS\"\ncase \"$1\" in\n"
+            "login) exit 0 ;;\n--version) echo 'codex-cli 0.164.0'; exit 0 ;;\n*) exit 9 ;;\nesac\n")
+        (bin_dir / "python3").write_text("#!/bin/sh\nif [ \"$1\" = -m ] && [ \"$2\" = amap_codex.cli ]; then "
+            "echo legacy >> \"$LEGACY_RUNS\"; exit 0; fi\nexec " + shlex.quote(sys.executable) + " \"$@\"\n")
+        for name in ("codex", "python3"):
+            (bin_dir / name).chmod(0o755)
+        case = 0
+        for with_plan in (False, True, "reset"):
+            for mode in (None, "separate", "", "foreign"):
+                with self.subTest(plan=with_plan, mode=mode):
+                    parent = self.root / ("e" + str(case))
+                    parent.mkdir()
+                    state = parent / "codex"
+                    calls = self.root / ("calls" + str(case))
+                    legacy = self.root / ("runs" + str(case))
+                    case += 1
+                    outbox = self.root / ("out-case-" + str(case))
+                    outbox.mkdir()
+                    case_env = dict(self.env, AMAP_OUTBOX_DIR=str(outbox))
+                    fresh.birth(state, self.session, case_env)
+                    if with_plan == "reset":
+                        shutil.rmtree(state)
+                        fresh.intent_path(state).unlink()
+                    elif with_plan:
+                        (state / fresh.PLAN).write_text("{}")
+                    env = dict(case_env, PATH=str(bin_dir) + os.pathsep + self.env["PATH"],
+                               SANDY_FEATURE_STATE=str(parent), SANDY_AGENT="codex", NATIVE_CALLS=str(calls),
+                               LEGACY_RUNS=str(legacy))
+                    if mode is None:
+                        env.pop(fleet.EXPORT, None)
+                    else:
+                        env[fleet.EXPORT] = mode
+                    before = {p.name: p.read_bytes() for p in state.iterdir()} if state.exists() else None
+                    wrapper = installed / "interactive-launch"
+                    wrapper.write_text((HERE / "payload/codex/interactive-launch").read_text().replace(
+                        "STATE=/opt/sandy/feature-state/amap/codex", "STATE=" + str(state)))
+                    wrapped = subprocess.run(["/bin/sh", str(wrapper), str(bin_dir / "codex")],
+                                             cwd=self.root, env=env, capture_output=True, text=True, timeout=5)
+                    self.assertNotEqual(wrapped.returncode, 0)
+                    self.assertFalse(calls.exists())
+                    log = self.root / "entry-error"
+                    with log.open("w") as error:
+                        proc = subprocess.Popen(["/bin/sh", str(relay)], cwd=self.root, env=env,
+                                                stdout=subprocess.DEVNULL, stderr=error, start_new_session=True)
+                        try:
+                            until = time.monotonic() + 3
+                            expected = "unknown fleet conversation mode" if mode in {"", "foreign"} else "cannot downgrade"
+                            while time.monotonic() < until and expected not in log.read_text() and proc.poll() is None:
+                                time.sleep(.02)
+                            self.assertIsNone(proc.poll())
+                            self.assertIn(expected, log.read_text())
+                            self.assertEqual({p.name: p.read_bytes() for p in state.iterdir()} if state.exists() else None, before)
+                            self.assertFalse(calls.exists())
+                            self.assertFalse(legacy.exists())
+                        finally:
+                            if proc.poll() is None:
+                                os.killpg(proc.pid, signal.SIGTERM)
+                            proc.wait(timeout=5)
 
     def test_foreign_birth_and_unexplained_files_cannot_get_a_controller(self):
         (self.state / "unexplained").write_bytes(b"retain")
@@ -206,6 +539,11 @@ class FreshBirthTest(unittest.TestCase):
         self.select()
         fresh.selection_guard(self.state, self.env)
         self.assertFalse((self.state / "journal.sqlite3").exists())
+        inspected = fresh.inspect(self.state, self.env)
+        self.assertFalse(inspected["ready"])
+        self.assertIsNone(inspected["canonical_thread_id"])
+        self.assertEqual(inspected["initialization_phase"], "prepared")
+        self.assertFalse((self.state / "journal.sqlite3").exists())
         with self.assertRaisesRegex(ValueError, "not readiness"):
             fresh.require_initialized(self.state, self.env)
         for suffix in (["resume", "--last"], ["resume", str(uuid.uuid4())]):
@@ -234,6 +572,16 @@ class FreshBirthTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "another environment"):
             fresh.selection_guard(self.state, self.env)
 
+    def test_forged_birth_kind_cannot_publish_configuration(self):
+        value = fresh.read_json(self.state / fresh.BIRTH)
+        value["kind"] = "foreign"
+        (self.state / fresh.BIRTH).write_text(json.dumps(value))
+        fresh.intent_path(self.state).write_text(json.dumps(value))
+        with self.assertRaisesRegex(ValueError, "birth evidence is malformed"):
+            self.prepare()
+        self.assertFalse((self.state / "controller.toml").exists())
+        self.assertFalse((self.state / fresh.PLAN).exists())
+
     def test_full_argv_and_policy_drift_guards_fire(self):
         self.prepare()
         self.select()
@@ -258,9 +606,13 @@ class FreshBirthTest(unittest.TestCase):
             self.prepare()
         (self.state / "adapter-pause.json").unlink()
         long = self.root / ("long-" + "x" * 100)
-        fresh.birth(long, self.session, self.env)
+        other_outbox = self.root / "long-out"
+        other_outbox.mkdir()
+        other_env = dict(self.env, AMAP_OUTBOX_DIR=str(other_outbox))
+        other_born = fresh.birth(long, self.session, other_env)
+        context = dict(self.context, lanes=other_born["identity"]["lanes"])
         with self.assertRaisesRegex(ValueError, "Unix socket length"):
-            fresh.prepare(long, self.payload, self.context, self.env)
+            fresh.prepare(long, self.payload, context, other_env)
         self.assertFalse((long / "controller.toml").exists())
         self.assertFalse((long / "journal.sqlite3").exists())
         self.prepare()
@@ -282,6 +634,9 @@ class FreshBirthTest(unittest.TestCase):
                         plan, config, bound = fresh.require_initialized(self.state, self.env)
                         self.assertEqual(bound["thread_id"], self.protocol.thread)
                         self.assertEqual(fresh.evidence_problems(self.state, service.status), [])
+                        inspected = fresh.inspect(self.state, self.env)
+                        self.assertTrue(inspected["ready"])
+                        self.assertEqual(inspected["canonical_thread_id"], self.protocol.thread)
                         self.assertEqual(service.journal.db.execute("SELECT COUNT(*) FROM events").fetchone()[0], 0)
                         self.assertEqual(self.protocol.model_requests, 0)
                         await service.tick()
@@ -302,20 +657,20 @@ class FreshBirthTest(unittest.TestCase):
                 first = kind(fresh.config_at(self.state), self.state / "controller.toml")
                 try:
                     with mock.patch.object(fresh, "finalize", side_effect=OSError("fixture lost adapter receipt")):
-                        with self.assertRaisesRegex(OSError, "lost adapter receipt"):
-                            await first.start()
+                        await first.start()
+                    self.assertFalse(first.stop_requested.is_set())
+                    self.assertIsNone(first.backend.process.returncode)
+                    self.assertFalse(first.gate.accepting)
                 finally:
                     await first.close()
                 self.assertEqual(fresh.read_json(self.state / fresh.INITIALIZATION)["phase"], "start_attempted")
-                with mock.patch.object(settings, "environment_generation", return_value="b" * 32):
-                    fresh.publish_request(self.state, self.env)
-                    fresh.select_pane(self.state, ["codex", "resume", "--last", *NATIVE[1:]], self.env)
-                    second = kind(fresh.config_at(self.state), self.state / "controller.toml")
-                    try:
-                        await second.start()
-                        fresh.require_initialized(self.state, self.env)
-                    finally:
-                        await second.close()
+                fresh.select_pane(self.state, NATIVE + ["resume", "--last"], self.env)
+                second = kind(fresh.config_at(self.state), self.state / "controller.toml")
+                try:
+                    await second.start()
+                    fresh.require_initialized(self.state, self.env)
+                finally:
+                    await second.close()
             asyncio.run(check())
         self.assertEqual((self.protocol.starts, self.protocol.resumes), (1, 1))
 
@@ -344,6 +699,7 @@ class FreshBirthTest(unittest.TestCase):
         self.assertEqual(fresh.read_json(self.state / fresh.INITIALIZATION)["phase"], "start_attempted")
 
     def test_installed_birth_helper_runs_from_unrelated_working_directory(self):
+        self.remove_unused_fixture_birth()
         home = self.root / "h"
         prov.install_feature_payload(home, prov.DEFAULT_CONNECTOR_SRC, dry_run=False,
                                      codex_src=_workspace.CODEX_CONNECTOR_ROOT)
@@ -363,6 +719,113 @@ class FreshBirthTest(unittest.TestCase):
         self.assertFalse((state / "journal.sqlite3").exists())
 
 
+    def test_production_run_loop_pause_and_read_gap_hold_without_closing_active_backend(self):
+        import codex_transition as transition
+        self.prepare()
+        self.select()
+        with self.runtime():
+            self.protocol.active = True
+            async def check():
+                service = fresh.service_class()(fresh.config_at(self.state), self.state / "controller.toml")
+                task = asyncio.create_task(service.run())
+                try:
+                    until = time.monotonic() + 5
+                    while time.monotonic() < until and fresh.read_json(self.state / fresh.INITIALIZATION)["phase"] != "initialized":
+                        await asyncio.sleep(.02)
+                    self.assertEqual(fresh.read_json(self.state / fresh.INITIALIZATION)["phase"], "initialized")
+                    transition.pause(self.state, "Fixture active work remains owned", apply=True)
+                    await asyncio.sleep(1.1)
+                    self.assertFalse(task.done(), "pause ended the production run loop")
+                    self.assertFalse(service.stop_requested.is_set())
+                    self.assertIsNone(service.backend.process.returncode)
+                    self.assertFalse(self.protocol.closed)
+                    self.assertFalse(service.gate.accepting)
+                    self.assertEqual(service.status["readiness"]["state"], "holding")
+                    self.assertIn("maintenance pause", service.status["last_error"])
+                    (self.state / "adapter-pause.json").unlink()
+                    receipt = self.state / fresh.SELECTION
+                    raw = receipt.read_bytes()
+                    receipt.unlink()
+                    await asyncio.sleep(1.1)
+                    self.assertFalse(task.done(), "missing observation killed owned work")
+                    self.assertFalse(service.stop_requested.is_set())
+                    self.assertIsNone(service.backend.process.returncode)
+                    self.assertFalse(self.protocol.closed)
+                    self.assertFalse(service.gate.accepting)
+                    receipt.write_bytes(raw)
+                    await asyncio.sleep(1.1)
+                    self.assertFalse(task.done())
+                    self.assertEqual(self.protocol.starts, 1)
+                    self.assertEqual(service.status["scheduler_state"], "active")
+                finally:
+                    service.stop_requested.set()
+                    await asyncio.gather(task, return_exceptions=True)
+            asyncio.run(check())
+
+    def test_failed_holding_publication_does_not_close_owned_backend(self):
+        self.prepare()
+        self.select()
+        with self.runtime():
+            async def check():
+                import amap_codex.supervisor as supervisor
+                service = fresh.service_class()(fresh.config_at(self.state), self.state / "controller.toml")
+                try:
+                    await service.start()
+                    (self.state / "adapter-pause.json").write_text("{}")
+                    with mock.patch.object(supervisor, "atomic_json", side_effect=OSError("fixture status write unavailable")):
+                        await service.tick()
+                    self.assertFalse(service.stop_requested.is_set())
+                    self.assertIsNone(service.backend.process.returncode)
+                    self.assertFalse(service.gate.accepting)
+                    self.assertEqual(service.status["readiness"]["state"], "holding")
+                finally:
+                    await service.close()
+            asyncio.run(check())
+
+    def test_host_alias_uses_recorded_runtime_endpoint_namespace(self):
+        self.prepare()
+        self.select()
+        with self.runtime():
+            async def check():
+                service = fresh.service_class()(fresh.config_at(self.state), self.state / "controller.toml")
+                try:
+                    await service.start()
+                    host_alias = self.root / "host-view"
+                    shutil.copytree(self.state, host_alias)
+                    self.assertNotEqual(str(host_alias), str(self.state))
+                    self.assertEqual(fresh.evidence_problems(host_alias, service.status), [])
+                finally:
+                    await service.close()
+            asyncio.run(check())
+
+    def test_existing_pause_controls_resume_only_known_matching_fresh_state(self):
+        import codex_transition as transition
+        self.prepare()
+        self.select()
+        with self.runtime():
+            async def check():
+                service = fresh.service_class()(fresh.config_at(self.state), self.state / "controller.toml")
+                try:
+                    await service.start()
+                finally:
+                    await service.close()
+            asyncio.run(check())
+        canonical = self.protocol.thread
+        before = list(self.protocol.calls)
+        transition.pause(self.state, "Fixture operator maintenance", apply=True)
+        with self.assertRaisesRegex(ValueError, "maintenance pause"):
+            fresh.current_guard(self.state, self.env)
+        transition.unpause(self.state)
+        self.assertTrue((self.state / transition.PAUSE).exists())
+        with mock.patch.dict(os.environ, {"CODEX_MODEL": "foreign"}):
+            with self.assertRaisesRegex(ValueError, "drifted"):
+                transition.unpause(self.state, apply=True)
+        self.assertTrue((self.state / transition.PAUSE).exists())
+        transition.unpause(self.state, apply=True)
+        self.assertFalse((self.state / transition.PAUSE).exists())
+        self.assertEqual(self.protocol.thread, canonical)
+        self.assertEqual(self.protocol.calls, before)
+
     def test_binding_corruption_holds_before_any_more_core_observation(self):
         self.prepare()
         self.select()
@@ -376,8 +839,10 @@ class FreshBirthTest(unittest.TestCase):
                         db.execute("UPDATE unified_binding SET policy_hash=?", ("b" * 64,))
                     await service.tick()
                     self.assertEqual(service.status["readiness"]["state"], "holding")
-                    self.assertIsNone(service.backend.process.returncode)
+                    self.assertIn("initialized binding changed", str(service.status["last_error"]))
+                    self.assertFalse(service.gate.accepting)
                     self.assertFalse(service.stop_requested.is_set())
+                    self.assertIsNone(service.backend.process.returncode)
                     self.assertEqual(self.protocol.calls, before)
                 finally:
                     await service.close()
@@ -404,60 +869,15 @@ class FreshBirthTest(unittest.TestCase):
                     receipt["entry_generation"] = "f" * 32
                     (self.state / fresh.SELECTION).write_text(json.dumps(receipt))
                     await service.tick()
-                    self.assertEqual(service.status["readiness"]["state"], "holding")
+                    self.assertIn("another environment", service.status["last_error"])
                     self.assertFalse(service.gate.accepting)
-                    self.assertIsNone(service.backend.process.returncode)
                     self.assertFalse(service.stop_requested.is_set())
+                    self.assertIsNone(service.backend.process.returncode)
                     self.assertEqual(self.protocol.calls, before)
                 finally:
                     await service.close()
             asyncio.run(check())
         self.assertEqual(self.protocol.starts, 1)
-
-    def test_host_view_uses_bound_runtime_endpoint_path(self):
-        self.prepare()
-        self.select()
-        with self.runtime():
-            async def check():
-                service = fresh.service_class()(fresh.config_at(self.state), self.state / "controller.toml")
-                try:
-                    await service.start()
-                    host = self.root / "host-view"
-                    shutil.copytree(self.state, host)
-                    self.assertNotEqual(host, self.state)
-                    self.assertEqual(fresh.evidence_problems(host, service.status), [])
-                finally:
-                    await service.close()
-            asyncio.run(check())
-
-    def test_pause_in_run_holds_new_work_without_entering_cleanup(self):
-        self.prepare()
-        self.select()
-        with self.runtime():
-            async def check():
-                service = fresh.service_class()(fresh.config_at(self.state), self.state / "controller.toml")
-                task = asyncio.create_task(service.run())
-                try:
-                    async with asyncio.timeout(5):
-                        while not service.status:
-                            await asyncio.sleep(.01)
-                    canonical = self.protocol.thread
-                    self.protocol.active = True
-                    pause = self.state / "adapter-pause.json"
-                    pause.write_text("{}")
-                    await asyncio.sleep(service.config.poll_interval_ms / 1000 * 2 + .1)
-                    self.assertFalse(task.done())
-                    self.assertFalse(service.stop_requested.is_set())
-                    self.assertIsNone(service.backend.process.returncode)
-                    self.assertEqual(service.status["readiness"]["state"], "holding")
-                    self.assertEqual(self.protocol.thread, canonical)
-                    pause.unlink()
-                    await asyncio.sleep(service.config.poll_interval_ms / 1000 + .1)
-                    self.assertEqual(service.status["readiness"]["state"], "ready")
-                finally:
-                    service.stop_requested.set()
-                    await task
-            asyncio.run(check())
 
     def test_new_execution_generation_requires_new_argv_receipt_before_resume(self):
         self.prepare()
@@ -521,7 +941,98 @@ class FreshBirthTest(unittest.TestCase):
             asyncio.run(check())
 
 
+    def test_shipped_fresh_entry_waits_for_wrapper_argv_and_never_fabricates_readiness(self):
+        self.remove_unused_fixture_birth()
+        home = self.root / "h"
+        prov.install_feature_payload(home, prov.DEFAULT_CONNECTOR_SRC, dry_run=False,
+                                     codex_src=_workspace.CODEX_CONNECTOR_ROOT)
+        installed = prov.feature_payload_dir(home) / "codex"
+        feature_state = self.root / "e"
+        feature_state.mkdir()
+        state = feature_state / "codex"
+        self.assertLessEqual(len(os.fsencode(state / ("u-" + "0" * 32) / "b")), 100)
+        session = self.root / "session.json"
+        session.write_text(json.dumps(self.session))
+        relay = installed / "relay"
+        relay.write_text(relay.read_text().replace("SANDY_SESSION_FILE=/etc/sandy-session.json",
+                                                  "SANDY_SESSION_FILE=" + str(session)))
+        wrapper = installed / "interactive-launch"
+        wrapper.write_text(wrapper.read_text().replace("STATE=/opt/sandy/feature-state/amap/codex",
+                                                       "STATE=" + str(state)))
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir()
+        native_calls = self.root / "native-calls"
+        (bin_dir / "codex").write_text("#!/bin/sh\ncase \"$1\" in\n"
+            "login) exit 0 ;;\n--version) echo 'codex-cli 0.164.0'; exit 0 ;;\n"
+            "*) echo backend >> \"$NATIVE_CALLS\"; exit 9 ;;\nesac\n")
+        (bin_dir / "codex").chmod(0o755)
+        (bin_dir / "python3").write_text("#!/bin/sh\nexec " + shlex.quote(sys.executable) + " \"$@\"\n")
+        (bin_dir / "python3").chmod(0o755)
+        env = dict(self.env, PATH=str(bin_dir) + os.pathsep + self.env["PATH"],
+                   SANDY_FEATURE_STATE=str(feature_state), SANDY_AGENT="codex", NATIVE_CALLS=str(native_calls),
+                   AMAP_CODEX_LAUNCH_WAIT_SECONDS="2")
+        env.pop("AMAP_IDENTITY", None)
+        env.pop("AMAP_IDENTITY_DIR", None)
+        env.pop("AMAP_FLEET_DOMAIN", None)
+        proc = subprocess.Popen(["/bin/sh", str(relay)], cwd=self.root, env=env,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+        try:
+            until = time.monotonic() + 10
+            while time.monotonic() < until and not (state / fresh.REQUEST).exists():
+                if proc.poll() is not None:
+                    self.fail("shipped entry exited before preselection: " + proc.communicate()[1])
+                time.sleep(.05)
+            self.assertTrue((state / fresh.REQUEST).exists())
+            self.assertFalse(native_calls.exists())
+            self.assertFalse((state / "journal.sqlite3").exists())
+            self.assertEqual(fresh.read_json(state / fresh.INITIALIZATION)["phase"], "prepared")
+            result = subprocess.run(["/bin/sh", str(wrapper), *NATIVE], cwd=self.root, env=env,
+                                    capture_output=True, text=True, timeout=10)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("fresh canonical attachment remains held", result.stderr)
+            self.assertTrue((state / fresh.SELECTION).exists())
+            until = time.monotonic() + 5
+            while time.monotonic() < until and not native_calls.exists():
+                time.sleep(.05)
+            self.assertEqual(native_calls.read_text().splitlines(), ["backend"])
+            self.assertEqual(fresh.read_json(state / fresh.INITIALIZATION)["phase"], "start_attempted")
+            self.assertFalse((state / "adapter-transition.json").exists())
+            time.sleep(1.1)
+            self.assertEqual(native_calls.read_text().splitlines(), ["backend"])
+        finally:
+            if proc.poll() is None:
+                os.killpg(proc.pid, signal.SIGTERM)
+            try:
+                proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.communicate()
+
+
 class FreshHostBoundaryTest(unittest.TestCase):
+    def test_shipped_wrapper_validates_empty_and_unknown_modes_before_mixed_bypass(self):
+        import test_codex_interactive as surface
+        box = surface._Sandbox(self)
+        for agents in ("codex", "claude,codex"):
+            for mode in ("", "foreign"):
+                with self.subTest(agents=agents, mode=mode):
+                    result = box.run("interactive-launch", "/bin/echo", "UNWRAPPED", SANDY_AGENT=agents,
+                                     AMAP_CODEX_CONVERSATION_MODE=mode)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("unknown fleet conversation mode", result.stderr)
+                    self.assertNotIn("UNWRAPPED", result.stdout)
+        for mode in (None, "separate"):
+            extra = {} if mode is None else {fleet.EXPORT: mode}
+            result = box.run("interactive-launch", "/bin/echo", "LEGACY", SANDY_AGENT="claude,codex", **extra)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), "LEGACY")
+        result = box.run("interactive-launch", "/bin/echo", "UNWRAPPED", SANDY_AGENT="claude,codex",
+                         AMAP_CODEX_CONVERSATION_MODE="unified")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("does not support", result.stderr)
+        self.assertNotIn("UNWRAPPED", result.stdout)
+
+
     def test_host_can_import_and_report_unknown_without_connector_or_native_toml(self):
         import builtins
         real = builtins.__import__
