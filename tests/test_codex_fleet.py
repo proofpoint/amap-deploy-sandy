@@ -1,6 +1,7 @@
 """An explicit authored fleet choice reaches the manifest, without migrating state."""
 import json
 import os
+import subprocess
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
@@ -10,6 +11,8 @@ _workspace.skip_if_incomplete()
 import amap_sandy as prov
 import codex_fleet as fleet
 import fleet_policy as fp
+
+HERE = Path(__file__).resolve().parents[1]
 
 
 class FleetChoiceTest(unittest.TestCase):
@@ -94,3 +97,16 @@ class FleetChoiceTest(unittest.TestCase):
         parser = prov.build_parser()
         self.assertIsNone(parser.parse_args(["install"]).codex_mode)
         self.assertEqual(parser.parse_args(["install", "--codex-mode", "unified"]).codex_mode, "unified")
+
+    def test_shipped_wrapper_rejects_empty_or_unknown_mode_before_any_mixed_bypass(self):
+        for agents in ("codex", "claude,codex"):
+            for mode in ("", "foreign"):
+                with self.subTest(agents=agents, mode=mode):
+                    result = subprocess.run(
+                        [str(HERE / "payload/codex/interactive-launch"), "/bin/echo", "BARE_NATIVE"],
+                        env=dict(os.environ, SANDY_AGENT=agents,
+                                 AMAP_CODEX_CONVERSATION_MODE=mode, AMAP_OUTBOX_DIR=str(self.home)),
+                        capture_output=True, text=True)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("unknown fleet conversation mode", result.stderr)
+                    self.assertNotIn("BARE_NATIVE", result.stdout)
