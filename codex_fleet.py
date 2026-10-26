@@ -3,11 +3,16 @@
 POLICY_KEY = "codex_conversation_mode"
 EXPORT = "AMAP_CODEX_CONVERSATION_MODE"
 MODES = ("separate", "unified")
+CUSTODY = ".codex-unified-custody.json"
 FRESH_FILES = ("fresh-birth.json", "fresh-plan.json", "fresh-initialization.json", "fresh-startup.json", "fresh-selection.json")
 
 
-def fresh_markers(state):
-    return tuple(state / name for name in FRESH_FILES) + (state.parent / (".fresh-intent-" + state.name + ".json"),)
+def fresh_markers(state, outbox=None):
+    markers = tuple(state / name for name in FRESH_FILES) + (state.parent / (".fresh-intent-" + state.name + ".json"),)
+    if outbox is not None:
+        from pathlib import Path
+        markers += (Path(outbox) / CUSTODY,)
+    return markers
 
 
 def mode(policy):

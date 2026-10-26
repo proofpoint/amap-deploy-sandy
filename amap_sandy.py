@@ -2788,11 +2788,21 @@ def verify_codex_supervisor(home: Path, slug: str, record: Optional[dict], *,
                         f"no {CODEX_PAYLOAD_SUBDIR}/ — run install --apply with the "
                         f"{CODEX_CONNECTOR_REPO_NAME} checkout (--codex-connector-src)")
         return problems, notes
+    custody = feature_instance_dir(home, slug) / "outbox" / cf.CUSTODY
     state = codex_state_dir(record)
+    if os.path.lexists(custody) and (state is None or not os.path.lexists(state / "fresh-birth.json")):
+        problems.append(f"codex unified HOLD: {slug}: retained namespace custody requires operator recreation; no new birth or downgrade")
     if state is None:
         problems.append(f"codex supervisor UNKNOWN: {slug}: sandy reports no {FEATURE_NAME} entry "
                         f"state directory for its last launch — relaunch it")
         return problems, notes
+    if os.path.lexists(state / "fresh-birth.json"):
+        try:
+            birth = json.loads(ca.regular(state / "fresh-birth.json"))
+            if json.loads(ca.regular(custody)) != birth:
+                raise ValueError("custody differs from birth")
+        except (OSError, ValueError) as exc:
+            problems.append(f"codex unified HOLD: {slug}: retained namespace custody unavailable: {exc}")
     status = _read_json(state / CODEX_STATUS_NAME)
     if isinstance(status, dict):
         uncertain = status.get("uncertain_count")
@@ -2814,7 +2824,7 @@ def verify_codex_supervisor(home: Path, slug: str, record: Optional[dict], *,
     if os.path.lexists(state / "adapter-pause.json"):
         problems.append(f"codex supervisor holding: {slug}: explicit operator maintenance pause; inspect adapter-pause.json")
     fresh_birth = os.path.lexists(state / "fresh-birth.json")
-    fresh_evidence = any(os.path.lexists(path) for path in cf.fresh_markers(state))
+    fresh_evidence = any(os.path.lexists(path) for path in cf.fresh_markers(state, feature_instance_dir(home, slug) / "outbox"))
     if expected_mode == "unified" and not fresh_birth:
         problems.append(f"codex unified HOLD: {slug}: fleet mode requires fresh initialization; "
                         f"operator recreation is required for legacy or unknown state; nothing is automatically erased")
