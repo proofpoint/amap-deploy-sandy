@@ -190,6 +190,9 @@ def load_plan(state):
         raise ValueError("fresh birth and adoption evidence cannot be combined")
     if plan.get("validator_sha256") != validator_digest():
         raise ValueError("protected fresh validator changed; retain the hold")
+    if (not isinstance(plan.get("runtime_state_dir"), str)
+            or not Path(plan["runtime_state_dir"]).is_absolute()):
+        raise ValueError("fresh runtime state path is unknown")
     return plan
 
 
@@ -228,6 +231,7 @@ def prepare(state, payload, context, env):
     raw = toml_bytes(doc)
     plan = {"schema": 1, "kind": "fresh_unified_plan", "birth_id": born["birth_id"],
             "identity": born["identity"], "context": context, "selection": selection,
+            "runtime_state_dir": doc["state_dir"],
             "controller_sha256": assets.digest(raw), "protected_assets": selected,
             "native_config_sha256": native_config_digest(env), "validator_sha256": validator_digest()}
     with locked(state, "fresh-init.lock"):
@@ -274,6 +278,8 @@ def current_guard(state, env):
     if selected != plan["protected_assets"]:
         raise ValueError("fresh protected version changed")
     config = config_at(state)
+    if str(config.state_dir) != plan["runtime_state_dir"]:
+        raise ValueError("fresh runtime state path differs from its controller")
     if initialization(state, plan).get("fingerprint") != config.fingerprint():
         raise ValueError("fresh protected configuration fingerprint changed")
     return plan, config
@@ -322,12 +328,22 @@ def selection_guard(state, env):
             or receipt["validated_at"] <= 0 or not isinstance(receipt.get("argv"), list)
             or not receipt["argv"] or not all(isinstance(v, str) and "\x00" not in v for v in receipt["argv"])):
         raise ValueError("fresh native argv receipt is malformed")
-    record = initialization(state, plan)
-    thread = binding(state, plan, config)["thread_id"] if record["phase"] == "initialized" else None
+    thread = selection_thread(state, plan, config)
     if settings.validate_native_argv(config, thread, receipt["argv"]) != receipt.get("argv_sha256"):
         raise ValueError("fresh native argv preselection digest differs")
     unpaused(state)
     return plan, config
+
+
+def selection_thread(state, plan, config):
+    """A committed core binding can authorize selection before adapter finalization."""
+    record = initialization(state, plan)
+    if (record["phase"] == "initialized"
+            or record["phase"] == "start_attempted" and os.path.lexists(state / "journal.sqlite3")):
+        return binding(state, plan, config)["thread_id"]
+    if os.path.lexists(state / "journal.sqlite3"):
+        raise ValueError(RECREATE + "; unexplained journal before first service start")
+    return None
 
 
 def publish_request(state, env):
@@ -344,8 +360,7 @@ def select_pane(state, argv, env):
     expected = request_for(plan, settings.environment_generation())
     if read_json(state / REQUEST) != expected:
         raise ValueError("fresh native selection request is unavailable or foreign")
-    record = initialization(state, plan)
-    thread = binding(state, plan, config)["thread_id"] if record["phase"] == "initialized" else None
+    thread = selection_thread(state, plan, config)
     receipt = {**expected, "argv": list(argv), "argv_sha256": settings.validate_native_argv(config, thread, argv),
                "validated_at": time.time()}
     with locked(state, "fresh-init.lock"):
@@ -393,7 +408,18 @@ def service_class():
             selection_guard(state, os.environ)
 
         async def tick(self):
-            require_initialized(self.config.state_dir, os.environ)
+            try:
+                require_initialized(self.config.state_dir, os.environ)
+            except (OSError, ValueError, KeyError, TypeError, sqlite3.Error) as exc:
+                self.gate.accepting = False
+                try:
+                    self.journal.operational_error("fresh startup evidence is held: " + str(exc))
+                    self.write_status(False, None, None)
+                except (OSError, ValueError, sqlite3.Error):
+                    # Missing durable evidence leaves new attachment/dispatch held.
+                    # Existing authorized native work still belongs to this backend.
+                    pass
+                return
             await super().tick()
 
     return FreshService
@@ -432,7 +458,7 @@ def evidence_problems(state, status, *, now=None):
                 or type(receipt.get("validated_at")) not in {int, float}
                 or not math.isfinite(receipt["validated_at"]) or receipt["validated_at"] <= 0):
             raise ValueError("fresh full argv validation evidence is malformed")
-        view = {"state_dir": str(state), "instance_id": context["instance_id"], "thread": bound["thread_id"],
+        view = {"state_dir": plan["runtime_state_dir"], "instance_id": context["instance_id"], "thread": bound["thread_id"],
                 "fingerprint": record["fingerprint"], "policy_hash": bound["policy_hash"],
                 "poll_interval_ms": record["poll_interval_ms"], "codex_version": context["codex_version"],
                 "codex_model": plan["selection"]["selected_model"], "sandbox": "danger-full-access",

@@ -307,12 +307,15 @@ class FreshBirthTest(unittest.TestCase):
                 finally:
                     await first.close()
                 self.assertEqual(fresh.read_json(self.state / fresh.INITIALIZATION)["phase"], "start_attempted")
-                second = kind(fresh.config_at(self.state), self.state / "controller.toml")
-                try:
-                    await second.start()
-                    fresh.require_initialized(self.state, self.env)
-                finally:
-                    await second.close()
+                with mock.patch.object(settings, "environment_generation", return_value="b" * 32):
+                    fresh.publish_request(self.state, self.env)
+                    fresh.select_pane(self.state, ["codex", "resume", "--last", *NATIVE[1:]], self.env)
+                    second = kind(fresh.config_at(self.state), self.state / "controller.toml")
+                    try:
+                        await second.start()
+                        fresh.require_initialized(self.state, self.env)
+                    finally:
+                        await second.close()
             asyncio.run(check())
         self.assertEqual((self.protocol.starts, self.protocol.resumes), (1, 1))
 
@@ -371,8 +374,10 @@ class FreshBirthTest(unittest.TestCase):
                     before = list(self.protocol.calls)
                     with sqlite3.connect(self.state / "journal.sqlite3") as db:
                         db.execute("UPDATE unified_binding SET policy_hash=?", ("b" * 64,))
-                    with self.assertRaisesRegex(ValueError, "initialized binding changed"):
-                        await service.tick()
+                    await service.tick()
+                    self.assertEqual(service.status["readiness"]["state"], "holding")
+                    self.assertIsNone(service.backend.process.returncode)
+                    self.assertFalse(service.stop_requested.is_set())
                     self.assertEqual(self.protocol.calls, before)
                 finally:
                     await service.close()
@@ -398,13 +403,61 @@ class FreshBirthTest(unittest.TestCase):
                     receipt = fresh.read_json(self.state / fresh.SELECTION)
                     receipt["entry_generation"] = "f" * 32
                     (self.state / fresh.SELECTION).write_text(json.dumps(receipt))
-                    with self.assertRaisesRegex(ValueError, "another environment"):
-                        await service.tick()
+                    await service.tick()
+                    self.assertEqual(service.status["readiness"]["state"], "holding")
+                    self.assertFalse(service.gate.accepting)
+                    self.assertIsNone(service.backend.process.returncode)
+                    self.assertFalse(service.stop_requested.is_set())
                     self.assertEqual(self.protocol.calls, before)
                 finally:
                     await service.close()
             asyncio.run(check())
         self.assertEqual(self.protocol.starts, 1)
+
+    def test_host_view_uses_bound_runtime_endpoint_path(self):
+        self.prepare()
+        self.select()
+        with self.runtime():
+            async def check():
+                service = fresh.service_class()(fresh.config_at(self.state), self.state / "controller.toml")
+                try:
+                    await service.start()
+                    host = self.root / "host-view"
+                    shutil.copytree(self.state, host)
+                    self.assertNotEqual(host, self.state)
+                    self.assertEqual(fresh.evidence_problems(host, service.status), [])
+                finally:
+                    await service.close()
+            asyncio.run(check())
+
+    def test_pause_in_run_holds_new_work_without_entering_cleanup(self):
+        self.prepare()
+        self.select()
+        with self.runtime():
+            async def check():
+                service = fresh.service_class()(fresh.config_at(self.state), self.state / "controller.toml")
+                task = asyncio.create_task(service.run())
+                try:
+                    async with asyncio.timeout(5):
+                        while not service.status:
+                            await asyncio.sleep(.01)
+                    canonical = self.protocol.thread
+                    self.protocol.active = True
+                    pause = self.state / "adapter-pause.json"
+                    pause.write_text("{}")
+                    await asyncio.sleep(service.config.poll_interval_ms / 1000 * 2 + .1)
+                    self.assertFalse(task.done())
+                    self.assertFalse(service.stop_requested.is_set())
+                    self.assertIsNone(service.backend.process.returncode)
+                    self.assertEqual(service.status["readiness"]["state"], "holding")
+                    self.assertEqual(self.protocol.thread, canonical)
+                    pause.unlink()
+                    await asyncio.sleep(service.config.poll_interval_ms / 1000 + .1)
+                    self.assertEqual(service.status["readiness"]["state"], "ready")
+                finally:
+                    service.stop_requested.set()
+                    await task
+            asyncio.run(check())
 
     def test_new_execution_generation_requires_new_argv_receipt_before_resume(self):
         self.prepare()
