@@ -4,7 +4,7 @@
 # in an interactive pane, sandy runs it with its complete native command line
 # (the binary first) as the arguments.
 #
-# Once the supervisor is ready it execs the Codex connector's `interactive`
+# In separate mode, once the supervisor is ready it execs `interactive`
 # (amap-connector-codex) with that command line after `--`. The connector
 # keeps sandy's native options, adds the three trusted AMAP MCP servers, the
 # read-only `amap_fleet` activity server and the operator policy, and execs
@@ -14,7 +14,7 @@
 # bare Codex. The supervisor this sandbox's entry runs stays the only owner
 # of the incoming lanes and of its thread.
 #
-# Ready means the connector's own read-only `activity` snapshot reports
+# Separate-mode readiness means the read-only `activity` snapshot reports
 # `readiness.state` "ready" (its checks: heartbeat, configuration and build,
 # thread binding, held claims and their owner, no unresolved dispatch, no
 # operational error, no blocked request), the supervisor configuration is a
@@ -24,6 +24,11 @@
 # check is given the time that remains (at least a second), no pause outlasts
 # it, and after that the pane shows the checks that did not pass and Codex is
 # not started.
+#
+# Unified mode validates the complete native argv and records the current
+# entry generation's selection before incoming work starts. It then delegates
+# directly to the connector's one bounded attachment wait for the canonical
+# thread. Unsupported or conflicting controls never authorize a backend.
 #
 # The arguments travel as an array: nothing is joined into a shell command or
 # split on whitespace. This file sits behind the read-only payload mount.
@@ -42,6 +47,19 @@ case ",${SANDY_AGENT:-}," in
 esac
 : "${AMAP_OUTBOX_DIR:?interactive-launch: no AMAP_OUTBOX_DIR in this pane; the outbox lane is not mounted}"
 export PYTHONPATH="$SELF_DIR/src"
+if [ -e "$STATE/adapter-pause.json" ] || [ -L "$STATE/adapter-pause.json" ]; then
+    echo "interactive-launch: operator maintenance pause; not starting Codex" >&2
+    exit 1
+fi
+if mode=$(python3 "$SELF_DIR/transition" --state "$STATE" entry-mode --check-pane-settings); then
+    :
+else
+    echo "interactive-launch: explicit adapter configuration is holding; not starting Codex" >&2
+    exit 1
+fi
+if [ "$mode" = unified ]; then
+    exec python3 "$SELF_DIR/transition" --state "$STATE" launch-pane -- "$@"
+fi
 python3 -c '
 import json, math, os, stat, subprocess, sys, time
 
@@ -57,6 +75,8 @@ def is_regular(path):
         return False
 
 def not_ready(remaining):
+    if os.path.lexists(os.path.join(state, "adapter-pause.json")):
+        return "operator maintenance pause"
     if os.path.lexists(hold):
         if not is_regular(hold):
             return "something other than a hold record occupies %s; the supervisor is treated as holding" % hold
@@ -81,6 +101,8 @@ def not_ready(remaining):
     except (ValueError, KeyError, TypeError):
         return "the connector activity snapshot carries no readiness this launcher reads"
     if ready == "ready":
+        if os.path.lexists(os.path.join(state, "adapter-pause.json")):
+            return "operator maintenance pause"
         return None
     open_checks = sorted("%s=%s" % (k, v) for k, v in checks.items() if v != "pass") \
         if isinstance(checks, dict) else []
@@ -103,4 +125,8 @@ while True:
         sys.exit("interactive-launch: %s; not starting Codex" % why)
     time.sleep(min(1, remaining))
 ' "$STATE" "${AMAP_CODEX_LAUNCH_WAIT_SECONDS:-60}" "$AMAP_OUTBOX_DIR"
+if [ -e "$STATE/adapter-pause.json" ] || [ -L "$STATE/adapter-pause.json" ]; then
+    echo "interactive-launch: operator maintenance pause after readiness wait; not starting Codex" >&2
+    exit 1
+fi
 exec python3 -m amap_codex.cli --config "$STATE/controller.toml" interactive --outbox-dir "$AMAP_OUTBOX_DIR" -- "$@"

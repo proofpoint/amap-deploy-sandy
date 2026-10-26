@@ -24,7 +24,7 @@
     {
       "name": "amap-connector-codex",
       "url": "https://github.com/proofpoint/amap-connector-codex",
-      "commit": "ba9d212c32970cc227b8bd4a10d89eb77f2056d9",
+      "commit": "e10eb2cf22a1056d1506938ef0669bfde582ff75",
       "override": "AMAP_CODEX_CONNECTOR_REPO",
       "opt_in": "AMAP_CODEX"
     }

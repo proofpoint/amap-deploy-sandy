@@ -24,8 +24,10 @@ records the final `exec` instead of running it.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
+import stat
 import shutil
 import signal
 import subprocess
@@ -36,6 +38,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 HERE = Path(__file__).resolve().parents[1]
+LEGACY_RELAY_BASELINE = "7c4b766fcb9947fe39fc2c78b9a58ff43a55207c"
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 import _workspace  # noqa: E402
@@ -77,6 +80,10 @@ esac
 PYTHON_SHIM = """#!/bin/sh
 if [ "$1" = "-m" ] && [ "$2" = "amap_codex.cli" ]; then
   printf '%s\\n' "$@" > "$SHIM_ARGV"
+  if [ -n "$SHIM_PAUSE_AFTER_RUN" ]; then
+    echo run >> "$SHIM_RUN_RECORD"
+    echo '{{}}' > "$SHIM_PAUSE_AFTER_RUN"
+  fi
   if [ -n "$SHIM_RUN_UNTIL_TERM" ]; then
     trap 'echo stopped > "$SHIM_RUN_UNTIL_TERM"; exit 0' TERM
     while :; do sleep 1; done
@@ -239,7 +246,27 @@ class CodexRelayTest(unittest.TestCase):
     def _start(self, **env):
         return subprocess.Popen(["/bin/sh", str(self.payload / "codex/relay")],
                                 env={**self.env, **env}, stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, text=True, start_new_session=True)
+                                stderr=subprocess.PIPE, text=True, start_new_session=True,
+                                cwd=self.root)
+
+    def test_installed_renderer_requires_its_installed_helper_from_unrelated_cwd(self):
+        (self.root / "logged-in").write_text("")
+        helper = self.payload / "codex/codex_transition.py"
+        raw, mode = helper.read_bytes(), stat.S_IMODE(helper.stat().st_mode)
+        helper.unlink()
+        proc = self._start()
+        _, error = proc.communicate(timeout=30)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("No module named 'codex_transition'", error)
+        self.assertFalse((self.state / "codex/controller.toml").exists())
+        self.assertFalse((self.root / "argv").exists())
+        helper.write_bytes(raw)
+        helper.chmod(mode)
+        proc = self._start()
+        _, error = proc.communicate(timeout=30)
+        self.assertEqual(proc.returncode, 0, error)
+        self.assertTrue((self.state / "codex/controller.toml").is_file())
+        self.assertTrue((self.root / "argv").is_file())
 
     def _hold_reason(self, proc):
         hold = self.state / prov.CODEX_STATE_SUBDIR / prov.CODEX_HOLD_NAME
@@ -279,11 +306,40 @@ class CodexRelayTest(unittest.TestCase):
         env = dict(self.env)
         del env["AMAP_FLEET_DOMAIN"]
         proc = subprocess.run(["/bin/sh", str(self.payload / "codex/relay")], env=env,
-                              capture_output=True, text=True, timeout=30)
+                              capture_output=True, text=True, timeout=30, cwd=self.root)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         config = Config.load(self.state / "codex/controller.toml")
         self.assertIsNone(config.self_address)
         self.assertEqual([l.name for l in config.lanes], ["mail"])
+
+    def test_entry_retains_the_previous_controller_before_replacing_it(self):
+        import hashlib
+        (self.root / "logged-in").write_text("")
+        proc = self._start()
+        _, err = proc.communicate(timeout=30)
+        self.assertEqual(proc.returncode, 0, err)
+        path = self.state / "codex/controller.toml"
+        previous = path.read_bytes()
+        snapshot = path.parent / "controller-history" / (hashlib.sha256(previous).hexdigest() + ".toml")
+        archived_at = None
+        for _ in range(2):
+            proc = self._start()
+            _, err = proc.communicate(timeout=30)
+            self.assertEqual(proc.returncode, 0, err)
+            self.assertEqual(list(snapshot.parent.glob("*.toml")), [snapshot])
+            if archived_at is not None:
+                self.assertEqual(snapshot.stat().st_mtime_ns, archived_at)
+            archived_at = snapshot.stat().st_mtime_ns
+        self.codex_config.write_text('model = "different-model"\n')
+        proc = self._start()
+        _, err = proc.communicate(timeout=30)
+        self.assertEqual(proc.returncode, 0, err)
+        self.assertEqual(snapshot.read_bytes(), previous)
+        self.assertEqual(stat.S_IMODE(snapshot.stat().st_mode), 0o600)
+        self.assertNotEqual(path.read_bytes(), previous)
+        # The fingerprint binds protected references/bytes and the namespace;
+        # model and build changes are audited separately by the connector.
+        self.assertEqual(Config.load(snapshot).fingerprint(), Config.load(path).fingerprint())
 
     # With the identity mount: the registry's address, never the slug.
     SCHEMA = "example-registry.name/1"
@@ -306,7 +362,7 @@ class CodexRelayTest(unittest.TestCase):
         (self.root / "logged-in").write_text("")
         proc = subprocess.run(["/bin/sh", str(self.payload / "codex/relay")],
                               env={**self.env, **self._identity(self._name_json())},
-                              capture_output=True, text=True, timeout=30)
+                              capture_output=True, text=True, timeout=30, cwd=self.root)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         config = Config.load(self.state / "codex/controller.toml")
         self.assertEqual(config.self_address, "gamma@sandy.host.internal")
@@ -347,23 +403,196 @@ class CodexRelayTest(unittest.TestCase):
     def test_not_logged_in_holds_with_the_reason(self):
         self.assertIn("not logged in", self._hold_reason(self._start()))
 
-    def test_the_model_is_the_agents_own_and_nothing_else(self):
-        """An AMAP_CODEX_MODEL or CODEX_MODEL in the environment is not a
-        source: the agent's config.toml is the only one."""
+    def test_operator_pause_holds_before_login_or_supervisor_start(self):
+        state = self.state / prov.CODEX_STATE_SUBDIR
+        state.mkdir()
+        (state / "adapter-pause.json").write_text('{"schema":1,"state":"paused"}')
+        self.assertIn("operator maintenance pause", self._hold_reason(self._start()))
+        self.assertFalse((self.root / "argv").exists())
+        self.assertFalse((state / "controller.toml").exists())
+
+    def test_operator_pause_blocks_the_next_automatic_child_retry(self):
+        (self.root / "logged-in").write_text("")
+        sleep = self.root / "bin/sleep"
+        sleep.write_text('#!/bin/sh\nexec ' + sys.executable + ' -c "import time; time.sleep(.02)"\n')
+        sleep.chmod(0o755)
+        state = self.state / prov.CODEX_STATE_SUBDIR
+        record = self.root / "run-record"
+        proc = self._start(SHIM_RC="1", SHIM_PAUSE_AFTER_RUN=str(state / "adapter-pause.json"),
+                           SHIM_RUN_RECORD=str(record))
+        try:
+            deadline = time.monotonic() + 20
+            reason = ""
+            while time.monotonic() < deadline:
+                hold = state / prov.CODEX_HOLD_NAME
+                if hold.is_file():
+                    reason = json.loads(hold.read_text()).get("reason", "")
+                    if "operator maintenance pause" in reason:
+                        break
+                time.sleep(.05)
+            self.assertIn("operator maintenance pause", reason)
+            time.sleep(.1)
+            self.assertEqual(record.read_text().splitlines(), ["run"])
+        finally:
+            os.killpg(proc.pid, signal.SIGKILL)
+            proc.communicate()
+
+    def test_unified_receiver_waits_for_full_native_argv_before_starting(self):
+        import test_codex_transition as tt
+        import codex_transition as transition
+        f = tt.TransitionTest()
+        f.setUp()
+        self.addCleanup(f.doCleanups)
+        export = unittest.mock.patch.dict(os.environ, {"CODEX_MODEL": "unified-pane-model"})
+        export.start()
+        self.addCleanup(export.stop)
+        f.prepare(apply=True)
+        f.commit_adoption_fixture()
+        transition.confirm(f.state, apply=True)
+        (self.root / "logged-in").write_text("")
+        (self.root / "sandy-session.json").write_text(json.dumps({"sandbox_name": f.previous.instance_id,
+                                                               "workspace": str(f.root)}))
+        proc = self._start(SANDY_FEATURE_STATE=str(f.state.parent), CODEX_HOME=str(f.native_home),
+                           CODEX_MODEL="unified-pane-model", SANDY_SKIP_PERMISSIONS="true",
+                           FAKE_CODEX_VERSION=f.previous.codex_version)
+        try:
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline and not (f.state / "pane-startup.json").exists():
+                time.sleep(.05)
+            self.assertTrue((f.state / "pane-startup.json").exists())
+            self.assertFalse((self.root / "argv").exists(), "receiver started before full argv selection")
+            with self.assertRaisesRegex(ValueError, "model or permissions differ"):
+                transition.select_pane(f.state, ["codex", "-a", "on-request"], apply=True)
+            self.assertFalse((self.root / "argv").exists())
+            transition.select_pane(f.state, ["codex", "-s", "danger-full-access", "-a", "never", "-m", "unified-pane-model"], apply=True)
+            _, err = proc.communicate(timeout=20)
+            self.assertEqual(proc.returncode, 0, err)
+            self.assertTrue((self.root / "argv").exists())
+            # A generic entry re-exec in the same execution environment reuses
+            # the selected policy without a new terminal or silent fleet hold.
+            before = json.loads((f.state / "pane-startup.json").read_text())
+            proc = self._start(SANDY_FEATURE_STATE=str(f.state.parent), CODEX_HOME=str(f.native_home),
+                               CODEX_MODEL="unified-pane-model", SANDY_SKIP_PERMISSIONS="true",
+                               FAKE_CODEX_VERSION=f.previous.codex_version)
+            _, err = proc.communicate(timeout=20)
+            self.assertEqual(proc.returncode, 0, err)
+            self.assertEqual(json.loads((f.state / "pane-startup.json").read_text()), before)
+        finally:
+            if proc.poll() is None:
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.communicate()
+
+    def test_pause_inside_transition_wait_blocks_render_and_service_start(self):
+        for stage in ("render", "service", "refuse"):
+            with self.subTest(stage=stage):
+                fixture = CodexRelayTest()
+                fixture.setUp()
+                self.addCleanup(fixture.doCleanups)
+                (fixture.root / "logged-in").write_text("")
+                shim = fixture.root / "bin/python3"
+                prefix = '''#!/bin/sh
+case "$1" in
+  */transition)
+    for token in "$@"; do
+      if [ "$token" = entry-mode ]; then
+        if [ "$FIXTURE_TRANSITION_STAGE" = refuse ]; then
+          echo 'fixture transition blocked' >&2; exit 1
+        fi
+        if [ "$FIXTURE_TRANSITION_STAGE" = render ] || [ -f "$3/controller.toml" ]; then
+          echo '{}' > "$3/adapter-pause.json"
+        fi
+        echo separate; exit 0
+      fi
+    done ;;
+esac
+'''
+                shim.write_text(prefix + shim.read_text())
+                proc = fixture._start(FIXTURE_TRANSITION_STAGE=stage)
+                try:
+                    state = fixture.state / "codex"
+                    deadline = time.monotonic() + 20
+                    reason = ""
+                    while time.monotonic() < deadline:
+                        hold = state / "hold.json"
+                        if hold.exists():
+                            reason = json.loads(hold.read_text()).get("reason", "")
+                            if ("operator maintenance pause" in reason if stage != "refuse" else "fixture transition blocked" in reason):
+                                break
+                        self.assertIsNone(proc.poll(), "a transition hold must not exit")
+                        time.sleep(.05)
+                    self.assertIn("operator maintenance pause" if stage != "refuse" else "fixture transition blocked", reason)
+                    self.assertFalse((fixture.root / "argv").exists())
+                    self.assertEqual((state / "controller.toml").exists(), stage == "service")
+                finally:
+                    if proc.poll() is None:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                        proc.communicate()
+
+    def test_first_upgrade_bootstrap_runs_without_adapter_imports_and_new_relay_holds(self):
+        original_relay = (self.payload / "codex/relay").read_text()
+        fixture = HERE / "tests/fixtures/codex-separate-relay.sh"
+        binding = json.loads(fixture.with_suffix(".json").read_text())
+        raw = fixture.read_bytes()
+        self.assertEqual(binding["baseline_commit"], LEGACY_RELAY_BASELINE)
+        self.assertEqual(binding["git_mode"], "100755")
+        self.assertEqual(binding["path"], "payload/codex/relay")
+        self.assertEqual(hashlib.sha256(raw).hexdigest(), binding["sha256"])
+        self.assertEqual(hashlib.sha1(b"blob " + str(len(raw)).encode() + b"\0" + raw).hexdigest(),
+                         binding["git_blob"])
+        old = raw.decode()
+        old = old.replace(SESSION_LINE, "SANDY_SESSION_FILE=" + str(self.root / "sandy-session.json"))
+        (self.payload / "codex/relay").write_text(old)
+        (self.root / "logged-in").write_text("")
+        proc = self._start()
+        _, err = proc.communicate(timeout=30)
+        self.assertEqual(proc.returncode, 0, err)
+        state = self.state / "codex"
+        previous = (state / "controller.toml").read_bytes()
+        source = (HERE / "codex_bootstrap_pause.py").read_text()
+        command = [sys.executable, "-I", "-S", "-c", source, "--state", str(state),
+                   "--note", "operator-selected first upgrade", "--apply"]
+        result = subprocess.run(command, capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(json.loads(result.stdout)["service_stopped"])
+        # The old script ignores the marker; it must still be stopped separately.
+        proc = self._start()
+        _, err = proc.communicate(timeout=30)
+        self.assertEqual(proc.returncode, 0, err)
+        (self.root / "argv").rename(self.root / "old-argv")
+        (self.payload / "codex/relay").write_text(original_relay)
+        self.assertIn("operator maintenance pause", self._hold_reason(self._start()))
+        self.assertFalse((self.root / "argv").exists())
+        self.assertEqual((state / "controller.toml").read_bytes(), previous)
+
+    def test_separate_entry_keeps_native_model_despite_forwarded_pane_exports(self):
+        """The separate supervisor keeps its native-config model contract."""
         (self.root / "logged-in").write_text("")
         proc = subprocess.run(["/bin/sh", str(self.payload / "codex/relay")],
                               env={**self.env, "AMAP_CODEX_MODEL": "gpt-env",
                                    "CODEX_MODEL": "gpt-env"},
-                              capture_output=True, text=True, timeout=30)
+                              capture_output=True, text=True, timeout=30, cwd=self.root)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(Config.load(self.state / "codex/controller.toml").codex_model,
                          "gpt-test")
+        receipt = json.loads((self.state / "codex/entry-settings.json").read_text())
+        self.assertEqual((receipt["selected_model"], receipt["model_source"]), ("gpt-test", "native_config"))
+
+    def test_empty_codex_model_uses_native_configuration_and_records_its_source(self):
+        (self.root / "logged-in").write_text("")
+        proc = self._start(CODEX_MODEL="", AMAP_CODEX_MODEL="ignored")
+        _, err = proc.communicate(timeout=30)
+        self.assertEqual(proc.returncode, 0, err)
+        config = Config.load(self.state / "codex/controller.toml")
+        self.assertEqual(config.codex_model, "gpt-test")
+        receipt = json.loads((self.state / "codex/entry-settings.json").read_text())
+        self.assertEqual(receipt["model_source"], "native_config")
 
     def test_no_model_in_the_agents_config_leaves_the_choice_to_codex(self):
         (self.root / "logged-in").write_text("")
         self.codex_config.write_text('sandbox_mode = "danger-full-access"\n')
-        proc = subprocess.run(["/bin/sh", str(self.payload / "codex/relay")], env=self.env,
-                              capture_output=True, text=True, timeout=30)
+        proc = subprocess.run(["/bin/sh", str(self.payload / "codex/relay")],
+                              env={**self.env, "CODEX_MODEL": "pane-only-model"},
+                              capture_output=True, text=True, timeout=30, cwd=self.root)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         controller = self.state / "codex/controller.toml"
         self.assertNotIn("codex_model", controller.read_text())
@@ -397,7 +626,7 @@ class CodexRelayTest(unittest.TestCase):
         (self.root / "logged-in").write_text("")
         proc = subprocess.run(["/bin/sh", str(self.payload / "codex/relay")],
                               env={**self.env, "FAKE_CODEX_VERSION": "codex-cli 9.9.9"},
-                              capture_output=True, text=True, timeout=30)
+                              capture_output=True, text=True, timeout=30, cwd=self.root)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         config = Config.load(self.state / "codex/controller.toml")
         self.assertEqual(config.codex_version, "codex-cli 9.9.9")
