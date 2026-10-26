@@ -93,13 +93,15 @@ class Fixture(unittest.TestCase):
                                              small=SMALL.hex(), noncanon=NON_CANONICAL.hex(), codec_patch=codec_patch))
         self.plugin.chmod(0o444)
 
-    def config(self, hosts, *, inbound=False):
-        keys = hp.hop_keys(spec(), link(), FLEET_DOMAIN)
+    def config(self, hosts, *, inbound=False, fleet_domain=FLEET_DOMAIN, trusted=None, hub=None):
+        lk = link() if trusted is None else link(trusted_fleet_hosts=trusted)
+        keys = hp.hop_keys(spec(**(hub or {})), lk, fleet_domain)
         keys["delivered_domains_file"] = str(self.d7)
         keys["transport_plugin"] = {"path": str(self.plugin),
                                     "sha256": hashlib.sha256(self.plugin.read_bytes()).hexdigest()}
-        me, peers = fk.select(hosts, FLEET_DOMAIN, list(link().trusted))
+        me, peers = fk.select(hosts, fleet_domain, list(lk.trusted))
         doc = router_doc(keys)
+        doc["fleet_domain"] = fleet_domain
         doc["delegation"] = dict(dr.render_block(key_path=str(self.key), me=me, peers=peers, inbound=inbound),
                                  partition_verified=pa.LOADER_PLACEHOLDER)
         return doc
@@ -124,6 +126,53 @@ class RenderTest(Fixture):
         self.assertNotIn("partition_verified", block)
         self.assertIs(dr.render_block(key_path="/k", me=me, peers=peers, inbound=True)["inbound"], True)
 
+    def test_each_host_renders_the_other_as_its_one_peer(self):
+        hosts = inventory(*GOOD)
+        for domain, trusted, mine, theirs in ((FLEET_DOMAIN, ["beta.internal"], GOOD[0], GOOD[1]),
+                                              ("beta.internal", [FLEET_DOMAIN], GOOD[1], GOOD[0])):
+            with self.subTest(host=mine["name"]):
+                me, peers = fk.select(hosts, domain, trusted)
+                block = dr.render_block(key_path="/k", me=me, peers=peers, inbound=False)
+                self.assertEqual(block["signing_key"]["key_id"], mine["key_id"])
+                self.assertEqual(block["runtimes"], [{"name": theirs["name"], "runtime": theirs["runtime"],
+                                                      "domains": theirs["domains"],
+                                                      "keys": [{"key_id": theirs["key_id"],
+                                                                "public_key": theirs["public_key"]}]}])
+
+    def test_a_block_with_no_peer_runtime_refuses_at_render(self):
+        me = inventory(GOOD[0])[0]
+        with self.assertRaises(dr.DelegationRenderError) as cm:
+            dr.render_block(key_path="/k", me=me, peers=(), inbound=False)
+        self.assertIn("no peer runtime", str(cm.exception))
+
+    def test_this_host_is_never_rendered_as_its_own_peer(self):
+        me = inventory(*GOOD)[0]
+        with self.assertRaises(dr.DelegationRenderError) as cm:
+            dr.render_block(key_path="/k", me=me, peers=(me,), inbound=False)
+        self.assertIn("own signing entry", str(cm.exception))
+
+    def test_a_projection_that_is_not_the_peers_one_key_refuses(self):
+        me, peers = fk.select(inventory(*GOOD), FLEET_DOMAIN, ["beta.internal"])
+        orig = fk.Host.table_entry
+        self.addCleanup(setattr, fk.Host, "table_entry", orig)
+        two = {"key_id": "a" * 64, "public_key": "b" * 64}
+        for label, change, words in (
+                ("no key", lambda e: e.update(keys=[]), "exactly its one inventory key"),
+                ("two keys", lambda e: e["keys"].append(two), "exactly its one inventory key"),
+                ("malformed key", lambda e: e["keys"][0].pop("public_key"), "exactly its one inventory key"),
+                ("another key", lambda e: e["keys"][0].update(two), "exactly its one inventory key"),
+                ("another runtime", lambda e: e.update(runtime="amap.router@gamma.internal"), "runtime and domains"),
+                ("other domains", lambda e: e.update(domains=["gamma.internal"]), "runtime and domains")):
+            with self.subTest(label):
+                def mutated(host, change=change):
+                    e = orig(host)
+                    change(e)
+                    return e
+                fk.Host.table_entry = mutated
+                with self.assertRaises(dr.DelegationRenderError) as cm:
+                    dr.render_block(key_path="/k", me=me, peers=peers, inbound=False)
+                self.assertIn(words, str(cm.exception))
+
     def test_the_hop_link_carries_the_switch_and_nothing_else_new(self):
         self.assertIsNone(link().inbound)
         self.assertIs(link(delegation={"inbound": True}).inbound, True)
@@ -144,6 +193,55 @@ class NoSeedTest(Fixture):
 
     def test_a_public_only_table_passes_with_the_key_absent(self):
         self.assertIsNone(self.check(self.config(inventory(*GOOD))))
+
+    def test_both_hosts_renderings_pass_through_the_routers_input_and_the_gate(self):
+        """One inventory, as the crossing has it: each router's domain is the
+        `<label>.internal` the other trusts, and each host's rendering passes
+        the router's loader, its key_table_input and the gate. The hub section
+        is the fixture's own, which only the hop keys read; its fleet_hosts is
+        the one other host, so each side's own domain stays outside it."""
+        hosts = inventory(entry("beta", ["beta.internal"], 1), entry("gamma", ["gamma.internal"], 2))
+        for label, other in (("beta", "gamma"), ("gamma", "beta")):
+            domain, other = label + ".internal", other + ".internal"
+            with self.subTest(host=label):
+                doc = self.config(hosts, fleet_domain=domain, trusted=[other], hub={"fleet_hosts": [other]})
+                self.assertEqual([r["domains"] for r in doc["delegation"]["runtimes"]], [[other]])
+                self.assertIsNone(self.check(doc))
+
+    def test_an_empty_or_keyless_peer_table_refuses(self):
+        """The router's loader accepts both shapes; the gate would load each
+        as a table that verifies nothing."""
+        second = entry("gamma", ["gamma.internal"], 3)
+        for label, change, reason in (
+                ("no runtime", lambda d: d.update(runtimes=[]), "no_peer"),
+                ("no key", lambda d: d["runtimes"][0].update(keys=[]), "key_malformed"),
+                ("two keys", lambda d: d["runtimes"][0]["keys"].append(
+                    {"key_id": second["key_id"], "public_key": second["public_key"]}), "key_malformed")):
+            with self.subTest(label):
+                doc = self.config(inventory(*GOOD))
+                change(doc["delegation"])
+                why = self.check(doc)
+                self.assertTrue(why and why.startswith(reason + ":"), why)
+
+    def test_a_gate_that_drops_or_alters_a_peer_key_refuses(self):
+        """A plugin whose key gate loads without error but returns a table
+        missing or misbinding a configured key: the check selects every one."""
+        wrap = ('_orig = _m.load_key_table\n'
+                'def _patched(peers):\n'
+                '    t = _orig(peers)\n'
+                '    for k in [k for k in t._keys.values() if k.runtime != "amap.router@" + {own!r}]:\n'
+                '        {change}\n'
+                '    return t\n'
+                '_m.PeerCodec.load_key_table = staticmethod(_patched)')
+        for label, change, reason in (
+                ("dropped", "del t._keys[k.key_id]", "peer_key_unselectable"),
+                ("other bytes", "k.public_key = bytes(32)", "peer_key_mismatch"),
+                ("other runtime", "k.runtime = 'amap.router@gamma.internal'", "peer_key_mismatch"),
+                ("other domains", "k.domains = ('gamma.internal',)", "peer_key_mismatch")):
+            with self.subTest(label):
+                self.write_plugin(wrap.format(own=FLEET_DOMAIN, change=change))
+                why = self.check(self.config(inventory(*GOOD)))
+                self.assertTrue(why and why.startswith(reason + ":"), why)
 
     def test_a_key_that_is_there_is_never_opened(self):
         for mode in (0o400, 0o000):
@@ -179,9 +277,11 @@ class NoSeedTest(Fixture):
         self.assertTrue(why and why.startswith("codec:") and "CANDIDATE_REASONS" in why, why)
 
     def test_the_signing_key_id_among_the_peers_refuses(self):
+        # The peer's one key is replaced, not joined: a second key is refused
+        # first, by the one-key rule.
         doc = self.config(inventory(*GOOD))
-        doc["delegation"]["runtimes"][0]["keys"].append(
-            {"key_id": doc["delegation"]["signing_key"]["key_id"], "public_key": "ab" * 32})
+        doc["delegation"]["runtimes"][0]["keys"] = [
+            {"key_id": doc["delegation"]["signing_key"]["key_id"], "public_key": "ab" * 32}]
         why = self.check(doc)
         self.assertTrue(why and why.startswith("duplicate_key_id:"), why)
 
