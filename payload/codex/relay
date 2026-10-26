@@ -38,6 +38,10 @@ case "${AMAP_CODEX_CONVERSATION_MODE-separate}" in
             sleep 30
         done ;;
     separate)
+        if [ -e "$SANDY_FEATURE_STATE/.fresh-intent-codex.json" ] || [ -L "$SANDY_FEATURE_STATE/.fresh-intent-codex.json" ]; then
+            echo "codex relay: fresh unified state cannot downgrade to separate; durable birth intent remains" >&2
+            while :; do sleep 30; done
+        fi
         for evidence in fresh-birth.json fresh-plan.json fresh-initialization.json fresh-startup.json fresh-selection.json; do
             if [ -e "$STATE/$evidence" ] || [ -L "$STATE/$evidence" ]; then
                 echo "codex relay: fresh unified state cannot downgrade to separate; retain it for operator inspection" >&2

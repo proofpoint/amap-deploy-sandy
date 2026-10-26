@@ -11,6 +11,7 @@ import time
 import subprocess
 
 import codex_assets as assets
+import codex_fleet as fleet
 import codex_settings as settings
 
 RECORD = "adapter-transition.json"
@@ -273,8 +274,7 @@ def confirm(state, *, apply=False):
 
 def entry_mode(state, *, selected_model=None, observed_version=None, check_pane_settings=False):
     """Read-only gate, used before relay rendering and terminal attachment."""
-    if any(os.path.lexists(state / name) for name in
-           ("fresh-birth.json", "fresh-plan.json", "fresh-initialization.json", "fresh-startup.json", "fresh-selection.json")):
+    if any(os.path.lexists(path) for path in fleet.fresh_markers(state)):
         raise ValueError("fresh unified state cannot enter the separate/adoption path; use the protected fresh launcher")
     if not os.path.lexists(state / RECORD):
         path = state / "controller.toml"

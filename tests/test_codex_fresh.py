@@ -165,6 +165,25 @@ class FreshBirthTest(unittest.TestCase):
                 if name:
                     (other / name).unlink()
 
+    def test_durable_parent_intent_closes_the_mkdir_before_birth_record_crash_gap(self):
+        import codex_transition as transition
+        state = self.root / "interrupted"
+        real = assets.place
+        def interrupted(path, raw, **kwargs):
+            if path == state / fresh.BIRTH:
+                raise OSError("fixture crash before child birth receipt")
+            return real(path, raw, **kwargs)
+        with mock.patch.object(assets, "place", side_effect=interrupted):
+            with self.assertRaisesRegex(OSError, "before child birth"):
+                fresh.birth(state, self.session, self.env)
+        self.assertTrue(fresh.intent_path(state).is_file())
+        self.assertEqual(list(state.iterdir()), [])
+        with self.assertRaisesRegex(ValueError, "operator recreation"):
+            fresh.birth(state, self.session, self.env)
+        with self.assertRaisesRegex(ValueError, "cannot enter"):
+            transition.entry_mode(state)
+        self.assertFalse((state / "controller.toml").exists())
+
     def test_retained_mailbox_work_blocks_first_birth_but_new_work_after_birth_is_retained(self):
         notice = Path(self.env["AMAP_INBOX_DIR"]) / "notices" / "retained.json"
         notice.write_bytes(b"retained work; never replay automatically")
@@ -336,6 +355,7 @@ class FreshBirthTest(unittest.TestCase):
         value = fresh.read_json(self.state / fresh.BIRTH)
         value["kind"] = "foreign"
         (self.state / fresh.BIRTH).write_text(json.dumps(value))
+        fresh.intent_path(self.state).write_text(json.dumps(value))
         with self.assertRaisesRegex(ValueError, "birth evidence is malformed"):
             self.prepare()
         self.assertFalse((self.state / "controller.toml").exists())
@@ -592,8 +612,8 @@ class FreshBirthTest(unittest.TestCase):
                     with sqlite3.connect(self.state / "journal.sqlite3") as db:
                         db.execute("UPDATE unified_binding SET policy_hash=?", ("b" * 64,))
                     await service.tick()
-                    self.assertIn("initialized binding changed", service.status["last_error"])
                     self.assertEqual(service.status["readiness"]["state"], "holding")
+                    self.assertIn("initialized binding changed", str(service.status["last_error"]))
                     self.assertFalse(service.gate.accepting)
                     self.assertFalse(service.stop_requested.is_set())
                     self.assertIsNone(service.backend.process.returncode)

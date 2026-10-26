@@ -3,6 +3,11 @@
 POLICY_KEY = "codex_conversation_mode"
 EXPORT = "AMAP_CODEX_CONVERSATION_MODE"
 MODES = ("separate", "unified")
+FRESH_FILES = ("fresh-birth.json", "fresh-plan.json", "fresh-initialization.json", "fresh-startup.json", "fresh-selection.json")
+
+
+def fresh_markers(state):
+    return tuple(state / name for name in FRESH_FILES) + (state.parent / (".fresh-intent-" + state.name + ".json"),)
 
 
 def mode(policy):
