@@ -18,6 +18,48 @@ PREVIOUS = "adapter-previous.toml"
 PAUSE = "adapter-pause.json"
 
 
+def require_native_runtime():
+    if sys.version_info < (3, 11):
+        raise ValueError("unified transition operations require Python 3.11 or newer; retain the hold")
+
+
+def configuration_mode(raw):
+    """Project mode on the host; native Python validates the complete TOML."""
+    if sys.version_info >= (3, 11):
+        import tomllib
+        return tomllib.loads(raw.decode()).get("conversation_mode", "separate")
+    # The separate renderer emits one JSON-compatible value per bare key and
+    # bare lane headers. Other TOML syntax needs the native runtime; it never
+    # defaults an uninspectable document to separate mode.
+    mode, section, seen = "separate", "", set()
+    decoder = json.JSONDecoder()
+    for line in raw.decode().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if re.fullmatch(r"\[lanes\.[A-Za-z0-9_-]+\]", line):
+            section = line
+            continue
+        assignment = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+)", line)
+        if assignment is None:
+            raise ValueError("noncanonical controller inspection requires Python 3.11 or newer")
+        key, encoded = assignment.groups()
+        identity = (section, key)
+        if identity in seen:
+            raise ValueError("duplicate controller key; retain the hold")
+        seen.add(identity)
+        value, end = decoder.raw_decode(encoded)
+        if not (type(value) in {str, bool, int}
+                or isinstance(value, list) and all(isinstance(item, str) for item in value)):
+            raise ValueError("noncanonical controller inspection requires Python 3.11 or newer")
+        tail = encoded[end:].strip()
+        if tail and not tail.startswith("#"):
+            raise ValueError("noncanonical controller inspection requires Python 3.11 or newer")
+        if not section and key == "conversation_mode":
+            mode = value
+    return mode
+
+
 def snapshot_current(state):
     """Retain exact controller bytes before a separate-mode entry re-renders."""
     path = state / "controller.toml"
@@ -231,14 +273,14 @@ def entry_mode(state, *, selected_model=None, observed_version=None, check_pane_
     if not os.path.lexists(state / RECORD):
         path = state / "controller.toml"
         if os.path.lexists(path):
-            import tomllib
             try:
-                doc = tomllib.loads(assets.regular(path).decode())
+                mode = configuration_mode(assets.regular(path))
             except (OSError, ValueError) as exc:
                 raise ValueError("the supervisor has not written a regular controller configuration: " + str(exc)) from exc
-            if doc.get("conversation_mode", "separate") != "separate":
+            if mode != "separate":
                 raise ValueError("unified configuration lacks explicit adapter transition confirmation")
         return "separate"
+    require_native_runtime()
     record = read_record(state)
     if record["state"] != "confirmed":
         raise ValueError("explicit unified adoption is pending; retain controller and previous configuration")
@@ -387,6 +429,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     sys.path.insert(0, str(args.payload / "src"))
     try:
+        if args.command != "entry-mode":
+            require_native_runtime()
         if args.command == "prepare":
             result = prepare(args.state, args.payload, args.thread, apply=args.apply)
         elif args.command == "confirm":
