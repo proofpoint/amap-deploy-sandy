@@ -327,7 +327,52 @@ def load(sec: Any, spec: Any) -> HubSpec:
         raise HubSpecError("hub.d7.dir must hold only the D7 file")
     for p in (hs.hop_root,) + tuple(paths.values()):
         _in_container(spec, s.principal, p)
+    state_separation(spec, s.principal, hs.hop_root, paths)
     return hs
+
+
+def _apart(a: str, b: str) -> bool:
+    """Neither normalised absolute path is `b`'s or `a`'s own tree: compared
+    by whole path components, so "/hop" and "/hops" are apart. "/" holds
+    every path, so nothing is apart from it."""
+    if a == "/" or b == "/":
+        return False
+    return not (a == b or a.startswith(b + "/") or b.startswith(a + "/"))
+
+
+def _projected(c: str, what: str) -> str:
+    """A container path as `_in_container` projects it, required to be
+    absolute and normalised: a mount whose container destination is "/"
+    projects "//x", which no comparison can trust."""
+    if not c.startswith("/") or c.startswith("//") or posixpath.normpath(c) != c:
+        raise HubSpecError(f"{what} is seen at {c!r} in the runtime, which is not a normalised absolute "
+                           f"path; a mount's container destination must not be \"/\"")
+    return c
+
+
+def state_separation(spec: Any, principal: str, hop_root: str, dirs: Dict[str, str]) -> None:
+    """The runtime's private state (each of `dirs`, which holds the mailbox
+    root and so the relay log, the ledger, the inbound state and the lock)
+    never resolves into the hop root's tree, by any route the document
+    declares: on the host, in the container's view, or through the mounts
+    that carry them. Two dirs carried by the hop root's own mount, or by a
+    mount whose host source is nested with it, share its storage whatever
+    their container names. Storage the document cannot show (a host bind
+    mount or a link aliasing two declared paths) is outside this check."""
+    hop_c = _projected(_in_container(spec, principal, hop_root), "hub.hop.root")
+    hop_m = mount_holding(spec, principal, hop_root)
+    for k, p in sorted(dirs.items()):
+        if not _apart(p, hop_root):
+            raise HubSpecError(f"hub.dirs.{k} {p} overlaps hub.hop.root {hop_root}: the runtime's private "
+                               f"state must be outside the hop root's tree")
+        m = mount_holding(spec, principal, p)
+        if m is hop_m or not _apart(m["host"], hop_m["host"]):
+            raise HubSpecError(f"hub.dirs.{k} {p} is carried by {principal}'s mount of {m['host']}, which "
+                               f"shares storage with the mount of {hop_m['host']} that carries hub.hop.root")
+        c = _projected(_in_container(spec, principal, p), f"hub.dirs.{k}")
+        if not _apart(c, hop_c):
+            raise HubSpecError(f"hub.dirs.{k} is seen at {c} in {principal}'s runtime, inside or around "
+                               f"HOP_ROOT {hop_c}")
 
 
 # --- The rendering --------------------------------------------------------------
