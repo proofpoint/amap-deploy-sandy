@@ -3171,8 +3171,8 @@ def verify_codex_supervisor(home: Path, slug: str, record: Optional[dict], *,
         return problems, notes
     if os.path.lexists(state / "fresh-birth.json"):
         try:
-            birth = json.loads(ca.regular(state / "fresh-birth.json"))
-            if json.loads(ca.regular(custody)) != birth:
+            birth = json.loads(ca.read_path(state / "fresh-birth.json"))
+            if json.loads(ca.read_path(custody)) != birth:
                 raise ValueError("custody differs from birth")
         except (OSError, ValueError) as exc:
             problems.append(f"codex unified HOLD: {slug}: retained namespace custody unavailable: {exc}")
