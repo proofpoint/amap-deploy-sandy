@@ -79,6 +79,7 @@ esac
 # python3 call (the relay's own helpers) runs for real.
 PYTHON_SHIM = """#!/bin/sh
 if [ "$1" = "-m" ] && [ "$2" = "amap_codex.cli" ]; then
+  if [ -n "$SHIM_INTERPRETER" ]; then printf '%s\\n' "$0" > "$SHIM_INTERPRETER"; fi
   printf '%s\\n' "$@" > "$SHIM_ARGV"
   if [ -n "$SHIM_PAUSE_AFTER_RUN" ]; then
     echo run >> "$SHIM_RUN_RECORD"
@@ -223,7 +224,10 @@ class CodexRelayTest(unittest.TestCase):
         bindir.mkdir()
         (bindir / "codex").write_text(FAKE_CODEX)
         (bindir / "python3").write_text(PYTHON_SHIM.format(python=sys.executable))
-        for name in ("codex", "python3"):
+        (bindir / "system-python3").write_text(PYTHON_SHIM.format(python=sys.executable))
+        relay.write_text(relay.read_text().replace("ADOPTED_PYTHON=/usr/bin/python3",
+                                                  "ADOPTED_PYTHON=" + str(bindir / "system-python3")))
+        for name in ("codex", "python3", "system-python3"):
             (bindir / name).chmod(0o755)
         lanes = {}
         for lane, export in prov.EXPORT_LANE_DIR.items():
@@ -464,6 +468,7 @@ class CodexRelayTest(unittest.TestCase):
                            CODEX_MODEL="unified-pane-model", SANDY_SKIP_PERMISSIONS="true",
                            AMAP_CODEX_CONVERSATION_MODE=fleet_mode,
                            AMAP_INBOX_DIR=str(f.root / "mail"), AMAP_PEER_DIR=str(f.root / "peer"),
+                           SHIM_INTERPRETER=str(self.root / "interpreter"),
                            FAKE_CODEX_VERSION=f.previous.codex_version)
         try:
             deadline = time.monotonic() + 20
@@ -478,6 +483,8 @@ class CodexRelayTest(unittest.TestCase):
             _, err = proc.communicate(timeout=20)
             self.assertEqual(proc.returncode, 0, err)
             self.assertTrue((self.root / "argv").exists())
+            self.assertEqual((self.root / "interpreter").read_text().strip(),
+                             str(self.root / "bin/system-python3"))
             # A generic entry re-exec in the same execution environment reuses
             # the selected policy without a new terminal or silent fleet hold.
             before = json.loads((f.state / "pane-startup.json").read_text())
