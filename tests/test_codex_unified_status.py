@@ -380,9 +380,8 @@ class UnifiedEvidenceTest(unittest.TestCase):
         self.assertTrue(any("pending explicit revalidation" in p for p in self._unified(prov, home, record)))
         with self.assertRaisesRegex(ValueError, "pending explicit revalidation"):
             transition.read_record(self.fixture.state)
-        for apply in (False, True):
-            with self.assertRaisesRegex(ValueError, "pending explicit revalidation"):
-                transition.confirm(self.fixture.state, apply=apply)
+        with self.assertRaisesRegex(ValueError, "pending explicit revalidation"):
+            transition.entry_mode(self.fixture.state)
         self._record(lambda value: value.update(previous_fingerprint="F" * 64))
         self.assertTrue(any("pending explicit revalidation" in p for p in self._unified(prov, home, record)))
         with self.assertRaisesRegex(ValueError, "invalid adapter transition previous_fingerprint"):
@@ -392,6 +391,104 @@ class UnifiedEvidenceTest(unittest.TestCase):
         self._record(lambda value: value.update(previous_fingerprint="e" * 64))
         with self.assertRaisesRegex(ValueError, "not confirmed"):
             transition.confirmed_adoption(transition.config_at(self.fixture.state), transition.read_record(self.fixture.state))
+
+    def _bytes(self):
+        state = self.fixture.state
+        return {name: (state / name).read_bytes()
+                for name in ("controller.toml", transition.PREVIOUS, "journal.sqlite3")}
+
+    def test_confirm_enriches_a_legacy_record_with_only_the_expected_previous_fingerprint(self):
+        """The pre-r4 record of a confirmed adoption: it is pending revalidation everywhere until
+        confirm --apply adds the one field, and then host verify and startup accept it."""
+        prov, home, record = self._host()
+        expected = json.loads((self.fixture.state / "adapter-transition.json").read_bytes())
+        path = self._record(lambda value: value.pop("previous_fingerprint"))
+        legacy = path.read_bytes()
+        self.assertTrue(any("pending explicit revalidation" in p for p in self._unified(prov, home, record)))
+        before = self._bytes()
+        dry = transition.confirm(self.fixture.state)
+        self.assertEqual((dry["apply"], dry["previous_fingerprint"]), (False, expected["previous_fingerprint"]))
+        self.assertEqual(path.read_bytes(), legacy)
+        transition.confirm(self.fixture.state, apply=True)
+        self.assertEqual(json.loads(path.read_bytes()), expected)
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self._bytes(), before)
+        self.assertEqual(self._unified(prov, home, record), [])
+        self.assertIsNone(self._startup_refuses())
+        transition.confirm(self.fixture.state, apply=True)
+        self.assertEqual(json.loads(path.read_bytes()), expected)
+
+    def test_confirm_refuses_to_enrich_against_conflicting_evidence(self):
+        cases = {
+            "native row": ("row", "UPDATE unified_adoptions SET previous_fingerprint='" + "f" * 64 + "'",
+                           "not confirmed"),
+            "retained previous bytes": ("previous", b"# edited\n", "retained previous configuration differs"),
+            "recorded expectation": ("record", {"previous_fingerprint": "e" * 64},
+                                     "recorded previous fingerprint differs"),
+            "settings": ("record", {"poll_interval_ms": 1}, "transition settings differ"),
+            "policy binding": ("record", {"policy_hash": "c" * 64}, "policy binding differs"),
+        }
+        state = self.fixture.state
+        journal, previous = state / "journal.sqlite3", state / transition.PREVIOUS
+        record = state / "adapter-transition.json"
+        originals = {journal: journal.read_bytes(), previous: previous.read_bytes(), record: record.read_bytes()}
+        for name, (kind, change, message) in cases.items():
+            with self.subTest(name):
+                for target, data in originals.items():
+                    target.write_bytes(data)
+                path = self._record(lambda value: value.pop("previous_fingerprint"))
+                if kind == "row":
+                    self._native_adoption(change)
+                elif kind == "previous":
+                    previous.write_bytes(originals[previous] + change)
+                else:
+                    self._record(lambda value: value.update(change))
+                held = path.read_bytes()
+                for apply in (False, True):
+                    with self.assertRaisesRegex(ValueError, message):
+                        transition.confirm(state, apply=apply)
+                    self.assertEqual(path.read_bytes(), held)
+        for target, data in originals.items():
+            target.write_bytes(data)
+
+    def test_confirm_enrichment_needs_controller_ownership(self):
+        """A running controller holds controller.lock; the enrichment refuses and writes nothing."""
+        import fcntl
+        import os
+        path = self._record(lambda value: value.pop("previous_fingerprint"))
+        legacy = path.read_bytes()
+        fd = os.open(self.fixture.state / "controller.lock", os.O_CREAT | os.O_RDWR, 0o600)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with self.assertRaisesRegex(RuntimeError, "another controller owns this state directory"):
+            transition.confirm(self.fixture.state, apply=True)
+        self.assertEqual(path.read_bytes(), legacy)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+
+    def test_confirm_enrichment_refuses_a_record_changed_while_taking_ownership(self):
+        from unittest import mock
+        import amap_codex.supervisor as supervisor
+        path = self._record(lambda value: value.pop("previous_fingerprint"))
+        real = supervisor.Ownership
+
+        class Racing(real):
+            def __enter__(self):
+                entered = super().__enter__()
+                path.write_bytes(path.read_bytes().replace(b'"confirmed"', b'"prepared"'))
+                return entered
+
+        with mock.patch.object(supervisor, "Ownership", Racing):
+            with self.assertRaisesRegex(ValueError, "changed while acquiring controller ownership"):
+                transition.confirm(self.fixture.state, apply=True)
+        self.assertNotIn(b"previous_fingerprint", path.read_bytes())
+
+    def test_only_confirm_accepts_a_record_without_the_expectation(self):
+        self._record(lambda value: value.pop("previous_fingerprint"))
+        self.assertNotIn("previous_fingerprint", transition.read_record(self.fixture.state, legacy=True))
+        for call in (lambda: transition.read_record(self.fixture.state),
+                     lambda: transition.entry_mode(self.fixture.state)):
+            with self.assertRaisesRegex(ValueError, "pending explicit revalidation"):
+                call()
 
     def _startup_refuses(self):
         try:

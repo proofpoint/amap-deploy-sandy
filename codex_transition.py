@@ -93,7 +93,9 @@ def toml_bytes(doc):
     return ("\n".join(lines) + "\n").encode()
 
 
-def read_record(state):
+def read_record(state, *, legacy=False):
+    """The transition record. Only confirm's enrichment (`legacy=True`) accepts a record
+    from before the expected previous fingerprint was recorded."""
     value = json.loads(assets.regular(state / RECORD))
     if (not isinstance(value, dict) or type(value.get("schema")) is not int or value.get("schema") != 1
             or value.get("state") not in {"prepared", "confirmed"}
@@ -104,8 +106,11 @@ def read_record(state):
         if not isinstance(value.get(name), str) or not re.fullmatch("[a-f0-9]{64}", value[name]):
             raise ValueError("invalid adapter transition " + name)
     if "previous_fingerprint" not in value:
+        if legacy:
+            return value
         raise ValueError("adapter transition records no expected previous fingerprint; pending explicit "
-                         "revalidation, so retain the record and keep this sandbox stopped")
+                         "revalidation: with this sandbox stopped, run transition confirm, then "
+                         "confirm --apply")
     if not isinstance(value["previous_fingerprint"], str) or not re.fullmatch("[a-f0-9]{64}", value["previous_fingerprint"]):
         raise ValueError("invalid adapter transition previous_fingerprint")
     return value
@@ -246,29 +251,52 @@ def prepare(state, payload, thread, *, apply=False):
     return {**planned, "apply": True, "next": "doctor, unified-adopt at controller.toml, then confirm"}
 
 
+# The record's settings fields, which prepare wrote from the target configuration.
+SETTINGS = ("instance_id", "codex_model", "codex_version", "sandbox", "approval_policy", "poll_interval_ms")
+
+
 def confirm(state, *, apply=False):
+    """Confirm a prepared transition, or enrich a record from before the expected previous
+    fingerprint was recorded. Enrichment adds only that field: state, policy hash, controller
+    bytes and journal rows are unchanged. It starts nothing and adopts nothing."""
+    from amap_codex.config import Config
     from amap_codex.supervisor import Ownership
-    record = read_record(state)
+    original = assets.regular(state / RECORD)
+    record = read_record(state, legacy=True)
     config = config_at(state)
-    if (config.conversation_mode != "unified"
-            or config.fingerprint() != record["fingerprint"]
-            or assets.digest(assets.regular(state / "controller.toml")) != record.get("target_sha256")
-            or assets.digest(assets.regular(state / PREVIOUS)) != record.get("previous_sha256")):
-        raise ValueError("transition target or retained previous configuration differs")
+
+    def checked():
+        if (config.conversation_mode != "unified"
+                or config.fingerprint() != record["fingerprint"]
+                or assets.digest(assets.regular(state / "controller.toml")) != record.get("target_sha256")
+                or assets.digest(assets.regular(state / PREVIOUS)) != record.get("previous_sha256")):
+            raise ValueError("transition target or retained previous configuration differs")
+        if (any(record.get(name) != getattr(config, name) for name in SETTINGS)
+                or record.get("state_dir") != str(config.state_dir)):
+            raise ValueError("transition settings differ from the target configuration")
+        derived = Config.load(state / PREVIOUS, create_state=False).fingerprint()
+        if record.get("previous_fingerprint", derived) != derived:
+            raise ValueError("recorded previous fingerprint differs from the retained previous configuration")
+        candidate = {**record, "previous_fingerprint": derived}
+        matching_status(config, fingerprint=record["fingerprint"], thread=record["thread"])
+        policy_hash = confirmed_adoption(config, candidate)
+        if record["state"] == "confirmed" and policy_hash != record.get("policy_hash"):
+            raise ValueError("confirmed adoption policy binding differs; retain the transition for inspection")
+        candidate.update(policy_hash=policy_hash, state="confirmed")
+        return candidate
+
     if not apply:
-        matching_status(config, fingerprint=record["fingerprint"], thread=record["thread"])
-        confirmed_adoption(config, record)
-        return {**record, "apply": False}
+        return {**checked(), "apply": False}
     with Ownership(config):
-        if config.fingerprint() != record["fingerprint"]:
-            raise ValueError("prepared target fingerprint differs; retain the transition hold")
-        matching_status(config, fingerprint=record["fingerprint"], thread=record["thread"])
-        record["policy_hash"] = confirmed_adoption(config, record)
-        record["state"] = "confirmed"
-        raw = assets.encoded(record)
-        if assets.regular(state / RECORD) != raw:
+        if assets.regular(state / RECORD) != original:
+            raise ValueError("adapter transition changed while acquiring controller ownership")
+        candidate = checked()
+        raw = assets.encoded(candidate)
+        if assets.regular(state / RECORD) != original:
+            raise ValueError("adapter transition changed during confirmation")
+        if raw != original:
             assets.place(state / RECORD, raw, replace=True, mode=0o600)
-    return {**record, "apply": True}
+    return {**candidate, "apply": True}
 
 
 def entry_mode(state, *, selected_model=None, observed_version=None, check_pane_settings=False):
