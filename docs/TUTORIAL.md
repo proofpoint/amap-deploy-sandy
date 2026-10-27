@@ -590,6 +590,13 @@ checks; its results do not establish target-host acceptance.
 
 ### Experimental unified conversation: existing-instance transition
 
+The unified Codex choice applies to Codex-served sandboxes. In a mixed sandbox
+containing Claude, the Claude daemon remains the sole AMAP receiver and the Codex
+pane starts with Sandy's native arguments, without the Codex supervisor's
+interactive tools. A fleet-wide unified choice does not disable that native
+pane. Retained Codex unified ownership requires explicit disposition before
+changing the sandbox to Claude-served operation.
+
 With the fleet choice set to unified, ordinary relay and interactive launches
 recognize an existing confirmed adoption. They verify its retained previous and
 target configurations, committed adoption and canonical binding, current pane
