@@ -482,6 +482,26 @@ class UnifiedEvidenceTest(unittest.TestCase):
                 transition.confirm(self.fixture.state, apply=True)
         self.assertNotIn(b"previous_fingerprint", path.read_bytes())
 
+    def test_confirm_enrichment_refuses_a_record_changed_during_its_checks(self):
+        """The second byte check: an edit made after ownership is taken, while the checks run."""
+        from unittest import mock
+        path = self._record(lambda value: value.pop("previous_fingerprint"))
+        real = transition.matching_status
+
+        def edits_then_checks(*args, **kwargs):
+            path.write_bytes(path.read_bytes().replace(b'"confirmed"', b'"prepared"'))
+            return real(*args, **kwargs)
+
+        with mock.patch.object(transition, "matching_status", side_effect=edits_then_checks):
+            with self.assertRaisesRegex(ValueError, "changed during confirmation"):
+                transition.confirm(self.fixture.state, apply=True)
+        self.assertNotIn(b"previous_fingerprint", path.read_bytes())
+
+    def test_a_legacy_prepared_record_names_operator_inspection(self):
+        self._record(lambda value: (value.pop("previous_fingerprint"), value.update(state="prepared")))
+        with self.assertRaisesRegex(ValueError, "needs operator inspection"):
+            transition.read_record(self.fixture.state)
+
     def test_only_confirm_accepts_a_record_without_the_expectation(self):
         self._record(lambda value: value.pop("previous_fingerprint"))
         self.assertNotIn("previous_fingerprint", transition.read_record(self.fixture.state, legacy=True))

@@ -108,9 +108,13 @@ def read_record(state, *, legacy=False):
     if "previous_fingerprint" not in value:
         if legacy:
             return value
+        if value["state"] == "prepared":
+            raise ValueError("prepared adapter transition records no expected previous fingerprint; it "
+                             "needs operator inspection: transition confirm --apply completes it only if "
+                             "its native adoption committed")
         raise ValueError("adapter transition records no expected previous fingerprint; pending explicit "
-                         "revalidation: with this sandbox stopped, run transition confirm, then "
-                         "confirm --apply")
+                         "revalidation: with the sandbox running, its relay held and no Codex service, "
+                         "run transition confirm, then confirm --apply")
     if not isinstance(value["previous_fingerprint"], str) or not re.fullmatch("[a-f0-9]{64}", value["previous_fingerprint"]):
         raise ValueError("invalid adapter transition previous_fingerprint")
     return value
@@ -257,8 +261,13 @@ SETTINGS = ("instance_id", "codex_model", "codex_version", "sandbox", "approval_
 
 def confirm(state, *, apply=False):
     """Confirm a prepared transition, or enrich a record from before the expected previous
-    fingerprint was recorded. Enrichment adds only that field: state, policy hash, controller
-    bytes and journal rows are unchanged. It starts nothing and adopts nothing."""
+    fingerprint was recorded.
+
+    For a record already confirmed, --apply adds only previous_fingerprint; its state and policy
+    hash must already agree. For a prepared record, --apply also sets state "confirmed" and writes
+    the policy hash, as confirmation always has. Controller bytes and journal rows are unchanged,
+    and nothing is started or adopted. Ownership refuses while a service holds the controller; it
+    does not stop one, so an --apply repeated after the relay has started the service refuses."""
     from amap_codex.config import Config
     from amap_codex.supervisor import Ownership
     original = assets.regular(state / RECORD)
