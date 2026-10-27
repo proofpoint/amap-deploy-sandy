@@ -202,18 +202,98 @@ class UnifiedEvidenceTest(unittest.TestCase):
         from unittest import mock
         prov, home, record = self._host()
         real = prov.ca.regular
-        calls = []
+        # An exception with an empty message is still a failed read.
+        for error in (NotImplementedError("dir_fd unavailable"), NotImplementedError()):
+            with self.subTest(message=str(error)):
+                calls = []
 
-        def first_read_fails(path, *args, **kwargs):
-            calls.append(path)
-            if len(calls) == 1:
-                raise NotImplementedError("dir_fd unavailable")
-            return real(path, *args, **kwargs)
+                def first_read_fails(path, *args, **kwargs):
+                    calls.append(path)
+                    if len(calls) == 1:
+                        raise error
+                    return real(path, *args, **kwargs)
 
-        with mock.patch.object(prov.ca, "regular", side_effect=first_read_fails):
-            problems = self._unified(prov, home, record, slug="other-sandbox")
-        self.assertEqual(calls[0].name, "adapter-transition.json")
-        self.assertTrue(any("adoption record unreadable for instance binding" in p for p in problems), problems)
+                with mock.patch.object(prov.ca, "regular", side_effect=first_read_fails):
+                    problems = self._unified(prov, home, record, slug="other-sandbox")
+                self.assertEqual(calls[0].name, "adapter-transition.json")
+                self.assertTrue(any("adoption record unreadable for instance binding" in p for p in problems),
+                                problems)
+
+    def _native_adoption(self, sql):
+        import sqlite3
+        from contextlib import closing
+        with closing(sqlite3.connect(self.fixture.state / "journal.sqlite3")) as db, db:
+            db.execute(sql)
+
+    def test_each_native_adoption_disagreement_is_unknown_through_host_verify(self):
+        """The connector's own startup gate refuses each of these rows."""
+        prov, home, record = self._host()
+        self.assertEqual(self._unified(prov, home, record), [])
+        other = "00000000-0000-4000-8000-000000000000"
+        cases = {
+            "planned": ("UPDATE unified_adoptions SET state='planned'", "native adoption is not confirmed"),
+            "row deleted": ("DELETE FROM unified_adoptions", "native adoption record is unavailable"),
+            "table missing": ("DROP TABLE unified_adoptions", "native adoption record is unavailable"),
+            "thread": (f"UPDATE unified_adoptions SET thread_id='{other}'", "native adoption thread is malformed or differs"),
+            "fingerprint": ("UPDATE unified_adoptions SET fingerprint='" + "c" * 64 + "'",
+                            "native adoption fingerprint is malformed or differs"),
+            "policy_hash": ("UPDATE unified_adoptions SET policy_hash='" + "b" * 64 + "'",
+                            "native adoption policy_hash is malformed or differs"),
+            "history": ("UPDATE unified_adoptions SET history_sha256=NULL", "native adoption history digest is malformed"),
+        }
+        journal = self.fixture.state / "journal.sqlite3"
+        original = journal.read_bytes()
+        for label, (sql, expected) in cases.items():
+            with self.subTest(label):
+                journal.write_bytes(original)
+                self._native_adoption(sql)
+                problems = self._unified(prov, home, record)
+                self.assertTrue(any(p.startswith("codex unified UNKNOWN: codex-test: ") and expected in p
+                                    for p in problems), problems)
+        journal.write_bytes(original)
+        self.assertEqual(self._unified(prov, home, record), [])
+
+    def _adoption_named(self, prov, home, record, label):
+        expected = "codex unified UNKNOWN: codex-test: native adoption " + label + " is malformed or differs"
+        problems = self._unified(prov, home, record)
+        self.assertTrue(any(p.startswith(expected) for p in problems), problems)
+
+    def test_a_non_text_native_adoption_value_is_named_not_a_traceback(self):
+        prov, home, record = self._host()
+        self._native_adoption("UPDATE unified_adoptions SET policy_hash=X'61'")
+        self._adoption_named(prov, home, record, "policy_hash")
+
+    def test_an_adoption_agreeing_with_only_one_side_is_unknown(self):
+        """The row must match the transition and the binding, each on its own."""
+        other = "00000000-0000-4000-8000-000000000000"
+        cases = {
+            "policy_hash binding only": ("policy_hash", ["UPDATE unified_binding SET policy_hash='" + "d" * 64 + "'"]),
+            "policy_hash transition only": ("policy_hash", [
+                "UPDATE unified_binding SET policy_hash='" + "d" * 64 + "'",
+                "UPDATE unified_adoptions SET policy_hash='" + "d" * 64 + "'"]),
+            "thread binding only": ("thread", [f"UPDATE unified_binding SET thread_id='{other}'"]),
+            "thread transition only": ("thread", [f"UPDATE unified_binding SET thread_id='{other}'",
+                                                  f"UPDATE unified_adoptions SET thread_id='{other}'"]),
+        }
+        prov, home, record = self._host()
+        journal = self.fixture.state / "journal.sqlite3"
+        original = journal.read_bytes()
+        for name, (label, statements) in cases.items():
+            with self.subTest(name):
+                journal.write_bytes(original)
+                for sql in statements:
+                    self._native_adoption(sql)
+                self._adoption_named(prov, home, record, label)
+        journal.write_bytes(original)
+
+    def test_a_malformed_policy_hash_equal_everywhere_is_unknown(self):
+        prov, home, record = self._host()
+        malformed = "A" * 64
+        path = self.fixture.state / "adapter-transition.json"
+        path.write_text(json.dumps({**json.loads(path.read_text()), "policy_hash": malformed}))
+        self._native_adoption(f"UPDATE unified_binding SET policy_hash='{malformed}'")
+        self._native_adoption(f"UPDATE unified_adoptions SET policy_hash='{malformed}'")
+        self._adoption_named(prov, home, record, "policy_hash")
 
     def test_an_adopted_sandbox_carries_the_workspace_binding_note(self):
         prov, home, record = self._host()
