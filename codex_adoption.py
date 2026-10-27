@@ -9,7 +9,7 @@ import re
 import sqlite3
 
 DIGEST = "[a-f0-9]{64}"
-PENDING = "; pending explicit revalidation, so retain the record and keep this sandbox stopped"
+PENDING = "; pending explicit revalidation: with this sandbox stopped, run transition confirm, then confirm --apply"
 
 
 def evidence(journal, instance_id):
