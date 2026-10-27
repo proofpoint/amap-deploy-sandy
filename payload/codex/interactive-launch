@@ -61,17 +61,32 @@ esac
 # sandy's native codex, unchanged.
 case ",${SANDY_AGENT:-}," in
     *,claude,*)
-        if [ "${AMAP_CODEX_CONVERSATION_MODE-separate}" = unified ]; then
-            echo "interactive-launch: unified fleet mode does not support a Claude-served mixed-agent Codex pane; use a Codex-served sandbox" >&2
-            exit 1
-        fi
+        # A fleet-wide Codex mode does not change which connector owns a
+        # mixed sandbox. Refuse retained Codex unified ownership rather than
+        # silently treating it as a new Claude-served namespace.
+        for evidence in "$STATE/adapter-transition.json" \
+            "$STATE/fresh-birth.json" "$STATE/fresh-plan.json" \
+            "$STATE/fresh-initialization.json" "$STATE/fresh-startup.json" \
+            "$STATE/fresh-selection.json" "${STATE%/*}/.fresh-intent-${STATE##*/}.json" \
+            "${AMAP_OUTBOX_DIR:-$STATE}/.codex-unified-custody.json"; do
+            if [ -e "$evidence" ] || [ -L "$evidence" ]; then
+                echo "interactive-launch: retained Codex unified ownership cannot become a Claude-served mixed sandbox automatically" >&2
+                exit 1
+            fi
+        done
         echo "interactive-launch: the Claude daemon serves this sandbox; starting codex without the AMAP interactive tools" >&2
         exec "$@" ;;
 esac
 : "${AMAP_OUTBOX_DIR:?interactive-launch: no AMAP_OUTBOX_DIR in this pane; the outbox lane is not mounted}"
 export PYTHONPATH="$SELF_DIR/src"
 case "${AMAP_CODEX_CONVERSATION_MODE-separate}" in
-    unified) exec python3 "$SELF_DIR/codex_fresh.py" --state "$STATE" launch-pane -- "$@" ;;
+    unified)
+        route=$(python3 "$SELF_DIR/transition" --state "$STATE" startup-route --session /etc/sandy-session.json)
+        case "$route" in
+            fresh) exec python3 "$SELF_DIR/codex_fresh.py" --state "$STATE" launch-pane -- "$@" ;;
+            adopted) : ;;
+            *) echo "interactive-launch: unknown unified startup route" >&2; exit 1 ;;
+        esac ;;
     separate) : ;;
     *) echo "interactive-launch: unknown fleet conversation mode; not starting Codex" >&2; exit 1 ;;
 esac
