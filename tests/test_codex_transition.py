@@ -35,6 +35,8 @@ class TransitionTest(unittest.TestCase):
         tmp = TemporaryDirectory(prefix=".ct-", dir=os.environ.get("AMAP_TEST_TMPDIR"))
         self.addCleanup(tmp.cleanup)
         self.root = Path(tmp.name)
+        import _execution_identity
+        self.identity_driver = _execution_identity.fixture(self, self.root)
         self.native_home = self.root / "native-home"
         self.native_home.mkdir()
         (self.native_home / "config.toml").write_text('model = "test-model"\n')
@@ -109,6 +111,58 @@ class TransitionTest(unittest.TestCase):
         self.assertEqual((self.state / "controller.toml").read_bytes(), self.previous_raw)
         self.assertFalse((self.state / transition.RECORD).exists())
         self.assertEqual(transition.entry_mode(self.state), "separate")
+
+    def route(self, **session_overrides):
+        path = self.root / "session.json"
+        path.write_text(json.dumps({"sandbox_name": self.previous.instance_id,
+                                    "workspace": self.previous.cwd, **session_overrides}))
+        with mock.patch.dict(os.environ, {"AMAP_INBOX_DIR": str(self.root / "mail"),
+                                         "AMAP_PEER_DIR": str(self.root / "peer")}):
+            return transition.startup_route(self.state, path)
+
+    def test_startup_route_keeps_unadopted_state_on_the_fresh_guard(self):
+        before = (self.state / "controller.toml").read_bytes()
+        self.assertEqual(self.route(), "fresh")
+        self.assertEqual((self.state / "controller.toml").read_bytes(), before)
+        self.assertFalse((self.state / "fresh-birth.json").exists())
+
+    def test_confirmed_adoption_routes_read_only_and_retains_pause(self):
+        self.prepare(apply=True)
+        self.commit_adoption_fixture()
+        transition.confirm(self.state, apply=True)
+        transition.pause(self.state, "maintenance", apply=True)
+        before = {p: p.read_bytes() for p in self.state.rglob("*") if p.is_file()}
+        self.assertEqual(self.route(), "adopted")
+        self.assertEqual({p: p.read_bytes() for p in self.state.rglob("*") if p.is_file()}, before)
+        for session in ({"sandbox_name": "foreign"}, {"workspace": "/foreign"}, {"workspace": "relative"}):
+            with self.subTest(session=session), self.assertRaisesRegex(ValueError, "another Sandy"):
+                self.route(**session)
+
+    def test_prepared_or_malformed_adoption_never_falls_back_to_fresh(self):
+        self.prepare(apply=True)
+        with self.assertRaisesRegex(ValueError, "adoption is pending"):
+            self.route()
+        (self.state / transition.RECORD).write_text("{}")
+        with self.assertRaises(ValueError):
+            self.route()
+        self.assertFalse((self.state / "fresh-birth.json").exists())
+
+    def test_routing_requires_committed_adoption_not_only_a_confirmed_adapter_marker(self):
+        self.prepare(apply=True)
+        self.commit_adoption_fixture()
+        transition.confirm(self.state, apply=True)
+        with closing(sqlite3.connect(self.state / "journal.sqlite3")) as db, db:
+            db.execute("UPDATE unified_adoptions SET state='planned'")
+        with self.assertRaisesRegex(ValueError, "not confirmed"):
+            self.route()
+
+    def test_mixed_fresh_and_adopted_evidence_refuses_routing(self):
+        self.prepare(apply=True)
+        self.commit_adoption_fixture()
+        transition.confirm(self.state, apply=True)
+        (self.state / "fresh-birth.json").write_text("{}")
+        with self.assertRaisesRegex(ValueError, "cannot enter"):
+            self.route()
 
     def test_prepare_saves_original_before_gate_before_final_path_replacement(self):
         calls = []

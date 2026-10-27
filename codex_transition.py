@@ -308,6 +308,32 @@ def entry_mode(state, *, selected_model=None, observed_version=None, check_pane_
     return "unified"
 
 
+def startup_route(state, session_path):
+    """Select an existing confirmed adoption without initializing or adopting it."""
+    if not os.path.lexists(state / RECORD):
+        return "fresh"
+    if entry_mode(state, check_pane_settings=True) != "unified":
+        raise ValueError("existing adapter transition is not confirmed unified state")
+    session = json.loads(assets.regular(session_path))
+    config = config_at(state)
+    record = read_record(state)
+    if confirmed_adoption(config, record) != record.get("policy_hash"):
+        raise ValueError("confirmed adoption policy binding differs")
+    if (not isinstance(session, dict) or not isinstance(session.get("workspace"), str)
+            or not Path(session["workspace"]).is_absolute()
+            or session.get("sandbox_name") != config.instance_id
+            or Path(session["workspace"]).resolve() != Path(config.cwd).resolve()):
+        raise ValueError("confirmed adoption belongs to another Sandy instance or workspace")
+    for lane in config.lanes:
+        export = {"mail": "AMAP_INBOX_DIR", "peer": "AMAP_PEER_DIR"}.get(lane.name)
+        root = os.environ.get(export) if export else None
+        if (not isinstance(root, str) or not Path(root).is_absolute()
+                or lane.notice_dir != Path(root) / "notices"
+                or lane.message_dir != Path(root) / "messages"):
+            raise ValueError("confirmed adoption delivery lanes differ from Sandy's mounts")
+    return "adopted"
+
+
 def pause(state, note, *, apply=False):
     if not note.strip() or len(note) > 500:
         raise ValueError("operator pause requires a note of 1 to 500 characters")
@@ -426,6 +452,8 @@ def main(argv=None):
     entry.add_argument("--model")
     entry.add_argument("--version")
     entry.add_argument("--check-pane-settings", action="store_true")
+    route = commands.add_parser("startup-route")
+    route.add_argument("--session", type=Path, required=True)
     startup = commands.add_parser("startup-gate")
     startup.add_argument("--generation", required=True)
     startup.add_argument("--apply", action="store_true")
@@ -448,6 +476,9 @@ def main(argv=None):
             result = pause(args.state, args.note, apply=args.apply)
         elif args.command == "unpause":
             result = unpause(args.state, apply=args.apply)
+        elif args.command == "startup-route":
+            print(startup_route(args.state, args.session))
+            return 0
         elif args.command == "startup-gate":
             result = startup_gate(args.state, args.generation, apply=args.apply)
         elif args.command == "selection-ready":
