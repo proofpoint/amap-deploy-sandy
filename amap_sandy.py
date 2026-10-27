@@ -1223,7 +1223,7 @@ def install_feature_payload(home: Path, connector_src: Path, *, dry_run: bool,
                                     PAYLOAD_DIR / CODEX_PAYLOAD_SUBDIR / "mcp.toml",
                                     dry_run=dry_run))
         except (OSError, ValueError, RuntimeError) as exc:
-            # RuntimeError: NotImplementedError where this platform's os.link lacks dir_fd support.
+            # RuntimeError: NotImplementedError where this platform lacks dir_fd support.
             raise ProvisionError(str(exc)) from exc
     for rel, src_file, executable in payload_sources(connector_src, servers_path) + codex:
         if codex and rel in {f"{CODEX_PAYLOAD_SUBDIR}/{name}" for name in ca.ASSETS}:
@@ -3175,7 +3175,7 @@ def verify_codex_supervisor(home: Path, slug: str, record: Optional[dict], *,
             birth = json.loads(ca.read_path(state / "fresh-birth.json"))
             if json.loads(ca.read_path(custody)) != birth:
                 raise ValueError("custody differs from birth")
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, RuntimeError) as exc:
             problems.append(f"codex unified HOLD: {slug}: retained namespace custody unavailable: {exc}")
     status = _read_json(state / CODEX_STATUS_NAME)
     if isinstance(status, dict):

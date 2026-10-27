@@ -264,6 +264,45 @@ class DescriptorAnchoredInstallTest(unittest.TestCase):
         with self._swap_after_walk(payload, decoy):
             self.assertEqual(assets.legacy_record(payload, raw), want)
 
+    def test_findings_reads_the_selected_record_through_the_walked_directory(self):
+        payload = self.root / "payload"
+        assets.install(payload, self.policy, self.mcp, dry_run=False)
+        decoy = self.root / "decoy-payload"
+        shutil.copytree(payload, decoy)
+        os.chmod(decoy / assets.SELECTED_RECORD, 0o644)
+        (decoy / assets.SELECTED_RECORD).write_bytes(b"{}\n")
+        self.assertNotEqual(assets.findings(decoy, self.policy, self.mcp), [])
+        with self._swap_after_walk(payload, decoy):
+            self.assertEqual(assets.findings(payload, self.policy, self.mcp), [])
+
+    def test_the_retained_assets_are_hashed_through_the_walked_directory(self):
+        payload = self.root / "payload"
+        assets.install(payload, self.policy, self.mcp, dry_run=False)
+        raw, _ = assets.sources(self.policy, self.mcp)
+        want = assets.legacy_record(payload, raw)
+        decoy = self.root / "decoy-payload"
+        shutil.copytree(payload, decoy)
+        os.chmod(decoy / "mcp.toml", 0o644)
+        (decoy / "mcp.toml").write_bytes(b"decoy retained bytes\n")
+        with self.assertRaisesRegex(assets.AssetError, "retained legacy"):
+            assets.legacy_record(decoy, raw)
+        with self._swap_after_walk(payload, decoy):
+            self.assertEqual(assets.legacy_record(payload, raw), want)
+
+    def test_unrecorded_legacy_assets_are_hashed_through_the_walked_directory(self):
+        payload = self.root / "payload"
+        payload.mkdir()
+        for name in assets.ASSETS:
+            (payload / name).write_bytes(b"operator installed legacy\n")
+        raw, _ = assets.sources(self.policy, self.mcp)
+        want = assets.legacy_record(payload, raw)
+        decoy = self.root / "decoy-payload"
+        shutil.copytree(payload, decoy)
+        (decoy / "mcp.toml").write_bytes(b"decoy legacy\n")
+        self.assertNotEqual(assets.legacy_record(decoy, raw), want)
+        with self._swap_after_walk(payload, decoy):
+            self.assertEqual(assets.legacy_record(payload, raw), want)
+
     def test_a_link_that_raises_leaves_no_temporary_name(self):
         payload = self.root / "payload"
         payload.mkdir()
@@ -274,7 +313,7 @@ class DescriptorAnchoredInstallTest(unittest.TestCase):
                 assets.place_at(dfd, "mcp.toml", b"bytes", payload / "mcp.toml")
         self.assertEqual(os.listdir(payload), [])
 
-    def test_findings_reports_a_platform_without_dir_fd_link_as_a_finding(self):
+    def test_findings_reports_a_platform_without_dir_fd_support_as_a_finding(self):
         payload = self.root / "payload"
         with mock.patch.object(assets, "open_dir", side_effect=NotImplementedError("dir_fd unavailable")):
             self.assertEqual(assets.findings(payload, self.policy, self.mcp),
