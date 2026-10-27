@@ -3165,7 +3165,9 @@ def verify_codex_supervisor(home: Path, slug: str, record: Optional[dict], *,
     custody = feature_instance_dir(home, slug) / "outbox" / cf.CUSTODY
     state = codex_state_dir(record)
     if os.path.lexists(custody) and (state is None or not os.path.lexists(state / "fresh-birth.json")):
-        problems.append(f"codex unified HOLD: {slug}: retained namespace custody requires operator recreation; no new birth or downgrade")
+        problems.append(f"codex unified HOLD: {slug}: retained namespace custody is present; retain the state and the "
+                        f"outbox custody and inspect them first; recreation is a later operator decision, never "
+                        f"automatic; no new birth or downgrade")
     if state is None:
         problems.append(f"codex supervisor UNKNOWN: {slug}: sandy reports no {FEATURE_NAME} entry "
                         f"state directory for its last launch — relaunch it")
@@ -3216,8 +3218,9 @@ def verify_codex_supervisor(home: Path, slug: str, record: Optional[dict], *,
         notes.append(f"{slug}: adopted workspace binding relies on in-sandbox startup checks; "
                      f"host/container workspace mapping is not independently verified")
     if expected_mode == "unified" and not fresh_birth and not adopted:
-        problems.append(f"codex unified HOLD: {slug}: fleet mode requires fresh initialization; "
-                        f"operator recreation is required for legacy or unknown state; nothing is automatically erased")
+        problems.append(f"codex unified HOLD: {slug}: fleet mode requires fresh initialization; retain and inspect "
+                        f"the legacy or unknown state first; recreation is a later operator decision, and nothing "
+                        f"is automatically erased")
     if fresh_evidence and expected_mode != "unified":
         problems.append(f"codex unified HOLD: {slug}: authored fleet mode differs from the fresh instance; "
                         f"no automatic downgrade is allowed")

@@ -130,8 +130,9 @@ def adoption_problems(adoption, record, binding):
                 or (digest and not re.fullmatch("[a-f0-9]{64}", value))
                 or value != record.get(label) or value != binding[column]):
             problems.append("native adoption " + label + " is malformed or differs from the transition or binding")
-    if not isinstance(adoption["history_sha256"], str) or not re.fullmatch("[a-f0-9]{64}", adoption["history_sha256"]):
-        problems.append("native adoption history digest is malformed")
+    for column, label in (("previous_fingerprint", "previous fingerprint"), ("history_sha256", "history digest")):
+        if not isinstance(adoption[column], str) or not re.fullmatch("[a-f0-9]{64}", adoption[column]):
+            problems.append("native adoption " + label + " is malformed")
     return problems
 
 
@@ -163,12 +164,14 @@ def problems(state, status, *, now=None):
             raise ValueError("journal is unavailable or a symlink")
         with closing(sqlite3.connect(journal.as_uri() + "?mode=ro", uri=True)) as db:
             db.row_factory = sqlite3.Row
+            # A SELECT outside a transaction is its own snapshot; BEGIN holds one across both reads.
+            db.execute("BEGIN")
             row = db.execute("SELECT i.fingerprint,b.thread_id,b.policy_hash,b.effective_model "
                              "FROM instance i JOIN unified_binding b USING(instance_id) "
                              "WHERE i.instance_id=?", (record["instance_id"],)).fetchone()
             try:
-                adoption = db.execute("SELECT state,thread_id,fingerprint,policy_hash,history_sha256 "
-                                      "FROM unified_adoptions WHERE singleton=1").fetchone()
+                adoption = db.execute("SELECT state,thread_id,fingerprint,previous_fingerprint,policy_hash,"
+                                      "history_sha256 FROM unified_adoptions WHERE singleton=1").fetchone()
             except sqlite3.Error as exc:
                 raise ValueError("native adoption record is unavailable") from exc
         if row is None:

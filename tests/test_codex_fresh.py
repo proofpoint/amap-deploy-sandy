@@ -280,7 +280,8 @@ class FreshBirthTest(unittest.TestCase):
         record = {prov.FEATURE_ENTRIES_KEY: {prov.FEATURE_NAME: {"state_dir": str(state.parent)}}}
         for running in (False, True):
             problems, _ = prov.verify_codex_supervisor(home, "fresh-fixture", record, running=running)
-            self.assertTrue(any("retained namespace custody requires" in p for p in problems))
+            self.assertTrue(any("retained namespace custody is present; retain the state and the outbox "
+                                "custody and inspect them first" in p for p in problems))
             self.assertFalse(state.exists())
         self.prepare()
         self.select()
