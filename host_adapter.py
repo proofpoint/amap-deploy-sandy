@@ -37,6 +37,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
+import safe_io
+
 ADAPTER = "sandy"
 
 OP_VERSION = "version"
@@ -114,7 +116,7 @@ def load_identifiers(path: Optional[Path]) -> Identifiers:
     if path is None:
         raise OverlayError(f"no deployment overlay: pass --overlay, or set ${OVERLAY_ENV}")
     try:
-        doc = json.loads(Path(path).read_text(encoding="utf-8"))
+        doc = json.loads(safe_io.read_text(path))
     except (OSError, ValueError) as e:
         raise OverlayError(f"deployment overlay {path} is unreadable: {e}") from None
     sec = doc.get(OVERLAY_SECTION) if isinstance(doc, dict) else None

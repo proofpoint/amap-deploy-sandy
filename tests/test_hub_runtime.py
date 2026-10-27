@@ -17,6 +17,7 @@ import copy
 import hashlib
 import json
 import os
+import posixpath
 import stat
 import tempfile
 import unittest
@@ -71,7 +72,7 @@ def hub_sec():
             "hop": {"name": "h1", "root": "/srv/example/a/b", "registry_dir": "/srv/example/registry",
                     "registry_uid": 2300, "peer_uid": PEER_UID, "link": "link-a"},
             "dirs": dict(PRIVATE, lock_file="relay.lock"),
-            "prefix_template": "/opt/ex/tmpl/prefix.json", "config_uid": 0}
+            "prefix_template": "/opt/ex/tmpl/prefix.json", "config_uid": 0, "candidate_carriage": "on"}
 
 
 def full_doc(**hub_over):
@@ -153,6 +154,22 @@ class LoadTest(unittest.TestCase):
     def test_the_probe_domain_is_always_excluded(self):
         self.assertIn("probe-x.internal", spec().hub.excluded)
 
+    def test_a_section_without_candidate_carriage_refuses(self):
+        d = full_doc()
+        del d[hr.SECTION]["candidate_carriage"]
+        self.refuses(d, "must have")
+
+    def test_candidate_carriage_takes_only_on_or_off_exactly(self):
+        # The runtime itself also accepts "", which this document never may: no default, no case-folding.
+        for bad in ("", "ON", "Off", "true", "1", None, True, ["on"]):
+            with self.subTest(value=bad):
+                self.refuses(full_doc(candidate_carriage=bad), "candidate_carriage")
+
+    def test_candidate_carriage_on_and_off_both_load(self):
+        for good in hr.CARRIAGE_VALUES:
+            with self.subTest(value=good):
+                self.assertEqual(spec(candidate_carriage=good).hub.candidate_carriage, good)
+
     def test_a_section_without_the_probe_domain_refuses(self):
         d = full_doc()
         del d[hr.SECTION]["probe_domain"]
@@ -232,6 +249,115 @@ class LoadTest(unittest.TestCase):
         self.refuses(d, "probe settings")
 
 
+class StateSeparationTest(unittest.TestCase):
+    """hub.dirs (mailbox root and its relay log, ledger, inbound state,
+    lock) never resolve into hub.hop.root's tree: not on the host, not in
+    the runtime's view, and not through a mount that carries the hop root's
+    storage. Each case moves ONE thing and names the refusal it must get."""
+
+    def refuses(self, doc, words):
+        with self.assertRaises(hs.SpecError) as e:
+            hs.load_spec(doc)
+        self.assertIn(words, str(e.exception))
+
+    @staticmethod
+    def root(d, path):
+        d["roots"].append({"path": path, "owner": "downstream", "group": "downgrp", "mode": "0700",
+                           "readers": ["downstream"], "purpose": "a test root"})
+
+    def with_dir(self, d, key, path):
+        self.root(d, path)
+        d[hr.SECTION]["dirs"][key] = path
+        return d
+
+    def test_the_fixture_keeps_every_dir_apart_in_both_views(self):
+        sp = spec()
+        env = dict(hr.environment(sp, sp.hub))
+        for k in ("MAILBOX_ROOT_DIR", "RELAY_LEDGER_DIR", "HUB_INBOUND_STATE_DIR"):
+            self.assertTrue(hr._apart(env[k], env["HOP_ROOT"]), k)
+        self.assertTrue(hr._apart(posixpath.dirname(env["RELAY_LOCK"]), env["HOP_ROOT"]))
+
+    def test_a_dir_inside_the_hop_root_refuses(self):
+        self.refuses(self.with_dir(full_doc(), "lock", "/srv/example/a/b/inner/lock"), "overlaps hub.hop.root")
+
+    def test_a_dir_that_is_the_hop_root_refuses(self):
+        d = full_doc()
+        d["roots"] = [dict(r, owner="downstream", mode="0700") if r["path"] == "/srv/example/a/b" else r
+                      for r in d["roots"]]
+        d[hr.SECTION]["dirs"]["RELAY_LEDGER_DIR"] = "/srv/example/a/b"
+        self.refuses(d, "hub.dirs.RELAY_LEDGER_DIR /srv/example/a/b overlaps")
+
+    def test_a_dir_holding_the_hop_root_refuses(self):
+        d = full_doc()
+        d["mounts"].append({"principal": "downstream", "host": "/srv/example/a", "container": "/up"})
+        self.refuses(self.with_dir(d, "MAILBOX_ROOT_DIR", "/srv/example/a"), "overlaps hub.hop.root")
+
+    def test_a_dir_carried_by_the_hop_roots_own_mount_refuses(self):
+        """Apart on the host and in the container, but the same bind."""
+        d = full_doc()
+        self.root(d, "/srv/example/a")
+        d["mounts"] = [m for m in d["mounts"] if not (m["principal"] == "downstream" and m["host"] == "/srv/example/a/b")]
+        d["mounts"].append({"principal": "downstream", "host": "/srv/example/a", "container": "/data"})
+        self.refuses(self.with_dir(d, "HUB_INBOUND_STATE_DIR", "/srv/example/a/st"), "shares storage")
+
+    def test_a_dir_carried_by_a_mount_nested_around_the_hop_mount_refuses(self):
+        """Two binds: the hop root's own, and one of its parent that carries the dir."""
+        d = full_doc()
+        self.root(d, "/srv/example/a")
+        d["mounts"].append({"principal": "downstream", "host": "/srv/example/a", "container": "/up"})
+        self.refuses(self.with_dir(d, "HUB_INBOUND_STATE_DIR", "/srv/example/a/st"), "shares storage")
+
+    def test_a_dir_mounted_inside_hop_root_in_the_container_refuses(self):
+        """Separate storage on the host, but seen inside HOP_ROOT."""
+        d = full_doc()
+        for m in d["mounts"]:
+            if m["principal"] == "downstream" and m["host"] == "/srv/example/down":
+                m["container"] = "/data/root/state"
+        self.refuses(d, "inside or around HOP_ROOT")
+
+    def _container(self, d, host, container):
+        for m in d["mounts"]:
+            if m["principal"] == "downstream" and m["host"] == host:
+                m["container"] = container
+        return d
+
+    def test_the_hop_mount_at_the_container_root_refuses_through_the_real_loader(self):
+        """Codex's case: the hop root's mount destination "/", so HOP_ROOT is "/"."""
+        self.refuses(self._container(full_doc(), "/srv/example/a/b", "/"), "inside or around HOP_ROOT /")
+
+    def test_a_private_mount_at_the_container_root_refuses_through_the_real_loader(self):
+        """The other root direction: the private tree's mount destination "/"
+        projects every private dir as "//…"."""
+        self.refuses(self._container(full_doc(), "/srv/example/down", "/"), "not a normalised absolute path")
+
+    def test_a_private_dir_projected_to_the_container_root_refuses(self):
+        """A dir that is its own mount, destination "/": it is "/", which holds HOP_ROOT."""
+        d = full_doc()
+        d["mounts"].append({"principal": "downstream", "host": "/srv/example/down/mail", "container": "/"})
+        self.refuses(d, "hub.dirs.MAILBOX_ROOT_DIR")
+
+    def test_root_holds_every_path_in_both_directions(self):
+        for a, b in (("/", "/data/root"), ("/data/root", "/"), ("/", "/")):
+            with self.subTest(a=a, b=b):
+                self.assertFalse(hr._apart(a, b))
+
+    def test_whole_components_decide_not_a_shared_prefix(self):
+        """/data/rootx is not inside /data/root, nor /srv/example/a/bb inside /srv/example/a/b."""
+        d = full_doc()
+        for m in d["mounts"]:
+            if m["principal"] == "downstream" and m["host"] == "/srv/example/down":
+                m["container"] = "/data/rootx"
+        self.assertEqual(hs.load_spec(d).hub.hop_root, "/srv/example/a/b")
+        d = full_doc()
+        self.root(d, "/srv/example/a/bb")
+        d["mounts"].append({"principal": "downstream", "host": "/srv/example/a/bb", "container": "/bb"})
+        self.assertEqual(hs.load_spec(self.with_dir(d, "lock", "/srv/example/a/bb/lock")).hub.dirs["lock"],
+                         "/srv/example/a/bb/lock")
+        self.assertTrue(hr._apart("/data/rootx", "/data/root"))
+        self.assertFalse(hr._apart("/data/root/x", "/data/root"))
+        self.assertFalse(hr._apart("/data", "/data/root"))
+
+
 class RenderingTest(unittest.TestCase):
     def setUp(self):
         self.spec = spec()
@@ -269,6 +395,13 @@ class RenderingTest(unittest.TestCase):
     def test_the_plan_names_the_same_peer_uid_as_the_environment(self):
         lines = hs.render_plan(self.spec)
         self.assertIn(f"# downstream's runtime environment: {self.spec.hops[0][3]}={PEER_UID}", lines)
+
+    def test_candidate_carriage_is_rendered_from_the_document_never_defaulted(self):
+        for value in hr.CARRIAGE_VALUES:
+            with self.subTest(value=value):
+                s = spec(candidate_carriage=value)
+                env = hr.environment(s, s.hub)
+                self.assertEqual([v for k, v in env if k == hr.CARRIAGE_ENV], [value])
 
     def test_the_d7_owner_is_root(self):
         self.assertEqual((self.env["HUB_D7_CONFIG"], self.env["HUB_D7_UID"]), ("/opt/ex/d7/d7.json", "0"))
@@ -420,6 +553,20 @@ class CompareTest(unittest.TestCase):
         live["Config"]["Env"] = [e if not e.startswith("SMTP_PORT=") else "SMTP_PORT=25"
                                  for e in live["Config"]["Env"]]
         self.assertEqual(hr.compare(live, self.rendered, []), ["SMTP_PORT differs from the rendering and the image"])
+
+    def test_a_running_carriage_other_than_the_rendered_one_is_named(self):
+        # The runtime reports no effective value, so the rendering is the truth and the running env is held to it.
+        live = copy.deepcopy(self.rendered)
+        live["Config"]["Env"] = [e if not e.startswith(hr.CARRIAGE_ENV + "=") else hr.CARRIAGE_ENV + "=off"
+                                 for e in live["Config"]["Env"]]
+        self.assertEqual(hr.compare(live, self.rendered, []),
+                         [f"{hr.CARRIAGE_ENV} differs from the rendering and the image"])
+
+    def test_a_running_container_without_the_carriage_is_named(self):
+        live = copy.deepcopy(self.rendered)
+        live["Config"]["Env"] = [e for e in live["Config"]["Env"] if not e.startswith(hr.CARRIAGE_ENV + "=")]
+        self.assertEqual(hr.compare(live, self.rendered, []),
+                         [f"{hr.CARRIAGE_ENV} differs from the rendering and the image"])
 
     def test_an_extra_mount_is_named(self):
         live = copy.deepcopy(self.rendered)

@@ -91,6 +91,7 @@ import codex_fleet as cf    # explicit fleet conversation policy keeps other hos
 import codex_assets as ca   # protected Codex assets retain their original-path inputs
 import codex_unified_status as cus  # unified readiness requires matching fresh evidence
 import hub_runtime as hr     # the hub-link router's rendering: where its ledger directory is seen
+import safe_io as sio        # every file install reads or writes, reached without following a link
 
 # `fleet_policy.py` sits beside this module. Guarded rather than bare: this
 # module is imported by its tests and by its sibling tools, where HERE is not
@@ -671,7 +672,7 @@ def load_selected(home: Path) -> Dict[str, Any]:
     the strength of this file."""
     path = feature_selected_path(home)
     try:
-        doc = json.loads(path.read_text(encoding="utf-8"))
+        doc = json.loads(sio.read_text(path))
     except FileNotFoundError:
         raise ProvisionError(
             f"{path} is absent — sandy has not evaluated the manifest yet (it writes this "
@@ -857,7 +858,7 @@ def _match_selectors(
 
 def load_servers(path: Path) -> Dict[str, dict]:
     try:
-        doc = json.loads(path.read_text())
+        doc = json.loads(sio.read_text(path))
     except OSError as e:
         raise ProvisionError(f"cannot read servers file {path}: {e}")
     except json.JSONDecodeError as e:
@@ -1111,34 +1112,32 @@ def _write_file(path: Path, want: str, *, dry_run: bool, label: str,
     """Content-compared, atomic write with the report string every other
     writer in this file returns. One writer, so no file ends up non-atomic.
 
-    Atomic (temp file + `os.replace` in the same directory) because a launch
-    racing the install must never read a half-written wrapper and run part
-    of it.
+    Atomic (`safe_io.write_leaf`: an exclusive temporary file renamed over
+    the leaf in the same directory) because a launch racing the install
+    must never read a half-written wrapper and run part of it. Neither the
+    read nor the write follows a link at the leaf, at the temporary name, or
+    at any directory from `/` down, and a refused read never prints the
+    file's bytes.
     """
     try:
-        have = path.read_text(encoding="utf-8")
+        data, st = sio.read_leaf_stat(path)
+        have: Optional[str] = sio.decode(data, path)
     except FileNotFoundError:
-        have = None
+        have, st = None, None
     except OSError as e:
         raise ProvisionError(f"cannot read {path}: {e}")
 
     mode_ok = True
-    if executable and have is not None:
-        mode_ok = bool(path.stat().st_mode & 0o111)
+    if executable and st is not None:
+        mode_ok = bool(st.st_mode & 0o111)
     if have == want and mode_ok:
         return f"{label} present"
     verb = "update" if have is not None else "create"
     if dry_run:
         return f"would {verb} {label}"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.tmp")
     try:
-        tmp.write_text(want, encoding="utf-8")
-        if executable:
-            tmp.chmod(0o755)
-        os.replace(tmp, path)
+        sio.write_leaf(path, want.encode("utf-8"), executable=executable)
     except OSError as e:
-        tmp.unlink(missing_ok=True)
         raise ProvisionError(f"cannot write {path}: {e}")
     return f"{verb}d {label}"
 
@@ -1211,8 +1210,9 @@ def install_feature_payload(home: Path, connector_src: Path, *, dry_run: bool,
 
     REAL FILES, NEVER SYMLINKS, byte-compared so an unchanged install writes
     nothing. `inbox-delivery` locates its module with `realpath(__file__)`,
-    so a symlink here would resolve to wherever it points; and `_write_file`'s
-    `os.replace` onto a symlink would follow it."""
+    so a symlink here would resolve to wherever it points. A link at a
+    payload leaf, at any directory between sandy's home and it, or at a
+    source file is refused, never followed or copied through."""
     dest = feature_payload_dir(home)
     parts = []
     codex = codex_payload_sources(codex_src) if codex_src is not None else ()
@@ -1228,7 +1228,7 @@ def install_feature_payload(home: Path, connector_src: Path, *, dry_run: bool,
         if codex and rel in {f"{CODEX_PAYLOAD_SUBDIR}/{name}" for name in ca.ASSETS}:
             continue
         try:
-            data = src_file.read_text(encoding="utf-8")
+            data = sio.read_text(src_file)
         except OSError as e:
             raise ProvisionError(f"payload source missing or unreadable: {src_file}: {e}")
         parts.append(_write_file(dest / rel, data, dry_run=dry_run, label=rel,
@@ -1241,19 +1241,28 @@ def install_feature_payload(home: Path, connector_src: Path, *, dry_run: bool,
 
 def _install_empty_dir(d: Path, what: str, whose: str, *, dry_run: bool) -> str:
     """Create `d`, empty, and nothing inside it. Settled once it exists. A
-    symlink or a non-directory at the path is refused rather than followed or
-    replaced: a mount source that resolves somewhere else is not the
-    directory its writer uses."""
+    symlink or a non-directory at the path, or at any directory from `/`
+    down to it, is refused rather than followed or replaced: a mount source
+    that resolves somewhere else is not the directory its writer uses. The
+    two checks before the walk only choose the message; the walk decides."""
     if d.is_symlink():
         raise ProvisionError(f"{d} is a symlink — the {what} must be a real directory; "
                              f"remove it and re-run")
-    if d.is_dir():
-        return f"{what} present"
-    if d.exists():
+    if os.path.lexists(d) and not d.is_dir():
         raise ProvisionError(f"{d} exists and is not a directory")
+    try:
+        os.close(sio.open_dir(d))
+        return f"{what} present"
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        raise ProvisionError(f"{d}: {e}")
     if dry_run:
         return f"would create {what} (empty; {whose})"
-    d.mkdir(parents=True, exist_ok=True)
+    try:
+        os.close(sio.open_dir(d, create=True))
+    except OSError as e:
+        raise ProvisionError(f"{d}: {e}")
     return f"created {what} (empty; {whose})"
 
 
@@ -1486,7 +1495,7 @@ def _owned_keys(receives: Optional[bool],
 
 def _read_manifest(path: Path) -> Any:
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        return json.loads(sio.read_text(path))
     except (OSError, json.JSONDecodeError):
         return None
 
@@ -1507,8 +1516,21 @@ def install_manifest(home: Path, policy: Dict[str, Any], *, dry_run: bool,
     except ValueError as exc:
         raise ProvisionError(str(exc)) from exc
     path = feature_manifest_path(home)
-    if path.exists():
-        existing = _read_manifest(path)
+    if path.is_symlink():
+        raise ProvisionError(f"{path} is a symlink — sandy refuses one, and so does this; "
+                             f"it is not followed or replaced")
+    try:
+        text: Optional[str] = sio.read_text(path)
+    except FileNotFoundError:
+        text = None
+    except OSError as e:
+        raise ProvisionError(f"cannot read {path}: {e}; it is the authored policy, so it is "
+                             f"not overwritten")
+    if text is not None:
+        try:
+            existing = json.loads(text)
+        except json.JSONDecodeError:
+            existing = None
         if not isinstance(existing, dict):
             raise ProvisionError(f"{path} exists but is not a JSON object — it is the authored "
                                  f"policy, so it is not overwritten; fix it by hand")
@@ -1565,7 +1587,7 @@ def verify_manifest(home: Path, policy: Dict[str, Any], *,
     if path.is_symlink():
         return [f"manifest drift: {path} is a symlink — sandy refuses one, and so does this"]
     try:
-        have = path.read_text(encoding="utf-8")
+        have = sio.read_text(path)
     except FileNotFoundError:
         return [f"manifest absent: {path} — run install --apply, which writes the template; "
                 f"without it sandy mounts nothing for this feature and selects no sandbox"]
@@ -2233,7 +2255,7 @@ def _read_json(path: Path) -> Any:
     ABSENT IS NOT EMPTY. A missing file and an empty one are different facts
     with different remedies, so the caller must be able to tell them apart."""
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        return json.loads(sio.read_text(path))
     except FileNotFoundError:
         return f"absent ({path})"
     except OSError as e:
@@ -3818,6 +3840,100 @@ def activation_sequence(spec: Any, source: str, final: bytes, path: Path, pre_ac
     ]
 
 
+def walk_router_inputs(home: Path, state_dir: Path) -> None:
+    """Walk, without following a link, what code outside this module then
+    reads by pathname during a rendering: the hop checks'
+    (`hop_router.state_problems`) record tree under `state_dir`, and the
+    router's own loader's `selected.json` and instances directory. Each may
+    be absent; a link at any component, or a non-regular verdict file, raises
+    `SafeIOError` before that code runs. This closes a link that is already
+    there; one planted between this walk and the external read is outside
+    it."""
+    _walk_hop_records(Path(state_dir))
+    try:
+        os.close(sio.open_dir(feature_instances_dir(home)))
+    except FileNotFoundError:
+        pass
+    try:
+        sio.read_leaf_stat(feature_selected_path(home))
+    except FileNotFoundError:
+        pass
+
+
+HOP_RUNTIME = "_runtime"                      # hop_router: the runtime namespace's records under state_dir
+HOP_GENERATION_PREFIX = "gen-"                # hop_router: an identity's generation directories
+HOP_RECORD_DIRS = ("transport", "ingress")    # hop_router: transport/hop.json, ingress/link.json
+HOP_RECORD_LEAVES = {"transport": "hop.json", "ingress": "link.json"}
+HOP_INDEX_LEAVES = ("generations.json", "generation.json")
+
+
+def _walk_hop_records(state_dir: Path) -> None:
+    """Every path `hop_router.state_problems` enumerates or reads, checked
+    for links through verified descriptors: each visible child of
+    `state_dir` (its `*`), within it every `gen-*` child (every child, for
+    `_runtime`), their `transport/` and `ingress/` directories and the
+    `hop.json` and `link.json` in them, and each child's
+    `generations.json`/`generation.json`. Hidden names are walked too:
+    `pathlib`'s glob matches them."""
+    try:
+        sfd = sio.open_dir(state_dir)
+    except FileNotFoundError:
+        return
+
+    def no_link_leaf(dfd: int, name: str, where: str) -> None:
+        st = sio.lstat_child(dfd, name)
+        if st is not None and stat.S_ISLNK(st.st_mode):
+            raise sio.SafeIOError(f"{where} is a symlink; the hop checks would read through it")
+
+    try:
+        for cname in sio.child_names(sfd):
+            cwhere = f"{state_dir}/{cname}"
+            st = sio.lstat_child(sfd, cname)
+            if st is None:
+                continue
+            if stat.S_ISLNK(st.st_mode):
+                raise sio.SafeIOError(f"{cwhere} is a symlink; the hop checks would list through it")
+            if not stat.S_ISDIR(st.st_mode):
+                continue
+            cfd = sio.open_child_dir(sfd, cname, cwhere)
+            try:
+                for leaf in HOP_INDEX_LEAVES:
+                    no_link_leaf(cfd, leaf, f"{cwhere}/{leaf}")
+                for gname in sio.child_names(cfd):
+                    if not (cname == HOP_RUNTIME or gname.startswith(HOP_GENERATION_PREFIX)):
+                        continue
+                    gwhere = f"{cwhere}/{gname}"
+                    gst = sio.lstat_child(cfd, gname)
+                    if gst is None:
+                        continue
+                    if stat.S_ISLNK(gst.st_mode):
+                        raise sio.SafeIOError(f"{gwhere} is a symlink; the hop checks would list through it")
+                    if not stat.S_ISDIR(gst.st_mode):
+                        continue
+                    gfd = sio.open_child_dir(cfd, gname, gwhere)
+                    try:
+                        for rdir in HOP_RECORD_DIRS:
+                            rwhere = f"{gwhere}/{rdir}"
+                            rst = sio.lstat_child(gfd, rdir)
+                            if rst is None:
+                                continue
+                            if stat.S_ISLNK(rst.st_mode):
+                                raise sio.SafeIOError(f"{rwhere} is a symlink; the hop checks would read through it")
+                            if not stat.S_ISDIR(rst.st_mode):
+                                continue
+                            rfd = sio.open_child_dir(gfd, rdir, rwhere)
+                            try:
+                                no_link_leaf(rfd, HOP_RECORD_LEAVES[rdir], f"{rwhere}/{HOP_RECORD_LEAVES[rdir]}")
+                            finally:
+                                os.close(rfd)
+                    finally:
+                        os.close(gfd)
+            finally:
+                os.close(cfd)
+    finally:
+        os.close(sfd)
+
+
 def run_render_router(args: argparse.Namespace, home: Path, boxes: List[Dict[str, Any]],
                       policy: Dict[str, Any], *, apply: bool) -> int:
     """Render the sibling and write it (`apply`) or compare it (dry). Exit 0
@@ -3836,6 +3952,11 @@ def run_render_router(args: argparse.Namespace, home: Path, boxes: List[Dict[str
     doc = result["_doc"]
     for w in result["_warnings"]:
         print(f"router config warning: {w}", file=sys.stderr)
+    try:
+        walk_router_inputs(home, state_dir)
+    except OSError as e:
+        print(f"router config: {e}", file=sys.stderr)
+        return 2
     hop_spec: List[Any] = []
     keys, hop_problems = hop_router_keys(policy, state_dir, ha.overlay_path(getattr(args, "overlay", None)),
                                          decommission=getattr(args, "decommission_hop", False), rendered=path,
@@ -3889,7 +4010,7 @@ def run_render_router(args: argparse.Namespace, home: Path, boxes: List[Dict[str
         return 2
     want = sibling_text(doc)
     try:
-        have = path.read_text(encoding="utf-8")
+        have = sio.read_text(path)
     except FileNotFoundError:
         have = None
     except OSError as e:
@@ -3975,7 +4096,7 @@ def verify_router_sibling(home: Path, policy: Dict[str, Any], members: Dict[str,
         if live:
             return [f"router config: {p}" for p in live]
     try:
-        have = path.read_text(encoding="utf-8")
+        have = sio.read_text(path)
     except FileNotFoundError:
         return [f"router config absent: {path} — run install --apply; the router reads it "
                 f"by --config and has nothing to start from without it"]
@@ -4640,7 +4761,7 @@ def run_prepare(args: argparse.Namespace, policy: Dict[str, Any], doc: Dict[str,
         print(f"partition-activate: cannot prepare A1 — {e}; nothing was written", file=sys.stderr)
         return 2
     try:
-        live = json.loads(path.read_text(encoding="utf-8"))
+        live = json.loads(sio.read_text(path))
     except (OSError, ValueError):
         live = None
     import partition_check as pcheck
@@ -4660,7 +4781,7 @@ def run_prepare(args: argparse.Namespace, policy: Dict[str, Any], doc: Dict[str,
         steps = list(pj.activation_steps(spec.partition, writer=writer, source=str(source), activation_bytes=record))
         argv = pj.job_argv(spec.partition, writer=writer, writer_sha256=spec.secrets.writer_sha256,
                            host=hsu.partition_host(spec), document=str(overlay),
-                           document_bytes=overlay.read_bytes(), activation_bytes=record)
+                           document_bytes=sio.read_leaf(overlay), activation_bytes=record)
     except (OSError, ValueError) as e:
         print(f"partition-activate: cannot prepare A1 — {e}; nothing was written", file=sys.stderr)
         return 2
@@ -4754,7 +4875,6 @@ def run_cadence(args: argparse.Namespace, home: Path) -> int:
                              if record.get("at") else record.get("reason") or "unknown"))
     print(f"  cadence kept: {'yes' if reason is None else 'NO — ' + reason}")
     if args.apply:
-        path.parent.mkdir(parents=True, exist_ok=True)
         print(f"  {_write_file(path, plist, dry_run=False, label=path.name)}")
     else:
         print(f"  would write {path} ({len(plist.splitlines())} lines) — pass --apply")
@@ -5123,21 +5243,29 @@ def apply_identity_links(links_dir: Path, plan: List[Tuple[str, str, str, str]])
     renamed over the name, so a reader sees the old target or the new one
     and never neither. Each path is looked at again first: a CREATE whose
     path now exists, or a REPOINT whose path is no longer a link, is left
-    alone and returned, by slug, as changed since the plan."""
-    links_dir.mkdir(parents=True, exist_ok=True)
-    moved: List[str] = []
-    for action, slug, target, _ in plan:
-        if action not in (LINK_CREATE, LINK_REPOINT):
-            continue
-        path = links_dir / slug
-        if (action == LINK_CREATE and os.path.lexists(path)) or \
-                (action == LINK_REPOINT and not path.is_symlink()):
-            moved.append(slug)
-            continue
-        tmp = links_dir / f".{slug}.{os.getpid()}.tmp"
-        os.symlink(target, tmp)
-        os.replace(tmp, path)
-    return moved
+    alone and returned, by slug, as changed since the plan. The directory
+    is walked from `/` without following a link, and every name is made
+    relative to its descriptor."""
+    dfd = sio.open_dir(links_dir, create=True)
+    try:
+        moved: List[str] = []
+        for action, slug, target, _ in plan:
+            if action not in (LINK_CREATE, LINK_REPOINT):
+                continue
+            try:
+                st = os.stat(slug, dir_fd=dfd, follow_symlinks=False)
+            except FileNotFoundError:
+                st = None
+            if (action == LINK_CREATE and st is not None) or \
+                    (action == LINK_REPOINT and (st is None or not stat.S_ISLNK(st.st_mode))):
+                moved.append(slug)
+                continue
+            tmp = f".{slug}.{os.getpid()}.tmp"
+            os.symlink(target, tmp, dir_fd=dfd)
+            os.replace(tmp, slug, src_dir_fd=dfd, dst_dir_fd=dfd)
+        return moved
+    finally:
+        os.close(dfd)
 
 
 def install_identity(client: "ha.Client", links_dir: Path, members: Dict[str, Path], *,
