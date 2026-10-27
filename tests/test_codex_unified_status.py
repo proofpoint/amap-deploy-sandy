@@ -239,7 +239,7 @@ class UnifiedEvidenceTest(unittest.TestCase):
                             "native adoption fingerprint is malformed or differs"),
             "policy_hash": ("UPDATE unified_adoptions SET policy_hash='" + "b" * 64 + "'",
                             "native adoption policy_hash is malformed or differs"),
-            "history": ("UPDATE unified_adoptions SET history_sha256=NULL", "native adoption history digest is malformed"),
+            "history": ("UPDATE unified_adoptions SET history_sha256=''", "native adoption history digest is malformed"),
             "previous fingerprint": ("UPDATE unified_adoptions SET previous_fingerprint='" + "F" * 64 + "'",
                                      "native adoption previous_fingerprint is malformed or differs"),
         }
@@ -413,7 +413,7 @@ class UnifiedEvidenceTest(unittest.TestCase):
             "fingerprint": "UPDATE unified_adoptions SET fingerprint='" + "c" * 64 + "'",
             "previous_fingerprint": "UPDATE unified_adoptions SET previous_fingerprint='" + "f" * 64 + "'",
             "policy_hash": "UPDATE unified_adoptions SET policy_hash='" + "b" * 64 + "'",
-            "history NULL": "UPDATE unified_adoptions SET history_sha256=NULL",
+            "history empty": "UPDATE unified_adoptions SET history_sha256=''",
             "history upper": "UPDATE unified_adoptions SET history_sha256='" + "B" * 64 + "'",
             "binding policy": "UPDATE unified_binding SET policy_hash='" + "d" * 64 + "'",
             "binding thread": f"UPDATE unified_binding SET thread_id='{other}'",
@@ -432,6 +432,23 @@ class UnifiedEvidenceTest(unittest.TestCase):
                 refusal = self._startup_refuses()
                 self.assertIsNotNone(refusal, "startup accepts " + label)
                 self.assertNotEqual(self._unified(prov, home, record), [], (label, refusal))
+        journal.write_bytes(original)
+
+    def test_null_adoption_values_are_named_by_both_callers(self):
+        """Defensive only: the connector's NOT NULL columns make these rows unreachable on a real
+        journal, so the table is rebuilt here without its constraints."""
+        columns = ("thread_id", "previous_fingerprint", "fingerprint", "policy_hash", "history_sha256", "state")
+        prov, home, record = self._host()
+        journal = self.fixture.state / "journal.sqlite3"
+        original = journal.read_bytes()
+        for column in columns:
+            with self.subTest(column):
+                journal.write_bytes(original)
+                self._native_adoption("ALTER TABLE unified_adoptions RENAME TO constrained")
+                self._native_adoption("CREATE TABLE unified_adoptions AS SELECT * FROM constrained")
+                self._native_adoption(f"UPDATE unified_adoptions SET {column}=NULL")
+                self.assertIsNotNone(self._startup_refuses())
+                self.assertNotEqual(self._unified(prov, home, record), [])
         journal.write_bytes(original)
 
     def test_startup_reads_the_binding_and_adoption_row_in_one_snapshot(self):
