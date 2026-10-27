@@ -8,6 +8,7 @@ from contextlib import closing
 import os
 from pathlib import Path
 import sqlite3
+import subprocess
 import sys
 from tempfile import TemporaryDirectory
 import unittest
@@ -111,6 +112,71 @@ class TransitionTest(unittest.TestCase):
         self.assertEqual((self.state / "controller.toml").read_bytes(), self.previous_raw)
         self.assertFalse((self.state / transition.RECORD).exists())
         self.assertEqual(transition.entry_mode(self.state), "separate")
+
+    def test_installed_version_is_explicit_and_retains_previous_identity(self):
+        measured = subprocess.CompletedProcess(["codex", "--version"], 0, "codex-cli 0.165.0\n", "")
+        with mock.patch.object(transition.subprocess, "run", return_value=measured) as run:
+            preview = self.prepare(use_installed_codex_version=True)
+            self.assertEqual(preview["codex_version"], "codex-cli 0.165.0")
+            self.assertEqual((self.state / "controller.toml").read_bytes(), self.previous_raw)
+            self.assertFalse((self.state / transition.RECORD).exists())
+            self.prepare(use_installed_codex_version=True, apply=True)
+        self.assertEqual(run.call_args.args[0], ["codex", "--version"])
+        self.assertTrue(run.call_args.kwargs["check"])
+        self.assertEqual((self.state / transition.PREVIOUS).read_bytes(), self.previous_raw)
+        target = transition.config_at(self.state)
+        self.assertEqual(target.codex_version, "codex-cli 0.165.0")
+        self.assertNotEqual(target.fingerprint(), self.previous.fingerprint())
+        with closing(sqlite3.connect(self.state / "journal.sqlite3")) as db:
+            row = db.execute("SELECT fingerprint,thread_id,codex_version FROM instance").fetchone()
+        self.assertEqual(row, (self.previous.fingerprint(), OLD_THREAD, self.previous.codex_version))
+        self.commit_adoption_fixture()
+        self.assertEqual(transition.confirm(self.state, apply=True)["state"], "confirmed")
+
+    def test_prepare_without_installed_version_keeps_configured_build(self):
+        with mock.patch.object(transition.subprocess, "run", side_effect=AssertionError("must not probe")):
+            result = self.prepare()
+        self.assertEqual(result["codex_version"], self.previous.codex_version)
+
+    def test_prepare_cli_passes_explicit_version_selection(self):
+        with mock.patch.object(transition, "prepare", return_value={}) as prepare:
+            self.assertEqual(transition.main(["prepare", "--thread", THREAD,
+                                             "--use-installed-codex-version", "--apply"]), 0)
+        self.assertTrue(prepare.call_args.kwargs["use_installed_codex_version"])
+        self.assertTrue(prepare.call_args.kwargs["apply"])
+
+    def test_installed_version_lookup_failure_or_malformed_output_writes_nothing(self):
+        failures = [FileNotFoundError("codex absent"),
+                    subprocess.CalledProcessError(1, ["codex", "--version"]),
+                    subprocess.TimeoutExpired(["codex", "--version"], 10)]
+        for failure in failures:
+            with self.subTest(failure=type(failure).__name__), mock.patch.object(
+                    transition.subprocess, "run", side_effect=failure):
+                with self.assertRaises(type(failure)):
+                    self.prepare(use_installed_codex_version=True, apply=True)
+            self.assertEqual((self.state / "controller.toml").read_bytes(), self.previous_raw)
+            self.assertFalse((self.state / transition.RECORD).exists())
+        for output in ("", "0.165.0", "codex-cli 0.165.0\nforeign output", "codex-cli unknown"):
+            measured = subprocess.CompletedProcess(["codex", "--version"], 0, output, "")
+            with self.subTest(output=output), mock.patch.object(
+                    transition.subprocess, "run", return_value=measured):
+                with self.assertRaisesRegex(ValueError, "version is unavailable or malformed"):
+                    self.prepare(use_installed_codex_version=True, apply=True)
+            self.assertEqual((self.state / "controller.toml").read_bytes(), self.previous_raw)
+            self.assertFalse((self.state / transition.RECORD).exists())
+
+    def test_installed_version_retry_is_stable_and_another_build_refuses(self):
+        measured = subprocess.CompletedProcess(["codex", "--version"], 0, "codex-cli 0.165.0\n", "")
+        with mock.patch.object(transition.subprocess, "run", return_value=measured):
+            self.prepare(use_installed_codex_version=True, apply=True)
+            paths = [self.state / n for n in (transition.RECORD, transition.PREVIOUS, "controller.toml")]
+            before = [(p.read_bytes(), p.stat().st_mtime_ns) for p in paths]
+            self.prepare(use_installed_codex_version=True, apply=True)
+            self.assertEqual(before, [(p.read_bytes(), p.stat().st_mtime_ns) for p in paths])
+            measured.stdout = "codex-cli 0.166.0\n"
+            with self.assertRaisesRegex(ValueError, "unfinished transition differs"):
+                self.prepare(use_installed_codex_version=True, apply=True)
+        self.assertEqual(before, [(p.read_bytes(), p.stat().st_mtime_ns) for p in paths])
 
     def route(self, **session_overrides):
         path = self.root / "session.json"

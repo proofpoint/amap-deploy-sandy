@@ -153,7 +153,7 @@ def confirmed_adoption(config, record):
     return adoption["policy_hash"]
 
 
-def prepare(state, payload, thread, *, apply=False):
+def prepare(state, payload, thread, *, apply=False, use_installed_codex_version=False):
     import tomllib
     from dataclasses import replace
     from amap_codex.config import Config
@@ -207,6 +207,16 @@ def prepare(state, payload, thread, *, apply=False):
     config = (Config.load(state / PREVIOUS, create_state=False) if record is not None else config_at(state))
     selection = settings.resolve(os.environ)
     settings.require_unified_permissions(selection, config)
+    target_version = config.codex_version
+    if use_installed_codex_version:
+        # Only the target changes; the retained controller and journal still
+        # identify the original configuration until native adoption commits.
+        measured = subprocess.run(["codex", "--version"], check=True,
+                                  capture_output=True, text=True, timeout=10)
+        target_version = measured.stdout.strip()
+        if not re.fullmatch(r"codex-cli [0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?", target_version):
+            raise ValueError("installed Codex version is unavailable or malformed; retain the pause")
+        doc["codex_version"] = target_version
     if selection["selected_model"] is None:
         doc.pop("codex_model", None)
     else:
@@ -214,6 +224,7 @@ def prepare(state, payload, thread, *, apply=False):
     target = toml_bytes(doc)
     candidate = replace(config, conversation_mode="unified", unified_argv=["codex"],
                         codex_model=selection["selected_model"],
+                        codex_version=target_version,
                         operator_kickoff_enabled=False, operator_instructions=protected / assets.ASSETS[0],
                         trusted_config_file=protected / assets.ASSETS[1])
     candidate.validate(create_state=False)
@@ -440,6 +451,8 @@ def main(argv=None):
     commands = parser.add_subparsers(dest="command", required=True)
     preparation = commands.add_parser("prepare")
     preparation.add_argument("--thread", required=True)
+    preparation.add_argument("--use-installed-codex-version", action="store_true",
+                             help="explicitly select the measured installed Codex build for the adoption target")
     preparation.add_argument("--apply", action="store_true")
     confirmation = commands.add_parser("confirm")
     confirmation.add_argument("--apply", action="store_true")
@@ -469,7 +482,8 @@ def main(argv=None):
         if args.command != "entry-mode":
             require_native_runtime()
         if args.command == "prepare":
-            result = prepare(args.state, args.payload, args.thread, apply=args.apply)
+            result = prepare(args.state, args.payload, args.thread, apply=args.apply,
+                             use_installed_codex_version=args.use_installed_codex_version)
         elif args.command == "confirm":
             result = confirm(args.state, apply=args.apply)
         elif args.command == "pause":
