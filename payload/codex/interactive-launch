@@ -80,7 +80,13 @@ esac
 : "${AMAP_OUTBOX_DIR:?interactive-launch: no AMAP_OUTBOX_DIR in this pane; the outbox lane is not mounted}"
 export PYTHONPATH="$SELF_DIR/src"
 case "${AMAP_CODEX_CONVERSATION_MODE-separate}" in
-    unified) exec python3 "$SELF_DIR/codex_fresh.py" --state "$STATE" launch-pane -- "$@" ;;
+    unified)
+        route=$(python3 "$SELF_DIR/transition" --state "$STATE" startup-route --session /etc/sandy-session.json)
+        case "$route" in
+            fresh) exec python3 "$SELF_DIR/codex_fresh.py" --state "$STATE" launch-pane -- "$@" ;;
+            adopted) : ;;
+            *) echo "interactive-launch: unknown unified startup route" >&2; exit 1 ;;
+        esac ;;
     separate) : ;;
     *) echo "interactive-launch: unknown fleet conversation mode; not starting Codex" >&2; exit 1 ;;
 esac
