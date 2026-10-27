@@ -185,7 +185,7 @@ class FreshBirthTest(unittest.TestCase):
                 if name:
                     (other / name).write_bytes(b"retained old bytes")
                 before = {p.name: p.read_bytes() for p in other.iterdir()}
-                with self.assertRaisesRegex(ValueError, "operator recreation"):
+                with self.assertRaisesRegex(ValueError, "retain the state and outbox custody and inspect them first"):
                     fresh.birth(other, self.session, self.env)
                 self.assertEqual({p.name: p.read_bytes() for p in other.iterdir()}, before)
                 if name:
@@ -205,7 +205,7 @@ class FreshBirthTest(unittest.TestCase):
                 fresh.birth(state, self.session, self.env)
         self.assertTrue(fresh.intent_path(state).is_file())
         self.assertEqual(list(state.iterdir()), [])
-        with self.assertRaisesRegex(ValueError, "operator recreation"):
+        with self.assertRaisesRegex(ValueError, "retain the state and outbox custody and inspect them first"):
             fresh.birth(state, self.session, self.env)
         with self.assertRaisesRegex(ValueError, "cannot enter"):
             transition.entry_mode(state)
