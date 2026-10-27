@@ -51,6 +51,7 @@ runs Docker or launches sandy, except the read-only `docker` queries
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import os
@@ -454,10 +455,18 @@ def sandy_home() -> Path:
     return Path(os.environ.get("SANDY_HOME", str(Path.home() / ".sandy")))
 
 
+# How long sandy gets to answer `--print-state`. It exits before Docker, but it
+# reports every sandbox and can take tens of seconds on a host with many, so
+# each verb reads it ONCE and passes the list on. A sandy that does not answer
+# within the bound is a named failure, never a smaller fleet.
+SANDY_PRINT_STATE_TIMEOUT_S = 120
+
+
 def discover_sandboxes(sandy_bin: str = "sandy") -> List[Dict[str, str]]:
-    """Ask sandy for its sandboxes. `--print-state` is a documented fast
-    path that exits before Docker, image builds, and mutex acquisition, so
-    it is cheap to call. Returns `[{name, path, workspace_path, agents}, ...]`.
+    """Ask sandy for its sandboxes. `--print-state` is a documented path
+    that exits before Docker, image builds, and mutex acquisition, but it
+    reports on every sandbox, so a verb reads it once and passes the list to
+    whatever else needs it. Returns `[{name, path, workspace_path, agents}, ...]`.
 
     `agents` is carried through EXACTLY as sandy reports it,
     `None` included: null means UNKNOWN and is never turned into the default.
@@ -468,12 +477,15 @@ def discover_sandboxes(sandy_bin: str = "sandy") -> List[Dict[str, str]]:
     it rather than derive it."""
     try:
         out = subprocess.run(
-            [sandy_bin, "--print-state"], capture_output=True, text=True, timeout=30,
+            [sandy_bin, "--print-state"], capture_output=True, text=True,
+            timeout=SANDY_PRINT_STATE_TIMEOUT_S,
         )
     except FileNotFoundError:
         raise ProvisionError(f"{sandy_bin!r} not found on PATH — pass --sandy")
     except subprocess.TimeoutExpired:
-        raise ProvisionError("`sandy --print-state` timed out (it should exit before Docker)")
+        raise ProvisionError(f"`sandy --print-state` did not answer within "
+                             f"{SANDY_PRINT_STATE_TIMEOUT_S}s, so the sandbox list is unknown and "
+                             f"this command cannot run")
     if out.returncode != 0:
         raise ProvisionError(f"`sandy --print-state` failed ({out.returncode}): {out.stderr.strip()}")
     try:
@@ -522,23 +534,37 @@ def discover_sandboxes(sandy_bin: str = "sandy") -> List[Dict[str, str]]:
     ]
 
 
-def discover_workspaces(sandy_bin: str = "sandy") -> Dict[str, Path]:
-    """`{slug: workspace_path}` for every sandbox sandy reports one for.
+def workspaces_of(boxes: List[Dict[str, Any]]) -> Dict[str, Path]:
+    """`{slug: workspace_path}` for every sandbox in a `discover_sandboxes`
+    list that sandy reports one for.
 
     READ, NEVER DERIVED. The slug is a hash of the workspace path, so the
     mapping only runs one way; `$SANDY_HOME/sandboxes/<slug>` is the sandbox
     dir, not the workspace, and there is no third place the pairing is
     written down but sandy's own `WORKSPACE.json` record. A sandbox sandy
     reports without one is simply absent from this map, and every caller
-    treats that as "cannot configure the relay", never as "no relay needed".
+    treats that as "cannot configure the relay", never as "no relay needed"."""
+    return {b["name"]: Path(b["workspace_path"]) for b in boxes if b.get("workspace_path")}
 
-    Tolerant of sandy being unreachable — the caller decides whether that is
-    fatal or merely reduces what can be checked."""
-    try:
-        return {b["name"]: Path(b["workspace_path"])
-                for b in discover_sandboxes(sandy_bin) if b.get("workspace_path")}
-    except ProvisionError:
-        return {}
+
+class ReadOnce:
+    """`read()` the first time it is called, and that same answer (a copy, or
+    the same ProvisionError) every time after: one verb, one sandbox list."""
+
+    def __init__(self, read: Callable[[], List[Dict[str, Any]]]):
+        self._read = read
+        self._answer: Optional[Tuple[str, Any]] = None
+
+    def __call__(self) -> List[Dict[str, Any]]:
+        if self._answer is None:
+            try:
+                self._answer = ("boxes", self._read())
+            except ProvisionError as exc:
+                self._answer = ("error", exc)
+        kind, value = self._answer
+        if kind == "error":
+            raise value
+        return copy.deepcopy(value)
 
 
 # ------------------------------------------------------- instance names
@@ -1964,6 +1990,7 @@ def run_provision(
     args: argparse.Namespace, servers: Dict[str, dict], home: Path, boxes_dir: Path, dry: bool,
     policy: Optional[Dict[str, Any]] = None, states_reported: bool = False,
     verifying: bool = False, notes_out: Optional[List[vr.Row]] = None,
+    sandboxes: Optional[Callable[[], List[Dict[str, Any]]]] = None,
 ) -> int:
     """The manifest and the payload once per host, then every selected
     sandbox. Exit 1 on any part that failed; the count of parts that needed
@@ -2052,7 +2079,7 @@ def run_provision(
     if settled_parts:
         print(f"  in place, nothing to change: {', '.join(settled_parts)}")
 
-    boxes = discover_sandboxes(args.sandy)
+    boxes = sandboxes() if sandboxes is not None else discover_sandboxes(args.sandy)
     by_name = {b["name"]: b for b in boxes}
     members = load_membership(home, boxes)
     # THE POLICY MUST BE RATIFIED before the router's config is rendered from
@@ -4327,7 +4354,8 @@ class HostFacts:
 
 def run_verify(args: argparse.Namespace, servers: Dict[str, dict], home: Path,
                boxes_dir: Path, facts: Optional[HostFacts] = None,
-               install_notes: Optional[List[vr.Row]] = None) -> int:
+               install_notes: Optional[List[vr.Row]] = None,
+               sandboxes: Optional[Callable[[], List[Dict[str, Any]]]] = None) -> int:
     """Every check, over every selected sandbox, then the router process.
     Exit 1 on any problem — an UNKNOWN about the router included, because
     "could not tell" is not a clean bill.
@@ -4338,7 +4366,7 @@ def run_verify(args: argparse.Namespace, servers: Dict[str, dict], home: Path,
     early makes "how bad is it" take one run per fault."""
     policy = fp.load_policy(feature_manifest_path(home))
     try:
-        reported = discover_sandboxes(args.sandy)
+        reported = sandboxes() if sandboxes is not None else discover_sandboxes(args.sandy)
         records = {b["name"]: b for b in reported}
         boxes = {name: Path(b["path"]) for name, b in records.items()}
     except ProvisionError as e:
@@ -4356,7 +4384,7 @@ def run_verify(args: argparse.Namespace, servers: Dict[str, dict], home: Path,
         print(f"no sandbox selected — nothing per-sandbox to verify "
               f"(selection is {membership_source(home)})")
     sandbox_dirs = {s: boxes[s] for s in sorted(enrolled)}
-    workspaces = discover_workspaces(args.sandy)
+    workspaces = workspaces_of(reported)
     running = running_containers(args.sandy)
 
     problems: List[str] = []
@@ -4686,7 +4714,7 @@ def run_sync(args: argparse.Namespace, home: Path, boxes_dir: Path) -> int:
     servers = load_servers(args.servers)
     print()
     prov_rc = run_provision(args, servers, home, boxes_dir, dry=not apply, policy=policy,
-                            states_reported=True)
+                            states_reported=True, sandboxes=lambda: copy.deepcopy(boxes))
     if prov_rc == EXIT_POLICY_UNRATIFIED:
         return prov_rc
 
@@ -5920,12 +5948,15 @@ def run_verify_command(args: argparse.Namespace, home: Path, boxes_dir: Path) ->
     rc = 2
     try:
         servers = load_servers(args.servers)
+        # ONE `--print-state` read serves both halves, so they judge one sandbox list.
+        sandboxes = ReadOnce(lambda: discover_sandboxes(args.sandy))
         print("verify (1/2): is the install up to date?")
         install_notes: List[vr.Row] = []
         stale_rc = run_provision(args, servers, home, boxes_dir, dry=True, verifying=True,
-                                 notes_out=install_notes)
+                                 notes_out=install_notes, sandboxes=sandboxes)
         print("\nverify (2/2): the checks the install cannot make")
-        live_rc = run_verify(args, servers, home, boxes_dir, facts, install_notes=install_notes)
+        live_rc = run_verify(args, servers, home, boxes_dir, facts, install_notes=install_notes,
+                             sandboxes=sandboxes)
         hop_rc = run_verify_host_setup(args, home)
         rc = stale_rc or live_rc or hop_rc
         return rc
