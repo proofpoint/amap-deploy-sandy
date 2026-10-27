@@ -123,6 +123,95 @@ class UnifiedEvidenceTest(unittest.TestCase):
         problems, _ = prov.verify_codex_supervisor(home, "codex-test", record, running=True, now=self.now)
         self.assertTrue(any("descriptor fresh_heartbeat" in p for p in problems), problems)
 
+    def _host(self):
+        import amap_sandy as prov
+        home = self.fixture.root / "host-home"
+        relay = prov.feature_payload_dir(home) / "codex/relay"
+        relay.parent.mkdir(parents=True, exist_ok=True)
+        relay.write_text("fixture relay")
+        record = {prov.FEATURE_ENTRIES_KEY: {prov.FEATURE_NAME: {"state_dir": str(self.fixture.state.parent)}}}
+        return prov, home, record
+
+    def test_a_confirmed_adoption_verifies_clean_under_authored_unified_mode(self):
+        prov, home, record = self._host()
+        self.assertFalse((self.fixture.state / "fresh-birth.json").exists())
+        problems, _ = prov.verify_codex_supervisor(home, "codex-test", record, running=True, now=self.now,
+                                                   expected_mode="unified")
+        self.assertEqual(problems, [])
+
+    def test_an_unconfirmed_adoption_under_unified_mode_is_unknown_not_accepted(self):
+        prov, home, record = self._host()
+        (self.fixture.state / "adapter-transition.json").write_text("[]")
+        problems, _ = prov.verify_codex_supervisor(home, "codex-test", record, running=True, now=self.now,
+                                                   expected_mode="unified")
+        self.assertTrue(any("codex unified UNKNOWN" in p and "not confirmed" in p for p in problems), problems)
+
+    def test_unified_mode_without_fresh_birth_or_adoption_holds_for_recreation(self):
+        prov, home, record = self._host()
+        (self.fixture.state / "adapter-transition.json").unlink()
+        problems, _ = prov.verify_codex_supervisor(home, "codex-test", record, running=True, now=self.now,
+                                                   expected_mode="unified")
+        self.assertTrue(any("fleet mode requires fresh initialization" in p for p in problems), problems)
+
+    def test_an_adoption_mixed_with_fresh_evidence_still_holds_under_unified_mode(self):
+        prov, home, record = self._host()
+        (self.fixture.state / "fresh-plan.json").write_text("{}")
+        self.assertFalse((self.fixture.state / "fresh-birth.json").exists())
+        problems, _ = prov.verify_codex_supervisor(home, "codex-test", record, running=True, now=self.now,
+                                                   expected_mode="unified")
+        self.assertTrue(any("fleet mode requires fresh initialization" in p for p in problems), problems)
+
+    def _unified(self, prov, home, record, slug="codex-test"):
+        return prov.verify_codex_supervisor(home, slug, record, running=True, now=self.now,
+                                            expected_mode="unified")[0]
+
+    def test_a_prepared_transition_under_unified_mode_is_unknown(self):
+        prov, home, record = self._host()
+        path = self.fixture.state / "adapter-transition.json"
+        path.write_text(json.dumps({**json.loads(path.read_text()), "state": "prepared"}))
+        problems = self._unified(prov, home, record)
+        self.assertTrue(any("codex unified UNKNOWN" in p and "not confirmed" in p for p in problems), problems)
+
+    def test_policy_drift_under_unified_mode_is_a_problem(self):
+        prov, home, record = self._host()
+        path = self.fixture.state / "adapter-transition.json"
+        path.write_text(json.dumps({**json.loads(path.read_text()), "policy_hash": "c" * 64}))
+        self.assertNotEqual(self._unified(prov, home, record), [])
+
+    def test_settings_drift_under_unified_mode_is_a_problem(self):
+        prov, home, record = self._host()
+        path = self.fixture.state / settings.RECEIPT
+        path.write_text(json.dumps({**json.loads(path.read_text()), "selected_model": "foreign-model"}))
+        self.assertTrue(any("model differs" in p for p in self._unified(prov, home, record)))
+
+    def test_an_adoption_verified_for_another_sandbox_is_unknown(self):
+        prov, home, record = self._host()
+        problems = self._unified(prov, home, record, slug="other-sandbox")
+        self.assertTrue(any("names another Sandy instance" in p for p in problems), problems)
+
+    def test_fresh_intent_beside_an_adoption_still_holds(self):
+        prov, home, record = self._host()
+        intent = self.fixture.state.parent / (".fresh-intent-" + self.fixture.state.name + ".json")
+        intent.write_text("{}")
+        problems = self._unified(prov, home, record)
+        self.assertTrue(any("fleet mode requires fresh initialization" in p for p in problems), problems)
+
+    def test_outbox_custody_beside_an_adoption_still_holds(self):
+        prov, home, record = self._host()
+        outbox = prov.feature_instance_dir(home, "codex-test") / "outbox"
+        outbox.mkdir(parents=True)
+        (outbox / prov.cf.CUSTODY).write_text("{}")
+        problems = self._unified(prov, home, record)
+        self.assertTrue(any("custody" in p for p in problems), problems)
+        self.assertTrue(any("fleet mode requires fresh initialization" in p for p in problems), problems)
+
+    def test_fresh_evidence_under_separate_mode_is_a_downgrade_hold(self):
+        prov, home, record = self._host()
+        (self.fixture.state / "fresh-birth.json").write_text("{}")
+        problems, _ = prov.verify_codex_supervisor(home, "codex-test", record, running=True, now=self.now,
+                                                   expected_mode="separate")
+        self.assertTrue(any("no automatic downgrade" in p for p in problems), problems)
+
     def test_malformed_transition_is_unknown(self):
         (self.fixture.state / "adapter-transition.json").write_text("[]")
         self.assertTrue(any("not confirmed" in p for p in verifier.problems(self.fixture.state, self.status)))
