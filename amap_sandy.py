@@ -1852,14 +1852,14 @@ def verify_feature_payload(home: Path, connector_src: Optional[Path],
             problems.append(f"payload drift: {path} is a symlink — real files only")
             continue
         try:
-            have = path.read_bytes()
+            have, st = sio.read_leaf_stat(path)
         except OSError:
             problems.append(f"payload drift: {path} is missing or unreadable")
             continue
-        if executable and not os.access(path, os.X_OK):
+        if executable and not st.st_mode & stat.S_IXUSR:
             problems.append(f"payload drift: {path} is not executable")
         try:
-            want = src_file.read_bytes()
+            want = sio.read_leaf(src_file)
         except OSError:
             problems.append(f"payload drift: cannot read {src_file} to compare against — "
                             f"pass --connector-src")
@@ -1871,7 +1871,7 @@ def verify_feature_payload(home: Path, connector_src: Optional[Path],
     # must still be a positive number, or the daemon's receipt window is
     # nonsense. Checked on the payload's wrapper, where it would be set.
     try:
-        text = (dest / RELAY_WRAPPER_NAME).read_text(encoding="utf-8")
+        text = sio.read_text(dest / RELAY_WRAPPER_NAME)
     except OSError:
         text = ""
     for line in text.splitlines():
