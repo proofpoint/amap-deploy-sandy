@@ -1138,9 +1138,9 @@ print(json.dumps(problems))
             self.assertEqual(result.stdout.strip(), "LEGACY")
         result = box.run("interactive-launch", "/bin/echo", "UNWRAPPED", SANDY_AGENT="claude,codex",
                          AMAP_CODEX_CONVERSATION_MODE="unified")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("does not support", result.stderr)
-        self.assertNotIn("UNWRAPPED", result.stdout)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Claude daemon serves", result.stderr)
+        self.assertIn("UNWRAPPED", result.stdout)
 
 
     def test_host_can_import_and_report_unknown_without_connector_or_native_toml(self):

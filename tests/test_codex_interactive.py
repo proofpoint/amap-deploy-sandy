@@ -179,6 +179,26 @@ class InteractiveLaunchTest(unittest.TestCase):
         self.assertEqual(self.box.calls(), [])
         self.assertIn("Claude daemon serves this sandbox", r.stderr)
 
+    def test_unified_fleet_keeps_mixed_sandbox_claude_served_and_passes_native_codex_argv(self):
+        for agents in ("claude,codex", "codex,claude", "claude,codex,gemini"):
+            with self.subTest(agents=agents):
+                result = self._ok(*NATIVE, SANDY_AGENT=agents, AMAP_CODEX_CONVERSATION_MODE="unified")
+                self.assertEqual(self.box.execd(), NATIVE[1:])
+                self.assertEqual(self.box.calls(), [])
+                self.assertIn("Claude daemon serves this sandbox", result.stderr)
+
+    def test_mixed_sandbox_refuses_existing_codex_unified_ownership(self):
+        for filename in ("adapter-transition.json", "fresh-birth.json"):
+            with self.subTest(filename=filename):
+                marker = self.box.state / filename
+                marker.write_text("{}")
+                result = self.box.run("interactive-launch", *NATIVE, SANDY_AGENT="claude,codex",
+                                      AMAP_CODEX_CONVERSATION_MODE="unified")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("retained Codex unified ownership", result.stderr)
+                self.assertIsNone(self.box.execd())
+                marker.unlink()
+
     def _refused(self, must, **env):
         r = self.box.run("interactive-launch", *NATIVE, **env)
         self.assertNotEqual(r.returncode, 0)
