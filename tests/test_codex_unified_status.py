@@ -189,6 +189,40 @@ class UnifiedEvidenceTest(unittest.TestCase):
         problems = self._unified(prov, home, record, slug="other-sandbox")
         self.assertTrue(any("names another Sandy instance" in p for p in problems), problems)
 
+    def test_an_adoption_record_without_an_instance_is_unknown(self):
+        prov, home, record = self._host()
+        path = self.fixture.state / "adapter-transition.json"
+        value = json.loads(path.read_text())
+        del value["instance_id"]
+        path.write_text(json.dumps(value))
+        problems = self._unified(prov, home, record)
+        self.assertTrue(any("names another Sandy instance" in p for p in problems), problems)
+
+    def test_a_failed_binding_read_is_unknown_not_a_skipped_instance_check(self):
+        from unittest import mock
+        prov, home, record = self._host()
+        real = prov.ca.regular
+        calls = []
+
+        def first_read_fails(path, *args, **kwargs):
+            calls.append(path)
+            if len(calls) == 1:
+                raise NotImplementedError("dir_fd unavailable")
+            return real(path, *args, **kwargs)
+
+        with mock.patch.object(prov.ca, "regular", side_effect=first_read_fails):
+            problems = self._unified(prov, home, record, slug="other-sandbox")
+        self.assertEqual(calls[0].name, "adapter-transition.json")
+        self.assertTrue(any("adoption record unreadable for instance binding" in p for p in problems), problems)
+
+    def test_an_adopted_sandbox_carries_the_workspace_binding_note(self):
+        prov, home, record = self._host()
+        problems, notes = prov.verify_codex_supervisor(home, "codex-test", record, running=True, now=self.now,
+                                                       expected_mode="unified")
+        self.assertEqual(problems, [])
+        self.assertIn("codex-test: adopted workspace binding relies on in-sandbox startup checks; "
+                      "host/container workspace mapping is not independently verified", notes)
+
     def test_fresh_intent_beside_an_adoption_still_holds(self):
         prov, home, record = self._host()
         intent = self.fixture.state.parent / (".fresh-intent-" + self.fixture.state.name + ".json")

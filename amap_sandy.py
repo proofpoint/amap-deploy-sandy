@@ -3181,11 +3181,17 @@ def verify_codex_supervisor(home: Path, slug: str, record: Optional[dict], *,
     if adopted:
         try:
             adoption = json.loads(ca.regular(state / "adapter-transition.json"))
-        except (OSError, ValueError, RuntimeError):
-            adoption = None  # cus.problems below names the unreadable record
-        if isinstance(adoption, dict) and adoption.get("instance_id") != slug:
+            unread = None if isinstance(adoption, dict) else "it is not a JSON object"
+        except (OSError, ValueError, RuntimeError) as exc:
+            adoption, unread = None, str(exc)
+        if unread is not None:
+            problems.append(f"codex unified UNKNOWN: {slug}: adoption record unreadable for instance "
+                            f"binding: {unread}")
+        elif adoption.get("instance_id") != slug:
             problems.append(f"codex unified UNKNOWN: {slug}: its adoption record names another Sandy "
                             f"instance; an adoption is valid only for the sandbox that made it")
+        notes.append(f"{slug}: adopted workspace binding relies on in-sandbox startup checks; "
+                     f"host/container workspace mapping is not independently verified")
     if expected_mode == "unified" and not fresh_birth and not adopted:
         problems.append(f"codex unified HOLD: {slug}: fleet mode requires fresh initialization; "
                         f"operator recreation is required for legacy or unknown state; nothing is automatically erased")
@@ -5451,8 +5457,8 @@ def build_parser() -> argparse.ArgumentParser:
                               "state: the explicit removal of a hop link (then restart the router)")
     install.add_argument("--codex-mode", choices=cf.MODES,
                          help="author one fleet-wide Codex conversation mode; unified starts fresh "
-                              "Codex-served instances and recognizes an existing confirmed adoption, and "
-                              "never migrates, adopts or erases existing state")
+                              "Codex-served instances and recognizes an existing confirmed adoption; it "
+                              "never automatically adopts, migrates or erases existing state")
     install.add_argument("--fleet-domain-base", metavar="BASE",
                          help="a fresh host's template gets fleet_domain sandy.<host>.BASE "
                               "(default: internal, non-routable); a domain you control is "
