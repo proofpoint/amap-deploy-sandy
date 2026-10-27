@@ -492,6 +492,32 @@ class UnifiedEvidenceTest(unittest.TestCase):
         self.assertIsNotNone(refusal, outcome)
         self.assertIn("native adoption policy_hash is malformed or differs", refusal)
 
+    def test_a_symlinked_journal_is_not_read(self):
+        prov, home, record = self._host()
+        journal = self.fixture.state / "journal.sqlite3"
+        copy = self.fixture.state.parent / "journal-copy.sqlite3"
+        copy.write_bytes(journal.read_bytes())
+        journal.unlink()
+        journal.symlink_to(copy)
+        self.assertTrue(any("journal is unavailable or a symlink" in p for p in self._unified(prov, home, record)))
+        self.assertIn("journal is unavailable or a symlink", self._startup_refuses())
+
+    def test_an_empty_or_malformed_trust_binds_nothing(self):
+        import codex_adoption as adoptions
+        row = {"state": "confirmed", "thread_id": transition_tests.THREAD, "fingerprint": "a" * 64,
+               "previous_fingerprint": "b" * 64, "policy_hash": "c" * 64, "history_sha256": "d" * 64}
+        trusted = {"thread": (row["thread_id"],), "fingerprint": (row["fingerprint"],),
+                   "previous_fingerprint": (row["previous_fingerprint"],), "policy_hash": (row["policy_hash"],)}
+        self.assertEqual(adoptions.problems(row, **trusted), [])
+        for name in trusted:
+            for bound in ((), (None,), ("A" * 64,)):
+                if name == "thread" and bound == ("A" * 64,):
+                    continue
+                with self.subTest(name=name, bound=bound):
+                    found = adoptions.problems(row, **{**trusted, name: bound})
+                    label = "thread" if name == "thread" else name
+                    self.assertTrue(any(f"native adoption {label} has no valid expected value" in p for p in found), found)
+
     def test_an_adopted_sandbox_carries_the_workspace_binding_note(self):
         prov, home, record = self._host()
         problems, notes = prov.verify_codex_supervisor(home, "codex-test", record, running=True, now=self.now,

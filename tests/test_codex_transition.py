@@ -108,6 +108,21 @@ class TransitionTest(unittest.TestCase):
             db.execute("INSERT INTO unified_binding VALUES(?,?,?,?)", (target.instance_id, THREAD,
                        ("a" if policy_matches else "c") * 64, target.codex_model))
 
+    def test_prepare_refuses_when_the_retained_previous_bytes_differ(self):
+        """The expected previous fingerprint is recorded only from the exact retained bytes."""
+        real = assets.place
+
+        def altered(path, raw, **kwargs):
+            if path == self.state / transition.PREVIOUS:
+                raw = raw + b"\n# altered after placement\n"
+            return real(path, raw, **kwargs)
+
+        with mock.patch.object(assets, "place", side_effect=altered):
+            with self.assertRaisesRegex(ValueError, "does not yield the recorded previous fingerprint"):
+                self.prepare(apply=True)
+        self.assertFalse((self.state / transition.RECORD).exists())
+        self.assertEqual((self.state / "controller.toml").read_bytes(), self.previous_raw)
+
     def test_dry_run_preserves_controller_and_does_not_create_gate(self):
         self.assertFalse(self.prepare()["apply"])
         self.assertEqual((self.state / "controller.toml").read_bytes(), self.previous_raw)
