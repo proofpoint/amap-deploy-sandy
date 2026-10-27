@@ -290,9 +290,10 @@ class FreshBirthTest(unittest.TestCase):
                     await service.start()
                     state.parent.mkdir()
                     shutil.copytree(self.state, state)
-                    problems, _ = prov.verify_codex_supervisor(home, "fresh-fixture", record,
-                                                             running=True, expected_mode="unified")
+                    problems, notes = prov.verify_codex_supervisor(home, "fresh-fixture", record,
+                                                                 running=True, expected_mode="unified")
                     self.assertEqual(problems, [])
+                    self.assertFalse(any("adopted workspace binding" in n for n in notes), notes)
                     custody.write_text("{}")
                     problems, _ = prov.verify_codex_supervisor(home, "fresh-fixture", record,
                                                              running=True, expected_mode="unified")
