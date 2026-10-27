@@ -29,7 +29,8 @@ PLAN = "fresh-plan.json"
 INITIALIZATION = "fresh-initialization.json"
 REQUEST = "fresh-startup.json"
 SELECTION = "fresh-selection.json"
-RECREATE = "HOLD: existing or uncertain Codex state requires operator recreation; retain it, do not erase or adopt automatically"
+RECREATE = ("HOLD: existing or uncertain Codex state; retain the state and outbox custody and inspect them first; "
+            "recreation is a later explicit operator decision, never automatic; nothing is erased or adopted automatically")
 
 
 def native_runtime():
