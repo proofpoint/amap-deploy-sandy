@@ -360,7 +360,7 @@ def findings(payload, policy, mcp):
         for name in ASSETS:
             if read_at(vfd, name, version_dir / name) != raw[name]:
                 raise AssetError("selected protected asset differs: %s" % (version_dir / name))
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, RuntimeError) as exc:
         return ["Codex protected assets: %s" % exc]
     finally:
         for fd in reversed(fds):

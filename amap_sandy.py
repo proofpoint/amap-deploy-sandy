@@ -1222,7 +1222,8 @@ def install_feature_payload(home: Path, connector_src: Path, *, dry_run: bool,
                                     Path(codex_src) / "config" / CODEX_INSTRUCTIONS,
                                     PAYLOAD_DIR / CODEX_PAYLOAD_SUBDIR / "mcp.toml",
                                     dry_run=dry_run))
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, RuntimeError) as exc:
+            # RuntimeError: NotImplementedError where this platform's os.link lacks dir_fd support.
             raise ProvisionError(str(exc)) from exc
     for rel, src_file, executable in payload_sources(connector_src, servers_path) + codex:
         if codex and rel in {f"{CODEX_PAYLOAD_SUBDIR}/{name}" for name in ca.ASSETS}:

@@ -1,6 +1,7 @@
 """Protected versions preserve original-path bytes across an interrupted upgrade."""
 import json
 import os
+import shutil
 from pathlib import Path
 import sys
 from tempfile import TemporaryDirectory
@@ -224,6 +225,60 @@ class DescriptorAnchoredInstallTest(unittest.TestCase):
 
         with mock.patch.object(assets, "open_dir", side_effect=walk_then_swap):
             self.assertEqual(assets.read_path(state / "fresh-birth.json"), b"{\"walked\": true}")
+
+    def _swap_after_walk(self, directory, decoy):
+        """open_dir walks, then `directory` is replaced by a link to `decoy`."""
+        real = assets.open_dir
+
+        def walk_then_swap(path, **kwargs):
+            fd = real(path, **kwargs)
+            if Path(path) == directory and not os.path.islink(directory):
+                directory.rename(self.root / "moved")
+                directory.symlink_to(decoy, target_is_directory=True)
+            return fd
+
+        return mock.patch.object(assets, "open_dir", side_effect=walk_then_swap)
+
+    def test_findings_reads_the_version_files_through_the_walked_directory(self):
+        payload = self.root / "payload"
+        assets.install(payload, self.policy, self.mcp, dry_run=False)
+        decoy = self.root / "decoy-payload"
+        shutil.copytree(payload, decoy)
+        version = json.loads((payload / assets.SELECTED_RECORD).read_bytes())["version"]
+        (decoy / "protected" / version / "mcp.toml").write_bytes(b"decoy registry\n")
+        os.chmod(decoy / "protected" / version / "mcp.toml", 0o644)
+        self.assertNotEqual(assets.findings(decoy, self.policy, self.mcp), [])
+        with self._swap_after_walk(payload, decoy):
+            self.assertEqual(assets.findings(payload, self.policy, self.mcp), [])
+
+    def test_the_legacy_record_is_read_through_the_walked_directory(self):
+        payload = self.root / "payload"
+        assets.install(payload, self.policy, self.mcp, dry_run=False)
+        raw, _ = assets.sources(self.policy, self.mcp)
+        want = assets.legacy_record(payload, raw)
+        decoy = self.root / "decoy-payload"
+        shutil.copytree(payload, decoy)
+        (decoy / assets.LEGACY_RECORD).write_bytes(b"not a record")
+        with self.assertRaises(ValueError):
+            assets.legacy_record(decoy, raw)
+        with self._swap_after_walk(payload, decoy):
+            self.assertEqual(assets.legacy_record(payload, raw), want)
+
+    def test_a_link_that_raises_leaves_no_temporary_name(self):
+        payload = self.root / "payload"
+        payload.mkdir()
+        dfd = assets.open_dir(payload)
+        self.addCleanup(os.close, dfd)
+        with mock.patch.object(assets.os, "link", side_effect=OSError("link refused")):
+            with self.assertRaisesRegex(OSError, "link refused"):
+                assets.place_at(dfd, "mcp.toml", b"bytes", payload / "mcp.toml")
+        self.assertEqual(os.listdir(payload), [])
+
+    def test_findings_reports_a_platform_without_dir_fd_link_as_a_finding(self):
+        payload = self.root / "payload"
+        with mock.patch.object(assets, "open_dir", side_effect=NotImplementedError("dir_fd unavailable")):
+            self.assertEqual(assets.findings(payload, self.policy, self.mcp),
+                             ["Codex protected assets: dir_fd unavailable"])
 
     def test_findings_refuses_a_link_above_the_payload(self):
         assets.install(self.root / "payload", self.policy, self.mcp, dry_run=False)

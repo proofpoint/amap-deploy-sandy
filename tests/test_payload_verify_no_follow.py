@@ -12,6 +12,7 @@ import os
 import shutil
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 import amap_sandy as prov
@@ -59,6 +60,24 @@ class PayloadVerifyNoFollowTest(unittest.TestCase):
         leaf = self.dest / prov.RELAY_WRAPPER_NAME
         leaf.chmod(0o644)
         self.assertIn(f"payload drift: {leaf} is not executable", self.verify())
+
+
+class CodexInstallUnsupportedLinkTest(unittest.TestCase):
+    """A platform whose os.link takes no dir_fd raises NotImplementedError
+    inside the Codex asset install; install reports it as a FAIL line
+    (ProvisionError) rather than a traceback."""
+
+    def test_not_implemented_becomes_a_provision_error(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        home = Path(td.name).resolve() / "sandy-home"
+        prov.feature_root(home).mkdir(parents=True)
+        self.assertTrue(prov.codex_payload_sources(prov.DEFAULT_CODEX_CONNECTOR_SRC),
+                        "this test needs the amap-connector-codex checkout")
+        with unittest.mock.patch.object(prov.ca, "install", side_effect=NotImplementedError("dir_fd unavailable")):
+            with self.assertRaisesRegex(prov.ProvisionError, "dir_fd unavailable"):
+                prov.install_feature_payload(home, prov.DEFAULT_CONNECTOR_SRC, dry_run=False,
+                                             codex_src=prov.DEFAULT_CODEX_CONNECTOR_SRC)
 
 
 if __name__ == "__main__":
