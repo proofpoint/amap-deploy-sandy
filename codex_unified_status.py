@@ -1,12 +1,12 @@
 """Read-only unified evidence checks, usable on the host without Codex imports."""
 import json
-from contextlib import closing
 import math
 from pathlib import Path
 import re
 import sqlite3
 import time
 
+import codex_adoption as adoptions
 import codex_assets as assets
 import codex_fleet as fleet
 import codex_settings as settings
@@ -117,31 +117,11 @@ def evidence_problems(status, descriptor, record, binding, *, now):
 
 
 def adoption_problems(adoption, record, binding):
-    """The connector's committed adoption must agree with the transition and the binding."""
-    if adoption is None:
-        return ["native adoption record is unavailable"]
-    problems = []
-    if adoption["state"] != "confirmed":
-        problems.append("native adoption is not confirmed")
-    for column, label, digest in (("thread_id", "thread", False), ("fingerprint", "fingerprint", True),
-                                  ("policy_hash", "policy_hash", True)):
-        value = adoption[column]
-        if (not isinstance(value, str) or not value
-                or (digest and not re.fullmatch("[a-f0-9]{64}", value))
-                or value != record.get(label) or value != binding[column]):
-            problems.append("native adoption " + label + " is malformed or differs from the transition or binding")
-    expected, previous = record.get("previous_fingerprint"), adoption["previous_fingerprint"]
-    if not isinstance(expected, str) or not re.fullmatch("[a-f0-9]{64}", expected):
-        expected = None
-        problems.append("adoption previous fingerprint is pending explicit revalidation: the transition record "
-                        "has no valid expected previous fingerprint; retain the record and keep this sandbox stopped")
-    if not isinstance(previous, str) or not re.fullmatch("[a-f0-9]{64}", previous):
-        problems.append("native adoption previous fingerprint is malformed")
-    elif expected is not None and previous != expected:
-        problems.append("native adoption previous fingerprint differs from the recorded expectation")
-    if not isinstance(adoption["history_sha256"], str) or not re.fullmatch("[a-f0-9]{64}", adoption["history_sha256"]):
-        problems.append("native adoption history digest is malformed")
-    return problems
+    """The committed adoption against the transition record and the durable binding."""
+    return adoptions.problems(adoption, thread=(record.get("thread"), binding["thread_id"]),
+                              fingerprint=(record.get("fingerprint"), binding["fingerprint"]),
+                              previous_fingerprint=(record.get("previous_fingerprint"),),
+                              policy_hash=(record.get("policy_hash"), binding["policy_hash"]))
 
 
 def problems(state, status, *, now=None):
@@ -167,24 +147,10 @@ def problems(state, status, *, now=None):
         entry_selection = json.loads(assets.regular(state / settings.RECEIPT))
         startup = json.loads(assets.regular(state / settings.STARTUP))
         pane_selection = json.loads(assets.regular(state / settings.PANE_SELECTION))
-        journal = state / "journal.sqlite3"
-        if journal.is_symlink() or not journal.is_file():
-            raise ValueError("journal is unavailable or a symlink")
-        with closing(sqlite3.connect(journal.as_uri() + "?mode=ro", uri=True)) as db:
-            db.row_factory = sqlite3.Row
-            # A SELECT outside a transaction is its own snapshot; BEGIN holds one across both reads.
-            db.execute("BEGIN")
-            row = db.execute("SELECT i.fingerprint,b.thread_id,b.policy_hash,b.effective_model "
-                             "FROM instance i JOIN unified_binding b USING(instance_id) "
-                             "WHERE i.instance_id=?", (record["instance_id"],)).fetchone()
-            try:
-                adoption = db.execute("SELECT state,thread_id,fingerprint,previous_fingerprint,policy_hash,"
-                                      "history_sha256 FROM unified_adoptions WHERE singleton=1").fetchone()
-            except sqlite3.Error as exc:
-                raise ValueError("native adoption record is unavailable") from exc
+        row, adoption = adoptions.evidence(state / "journal.sqlite3", record["instance_id"])
         if row is None:
             raise ValueError("durable unified binding is unavailable")
-        return (adoption_problems(adoption, record, dict(row))
+        return (adoption_problems(adoption, record, row)
                 + settings.evidence_problems(entry_selection, record)
                 + settings.startup_problems(startup, pane_selection, record, entry_selection)
                 + evidence_problems(status, descriptor, record, dict(row), now=time.time() if now is None else now))

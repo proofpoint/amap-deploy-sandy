@@ -1180,7 +1180,8 @@ def codex_payload_sources(codex_src: Path) -> Tuple[Tuple[str, Path, bool], ...]
     sub = CODEX_PAYLOAD_SUBDIR
     parts = [(f"{sub}/{name}", PAYLOAD_DIR / sub / name, executable)
              for name, executable in CODEX_PAYLOAD_FILES]
-    parts += [(f"{sub}/codex_fleet.py", Path(__file__).parent / "codex_fleet.py", False),
+    parts += [(f"{sub}/codex_adoption.py", Path(__file__).parent / "codex_adoption.py", False),
+              (f"{sub}/codex_fleet.py", Path(__file__).parent / "codex_fleet.py", False),
               (f"{sub}/codex_fresh.py", Path(__file__).parent / "codex_fresh.py", False),
               (f"{sub}/codex_assets.py", Path(__file__).parent / "codex_assets.py", False),
               (f"{sub}/codex_settings.py", Path(__file__).parent / "codex_settings.py", False),
