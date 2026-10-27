@@ -116,6 +116,25 @@ def evidence_problems(status, descriptor, record, binding, *, now):
     return problems
 
 
+def adoption_problems(adoption, record, binding):
+    """The connector's committed adoption must agree with the transition and the binding."""
+    if adoption is None:
+        return ["native adoption record is unavailable"]
+    problems = []
+    if adoption["state"] != "confirmed":
+        problems.append("native adoption is not confirmed")
+    for column, label, digest in (("thread_id", "thread", False), ("fingerprint", "fingerprint", True),
+                                  ("policy_hash", "policy_hash", True)):
+        value = adoption[column]
+        if (not isinstance(value, str) or not value
+                or (digest and not re.fullmatch("[a-f0-9]{64}", value))
+                or value != record.get(label) or value != binding[column]):
+            problems.append("native adoption " + label + " is malformed or differs from the transition or binding")
+    if not isinstance(adoption["history_sha256"], str) or not re.fullmatch("[a-f0-9]{64}", adoption["history_sha256"]):
+        problems.append("native adoption history digest is malformed")
+    return problems
+
+
 def problems(state, status, *, now=None):
     state = Path(state)
     if any(path.exists() or path.is_symlink() for path in fleet.fresh_markers(state)):
@@ -147,9 +166,15 @@ def problems(state, status, *, now=None):
             row = db.execute("SELECT i.fingerprint,b.thread_id,b.policy_hash,b.effective_model "
                              "FROM instance i JOIN unified_binding b USING(instance_id) "
                              "WHERE i.instance_id=?", (record["instance_id"],)).fetchone()
+            try:
+                adoption = db.execute("SELECT state,thread_id,fingerprint,policy_hash,history_sha256 "
+                                      "FROM unified_adoptions WHERE singleton=1").fetchone()
+            except sqlite3.Error as exc:
+                raise ValueError("native adoption record is unavailable") from exc
         if row is None:
             raise ValueError("durable unified binding is unavailable")
-        return (settings.evidence_problems(entry_selection, record)
+        return (adoption_problems(adoption, record, dict(row))
+                + settings.evidence_problems(entry_selection, record)
                 + settings.startup_problems(startup, pane_selection, record, entry_selection)
                 + evidence_problems(status, descriptor, record, dict(row), now=time.time() if now is None else now))
     except (OSError, ValueError, KeyError, TypeError, sqlite3.Error) as exc:

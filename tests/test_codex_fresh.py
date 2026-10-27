@@ -4,6 +4,7 @@ The native protocol is a local in-memory fake. UnifiedService and Journal run
 unmodified; these fixtures never manufacture an adoption or canonical SQL row.
 """
 import asyncio
+from contextlib import closing
 import json
 import os
 from pathlib import Path
@@ -290,6 +291,9 @@ class FreshBirthTest(unittest.TestCase):
                     await service.start()
                     state.parent.mkdir()
                     shutil.copytree(self.state, state)
+                    with closing(sqlite3.connect((state / "journal.sqlite3").as_uri() + "?mode=ro", uri=True)) as db:
+                        adoptions = db.execute("SELECT 1 FROM sqlite_master WHERE name='unified_adoptions'").fetchone()
+                    self.assertIsNone(adoptions, "a fresh birth carries no native adoption table")
                     problems, notes = prov.verify_codex_supervisor(home, "fresh-fixture", record,
                                                                  running=True, expected_mode="unified")
                     self.assertEqual(problems, [])
