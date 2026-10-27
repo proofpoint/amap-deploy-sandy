@@ -31,6 +31,10 @@ SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 
 STATE="$SANDY_FEATURE_STATE/codex"
 SANDY_SESSION_FILE=/etc/sandy-session.json
+# Adoption maintenance runs through docker exec with Sandy's system Python.
+# Its activity MCP interpreter is part of the protected policy binding. A
+# workspace venv must not select a different interpreter on ordinary restart.
+ADOPTED_PYTHON=/usr/bin/python3
 RUNTIME_ROUTE="fresh"
 case "${AMAP_CODEX_CONVERSATION_MODE-separate}" in
     unified)
@@ -280,7 +284,9 @@ while :; do
     if [ -e "$AMAP_CODEX_PAUSE_PATH" ] || [ -L "$AMAP_CODEX_PAUSE_PATH" ]; then continue; fi
     rm -f "$HOLD"
     if [ -e "$AMAP_CODEX_PAUSE_PATH" ] || [ -L "$AMAP_CODEX_PAUSE_PATH" ]; then continue; fi
-    python3 -m amap_codex.cli --config "$STATE/controller.toml" run &
+    supervisor_python=python3
+    if [ "$mode" = unified ]; then supervisor_python="$ADOPTED_PYTHON"; fi
+    "$supervisor_python" -m amap_codex.cli --config "$STATE/controller.toml" run &
     supervisor=$!
     rc=0
     wait "$supervisor" || rc=$?

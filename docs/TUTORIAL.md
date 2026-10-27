@@ -604,6 +604,12 @@ settings, and Sandy instance/workspace/lane identity before selecting that
 runtime. The full native argv startup gate still applies on every new execution
 environment. No per-process separate-mode override is needed.
 
+The adopted service uses Sandy's system `/usr/bin/python3`, matching the
+`sandy --exec` maintenance environment. The protected activity-tool definition
+binds that interpreter path. Workspace virtualenv activation must not substitute
+another interpreter on restart. Fresh unified runtimes retain their own protected
+startup path.
+
 A prepared, malformed, mismatched or mixed fresh/adopted record holds; it is
 never interpreted as permission to initialize another conversation. Instances
 without an adoption record continue through the fresh-state guard, which refuses
