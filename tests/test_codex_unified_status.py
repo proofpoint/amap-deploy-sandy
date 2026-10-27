@@ -240,6 +240,8 @@ class UnifiedEvidenceTest(unittest.TestCase):
             "policy_hash": ("UPDATE unified_adoptions SET policy_hash='" + "b" * 64 + "'",
                             "native adoption policy_hash is malformed or differs"),
             "history": ("UPDATE unified_adoptions SET history_sha256=NULL", "native adoption history digest is malformed"),
+            "previous fingerprint": ("UPDATE unified_adoptions SET previous_fingerprint='" + "F" * 64 + "'",
+                                     "native adoption previous fingerprint is malformed"),
         }
         journal = self.fixture.state / "journal.sqlite3"
         original = journal.read_bytes()
@@ -294,6 +296,61 @@ class UnifiedEvidenceTest(unittest.TestCase):
         self._native_adoption(f"UPDATE unified_binding SET policy_hash='{malformed}'")
         self._native_adoption(f"UPDATE unified_adoptions SET policy_hash='{malformed}'")
         self._adoption_named(prov, home, record, "policy_hash")
+
+    def test_a_writer_between_the_two_journal_reads_cannot_mix_snapshots(self):
+        """Before, the row's policy_hash disagrees with the binding. A writer commits a new binding and
+        a new row: read as the OLD binding with the NEW row they would agree, and both whole states are
+        refused. The writer runs immediately before the adoption SELECT."""
+        import sqlite3
+        from contextlib import closing
+        from unittest import mock
+        prov, home, record = self._host()
+        journal = self.fixture.state / "journal.sqlite3"
+        good, other = self.record["policy_hash"], "d" * 64
+        self._native_adoption(f"UPDATE unified_adoptions SET policy_hash='{other}'")
+        real_connect = sqlite3.connect
+        outcome = []
+
+        def writer():
+            try:
+                with closing(real_connect(journal, timeout=0)) as db, db:
+                    db.execute(f"UPDATE unified_binding SET policy_hash='{other}'")
+                    db.execute(f"UPDATE unified_adoptions SET policy_hash='{good}'")
+                outcome.append("committed")
+            except sqlite3.OperationalError as exc:
+                outcome.append("refused: " + str(exc))
+
+        class Interleaved:
+            def __init__(self, db):
+                object.__setattr__(self, "db", db)
+
+            def __getattr__(self, name):
+                return getattr(self.db, name)
+
+            def __setattr__(self, name, value):
+                setattr(self.db, name, value)
+
+            def execute(self, sql, *args):
+                if "FROM unified_adoptions" in sql and not outcome:
+                    writer()
+                return self.db.execute(sql, *args)
+
+        with mock.patch.object(verifier.sqlite3, "connect", side_effect=lambda *a, **k: Interleaved(real_connect(*a, **k))):
+            problems = self._unified(prov, home, record)
+        self.assertEqual(len(outcome), 1, outcome)
+        self.assertTrue(any("native adoption policy_hash is malformed or differs" in p for p in problems),
+                        (outcome, problems))
+
+    def test_stale_or_holding_runtime_evidence_is_named_through_host_verify(self):
+        prov, home, record = self._host()
+        problems, _ = prov.verify_codex_supervisor(home, "codex-test", record, running=True, now=self.now + 3600,
+                                                   expected_mode="unified")
+        self.assertTrue(any("status fresh_heartbeat is unknown or stale" in p for p in problems), problems)
+        path = self.fixture.state / "status.json"
+        status = json.loads(path.read_text())
+        status["readiness"]["state"] = "holding"
+        path.write_text(json.dumps(status))
+        self.assertTrue(any("status readiness is holding or unknown" in p for p in self._unified(prov, home, record)))
 
     def test_an_adopted_sandbox_carries_the_workspace_binding_note(self):
         prov, home, record = self._host()
