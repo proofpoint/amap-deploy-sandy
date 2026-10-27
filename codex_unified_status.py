@@ -130,9 +130,17 @@ def adoption_problems(adoption, record, binding):
                 or (digest and not re.fullmatch("[a-f0-9]{64}", value))
                 or value != record.get(label) or value != binding[column]):
             problems.append("native adoption " + label + " is malformed or differs from the transition or binding")
-    for column, label in (("previous_fingerprint", "previous fingerprint"), ("history_sha256", "history digest")):
-        if not isinstance(adoption[column], str) or not re.fullmatch("[a-f0-9]{64}", adoption[column]):
-            problems.append("native adoption " + label + " is malformed")
+    expected, previous = record.get("previous_fingerprint"), adoption["previous_fingerprint"]
+    if not isinstance(expected, str) or not re.fullmatch("[a-f0-9]{64}", expected):
+        expected = None
+        problems.append("adoption previous fingerprint is pending explicit revalidation: the transition record "
+                        "has no valid expected previous fingerprint; retain the record and keep this sandbox stopped")
+    if not isinstance(previous, str) or not re.fullmatch("[a-f0-9]{64}", previous):
+        problems.append("native adoption previous fingerprint is malformed")
+    elif expected is not None and previous != expected:
+        problems.append("native adoption previous fingerprint differs from the recorded expectation")
+    if not isinstance(adoption["history_sha256"], str) or not re.fullmatch("[a-f0-9]{64}", adoption["history_sha256"]):
+        problems.append("native adoption history digest is malformed")
     return problems
 
 

@@ -352,6 +352,46 @@ class UnifiedEvidenceTest(unittest.TestCase):
         path.write_text(json.dumps(status))
         self.assertTrue(any("status readiness is holding or unknown" in p for p in self._unified(prov, home, record)))
 
+    def _record(self, change):
+        path = self.fixture.state / "adapter-transition.json"
+        value = json.loads(path.read_text())
+        change(value)
+        path.write_text(json.dumps(value))
+        return path
+
+    def test_prepare_records_the_previous_fingerprint_from_the_retained_configuration(self):
+        from amap_codex.config import Config
+        derived = Config.load(self.fixture.state / transition.PREVIOUS, create_state=False).fingerprint()
+        self.assertEqual(self.record["previous_fingerprint"], derived)
+
+    def test_a_changed_native_previous_fingerprint_is_refused_by_host_and_startup(self):
+        """The witness both gates reproduced: only the row's previous_fingerprint changes."""
+        prov, home, record = self._host()
+        self._native_adoption("UPDATE unified_adoptions SET previous_fingerprint='" + "f" * 64 + "'")
+        self.assertTrue(any("native adoption previous fingerprint differs from the recorded expectation" in p
+                            for p in self._unified(prov, home, record)))
+        with self.assertRaisesRegex(ValueError, "not confirmed"):
+            transition.confirmed_adoption(transition.config_at(self.fixture.state), transition.read_record(self.fixture.state))
+
+    def test_a_record_without_the_expectation_is_pending_revalidation_everywhere(self):
+        prov, home, record = self._host()
+        self._record(lambda value: value.pop("previous_fingerprint"))
+        self.assertTrue(any("pending explicit revalidation" in p for p in self._unified(prov, home, record)))
+        with self.assertRaisesRegex(ValueError, "pending explicit revalidation"):
+            transition.read_record(self.fixture.state)
+        for apply in (False, True):
+            with self.assertRaisesRegex(ValueError, "pending explicit revalidation"):
+                transition.confirm(self.fixture.state, apply=apply)
+        self._record(lambda value: value.update(previous_fingerprint="F" * 64))
+        self.assertTrue(any("pending explicit revalidation" in p for p in self._unified(prov, home, record)))
+        with self.assertRaisesRegex(ValueError, "invalid adapter transition previous_fingerprint"):
+            transition.read_record(self.fixture.state)
+
+    def test_a_record_expectation_that_differs_from_the_row_is_refused_by_startup(self):
+        self._record(lambda value: value.update(previous_fingerprint="e" * 64))
+        with self.assertRaisesRegex(ValueError, "not confirmed"):
+            transition.confirmed_adoption(transition.config_at(self.fixture.state), transition.read_record(self.fixture.state))
+
     def test_an_adopted_sandbox_carries_the_workspace_binding_note(self):
         prov, home, record = self._host()
         problems, notes = prov.verify_codex_supervisor(home, "codex-test", record, running=True, now=self.now,

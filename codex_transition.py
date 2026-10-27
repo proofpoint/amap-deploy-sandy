@@ -103,6 +103,11 @@ def read_record(state):
     for name in ("previous_sha256", "target_sha256", "fingerprint"):
         if not isinstance(value.get(name), str) or not re.fullmatch("[a-f0-9]{64}", value[name]):
             raise ValueError("invalid adapter transition " + name)
+    if "previous_fingerprint" not in value:
+        raise ValueError("adapter transition records no expected previous fingerprint; pending explicit "
+                         "revalidation, so retain the record and keep this sandbox stopped")
+    if not isinstance(value["previous_fingerprint"], str) or not re.fullmatch("[a-f0-9]{64}", value["previous_fingerprint"]):
+        raise ValueError("invalid adapter transition previous_fingerprint")
     return value
 
 
@@ -145,6 +150,7 @@ def confirmed_adoption(config, record):
             or adoption["fingerprint"] != config.fingerprint()
             or adoption["fingerprint"] != record["fingerprint"]
             or adoption["previous_fingerprint"] != previous.fingerprint()
+            or adoption["previous_fingerprint"] != record["previous_fingerprint"]
             or adoption["policy_hash"] != binding["policy_hash"]
             or not re.fullmatch("[a-f0-9]{64}", adoption["policy_hash"])
             or not re.fullmatch("[a-f0-9]{64}", adoption["history_sha256"])
@@ -219,6 +225,7 @@ def prepare(state, payload, thread, *, apply=False):
     candidate.validate(create_state=False)
     planned = {"schema": 1, "state": "prepared", "thread": thread,
                "previous_sha256": assets.digest(previous), "target_sha256": assets.digest(target),
+               "previous_fingerprint": config.fingerprint(),
                "fingerprint": candidate.fingerprint(), "instance_id": candidate.instance_id,
                "codex_model": candidate.codex_model, "codex_version": candidate.codex_version,
                "model_source": selection["model_source"],
@@ -241,6 +248,10 @@ def prepare(state, payload, thread, *, apply=False):
             raise ValueError("configuration changed while acquiring controller ownership")
         matching_status(config, fingerprint=config.fingerprint())
         assets.place(state / PREVIOUS, previous, mode=0o600)
+        # The expectation comes from the exact retained bytes, before the record names it.
+        if (assets.regular(state / PREVIOUS) != previous
+                or Config.load(state / PREVIOUS, create_state=False).fingerprint() != planned["previous_fingerprint"]):
+            raise ValueError("retained previous configuration does not yield the recorded previous fingerprint")
         assets.place(state / RECORD, assets.encoded(planned), mode=0o600)
         if current != target:
             assets.place(path, target, replace=True, mode=0o600)
