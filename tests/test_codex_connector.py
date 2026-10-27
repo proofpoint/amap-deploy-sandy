@@ -438,11 +438,19 @@ class CodexRelayTest(unittest.TestCase):
             proc.communicate()
 
     def test_unified_receiver_waits_for_full_native_argv_before_starting(self):
+        self._check_unified_receiver("separate")
+
+    def test_unified_fleet_receiver_resumes_confirmed_adoption_without_fresh_birth(self):
+        self._check_unified_receiver("unified")
+
+    def _check_unified_receiver(self, fleet_mode):
         import test_codex_transition as tt
         import codex_transition as transition
         f = tt.TransitionTest()
         f.setUp()
         self.addCleanup(f.doCleanups)
+        import _execution_identity
+        _execution_identity.install_driver(self.root / "bin/python3", f.identity_driver)
         export = unittest.mock.patch.dict(os.environ, {"CODEX_MODEL": "unified-pane-model"})
         export.start()
         self.addCleanup(export.stop)
@@ -454,6 +462,8 @@ class CodexRelayTest(unittest.TestCase):
                                                                "workspace": str(f.root)}))
         proc = self._start(SANDY_FEATURE_STATE=str(f.state.parent), CODEX_HOME=str(f.native_home),
                            CODEX_MODEL="unified-pane-model", SANDY_SKIP_PERMISSIONS="true",
+                           AMAP_CODEX_CONVERSATION_MODE=fleet_mode,
+                           AMAP_INBOX_DIR=str(f.root / "mail"), AMAP_PEER_DIR=str(f.root / "peer"),
                            FAKE_CODEX_VERSION=f.previous.codex_version)
         try:
             deadline = time.monotonic() + 20
@@ -473,10 +483,13 @@ class CodexRelayTest(unittest.TestCase):
             before = json.loads((f.state / "pane-startup.json").read_text())
             proc = self._start(SANDY_FEATURE_STATE=str(f.state.parent), CODEX_HOME=str(f.native_home),
                                CODEX_MODEL="unified-pane-model", SANDY_SKIP_PERMISSIONS="true",
+                               AMAP_CODEX_CONVERSATION_MODE=fleet_mode,
+                               AMAP_INBOX_DIR=str(f.root / "mail"), AMAP_PEER_DIR=str(f.root / "peer"),
                                FAKE_CODEX_VERSION=f.previous.codex_version)
             _, err = proc.communicate(timeout=20)
             self.assertEqual(proc.returncode, 0, err)
             self.assertEqual(json.loads((f.state / "pane-startup.json").read_text()), before)
+            self.assertFalse((f.state / "fresh-birth.json").exists())
         finally:
             if proc.poll() is None:
                 os.killpg(proc.pid, signal.SIGKILL)

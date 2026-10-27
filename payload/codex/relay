@@ -31,10 +31,18 @@ SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 
 STATE="$SANDY_FEATURE_STATE/codex"
 SANDY_SESSION_FILE=/etc/sandy-session.json
+RUNTIME_ROUTE="fresh"
 case "${AMAP_CODEX_CONVERSATION_MODE-separate}" in
     unified)
-        while ! python3 "$SELF_DIR/codex_fresh.py" --state "$STATE" birth --session "$SANDY_SESSION_FILE"; do
-            echo "codex relay: fresh unified birth held; retain existing state for operator inspection" >&2
+        while :; do
+            if RUNTIME_ROUTE=$(python3 "$SELF_DIR/transition" --state "$STATE" startup-route --session "$SANDY_SESSION_FILE"); then
+                case "$RUNTIME_ROUTE" in
+                    adopted) break ;;
+                    fresh)
+                        if python3 "$SELF_DIR/codex_fresh.py" --state "$STATE" birth --session "$SANDY_SESSION_FILE"; then break; fi ;;
+                esac
+            fi
+            echo "codex relay: unified startup held; retain existing state for operator inspection" >&2
             sleep 30
         done ;;
     separate)
@@ -235,7 +243,7 @@ elif [ -n "${AMAP_FLEET_DOMAIN+x}" ]; then
     self_address="$sandbox_name@$AMAP_FLEET_DOMAIN"
 fi
 
-if [ "${AMAP_CODEX_CONVERSATION_MODE-separate}" = unified ]; then
+if [ "${AMAP_CODEX_CONVERSATION_MODE-separate}" = unified ] && [ "$RUNTIME_ROUTE" = fresh ]; then
     exec python3 "$SELF_DIR/codex_fresh.py" --state "$STATE" --payload "$SELF_DIR" relay \
         --instance "$sandbox_name" --workspace "$workspace" --address "$self_address" --version "$CODEX_VERSION"
 fi
