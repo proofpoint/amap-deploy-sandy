@@ -241,7 +241,7 @@ class UnifiedEvidenceTest(unittest.TestCase):
                             "native adoption policy_hash is malformed or differs"),
             "history": ("UPDATE unified_adoptions SET history_sha256=NULL", "native adoption history digest is malformed"),
             "previous fingerprint": ("UPDATE unified_adoptions SET previous_fingerprint='" + "F" * 64 + "'",
-                                     "native adoption previous fingerprint is malformed"),
+                                     "native adoption previous_fingerprint is malformed or differs"),
         }
         journal = self.fixture.state / "journal.sqlite3"
         original = journal.read_bytes()
@@ -295,7 +295,8 @@ class UnifiedEvidenceTest(unittest.TestCase):
         path.write_text(json.dumps({**json.loads(path.read_text()), "policy_hash": malformed}))
         self._native_adoption(f"UPDATE unified_binding SET policy_hash='{malformed}'")
         self._native_adoption(f"UPDATE unified_adoptions SET policy_hash='{malformed}'")
-        self._adoption_named(prov, home, record, "policy_hash")
+        self.assertIn("codex unified UNKNOWN: codex-test: native adoption policy_hash has no valid expected value",
+                      self._unified(prov, home, record))
 
     def test_a_writer_between_the_two_journal_reads_cannot_mix_snapshots(self):
         """Before, the row's policy_hash disagrees with the binding. A writer commits a new binding and
@@ -368,7 +369,7 @@ class UnifiedEvidenceTest(unittest.TestCase):
         """The witness both gates reproduced: only the row's previous_fingerprint changes."""
         prov, home, record = self._host()
         self._native_adoption("UPDATE unified_adoptions SET previous_fingerprint='" + "f" * 64 + "'")
-        self.assertTrue(any("native adoption previous fingerprint differs from the recorded expectation" in p
+        self.assertTrue(any("native adoption previous_fingerprint is malformed or differs" in p
                             for p in self._unified(prov, home, record)))
         with self.assertRaisesRegex(ValueError, "not confirmed"):
             transition.confirmed_adoption(transition.config_at(self.fixture.state), transition.read_record(self.fixture.state))
@@ -391,6 +392,88 @@ class UnifiedEvidenceTest(unittest.TestCase):
         self._record(lambda value: value.update(previous_fingerprint="e" * 64))
         with self.assertRaisesRegex(ValueError, "not confirmed"):
             transition.confirmed_adoption(transition.config_at(self.fixture.state), transition.read_record(self.fixture.state))
+
+    def _startup_refuses(self):
+        try:
+            transition.confirmed_adoption(transition.config_at(self.fixture.state),
+                                          transition.read_record(self.fixture.state))
+        except ValueError as exc:
+            return str(exc)
+        return None
+
+    def test_host_verify_names_a_problem_wherever_startup_refuses(self):
+        """One mutation matrix through both callers of codex_adoption: startup's refusal must
+        never meet a clean host verdict."""
+        other = "00000000-0000-4000-8000-000000000000"
+        matrix = {
+            "planned": "UPDATE unified_adoptions SET state='planned'",
+            "row deleted": "DELETE FROM unified_adoptions",
+            "table missing": "DROP TABLE unified_adoptions",
+            "thread": f"UPDATE unified_adoptions SET thread_id='{other}'",
+            "fingerprint": "UPDATE unified_adoptions SET fingerprint='" + "c" * 64 + "'",
+            "previous_fingerprint": "UPDATE unified_adoptions SET previous_fingerprint='" + "f" * 64 + "'",
+            "policy_hash": "UPDATE unified_adoptions SET policy_hash='" + "b" * 64 + "'",
+            "history NULL": "UPDATE unified_adoptions SET history_sha256=NULL",
+            "history upper": "UPDATE unified_adoptions SET history_sha256='" + "B" * 64 + "'",
+            "binding policy": "UPDATE unified_binding SET policy_hash='" + "d" * 64 + "'",
+            "binding thread": f"UPDATE unified_binding SET thread_id='{other}'",
+            "binding model": "UPDATE unified_binding SET effective_model='another-model'",
+            "instance fingerprint": "UPDATE instance SET fingerprint='" + "e" * 64 + "'",
+        }
+        prov, home, record = self._host()
+        self.assertIsNone(self._startup_refuses())
+        self.assertEqual(self._unified(prov, home, record), [])
+        journal = self.fixture.state / "journal.sqlite3"
+        original = journal.read_bytes()
+        for label, sql in matrix.items():
+            with self.subTest(label):
+                journal.write_bytes(original)
+                self._native_adoption(sql)
+                refusal = self._startup_refuses()
+                self.assertIsNotNone(refusal, "startup accepts " + label)
+                self.assertNotEqual(self._unified(prov, home, record), [], (label, refusal))
+        journal.write_bytes(original)
+
+    def test_startup_reads_the_binding_and_adoption_row_in_one_snapshot(self):
+        """The writer that would pair an old binding with a new row, run against startup."""
+        import sqlite3
+        from contextlib import closing
+        from unittest import mock
+        journal = self.fixture.state / "journal.sqlite3"
+        good, other = self.record["policy_hash"], "d" * 64
+        self._native_adoption(f"UPDATE unified_adoptions SET policy_hash='{other}'")
+        real_connect = sqlite3.connect
+        outcome = []
+
+        def writer():
+            try:
+                with closing(real_connect(journal, timeout=0)) as db, db:
+                    db.execute(f"UPDATE unified_binding SET policy_hash='{other}'")
+                    db.execute(f"UPDATE unified_adoptions SET policy_hash='{good}'")
+                outcome.append("committed")
+            except sqlite3.OperationalError as exc:
+                outcome.append("refused: " + str(exc))
+
+        class Interleaved:
+            def __init__(self, db):
+                object.__setattr__(self, "db", db)
+
+            def __getattr__(self, name):
+                return getattr(self.db, name)
+
+            def __setattr__(self, name, value):
+                setattr(self.db, name, value)
+
+            def execute(self, sql, *args):
+                if "FROM unified_adoptions" in sql and not outcome:
+                    writer()
+                return self.db.execute(sql, *args)
+
+        with mock.patch.object(sqlite3, "connect", side_effect=lambda *a, **k: Interleaved(real_connect(*a, **k))):
+            refusal = self._startup_refuses()
+        self.assertEqual(len(outcome), 1, outcome)
+        self.assertIsNotNone(refusal, outcome)
+        self.assertIn("native adoption policy_hash is malformed or differs", refusal)
 
     def test_an_adopted_sandbox_carries_the_workspace_binding_note(self):
         prov, home, record = self._host()
@@ -456,6 +539,38 @@ class UnifiedEvidenceTest(unittest.TestCase):
             with self.subTest(key=key):
                 (self.fixture.state / settings.RECEIPT).write_text(json.dumps({**receipt, key: value}))
                 self.assertTrue(any(name in p for p in verifier.problems(self.fixture.state, self.status)), key)
+
+class InstalledAdoptionClosureTest(unittest.TestCase):
+    """The installed payload's Codex modules import with only the payload on the path (-I -S, from an
+    unrelated directory), so every module a startup or verify path reaches is shipped beside it."""
+
+    def test_every_installed_codex_module_imports_and_the_transition_entry_runs(self):
+        import subprocess
+        import tempfile
+        import _workspace
+        import amap_sandy as prov
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            prov.feature_root(home).mkdir(parents=True)
+            prov.install_feature_payload(home, prov.DEFAULT_CONNECTOR_SRC, dry_run=False,
+                                         codex_src=_workspace.CODEX_CONNECTOR_ROOT)
+            installed = prov.feature_payload_dir(home) / "codex"
+            modules = sorted(p.stem for p in installed.glob("codex_*.py"))
+            self.assertIn("codex_adoption", modules)
+            elsewhere = root / "elsewhere"
+            elsewhere.mkdir()
+            code = "import sys; sys.path[:0] = [sys.argv[1]]\nfor name in sys.argv[2:]: __import__(name)"
+            run = subprocess.run([sys.executable, "-I", "-S", "-c", code, str(installed), *modules],
+                                 cwd=elsewhere, capture_output=True, text=True)
+            self.assertEqual(run.returncode, 0, run.stderr)
+            state = root / "state"
+            state.mkdir()
+            # The relay runs the entry as a script, whose own directory leads sys.path; -I would drop it
+            # (-P), so the entry keeps -I's other isolation: -E -s, plus -S.
+            route = subprocess.run([sys.executable, "-E", "-s", "-S", str(installed / "transition"), "--state",
+                                    str(state), "entry-mode"], cwd=elsewhere, capture_output=True, text=True)
+            self.assertEqual((route.returncode, route.stdout.strip()), (0, "separate"), route.stderr)
 
 
 if __name__ == "__main__":

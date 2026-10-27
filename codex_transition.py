@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Prepare a stopped instance's explicit unified transition; never start it."""
 import argparse
-from contextlib import closing
 import json
 import os
 from pathlib import Path
@@ -10,6 +9,7 @@ import sys
 import time
 import subprocess
 
+import codex_adoption as adoptions
 import codex_assets as assets
 import codex_fleet as fleet
 import codex_settings as settings
@@ -130,32 +130,20 @@ def matching_status(config, *, fingerprint, thread=None):
 
 
 def confirmed_adoption(config, record):
-    """Require the connector's committed adoption and matching policy binding."""
-    import sqlite3
+    """Require the connector's committed adoption and matching policy binding (codex_adoption,
+    the rule host verify applies), plus the model this configuration selects."""
     from amap_codex.config import Config
     previous = Config.load(config.state_dir / PREVIOUS, create_state=False)
-    path = config.state_dir / "journal.sqlite3"
-    # Config/CLI enforce the same journal leaf rule. URI mode prevents creation.
-    if path.is_symlink() or not path.is_file():
-        raise ValueError("adoption journal must be an existing regular file")
-    with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as db:
-        db.row_factory = sqlite3.Row
-        try:
-            adoption = db.execute("SELECT * FROM unified_adoptions WHERE singleton=1").fetchone()
-            binding = db.execute("SELECT * FROM unified_binding WHERE instance_id=?", (config.instance_id,)).fetchone()
-        except sqlite3.Error as exc:
-            raise ValueError("confirmed native adoption evidence is unavailable") from exc
-    if (adoption is None or binding is None or adoption["state"] != "confirmed"
-            or adoption["thread_id"] != record["thread"] or binding["thread_id"] != record["thread"]
-            or adoption["fingerprint"] != config.fingerprint()
-            or adoption["fingerprint"] != record["fingerprint"]
-            or adoption["previous_fingerprint"] != previous.fingerprint()
-            or adoption["previous_fingerprint"] != record["previous_fingerprint"]
-            or adoption["policy_hash"] != binding["policy_hash"]
-            or not re.fullmatch("[a-f0-9]{64}", adoption["policy_hash"])
-            or not re.fullmatch("[a-f0-9]{64}", adoption["history_sha256"])
-            or (config.codex_model is not None and binding["effective_model"] != config.codex_model)):
-        raise ValueError("native adoption, history or protected policy binding is not confirmed")
+    binding, adoption = adoptions.evidence(config.state_dir / "journal.sqlite3", config.instance_id)
+    found = ["durable unified binding is unavailable"] if binding is None else adoptions.problems(
+        adoption, thread=(record["thread"], binding["thread_id"]),
+        fingerprint=(config.fingerprint(), record["fingerprint"], binding["fingerprint"]),
+        previous_fingerprint=(previous.fingerprint(), record.get("previous_fingerprint")),
+        policy_hash=(binding["policy_hash"],))
+    if not found and config.codex_model is not None and binding["effective_model"] != config.codex_model:
+        found.append("durable binding names another model")
+    if found:
+        raise ValueError("native adoption, history or protected policy binding is not confirmed: " + "; ".join(found))
     return adoption["policy_hash"]
 
 
