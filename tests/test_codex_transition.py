@@ -97,12 +97,14 @@ class TransitionTest(unittest.TestCase):
         target = transition.config_at(self.state)
         with closing(sqlite3.connect(self.state / "journal.sqlite3")) as db, db:
             db.execute("UPDATE instance SET fingerprint=?,thread_id=?", (target.fingerprint(), THREAD))
-            db.execute("CREATE TABLE unified_adoptions (singleton INTEGER PRIMARY KEY, thread_id TEXT, "
-                       "previous_fingerprint TEXT, fingerprint TEXT, policy_hash TEXT, history_sha256 TEXT, state TEXT)")
+            # The connector's DDL (amap_codex.unified_maintenance), constraints included.
+            db.execute("CREATE TABLE unified_adoptions (singleton INTEGER PRIMARY KEY CHECK(singleton=1), "
+                       "thread_id TEXT NOT NULL, previous_fingerprint TEXT NOT NULL, fingerprint TEXT NOT NULL, "
+                       "policy_hash TEXT NOT NULL, history_sha256 TEXT NOT NULL, state TEXT NOT NULL)")
             db.execute("INSERT INTO unified_adoptions VALUES(1,?,?,?,?,?,?)", (THREAD, self.previous.fingerprint(),
                        target.fingerprint(), "a" * 64, "b" * 64, "confirmed" if confirmed else "planned"))
-            db.execute("CREATE TABLE unified_binding (instance_id TEXT PRIMARY KEY, thread_id TEXT, "
-                       "policy_hash TEXT, effective_model TEXT)")
+            db.execute("CREATE TABLE unified_binding (instance_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, "
+                       "policy_hash TEXT NOT NULL, effective_model TEXT NOT NULL)")
             db.execute("INSERT INTO unified_binding VALUES(?,?,?,?)", (target.instance_id, THREAD,
                        ("a" if policy_matches else "c") * 64, target.codex_model))
 
