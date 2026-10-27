@@ -590,8 +590,22 @@ checks; its results do not establish target-host acceptance.
 
 ### Experimental unified conversation: existing-instance transition
 
-The Codex pin names merged connector main commit
-`e10eb2cf22a1056d1506938ef0669bfde582ff75`. Before end-to-end execution,
+With the fleet choice set to unified, ordinary relay and interactive launches
+recognize an existing confirmed adoption. They verify its retained previous and
+target configurations, committed adoption and canonical binding, current pane
+settings, and Sandy instance/workspace/lane identity before selecting that
+runtime. The full native argv startup gate still applies on every new execution
+environment. No per-process separate-mode override is needed.
+
+A prepared, malformed, mismatched or mixed fresh/adopted record holds; it is
+never interpreted as permission to initialize another conversation. Instances
+without an adoption record continue through the fresh-state guard, which refuses
+unexplained legacy state. The transition below retains the mailbox address and
+delivery journal; it does not reset the router or require stopping other
+instances. Keep only the target service and native clients stopped for adoption.
+
+The Codex pin names connector commit
+`197ed8bbcd6cecfee06ccf101c463e2e0c0e34d9`. Before end-to-end execution,
 require the approved deployment commit for the host's line, full exact-pin
 suite and canary evidence, the operator's unified-model precedence decision,
 and actual-host acceptance of the paused-restart procedure below.

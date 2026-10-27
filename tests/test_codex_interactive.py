@@ -332,11 +332,19 @@ class UnifiedLaunchTest(unittest.TestCase):
         self.fixture = tt.TransitionTest()
         self.fixture.setUp()
         self.addCleanup(self.fixture.doCleanups)
+        import _execution_identity
+        _execution_identity.install_driver(self.box.root / "bin/python3", self.fixture.identity_driver)
         self.fixture.prepare(apply=True)
         self.box.env.update(CODEX_HOME=str(self.fixture.native_home), SANDY_SKIP_PERMISSIONS="true")
         launcher = self.box.payload / "interactive-launch"
         launcher.write_text(launcher.read_text().replace("STATE=" + str(self.box.state),
                                                        "STATE=" + str(self.fixture.state)))
+        session = self.box.root / "sandy-session.json"
+        session.write_text(json.dumps({"sandbox_name": self.fixture.previous.instance_id,
+                                       "workspace": self.fixture.previous.cwd}))
+        launcher.write_text(launcher.read_text().replace("/etc/sandy-session.json", str(session)))
+        self.box.env.update(AMAP_INBOX_DIR=str(self.fixture.root / "mail"),
+                            AMAP_PEER_DIR=str(self.fixture.root / "peer"))
 
     def _startup_challenge(self):
         import codex_settings as settings
@@ -366,6 +374,25 @@ class UnifiedLaunchTest(unittest.TestCase):
         self.assertIn("adoption is pending", result.stderr)
         self.assertIsNone(self.box.interactive())
         self.assertIsNone(self.box.execd())
+
+    def test_unified_fleet_choice_uses_confirmed_adoption_without_fresh_birth(self):
+        import codex_transition as transition
+        self.fixture.commit_adoption_fixture()
+        transition.confirm(self.fixture.state, apply=True)
+        self._startup_challenge()
+        result = self.box.run("interactive-launch", "codex", "--model", "test-model",
+                              "--sandbox", "danger-full-access", "--ask-for-approval", "never",
+                              AMAP_CODEX_CONVERSATION_MODE="unified")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.box.execd(), [])
+        self.assertFalse((self.fixture.state / "fresh-birth.json").exists())
+
+    def test_unified_fleet_choice_refuses_pending_adoption_without_fresh_birth(self):
+        result = self.box.run("interactive-launch", "codex", AMAP_CODEX_CONVERSATION_MODE="unified")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("adoption is pending", result.stderr)
+        self.assertIsNone(self.box.execd())
+        self.assertFalse((self.fixture.state / "fresh-birth.json").exists())
 
     def test_operator_pause_blocks_attachment_even_after_confirmation(self):
         import codex_transition as transition
