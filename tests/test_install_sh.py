@@ -139,9 +139,10 @@ class InstallShTest(unittest.TestCase):
         return ("#!/bin/sh\ncase \"$1\" in\n  --print-schema) cat <<'EOF'\n" + json.dumps(SCHEMA)
                 + "\nEOF\n;;\n  *) echo '{\"sandboxes\": []}';;\nesac\n")
 
-    def _run(self, env=None):
+    def _run(self, env=None, umask=None):
         r = subprocess.run(["bash", str(INSTALLER)], env=env or self.env,
-                           capture_output=True, text=True, timeout=300)
+                           capture_output=True, text=True, timeout=300,
+                           preexec_fn=None if umask is None else (lambda: os.umask(umask)))
         return r.returncode, r.stdout + r.stderr
 
     def _calls(self):
@@ -185,6 +186,43 @@ class InstallShTest(unittest.TestCase):
         self.assertTrue((payload / "codex/relay").is_file())
         self.assertTrue((payload / "codex/src/amap_codex/supervisor.py").is_file())
         self.assertNotIn("a Codex sandbox gets no supervisor", out)
+
+    def _codex_asset(self):
+        return self.amap_dir / prov.CODEX_CONNECTOR_REPO_NAME / "config" / "operator-instructions.md"
+
+    def test_a_umask_002_host_installs_the_codex_payload(self):
+        # Under 002 git checks out group-writable files, and install refuses a
+        # group-writable protected Codex asset.
+        rc, out = self._run({**self.env, "AMAP_CODEX": "1"}, umask=0o002)
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self._codex_asset().stat().st_mode & 0o022, 0)
+        self.assertTrue((self.sandy_home / "features/amap/payload/codex/relay").is_file())
+
+    def test_a_group_writable_checkout_is_repaired_on_the_next_run(self):
+        env = {**self.env, "AMAP_CODEX": "1"}
+        rc, out = self._run(env)
+        self.assertEqual(rc, 0, out)
+        asset = self._codex_asset()
+        asset.chmod(0o664)
+        rc, out = self._run(env)
+        self.assertEqual(rc, 0, out)
+        self.assertIn(f"removing group/world write from 1 file(s) in {prov.CODEX_CONNECTOR_REPO_NAME}", out)
+        self.assertEqual(asset.stat().st_mode & 0o777, 0o644)
+        self.assertEqual(_git("status", "--porcelain", cwd=asset.parents[1]), "")
+
+    def test_a_failed_install_is_reported_and_starts_no_router(self):
+        env = {**self.env, "AMAP_CODEX": "1"}
+        asset = self._codex_asset()
+        rc, out = self._run(env)
+        self.assertEqual(rc, 0, out)
+        # A second link makes the protected asset one install refuses.
+        os.link(asset, self.root / "second-link")
+        (self.root / "running").unlink()
+        self.log.unlink()
+        rc, out = self._run(env)
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("install --apply reported a failure", out)
+        self.assertFalse(any(c.startswith("docker run") for c in self._calls()), self._calls())
 
     def test_the_fleet_domain_is_this_hosts_and_takes_a_base_from_the_environment(self):
         rc, out = self._run()
