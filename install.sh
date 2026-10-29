@@ -36,6 +36,8 @@ ROUTER_CONTAINER=amap-router-local
 # The checkouts are the ones under $AMAP_DIR: an override pointing elsewhere
 # would install and build from a tree this script did not put at its pin.
 unset AMAP_ROUTER_REPO AMAP_HOP_ROUTER_REPO AMAP_CONNECTOR_REPO AMAP_CODEX_CONNECTOR_REPO
+# Checkouts and installed files are the operator's alone.
+umask 022
 
 say() { printf '[amap] %s\n' "$*"; }
 die() { printf '[amap] error: %s\n' "$*" >&2; exit 1; }
@@ -67,6 +69,23 @@ say "putting the router and the connector at their pinned commits"
 AMAP_REPO_BASE="$AMAP_REPO_BASE" python3 "$dest/amap-siblings.py" --apply --base "$AMAP_DIR" \
   || die "a sibling checkout could not be put at its pin; see above."
 
+# install refuses a group- or world-writable protected Codex asset, which a
+# checkout made under a umask of 002 (Ubuntu's default) has. Only regular
+# files in this script's checkouts lose group/world write; git tracks no
+# such bit, so the checkouts stay clean.
+checkouts=$(python3 -I -c 'import sys; sys.path.insert(0, sys.argv[1]); import siblings
+print("\n".join(siblings.checkout_dir(s) for s in siblings.load_pins()))' "$dest") \
+  || die "siblings.json could not be read; see above."
+for name in amap-deploy-sandy $checkouts; do
+  dir="$AMAP_DIR/$name"
+  [ -d "$dir" ] || continue
+  writable=$(find "$dir" -path "$dir/.git" -prune -o -type f \( -perm -020 -o -perm -002 \) -print | wc -l)
+  if [ "$writable" -gt 0 ]; then
+    say "removing group/world write from $writable file(s) in $name"
+    find "$dir" -path "$dir/.git" -prune -o -type f \( -perm -020 -o -perm -002 \) -exec chmod go-w {} +
+  fi
+done
+
 # --- an existing host's fleet domain ---------------------------------------
 # A fresh host's template gets sandy.<host>.<base> from install below. An
 # existing host keeps its domain: it is reported when it differs from this
@@ -97,7 +116,8 @@ fi
 # --- the manifest, the payload, the router's config and its directories ---
 say "installing the AMAP feature into $SANDY_HOME/features/amap"
 SANDY_HOME="$SANDY_HOME" python3 "$AMAP_SANDY" install --apply \
-  ${AMAP_FLEET_DOMAIN_BASE:+--fleet-domain-base "$AMAP_FLEET_DOMAIN_BASE"}
+  ${AMAP_FLEET_DOMAIN_BASE:+--fleet-domain-base "$AMAP_FLEET_DOMAIN_BASE"} \
+  || die "install --apply reported a failure (FAIL above); the router was not started. Fix it, then re-run."
 CONFIG="$SANDY_HOME/features/amap/router.json"
 [ -f "$CONFIG" ] || die "install did not write $CONFIG; see its output above."
 
