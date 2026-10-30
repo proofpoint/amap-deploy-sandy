@@ -9,19 +9,30 @@ over (REPORTED sandy a010af93). sandy regenerates its other build files
 byte-identically at the same commit, so this closed list is all that moves.
 
 It runs as the agents' account (`<op>`), never as root, so the copies are
-that account's. It copies exactly MAN's `hdot` entries, keeping names and
-modes, and refuses:
-  - an entry missing from SEED, or a hash dotfile in SEED that MAN does not list;
-  - anything that is not a regular file, or a link anywhere on the way;
+that account's; the caller binds the process to `<op>`. It copies exactly
+MAN's `hdot` entries, keeping names and modes. Every path is opened from `/`
+one component at a time with O_NOFOLLOW, so a link anywhere on the way to
+MAN, SEED, SANDY_HOME or an entry is refused, never followed. It refuses,
+before anything is written:
+  - an entry missing from SEED, or a hash dotfile in SEED or SANDY_HOME that
+    MAN does not list (a `sandboxes/` entry that is a link, not a directory, or
+    an off-pattern slug holding a project hash counts as extra);
+  - anything that is not a regular file with one link;
   - a source whose sha256 or mode differs from MAN's;
-  - an existing destination file that differs (an identical one is `present`);
+  - a destination file that differs from the source, or is not owned by the
+    running account (an identical one is `present`), and a destination
+    directory not owned by it;
   - a DST that is missing or not a plain directory (it is never created).
+
+Writes are atomic per file (temp, fsync, rename, directory fsync), not for
+the whole set. An internal error after N files leaves those N in place and
+prints no SEED or PASS line; a rerun reports them `present` and finishes.
 
 Output: one `SEED <name> mode=<octal> sha256=<hex> copied|present` line per
 entry, then `M1-SEED-COPY PASS n=<count> man=<sha256 of MAN>` last.
 
 Exit status: 0 PASS; 1 REFUSED (one `REFUSE <reason>` line on stderr, and
-nothing further written); 2 a usage error; 3 an internal error.
+nothing written); 2 a usage error; 3 an internal error.
 """
 
 import errno
@@ -42,12 +53,19 @@ MAX_HDOT_BYTES = 1 << 20
 TOP_PATTERNS = (".base_build_hash", ".build_hash*", ".skills_*_build_hash", ".skill_version_*")
 SANDBOX_NAME = ".project_build_hash"
 _SLUG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+_TOP_RE = re.compile(r"[!-~]+\Z")  # printable, no whitespace
 _SHA_RE = re.compile(r"[0-9a-f]{64}\Z")
 _MODE_RE = re.compile(r"0[0-7]{3}\Z")
 
+_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+
+
+def _euid():
+    return os.geteuid()
+
 
 class Refused(Exception):
-    """A contract violation: exit 1, nothing further written."""
+    """A contract violation: exit 1, nothing written."""
 
 
 class Usage(Exception):
@@ -58,27 +76,27 @@ def is_hdot_name(name):
     """True for a name in HDOT's closed set, relative to SANDY_HOME."""
     parts = name.split("/")
     if len(parts) == 1:
-        return any(fnmatch.fnmatchcase(parts[0], p) for p in TOP_PATTERNS) and "/" not in parts[0]
+        return bool(_TOP_RE.match(name)) and any(fnmatch.fnmatchcase(name, p) for p in TOP_PATTERNS)
     return (len(parts) == 3 and parts[0] == "sandboxes" and bool(_SLUG_RE.match(parts[1]))
             and parts[2] == SANDBOX_NAME)
 
 
 # ------------------------------------------------------------------ files
 
-def _open_dir(base_fd, parts):
+def _open_dir(base_fd, parts, what):
     """A descriptor for directory PARTS under BASE_FD, every component a real
-    directory; None if one is absent. A link or non-directory raises Refused."""
+    directory; None if one is absent. A link or non-directory is Refused."""
     fd = base_fd
     for part in parts:
         try:
-            nfd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
+            nfd = os.open(part, _DIR_FLAGS, dir_fd=fd)
         except FileNotFoundError:
             nfd = None
         except OSError as exc:
+            if fd != base_fd:
+                os.close(fd)
             if exc.errno in (errno.ELOOP, errno.ENOTDIR):
-                if fd != base_fd:
-                    os.close(fd)
-                raise Refused(f"{part}: not a plain directory") from None
+                raise Refused(f"{what}: {part} is not a plain directory") from None
             raise
         if fd != base_fd:
             os.close(fd)
@@ -88,8 +106,26 @@ def _open_dir(base_fd, parts):
     return fd
 
 
+def open_abs_dir(path, what):
+    """A descriptor for absolute directory PATH, walked from / with O_NOFOLLOW
+    at every component; Refused if any is absent, a link or not a directory."""
+    if not path.startswith("/") or os.path.normpath(path) != path or path.startswith("//"):
+        raise Usage(f"{what} must be a normalised absolute path")
+    root = os.open("/", _DIR_FLAGS)
+    try:
+        fd = _open_dir(root, [p for p in path.split("/") if p], f"{what} {path}")
+    finally:
+        pass
+    if fd is None:
+        os.close(root)
+        raise Refused(f"{what} {path}: absent")
+    if fd != root:
+        os.close(root)
+    return fd
+
+
 def _read_regular(dir_fd, name, limit):
-    """(bytes, mode) of regular file NAME in DIR_FD; None if absent."""
+    """(bytes, mode, uid) of regular file NAME in DIR_FD; None if absent."""
     try:
         fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, dir_fd=dir_fd)
     except FileNotFoundError:
@@ -115,40 +151,37 @@ def _read_regular(dir_fd, name, limit):
             if total > limit:
                 raise Refused(f"{name}: larger than {limit} bytes")
             chunks.append(chunk)
-        return b"".join(chunks), stat.S_IMODE(st.st_mode)
+        return b"".join(chunks), stat.S_IMODE(st.st_mode), st.st_uid
     finally:
         os.close(fd)
 
 
-def open_root(path, what):
-    if not path.startswith("/") or os.path.normpath(path) != path:
-        raise Usage(f"{what} must be a normalised absolute path")
-    try:
-        st = os.lstat(path)
-    except FileNotFoundError:
-        raise Refused(f"{what} {path}: absent") from None
-    if not stat.S_ISDIR(st.st_mode):
-        raise Refused(f"{what} {path}: not a plain directory")
-    return os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
-
-
 # ------------------------------------------------------------------ MAN
+
+def _no_duplicates(pairs):
+    seen = {}
+    for key, value in pairs:
+        if key in seen:
+            raise Refused(f"MAN: duplicate key {key!r}")
+        seen[key] = value
+    return seen
+
 
 def load_hdot(man_path):
     """(entries, man_sha): MAN's validated `hdot` list and MAN's sha256."""
-    if not man_path.startswith("/") or os.path.normpath(man_path) != man_path:
+    if not man_path.startswith("/") or os.path.normpath(man_path) != man_path or man_path.startswith("//"):
         raise Usage("--man must be a normalised absolute path")
     head, name = os.path.split(man_path)
-    dfd = os.open(head, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    dfd = open_abs_dir(head, "MAN's directory")
     try:
         got = _read_regular(dfd, name, MAX_MAN_BYTES)
     finally:
         os.close(dfd)
     if got is None:
         raise Refused(f"MAN {man_path}: absent")
-    raw, _ = got
+    raw = got[0]
     try:
-        man = json.loads(raw.decode("utf-8"))
+        man = json.loads(raw.decode("utf-8"), object_pairs_hook=_no_duplicates)
     except (UnicodeDecodeError, ValueError):
         raise Refused("MAN: not JSON") from None
     if not isinstance(man, dict) or man.get("schema") != MAN_SCHEMA:
@@ -171,43 +204,48 @@ def load_hdot(man_path):
 
 # ------------------------------------------------------------------ the copy
 
-def seed_names(src_fd):
-    """Every HDOT-shaped name in the seed, relative to it."""
-    names = set()
-    for n in os.listdir(src_fd):
-        if is_hdot_name(n):
-            names.add(n)
-    sfd = _open_dir(src_fd, ["sandboxes"])
-    if sfd is not None:
-        try:
-            for slug in os.listdir(sfd):
-                name = f"sandboxes/{slug}/{SANDBOX_NAME}"
-                if not _SLUG_RE.match(slug):
-                    continue
-                st = os.stat(slug, dir_fd=sfd, follow_symlinks=False)
-                if not stat.S_ISDIR(st.st_mode):
-                    continue
-                try:
-                    os.stat(f"{slug}/{SANDBOX_NAME}", dir_fd=sfd, follow_symlinks=False)
-                except FileNotFoundError:
-                    continue
-                names.add(name)
-        finally:
-            os.close(sfd)
+def hash_names(root_fd, what):
+    """Every hash dotfile under ROOT_FD, relative to it. A `sandboxes/` entry
+    that is a link or not a directory is Refused; an off-pattern slug holding
+    a project hash is returned as is, so the caller reports it as extra."""
+    names = {n for n in os.listdir(root_fd)
+             if "/" not in n and any(fnmatch.fnmatchcase(n, p) for p in TOP_PATTERNS)}
+    sfd = _open_dir(root_fd, ["sandboxes"], what)
+    if sfd is None:
+        return names
+    try:
+        for slug in os.listdir(sfd):
+            st = os.stat(slug, dir_fd=sfd, follow_symlinks=False)
+            if not stat.S_ISDIR(st.st_mode):
+                raise Refused(f"{what}: sandboxes/{slug!r} is not a plain directory")
+            try:
+                os.stat(f"{slug}/{SANDBOX_NAME}", dir_fd=sfd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            names.add(f"sandboxes/{slug}/{SANDBOX_NAME}")
+    finally:
+        os.close(sfd)
     return names
+
+
+def _check_owner(st, label):
+    if st.st_uid != _euid():
+        raise Refused(f"{label}: owned by uid {st.st_uid}, not the running account")
 
 
 def plan(hdot, src_fd, dst_fd):
     """[(entry, data, state)] with state 'copy' or 'present'; Refused on any
     violation, before anything is written."""
     listed = {e["name"] for e in hdot}
-    extra = sorted(seed_names(src_fd) - listed)
-    if extra:
-        raise Refused(f"the seed holds hash dotfiles MAN does not list: {', '.join(extra)}")
+    for fd, what in ((src_fd, "the seed"), (dst_fd, "the destination")):
+        extra = sorted(hash_names(fd, what) - listed)
+        if extra:
+            raise Refused(f"{what} holds hash dotfiles MAN does not list: {', '.join(map(repr, extra))}")
+    _check_owner(os.fstat(dst_fd), "the destination")
     out = []
     for entry in hdot:
         parts = entry["name"].split("/")
-        sdir = _open_dir(src_fd, parts[:-1])
+        sdir = _open_dir(src_fd, parts[:-1], "the seed")
         if sdir is None:
             raise Refused(f"{entry['name']}: absent from the seed")
         try:
@@ -217,15 +255,17 @@ def plan(hdot, src_fd, dst_fd):
                 os.close(sdir)
         if got is None:
             raise Refused(f"{entry['name']}: absent from the seed")
-        data, mode = got
+        data, mode, _ = got
         if hashlib.sha256(data).hexdigest() != entry["sha256"]:
             raise Refused(f"{entry['name']}: the seed's sha256 differs from MAN's")
         if mode != int(entry["mode"], 8):
             raise Refused(f"{entry['name']}: the seed's mode {mode:04o} differs from MAN's {entry['mode']}")
-        ddir = _open_dir(dst_fd, parts[:-1])
         state = "copy"
+        ddir = _open_dir(dst_fd, parts[:-1], "the destination")
         if ddir is not None:
             try:
+                if ddir != dst_fd:
+                    _check_owner(os.fstat(ddir), f"{'/'.join(parts[:-1])}/ in the destination")
                 have = _read_regular(ddir, parts[-1], MAX_HDOT_BYTES)
             finally:
                 if ddir != dst_fd:
@@ -233,6 +273,9 @@ def plan(hdot, src_fd, dst_fd):
             if have is not None:
                 if have[0] != data or have[1] != mode:
                     raise Refused(f"{entry['name']}: the destination already holds a different file")
+                if have[2] != _euid():
+                    raise Refused(f"{entry['name']}: the destination's copy is owned by uid {have[2]}, "
+                                  "not the running account")
                 state = "present"
         out.append((entry, data, state))
     return out
@@ -248,8 +291,8 @@ def _ensure_dirs(src_fd, dst_fd, parts):
             os.chmod(part, smode, dir_fd=fd, follow_symlinks=False)
         except FileExistsError:
             pass
-        nfd = _open_dir(fd, [part])
-        nsfd = _open_dir(sfd, [part])
+        nfd = _open_dir(fd, [part], "the destination")
+        nsfd = _open_dir(sfd, [part], "the seed")
         if fd != dst_fd:
             os.close(fd)
         if sfd != src_fd:
@@ -311,14 +354,18 @@ def main(argv):
     except Usage as exc:
         print(exc, file=sys.stderr)
         return 2
-    if os.geteuid() == 0:
+    if _euid() == 0:
         print("REFUSE runs as the agents' account, never as root", file=sys.stderr)
         return 1
     src_fd = dst_fd = None
     try:
+        for flag in ("man", "src", "dst"):
+            value = args[flag]
+            if not value.startswith("/") or os.path.normpath(value) != value or value.startswith("//"):
+                raise Usage(f"--{flag} must be a normalised absolute path")
         hdot, man_sha = load_hdot(args["man"])
-        src_fd = open_root(args["src"], "--src")
-        dst_fd = open_root(args["dst"], "--dst")
+        src_fd = open_abs_dir(args["src"], "--src")
+        dst_fd = open_abs_dir(args["dst"], "--dst")
         steps = plan(hdot, src_fd, dst_fd)
         lines = []
         for entry, data, state in steps:
