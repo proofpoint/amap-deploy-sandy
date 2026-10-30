@@ -7,6 +7,7 @@
   python3 -I -S -B b6.py state  --instance-data PATH
   python3 -I -S -B b6.py seed   --man MAN --seed SEED --dst SANDY_HOME
   python3 -I -S -B b6.py fprint --man MAN --run-dir DIR --deploy CHECKOUT
+  python3 -I -S -B b6.py graph
 
 Each phase prints `B6 <check> PASS|FAIL <detail>` rows; its last line is
 `M1-B6 <phase> PASS` only when every row passed. Exit status: 0 PASS, 1 FAIL,
@@ -26,6 +27,12 @@ Each phase prints `B6 <check> PASS|FAIL <detail>` rows; its last line is
           `image.id` is MAN's builds.router1.id; and `router-fingerprint
           --verify-image FILE --commit <MAN's builds.router1.commit>` run from
           CHECKOUT prints EXACT and exits 0.
+  graph   the boot-stop contract, read from systemd itself on 206 (NET
+          d0fe2ccb option 0): m1-state-check.service is Type=oneshot,
+          RemainAfterExit, and active; the state mount Requires and is After
+          it, is RequiredBy local-fs.target, carries no nofail and is active
+          from /dev/disk/by-label/m1-state; local-fs.target Requires both
+          mounts; Docker's mount is RequiredBy local-fs.target too.
 """
 
 import errno
@@ -200,10 +207,60 @@ def phase_fprint(man, run_dir, deploy, runner=run):
     return p
 
 
+SYSTEMCTL = "/usr/bin/systemctl"
+CHECK_UNIT = "m1-state-check.service"
+DATA_MOUNT = "srv-m1\\x2dstate.mount"
+DOCKER_MOUNT = "var-lib-docker.mount"
+
+
+def show(unit, props, runner):
+    """{prop: value} from `systemctl show -p ... UNIT`; every PROP once."""
+    rc, out, _ = runner([SYSTEMCTL, "show", "-p", ",".join(props), "--", unit])
+    if rc != 0:
+        return None
+    got = {}
+    for line in out.splitlines():
+        key, sep, value = line.partition("=")
+        if not sep or key not in props or key in got:
+            return None
+        got[key] = value
+    return got if set(got) == set(props) else None
+
+
+def phase_graph(runner=run):
+    p = Phase("graph")
+    c = show(CHECK_UNIT, ("Type", "RemainAfterExit", "ActiveState", "Result"), runner)
+    p.row("check-unit", c is not None, f"{CHECK_UNIT}: {c}")
+    if c:
+        p.row("check-oneshot", c["Type"] == "oneshot", c["Type"])
+        p.row("check-remain", c["RemainAfterExit"] == "yes", c["RemainAfterExit"])
+        p.row("check-active", c["ActiveState"] == "active" and c["Result"] == "success",
+              f'{c["ActiveState"]}/{c["Result"]}')
+    m = show(DATA_MOUNT, ("Requires", "After", "RequiredBy", "WantedBy", "Options", "What", "Where", "ActiveState"),
+             runner)
+    p.row("state-mount", m is not None, f"{DATA_MOUNT}: {m}")
+    if m:
+        p.row("mount-requires-check", CHECK_UNIT in m["Requires"].split(), m["Requires"])
+        p.row("mount-after-check", CHECK_UNIT in m["After"].split(), m["After"])
+        p.row("mount-required-by-local-fs", "local-fs.target" in m["RequiredBy"].split(), m["RequiredBy"])
+        p.row("mount-not-merely-wanted", "local-fs.target" not in m["WantedBy"].split(), m["WantedBy"])
+        p.row("mount-no-nofail", "nofail" not in m["Options"].split(","), m["Options"])
+        p.row("mount-what-where", (m["What"], m["Where"]) == ("/dev/disk/by-label/m1-state", "/srv/m1-state"),
+              f'{m["What"]} {m["Where"]}')
+        p.row("mount-active", m["ActiveState"] == "active", m["ActiveState"])
+    d = show(DOCKER_MOUNT, ("RequiredBy", "Options", "ActiveState"), runner)
+    p.row("docker-mount", d is not None and "local-fs.target" in d["RequiredBy"].split()
+          and "nofail" not in d["Options"].split(",") and d["ActiveState"] == "active", f"{DOCKER_MOUNT}: {d}")
+    t = show("local-fs.target", ("Requires",), runner)
+    p.row("local-fs-requires", t is not None and {DATA_MOUNT, DOCKER_MOUNT} <= set(t["Requires"].split()),
+          f"local-fs.target: {t}")
+    return p
+
+
 # ------------------------------------------------------------------ the CLI
 
 FLAGS = {"b6d": {"--man"}, "facts": set(), "state": {"--instance-data"},
-         "seed": {"--man", "--seed", "--dst"}, "fprint": {"--man", "--run-dir", "--deploy"}}
+         "seed": {"--man", "--seed", "--dst"}, "fprint": {"--man", "--run-dir", "--deploy"}, "graph": set()}
 
 
 def parse(argv):
@@ -243,6 +300,8 @@ def main(argv, runner=run):
         p = phase_state(a["--instance-data"], runner)
     elif phase == "seed":
         p = phase_seed(a["--man"], man, a["--seed"], a["--dst"], runner)
+    elif phase == "graph":
+        p = phase_graph(runner)
     else:
         p = phase_fprint(man, a["--run-dir"], a["--deploy"], runner)
     for line in p.lines():

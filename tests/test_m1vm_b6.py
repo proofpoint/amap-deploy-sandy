@@ -191,3 +191,86 @@ class CliTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GraphTest(unittest.TestCase):
+    """phase graph against `systemctl show` KEY=VALUE output (INFERRED form
+    until 206; the property names are systemd's documented ones)."""
+
+    GOOD = {
+        "m1-state-check.service": {"Type": "oneshot", "RemainAfterExit": "yes", "ActiveState": "active",
+                                   "Result": "success"},
+        "srv-m1\\x2dstate.mount": {"Requires": "system.slice m1-state-check.service -.mount",
+                                    "After": "m1-state-check.service systemd-journald.socket",
+                                    "RequiredBy": "local-fs.target", "WantedBy": "",
+                                    "Options": "rw,nosuid,nodev,relatime", "What": "/dev/disk/by-label/m1-state",
+                                    "Where": "/srv/m1-state", "ActiveState": "active"},
+        "var-lib-docker.mount": {"RequiredBy": "local-fs.target docker.service", "Options": "rw,nodev,relatime",
+                                 "ActiveState": "active"},
+        "local-fs.target": {"Requires": "srv-m1\\x2dstate.mount var-lib-docker.mount -.mount"},
+    }
+
+    def runner(self, units):
+        def run(argv, root=False, check=True):
+            self.assertEqual(argv[:3], [b6.SYSTEMCTL, "show", "-p"])
+            unit = argv[-1]
+            props = argv[3].split(",")
+            if unit not in units:
+                return 1, "", "no such unit"
+            return 0, "".join(f"{k}={units[unit][k]}\n" for k in props if k in units[unit]), ""
+        return run
+
+    def units(self):
+        return {u: dict(v) for u, v in self.GOOD.items()}
+
+    def test_pass(self):
+        p = b6.phase_graph(self.runner(self.units()))
+        self.assertTrue(p.ok, p.lines())
+        self.assertEqual(p.lines()[-1], "M1-B6 graph PASS")
+
+    def test_each_break(self):
+        breaks = {
+            "simple": ("m1-state-check.service", "Type", "simple"),
+            "no remain": ("m1-state-check.service", "RemainAfterExit", "no"),
+            "check failed": ("m1-state-check.service", "Result", "exit-code"),
+            "check inactive": ("m1-state-check.service", "ActiveState", "failed"),
+            "mount not requiring": ("srv-m1\\x2dstate.mount", "Requires", "system.slice"),
+            "mount not after": ("srv-m1\\x2dstate.mount", "After", "systemd-journald.socket"),
+            "only wanted": ("srv-m1\\x2dstate.mount", "RequiredBy", ""),
+            "wanted too": ("srv-m1\\x2dstate.mount", "WantedBy", "local-fs.target"),
+            "nofail": ("srv-m1\\x2dstate.mount", "Options", "rw,nofail"),
+            "other device": ("srv-m1\\x2dstate.mount", "What", "/dev/sdc"),
+            "mount inactive": ("srv-m1\\x2dstate.mount", "ActiveState", "failed"),
+            "docker wanted": ("var-lib-docker.mount", "RequiredBy", "docker.service"),
+            "docker nofail": ("var-lib-docker.mount", "Options", "nofail"),
+            "local-fs misses state": ("local-fs.target", "Requires", "var-lib-docker.mount"),
+        }
+        for name, (unit, key, value) in breaks.items():
+            with self.subTest(name):
+                units = self.units()
+                units[unit][key] = value
+                self.assertFalse(b6.phase_graph(self.runner(units)).ok)
+
+    def test_missing_unit_or_property(self):
+        units = self.units()
+        units.pop("m1-state-check.service")
+        self.assertFalse(b6.phase_graph(self.runner(units)).ok)
+        units = self.units()
+        units["local-fs.target"] = {}
+        self.assertFalse(b6.phase_graph(self.runner(units)).ok)
+
+    def test_duplicate_property_line_fails(self):
+        def run(argv, root=False, check=True):
+            return 0, "Requires=a\nRequires=b\n", ""
+        self.assertIsNone(b6.show("local-fs.target", ("Requires",), run))
+
+
+class ReadRegularTest(unittest.TestCase):
+    def test_hard_linked_capture_refused(self):
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d)
+        (d / "run").mkdir()
+        f = d / "run" / "router-fingerprint-image-1.json"
+        f.write_text(json.dumps({"source": "image", "image": {"id": IMG}}))
+        os.link(f, d / "second-name")
+        self.assertFalse(b6.phase_fprint(MAN, str(d / "run"), "/d", Runner()).ok)
