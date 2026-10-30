@@ -13,6 +13,10 @@ prints the calls; this module is what they run. Standard library only.
   python3 host_steps.py place SRC DEST --sha256 HEX --mode 0644
                                                   the same, root-owned 0644 (a LaunchDaemon's plist);
                                                   the mode is 0444 or 0644, nothing else
+  python3 host_steps.py install SRC DEST UID GID --sha256 HEX --mode 0600
+                                                  a file owned by UID:GID, 0600 or 0400, refused unless
+                                                  SRC has that sha256 and DEST's directory is UID's own
+                                                  0700 directory
 
 A runtime's secret file, in a directory that only that runtime's uid can open:
 
@@ -208,6 +212,97 @@ def place(src, dest, sha256=None, mode=OVERLAY_MODE):
         try:
             os.write(fd, data)
             os.fchown(fd, OWNER_UID, OWNER_GID)
+            os.fchmod(fd, mode)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.rename(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+
+
+#: The modes `install` may set: owner read-write, or owner read-only.
+INSTALL_MODES = (0o600, 0o400)
+
+
+def _fd_acl_problem(fd, listxattr):
+    """Why the directory open at `fd` carries an ACL, or None. Read through
+    the descriptor, so it is the directory already reached without links.
+    A filesystem that cannot hold extended attributes has no ACL; any other
+    error is a refusal, because an ACL that cannot be read may be there."""
+    try:
+        names = listxattr(fd)
+    except OSError as e:
+        if e.errno in (getattr(errno, "ENOTSUP", -1), getattr(errno, "EOPNOTSUPP", -1)):
+            return None
+        return f"its ACL cannot be read ({e.strerror})"
+    if "system.posix_acl_access" in names or "system.posix_acl_default" in names:
+        return "it carries an ACL"
+    return None
+
+
+def _existing_problem(dfd, name, sha256):
+    """Why an existing `name` in the directory open at `dfd` must not be
+    replaced, or None when it is absent or already the pinned bytes. A link,
+    a non-regular file, a second link or other bytes are refused: install
+    places the pinned bytes, and never overwrites something else."""
+    try:
+        st = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+        return "exists and is not a regular file with one link"
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
+    try:
+        h = hashlib.sha256()
+        while True:
+            chunk = os.read(fd, 1 << 16)
+            if not chunk:
+                break
+            h.update(chunk)
+    finally:
+        os.close(fd)
+    if h.hexdigest() != sha256.lower():
+        return "exists with other bytes than the pin"
+    return None
+
+
+def install(src, dest, uid, gid, sha256, mode, listxattr=getattr(os, "listxattr", None)):
+    """Copy `src` to `dest` as a file owned by `uid`:`gid`, mode 0600 or
+    0400, for a runtime's own configuration (a registry's host.json).
+    Nothing is written unless: the bytes match `sha256`; dest's directory,
+    reached without links, is that owner's 0700 directory and carries no
+    ACL (read through its descriptor before the first byte); and dest is
+    absent or already the pinned bytes. Written under a fresh temporary name
+    (O_EXCL, O_NOFOLLOW), then renamed over dest, as `place`."""
+    if mode not in INSTALL_MODES:
+        raise StepError(f"mode {mode:04o} is not one of " + ", ".join(f"{m:04o}" for m in INSTALL_MODES))
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", sha256 or ""):
+        raise StepError("--sha256 must be 64 hex characters")
+    parent, name = _split(dest)
+    data = _read_source(src)
+    if hashlib.sha256(data).hexdigest() != sha256.lower():
+        raise StepError(f"{src}: sha256 is not the pinned {sha256}; nothing installed")
+    dfd = open_dir(parent)
+    try:
+        st = os.fstat(dfd)
+        if (st.st_uid, st.st_gid, stat.S_IMODE(st.st_mode)) != (uid, gid, 0o700):
+            raise StepError(f"{parent} is {st.st_uid}:{st.st_gid} {stat.S_IMODE(st.st_mode):04o}, not "
+                            f"{uid}:{gid} 0700; nothing installed")
+        if listxattr is None:
+            raise StepError(f"{parent}: its ACL cannot be read on this platform; nothing installed")
+        acl = _fd_acl_problem(dfd, listxattr)
+        if acl:
+            raise StepError(f"{parent}: {acl}; nothing installed")
+        existing = _existing_problem(dfd, name, sha256)
+        if existing:
+            raise StepError(f"{dest} {existing}; not overwritten, nothing installed")
+        tmp = f".{name}.{os.getpid()}.tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dfd)
+        try:
+            os.write(fd, data)
+            os.fchown(fd, uid, gid)
             os.fchmod(fd, mode)
             os.fsync(fd)
         finally:
@@ -3249,6 +3344,10 @@ def main(argv):
             if not re.fullmatch(r"0?[0-7]{3}", argv[6]):
                 raise StepError(f"--mode {argv[6]!r} is not an octal mode; 0444 or 0644")
             place(argv[1], argv[2], sha256=argv[4], mode=int(argv[6], 8))
+        elif len(argv) == 9 and argv[0] == "install" and argv[5] == "--sha256" and argv[7] == "--mode":
+            if not re.fullmatch(r"0?[0-7]{3}", argv[8]):
+                raise StepError(f"--mode {argv[8]!r} is not an octal mode; 0600 or 0400")
+            install(argv[1], argv[2], int(argv[3]), int(argv[4]), argv[6], int(argv[8], 8))
         elif len(argv) == 2 and argv[0] == "marker":
             marker(argv[1])
         elif argv == ["noop"]:
