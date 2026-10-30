@@ -248,9 +248,10 @@ TASK_GRAPH_ALL = "ALL"
 TASK_DENY_KEY = "task_deny"
 RECREATE_INTERVAL_KEY = "container_recreate_interval_hours"
 # The fleet's sender-age floor, in seconds: how long after its first
-# enrolment a sender's signed delegation is admitted. The policy carries it;
-# the router that receives it enforces it. 0 means no wait; the ceiling is one
-# year.
+# enrolment a sender's signed delegation is admitted. The policy carries the
+# reviewed value. A separately gated render places it in each enforcing
+# router's configuration; the router enforces that configured value. 0 means
+# no wait; the ceiling is one year.
 MIN_SENDER_AGE_KEY = "min_sender_age_s"
 MIN_SENDER_AGE_MAX_S = 31536000
 
@@ -702,8 +703,9 @@ def load_policy(path: Path) -> Dict[str, Any]:
                 f"{path}: {MIN_SENDER_AGE_KEY!r} is {age!r} — expected a whole number of seconds "
                 f"from 0 to {MIN_SENDER_AGE_MAX_S}. Absent is also an answer here, and a different "
                 "one: `install` refuses to provision under a manifest that omits this field, "
-                "because the policy is where the number is reviewed and the router that "
-                "receives it enforces it.")
+                "because the policy carries the reviewed value. A separately gated render "
+                "places it in each enforcing router's configuration, and the router enforces "
+                "that configured value.")
 
     out = {
         "version": version,
