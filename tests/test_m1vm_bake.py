@@ -36,7 +36,8 @@ def make_pin():
         "apt": {"sources": ["deb [signed-by=/usr/share/keyrings/u.gpg] https://snapshot.example.org/ubuntu/20261030T000000Z noble main"],
                 "packages": {"docker-ce": "5:27.0.0-1", "git": "1:2.43.0-1", "acl": "2.3.2-1",
                              "qemu-guest-agent": "1:8.2.2", "python3": "3.12.3-0"}},
-        "quiet": {"mask": ["unattended-upgrades.service", "apt-daily.timer"], "remove": ["snapd", "apport"]},
+        "quiet": {"mask": ["unattended-upgrades.service", "apt-daily.timer", "apt-daily-upgrade.timer",
+                           "motd-news.timer"], "remove": ["snapd", "apport"]},
         "docker": {"d_uuid": "11111111-2222-4333-8444-555555555555", "log_max_size": "10m", "log_max_file": 3},
         "accounts": {"op": {"name": "op", "uid": 2101, "gid": 2101},
                      "m1-admin": {"name": "m1admin", "uid": 2102, "gid": 2102},
@@ -54,8 +55,8 @@ def make_pin():
                     "build": ["./docker/build.sh", "--tag", "m1-hub:pin"]},
         "sandy": {"repo": "amap-router-local", "install": ["/usr/bin/true"], "build": ["/usr/local/bin/sandy", "--build-only"]},
         "base_images": ["docker.io/library/python@sha256:" + "9" * 64],
-        "npm_route": {"kind": "sandy-pin"},
-        "sandy_secrets": {"path": "$SANDY_HOME/.secrets"},
+        "npm_route": {"kind": "sandy-pin", "sandy_commit": H("d")},
+        "sandy_secrets": {"path": "/srv/m1-state/sandy/.secrets"},
         "man_files": [],
     }
 
@@ -86,6 +87,14 @@ class FakeHost:
                     raise out
                 return out
         a = argv
+        if a == ["cat", "/etc/sudoers.d/m1-admin"]:
+            return "m1admin ALL=(ALL:ALL) NOPASSWD: ALL\n"
+        if a[:3] == ["stat", "-c", "%a %u %g %h %F"]:
+            return "440 0 0 1 regular file\n"
+        if a[:2] == ["ls", "-A"]:
+            return "m1-admin\nm1adm\n"
+        if a[0] == "find":
+            return ""
         if a[0] == "dpkg-query":
             return "".join(f"{n}\t{self.pin['apt']['packages'][n]}\n" for n in a[4:])
         if a[:2] == ["swapon", "--show"]:
@@ -163,7 +172,19 @@ class PinTest(unittest.TestCase):
             "relative sandy": lambda p: p["sandy"].update(build=["sandy", "--build-only"]),
             "undigested base": lambda p: p.update(base_images=["python:3"]),
             "empty npm route": lambda p: p.update(npm_route={}),
+            "npm route other commit": lambda p: p["npm_route"].update(sandy_commit=H("0")),
+            "npm route unknown kind": lambda p: p.update(npm_route={"kind": "latest"}),
+            "npm route unknown kind with go": lambda p: p.update(npm_route={"kind": "latest", "go_sha256": "a" * 64}),
+            "npm exception no go": lambda p: p.update(npm_route={"kind": "operator-exception"}),
             "empty secrets": lambda p: p.update(sandy_secrets={}),
+            "secrets on R": lambda p: p.update(sandy_secrets={"path": "/home/op/.sandy/.secrets"}),
+            "mask misses unattended": lambda p: p["quiet"]["mask"].remove("unattended-upgrades.service"),
+            "mask misses apt-daily-upgrade": lambda p: p["quiet"]["mask"].remove("apt-daily-upgrade.timer"),
+            "mask misses motd": lambda p: p["quiet"]["mask"].remove("motd-news.timer"),
+            "remove misses snapd": lambda p: p["quiet"]["remove"].remove("snapd"),
+            "remove misses apport": lambda p: p["quiet"]["remove"].remove("apport"),
+            "agent masked": lambda p: p["quiet"]["mask"].append("qemu-guest-agent.service"),
+            "agent removed": lambda p: p["quiet"]["remove"].append("qemu-guest-agent"),
             "d_uuid": lambda p: p["docker"].update(d_uuid="x"),
         }
         for name, brk in breaks.items():
@@ -315,9 +336,21 @@ class StepFailTest(BakeCase):
                              "builder cache is not empty"),
             "two cache rows": (lambda h: setattr(h, "df", '{"Type":"Build Cache","TotalCount":"0"}\n' * 2),
                                "builder cache is not empty"),
-            "man changed": (lambda h: h.over.update({"^cat ": "{}"}), "not the bytes m1-man reported"),
+            "man changed": (lambda h: h.over.update({"^cat /opt/amap/MAN.json": "{}"}), "not the bytes m1-man reported"),
             "command fails": (lambda h: h.over.update({"^docker pull": bake.BakeFail("docker pull: exit 1")}),
                               "images: docker pull"),
+            "admin sudoers broader": (lambda h: h.over.update({"^cat /etc/sudoers.d/m1-admin$":
+                                                                "m1admin ALL=(ALL:ALL) NOPASSWD: ALL\nop ALL=(ALL) ALL\n"}),
+                                      "not exactly the reviewed rule"),
+            "admin sudoers mode": (lambda h: h.over.update({"^stat -c": "640 0 0 1 regular file\n"}),
+                                   "not root:root 0440"),
+            "admin sudoers linked": (lambda h: h.over.update({"^stat -c": "440 0 0 2 regular file\n"}),
+                                     "not root:root 0440"),
+            "extra sudoers file": (lambda h: h.over.update({"^ls -A": "90-cloud-init-users\nm1-admin\nm1adm\n"}),
+                                   "not exactly"),
+            "missing adm sudoers": (lambda h: h.over.update({"^ls -A": "m1-admin\n"}), "not exactly"),
+            "seed holds secrets": (lambda h: h.over.update({"^find ": "/opt/amap/sandy-seed/.secrets\n"}),
+                                   "the seed holds a .secrets"),
         }
         for name, (brk, needle) in breaks.items():
             with self.subTest(name):

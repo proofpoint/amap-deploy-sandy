@@ -67,6 +67,13 @@ _DIGEST_REF = re.compile(r"[a-z0-9][a-z0-9._/:-]*@sha256:[0-9a-f]{64}\Z")
 _KEY = re.compile(r"(ssh-ed25519|ecdsa-sha2-nistp256|ssh-rsa) [A-Za-z0-9+/=]+( [!-~]+)?\Z")
 _ID = re.compile(r"sha256:[0-9a-f]{64}\Z")
 
+# DS2 d8 §1.1 step 2: the automatic-change units every PIN must mask, and the
+# packages it must remove; the guest agent may be neither (NET r20 §3.2).
+QUIET_MASK = ("unattended-upgrades.service", "apt-daily.timer", "apt-daily-upgrade.timer", "motd-news.timer")
+QUIET_REMOVE = ("snapd", "apport")
+AGENT = "qemu-guest-agent"
+SUDOERS_DIR = "/etc/sudoers.d"
+
 
 class BakeFail(Exception):
     """A step failed: the bake stops."""
@@ -115,6 +122,10 @@ def validate_pin(pin):
                                                                     for u in quiet["mask"]), "quiet.mask")
     _req(isinstance(quiet["remove"], list) and all(isinstance(p, str) and _PKG.match(p) for p in quiet["remove"]),
          "quiet.remove")
+    _req(set(QUIET_MASK) <= set(quiet["mask"]), f"quiet.mask must include {list(QUIET_MASK)}")
+    _req(set(QUIET_REMOVE) <= set(quiet["remove"]), f"quiet.remove must include {list(QUIET_REMOVE)}")
+    _req(not any(u.startswith(AGENT) for u in quiet["mask"]) and AGENT not in quiet["remove"],
+         "quiet: the guest agent may be neither masked nor removed")
     dk = pin["docker"]
     _req(isinstance(dk, dict) and set(dk) == {"d_uuid", "log_max_size", "log_max_file"}, "docker: exactly {d_uuid, log_max_size, log_max_file}")
     _req(isinstance(dk["d_uuid"], str) and _UUID.match(dk["d_uuid"]), "docker.d_uuid")
@@ -160,8 +171,19 @@ def validate_pin(pin):
              f"sandy.{k}: an absolute argv")
     _req(isinstance(pin["base_images"], list) and pin["base_images"]
          and all(isinstance(r, str) and _DIGEST_REF.match(r) for r in pin["base_images"]), "base_images: ref@sha256 digests")
-    _req(isinstance(pin["npm_route"], dict) and pin["npm_route"], "npm_route: required (LC d8 §0.4)")
-    _req(isinstance(pin["sandy_secrets"], dict) and pin["sandy_secrets"], "sandy_secrets: required (LC d8 §0.4)")
+    npm = pin["npm_route"]
+    _req(isinstance(npm, dict) and npm.get("kind") in ("sandy-pin", "operator-exception"),
+         "npm_route: kind sandy-pin or operator-exception (LC d8 §0.4)")
+    if npm["kind"] == "sandy-pin":
+        _req(set(npm) == {"kind", "sandy_commit"} and npm["sandy_commit"] == repos[sandy["repo"]]["commit"],
+             "npm_route: a sandy pin names exactly sandy's PIN commit")
+    else:
+        _req(set(npm) == {"kind", "go_sha256"} and isinstance(npm["go_sha256"], str) and _HEX64.match(npm["go_sha256"]),
+             "npm_route: an operator exception names the sha256 of the operator's go")
+    sec = pin["sandy_secrets"]
+    _req(isinstance(sec, dict) and set(sec) == {"path"} and isinstance(sec["path"], str)
+         and sec["path"].startswith(STATE + "/") and os.path.normpath(sec["path"]) == sec["path"],
+         f"sandy_secrets: exactly {{path}}, under {STATE} (never on R)")
     _req(isinstance(pin["man_files"], list) and all(isinstance(p, str) and p.startswith("/")
                                                     and os.path.normpath(p) == p for p in pin["man_files"]),
          "man_files: absolute paths")
@@ -283,8 +305,21 @@ def step_accounts(pin, host):
         host.run(["groupadd", "-g", str(a["gid"]), a["name"]])
         host.run(["useradd", "-u", str(a["uid"]), "-g", str(a["gid"]), "-M", "-d", f"/var/lib/{a['name']}",
                   "-s", "/usr/sbin/nologin" if who != "adm" else "/bin/sh", a["name"]])
+    # Stage U's sudoers file, byte-exact with its mode and owner (user-data).
+    admin = acc["m1-admin"]["name"]
+    want = f"{admin} ALL=(ALL:ALL) NOPASSWD: ALL\n"
+    if host.run(["cat", f"{SUDOERS_DIR}/m1-admin"]) != want:
+        raise BakeFail("accounts: /etc/sudoers.d/m1-admin is not exactly the reviewed rule")
+    if host.run(["stat", "-c", "%a %u %g %h %F", f"{SUDOERS_DIR}/m1-admin"]).strip() != "440 0 0 1 regular file":
+        raise BakeFail("accounts: /etc/sudoers.d/m1-admin is not root:root 0440 with one link")
     adm = acc["adm"]["name"]
-    host.put(f"/etc/sudoers.d/{adm}", f"{adm} ALL=(root) NOPASSWD: /usr/bin/python3 -I -S -B -\n", mode="0440")
+    host.put(f"{SUDOERS_DIR}/{adm}", f"{adm} ALL=(root) NOPASSWD: /usr/bin/python3 -I -S -B -\n", mode="0440")
+    # The closed set (DS2 d8 §1.1 step 4): the distribution's README is the
+    # only other entry a stock image carries, and it goes.
+    host.run(["rm", "-f", f"{SUDOERS_DIR}/README"])
+    names = sorted(host.run(["ls", "-A", SUDOERS_DIR]).split())
+    if names != sorted(["m1-admin", adm]):
+        raise BakeFail(f"accounts: {SUDOERS_DIR} holds {names}, not exactly ['m1-admin', '{adm}']")
     host.run(["visudo", "-c", "-q"])
     homes = {"op": pin["op_home"], "m1-admin": None, "adm": f"/var/lib/{adm}"}
     for who, lines in pin["keys"].items():
@@ -342,10 +377,15 @@ def step_images(pin, host):
             raise BakeFail(f"images: {r['image']} is labelled {label!r}, not {r['commit']}")
         host.run(["rm", "-rf", dest])
     op = pin["accounts"]["op"]["name"]
-    for argv in (pin["sandy"]["install"],):
-        host.run(argv)
+    print(f"M1-BAKE NPM-ROUTE {pin['npm_route']['kind']} "
+          f"{pin['npm_route'].get('sandy_commit') or pin['npm_route'].get('go_sha256')}", flush=True)
+    host.run(pin["sandy"]["install"])
     host.run(["install", "-d", "-o", op, "-g", str(pin["accounts"]["op"]["gid"]), "-m", "0755", SEED])
     host.run(["runuser", "-u", op, "--", "env", f"SANDY_HOME={SEED}", "SANDY_OFFLINE=1", *pin["sandy"]["build"]])
+    # The model key's file lives on the state disk (sandy_secrets.path); the
+    # baked seed must not hold one.
+    if host.run(["find", SEED, "-maxdepth", "1", "-name", ".secrets", "-print"]).strip():
+        raise BakeFail(f"images: the seed holds a .secrets; it belongs at {pin['sandy_secrets']['path']}")
 
 
 def step_programs(pin, host):

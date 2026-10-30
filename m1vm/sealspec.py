@@ -332,13 +332,20 @@ def gitconfig_problem(data):
         text = data.decode("utf-8")
     except UnicodeDecodeError:
         return "not UTF-8"
-    # git reads a leading byte-order mark as nothing, and a trailing backslash
-    # as a continuation: both must be undone before any line is judged.
+    # git reads a leading byte-order mark as nothing.
     if text.startswith("\ufeff"):
         text = text[1:]
-    text = re.sub(r"\\\r?\n", "", text)
     section = None
     for n, line in enumerate(text.splitlines(), 1):
+        stripped_line = line.strip()
+        # git joins a value line ending in an odd run of backslashes with the
+        # next one. Rather than re-implement where git does and does not join
+        # (inside a value, outside comments, unescaped), any such line that is
+        # not a whole-line comment fails closed: no checked config needs one.
+        if not stripped_line.startswith(("#", ";")):
+            run = len(line.rstrip("\r")) - len(line.rstrip("\r").rstrip("\\"))
+            if run % 2 == 1:
+                return f"line {n}: a line continuation"
         if _USERINFO_RE.search(line):
             return f"line {n}: URL userinfo"
         m = _SECTION_RE.match(line)

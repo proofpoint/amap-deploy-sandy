@@ -366,7 +366,8 @@ class GitconfigTest(unittest.TestCase):
                      b'[remote "o\\"x"]\n\turl = /x\n',
                      b"[include]\n\tpath = /etc/other\n", b'[includeIf "gitdir:/x/"]\n\tpath = y\n',
                      b"[core\n", b'\xef\xbb\xbf[remote "origin"]\n\turl = /x\n',
-                     b"[http]\n\textraHeader = https://u:\\\np@h/\n"):
+                     b"[http]\n\textraHeader = https://u:\\\np@h/\n",
+                     b"[core]\n\tx = a \\\n[remote \"o\"]\n"):
             with self.subTest(text):
                 self.assertIsNotNone(sealspec.gitconfig_problem(text))
 
@@ -383,6 +384,27 @@ class GuardTest(TreeCase):
         self.assertEqual(r.returncode, 3, r.stderr)
         self.assertNotIn("M1-SEALSPEC PASS", r.stdout)
         self.assertTrue(r.stderr.startswith("internal-error "))
+
+
+class GitconfigContinuationTest(unittest.TestCase):
+    """Opus nb1 probes: what git does NOT join must not hide the next line."""
+
+    def test_next_line_is_still_judged(self):
+        hidden = (b'[remote "o"]\n\turl = /x\n', b"[include]\n\tpath = /y\n", b'[url "a"]\n\tinsteadOf = b\n')
+        heads = (b"[core]\n\tx = a\\\\\n",      # an even run: git does not join
+                 b"# C:\\path\\\n",             # a whole-line comment ending in \
+                 b"; c:\\dir\\\n")              # the other comment form
+        for head in heads:
+            for tail in hidden:
+                with self.subTest(head=head, tail=tail):
+                    self.assertIsNotNone(sealspec.gitconfig_problem(head + tail))
+
+    def test_odd_backslash_value_fails_closed(self):
+        self.assertIn("line continuation", sealspec.gitconfig_problem(b"[core]\n\tx = a\\\n\ty = b\n"))
+        self.assertIn("line continuation", sealspec.gitconfig_problem(b"[core]\n\tx = a ; c:\\dir\\\n"))
+
+    def test_clean_with_even_backslashes(self):
+        self.assertIsNone(sealspec.gitconfig_problem(b"[core]\n\tx = a\\\\\n# c:\\dir\\\n"))
 
 
 class CliTest(TreeCase):
