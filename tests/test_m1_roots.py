@@ -56,7 +56,8 @@ class Fixture(unittest.TestCase):
                 "writer": "/opt/amap/libexec/host_steps.py", "writer_sha256": "a" * 64, "roots": roots,
                 "hostj": {"path": self.hostj_src, "sha256": self.hostj_sha},
                 "seed_copy": {"path": "/opt/amap/m1-seed-copy", "sha256": "b" * 64, "uid": u,
-                              "argv": ["/usr/bin/python3", "-I", "-S", "/opt/amap/m1-seed-copy"]}}
+                              "argv": ["/usr/bin/python3", "-I", "-S", "-B", "/opt/amap/m1-seed-copy", "--man",
+                                       "/opt/amap/MAN.json", "--src", "/opt/amap/sandy-seed", "--dst", d + "/sandy"]}}
 
     def run_steps(self):
         """What the plan's root lines do, through the same writer functions."""
@@ -119,6 +120,18 @@ class SpecTest(Fixture):
 
 class PlanTest(Fixture):
 
+    def test_the_seed_copy_line_stops_without_its_pass_line(self):
+        import shlex
+        import subprocess
+        line = [ln for ln in mr.plan(mr.load_spec(self.spec), "/l", "/s") if "M1-SEED-COPY PASS" in ln][0]
+        tail = line.split("&& out=$(", 1)[1].split(") && ", 1)[1]
+        for out, want in (("SEED a present\nM1-SEED-COPY PASS n=1 man=x", 0), ("SEED a present", 1),
+                          ("M1-SEED-COPY PASS n=1\nSEED late", 1)):
+            with self.subTest(out=out):
+                rc = subprocess.run(["/bin/sh", "-c", f"out={shlex.quote(out)}; " + tail],
+                                    capture_output=True).returncode
+                self.assertEqual(rc != 0, bool(want))
+
     def test_the_plan_checks_the_writer_first_and_ends_with_the_receipt(self):
         lines = mr.plan(mr.load_spec(self.spec), "/opt/amap/amap-m1-roots.py", "/opt/amap/roots.json")
         self.assertTrue(lines[1].startswith("printf '%s  %s\\n' " + "a" * 64))
@@ -135,7 +148,8 @@ class PlanTest(Fixture):
         seed = [ln for ln in lines if "m1-seed-copy" in ln and "sudo -u" in ln]
         self.assertEqual(len(seed), 1)
         self.assertIn("b" * 64, seed[0])
-        self.assertIn(f"&& sudo -u '#{self.uid}' -- ", seed[0])
+        self.assertIn(f"&& out=$(sudo -u '#{self.uid}' -- ", seed[0])
+        self.assertTrue(seed[0].endswith("| tail -n 1 | grep -q '^M1-SEED-COPY PASS '"), seed[0])
         self.assertIn("receipt --spec", lines[-1])
 
 

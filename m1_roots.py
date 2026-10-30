@@ -34,7 +34,9 @@ The spec is the role's reviewed parameters, a closed JSON object:
                  (each exactly once), workspace, dir.
   hostj          {path, sha256}: the reviewed host.json to install
   seed_copy      {path, sha256, uid, argv}: the m1-seed-copy program, the uid it
-                 runs as, and its whole argv, which names `path` exactly once
+                 runs as, and its whole argv, which names `path` exactly once. The
+                 plan stops unless it exits 0 AND its last stdout line starts
+                 `M1-SEED-COPY PASS`.
 
 Exit codes: 0 pass, 1 a check failed, 2 the spec cannot be used."""
 
@@ -61,6 +63,8 @@ ROLES = frozenset(ONCE) | {"workspace", "dir"}
 ROOT_MODES = (0o700, 0o750, 0o755)
 PRIVATE_ROLES = ("state_dir", "registry", "identities")
 HOSTJ_NAME = "host.json"
+#: m1-seed-copy's last stdout line on success; exit 0 without it does not pass.
+SEED_PASS = "M1-SEED-COPY PASS"
 HOSTJ_MODE = 0o600
 MOUNTINFO = "/proc/self/mountinfo"
 BY_UUID = "/dev/disk/by-uuid"
@@ -189,7 +193,9 @@ def plan(spec: Dict[str, Any], launcher: str, spec_path: str) -> List[str]:
                  f"--sha256 {spec['hostj']['sha256']} --mode {HOSTJ_MODE:04o}")
     lines.append(f"{root_py} sync {q(spec['data'])} " + " ".join(q(r["path"]) for r in spec["roots"]))
     lines.append(f"printf '%s  %s\\n' {c['sha256']} {q(c['path'])} | sha256sum -c --strict - && "
-                 f"sudo -u '#{c['uid']}' -- " + " ".join(q(a) for a in c["argv"]))
+                 f"out=$(sudo -u '#{c['uid']}' -- " + " ".join(q(a) for a in c["argv"]) + ") && "
+                 f"printf '%s\\n' \"$out\" && printf '%s\\n' \"$out\" | tail -n 1 | "
+                 f"grep -q '^{SEED_PASS} '")
     lines.append(f"sudo {q(py)} -I -S {q(launcher)} receipt --spec {q(spec_path)}")
     return lines
 
