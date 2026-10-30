@@ -8,6 +8,7 @@ from contextlib import closing
 import os
 from pathlib import Path
 import sqlite3
+import subprocess
 import sys
 from tempfile import TemporaryDirectory
 import unittest
