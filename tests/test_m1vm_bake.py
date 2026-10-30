@@ -100,8 +100,8 @@ class FakeHost:
             return self.pin["apt"]["packages"][a[4]]
         if a[:2] == ["id", "-nG"]:
             return "op docker\n"
-        if a == ["cat", "/etc/sudoers.d/m1-admin"]:
-            return "m1admin ALL=(ALL:ALL) NOPASSWD: ALL\n"
+        if a == ["sha256sum", "/etc/sudoers.d/m1-admin"]:
+            return hashlib.sha256(b"m1admin ALL=(ALL:ALL) NOPASSWD: ALL\n").hexdigest() + "  /etc/sudoers.d/m1-admin\n"
         if a[:3] == ["stat", "-c", "%a %u %g %h %F"]:
             return "440 0 0 1 regular file\n"
         if a[:2] == ["find", "/etc/sudoers.d"]:
@@ -412,9 +412,12 @@ class StepFailTest(BakeCase):
             "op not in docker": (lambda h: h.over.update({"^id -nG": "op\n"}), "not in the docker group"),
             "command fails": (lambda h: h.over.update({"^docker pull": bake.BakeFail("docker pull: exit 1")}),
                               "images: docker pull"),
-            "admin sudoers broader": (lambda h: h.over.update({"^cat /etc/sudoers.d/m1-admin$":
-                                                                "m1admin ALL=(ALL:ALL) NOPASSWD: ALL\nop ALL=(ALL) ALL\n"}),
+            "admin sudoers broader": (lambda h: h.over.update({"^sha256sum /etc/sudoers.d/m1-admin$":
+                hashlib.sha256(b"m1admin ALL=(ALL:ALL) NOPASSWD: ALL\nop ALL=(ALL) ALL\n").hexdigest() + "  x\n"}),
                                       "not exactly the reviewed rule"),
+            "admin sudoers crlf": (lambda h: h.over.update({"^sha256sum /etc/sudoers.d/m1-admin$":
+                hashlib.sha256(b"m1admin ALL=(ALL:ALL) NOPASSWD: ALL\r\n").hexdigest() + "  x\n"}),
+                                   "not exactly the reviewed rule"),
             "admin sudoers mode": (lambda h: h.over.update({"^stat -c": "640 0 0 1 regular file\n"}),
                                    "not root:root 0440"),
             "admin sudoers linked": (lambda h: h.over.update({"^stat -c": "440 0 0 2 regular file\n"}),

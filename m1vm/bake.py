@@ -346,7 +346,9 @@ def step_accounts(pin, host):
     # Stage U's sudoers file, byte-exact with its mode and owner (user-data).
     admin = acc["m1-admin"]["name"]
     want = f"{admin} ALL=(ALL:ALL) NOPASSWD: ALL\n"
-    if host.run(["cat", f"{SUDOERS_DIR}/m1-admin"]) != want:
+    # By sha256 of the bytes, not a text read, which would fold CR/CRLF (Opus).
+    have = host.run(["sha256sum", f"{SUDOERS_DIR}/m1-admin"]).split()[:1]
+    if have != [hashlib.sha256(want.encode("utf-8")).hexdigest()]:
         raise BakeFail("accounts: /etc/sudoers.d/m1-admin is not exactly the reviewed rule")
     if host.run(["stat", "-c", "%a %u %g %h %F", f"{SUDOERS_DIR}/m1-admin"]).strip() != "440 0 0 1 regular file":
         raise BakeFail("accounts: /etc/sudoers.d/m1-admin is not root:root 0440 with one link")

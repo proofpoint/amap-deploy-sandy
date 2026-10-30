@@ -1,0 +1,296 @@
+"""m1vm/vm_admit.py (ADM): the phase-independent rows against a fixture VM
+tree, each row proven to FAIL on a tree broken for it, the final line's
+form, and that UNKNOWN never yields a PASS line.
+
+Ownership is root's on a real VM; the tests run unprivileged, so a stand-in
+reports root ownership for the files a real VM would have root-owned. The
+command outputs (systemctl show, findmnt, docker inspect, getfacl) follow
+the tools' documented forms and are INFERRED until A1 runs on a clone.
+"""
+
+import hashlib
+import io
+import json
+import os
+import shutil
+import stat
+import sys
+import tempfile
+import unittest
+from contextlib import redirect_stdout
+from pathlib import Path
+from unittest import mock
+
+M1VM = Path(__file__).resolve().parent.parent / "m1vm"
+sys.path.insert(0, str(M1VM))
+import vm_admit  # noqa: E402
+
+STATE_UUID = "3f2c8a10-5b7e-4c1d-9a2e-6f0b1c2d3e4f"
+D_UUID = "11111111-2222-4333-8444-555555555555"
+BOOT = "0a0b0c0d-1111-4222-8333-944445555666"
+IMG = "sha256:" + "1" * 64
+KEY_OP = "ssh-ed25519 AAAAop operator"
+KEY_NET = "ssh-ed25519 AAAAne net-m1"
+KEY_ADMIN = "ssh-ed25519 AAAAad m1-admin"
+KEY_ADM = "ssh-ed25519 AAAAam adm"
+ACCOUNTS = {"op": {"name": "op", "uid": 2101, "gid": 2101}, "m1-admin": {"name": "m1admin", "uid": 2102, "gid": 2102},
+            "adm": {"name": "m1adm", "uid": 2103, "gid": 2103}, "uid-1": {"name": "m1router", "uid": 2104, "gid": 2104},
+            "uid-2": {"name": "m1hub", "uid": 2105, "gid": 2105}, "registry": {"name": "m1reg", "uid": 2106, "gid": 2106}}
+KEYS = {"op": [KEY_OP, KEY_NET], "m1-admin": [KEY_ADMIN], "adm": [KEY_ADM]}
+
+
+class Vm:
+    """A fixture VM rooted at a temp dir."""
+
+    def __init__(self):
+        self.root = Path(tempfile.mkdtemp())
+        r = self.root
+        homes = {"op": "/home/op", "m1-admin": "/home/m1admin", "adm": "/var/lib/m1adm"}
+        lines = ["root:x:0:0:root:/root:/bin/bash"]
+        for role, a in ACCOUNTS.items():
+            home = homes.get(role, f"/var/lib/{a['name']}")
+            lines.append(f"{a['name']}:x:{a['uid']}:{a['gid']}::{home}:/bin/sh")
+        (r / "etc/sudoers.d").mkdir(parents=True)
+        (r / "etc/passwd").write_text("\n".join(lines) + "\n")
+        (r / "etc/sudoers.d/m1-admin").write_text("m1admin ALL=(ALL:ALL) NOPASSWD: ALL\n")
+        (r / "etc/sudoers.d/m1adm").write_text("m1adm ALL=(root) NOPASSWD: /usr/bin/python3 -I -S -B -\n")
+        for p in (r / "etc/sudoers.d").iterdir():
+            p.chmod(0o440)
+        for role, keys in KEYS.items():
+            d = r / homes[role].lstrip("/") / ".ssh"
+            d.mkdir(parents=True)
+            (d / "authorized_keys").write_text("\n".join(keys) + "\n")
+            (d / "authorized_keys").chmod(0o600)
+        (r / "etc/systemd/system").mkdir(parents=True)
+        os.symlink("/dev/null", r / "etc/systemd/system/qemu-guest-agent.service")
+        (r / "proc/sys/kernel/random").mkdir(parents=True)
+        (r / "proc/sys/kernel/random/boot_id").write_text(BOOT + "\n")
+        (r / "proc/1/fd").mkdir(parents=True)
+        os.symlink("/dev/null", r / "proc/1/fd/0")
+        sandy = r / "srv/m1-state/sandy"
+        sandy.mkdir(parents=True)
+        (sandy / ".base_build_hash").write_bytes(b"b\n")
+        (r / "opt/amap").mkdir(parents=True)
+        self.man = {"schema": "m1vm-man/1", "images": {"m1-hop:pin": IMG},
+                    "hdot": [{"name": ".base_build_hash", "mode": "0644", "sha256": hashlib.sha256(b"b\n").hexdigest()}],
+                    "accounts": {a["name"]: {"uid": a["uid"], "gid": a["gid"], "home": "",
+                                             "groups": ["docker"] if role == "op" else []}
+                                 for role, a in ACCOUNTS.items()}}
+        self.write_man()
+        self.cmd = {}
+
+    def write_man(self):
+        p = self.root / "opt/amap/MAN.json"
+        if p.exists():
+            p.chmod(0o644)
+        p.write_text(json.dumps(self.man, sort_keys=True))
+        p.chmod(0o444)
+        return hashlib.sha256(p.read_bytes()).hexdigest()
+
+    def runner(self, argv):
+        key = " ".join(argv)
+        for pat, out in self.cmd.items():
+            if pat in key:
+                return out
+        if "qemu-guest-agent.service" in argv:
+            return 0, "ActiveState=inactive\nUnitFileState=masked\n"
+        if argv[:3] == ["/usr/bin/findmnt", "-n", "-o"] and argv[3] == "UUID,SOURCE,FSTYPE":
+            return 0, f"{STATE_UUID} /dev/sdc ext4\n"
+        if argv[:3] == ["/usr/bin/findmnt", "-n", "-o"]:
+            return 0, D_UUID + "\n"
+        if argv[:3] == ["/usr/bin/docker", "image", "inspect"]:
+            return 0, IMG + "\n"
+        if argv[0] == "/usr/bin/getfacl":
+            return 0, "user::rw-\nuser:2104:rw-\ngroup::rw-\nmask::rw-\nother::---\n"
+        raise AssertionError(argv)
+
+
+def params(vm, phase="A1", **over):
+    p = {"phase": phase, "host": "H1", "att": "ATT-1", "adm": "a" * 64, "prov": "b" * 64,
+         "env": "none", "exp": "none", "ovl": "none", "d7": "c" * 64, "dd": "d" * 64, "ctlr": "none",
+         "accounts": ACCOUNTS, "keys": KEYS, "state_uuid": STATE_UUID, "d_uuid": D_UUID,
+         "man_sha256": hashlib.sha256((vm.root / "opt/amap/MAN.json").read_bytes()).hexdigest()}
+    if phase not in ("A1", "A1r"):
+        p.update(env="e" * 64, exp="f" * 64, ovl="0" * 64)
+    p.update(over)
+    return p
+
+
+class AdmCase(unittest.TestCase):
+    def setUp(self):
+        self.vm = Vm()
+        self.addCleanup(shutil.rmtree, self.vm.root)
+        patcher = mock.patch.object(vm_admit, "ROOT", str(self.vm.root))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        # Root ownership, as on a real VM, for the files root owns there.
+        real_read, real_lstat = vm_admit.read_regular, vm_admit.lstat_path
+        self.foreign = set()
+
+        def as_root(st, path):
+            uid = st.st_uid
+            if path.startswith(("/etc/", "/opt/")) and path not in self.foreign:
+                uid = 0
+            elif "/.ssh/" in path:
+                owner = {"/home/op": 2101, "/home/m1admin": 2102, "/var/lib/m1adm": 2103}
+                uid = next((u for h, u in owner.items() if path.startswith(h)), uid)
+            return os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, uid, st.st_gid, st.st_size,
+                                   st.st_atime, st.st_mtime, st.st_ctime))
+
+        def read(path, limit=1 << 22):
+            data, st = real_read(path, limit)
+            return data, as_root(st, path)
+
+        def lstat(path):
+            st = real_lstat(path)
+            return None if st is None else as_root(st, path)
+        for name, fn in (("read_regular", read), ("lstat_path", lstat)):
+            p = mock.patch.object(vm_admit, name, fn)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def admit(self, phase="A1", **over):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            rc = vm_admit.main(params(self.vm, phase, **over), runner=self.vm.runner,
+                               now=lambda: (2026, 10, 31, 0, 0, 0, 4, 304, 0))
+        return rc, out.getvalue().splitlines()
+
+    def failing(self, phase="A1", **over):
+        _, lines = self.admit(phase, **over)
+        return sorted(l.split()[2] for l in lines if l.startswith("CHECK ") and l.split()[3] != "PASS")
+
+
+class PassTest(AdmCase):
+    def test_a1_pass_line(self):
+        rc, lines = self.admit()
+        self.assertEqual(rc, 0, lines)
+        self.assertEqual(lines[-1],
+                         f"VM-ADMIT A1 PASS host=H1 att=ATT-1 boot_id={BOOT} adm={'a' * 64} "
+                         f"man={params(self.vm)['man_sha256']} ovl=none prov={'b' * 64} env=none exp=none "
+                         f"d7={'c' * 64} dd={'d' * 64} ctlr=none role=none utc=2026-10-31T00:00:00Z")
+        self.assertTrue(all(l.startswith("CHECK A1 ") for l in lines[:-1]))
+
+    def test_a2a_is_not_yet_complete(self):
+        # The B6c-bound rows are UNKNOWN until DS's receipt is reviewed: no PASS line.
+        rc, lines = self.admit("A2a")
+        self.assertEqual(rc, 1)
+        self.assertIn("CHECK A2a role-and-o-n UNKNOWN", "\n".join(lines))
+        self.assertTrue(lines[-1].startswith("VM-ADMIT A2a FAIL failed=0 unknown=1"))
+
+
+class BreakTest(AdmCase):
+    def test_each_break(self):
+        def keyfile(rel, text):
+            (self.vm.root / rel).write_text(text)
+        breaks = {
+            "man": lambda: (self.vm.root / "opt/amap/MAN.json").chmod(0o644),
+            "accounts": lambda: (self.vm.root / "etc/passwd").write_text(
+                (self.vm.root / "etc/passwd").read_text().replace(":2104:2104:", ":2199:2104:")),
+            "keys": lambda: keyfile("home/op/.ssh/authorized_keys", KEY_OP + "\n"),
+            "sudoers": lambda: (self.vm.root / "etc/sudoers.d/README").write_text(""),
+            "agent-sealed": lambda: ((self.vm.root / "etc/systemd/system/qemu-guest-agent.service").unlink(),
+                                     os.symlink("/lib/systemd/system/qemu-guest-agent.service",
+                                                self.vm.root / "etc/systemd/system/qemu-guest-agent.service")),
+            "root-ssh-absent": lambda: (self.vm.root / "root/.ssh").mkdir(parents=True),
+            "bake-copy-absent": lambda: (self.vm.root / "var/lib/m1-bake").mkdir(parents=True),
+            "mounts": lambda: self.vm.cmd.update({"UUID,SOURCE,FSTYPE": (0, f"{D_UUID} /dev/sdc ext4\n")}),
+        }
+        for name, brk in breaks.items():
+            with self.subTest(name):
+                self.setUp()
+                brk()
+                rc, lines = self.admit()
+                self.assertEqual(rc, 1)
+                self.assertNotIn(" PASS host=", lines[-1])
+                self.assertIn(name, self.failing(), lines)
+
+    def test_man_sha_must_match(self):
+        self.assertEqual(self.failing(man_sha256="9" * 64), ["man"])
+
+    def test_more_breaks(self):
+        cases = {
+            "unlisted keyed account": (lambda: ((self.vm.root / "var/lib/m1router/.ssh").mkdir(parents=True),
+                                                (self.vm.root / "var/lib/m1router/.ssh/authorized_keys").write_text("x\n")),
+                                       "keys"),
+            "sudoers crlf": (lambda: ((self.vm.root / "etc/sudoers.d/m1-admin").chmod(0o640),
+                                      (self.vm.root / "etc/sudoers.d/m1-admin").write_bytes(
+                                          b"m1admin ALL=(ALL:ALL) NOPASSWD: ALL\r\n"),
+                                      (self.vm.root / "etc/sudoers.d/m1-admin").chmod(0o440)), "sudoers"),
+            "agent active": (lambda: self.vm.cmd.update({"qemu-guest-agent.service":
+                                                         (0, "ActiveState=active\nUnitFileState=masked\n")}),
+                             "agent-sealed"),
+            "agent port held": (lambda: os.symlink(vm_admit.AGENT_PORT, self.vm.root / "proc/1/fd/3"),
+                                "agent-sealed"),
+            "docker not D": (lambda: self.vm.cmd.update({"--target /var/lib/docker": (0, STATE_UUID + "\n")}),
+                             "mounts"),
+            "op not in docker": (lambda: (self.vm.man["accounts"]["op"].update(groups=[]), self.vm.write_man()),
+                                 "accounts"),
+        }
+        for name, (brk, row) in cases.items():
+            with self.subTest(name):
+                self.setUp()
+                brk()
+                over = {}
+                if name == "op not in docker":
+                    over["man_sha256"] = hashlib.sha256((self.vm.root / "opt/amap/MAN.json").read_bytes()).hexdigest()
+                self.assertIn(row, self.failing(**over))
+
+    def test_a2_rows(self):
+        cases = {
+            "hdot": lambda: (self.vm.root / "srv/m1-state/sandy/.base_build_hash").write_bytes(b"x\n"),
+            "images": lambda: self.vm.cmd.update({"docker image inspect": (0, "sha256:" + "2" * 64 + "\n")}),
+            "socket-acl": lambda: self.vm.cmd.update({"getfacl": (0, "user::rw-\n")}),
+        }
+        for row, brk in cases.items():
+            with self.subTest(row):
+                self.setUp()
+                brk()
+                self.assertIn(row, self.failing("A2b"))
+
+
+class ParamTest(AdmCase):
+    def test_refusals(self):
+        for over in ({"phase": "A3"}, {"host": "H3"}, {"adm": "x"}, {"ctlr": "x"}, {"ovl": "0" * 64},
+                     {"state_uuid": "x"}, {"att": "1"}, {"extra": 1}):
+            with self.subTest(over):
+                p = params(self.vm)
+                p.update(over)
+                with redirect_stdout(io.StringIO()) as out:
+                    self.assertEqual(vm_admit.main(p, runner=self.vm.runner), 2)
+                self.assertTrue(out.getvalue().startswith("VM-ADMIT USAGE "))
+
+    def test_unknown_boot_id_is_not_pass(self):
+        (self.vm.root / "proc/sys/kernel/random/boot_id").write_text("not-a-uuid\n")
+        rc, lines = self.admit()
+        self.assertEqual(rc, 1)
+        self.assertTrue(lines[-1].startswith("VM-ADMIT A1 FAIL "))
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class StdinTest(unittest.TestCase):
+    """The delivery shape: one parameter line, then the program, on stdin to
+    `python3 -I -S -B -`. On this (non-VM) machine every row fails; what is
+    proven is the shape: rows, a FAIL last line, exit 1, never a crash."""
+
+    def run_stdin(self, header):
+        import subprocess
+        body = (M1VM / "vm_admit.py").read_bytes()
+        return subprocess.run([sys.executable, "-I", "-S", "-B", "-"], input=header + body, capture_output=True)
+
+    def test_params_line_then_program(self):
+        p = {"phase": "A1", "host": "H1", "att": "ATT-1", "adm": "a" * 64, "prov": "b" * 64, "env": "none",
+             "exp": "none", "ovl": "none", "d7": "c" * 64, "dd": "d" * 64, "ctlr": "none", "accounts": ACCOUNTS,
+             "keys": KEYS, "state_uuid": STATE_UUID, "d_uuid": D_UUID, "man_sha256": "e" * 64}
+        r = self.run_stdin(f"M1_ADM_PARAMS = {json.dumps(p)}\n".encode())
+        lines = r.stdout.decode().splitlines()
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertTrue(lines[-1].startswith("VM-ADMIT A1 FAIL "), lines[-1:])
+        self.assertTrue(all(l.startswith("CHECK A1 ") for l in lines[:-1]))
+
+    def test_bad_params_is_usage(self):
+        r = self.run_stdin(b'M1_ADM_PARAMS = {"phase": "A1"}\n')
+        self.assertEqual(r.returncode, 2, r.stdout)
