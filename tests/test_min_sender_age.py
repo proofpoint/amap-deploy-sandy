@@ -46,7 +46,7 @@ class ShapeTest(unittest.TestCase):
             self.assertNotIn(fp.MIN_SENDER_AGE_KEY, fp.load_policy(_write(Path(d), pol)))
 
     def test_bad_shapes_are_refused(self):
-        for bad in (-1, fp.MIN_SENDER_AGE_MAX_S + 1, True, 1.5, "7200"):
+        for bad in (-1, fp.MIN_SENDER_AGE_MAX_S + 1, True, False, 1.5, "7200", ""):
             with self.subTest(bad=bad), self.assertRaisesRegex(fp.PolicyError, fp.MIN_SENDER_AGE_KEY):
                 self.load(**{fp.MIN_SENDER_AGE_KEY: bad})
 
@@ -59,6 +59,12 @@ class AbsenceTest(unittest.TestCase):
         problems = checks.check_ratification(pol)
         self.assertEqual(len([p for p in problems if fp.MIN_SENDER_AGE_KEY in p]), 1)
         self.assertIn("is missing", problems[0])
+
+    def test_zero_is_present_not_absent(self):
+        """V = 0 is the M1 value: it must never read as absent."""
+        self.assertEqual(checks.check_min_sender_age(_policy(**{fp.MIN_SENDER_AGE_KEY: 0})), [])
+        self.assertEqual([p for p in checks.check_ratification(_policy(**{fp.MIN_SENDER_AGE_KEY: 0}))
+                          if fp.MIN_SENDER_AGE_KEY in p], [])
 
     def test_presence_is_no_problem(self):
         self.assertEqual(checks.check_min_sender_age(_policy()), [])
@@ -84,6 +90,10 @@ class VerifyTest(unittest.TestCase):
         problems = [p for p in self.manifest_problems(pol) if fp.MIN_SENDER_AGE_KEY in p]
         self.assertEqual(len(problems), 1)
         self.assertTrue(problems[0].startswith("policy: "))
+
+    def test_a_policy_at_zero_has_no_such_problem(self):
+        pol = {**fp.default_policy(), fp.MIN_SENDER_AGE_KEY: 0}
+        self.assertEqual([p for p in self.manifest_problems(pol) if fp.MIN_SENDER_AGE_KEY in p], [])
 
     def test_a_policy_with_the_key_has_no_such_problem(self):
         self.assertEqual([p for p in self.manifest_problems(fp.default_policy()) if fp.MIN_SENDER_AGE_KEY in p], [])
