@@ -590,6 +590,13 @@ checks; its results do not establish target-host acceptance.
 
 ### Experimental unified conversation: existing-instance transition
 
+The unified Codex choice applies to Codex-served sandboxes. In a mixed sandbox
+containing Claude, the Claude daemon remains the sole AMAP receiver and the Codex
+pane starts with Sandy's native arguments, without the Codex supervisor's
+interactive tools. A fleet-wide unified choice does not disable that native
+pane. Retained Codex unified ownership requires explicit disposition before
+changing the sandbox to Claude-served operation.
+
 The Codex pin names merged connector main commit
 `e10eb2cf22a1056d1506938ef0669bfde582ff75`. Before end-to-end execution,
 require the approved deployment commit for the host's line, full exact-pin
