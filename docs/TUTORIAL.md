@@ -863,6 +863,24 @@ If acknowledgement was lost after native adoption committed, run confirmation;
 do not create another history or replay model input. If native maintenance is
 still planned, retain the hold and follow its explicit same-command recovery.
 
+An adoption confirmed by an older adapter can lack `previous_fingerprint` in
+its transition record. Startup and host verify hold that record for explicit
+revalidation. Preserve the record, previous controller, journal and native home.
+With the target relay held, all native clients and its Codex service stopped,
+and container exec available, preview and apply confirmation again:
+
+```sh
+sandy --exec --workspace "$WORKSPACE" -- /usr/bin/python3 /opt/sandy/features/amap/codex/transition confirm
+sandy --exec --workspace "$WORKSPACE" -- /usr/bin/python3 /opt/sandy/features/amap/codex/transition confirm --apply
+```
+
+This derives the expectation from the retained previous controller, validates
+its retained bytes and the committed native adoption, and adds only the missing
+expectation to an already confirmed record. It changes neither controller bytes
+nor journal rows and submits no native model input. A prepared record can be
+completed only if its native adoption already committed. Foreign or conflicting
+evidence refuses. Do not run `unified-adopt` again merely to add this field.
+
 Only after confirmation, release the adapter pause, with the service still
 stopped:
 
