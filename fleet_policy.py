@@ -702,7 +702,8 @@ def load_policy(path: Path) -> Dict[str, Any]:
                 f"{path}: {MIN_SENDER_AGE_KEY!r} is {age!r} — expected a whole number of seconds "
                 f"from 0 to {MIN_SENDER_AGE_MAX_S}. Absent is also an answer here, and a different "
                 "one: `install` refuses to provision under a manifest that omits this field, "
-                "because the local router enforces it.")
+                "because the policy is where the number is reviewed and the router that "
+                "receives it enforces it.")
 
     out = {
         "version": version,
