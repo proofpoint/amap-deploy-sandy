@@ -5,9 +5,10 @@
   python3 -I -S -B b6.py b6d    --man MAN
   python3 -I -S -B b6.py facts
   python3 -I -S -B b6.py state  --instance-data PATH
-  python3 -I -S -B b6.py seed   --man MAN --seed SEED --dst SANDY_HOME
+  python3 -I -S -B b6.py seed   --man MAN --seed SEED --dst SANDY_HOME --op OP
   python3 -I -S -B b6.py fprint --man MAN --run-dir DIR --deploy CHECKOUT
   python3 -I -S -B b6.py graph
+  python3 -I -S -B b6.py egress --profile PROFILE --profile-sha256 HEX --probe NET_PROBE_FILE
 
 Each phase prints `B6 <check> PASS|FAIL <detail>` rows; its last line is
 `M1-B6 <phase> PASS` only when every row passed. Exit status: 0 PASS, 1 FAIL,
@@ -33,6 +34,12 @@ Each phase prints `B6 <check> PASS|FAIL <detail>` rows; its last line is
           it, is RequiredBy local-fs.target, carries no nofail and is active
           from /dev/disk/by-label/m1-state; local-fs.target Requires both
           mounts; Docker's mount is RequiredBy local-fs.target too.
+  egress  the M1 .fw from inside 206 (NET d0fe2ccb, 16a97150): NET's own
+          NET_PROBE program (pve-m1.py at d94fe842, its bytes checked against
+          NET_PROBE_SHA256) run as `python3 -I -c <program> <list>` over the
+          genesis profile's net_probes.clone_reach (each must reach) and
+          clone_fail (each must fail); the printed list, minus `ok`, must equal
+          the input in order. The profile's sha is checked and quoted.
 """
 
 import errno
@@ -40,6 +47,7 @@ import fnmatch
 import hashlib
 import json
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -99,10 +107,19 @@ def read_regular(path, limit=1 << 22):
         st = os.fstat(ffd)
         if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
             raise OSError(errno.EINVAL, f"{path}: not a regular file with one link")
-        data = os.read(ffd, limit + 1)
-        if len(data) > limit:
-            raise OSError(errno.EFBIG, f"{path}: too large")
-        return data
+        chunks, total = [], 0
+        while True:  # to EOF, under the cap (Codex item 6 (2))
+            chunk = os.read(ffd, 65536)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > limit:
+                raise OSError(errno.EFBIG, f"{path}: too large")
+            chunks.append(chunk)
+        end = os.fstat(ffd)
+        if (end.st_size, end.st_mtime_ns) != (total, st.st_mtime_ns):
+            raise OSError(errno.EAGAIN, f"{path}: changed while read")
+        return b"".join(chunks)
     finally:
         os.close(ffd)
 
@@ -125,7 +142,9 @@ def phase_b6d(man, runner=run):
     for mount in ("/", "/var/lib/docker"):
         rc, out, _ = runner(["df", "--output=avail,size", "-B1", mount])
         lines = out.strip().splitlines()
-        p.row(f"space:{mount}", rc == 0 and len(lines) == 2, f"{lines[-1].split() if len(lines) == 2 else out.strip()!r}")
+        fields = lines[1].split() if len(lines) == 2 else []
+        ok = rc == 0 and len(fields) == 2 and all(re.fullmatch(r"[0-9]+", f) for f in fields)
+        p.row(f"space:{mount}", ok, f"avail,size={fields if fields else out.strip()!r}")
     return p
 
 
@@ -152,9 +171,17 @@ def phase_state(instance_data, runner=run):
     return p
 
 
-def phase_seed(man_path, man, seed, dst, runner=run):
+def phase_seed(man_path, man, seed, dst, op_name, runner=run):
+    """m1-seed-copy as <op> (LC d8 §2.3), whose uid comes from MAN."""
     p = Phase("seed")
-    rc, out, err = runner([PYTHON, "-I", "-S", "-B", SEED_COPY, "--man", man_path, "--src", seed, "--dst", dst])
+    acct = man.get("accounts", {}).get(op_name)
+    uid = acct.get("uid") if isinstance(acct, dict) else None
+    if type(uid) is not int or uid < 1000:
+        p.row("op-uid", False, f"MAN has no account {op_name!r} with a uid >= 1000")
+        return p
+    p.row("op-uid", True, f"{op_name}={uid}")
+    rc, out, err = runner(["sudo", "-n", "-u", f"#{uid}", "--", PYTHON, "-I", "-S", "-B", SEED_COPY,
+                           "--man", man_path, "--src", seed, "--dst", dst])
     last = out.strip().splitlines()[-1] if out.strip() else ""
     p.row("m1-seed-copy", rc == 0 and last.startswith("M1-SEED-COPY PASS "), last or err.strip()[-200:])
     for entry in man.get("hdot", []):
@@ -191,19 +218,91 @@ def phase_fprint(man, run_dir, deploy, runner=run):
     p.row("man-build", isinstance(b, dict) and {"id", "commit"} <= set(b), "MAN builds.router1")
     if not p.ok:
         return p
+    import tempfile
     try:
         path = capture_file(run_dir)
-        doc = json.loads(read_regular(path).decode("utf-8"))
+        raw = read_regular(path)
+        doc = json.loads(raw.decode("utf-8"))
     except (OSError, ValueError) as exc:
         p.row("capture", False, str(exc))
         return p
-    p.row("capture", True, path)
+    sha = hashlib.sha256(raw).hexdigest()
+    p.row("capture", True, f"{path} sha256 {sha}")
+    # One read: the bytes checked here are the bytes verify-image reads, from
+    # a private copy (Codex item 6 (3)).
+    private = tempfile.mkdtemp(prefix="m1-b6-")
+    copy = os.path.join(private, "capture.json")
+    fd = os.open(copy, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+    try:
+        os.write(fd, raw)
+    finally:
+        os.close(fd)
     p.row("source", doc.get("source") == "image", repr(doc.get("source")))
     image = doc.get("image") if isinstance(doc.get("image"), dict) else {}
     p.row("image-id", image.get("id") == b["id"], repr(image.get("id")))
-    rc, out, err = runner([PYTHON, "-I", os.path.join(deploy, "amap-sandy.py"), "router-fingerprint",
-                           "--verify-image", path, "--commit", b["commit"]])
-    p.row("verify-image", rc == 0 and "EXACT" in out.split(), f"exit {rc}: {out.strip()[-120:] or err.strip()[-120:]}")
+    try:
+        rc, out, err = runner([PYTHON, "-I", os.path.join(deploy, "amap-sandy.py"), "router-fingerprint",
+                               "--verify-image", copy, "--commit", b["commit"]])
+        p.row("verify-image", rc == 0 and "EXACT" in out.split(), f"exit {rc}: {out.strip()[-120:] or err.strip()[-120:]}")
+        with open(copy, "rb") as fh:
+            p.row("copy-unchanged", hashlib.sha256(fh.read()).hexdigest() == sha, "the verified bytes are the checked bytes")
+    finally:
+        os.unlink(copy)
+        os.rmdir(private)
+    return p
+
+
+NET_PROBE_SHA256 = "da17051e9fd03b82ba3356cbe9e2248a1c0d70197c0105c850d989a8605423bd"
+PROBE_KEYS = {"kind", "addr", "port", "what"}
+PROBE_TIMEOUT_S = 600
+
+
+def run_probe(program, items, runner=run):
+    """NET_PROBE's output list for ITEMS, or OSError when the run itself failed."""
+    rc, out, err = runner([PYTHON, "-I", "-c", program, json.dumps(items)])
+    if rc != 0:
+        raise OSError(errno.EIO, f"NET_PROBE exited {rc}: {err.strip()[-200:]}")
+    lines = out.splitlines()
+    try:
+        got = json.loads(lines[0]) if len(lines) == 1 else None
+    except ValueError:
+        got = None
+    if not isinstance(got, list):
+        raise OSError(errno.EIO, "NET_PROBE printed no single JSON list")
+    return got
+
+
+def phase_egress(profile_path, profile_sha, probe_path, runner=run):
+    p = Phase("egress")
+    try:
+        program = read_regular(probe_path)
+        raw = read_regular(profile_path)
+    except OSError as exc:
+        p.row("inputs", False, exc.strerror or str(exc))
+        return p
+    p.row("probe-program", hashlib.sha256(program).hexdigest() == NET_PROBE_SHA256,
+          f"NET_PROBE sha256 {hashlib.sha256(program).hexdigest()}")
+    p.row("profile", hashlib.sha256(raw).hexdigest() == profile_sha, f"profile sha256 {hashlib.sha256(raw).hexdigest()}")
+    if not p.ok:
+        return p
+    probes = json.loads(raw.decode("utf-8")).get("net_probes", {})
+    for which, want in (("clone_reach", True), ("clone_fail", False)):
+        items = probes.get(which)
+        if not (isinstance(items, list) and items and all(isinstance(i, dict) and set(i) == PROBE_KEYS
+                                                          for i in items)):
+            p.row(which, False, "absent, empty, or an item is not exactly {kind, addr, port, what}")
+            continue
+        try:
+            got = run_probe(program.decode("utf-8"), items, runner)
+        except OSError as exc:
+            p.row(which, False, exc.strerror or str(exc))
+            continue
+        echoed = [{k: v for k, v in g.items() if k != "ok"} for g in got if isinstance(g, dict)]
+        p.row(f"{which}-echo", echoed == items, f"{len(got)} result(s) for {len(items)} item(s), in order")
+        for item, g in zip(items, got):
+            ok = isinstance(g, dict) and g.get("ok") is want
+            p.row(f"{which}:{item['kind']}:{item['addr']}:{item['port']}", ok,
+                  f"{item['what']}: ok={g.get('ok') if isinstance(g, dict) else g!r}, want {want}")
     return p
 
 
@@ -260,7 +359,8 @@ def phase_graph(runner=run):
 # ------------------------------------------------------------------ the CLI
 
 FLAGS = {"b6d": {"--man"}, "facts": set(), "state": {"--instance-data"},
-         "seed": {"--man", "--seed", "--dst"}, "fprint": {"--man", "--run-dir", "--deploy"}, "graph": set()}
+         "seed": {"--man", "--seed", "--dst", "--op"}, "fprint": {"--man", "--run-dir", "--deploy"}, "graph": set(),
+         "egress": {"--profile", "--profile-sha256", "--probe"}}
 
 
 def parse(argv):
@@ -272,7 +372,15 @@ def parse(argv):
         if flag not in FLAGS[argv[0]] or flag in got or not rest:
             raise Usage(f"{argv[0]}: unexpected {flag!r}")
         value = rest.pop(0)
-        if not value.startswith("/") or os.path.normpath(value) != value:
+        if flag == "--op":
+            if not re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", value):
+                raise Usage("--op must be an account name")
+            got[flag] = value
+            continue
+        if flag == "--profile-sha256":
+            if not re.fullmatch(r"[0-9a-f]{64}", value):
+                raise Usage("--profile-sha256 must be 64 lowercase hex")
+        elif not value.startswith("/") or os.path.normpath(value) != value:
             raise Usage(f"{flag} must be a normalised absolute path")
         got[flag] = value
     if set(got) != FLAGS[argv[0]]:
@@ -299,9 +407,11 @@ def main(argv, runner=run):
     elif phase == "state":
         p = phase_state(a["--instance-data"], runner)
     elif phase == "seed":
-        p = phase_seed(a["--man"], man, a["--seed"], a["--dst"], runner)
+        p = phase_seed(a["--man"], man, a["--seed"], a["--dst"], a["--op"], runner)
     elif phase == "graph":
         p = phase_graph(runner)
+    elif phase == "egress":
+        p = phase_egress(a["--profile"], a["--profile-sha256"], a["--probe"], runner)
     else:
         p = phase_fprint(man, a["--run-dir"], a["--deploy"], runner)
     for line in p.lines():

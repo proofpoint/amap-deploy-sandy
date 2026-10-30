@@ -55,7 +55,8 @@ class Runner:
         raise AssertionError(argv)
 
 
-MAN = {"images": {"m1-hop:pin": IMG}, "hdot": [{"name": ".base_build_hash", "mode": "0644",
+MAN = {"accounts": {"op": {"uid": 2101, "gid": 2101, "home": "/home/op", "groups": ["docker"]}},
+       "images": {"m1-hop:pin": IMG}, "hdot": [{"name": ".base_build_hash", "mode": "0644",
                                                  "sha256": hashlib.sha256(b"b\n").hexdigest()}],
        "builds": {"router1": {"commit": COMMIT, "tree": "e" * 40, "image": "m1-hop:pin", "id": IMG}}}
 
@@ -106,16 +107,31 @@ class PhaseTest(unittest.TestCase):
         dst = self.tmp / "sandy"
         dst.mkdir()
         (dst / ".base_build_hash").write_bytes(b"b\n")
-        self.assertTrue(b6.phase_seed("/opt/amap/MAN.json", MAN, "/opt/amap/sandy-seed", str(dst), self.r).ok)
+        self.assertTrue(b6.phase_seed("/opt/amap/MAN.json", MAN, "/opt/amap/sandy-seed", str(dst), "op", self.r).ok)
         (dst / ".base_build_hash").write_bytes(b"changed\n")
-        self.assertFalse(b6.phase_seed("/m", MAN, "/s", str(dst), self.r).ok)
+        self.assertFalse(b6.phase_seed("/m", MAN, "/s", str(dst), "op", self.r).ok)
         (dst / ".base_build_hash").write_bytes(b"b\n")
         r = Runner()
         r.over["{{.Id}}"] = (0, "sha256:" + "2" * 64 + "\n", "")
-        self.assertFalse(b6.phase_seed("/m", MAN, "/s", str(dst), r).ok)
+        self.assertFalse(b6.phase_seed("/m", MAN, "/s", str(dst), "op", r).ok)
         r = Runner()
         r.over[b6.SEED_COPY] = (1, "", "REFUSE x")
-        self.assertFalse(b6.phase_seed("/m", MAN, "/s", str(dst), r).ok)
+        self.assertFalse(b6.phase_seed("/m", MAN, "/s", str(dst), "op", r).ok)
+
+    def test_seed_runs_as_op(self):
+        dst = self.tmp / "sandy"
+        dst.mkdir()
+        (dst / ".base_build_hash").write_bytes(b"b\n")
+        b6.phase_seed("/m", MAN, "/s", str(dst), "op", self.r)
+        argv = [a for a, _ in self.r.calls if b6.SEED_COPY in a][0]
+        self.assertEqual(argv[:5], ["sudo", "-n", "-u", "#2101", "--"])
+        self.assertFalse(b6.phase_seed("/m", MAN, "/s", str(dst), "nobody", self.r).ok)
+        self.assertFalse(b6.phase_seed("/m", {"accounts": {"op": {"uid": 0}}}, "/s", str(dst), "op", self.r).ok)
+
+    def test_df_fields_must_be_integers(self):
+        r = Runner()
+        r.over["df"] = (0, "Avail Size\n12G 20G\n", "")
+        self.assertFalse(b6.phase_b6d(MAN, r).ok)
 
     def capture(self, doc, name="router-fingerprint-image-20261030T000000Z.json"):
         d = self.tmp / "run"
@@ -128,7 +144,10 @@ class PhaseTest(unittest.TestCase):
         p = b6.phase_fprint(MAN, run_dir, "/opt/amap/src/amap-deploy-sandy", self.r)
         self.assertTrue(p.ok, p.lines())
         verify = [a for a, _ in self.r.calls if "router-fingerprint" in a][0]
-        self.assertEqual(verify[-4:], ["--verify-image", os.path.join(run_dir, os.listdir(run_dir)[0]), "--commit", COMMIT])
+        self.assertEqual(verify[-4], "--verify-image")
+        self.assertNotEqual(os.path.dirname(verify[-3]), run_dir)  # a private copy, not the run_dir file
+        self.assertEqual(verify[-2:], ["--commit", COMMIT])
+        self.assertFalse(os.path.exists(verify[-3]))  # removed after
 
     def test_fprint_fails(self):
         cases = {
@@ -169,6 +188,7 @@ class PhaseTest(unittest.TestCase):
 class CliTest(unittest.TestCase):
     def test_usage(self):
         for argv in ([], ["frob"], ["b6d"], ["b6d", "--man", "rel"], ["seed", "--man", "/a", "--seed", "/b"],
+                     ["seed", "--man", "/a", "--seed", "/b", "--dst", "/c", "--op", "Bad Name"],
                      ["facts", "--man", "/a"]):
             with self.subTest(argv):
                 with redirect_stderr(io.StringIO()):
@@ -274,3 +294,97 @@ class ReadRegularTest(unittest.TestCase):
         f.write_text(json.dumps({"source": "image", "image": {"id": IMG}}))
         os.link(f, d / "second-name")
         self.assertFalse(b6.phase_fprint(MAN, str(d / "run"), "/d", Runner()).ok)
+
+
+class EgressTest(unittest.TestCase):
+    """phase egress runs NET's real NET_PROBE bytes. The probes here are
+    loopback only (a listener this test opens, and closed ports), so no host
+    is contacted; the output form is NET's own (NET 35209a88 sample)."""
+
+    def setUp(self):
+        import socket
+        self.d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.d)
+        self.listener = socket.socket()
+        self.listener.bind(("127.0.0.1", 0))
+        self.listener.listen(4)
+        self.addCleanup(self.listener.close)
+        port = self.listener.getsockname()[1]
+        self.profile = {"net_probes": {
+            "clone_reach": [{"kind": "tcp", "addr": "127.0.0.1", "port": port, "what": "a loopback listener"}],
+            "clone_fail": [{"kind": "tcp", "addr": "127.0.0.1", "port": 1, "what": "loopback closed tcp"},
+                           {"kind": "dns", "addr": "127.0.0.1", "port": 9, "what": "loopback no dns"}]}}
+        self.probe = str(M1VM / "net_probe_d94fe842.py")
+
+    def write_profile(self):
+        p = self.d / "profile.json"
+        p.write_text(json.dumps(self.profile))
+        return str(p), hashlib.sha256(p.read_bytes()).hexdigest()
+
+    def test_real_probe_pass(self):
+        path, sha = self.write_profile()
+        p = b6.phase_egress(path, sha, self.probe, b6.run)
+        self.assertTrue(p.ok, p.lines())
+        self.assertEqual(hashlib.sha256((M1VM / "net_probe_d94fe842.py").read_bytes()).hexdigest(),
+                         b6.NET_PROBE_SHA256)
+
+    def test_reach_that_fails_and_fail_that_reaches(self):
+        self.profile["net_probes"]["clone_reach"], self.profile["net_probes"]["clone_fail"][:1] = (
+            self.profile["net_probes"]["clone_fail"][:1], self.profile["net_probes"]["clone_reach"])
+        path, sha = self.write_profile()
+        p = b6.phase_egress(path, sha, self.probe, b6.run)
+        self.assertFalse(p.ok)
+        fails = [l for l in p.lines() if " FAIL " in l]
+        self.assertTrue(any("clone_reach:tcp" in l for l in fails), fails)
+        self.assertTrue(any("clone_fail:tcp" in l for l in fails), fails)
+
+    def test_shas_checked(self):
+        path, sha = self.write_profile()
+        self.assertFalse(b6.phase_egress(path, "0" * 64, self.probe, b6.run).ok)
+        other = self.d / "probe.py"
+        other.write_bytes((M1VM / "net_probe_d94fe842.py").read_bytes() + b"\n")
+        self.assertFalse(b6.phase_egress(path, sha, str(other), b6.run).ok)
+
+    def test_oversized_profile_fails_not_crashes(self):
+        big = self.d / "big.json"
+        big.write_bytes(b" " * ((1 << 22) + 1))
+        p = b6.phase_egress(str(big), "0" * 64, self.probe, b6.run)
+        self.assertFalse(p.ok)
+        self.assertIn("too large", "\n".join(p.lines()))
+
+    def test_item_shape(self):
+        self.profile["net_probes"]["clone_fail"][0]["extra"] = 1
+        path, sha = self.write_profile()
+        self.assertFalse(b6.phase_egress(path, sha, self.probe, b6.run).ok)
+        self.profile["net_probes"].pop("clone_reach")
+        path, sha = self.write_profile()
+        self.assertFalse(b6.phase_egress(path, sha, self.probe, b6.run).ok)
+
+    def test_echo_and_run_failures(self):
+        path, sha = self.write_profile()
+        cases = {
+            "reordered": lambda items: (0, json.dumps([dict(i, ok=False) for i in reversed(items)]) + "\n", ""),
+            "rc": lambda items: (1, json.dumps([dict(i, ok=(i["port"] != 1 and i["kind"] == "tcp")) for i in items]) + "\n", "boom"),
+            "echo altered": lambda items: (0, json.dumps([dict(i, what="changed", ok=(i["port"] != 1 and i["kind"] == "tcp"))
+                                                         for i in items]) + "\n", ""),
+            "two lines": lambda items: (0, "[]\n[]\n", ""),
+            "not a list": lambda items: (0, "{}\n", ""),
+        }
+        for name, fake in cases.items():
+            with self.subTest(name):
+                def runner(argv, root=False, check=True, fake=fake):
+                    return fake(json.loads(argv[-1]))
+                self.assertFalse(b6.phase_egress(path, sha, self.probe, runner).ok)
+
+    def test_program_passed_as_one_argv_with_its_newline(self):
+        path, sha = self.write_profile()
+        seen = []
+
+        def runner(argv, root=False, check=True):
+            seen.append(argv)
+            items = json.loads(argv[-1])
+            return 0, json.dumps([dict(i, ok=(i["port"] != 1 and i["kind"] == "tcp")) for i in items]) + "\n", ""
+        b6.phase_egress(path, sha, self.probe, runner)
+        self.assertEqual(seen[0][:3], [b6.PYTHON, "-I", "-c"])
+        self.assertEqual(seen[0][3], (M1VM / "net_probe_d94fe842.py").read_text())
+        self.assertTrue(seen[0][3].endswith("\n"))

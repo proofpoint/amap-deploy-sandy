@@ -79,10 +79,19 @@ def read_regular(path, limit=1 << 22):
         st = os.fstat(ffd)
         if not stat.S_ISREG(st.st_mode):
             raise OSError(errno.EINVAL, f"{path}: not a regular file")
-        data = os.read(ffd, limit + 1)
-        if len(data) > limit:
-            raise OSError(errno.EFBIG, f"{path}: larger than the bound")
-        return data, st
+        chunks, total = [], 0
+        while True:  # to EOF, under the cap
+            chunk = os.read(ffd, 65536)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > limit:
+                raise OSError(errno.EFBIG, f"{path}: larger than the bound")
+            chunks.append(chunk)
+        end = os.fstat(ffd)
+        if (end.st_size, end.st_mtime_ns) != (total, st.st_mtime_ns):
+            raise OSError(errno.EAGAIN, f"{path}: changed while read")
+        return b"".join(chunks), st
     finally:
         os.close(ffd)
 
