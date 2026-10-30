@@ -416,3 +416,56 @@ class CliTest(TreeCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RenderNetTest(unittest.TestCase):
+    """render-net: NET's seal input, canonical bytes, no claims it lacks."""
+
+    PARAMS = {"op_home": "/home/op", "data_mount": "/srv/m1-state"}
+
+    def test_exact_bytes(self):
+        out = sealspec.render_net(shipped(), dict(self.PARAMS))
+        self.assertEqual(out, b'{"assert_absent":["/etc/systemd/system/qemu-guest-agent.service",'
+                              b'"/home/op/m1-bundles","/var/lib/m1-bake"],"delete":[],"truncate":[]}\n')
+
+    def test_only_literal_absent_paths(self):
+        doc = json.loads(sealspec.render_net(shipped(), dict(self.PARAMS)))
+        self.assertEqual(sorted(doc), ["assert_absent", "delete", "truncate"])
+        self.assertEqual((doc["delete"], doc["truncate"]), ([], []))
+        expected = sorted(i["path"].replace("{op_home}", "/home/op") for i in shipped()["items"]
+                          if "path" in i and i["expect"] == "absent")
+        self.assertEqual(doc["assert_absent"], expected)
+        for path in doc["assert_absent"]:
+            self.assertTrue(path.startswith("/") and "*" not in path and "{" not in path, path)
+
+    def test_home_and_glob_items_never_render(self):
+        spec = shipped()
+        spec["items"].append({"id": "SS-99", "home": ".x", "expect": "absent", "why": "w"})
+        spec["items"].append({"id": "SS-98", "glob": "/etc/x*", "expect": "none", "why": "w"})
+        self.assertEqual(sealspec.render_net(spec, dict(self.PARAMS)), sealspec.render_net(shipped(), dict(self.PARAMS)))
+
+    def test_two_items_rendering_one_path(self):
+        spec = shipped()
+        spec["items"].append({"id": "SS-99", "path": "/home/op/m1-bundles", "expect": "absent", "why": "w"})
+        with self.assertRaises(sealspec.ParamError):
+            sealspec.render_net(spec, dict(self.PARAMS))
+
+    def test_param_refusals(self):
+        for params in ({"op_home": "/home/op"}, {"op_home": "home/op", "data_mount": "/srv/m1-state"},
+                       {"op_home": "/", "data_mount": "/srv/m1-state"},
+                       {"op_home": "/home/../op", "data_mount": "/srv/m1-state"},
+                       dict(self.PARAMS, op_user="op")):
+            with self.subTest(params):
+                with self.assertRaises(sealspec.ParamError):
+                    sealspec.render_net(shipped(), params)
+
+    def test_cli(self):
+        r = subprocess.run([sys.executable, "-I", "-S", "-B", str(M1VM / "sealspec.py"), "render-net",
+                            "--spec", str(SPEC_PATH), "--param", "op_home=/home/op",
+                            "--param", "data_mount=/srv/m1-state"], capture_output=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout, sealspec.render_net(shipped(), dict(self.PARAMS)))
+        bad = subprocess.run([sys.executable, "-I", "-S", "-B", str(M1VM / "sealspec.py"), "render-net",
+                              "--spec", str(SPEC_PATH), "--param", "op_user=op"], capture_output=True)
+        self.assertEqual(bad.returncode, 2)
+        self.assertEqual(bad.stdout, b"")

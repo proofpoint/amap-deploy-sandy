@@ -6,6 +6,8 @@ the items against an offline, mounted copy of R. Standard library only.
         the spec's own shape; prints its sha256
   python3 -I -S -B sealspec.py eval --spec SPEC --root DIR --param op_user=NAME --param data_mount=PATH
         every item, against the tree mounted at DIR
+  python3 -I -S -B sealspec.py render-net --spec SPEC --param op_home=PATH --param data_mount=PATH
+        NET's seal input: canonical {"assert_absent": [...], "delete": [], "truncate": []}
 
 NET's seal (`seal 208`, G-B4b step 3) runs the items with the spec's sha bound
 in its profile; the patterns and the allow-list feed its absence scan (NET
@@ -483,12 +485,43 @@ def evaluate(tree, spec, params):
 USAGE = __doc__.split("\n\n")[1]
 
 
-def _parse_params(args):
+RENDER_PARAMS = ("op_home", "data_mount")
+
+
+def render_net(spec, params):
+    """The canonical bytes of NET's seal input. Only `path` items expecting
+    `absent` render, with their placeholders resolved from the reviewed
+    PARAMS; a `home` or `glob` item, or any other expectation, renders
+    nothing, so the list claims no coverage it lacks (those stay with `eval`).
+    `delete` and `truncate` are always empty: the seal proves BAKE cleaned up,
+    it does not clean up for it."""
+    if set(params) != set(RENDER_PARAMS):
+        raise ParamError(f"parameters must be exactly {list(RENDER_PARAMS)}")
+    for key in RENDER_PARAMS:
+        if not _norm_abs(params[key]) or params[key] == "/":
+            raise ParamError(f"{key} must be a normalised absolute path other than /")
+    subst = {"{op_home}": params["op_home"], "{data_mount}": params["data_mount"]}
+    absent = []
+    for item in spec["items"]:
+        if "path" not in item or item["expect"] != "absent":
+            continue
+        value = item["path"]
+        for ph, real in subst.items():
+            if value.startswith(ph):
+                value = os.path.normpath(real + value[len(ph):])
+        absent.append(value)
+    if len(set(absent)) != len(absent):
+        raise ParamError("two items render the same path")
+    doc = {"assert_absent": sorted(absent), "delete": [], "truncate": []}
+    return (json.dumps(doc, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
+
+
+def _parse_params(args, allowed=PARAMS):
     params = {}
     for arg in args:
         key, sep, value = arg.partition("=")
-        if not sep or key not in PARAMS or key in params or not value:
-            raise ParamError(f"--param {arg!r}: want one of {list(PARAMS)}=VALUE, each once")
+        if not sep or key not in allowed or key in params or not value:
+            raise ParamError(f"--param {arg!r}: want one of {list(allowed)}=VALUE, each once")
         params[key] = value
     return params
 
@@ -501,6 +534,28 @@ def main(argv):
             print(f"M1-SEALSPEC INVALID {exc}", file=sys.stderr)
             return 2
         print(f"M1-SEALSPEC VALID sha256={sha}")
+        return 0
+    if argv[:1] == ["render-net"]:
+        spec_path, raw_params, rest = None, [], argv[1:]
+        while rest:
+            flag = rest.pop(0)
+            if flag == "--spec" and rest and spec_path is None:
+                spec_path = rest.pop(0)
+            elif flag == "--param" and rest:
+                raw_params.append(rest.pop(0))
+            else:
+                print(USAGE, file=sys.stderr)
+                return 2
+        try:
+            if spec_path is None:
+                raise ParamError("--spec is required")
+            spec, _ = load(spec_path)
+            out = render_net(spec, _parse_params(raw_params, RENDER_PARAMS))
+        except (OSError, SpecError, ParamError) as exc:
+            print(f"M1-SEALSPEC USAGE {exc}", file=sys.stderr)
+            return 2
+        sys.stdout.buffer.write(out)
+        sys.stdout.flush()
         return 0
     if not argv or argv[0] != "eval":
         print(USAGE, file=sys.stderr)
