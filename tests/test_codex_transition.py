@@ -336,6 +336,118 @@ class TransitionTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "not confirmed"):
             transition.confirm(self.state, apply=True)
 
+    def confirmed(self):
+        self.prepare(apply=True)
+        self.commit_adoption_fixture()
+        transition.confirm(self.state, apply=True)
+
+    def measured_build(self, version):
+        return mock.patch.object(transition.subprocess, "run", return_value=
+            subprocess.CompletedProcess(["codex", "--version"], 0, version + "\n", ""))
+
+    def test_sandy_build_updates_preserve_adoption_and_audit_on_service_restart(self):
+        self.confirmed()
+        original_record = (self.state / transition.RECORD).read_bytes()
+        original_previous = (self.state / transition.PREVIOUS).read_bytes()
+        original_controller = (self.state / "controller.toml").read_bytes()
+        baseline = transition.read_record(self.state)
+        with closing(sqlite3.connect(self.state / "journal.sqlite3")) as db:
+            original_adoption = db.execute("SELECT * FROM unified_adoptions").fetchall()
+            original_binding = db.execute("SELECT * FROM unified_binding").fetchall()
+        for version in ("codex-cli 0.166.0", "codex-cli 0.167.0"):
+            with self.subTest(version=version), self.measured_build(version):
+                preview = transition.refresh_build(self.state, version)
+                self.assertTrue(preview["changed"])
+                transition.refresh_build(self.state, version, apply=True)
+                config = transition.config_at(self.state)
+                self.assertEqual(config.codex_version, version)
+                self.assertEqual(config.fingerprint(), baseline["fingerprint"])
+                self.assertEqual(transition.entry_mode(self.state, observed_version=version), "unified")
+                self.assertEqual(transition.read_record(self.state)["codex_version"], version)
+                self.assertEqual((self.state / transition.RECORD).read_bytes(), original_record)
+                self.assertEqual((self.state / transition.PREVIOUS).read_bytes(), original_previous)
+                with closing(sqlite3.connect(self.state / "journal.sqlite3")) as db:
+                    self.assertEqual(db.execute("SELECT * FROM unified_adoptions").fetchall(), original_adoption)
+                    self.assertEqual(db.execute("SELECT * FROM unified_binding").fetchall(), original_binding)
+                with Journal(self.state, config.instance_id, config.fingerprint(), version, config.codex_model) as journal:
+                    self.assertEqual(journal.thread_id, THREAD)
+                    self.assertEqual(journal.db.execute("SELECT note FROM audit WHERE action='codex_version_changed' ORDER BY id DESC").fetchone()[0].split(' -> ')[-1], version)
+                self.assertFalse(transition.refresh_build(self.state, version, apply=True)["changed"])
+        self.assertEqual((self.state / 'controller-history' / (assets.digest(original_controller) + '.toml')).read_bytes(), original_controller)
+
+    def test_build_refresh_refuses_active_service_pause_downgrade_and_changed_measurement(self):
+        self.confirmed()
+        config = transition.config_at(self.state)
+        before = (self.state / 'controller.toml').read_bytes()
+        with Ownership(config), self.measured_build("codex-cli 0.166.0"):
+            with self.assertRaisesRegex(RuntimeError, "another controller"):
+                transition.refresh_build(self.state, "codex-cli 0.166.0", apply=True)
+        transition.pause(self.state, "maintenance", apply=True)
+        with self.measured_build("codex-cli 0.166.0"), self.assertRaisesRegex(ValueError, "pause"):
+            transition.refresh_build(self.state, "codex-cli 0.166.0", apply=True)
+        transition.unpause(self.state, apply=True)
+        with self.assertRaisesRegex(ValueError, "backwards"):
+            transition.refresh_build(self.state, "codex-cli 0.163.0", apply=True)
+        with self.measured_build("codex-cli 0.167.0"), self.assertRaisesRegex(ValueError, "measurement"):
+            transition.refresh_build(self.state, "codex-cli 0.166.0", apply=True)
+        self.assertEqual((self.state / 'controller.toml').read_bytes(), before)
+
+    def test_build_projection_never_accepts_model_or_permission_edits(self):
+        import codex_adoption as adoption
+        self.confirmed()
+        baseline = transition.read_record(self.state)
+        path = self.state / "controller.toml"
+        raw = path.read_bytes()
+        for previous, updated in ((b'test-model', b'foreign-model'), (b'danger-full-access', b'read-only')):
+            with self.subTest(updated=updated):
+                path.write_bytes(adoption.with_build(raw, "codex-cli 0.166.0").replace(previous, updated))
+                with self.assertRaisesRegex(ValueError, "beyond an advancing Codex build"):
+                    transition.read_record(self.state)
+        path.write_bytes(raw)
+
+    def test_build_refresh_refuses_missing_native_confirmation_and_bad_measurements(self):
+        self.confirmed()
+        path = self.state / "controller.toml"
+        before = path.read_bytes()
+        for version in ('', 'codex-cli unknown', 'codex-cli 0.166.0\nextra'):
+            with self.subTest(version=version), self.assertRaises(ValueError):
+                transition.refresh_build(self.state, version, apply=True)
+        with mock.patch.object(transition.subprocess, 'run', side_effect=subprocess.TimeoutExpired('codex', 10)):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                transition.refresh_build(self.state, 'codex-cli 0.166.0', apply=True)
+        with closing(sqlite3.connect(self.state / 'journal.sqlite3')) as db, db:
+            db.execute("UPDATE unified_adoptions SET state='planned'")
+        with self.assertRaisesRegex(ValueError, 'not confirmed'):
+            transition.refresh_build(self.state, 'codex-cli 0.166.0', apply=True)
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_wait_selection_times_out_with_the_relay_reason_and_accepts_current_challenge(self):
+        import codex_settings as settings
+        self.confirmed()
+        generation = settings.environment_generation()
+        settings.capture(self.state, self.previous.instance_id, settings.resolve(os.environ), generation=generation)
+        (self.state / 'hold.json').write_text(json.dumps({'reason': 'installed backend cannot initialize'}))
+        with self.assertRaisesRegex(ValueError, 'installed backend cannot initialize'):
+            transition.wait_selection(self.state, wait=0)
+        with self.assertRaises(ValueError):
+            transition.startup_gate(self.state, generation, apply=True)
+        transition.wait_selection(self.state)
+
+    def test_pane_waits_for_the_current_generation_instead_of_using_old_challenge(self):
+        import codex_settings as settings
+        self.confirmed()
+        generation = settings.environment_generation()
+        settings.capture(self.state, self.previous.instance_id, settings.resolve(os.environ), generation=generation)
+        config = transition.config_at(self.state)
+        stale = settings.startup_request(self.state, config, THREAD, 'b' * 32)
+        (self.state / settings.STARTUP).write_bytes(assets.encoded(stale))
+        def relay_publishes(_):
+            current = settings.startup_request(self.state, config, THREAD, generation)
+            (self.state / settings.STARTUP).write_bytes(assets.encoded(current))
+        with mock.patch.object(transition.time, 'sleep', side_effect=relay_publishes) as sleep:
+            transition.wait_selection(self.state)
+        sleep.assert_called_once()
+
     def test_manual_unified_mode_without_transition_never_defaults_to_separate(self):
         self.doc.update(conversation_mode="unified", unified_argv=["codex"], operator_kickoff_enabled=False)
         (self.state / "controller.toml").write_bytes(transition.toml_bytes(self.doc))

@@ -107,6 +107,13 @@ wait_operator_pause() {
 wait_transition() {
     while :; do
         wait_operator_pause
+        if [ "$RUNTIME_ROUTE" = adopted ]; then
+            if ! build_refresh=$("$ADOPTED_PYTHON" "$SELF_DIR/transition" --state "$STATE" refresh-build --version "$CODEX_VERSION" --apply 2>&1); then
+                hold_record "$build_refresh"
+                sleep 1
+                continue
+            fi
+        fi
         if MODEL=$(python3 "$SELF_DIR/codex_settings.py" --for-entry --state "$STATE" --instance "$sandbox_name" --generation "$ENTRY_GENERATION" --apply 2>&1); then
             if mode=$(python3 "$SELF_DIR/transition" --state "$STATE" entry-mode --model "$MODEL" --version "$CODEX_VERSION" --check-pane-settings 2>&1); then
                 if [ -e "$AMAP_CODEX_PAUSE_PATH" ] || [ -L "$AMAP_CODEX_PAUSE_PATH" ]; then continue; fi
