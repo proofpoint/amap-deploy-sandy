@@ -1,12 +1,12 @@
 """Read-only unified evidence checks, usable on the host without Codex imports."""
 import json
-from contextlib import closing
 import math
 from pathlib import Path
 import re
 import sqlite3
 import time
 
+import codex_adoption as adoptions
 import codex_assets as assets
 import codex_fleet as fleet
 import codex_settings as settings
@@ -116,6 +116,14 @@ def evidence_problems(status, descriptor, record, binding, *, now):
     return problems
 
 
+def adoption_problems(adoption, record, binding):
+    """The committed adoption against the transition record and the durable binding."""
+    return adoptions.problems(adoption, thread=(record.get("thread"), binding["thread_id"]),
+                              fingerprint=(record.get("fingerprint"), binding["fingerprint"]),
+                              previous_fingerprint=(record.get("previous_fingerprint"),),
+                              policy_hash=(record.get("policy_hash"), binding["policy_hash"]))
+
+
 def problems(state, status, *, now=None):
     state = Path(state)
     if any(path.exists() or path.is_symlink() for path in fleet.fresh_markers(state)):
@@ -139,17 +147,11 @@ def problems(state, status, *, now=None):
         entry_selection = json.loads(assets.regular(state / settings.RECEIPT))
         startup = json.loads(assets.regular(state / settings.STARTUP))
         pane_selection = json.loads(assets.regular(state / settings.PANE_SELECTION))
-        journal = state / "journal.sqlite3"
-        if journal.is_symlink() or not journal.is_file():
-            raise ValueError("journal is unavailable or a symlink")
-        with closing(sqlite3.connect(journal.as_uri() + "?mode=ro", uri=True)) as db:
-            db.row_factory = sqlite3.Row
-            row = db.execute("SELECT i.fingerprint,b.thread_id,b.policy_hash,b.effective_model "
-                             "FROM instance i JOIN unified_binding b USING(instance_id) "
-                             "WHERE i.instance_id=?", (record["instance_id"],)).fetchone()
+        row, adoption = adoptions.evidence(state / "journal.sqlite3", record["instance_id"])
         if row is None:
             raise ValueError("durable unified binding is unavailable")
-        return (settings.evidence_problems(entry_selection, record)
+        return (adoption_problems(adoption, record, row)
+                + settings.evidence_problems(entry_selection, record)
                 + settings.startup_problems(startup, pane_selection, record, entry_selection)
                 + evidence_problems(status, descriptor, record, dict(row), now=time.time() if now is None else now))
     except (OSError, ValueError, KeyError, TypeError, sqlite3.Error) as exc:

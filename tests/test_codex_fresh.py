@@ -4,6 +4,7 @@ The native protocol is a local in-memory fake. UnifiedService and Journal run
 unmodified; these fixtures never manufacture an adoption or canonical SQL row.
 """
 import asyncio
+from contextlib import closing
 import json
 import os
 from pathlib import Path
@@ -184,7 +185,7 @@ class FreshBirthTest(unittest.TestCase):
                 if name:
                     (other / name).write_bytes(b"retained old bytes")
                 before = {p.name: p.read_bytes() for p in other.iterdir()}
-                with self.assertRaisesRegex(ValueError, "operator recreation"):
+                with self.assertRaisesRegex(ValueError, "retain the state and outbox custody and inspect them first"):
                     fresh.birth(other, self.session, self.env)
                 self.assertEqual({p.name: p.read_bytes() for p in other.iterdir()}, before)
                 if name:
@@ -204,7 +205,7 @@ class FreshBirthTest(unittest.TestCase):
                 fresh.birth(state, self.session, self.env)
         self.assertTrue(fresh.intent_path(state).is_file())
         self.assertEqual(list(state.iterdir()), [])
-        with self.assertRaisesRegex(ValueError, "operator recreation"):
+        with self.assertRaisesRegex(ValueError, "retain the state and outbox custody and inspect them first"):
             fresh.birth(state, self.session, self.env)
         with self.assertRaisesRegex(ValueError, "cannot enter"):
             transition.entry_mode(state)
@@ -279,7 +280,8 @@ class FreshBirthTest(unittest.TestCase):
         record = {prov.FEATURE_ENTRIES_KEY: {prov.FEATURE_NAME: {"state_dir": str(state.parent)}}}
         for running in (False, True):
             problems, _ = prov.verify_codex_supervisor(home, "fresh-fixture", record, running=running)
-            self.assertTrue(any("retained namespace custody requires" in p for p in problems))
+            self.assertTrue(any("retained namespace custody is present; retain the state and the outbox "
+                                "custody and inspect them first" in p for p in problems))
             self.assertFalse(state.exists())
         self.prepare()
         self.select()
@@ -290,9 +292,13 @@ class FreshBirthTest(unittest.TestCase):
                     await service.start()
                     state.parent.mkdir()
                     shutil.copytree(self.state, state)
-                    problems, _ = prov.verify_codex_supervisor(home, "fresh-fixture", record,
-                                                             running=True, expected_mode="unified")
+                    with closing(sqlite3.connect((state / "journal.sqlite3").as_uri() + "?mode=ro", uri=True)) as db:
+                        adoptions = db.execute("SELECT 1 FROM sqlite_master WHERE name='unified_adoptions'").fetchone()
+                    self.assertIsNone(adoptions, "a fresh birth carries no native adoption table")
+                    problems, notes = prov.verify_codex_supervisor(home, "fresh-fixture", record,
+                                                                 running=True, expected_mode="unified")
                     self.assertEqual(problems, [])
+                    self.assertFalse(any("adopted workspace binding" in n for n in notes), notes)
                     custody.write_text("{}")
                     problems, _ = prov.verify_codex_supervisor(home, "fresh-fixture", record,
                                                              running=True, expected_mode="unified")
