@@ -90,10 +90,31 @@ def check_resolve_peers(policy: Dict[str, Any], enrolled_record: Dict[str, dict]
     fp.resolve_peers(policy, list(names_by_slug.values()), enrolled_record)
 
 
+def check_min_sender_age(policy: Dict[str, Any]) -> List[str]:
+    """The sender-age floor must be present in the file. The policy carries
+    the reviewed value. A separately gated render places it in each enforcing
+    router's configuration, and the router enforces that configured value;
+    without it, a router's own default would decide a number no reviewed file
+    names. `fleet_policy.load_policy` validates its shape when present (a null is malformed, not absent); this is the one
+    place absence is decided, and it refuses a malformed value too, for a
+    policy that did not come through the loader."""
+    if fp.MIN_SENDER_AGE_KEY in policy:
+        age = policy[fp.MIN_SENDER_AGE_KEY]
+        if isinstance(age, bool) or not isinstance(age, int) or not 0 <= age <= fp.MIN_SENDER_AGE_MAX_S:
+            return [f"{fp.MIN_SENDER_AGE_KEY!r} is {age!r}, not a whole number of seconds from 0 to "
+                    f"{fp.MIN_SENDER_AGE_MAX_S}. Set it, in seconds (0 means no wait)."]
+        return []
+    return [f"{fp.MIN_SENDER_AGE_KEY!r} is missing. It is how many seconds after its first "
+            "enrolment a sender's signed delegation is admitted. This file carries the reviewed "
+            "value; a separately gated render places it in each enforcing router's configuration, "
+            "and the router enforces that configured value. Add it, in seconds "
+            f"({fp.DEFAULT_MIN_SENDER_AGE_S} is the template's; 0 means no wait)."]
+
+
 def check_ratification(policy: Dict[str, Any]) -> List[str]:
     """The refusals that need NOTHING but the candidate itself: the
-    recreation cadence must be present, and a task graph with edges must
-    have a `fleet_domain` to address them with. Returns one line per
+    sender-age floor and the recreation cadence must be present, and a task
+    graph with edges must have a `fleet_domain` to address them with. Returns one line per
     failure; empty means it passed.
 
     These are hard refusals, not `--apply` gates like the
@@ -119,7 +140,7 @@ def check_ratification(policy: Dict[str, Any]) -> List[str]:
     at either end, and the router's own loader refuses `peer_senders`
     without one. Refusing here means that error never
     reaches the operator from a file they did not edit."""
-    problems: List[str] = []
+    problems: List[str] = list(check_min_sender_age(policy))
     if fp.RECREATE_INTERVAL_KEY not in policy:
         problems.append(
             f"{fp.RECREATE_INTERVAL_KEY!r} is missing. The launchd job that recreates "

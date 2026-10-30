@@ -1636,6 +1636,8 @@ def verify_manifest(home: Path, policy: Dict[str, Any], *,
                         f"adapter renders — those blocks are the adapter's; re-run install "
                         f"--apply, which repairs them and leaves the policy keys alone")
     problems += verify_manifest_domain(home)
+    import policy_checks as checks
+    problems += [f"policy: {path}: {p}" for p in checks.check_min_sender_age(policy)]
     return problems
 
 
