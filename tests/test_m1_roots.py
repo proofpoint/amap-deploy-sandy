@@ -188,6 +188,94 @@ class InstallTest(Fixture):
         with self.assertRaisesRegex(st.StepError, "not a real directory"):
             st.install(self.hostj_src, self.p("link") + "/host.json", self.uid, self.gid, self.hostj_sha, 0o600)
 
+    def assert_nothing_written(self):
+        self.assertEqual(os.listdir(self.dir), [])
+
+    def install(self, **kw):
+        args = dict(src=self.hostj_src, dest=self.dir + "/host.json", uid=self.uid, gid=self.gid,
+                    sha256=self.hostj_sha, mode=0o600)
+        args.update(kw)
+        return st.install(**args)
+
+    def test_an_access_acl_on_the_directory_is_refused_before_any_byte(self):
+        with self.assertRaisesRegex(st.StepError, "carries an ACL; nothing installed"):
+            self.install(listxattr=lambda fd: ["system.posix_acl_access"])
+        self.assert_nothing_written()
+
+    def test_a_default_acl_on_the_directory_is_refused_before_any_byte(self):
+        with self.assertRaisesRegex(st.StepError, "carries an ACL; nothing installed"):
+            self.install(listxattr=lambda fd: ["user.x", "system.posix_acl_default"])
+        self.assert_nothing_written()
+
+    def test_an_unreadable_acl_is_refused_before_any_byte(self):
+        import errno
+
+        def broken(fd):
+            raise OSError(errno.EIO, "I/O error")
+        with self.assertRaisesRegex(st.StepError, "ACL cannot be read"):
+            self.install(listxattr=broken)
+        self.assert_nothing_written()
+
+    def test_the_acl_is_read_through_the_directory_descriptor(self):
+        seen = []
+        self.install(listxattr=lambda fd: seen.append(fd) or [])
+        self.assertEqual(len(seen), 1)
+        self.assertIsInstance(seen[0], int)
+
+    def test_a_filesystem_without_xattrs_has_no_acl(self):
+        import errno
+
+        def unsupported(fd):
+            raise OSError(errno.ENOTSUP, "not supported")
+        self.install(listxattr=unsupported)
+        self.assertEqual(os.listdir(self.dir), ["host.json"])
+
+    def test_another_uid_argument_is_refused(self):
+        with self.assertRaisesRegex(st.StepError, "0700; nothing installed"):
+            self.install(uid=self.uid + 1)
+        self.assert_nothing_written()
+
+    def test_another_gid_argument_is_refused(self):
+        with self.assertRaisesRegex(st.StepError, "0700; nothing installed"):
+            self.install(gid=self.gid + 1)
+        self.assert_nothing_written()
+
+    def test_a_linked_source_is_refused(self):
+        os.symlink(self.hostj_src, self.p("src-link"))
+        with self.assertRaisesRegex(st.StepError, "nothing placed"):
+            self.install(src=self.p("src-link"))
+        self.assert_nothing_written()
+
+    def test_a_malformed_sha_is_refused(self):
+        with self.assertRaisesRegex(st.StepError, "64 hex characters"):
+            self.install(sha256="abc")
+        self.assert_nothing_written()
+
+    def test_a_dest_that_is_a_link_is_refused_and_not_followed(self):
+        target = self.p("elsewhere")
+        with open(target, "w") as f:
+            f.write("keep")
+        os.symlink(target, self.dir + "/host.json")
+        with self.assertRaisesRegex(st.StepError, "not a regular file with one link; not overwritten"):
+            self.install()
+        self.assertTrue(os.path.islink(self.dir + "/host.json"))
+        with open(target) as f:
+            self.assertEqual(f.read(), "keep")
+
+    def test_an_existing_dest_with_other_bytes_is_refused(self):
+        with open(self.dir + "/host.json", "w") as f:
+            f.write("other")
+        with self.assertRaisesRegex(st.StepError, "other bytes than the pin; not overwritten"):
+            self.install()
+        with open(self.dir + "/host.json") as f:
+            self.assertEqual(f.read(), "other")
+        self.assertEqual(sorted(os.listdir(self.dir)), ["host.json"])
+
+    def test_an_existing_dest_with_the_pinned_bytes_is_installed_again(self):
+        self.install()
+        self.install()
+        self.assertEqual(os.listdir(self.dir), ["host.json"])
+
     def test_the_command_line_reaches_install(self):
         rc = st.main(["install", self.hostj_src, self.dir + "/host.json", str(self.uid), str(self.gid),
                       "--sha256", self.hostj_sha, "--mode", "0600"])

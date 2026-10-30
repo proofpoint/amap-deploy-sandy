@@ -226,13 +226,56 @@ def place(src, dest, sha256=None, mode=OVERLAY_MODE):
 INSTALL_MODES = (0o600, 0o400)
 
 
-def install(src, dest, uid, gid, sha256, mode):
+def _fd_acl_problem(fd, listxattr):
+    """Why the directory open at `fd` carries an ACL, or None. Read through
+    the descriptor, so it is the directory already reached without links.
+    A filesystem that cannot hold extended attributes has no ACL; any other
+    error is a refusal, because an ACL that cannot be read may be there."""
+    try:
+        names = listxattr(fd)
+    except OSError as e:
+        if e.errno in (getattr(errno, "ENOTSUP", -1), getattr(errno, "EOPNOTSUPP", -1)):
+            return None
+        return f"its ACL cannot be read ({e.strerror})"
+    if "system.posix_acl_access" in names or "system.posix_acl_default" in names:
+        return "it carries an ACL"
+    return None
+
+
+def _existing_problem(dfd, name, sha256):
+    """Why an existing `name` in the directory open at `dfd` must not be
+    replaced, or None when it is absent or already the pinned bytes. A link,
+    a non-regular file, a second link or other bytes are refused: install
+    places the pinned bytes, and never overwrites something else."""
+    try:
+        st = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+        return "exists and is not a regular file with one link"
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
+    try:
+        h = hashlib.sha256()
+        while True:
+            chunk = os.read(fd, 1 << 16)
+            if not chunk:
+                break
+            h.update(chunk)
+    finally:
+        os.close(fd)
+    if h.hexdigest() != sha256.lower():
+        return "exists with other bytes than the pin"
+    return None
+
+
+def install(src, dest, uid, gid, sha256, mode, listxattr=getattr(os, "listxattr", None)):
     """Copy `src` to `dest` as a file owned by `uid`:`gid`, mode 0600 or
-    0400, for a runtime's own configuration (a registry's host.json). The
-    bytes are checked against `sha256` before anything is written, and dest's
-    directory must already be that owner's 0700 directory, so the file never
-    lands where another principal can reach it. Written under a fresh
-    temporary name (O_EXCL, O_NOFOLLOW), then renamed over dest, as `place`."""
+    0400, for a runtime's own configuration (a registry's host.json).
+    Nothing is written unless: the bytes match `sha256`; dest's directory,
+    reached without links, is that owner's 0700 directory and carries no
+    ACL (read through its descriptor before the first byte); and dest is
+    absent or already the pinned bytes. Written under a fresh temporary name
+    (O_EXCL, O_NOFOLLOW), then renamed over dest, as `place`."""
     if mode not in INSTALL_MODES:
         raise StepError(f"mode {mode:04o} is not one of " + ", ".join(f"{m:04o}" for m in INSTALL_MODES))
     if not re.fullmatch(r"[0-9a-fA-F]{64}", sha256 or ""):
@@ -247,6 +290,14 @@ def install(src, dest, uid, gid, sha256, mode):
         if (st.st_uid, st.st_gid, stat.S_IMODE(st.st_mode)) != (uid, gid, 0o700):
             raise StepError(f"{parent} is {st.st_uid}:{st.st_gid} {stat.S_IMODE(st.st_mode):04o}, not "
                             f"{uid}:{gid} 0700; nothing installed")
+        if listxattr is None:
+            raise StepError(f"{parent}: its ACL cannot be read on this platform; nothing installed")
+        acl = _fd_acl_problem(dfd, listxattr)
+        if acl:
+            raise StepError(f"{parent}: {acl}; nothing installed")
+        existing = _existing_problem(dfd, name, sha256)
+        if existing:
+            raise StepError(f"{dest} {existing}; not overwritten, nothing installed")
         tmp = f".{name}.{os.getpid()}.tmp"
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dfd)
         try:
