@@ -216,7 +216,7 @@ class ManifestTest(unittest.TestCase):
         # to a block that is not theirs, and a domain change.
         authored = {"_comment": "mine",
                     "feature": {"_note": "kept", fp.FLEET_DOMAIN_KEY: "new.example",
-                                fp.TASK_GRAPH_KEY: {}},
+                                fp.TASK_GRAPH_KEY: {}, fp.MIN_SENDER_AGE_KEY: 0},
                     "sandboxes": {"include": ["only-*"], "exclude": []},
                     "agents": {"include": ["claude"], "exclude": []},
                     "create": ["wrong"], "mounts": [], "expose": {"AMAP_FLEET_DOMAIN": "stale"},
