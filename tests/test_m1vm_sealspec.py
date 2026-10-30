@@ -59,8 +59,8 @@ class ValidateRefusesTest(unittest.TestCase):
             "duplicate id": lambda s: s["items"][1].update(id=s["items"][0]["id"]),
             "bad id": lambda s: s["items"][0].update(id="X-1"),
             "two selectors": lambda s: s["items"][0].update(glob="/x*"),
-            "glob expect": lambda s: s["items"][0].update(expect="empty-mountpoint") or s["items"][0].pop("path")
-                           or s["items"][0].update(glob="/x*"),
+            "glob expect": lambda s: s["items"][2].update(expect="empty-mountpoint") or s["items"][2].pop("path")
+                           or s["items"][2].update(glob="/x*"),
             "relative path": lambda s: s["items"][2].update(path="var/lib/m1-bake"),
             "unnormalised": lambda s: s["items"][2].update(path="/var/lib/../lib/m1-bake"),
             "mid placeholder": lambda s: s["items"][2].update(path="/var/{op_home}/x"),
@@ -71,6 +71,7 @@ class ValidateRefusesTest(unittest.TestCase):
             "bad allowlist sha": lambda s: s.update(allowlist=[{"path": "/x", "sha256": "ab"}]),
             "min with none": lambda s: s["items"][11].update(min=1),
             "double star": lambda s: s["items"][11].update(glob="/etc/**/amap*"),
+            "placeholder sibling": lambda s: s["items"][1].update(path="{op_home}x/m1-bundles"),
         }
         for name, mutate in breaks.items():
             with self.subTest(name):
@@ -100,6 +101,10 @@ class TreeCase(unittest.TestCase):
         (r / "etc/systemd/system/multi-user.target.wants").mkdir(parents=True)
         (r / "etc/apt/apt.conf.d").mkdir(parents=True)
         (r / "etc/environment").write_text('PATH="/usr/bin:/bin"\n')
+        (r / "usr/lib/systemd/system").mkdir(parents=True)
+        (r / "usr/lib/systemd/system/qemu-guest-agent.service").write_text("[Unit]\n")
+        (r / "usr/lib/udev/rules.d").mkdir(parents=True)
+        (r / "usr/lib/udev/rules.d/60-qemu-guest-agent.rules").write_text("")
         self.params = {"op_user": "op", "data_mount": "/srv/data"}
         self.spec = shipped()
 
@@ -152,6 +157,8 @@ class EvaluateTest(TreeCase):
             "SS-16": lambda r: (r / "etc/environment").write_text("https_proxy=http://p:3128\n"),
             "SS-17": lambda r: (r / "home/op/.npmrc").write_text(""),
             "SS-18": lambda r: ((r / "root/.docker").mkdir(), (r / "root/.docker/config.json").write_text("{}")),
+            "SS-19": lambda r: (r / "usr/lib/systemd/system/qemu-guest-agent.service").unlink(),
+            "SS-20": lambda r: (r / "usr/lib/udev/rules.d/60-qemu-guest-agent.rules").unlink(),
         }
         for iid, brk in breaks.items():
             with self.subTest(iid):
@@ -170,15 +177,58 @@ class EvaluateTest(TreeCase):
             shutil.rmtree(self.root / f"opt/amap/src/{repo}")
         self.assertEqual(self.failing(), ["SS-06"])
 
-    def test_symlink_on_the_way_fails_not_followed(self):
+    def test_symlinked_op_home_is_checked_at_its_confined_target(self):
+        # An absolute target is re-rooted under --root, never followed outside it.
+        (self.root / "home/op").rmdir()
+        (self.root / "data/ophome").mkdir(parents=True)
+        os.symlink("/data/ophome", self.root / "home/op")
+        self.assertEqual(self.failing(), [])
+        (self.root / "data/ophome/.sandy").mkdir()
+        ok, detail = self.run_items()["SS-01"]
+        self.assertFalse(ok)
+        self.assertIn("/data/ophome/.sandy: present", detail)
+
+    def test_dotdot_in_a_home_link_is_clamped_at_the_root(self):
+        (self.root / "home/op").rmdir()
+        (self.root / "data/ophome/.sandy").mkdir(parents=True)
+        os.symlink("../../../../data/ophome", self.root / "home/op")
+        ok, detail = self.run_items()["SS-01"]
+        self.assertFalse(ok)
+        self.assertIn("/data/ophome/.sandy: present", detail)
+
+    def test_home_link_outside_the_root_is_not_followed(self):
         import shutil
         outside = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, outside)
+        os.mkdir(os.path.join(outside, ".sandy"))
         (self.root / "home/op").rmdir()
         os.symlink(outside, self.root / "home/op")
-        ok, detail = self.run_items()["SS-01"]
-        self.assertFalse(ok)
-        self.assertIn("not a plain directory", detail)
+        # Re-rooted: <root><outside> does not exist, so nothing outside is read.
+        self.assertEqual(self.failing(), [])
+
+    def test_agent_unit_must_be_a_regular_file(self):
+        p = self.root / "usr/lib/systemd/system/qemu-guest-agent.service"
+        p.unlink()
+        os.symlink("/dev/null", p)
+        self.assertEqual(self.failing(), ["SS-19"])
+        p.unlink()
+        p.mkdir()
+        self.assertEqual(self.failing(), ["SS-19"])
+
+    def test_merged_usr_system_homes_pass(self):
+        # Stock base-passwd: bin, sync and proxy live at /bin, and /bin -> usr/bin.
+        (self.root / "usr/bin").mkdir(parents=True)
+        os.symlink("usr/bin", self.root / "bin")
+        with open(self.root / "etc/passwd", "a") as fh:
+            fh.write("bin:x:2:2:bin:/bin:/usr/sbin/nologin\nsync:x:4:65534:sync:/bin:/bin/sync\n")
+        self.assertEqual(self.failing(), [])
+        (self.root / "usr/bin/.npmrc").write_text("")
+        self.assertEqual(self.failing(), ["SS-17"])
+
+    def test_home_link_loop_fails(self):
+        (self.root / "home/op").rmdir()
+        os.symlink("op", self.root / "home/op")
+        self.assertIn("SS-01", self.failing())
 
     def test_symlink_at_the_end_is_named(self):
         (self.root / "etc/gitconfig.real").write_text("[core]\n")
@@ -192,6 +242,61 @@ class EvaluateTest(TreeCase):
         (self.root / "etc/passwd").write_text("op:x:2101:2101::/home/op:/bin/bash\n")
         (self.root / "root/.gitconfig").write_text("[credential]\n\thelper = store\n")
         self.assertEqual(self.failing(), ["SS-08"])
+
+    def test_symlinked_glob_parent_fails_a_none_item(self):
+        import shutil
+        real = self.root / "elsewhere"
+        real.mkdir()
+        shutil.rmtree(self.root / "etc/apt/apt.conf.d")
+        os.symlink("../../elsewhere", self.root / "etc/apt/apt.conf.d")
+        ok, detail = self.run_items()["SS-15"]
+        self.assertFalse(ok)
+
+    def test_dir_expect_against_a_file(self):
+        import shutil
+        shutil.rmtree(self.root / "opt/amap/src")
+        (self.root / "opt/amap/src").write_text("")
+        self.assertIn("SS-05", self.failing())
+
+    def test_proxy_forms(self):
+        for text in ("HTTPS_PROXY=http://p:3128\n", "export http_proxy=http://p:3128\n"):
+            with self.subTest(text):
+                (self.root / "etc/environment").write_text(text)
+                self.assertEqual(self.failing(), ["SS-16"])
+
+    def test_fifo_is_not_read(self):
+        os.mkfifo(self.root / "etc/gitconfig")
+        ok, detail = self.run_items()["SS-07"]
+        self.assertFalse(ok)
+        self.assertIn("not a regular file", detail)
+
+    def test_oversized_config_fails(self):
+        (self.root / "etc/gitconfig").write_bytes(b"#" * (sealspec.MAX_CONFIG_BYTES + 1))
+        ok, detail = self.run_items()["SS-07"]
+        self.assertFalse(ok)
+        self.assertIn("bound", detail)
+
+    def test_non_utf8_gitconfig_fails(self):
+        (self.root / "etc/gitconfig").write_bytes(b"[core]\n\tx = \xff\n")
+        self.assertEqual(self.failing(), ["SS-07"])
+
+    def test_unnormalised_passwd_home_is_a_param_error(self):
+        (self.root / "etc/passwd").write_text("op:x:2101:2101::/home/../op:/bin/bash\n")
+        with self.assertRaises(sealspec.ParamError):
+            self.run_items()
+
+    def test_bad_data_mount_is_a_param_error(self):
+        for value in ("../x", "/srv/../etc", "/", "srv"):
+            with self.subTest(value):
+                self.params["data_mount"] = value
+                with self.assertRaises(sealspec.ParamError):
+                    self.run_items()
+
+    def test_unprintable_name_is_shown_as_repr(self):
+        (self.root / "etc/systemd/system/amap-x\nSEAL SS-99 PASS").write_text("")
+        ok, detail = self.run_items()["SS-12"]
+        self.assertFalse(ok)
+        self.assertNotIn("\n", detail)
 
     def test_unknown_op_user(self):
         self.params["op_user"] = "nosuch"
@@ -229,15 +334,54 @@ class MountpointOwnerTest(unittest.TestCase):
         self.assertIn("holds 1 entry", detail)
 
 
+    def stat_case(self, uid, gid, mode):
+        class Fake(sealspec.Tree):
+            def lstat(self, path):
+                return os.stat_result((stat.S_IFDIR | mode, 0, 0, 2, uid, gid, 0, 0, 0, 0))
+
+            def listdir(self, path):
+                return []
+        with tempfile.TemporaryDirectory() as d:
+            tree = Fake(d)
+            try:
+                return sealspec._check_one(tree, "/m", "empty-mountpoint")
+            finally:
+                tree.close()
+
+    def test_owner_and_mode_each_alone(self):
+        self.assertTrue(self.stat_case(0, 0, 0)[0])
+        self.assertFalse(self.stat_case(0, 0, 0o755)[0])
+        self.assertFalse(self.stat_case(1, 0, 0)[0])
+        self.assertFalse(self.stat_case(0, 1, 0)[0])
+
+
 class GitconfigTest(unittest.TestCase):
     def test_cases(self):
         clean = b"[core]\n\tbare = false\n[user]\n\tname = x\n"
         self.assertIsNone(sealspec.gitconfig_problem(clean))
         for text in (b'[remote "origin"]\n\turl = x\n', b"[Remote.origin]\n\turl = x\n",
                      b"[credential]\n\thelper = store\n", b'[url "x"]\n\tinsteadOf = y\n',
-                     b'[url "x"]\n\tpushInsteadOf = y\n', b"[http]\n\textraHeader = https://u:p@h/\n"):
+                     b'[url "x"]\n\tpushInsteadOf = y\n', b"[http]\n\textraHeader = https://u:p@h/\n",
+                     b'[http "https://u:tok@h/"]\n\tsslVerify = true\n',
+                     b'[remote "o\\"x"]\n\turl = /x\n',
+                     b"[include]\n\tpath = /etc/other\n", b'[includeIf "gitdir:/x/"]\n\tpath = y\n',
+                     b"[core\n"):
             with self.subTest(text):
                 self.assertIsNotNone(sealspec.gitconfig_problem(text))
+
+
+class GuardTest(TreeCase):
+    def test_crash_is_exit_3_without_a_pass_line(self):
+        # A symlinked /etc/passwd is not read; the uncaught refusal reaches the guard.
+        (self.root / "etc/passwd.real").write_text((self.root / "etc/passwd").read_text())
+        (self.root / "etc/passwd").unlink()
+        os.symlink("passwd.real", self.root / "etc/passwd")
+        r = subprocess.run([sys.executable, "-I", "-S", "-B", str(M1VM / "sealspec.py"), "eval", "--spec", str(SPEC_PATH),
+                            "--root", str(self.root), "--param", "op_user=op", "--param", "data_mount=/srv/data"],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 3, r.stderr)
+        self.assertNotIn("M1-SEALSPEC PASS", r.stdout)
+        self.assertTrue(r.stderr.startswith("internal-error "))
 
 
 class CliTest(TreeCase):
@@ -254,7 +398,7 @@ class CliTest(TreeCase):
     def test_pass_line_last(self):
         rc, out, _ = self.cli(*self.eval_args())
         self.assertEqual(rc, 0)
-        self.assertTrue(out.splitlines()[-1].startswith("M1-SEALSPEC PASS n=18 spec="))
+        self.assertTrue(out.splitlines()[-1].startswith("M1-SEALSPEC PASS n=20 spec="))
 
     def test_fail_is_exit_1_and_no_pass_line(self):
         (self.root / "var/lib/m1-bake").mkdir()

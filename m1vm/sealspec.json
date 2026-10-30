@@ -2,8 +2,8 @@
   "schema": "m1vm-sealspec/1",
   "params": ["op_user", "data_mount"],
   "items": [
-    {"id": "SS-01", "path": "{op_home}/.sandy", "expect": "absent",
-     "why": "sandy's runtime home is never on R; only the seed under /opt/amap/sandy-seed is baked"},
+    {"id": "SS-01", "home": ".sandy", "expect": "absent",
+     "why": "sandy's runtime home is never on R, in any home; only the seed under /opt/amap/sandy-seed is baked"},
     {"id": "SS-02", "path": "{op_home}/m1-bundles", "expect": "absent",
      "why": "BAKE deletes <bundle-dir> after the clones"},
     {"id": "SS-03", "path": "/var/lib/m1-bake", "expect": "absent",
@@ -37,7 +37,11 @@
     {"id": "SS-17", "home": ".npmrc", "expect": "absent",
      "why": "no npm token surface"},
     {"id": "SS-18", "home": ".docker/config.json", "expect": "absent",
-     "why": "no registry auths surface"}
+     "why": "no registry auths surface"},
+    {"id": "SS-19", "path": "/usr/lib/systemd/system/qemu-guest-agent.service", "expect": "file",
+     "why": "T0 keeps the guest agent installed for P3-read and G-AS-n (NET r20 §3.2)"},
+    {"id": "SS-20", "glob": "/usr/lib/udev/rules.d/*qemu-guest-agent*", "expect": "file", "min": 1,
+     "why": "the agent is started by udev on its virtio port, not by an enablement link (INFERRED: Ubuntu's packaging)"}
   ],
   "patterns": [
     "# v2 git bundle\n",

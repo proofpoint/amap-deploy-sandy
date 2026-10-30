@@ -12,6 +12,18 @@ in its profile; the patterns and the allow-list feed its absence scan (NET
 r20 §2.5). Every path is resolved one component at a time under DIR with
 O_NOFOLLOW, so a symbolic link anywhere on the way is a FAIL, never followed.
 
+What SEALSPEC does NOT cover, and what does (DS2 d8 §3.1):
+  - D (Docker's store): it is evaluated on R only. "Builder cache pruned" and
+    "D holds exactly MAN's image Ids" are BAKE's own last-step assertions; D's
+    raw sha is then sealed at G-B4b and compared at B1-n, so D cannot change
+    after BAKE asserted it.
+  - State and enrolment trees: LC d8 §2.3 puts SANDY_HOME, the registry and
+    the identities tree under the state mount, so SS-10 (the mountpoint empty
+    on R) is the complete state/enrolment root on R.
+  - The guest agent's runtime: SS-04/SS-19/SS-20 prove it is installed, its
+    udev start rule present and no mask on R; NET's agent ping at G-B1s and at
+    every clone's P3-read proves it actually starts.
+
 Exit status: 0 every item passed; 1 an item failed; 2 a usage error or a spec
 that is not valid; 3 an internal error. The last stdout line is
 `M1-SEALSPEC PASS ...` only when every item passed.
@@ -34,9 +46,9 @@ SHA_RE = re.compile(r"[0-9a-f]{64}\Z")
 
 # Which expectations each selector may carry. A glob names a set, so it can
 # only be "none" or a per-match check; a path names one object.
-PATH_EXPECT = ("absent", "dir", "empty-mountpoint", "absent-or-gitconfig-clean",
+PATH_EXPECT = ("absent", "dir", "file", "empty-mountpoint", "absent-or-gitconfig-clean",
                "absent-or-no-proxy", "gitconfig-clean")
-GLOB_EXPECT = ("none", "gitconfig-clean")
+GLOB_EXPECT = ("none", "file", "gitconfig-clean")
 HOME_EXPECT = ("absent", "absent-or-gitconfig-clean")
 
 # A config file larger than this is refused rather than read.
@@ -105,6 +117,8 @@ def validate(spec):
             bare = value
             for ph in PLACEHOLDERS:
                 if bare.startswith(ph):
+                    if bare != ph and not bare.startswith(ph + "/"):
+                        raise SpecError(f"{iid}: a placeholder must be followed by / or end the path")
                     bare = "/" + bare[len(ph):].lstrip("/") if bare != ph else "/"
             if "{" in bare or "}" in bare or not _norm_abs(bare):
                 raise SpecError(f"{iid}: {sel} must be absolute and normalised, a placeholder only at its start")
@@ -196,6 +210,40 @@ class Tree:
             fd = nfd
         return fd
 
+    def resolve_confined(self, path, max_hops=40):
+        """PATH with every symbolic link resolved INSIDE the root: an absolute
+        target is re-rooted, `..` is clamped at the root, and more than
+        MAX_HOPS links raise ELOOP. Used only for passwd homes, so that a
+        stock `bin:/bin` with `/bin -> usr/bin` is checked at `/usr/bin`
+        rather than failed; nothing is ever followed outside the root."""
+        pending = [p for p in path.split("/") if p]
+        cur, hops = [], 0
+        while pending:
+            part = pending.pop(0)
+            if part == ".":
+                continue
+            if part == "..":
+                if cur:
+                    cur.pop()
+                continue
+            st = self.lstat("/" + "/".join(cur + [part]))
+            if st is None or not stat.S_ISLNK(st.st_mode):
+                cur.append(part)
+                continue
+            hops += 1
+            if hops > max_hops:
+                raise OSError(errno.ELOOP, f"more than {max_hops} links resolving {path}")
+            fd = self._open_dir(cur)
+            try:
+                target = os.readlink(part, dir_fd=fd)
+            finally:
+                if fd != self.root_fd:
+                    os.close(fd)
+            if target.startswith("/"):
+                cur = []
+            pending = [p for p in target.split("/") if p] + pending
+        return "/" + "/".join(cur)
+
     def listdir(self, path):
         """The names in directory PATH, or None if it is absent."""
         fd = self._open_dir(self._parts(path))
@@ -222,8 +270,6 @@ class Tree:
             st = os.fstat(ffd)
             if not stat.S_ISREG(st.st_mode):
                 raise OSError(errno.EINVAL, "not a regular file")
-            if st.st_size > MAX_CONFIG_BYTES:
-                raise OSError(errno.EFBIG, "larger than the config bound")
             chunks, total = [], 0
             while True:
                 chunk = os.read(ffd, 65536)
@@ -265,13 +311,19 @@ def gitconfig_problem(data):
         return "not UTF-8"
     section = None
     for n, line in enumerate(text.splitlines(), 1):
+        if _USERINFO_RE.search(line):
+            return f"line {n}: URL userinfo"
         m = _SECTION_RE.match(line)
         if m:
             section = m.group(1).lower()
             head = section.split(".", 1)[0]
-            if head in ("remote", "credential"):
+            if head in ("remote", "credential", "include", "includeif"):
                 return f"line {n}: a [{head}] section"
             rest = line[m.end():]
+        elif line.lstrip().startswith("["):
+            # A header this parser cannot read must not leave the previous
+            # section in force: fail closed.
+            return f"line {n}: a section header that is not understood"
         else:
             rest = line
         stripped = rest.strip()
@@ -279,8 +331,6 @@ def gitconfig_problem(data):
             key = stripped.split("=", 1)[0].strip().lower()
             if key in ("insteadof", "pushinsteadof"):
                 return f"line {n}: a url rewrite"
-        if _USERINFO_RE.search(stripped):
-            return f"line {n}: URL userinfo"
     return None
 
 
@@ -295,42 +345,52 @@ def proxy_problem(data):
     return None
 
 
+def _show(path):
+    """PATH for a detail string; repr() when it holds a character that could
+    forge a line of output."""
+    return path if path.isprintable() else repr(path)
+
+
 def _check_one(tree, path, expect):
     """(ok, detail) for one concrete PATH."""
+    shown = _show(path)
     try:
         st = tree.lstat(path)
     except OSError as exc:
-        return False, f"{path}: {exc.strerror or exc}"
+        return False, f"{shown}: {exc.strerror or exc}"
     if expect == "absent":
-        return (st is None, f"{path}: absent" if st is None else f"{path}: present")
+        return (st is None, f"{shown}: absent" if st is None else f"{shown}: present")
     if st is None:
         if expect.startswith("absent-or-"):
-            return True, f"{path}: absent"
-        return False, f"{path}: absent"
+            return True, f"{shown}: absent"
+        return False, f"{shown}: absent"
     if stat.S_ISLNK(st.st_mode):
-        return False, f"{path}: a symbolic link"
+        return False, f"{shown}: a symbolic link"
     if expect == "dir":
-        return (stat.S_ISDIR(st.st_mode), f"{path}: " + ("a directory" if stat.S_ISDIR(st.st_mode) else "not a directory"))
+        return (stat.S_ISDIR(st.st_mode), f"{shown}: " + ("a directory" if stat.S_ISDIR(st.st_mode) else "not a directory"))
+    if expect == "file":
+        ok = stat.S_ISREG(st.st_mode)
+        return ok, f"{shown}: " + ("a regular file" if ok else "not a regular file")
     if expect == "empty-mountpoint":
         if not stat.S_ISDIR(st.st_mode):
-            return False, f"{path}: not a directory"
+            return False, f"{shown}: not a directory"
         names = tree.listdir(path)
         if names:
-            return False, f"{path}: holds {len(names)} entr{'y' if len(names) == 1 else 'ies'}"
+            return False, f"{shown}: holds {len(names)} entr{'y' if len(names) == 1 else 'ies'}"
         if st.st_uid != 0 or st.st_gid != 0 or stat.S_IMODE(st.st_mode) != 0:
-            return False, f"{path}: owner {st.st_uid}:{st.st_gid} mode {stat.S_IMODE(st.st_mode):04o}, not 0:0 0000"
-        return True, f"{path}: empty, 0:0 0000"
+            return False, f"{shown}: owner {st.st_uid}:{st.st_gid} mode {stat.S_IMODE(st.st_mode):04o}, not 0:0 0000"
+        return True, f"{shown}: empty, 0:0 0000"
     try:
         data = tree.read(path)
     except OSError as exc:
-        return False, f"{path}: {exc.strerror or exc}"
+        return False, f"{shown}: {exc.strerror or exc}"
     if expect in ("gitconfig-clean", "absent-or-gitconfig-clean"):
         problem = gitconfig_problem(data)
     elif expect == "absent-or-no-proxy":
         problem = proxy_problem(data)
     else:
         raise AssertionError(expect)
-    return (problem is None, f"{path}: {problem or 'clean'}")
+    return (problem is None, f"{shown}: {problem or 'clean'}")
 
 
 def homes(tree):
@@ -361,8 +421,17 @@ def evaluate(tree, spec, params):
     users = homes(tree)
     if params["op_user"] not in users:
         raise ParamError(f"op_user {params['op_user']!r} is not in the tree's /etc/passwd")
-    subst = {"{op_home}": users[params["op_user"]], "{data_mount}": data_mount}
-    all_homes = sorted(set(users.values()))
+
+    def confined(home):
+        # A home that cannot be resolved inside the root is checked as
+        # written, where the strict walk fails it.
+        try:
+            return tree.resolve_confined(home)
+        except OSError:
+            return home
+
+    subst = {"{op_home}": confined(users[params["op_user"]]), "{data_mount}": data_mount}
+    all_homes = sorted({confined(h) for h in users.values()})
 
     def expand(value):
         for ph, real in subst.items():
@@ -393,7 +462,7 @@ def evaluate(tree, spec, params):
                 details.append(f"{item['glob']}: {exc.strerror or exc}")
             if ok and expect == "none":
                 ok = not matches
-                details = ["no match"] if ok else [f"{m}: present" for m in matches]
+                details = ["no match"] if ok else [f"{_show(m)}: present" for m in matches]
             elif ok:
                 if len(matches) < item.get("min", 0):
                     ok = False
