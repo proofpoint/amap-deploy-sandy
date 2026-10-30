@@ -1952,8 +1952,7 @@ class VerifyEndToEndTest(SandboxFixture):
         self.assertEqual(calls, 1, out)
 
     def test_install_asks_sandy_for_print_state_once(self):
-        rc, out, calls = self._count_print_state(
-            verb="install", host_args=("--allow-unpinned-connector",))
+        rc, out, calls = self._count_print_state(verb="install")
         self.assertIn("install (DRY RUN", out)
         self.assertEqual(calls, 1, out)
 
