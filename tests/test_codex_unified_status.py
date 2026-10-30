@@ -43,6 +43,7 @@ class UnifiedEvidenceTest(unittest.TestCase):
             effective={"model": config.codex_model, "sandbox": {"type": "dangerFullAccess"},
                 "approval_policy": "never", "model_source": "connector.codex_model",
                 "permission_source": "connector pane configuration"})
+        self.service = service
         UnifiedService.write_status(service, True,
             {"thread": {"id": transition_tests.THREAD, "status": {"type": "idle"}, "turns": []}}, [])
         self.status = json.loads((f.state / "status.json").read_bytes())
@@ -60,6 +61,33 @@ class UnifiedEvidenceTest(unittest.TestCase):
     def test_real_producer_positive_and_host_read_path(self):
         self.assertEqual(self.problems(), [])
         self.assertEqual(verifier.problems(self.fixture.state, self.status, now=self.now), [])
+
+    def test_upgraded_build_requires_new_entry_selection_and_real_current_status(self):
+        from unittest import mock
+        import subprocess
+        state = self.fixture.state
+        original_record = (state / transition.RECORD).read_bytes()
+        version = "codex-cli 0.166.0"
+        with mock.patch.object(transition.subprocess, 'run', return_value=
+                subprocess.CompletedProcess(['codex', '--version'], 0, version + '\n', '')):
+            transition.refresh_build(state, version, apply=True)
+        self.assertTrue(verifier.problems(state, self.status, now=time.time()))
+        config = transition.config_at(state)
+        settings.capture(state, config.instance_id, settings.resolve(os.environ), generation=self.entry_generation)
+        with self.assertRaises(ValueError):
+            transition.startup_gate(state, self.entry_generation, apply=True)
+        transition.select_pane(state, ['codex', '-s', 'danger-full-access', '-a', 'never'], apply=True)
+        transition.startup_gate(state, self.entry_generation, apply=True)
+        with Journal(state, config.instance_id, config.fingerprint(), version, config.codex_model) as journal:
+            self.service.config, self.service.journal = config, journal
+            UnifiedService.write_status(self.service, True,
+                {'thread': {'id': transition_tests.THREAD, 'status': {'type': 'idle'}, 'turns': []}}, [])
+        status = json.loads((state / 'status.json').read_bytes())
+        self.assertEqual(verifier.problems(state, status, now=time.time()), [])
+        prov, home, record = self._host()
+        self.assertEqual(prov.verify_codex_supervisor(home, 'codex-test', record, running=True,
+            now=time.time(), expected_mode='unified')[0], [])
+        self.assertEqual((state / transition.RECORD).read_bytes(), original_record)
 
     def test_each_required_check_is_required_on_both_surfaces(self):
         for surface in ("status", "descriptor"):

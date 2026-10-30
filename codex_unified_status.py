@@ -24,7 +24,7 @@ def selection_note(state):
             source = {"CODEX_MODEL": "CODEX_MODEL", "native_config": "native config.toml",
                       "native_default": "native Codex default"}[plan["selection"]["model_source"]]
             return "recorded fresh entry model source is " + source + " (entry environment scope)"
-        record = json.loads(assets.regular(Path(state) / "adapter-transition.json"))
+        record = adoptions.runtime_record(Path(state), json.loads(assets.regular(Path(state) / "adapter-transition.json")))
         receipt = json.loads(assets.regular(Path(state) / settings.RECEIPT))
         if settings.evidence_problems(receipt, record):
             return None
@@ -139,6 +139,7 @@ def problems(state, status, *, now=None):
             raise ValueError("explicit adapter transition is not confirmed")
         if type(record.get("poll_interval_ms")) is not int or record["poll_interval_ms"] <= 0:
             raise ValueError("configured polling interval is unknown")
+        record = adoptions.runtime_record(state, record)
         if assets.digest(assets.regular(state / "controller.toml")) != record["target_sha256"]:
             raise ValueError("current controller differs from the confirmed target")
         if assets.digest(assets.regular(state / "adapter-previous.toml")) != record["previous_sha256"]:

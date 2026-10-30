@@ -117,7 +117,7 @@ def read_record(state, *, legacy=False):
                          "run transition confirm, then confirm --apply")
     if not isinstance(value["previous_fingerprint"], str) or not re.fullmatch("[a-f0-9]{64}", value["previous_fingerprint"]):
         raise ValueError("invalid adapter transition previous_fingerprint")
-    return value
+    return adoptions.runtime_record(state, value) if value["state"] == "confirmed" else value
 
 
 def config_at(state):
@@ -370,6 +370,51 @@ def startup_route(state, session_path):
     return "adopted"
 
 
+def refresh_build(state, observed_version, *, apply=False):
+    """Follow Sandy's installed build without changing canonical adoption or policy."""
+    from dataclasses import replace
+    from amap_codex.supervisor import Ownership
+    adoptions.build_number(observed_version)
+    entry_mode(state, check_pane_settings=True)
+    config = config_at(state)
+    record = read_record(state)
+    if confirmed_adoption(config, record) != record.get("policy_hash"):
+        raise ValueError("confirmed adoption policy binding differs")
+    result = {"previous_build": config.codex_version, "codex_version": observed_version,
+              "changed": config.codex_version != observed_version, "apply": apply}
+    if not result["changed"]:
+        return result
+    if adoptions.build_number(observed_version) < adoptions.build_number(config.codex_version):
+        raise ValueError("installed Codex build moved backwards; retain state for inspection")
+    measured = subprocess.run([config.unified_argv[0], "--version"], check=True,
+                              capture_output=True, text=True, timeout=10).stdout.strip()
+    if measured != observed_version:
+        raise ValueError("installed Codex build changed during startup measurement")
+    original = assets.regular(state / "controller.toml")
+    updated = adoptions.with_build(original, measured)
+    candidate = replace(config, codex_version=measured)
+    candidate.validate(create_state=False)
+    if candidate.fingerprint() != config.fingerprint():
+        raise ValueError("native build refresh would change the protected fingerprint")
+    if os.path.lexists(state / PAUSE):
+        raise ValueError("operator maintenance pause; build refresh refused")
+    if apply:
+        with Ownership(config):
+            if (assets.regular(state / "controller.toml") != original
+                    or read_record(state) != record or os.path.lexists(state / PAUSE)):
+                raise ValueError("canonical configuration changed during build refresh")
+            if confirmed_adoption(config, record) != record.get("policy_hash"):
+                raise ValueError("confirmed adoption policy binding differs")
+            snapshot_current(state)
+            assets.place(state / "controller.toml", updated, replace=True, mode=0o600)
+            # The receipt remains the adoption-time evidence. Its read-only
+            # projection accepts exactly this build-only change after a crash.
+            current = config_at(state)
+            if current.fingerprint() != config.fingerprint():
+                raise ValueError("native build refresh changed the protected fingerprint")
+    return result
+
+
 def pause(state, note, *, apply=False):
     if not note.strip() or len(note) > 500:
         raise ValueError("operator pause requires a note of 1 to 500 characters")
@@ -443,9 +488,12 @@ def select_pane(state, argv, *, apply=False):
 
 
 def launch_pane(state, argv):
+    deadline = time.monotonic() + 35
+    wait_selection(state)
     select_pane(state, argv, apply=True)
     result = subprocess.run(["python3", "-m", "amap_codex.cli", "--config", str(state / "controller.toml"),
-                             "interactive-args", "--", *argv], capture_output=True, text=True, timeout=35)
+                             "interactive-args", "--", *argv], capture_output=True, text=True,
+                            timeout=max(.1, deadline - time.monotonic()))
     if result.returncode:
         raise ValueError(result.stderr.strip() or "connector attachment preparation failed")
     selected = json.loads(result.stdout)
@@ -458,13 +506,44 @@ def launch_pane(state, argv):
     os.execvp(selected[0], selected)
 
 
+def wait_selection(state, *, wait=30):
+    if type(wait) not in {int, float} or not 0 <= wait <= 30:
+        raise ValueError("selection wait must be between zero and thirty seconds")
+    deadline, announced = time.monotonic() + wait, None
+    while True:
+        entry_mode(state, check_pane_settings=True)
+        if os.path.lexists(state / PAUSE):
+            raise ValueError("operator maintenance pause; native selection refused")
+        try:
+            selection_ready(state)
+            return
+        except (OSError, ValueError, KeyError) as exc:
+            reason = str(exc)
+            if os.path.lexists(state / "hold.json"):
+                try:
+                    hold = json.loads(assets.regular(state / "hold.json"))
+                    reason = str(hold.get("reason") or reason)
+                except (OSError, ValueError, AttributeError):
+                    reason = "relay hold record is unreadable"
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ValueError("relay startup selection is not ready: " + reason) from exc
+            if reason != announced:
+                print("codex transition: waiting for relay startup selection: " + reason,
+                      file=sys.stderr, flush=True)
+                announced = reason
+            time.sleep(min(1, remaining))
+
+
 def selection_ready(state):
     entry_mode(state, check_pane_settings=True)
     config = config_at(state)
     record = read_record(state)
     request = json.loads(assets.regular(state / settings.STARTUP))
     expected = settings.startup_request(state, config, record["thread"], settings.environment_generation())
-    if request != expected or os.path.lexists(state / PAUSE):
+    entry = json.loads(assets.regular(state / settings.RECEIPT))
+    if (request != expected or entry.get("entry_generation") != expected["entry_generation"]
+            or settings.evidence_problems(entry, record) or os.path.lexists(state / PAUSE)):
         raise ValueError("native selection request is not current or the operator pause remains")
     return {"selection_ready": True, "scope": "startup selection, not backend readiness"}
 
@@ -488,6 +567,9 @@ def main(argv=None):
     entry.add_argument("--model")
     entry.add_argument("--version")
     entry.add_argument("--check-pane-settings", action="store_true")
+    build = commands.add_parser("refresh-build")
+    build.add_argument("--version", required=True)
+    build.add_argument("--apply", action="store_true")
     route = commands.add_parser("startup-route")
     route.add_argument("--session", type=Path, required=True)
     startup = commands.add_parser("startup-gate")
@@ -508,6 +590,8 @@ def main(argv=None):
             result = prepare(args.state, args.payload, args.thread, apply=args.apply)
         elif args.command == "confirm":
             result = confirm(args.state, apply=args.apply)
+        elif args.command == "refresh-build":
+            result = refresh_build(args.state, args.version, apply=args.apply)
         elif args.command == "pause":
             result = pause(args.state, args.note, apply=args.apply)
         elif args.command == "unpause":
