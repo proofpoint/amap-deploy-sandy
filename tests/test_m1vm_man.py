@@ -69,7 +69,8 @@ class ManCase(unittest.TestCase):
         self.runner = Runner()
         self.plan = {"pin_sha256": "d" * 64, "seed": str(self.seed),
                      "files": [str(self.etc / "sudoers-m1-admin")], "checkouts": [str(self.repo)],
-                     "images": ["amap-router-local:m1"], "accounts": [ME]}
+                     "images": ["amap-router-local:m1"], "accounts": [ME],
+                     "builds": {"router1": {"commit": HEAD, "tree": TREE, "image": "amap-router-local:m1"}}}
 
     def build(self):
         return man.build(self.plan, self.runner)
@@ -78,8 +79,10 @@ class ManCase(unittest.TestCase):
 class BuildTest(ManCase):
     def test_shape(self):
         m = self.build()
-        self.assertEqual(sorted(m), ["accounts", "checkouts", "files", "hdot", "images", "packages", "pin_sha256",
-                                     "schema"])
+        self.assertEqual(sorted(m), ["accounts", "builds", "checkouts", "files", "hdot", "images", "packages",
+                                     "pin_sha256", "schema"])
+        self.assertEqual(m["builds"], {"router1": {"commit": HEAD, "tree": TREE, "image": "amap-router-local:m1",
+                                                   "id": IMAGE}})
         self.assertEqual(m["schema"], "m1vm-man/1")
         self.assertEqual([e["name"] for e in m["hdot"]],
                          [".base_build_hash", ".build_hash_claude", "sandboxes/m1-one/.project_build_hash"])
@@ -154,7 +157,9 @@ class FailTest(ManCase):
         for mutate in (lambda p: p.pop("images"), lambda p: p.update(extra=1), lambda p: p.update(pin_sha256="x"),
                        lambda p: p.update(seed="rel"), lambda p: p.update(files=[]),
                        lambda p: p.update(files=["/a", "/a"]), lambda p: p.update(accounts=["Bad Name"]),
-                       lambda p: p.update(checkouts=["/x/../y"])):
+                       lambda p: p.update(checkouts=["/x/../y"]), lambda p: p.update(builds={}),
+                       lambda p: p["builds"]["router1"].update(image="other:x"),
+                       lambda p: p["builds"]["router1"].update(tree="nope")):
             with self.subTest(mutate):
                 self.setUp()
                 mutate(self.plan)

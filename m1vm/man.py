@@ -7,7 +7,8 @@ PLAN is the `man` member of PIN, a JSON object naming what MAN records:
 
   {"pin_sha256": HEX, "seed": "/opt/amap/sandy-seed",
    "files": [ABS, ...], "checkouts": [ABS, ...], "images": [REF, ...],
-   "accounts": [NAME, ...]}
+   "accounts": [NAME, ...],
+   "builds": {NAME: {"commit": HEX40, "tree": HEX40, "image": REF}, ...}}
 
 MAN then holds, in canonical JSON (sorted keys, no spaces):
   - `schema` "m1vm-man/1" and `pin_sha256`;
@@ -17,7 +18,10 @@ MAN then holds, in canonical JSON (sorted keys, no spaces):
   - `checkouts`: {path: {head, tree}};
   - `images`: {ref: image Id}, from the engine;
   - `packages`: {name: version}, every installed package (dpkg-query -W);
-  - `accounts`: {name: {uid, gid, home}}.
+  - `accounts`: {name: {uid, gid, home}};
+  - `builds`: {name: {commit, tree, image, id}}, each router image's pin, its
+    clean export's tree and its engine Id (the per-VM fingerprint check reads
+    these; controller ruling (i)).
 
 Every path is opened from / one component at a time with O_NOFOLLOW; a link,
 a missing file or a non-regular file fails the write. MAN is created O_EXCL
@@ -40,7 +44,7 @@ import subprocess
 import sys
 
 SCHEMA = "m1vm-man/1"
-PLAN_KEYS = {"pin_sha256", "seed", "files", "checkouts", "images", "accounts"}
+PLAN_KEYS = {"pin_sha256", "seed", "files", "checkouts", "images", "accounts", "builds"}
 GIT = "/usr/bin/git"
 DOCKER = "/usr/bin/docker"
 DPKG_QUERY = "/usr/bin/dpkg-query"
@@ -243,6 +247,15 @@ def validate_plan(plan):
     for a in plan["accounts"]:
         if not _NAME_RE.match(a):
             raise Usage(f"{a!r}: not an account name")
+    b = plan["builds"]
+    if not isinstance(b, dict) or not b:
+        raise Usage("builds must be a non-empty object")
+    for name, rec in b.items():
+        if not (isinstance(rec, dict) and set(rec) == {"commit", "tree", "image"}
+                and isinstance(rec["commit"], str) and _HEX40_RE.match(rec["commit"])
+                and isinstance(rec["tree"], str) and _HEX40_RE.match(rec["tree"])
+                and isinstance(rec["image"], str) and rec["image"] in plan["images"]):
+            raise Usage(f"builds.{name}: exactly {{commit, tree, image}}, the image one of `images`")
 
 
 def build(plan, runner=run):
@@ -256,6 +269,7 @@ def build(plan, runner=run):
         "images": {r: image_id(r, runner) for r in plan["images"]},
         "packages": packages(runner),
         "accounts": {a: account(a) for a in plan["accounts"]},
+        "builds": {n: dict(rec, id=image_id(rec["image"], runner)) for n, rec in plan["builds"].items()},
     }
 
 

@@ -1,0 +1,52 @@
+#!/bin/bash
+# m1-bake: the M1 template's bake (LC d8 B3; DS2 d8 §1). Rendered from
+# m1vm/bake.sh.in by `bake.py render-script`, which fills the two constants
+# below; NET's profile binds the rendered file's sha as bake_script_sha.
+# NET runs it on <bake> (208) as
+#   runuser -u <m1-admin> -- bash /var/lib/m1-bake/m1-bake.sh </dev/null
+# and BAKED requires rc 0 and the last stdout line `M1-BAKE PASS ...`.
+#
+# This file only proves PIN and the deploy checkout, then hands every step to
+# bake.py from that checkout. It never removes /var/lib/m1-bake (NET's
+# wrapper does, after reading the output).
+set -eu
+umask 022
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C LC_ALL=C
+export HOME="$(getent passwd "$(id -un)" | cut -d: -f6)"
+
+PIN_SHA256=@PIN_SHA256@
+DEPLOY_COMMIT=@DEPLOY_COMMIT@
+OP_HOME=@OP_HOME@
+M1VM_SHA256S='@M1VM_SHA256S@'
+BUNDLE_DIR="$OP_HOME/m1-bundles"
+SRC=/opt/amap/src
+DEPLOY="$SRC/amap-deploy-sandy"
+
+fail() { echo "M1-BAKE FAIL $*" >&2; exit 1; }
+
+[ "$(id -u)" != 0 ] || fail "runs as <m1-admin>, never as root"
+sudo -n true 2>/dev/null || fail "<m1-admin>'s sudo rule is not in force"
+
+# PIN sits in <op>'s home, beside the bundles (NET G-B2p). It is copied once,
+# by root, to a root-owned file on tmpfs, and only that copy is read after
+# its sha matches.
+PIN=/run/m1-bake/pin.json
+sudo -n install -d -o root -g root -m 0755 /run/m1-bake
+sudo -n install -o root -g root -m 0444 "$BUNDLE_DIR/pin.json" "$PIN"
+have=$(sha256sum "$PIN" | cut -d' ' -f1) || fail "pin.json unreadable"
+[ "$have" = "$PIN_SHA256" ] || fail "pin.json sha256 $have is not the reviewed $PIN_SHA256"
+
+# The deploy checkout, from its bundle, at the reviewed commit; nothing else
+# is trusted to run before it.
+[ ! -e "$DEPLOY" ] || fail "$DEPLOY already exists"
+sudo -n install -d -o root -g root -m 0755 /opt/amap "$SRC"
+sudo -n git clone --quiet --no-checkout "$BUNDLE_DIR/amap-deploy-sandy.bundle" "$DEPLOY"
+sudo -n git -C "$DEPLOY" -c advice.detachedHead=false checkout --quiet --detach "$DEPLOY_COMMIT"
+[ "$(sudo -n git -C "$DEPLOY" rev-parse HEAD)" = "$DEPLOY_COMMIT" ] || fail "deploy checkout is not $DEPLOY_COMMIT"
+
+# Every DS2 program the bake runs or installs must be the reviewed bytes:
+# their sha256 are rendered into this file, so bake_script_sha binds them.
+( cd "$DEPLOY/m1vm" && printf '%s\n' "$M1VM_SHA256S" | sha256sum --check --strict --quiet ) \
+    || fail "the deploy checkout's m1vm programs are not the reviewed bytes"
+
+exec /usr/bin/python3 -I -S -B "$DEPLOY/m1vm/bake.py" run --pin "$PIN" --pin-sha256 "$PIN_SHA256"
