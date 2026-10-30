@@ -803,9 +803,22 @@ model and its source. Supported unified permissions require explicit
 profile. Missing, false or other choices refuse; no alternate permission mapping
 is assumed. The pane wrapper checks the environment selection again, and a
 different explicit model/permission argv flag refuses at attachment. An
-established unified instance holds changed model/build selections; its controller
-is never automatically re-rendered. Settings transitions beyond this first
-adoption require their own reviewed procedure.
+established adopted instance holds changed model or protected settings selections.
+Sandy's automatic native build updates are operational: before starting an
+adopted service, the relay measures the installed build and refreshes only that
+controller string under exclusive ownership. It retains the previous controller
+bytes, leaves the original adoption receipt and native binding unchanged, and
+the connector audits the build change when the service starts. Host verify
+accepts a changed controller only if restoring the adoption-time build reproduces
+its exact confirmed bytes. Downgrades, an active owner, an operator pause,
+unconfirmed adoption, and other configuration edits refuse. The native backend
+must still initialize as the measured build and pass live protected-policy and
+readiness checks; a new version number alone does not establish compatibility.
+
+The pane waits for the current execution environment's startup challenge before
+validating its argv. It reports relay holds during that bounded wait, rather
+than immediately rejecting a retained challenge from an earlier container.
+Settings transitions beyond build updates require their own reviewed procedure.
 
 The relay writes `entry-settings.json` with entry-environment scope, the selected
 model/source and permission choice, bound to the controller bytes. Host verify
