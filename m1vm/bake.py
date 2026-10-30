@@ -269,8 +269,11 @@ def step_mount_d(pin, host):
     root 0000 and empty, as the seal requires (SS-10, SS-11); the state
     mountpoint stays unmounted (208 has no state disk)."""
     for mp in ("/var/lib/docker", STATE):
-        if host.run(["find", mp, "-mindepth", "1", "-maxdepth", "1", "-print", "-quit"], root=True).strip():
-            raise BakeFail(f"{mp} is not empty before the bake")
+        # On a stock image neither exists yet: absent counts as empty, and only
+        # an existing directory is listed (Opus item 2 A1). A non-directory or
+        # a link fails.
+        host.run(["sh", "-c", 'if [ -e "$1" ] || [ -L "$1" ]; then [ -d "$1" ] && [ ! -L "$1" ] && '
+                  '[ -z "$(find "$1" -mindepth 1 -maxdepth 1 -print -quit)" ]; fi', "m1-empty", mp])
         host.run(["install", "-d", "-o", "root", "-g", "root", "-m", "0000", mp])
     host.run(["mount", "-t", "ext4", "-o", "nodev", f"UUID={pin['docker']['d_uuid']}", "/var/lib/docker"])
     d_mounted(host, pin["docker"]["d_uuid"])
@@ -447,7 +450,8 @@ def step_clean(pin, host):
     if ids:
         host.run(["docker", "rm", "--force", *ids])
     host.run(["docker", "builder", "prune", "--all", "--force"])
-    host.run(["docker", "image", "prune", "--force"])
+    # No `docker image prune`: it removes the untagged, digest-pulled bases MAN
+    # names (Opus item 2 A2). assert-d's exact-set check catches any stray.
     for path in ("/etc/apt/apt.conf.d/95m1-proxy", f"{UNIT_DIR}/docker.service.d/m1-proxy.conf"):
         host.run(["rm", "-f", path])
     host.run(["rm", "-rf", f"{pin['op_home']}/m1-bundles"])

@@ -346,6 +346,39 @@ class SequenceTest(BakeCase):
                                                self.pin["base_images"][0]: base}})
         self.assertTrue(self.run_bake().startswith("M1-BAKE PASS "))
 
+    def test_mountpoints_absent_on_a_stock_image(self):
+        # GNU find exits 1 on a missing path: the bake must never run a bare
+        # find on a mountpoint that may not exist yet.
+        self.host.over.update({"^find /var/lib/docker": bake.BakeFail("find: exit 1"),
+                               "^find /srv/m1-state": bake.BakeFail("find: exit 1")})
+        self.assertTrue(self.run_bake().startswith("M1-BAKE PASS "))
+
+    def test_emptiness_script(self):
+        import subprocess
+        self.run_bake()
+        script = [a for a in self.host.log if a[:2] == ["sh", "-c"] and a[3] == "m1-empty"][0][2]
+        d = Path(tempfile.mkdtemp())
+        try:
+            run = lambda p: subprocess.run(["sh", "-c", script, "m1-empty", str(p)]).returncode
+            self.assertEqual(run(d / "absent"), 0)
+            (d / "empty").mkdir()
+            self.assertEqual(run(d / "empty"), 0)
+            (d / "full").mkdir()
+            (d / "full" / "x").write_text("")
+            self.assertNotEqual(run(d / "full"), 0)
+            (d / "file").write_text("")
+            self.assertNotEqual(run(d / "file"), 0)
+            (d / "link").symlink_to(d / "empty")
+            self.assertNotEqual(run(d / "link"), 0)
+        finally:
+            import shutil
+            shutil.rmtree(d)
+
+    def test_no_image_prune(self):
+        self.run_bake()
+        self.assertNotIn(["docker", "image", "prune", "--force"], self.host.log)
+        self.assertFalse(any(a[:3] == ["docker", "image", "prune"] for a in self.host.log))
+
     def test_never_touches_var_lib_m1_bake(self):
         self.run_bake()
         for a in self.host.log:
@@ -405,8 +438,8 @@ class StepFailTest(BakeCase):
             "D not mounted": (lambda h: h.over.update({"^findmnt": "\n"}), "/var/lib/docker is not D"),
             "engine root elsewhere": (lambda h: h.over.update({"^docker info": "/var/lib/docker2\n"}),
                                       "the engine's root"),
-            "docker dir not empty": (lambda h: h.over.update({"^find /var/lib/docker -mindepth": "/var/lib/docker/x\n"}),
-                                     "not empty before the bake"),
+            "docker dir not empty": (lambda h: h.over.update({"^sh -c .* m1-empty /var/lib/docker$":
+                                                              bake.BakeFail("sh: exit 1")}), "mount-d: sh"),
             "agent version": (lambda h: h.over.update({r"\$\{Version\} qemu-guest-agent": "1:9.0\n"}),
                               "never replaced"),
             "op not in docker": (lambda h: h.over.update({"^id -nG": "op\n"}), "not in the docker group"),
