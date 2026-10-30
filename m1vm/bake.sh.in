@@ -1,8 +1,8 @@
 #!/bin/bash
 # m1-bake: the M1 template's bake (LC d8 B3; DS2 d8 §1). Rendered from
-# m1vm/bake.sh.in by `bake.py render-script`, which fills the two constants
+# m1vm/bake.sh.in by `bake.py render-script`, which fills the four constants
 # below; NET's profile binds the rendered file's sha as bake_script_sha.
-# NET runs it on <bake> (208) as
+# NET's bake-run runs it on <bake> (208), through its wrapper, as
 #   runuser -u <m1-admin> -- bash /var/lib/m1-bake/m1-bake.sh </dev/null
 # and BAKED requires rc 0 and the last stdout line `M1-BAKE PASS ...`.
 #
@@ -12,11 +12,14 @@
 set -eu
 umask 022
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C LC_ALL=C
-export HOME="$(getent passwd "$(id -un)" | cut -d: -f6)"
+me=$(id -un)
+entry=$(getent passwd "$me") || { echo "M1-BAKE FAIL no passwd entry for $me" >&2; exit 1; }
+HOME=$(printf '%s\n' "$entry" | cut -d: -f6)
+export HOME
 
-PIN_SHA256=@PIN_SHA256@
-DEPLOY_COMMIT=@DEPLOY_COMMIT@
-OP_HOME=@OP_HOME@
+PIN_SHA256='@PIN_SHA256@'
+DEPLOY_COMMIT='@DEPLOY_COMMIT@'
+OP_HOME='@OP_HOME@'
 M1VM_SHA256S='@M1VM_SHA256S@'
 BUNDLE_DIR="$OP_HOME/m1-bundles"
 SRC=/opt/amap/src

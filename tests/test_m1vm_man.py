@@ -93,6 +93,7 @@ class BuildTest(ManCase):
         self.assertEqual(m["images"], {"amap-router-local:m1": IMAGE})
         self.assertEqual(m["packages"], {"docker-ce": "5:27.0.0-1", "python3": "3.12.3-0"})
         self.assertEqual(m["accounts"][ME]["uid"], os.getuid())
+        self.assertIsInstance(m["accounts"][ME]["groups"], list)
 
     def test_hdot_is_what_seed_copy_accepts(self):
         m = self.build()

@@ -18,7 +18,7 @@ MAN then holds, in canonical JSON (sorted keys, no spaces):
   - `checkouts`: {path: {head, tree}};
   - `images`: {ref: image Id}, from the engine;
   - `packages`: {name: version}, every installed package (dpkg-query -W);
-  - `accounts`: {name: {uid, gid, home}};
+  - `accounts`: {name: {uid, gid, home, groups}} (supplementary groups);
   - `builds`: {name: {commit, tree, image, id}}, each router image's pin, its
     clean export's tree and its engine Id (the per-VM fingerprint check reads
     these; controller ruling (i)).
@@ -37,6 +37,7 @@ import fnmatch
 import hashlib
 import json
 import os
+import grp
 import pwd
 import re
 import stat
@@ -224,7 +225,8 @@ def account(name):
         pw = pwd.getpwnam(name)
     except KeyError:
         raise Fail(f"account {name}: absent") from None
-    return {"uid": pw.pw_uid, "gid": pw.pw_gid, "home": pw.pw_dir}
+    groups = sorted(g.gr_name for g in grp.getgrall() if name in g.gr_mem)
+    return {"uid": pw.pw_uid, "gid": pw.pw_gid, "home": pw.pw_dir, "groups": groups}
 
 
 # ------------------------------------------------------------------ MAN

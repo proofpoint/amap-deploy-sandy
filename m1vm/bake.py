@@ -52,6 +52,7 @@ SRC = "/opt/amap/src"
 SEED = "/opt/amap/sandy-seed"
 MAN_PATH = "/opt/amap/MAN.json"
 STATE = "/srv/m1-state"
+SANDY_SECRETS = "/srv/m1-state/sandy/.secrets"
 RUN_TIMEOUT_S = 3600
 
 _HEX40 = re.compile(r"[0-9a-f]{40}\Z")
@@ -104,8 +105,8 @@ def validate_pin(pin):
             "router2", "sandy", "base_images", "npm_route", "sandy_secrets", "man_files"}
     _req(isinstance(pin, dict) and set(pin) == keys, f"PIN must be exactly {sorted(keys)}")
     _req(pin["schema"] == PIN_SCHEMA, f"schema must be {PIN_SCHEMA}")
-    _req(isinstance(pin["op_home"], str) and pin["op_home"].startswith("/home/")
-         and os.path.normpath(pin["op_home"]) == pin["op_home"], "op_home")
+    _req(isinstance(pin["op_home"], str) and re.fullmatch(r"/home/[a-z_][a-z0-9_-]{0,31}", pin["op_home"]),
+         "op_home: /home/<a plain account name>, nothing a shell would read")
     apt = pin["apt"]
     _req(isinstance(apt, dict) and set(apt) == {"sources", "packages"}, "apt: exactly {sources, packages}")
     _req(isinstance(apt["sources"], list) and apt["sources"]
@@ -122,10 +123,12 @@ def validate_pin(pin):
                                                                     for u in quiet["mask"]), "quiet.mask")
     _req(isinstance(quiet["remove"], list) and all(isinstance(p, str) and _PKG.match(p) for p in quiet["remove"]),
          "quiet.remove")
-    _req(set(QUIET_MASK) <= set(quiet["mask"]), f"quiet.mask must include {list(QUIET_MASK)}")
-    _req(set(QUIET_REMOVE) <= set(quiet["remove"]), f"quiet.remove must include {list(QUIET_REMOVE)}")
-    _req(not any(u.startswith(AGENT) for u in quiet["mask"]) and AGENT not in quiet["remove"],
-         "quiet: the guest agent may be neither masked nor removed")
+    # Closed sets (Codex item 2 (1)): exactly the reviewed units and packages,
+    # no more, no repeats; so neither the agent nor anything else can be added.
+    _req(sorted(quiet["mask"]) == sorted(QUIET_MASK) and len(set(quiet["mask"])) == len(quiet["mask"]),
+         f"quiet.mask must be exactly {list(QUIET_MASK)}")
+    _req(sorted(quiet["remove"]) == sorted(QUIET_REMOVE) and len(set(quiet["remove"])) == len(quiet["remove"]),
+         f"quiet.remove must be exactly {list(QUIET_REMOVE)}")
     dk = pin["docker"]
     _req(isinstance(dk, dict) and set(dk) == {"d_uuid", "log_max_size", "log_max_file"}, "docker: exactly {d_uuid, log_max_size, log_max_file}")
     _req(isinstance(dk["d_uuid"], str) and _UUID.match(dk["d_uuid"]), "docker.d_uuid")
@@ -180,10 +183,11 @@ def validate_pin(pin):
     else:
         _req(set(npm) == {"kind", "go_sha256"} and isinstance(npm["go_sha256"], str) and _HEX64.match(npm["go_sha256"]),
              "npm_route: an operator exception names the sha256 of the operator's go")
-    sec = pin["sandy_secrets"]
-    _req(isinstance(sec, dict) and set(sec) == {"path"} and isinstance(sec["path"], str)
-         and sec["path"].startswith(STATE + "/") and os.path.normpath(sec["path"]) == sec["path"],
-         f"sandy_secrets: exactly {{path}}, under {STATE} (never on R)")
+    # LC d8 §2.3: the model key is $SANDY_HOME/.secrets on the state disk. The
+    # MAN-declared bind alternative is not in this PIN schema; adding it is a
+    # schema change with its own review (Codex item 2 (2)).
+    _req(pin["sandy_secrets"] == {"path": SANDY_SECRETS},
+         f"sandy_secrets: exactly {{\"path\": \"{SANDY_SECRETS}\"}} ($SANDY_HOME/.secrets)")
     _req(isinstance(pin["man_files"], list) and all(isinstance(p, str) and p.startswith("/")
                                                     and os.path.normpath(p) == p for p in pin["man_files"]),
          "man_files: absolute paths")
@@ -253,13 +257,47 @@ class Host:
             os.unlink(tmp)
 
 
+def d_mounted(host, d_uuid):
+    out = host.run(["findmnt", "-n", "-o", "UUID", "--target", "/var/lib/docker"], root=False).strip()
+    if out != d_uuid:
+        raise BakeFail(f"/var/lib/docker is not D (findmnt UUID {out!r}, PIN {d_uuid})")
+
+
+def step_mount_d(pin, host):
+    """D, Docker's store, mounted at /var/lib/docker BEFORE docker-ce exists,
+    so every image lands on D (Opus item 2 B1). The mountpoints on R are made
+    root 0000 and empty, as the seal requires (SS-10, SS-11); the state
+    mountpoint stays unmounted (208 has no state disk)."""
+    for mp in ("/var/lib/docker", STATE):
+        if host.run(["find", mp, "-mindepth", "1", "-maxdepth", "1", "-print", "-quit"], root=True).strip():
+            raise BakeFail(f"{mp} is not empty before the bake")
+        host.run(["install", "-d", "-o", "root", "-g", "root", "-m", "0000", mp])
+    host.run(["mount", "-t", "ext4", "-o", "nodev", f"UUID={pin['docker']['d_uuid']}", "/var/lib/docker"])
+    d_mounted(host, pin["docker"]["d_uuid"])
+
+
+APT_ENV = ["env", "DEBIAN_FRONTEND=noninteractive", "NEEDRESTART_MODE=l", "NEEDRESTART_SUSPEND=1"]
+
+
 def step_apt(pin, host):
     host.put("/etc/apt/sources.list.d/m1-snapshot.list", "\n".join(pin["apt"]["sources"]) + "\n")
     host.run(["rm", "-f", "/etc/apt/sources.list"])
+    # needrestart only lists, never restarts: the guest agent (and anything
+    # else) is not restarted under the bake (Opus item 2 B4).
+    host.put("/etc/needrestart/conf.d/m1.conf", "$nrconf{restart} = 'l';\n")
     host.run(["apt-get", "update", "-o", "Dir::Etc::sourceparts=sources.list.d"])
-    pkgs = [f"{n}={v}" for n, v in sorted(pin["apt"]["packages"].items())]
-    host.run(["env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "install", "-y", "--no-install-recommends",
-              "--allow-downgrades", *pkgs])
+    agent_have = host.run(["dpkg-query", "-W", "-f", "${Version}", AGENT], root=False).strip()
+    if agent_have != pin["apt"]["packages"][AGENT]:
+        raise BakeFail(f"apt: {AGENT} is {agent_have!r}, not PIN's {pin['apt']['packages'][AGENT]}; the image's "
+                       "agent is never replaced under the bake")
+    host.run(["apt-mark", "hold", AGENT])
+    pkgs = [f"{n}={v}" for n, v in sorted(pin["apt"]["packages"].items()) if n != AGENT]
+    host.run([*APT_ENV, "apt-get", "install", "-y", "--no-install-recommends", "--allow-downgrades", *pkgs])
+    # B2: sandy's build runs as <op>, which drives the engine (LC d8 §4.1).
+    op = pin["accounts"]["op"]["name"]
+    host.run(["usermod", "-aG", "docker", op])
+    if "docker" not in host.run(["id", "-nG", op], root=False).split():
+        raise BakeFail(f"apt: {op} is not in the docker group")
     have = host.run(["dpkg-query", "-W", "-f", "${Package}\t${Version}\n", *sorted(pin["apt"]["packages"])],
                     root=False)
     got = dict(line.split("\t", 1) for line in have.splitlines() if "\t" in line)
@@ -271,7 +309,7 @@ def step_apt(pin, host):
 def step_quiet(pin, host):
     host.run(["systemctl", "mask", *pin["quiet"]["mask"]])
     if pin["quiet"]["remove"]:
-        host.run(["env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "purge", "-y", *pin["quiet"]["remove"]])
+        host.run([*APT_ENV, "apt-get", "purge", "-y", *pin["quiet"]["remove"]])
     host.put("/etc/systemd/journald.conf.d/m1.conf", "[Journal]\nStorage=volatile\n")
     host.put("/etc/systemd/coredump.conf.d/m1.conf", "[Coredump]\nStorage=none\n")
     host.run(["swapoff", "-a"])
@@ -317,7 +355,9 @@ def step_accounts(pin, host):
     # The closed set (DS2 d8 §1.1 step 4): the distribution's README is the
     # only other entry a stock image carries, and it goes.
     host.run(["rm", "-f", f"{SUDOERS_DIR}/README"])
-    names = sorted(host.run(["ls", "-A", SUDOERS_DIR]).split())
+    # NUL-framed, so no file name (whitespace included) can hide (Codex (3)).
+    names = sorted(n for n in host.run(["find", SUDOERS_DIR, "-mindepth", "1", "-maxdepth", "1",
+                                        "-printf", "%f\\0"]).split("\0") if n != "")
     if names != sorted(["m1-admin", adm]):
         raise BakeFail(f"accounts: {SUDOERS_DIR} holds {names}, not exactly ['m1-admin', '{adm}']")
     host.run(["visudo", "-c", "-q"])
@@ -430,8 +470,11 @@ def builds(pin, host):
 
 
 def step_man(pin, host, pin_sha):
-    refs = sorted(set(image_set(pin)) | set(host.run(["docker", "image", "ls", "--format",
-                                                       "{{.Repository}}:{{.Tag}}"]).split()) - {"<none>:<none>"})
+    # Tagged images by name; the pinned bases by their digest refs, which
+    # pulls by digest leave untagged (Opus item 2 B3). No `<none>` ref.
+    tagged = {r for r in host.run(["docker", "image", "ls", "--format", "{{.Repository}}:{{.Tag}}"]).split()
+              if not r.endswith(":<none>")}
+    refs = sorted(set(image_set(pin)) | tagged | set(pin["base_images"]))
     plan = {"pin_sha256": pin_sha, "seed": SEED, "files": sorted(set(pin["man_files"]) | {
         f"/etc/sudoers.d/{pin['accounts']['adm']['name']}", "/etc/sudoers.d/m1-admin", "/etc/docker/daemon.json",
         f"{UNIT_DIR}/docker.service.d/m1-mounts.conf", f"{UNIT_DIR}/docker.socket.d/m1-acl.conf",
@@ -463,6 +506,10 @@ def step_assert_d(pin, host, man_sha):
       - ids= is sha256 over the distinct Ids, `sha256:` prefix kept, sorted
         bytewise (LC_ALL=C order), each followed by one newline.
     Any mismatch raises, so `run` exits 1 and prints no PASS line."""
+    d_mounted(host, pin["docker"]["d_uuid"])
+    root_dir = host.run(["docker", "info", "--format", "{{.DockerRootDir}}"]).strip()
+    if root_dir != "/var/lib/docker":
+        raise BakeFail(f"assert-d: the engine's root is {root_dir!r}, not /var/lib/docker")
     raw = host.run(["cat", MAN_PATH])
     if hashlib.sha256(raw.encode("utf-8")).hexdigest() != man_sha:
         raise BakeFail("assert-d: MAN.json is not the bytes m1-man reported")
@@ -483,7 +530,7 @@ def step_assert_d(pin, host, man_sha):
 
 
 def bake(pin, pin_sha, host):
-    for name, step in (("apt", step_apt), ("quiet", step_quiet), ("docker", step_docker),
+    for name, step in (("mount-d", step_mount_d), ("apt", step_apt), ("quiet", step_quiet), ("docker", step_docker),
                        ("accounts", step_accounts), ("sources", step_sources), ("images", step_images),
                        ("programs", step_programs), ("units", step_units), ("clean", step_clean)):
         print(f"M1-BAKE STEP {name}", flush=True)

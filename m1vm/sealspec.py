@@ -24,11 +24,15 @@ What SEALSPEC does NOT cover, and what does (DS2 d8 §3.1):
     in the deploy checkout (itself checked out at the constant commit) before
     it execs bake.py; a mismatch exits non-zero before any step runs.
     assert-d, exactly:
+      - D is the engine's store: `findmnt -n -o UUID --target /var/lib/docker`
+        equals PIN's d_uuid (BAKE mounted D there before docker-ce existed),
+        and `docker info --format {{.DockerRootDir}}` is /var/lib/docker;
       - man= is the sha256 of /opt/amap/MAN.json's bytes, which must equal
         the sha m1-man printed when it wrote the file;
       - `docker image ls --all --quiet --no-trunc` is read as the SET of
         distinct Ids (one line per tag, repeats ignored), each kept as
-        `sha256:<64 hex>`, and must equal the SET of MAN's `images` values;
+        `sha256:<64 hex>`, and must equal the SET of MAN's `images` values
+        (MAN names the pinned base images by their digest refs);
       - the builder cache: `docker system df --format '{{json .}}'` must
         print exactly one row with Type "Build Cache", whose TotalCount is "0";
       - ids= is the sha256 of the distinct Ids, `sha256:` prefix kept, sorted

@@ -74,6 +74,8 @@ class FakeHost:
                    '{"Type":"Local Volumes","TotalCount":"0"}\n{"Type":"Build Cache","TotalCount":"0"}\n')
         self.man = json.dumps({"images": {"m1-hop:pin": IMG1, "m1-hub:pin": IMG2}})
         self.removed = set()
+        self.findmnt_calls = 0
+        self.unmount_after = None
 
     def put(self, path, text, mode="0644", owner="root:root"):
         self.files[path] = (text, mode, owner)
@@ -87,12 +89,23 @@ class FakeHost:
                     raise out
                 return out
         a = argv
+        if a[:2] == ["findmnt", "-n"]:
+            self.findmnt_calls += 1
+            if self.unmount_after is not None and self.findmnt_calls > self.unmount_after:
+                return "\n"
+            return self.pin["docker"]["d_uuid"] + "\n"
+        if a[:3] == ["docker", "info", "--format"]:
+            return "/var/lib/docker\n"
+        if a[:3] == ["dpkg-query", "-W", "-f"] and a[3] == "${Version}":
+            return self.pin["apt"]["packages"][a[4]]
+        if a[:2] == ["id", "-nG"]:
+            return "op docker\n"
         if a == ["cat", "/etc/sudoers.d/m1-admin"]:
             return "m1admin ALL=(ALL:ALL) NOPASSWD: ALL\n"
         if a[:3] == ["stat", "-c", "%a %u %g %h %F"]:
             return "440 0 0 1 regular file\n"
-        if a[:2] == ["ls", "-A"]:
-            return "m1-admin\nm1adm\n"
+        if a[:2] == ["find", "/etc/sudoers.d"]:
+            return "m1-admin\0m1adm\0"
         if a[0] == "find":
             return ""
         if a[0] == "dpkg-query":
@@ -124,7 +137,7 @@ class FakeHost:
         if a[:3] == ["docker", "image", "ls"]:
             if "--all" in a:
                 return "\n".join(self.images_left) + "\n"
-            return "m1-hop:pin\nm1-hub:pin\n<none>:<none>\n"
+            return "m1-hop:pin\nm1-hub:pin\n<none>:<none>\ndocker.io/library/python:<none>\n"
         if a[:2] == ["docker", "ps"]:
             return ""
         if a[:3] == ["docker", "system", "df"]:
@@ -153,6 +166,9 @@ class PinTest(unittest.TestCase):
             "extra key": lambda p: p.update(extra=1),
             "schema": lambda p: p.update(schema="m1vm-pin/2"),
             "op_home": lambda p: p.update(op_home="/root"),
+            "op_home metachar": lambda p: p.update(op_home="/home/op$(id)"),
+            "op_home space": lambda p: p.update(op_home="/home/o p"),
+            "op_home nested": lambda p: p.update(op_home="/home/op/x"),
             "missing docker-ce pin": lambda p: p["apt"]["packages"].pop("docker-ce"),
             "bad version": lambda p: p["apt"]["packages"].update(git="1 2"),
             "non-deb source": lambda p: p["apt"].update(sources=["http://x"]),
@@ -178,6 +194,12 @@ class PinTest(unittest.TestCase):
             "npm exception no go": lambda p: p.update(npm_route={"kind": "operator-exception"}),
             "empty secrets": lambda p: p.update(sandy_secrets={}),
             "secrets on R": lambda p: p.update(sandy_secrets={"path": "/home/op/.sandy/.secrets"}),
+            "secrets elsewhere on state": lambda p: p.update(sandy_secrets={"path": "/srv/m1-state/other/.secrets"}),
+            "secrets extra key": lambda p: p["sandy_secrets"].update(bind="/x"),
+            "mask adds ssh": lambda p: p["quiet"]["mask"].append("ssh.service"),
+            "mask repeats": lambda p: p["quiet"]["mask"].append("motd-news.timer"),
+            "remove adds a package": lambda p: p["quiet"]["remove"].append("curl"),
+            "remove repeats": lambda p: p["quiet"]["remove"].append("snapd"),
             "mask misses unattended": lambda p: p["quiet"]["mask"].remove("unattended-upgrades.service"),
             "mask misses apt-daily-upgrade": lambda p: p["quiet"]["mask"].remove("apt-daily-upgrade.timer"),
             "mask misses motd": lambda p: p["quiet"]["mask"].remove("motd-news.timer"),
@@ -200,9 +222,9 @@ class RenderTest(unittest.TestCase):
         template = (M1VM / "bake.sh.in").read_text()
         pin_bytes = json.dumps(make_pin()).encode()
         script = bake.render_script(template, pin_bytes, str(M1VM))
-        self.assertIn(f"PIN_SHA256={hashlib.sha256(pin_bytes).hexdigest()}\n", script)
-        self.assertIn(f"DEPLOY_COMMIT={H('a')}\n", script)
-        self.assertIn("OP_HOME=/home/op\n", script)
+        self.assertIn(f"PIN_SHA256='{hashlib.sha256(pin_bytes).hexdigest()}'\n", script)
+        self.assertIn(f"DEPLOY_COMMIT='{H('a')}'\n", script)
+        self.assertIn("OP_HOME='/home/op'\n", script)
         self.assertEqual(bake.PROGRAMS, ("bake.py", "man.py", "seed_copy.py", "state_check.py"))
         for name in bake.PROGRAMS:
             digest = hashlib.sha256((M1VM / name).read_bytes()).hexdigest()
@@ -281,6 +303,49 @@ class SequenceTest(BakeCase):
         self.assertLess(enable, assert_d)
         self.assertEqual(enable, max(i for i, a in enumerate(self.host.log) if a[0] == "systemctl"))
 
+    def test_d_mounted_before_docker_exists(self):
+        self.run_bake()
+        mount = self.index(lambda a: a[0] == "mount")
+        install = self.index(lambda a: "install" in a and "apt-get" in a)
+        self.assertLess(mount, install)
+        self.assertEqual(self.host.log[mount], ["mount", "-t", "ext4", "-o", "nodev",
+                                                f"UUID={self.pin['docker']['d_uuid']}", "/var/lib/docker"])
+        for mp in ("/var/lib/docker", "/srv/m1-state"):
+            self.assertIn(["install", "-d", "-o", "root", "-g", "root", "-m", "0000", mp], self.host.log)
+        self.assertNotIn(["mount", "-t", "ext4"], [a[:3] for a in self.host.log if "m1-state" in " ".join(a)])
+
+    def test_nothing_restarts_docker_or_the_agent(self):
+        self.run_bake()
+        for a in self.host.log:
+            joined = " ".join(a)
+            self.assertNotIn("restart", [x for x in a if x in ("restart", "try-restart", "reload-or-restart")], joined)
+            self.assertFalse(a[:2] == ["systemctl", "start"], joined)
+
+    def test_agent_held_and_never_reinstalled(self):
+        self.run_bake()
+        i = self.index(lambda a: "install" in a and "apt-get" in a)
+        self.assertFalse(any(x.startswith("qemu-guest-agent=") for x in self.host.log[i]))
+        self.assertLess(self.index(lambda a: a == ["apt-mark", "hold", "qemu-guest-agent"]), i)
+        self.assertEqual(self.host.files["/etc/needrestart/conf.d/m1.conf"][0], "$nrconf{restart} = 'l';\n")
+        self.assertIn("NEEDRESTART_MODE=l", self.host.log[i])
+
+    def test_op_in_docker_group(self):
+        self.run_bake()
+        self.assertIn(["usermod", "-aG", "docker", "op"], self.host.log)
+
+    def test_base_images_by_digest_in_man(self):
+        self.run_bake()
+        plan = json.loads(self.host.files["/run/m1-bake/man-plan.json"][0])
+        self.assertIn(self.pin["base_images"][0], plan["images"])
+        self.assertFalse(any(r.endswith(":<none>") for r in plan["images"]))
+
+    def test_base_id_on_d_matches_when_man_names_it(self):
+        base = "sha256:" + "4" * 64
+        self.host.images_left = [IMG1, IMG2, base]
+        self.host.man = json.dumps({"images": {"m1-hop:pin": IMG1, "m1-hub:pin": IMG2,
+                                               self.pin["base_images"][0]: base}})
+        self.assertTrue(self.run_bake().startswith("M1-BAKE PASS "))
+
     def test_never_touches_var_lib_m1_bake(self):
         self.run_bake()
         for a in self.host.log:
@@ -310,7 +375,7 @@ class SequenceTest(BakeCase):
         self.run_bake()
         plan = json.loads(self.host.files["/run/m1-bake/man-plan.json"][0])
         self.assertEqual(plan["builds"]["router1"], {"commit": H("d"), "tree": H("e"), "image": "m1-hop:pin"})
-        self.assertEqual(plan["images"], ["m1-hop:pin", "m1-hub:pin"])
+        self.assertEqual(plan["images"], sorted(["m1-hop:pin", "m1-hub:pin", self.pin["base_images"][0]]))
 
 
 class StepFailTest(BakeCase):
@@ -337,6 +402,14 @@ class StepFailTest(BakeCase):
             "two cache rows": (lambda h: setattr(h, "df", '{"Type":"Build Cache","TotalCount":"0"}\n' * 2),
                                "builder cache is not empty"),
             "man changed": (lambda h: h.over.update({"^cat /opt/amap/MAN.json": "{}"}), "not the bytes m1-man reported"),
+            "D not mounted": (lambda h: h.over.update({"^findmnt": "\n"}), "/var/lib/docker is not D"),
+            "engine root elsewhere": (lambda h: h.over.update({"^docker info": "/var/lib/docker2\n"}),
+                                      "the engine's root"),
+            "docker dir not empty": (lambda h: h.over.update({"^find /var/lib/docker -mindepth": "/var/lib/docker/x\n"}),
+                                     "not empty before the bake"),
+            "agent version": (lambda h: h.over.update({r"\$\{Version\} qemu-guest-agent": "1:9.0\n"}),
+                              "never replaced"),
+            "op not in docker": (lambda h: h.over.update({"^id -nG": "op\n"}), "not in the docker group"),
             "command fails": (lambda h: h.over.update({"^docker pull": bake.BakeFail("docker pull: exit 1")}),
                               "images: docker pull"),
             "admin sudoers broader": (lambda h: h.over.update({"^cat /etc/sudoers.d/m1-admin$":
@@ -346,10 +419,13 @@ class StepFailTest(BakeCase):
                                    "not root:root 0440"),
             "admin sudoers linked": (lambda h: h.over.update({"^stat -c": "440 0 0 2 regular file\n"}),
                                      "not root:root 0440"),
-            "extra sudoers file": (lambda h: h.over.update({"^ls -A": "90-cloud-init-users\nm1-admin\nm1adm\n"}),
+            "extra sudoers file": (lambda h: h.over.update({"^find /etc/sudoers.d": "90-cloud-init-users\0m1-admin\0m1adm\0"}),
                                    "not exactly"),
-            "missing adm sudoers": (lambda h: h.over.update({"^ls -A": "m1-admin\n"}), "not exactly"),
-            "seed holds secrets": (lambda h: h.over.update({"^find ": "/opt/amap/sandy-seed/.secrets\n"}),
+            "whitespace sudoers file": (lambda h: h.over.update({"^find /etc/sudoers.d": " \0m1-admin\0m1adm\0"}),
+                                        "not exactly"),
+            "missing adm sudoers": (lambda h: h.over.update({"^find /etc/sudoers.d": "m1-admin\0"}), "not exactly"),
+            "D unmounted before assert-d": (lambda h: setattr(h, "unmount_after", 1), "/var/lib/docker is not D"),
+            "seed holds secrets": (lambda h: h.over.update({"^find /opt/amap/sandy-seed": "/opt/amap/sandy-seed/.secrets\n"}),
                                    "the seed holds a .secrets"),
         }
         for name, (brk, needle) in breaks.items():
