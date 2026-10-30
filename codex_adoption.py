@@ -8,9 +8,53 @@ from pathlib import Path
 import re
 import sqlite3
 
+import codex_assets as assets
+
 DIGEST = "[a-f0-9]{64}"
 PENDING = ("; pending explicit revalidation: with the sandbox running, its relay held and no Codex service, "
            "run transition confirm, then confirm --apply")
+BUILD = r"codex-cli ([0-9]+)\.([0-9]+)\.([0-9]+)(?:[-+][0-9A-Za-z.-]+)?"
+BUILD_LINE = re.compile(rb'(?m)^[ \t]*(?:"codex_version"|codex_version)[ \t]*=[ \t]*"([^"\r\n]+)"[ \t]*(?:#[^\r\n]*)?$')
+
+
+def build_number(value):
+    match = re.fullmatch(BUILD, value) if isinstance(value, str) else None
+    if match is None:
+        raise ValueError("native Codex build is unavailable or malformed")
+    return tuple(int(part) for part in match.groups())
+
+
+def with_build(raw, version):
+    """Replace only the one top-level build string; retain every other byte."""
+    build_number(version)
+    matches = list(BUILD_LINE.finditer(raw))
+    if len(matches) != 1:
+        raise ValueError("controller has no unique native build assignment")
+    match = matches[0]
+    if re.search(rb'(?m)^[ \t]*\[', raw[:match.start()]):
+        raise ValueError("controller native build assignment is not top-level")
+    build_number(match[1].decode())
+    return raw[:match.start(1)] + version.encode() + raw[match.end(1):]
+
+
+def runtime_record(state, record):
+    """Read current build evidence without rewriting the original adoption receipt.
+
+    A changed controller is accepted only when restoring the recorded build
+    reproduces its exact confirmed bytes. All other edits still refuse.
+    """
+    raw = assets.regular(Path(state) / "controller.toml")
+    digest = assets.digest(raw)
+    if digest == record["target_sha256"]:
+        return record
+    matches = list(BUILD_LINE.finditer(raw))
+    if len(matches) != 1:
+        raise ValueError("current controller differs from the confirmed target")
+    version = matches[0][1].decode()
+    if (build_number(version) < build_number(record.get("codex_version"))
+            or assets.digest(with_build(raw, record["codex_version"])) != record["target_sha256"]):
+        raise ValueError("current controller differs from the confirmed target beyond an advancing Codex build")
+    return {**record, "codex_version": version, "target_sha256": digest}
 
 
 def evidence(journal, instance_id):
