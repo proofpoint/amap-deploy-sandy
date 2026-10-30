@@ -8,6 +8,7 @@ from contextlib import closing
 import os
 from pathlib import Path
 import sqlite3
+import subprocess
 import sys
 from tempfile import TemporaryDirectory
 import unittest
@@ -35,6 +36,8 @@ class TransitionTest(unittest.TestCase):
         tmp = TemporaryDirectory(prefix=".ct-", dir=os.environ.get("AMAP_TEST_TMPDIR"))
         self.addCleanup(tmp.cleanup)
         self.root = Path(tmp.name)
+        import _execution_identity
+        self.identity_driver = _execution_identity.fixture(self, self.root)
         self.native_home = self.root / "native-home"
         self.native_home.mkdir()
         (self.native_home / "config.toml").write_text('model = "test-model"\n')
@@ -95,20 +98,154 @@ class TransitionTest(unittest.TestCase):
         target = transition.config_at(self.state)
         with closing(sqlite3.connect(self.state / "journal.sqlite3")) as db, db:
             db.execute("UPDATE instance SET fingerprint=?,thread_id=?", (target.fingerprint(), THREAD))
-            db.execute("CREATE TABLE unified_adoptions (singleton INTEGER PRIMARY KEY, thread_id TEXT, "
-                       "previous_fingerprint TEXT, fingerprint TEXT, policy_hash TEXT, history_sha256 TEXT, state TEXT)")
+            # The connector's DDL (amap_codex.unified_maintenance), constraints included.
+            db.execute("CREATE TABLE unified_adoptions (singleton INTEGER PRIMARY KEY CHECK(singleton=1), "
+                       "thread_id TEXT NOT NULL, previous_fingerprint TEXT NOT NULL, fingerprint TEXT NOT NULL, "
+                       "policy_hash TEXT NOT NULL, history_sha256 TEXT NOT NULL, state TEXT NOT NULL)")
             db.execute("INSERT INTO unified_adoptions VALUES(1,?,?,?,?,?,?)", (THREAD, self.previous.fingerprint(),
                        target.fingerprint(), "a" * 64, "b" * 64, "confirmed" if confirmed else "planned"))
-            db.execute("CREATE TABLE unified_binding (instance_id TEXT PRIMARY KEY, thread_id TEXT, "
-                       "policy_hash TEXT, effective_model TEXT)")
+            db.execute("CREATE TABLE unified_binding (instance_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, "
+                       "policy_hash TEXT NOT NULL, effective_model TEXT NOT NULL)")
             db.execute("INSERT INTO unified_binding VALUES(?,?,?,?)", (target.instance_id, THREAD,
                        ("a" if policy_matches else "c") * 64, target.codex_model))
+
+    def test_prepare_refuses_when_the_retained_previous_bytes_differ(self):
+        """The expected previous fingerprint is recorded only from the exact retained bytes."""
+        real = assets.place
+
+        def altered(path, raw, **kwargs):
+            if path == self.state / transition.PREVIOUS:
+                raw = raw + b"\n# altered after placement\n"
+            return real(path, raw, **kwargs)
+
+        with mock.patch.object(assets, "place", side_effect=altered):
+            with self.assertRaisesRegex(ValueError, "does not yield the recorded previous fingerprint"):
+                self.prepare(apply=True)
+        self.assertFalse((self.state / transition.RECORD).exists())
+        self.assertEqual((self.state / "controller.toml").read_bytes(), self.previous_raw)
 
     def test_dry_run_preserves_controller_and_does_not_create_gate(self):
         self.assertFalse(self.prepare()["apply"])
         self.assertEqual((self.state / "controller.toml").read_bytes(), self.previous_raw)
         self.assertFalse((self.state / transition.RECORD).exists())
         self.assertEqual(transition.entry_mode(self.state), "separate")
+
+    def test_installed_version_is_explicit_and_retains_previous_identity(self):
+        measured = subprocess.CompletedProcess(["codex", "--version"], 0, "codex-cli 0.165.0\n", "")
+        with mock.patch.object(transition.subprocess, "run", return_value=measured) as run:
+            preview = self.prepare(use_installed_codex_version=True)
+            self.assertEqual(preview["codex_version"], "codex-cli 0.165.0")
+            self.assertEqual((self.state / "controller.toml").read_bytes(), self.previous_raw)
+            self.assertFalse((self.state / transition.RECORD).exists())
+            self.prepare(use_installed_codex_version=True, apply=True)
+        self.assertEqual(run.call_args.args[0], ["codex", "--version"])
+        self.assertTrue(run.call_args.kwargs["check"])
+        self.assertEqual((self.state / transition.PREVIOUS).read_bytes(), self.previous_raw)
+        target = transition.config_at(self.state)
+        self.assertEqual(target.codex_version, "codex-cli 0.165.0")
+        self.assertNotEqual(target.fingerprint(), self.previous.fingerprint())
+        with closing(sqlite3.connect(self.state / "journal.sqlite3")) as db:
+            row = db.execute("SELECT fingerprint,thread_id,codex_version FROM instance").fetchone()
+        self.assertEqual(row, (self.previous.fingerprint(), OLD_THREAD, self.previous.codex_version))
+        self.commit_adoption_fixture()
+        self.assertEqual(transition.confirm(self.state, apply=True)["state"], "confirmed")
+
+    def test_prepare_without_installed_version_keeps_configured_build(self):
+        with mock.patch.object(transition.subprocess, "run", side_effect=AssertionError("must not probe")):
+            result = self.prepare()
+        self.assertEqual(result["codex_version"], self.previous.codex_version)
+
+    def test_prepare_cli_passes_explicit_version_selection(self):
+        with mock.patch.object(transition, "prepare", return_value={}) as prepare:
+            self.assertEqual(transition.main(["prepare", "--thread", THREAD,
+                                             "--use-installed-codex-version", "--apply"]), 0)
+        self.assertTrue(prepare.call_args.kwargs["use_installed_codex_version"])
+        self.assertTrue(prepare.call_args.kwargs["apply"])
+
+    def test_installed_version_lookup_failure_or_malformed_output_writes_nothing(self):
+        failures = [FileNotFoundError("codex absent"),
+                    subprocess.CalledProcessError(1, ["codex", "--version"]),
+                    subprocess.TimeoutExpired(["codex", "--version"], 10)]
+        for failure in failures:
+            with self.subTest(failure=type(failure).__name__), mock.patch.object(
+                    transition.subprocess, "run", side_effect=failure):
+                with self.assertRaises(type(failure)):
+                    self.prepare(use_installed_codex_version=True, apply=True)
+            self.assertEqual((self.state / "controller.toml").read_bytes(), self.previous_raw)
+            self.assertFalse((self.state / transition.RECORD).exists())
+        for output in ("", "0.165.0", "codex-cli 0.165.0\nforeign output", "codex-cli unknown"):
+            measured = subprocess.CompletedProcess(["codex", "--version"], 0, output, "")
+            with self.subTest(output=output), mock.patch.object(
+                    transition.subprocess, "run", return_value=measured):
+                with self.assertRaisesRegex(ValueError, "version is unavailable or malformed"):
+                    self.prepare(use_installed_codex_version=True, apply=True)
+            self.assertEqual((self.state / "controller.toml").read_bytes(), self.previous_raw)
+            self.assertFalse((self.state / transition.RECORD).exists())
+
+    def test_installed_version_retry_is_stable_and_another_build_refuses(self):
+        measured = subprocess.CompletedProcess(["codex", "--version"], 0, "codex-cli 0.165.0\n", "")
+        with mock.patch.object(transition.subprocess, "run", return_value=measured):
+            self.prepare(use_installed_codex_version=True, apply=True)
+            paths = [self.state / n for n in (transition.RECORD, transition.PREVIOUS, "controller.toml")]
+            before = [(p.read_bytes(), p.stat().st_mtime_ns) for p in paths]
+            self.prepare(use_installed_codex_version=True, apply=True)
+            self.assertEqual(before, [(p.read_bytes(), p.stat().st_mtime_ns) for p in paths])
+            measured.stdout = "codex-cli 0.166.0\n"
+            with self.assertRaisesRegex(ValueError, "unfinished transition differs"):
+                self.prepare(use_installed_codex_version=True, apply=True)
+        self.assertEqual(before, [(p.read_bytes(), p.stat().st_mtime_ns) for p in paths])
+
+    def route(self, **session_overrides):
+        path = self.root / "session.json"
+        path.write_text(json.dumps({"sandbox_name": self.previous.instance_id,
+                                    "workspace": self.previous.cwd, **session_overrides}))
+        with mock.patch.dict(os.environ, {"AMAP_INBOX_DIR": str(self.root / "mail"),
+                                         "AMAP_PEER_DIR": str(self.root / "peer")}):
+            return transition.startup_route(self.state, path)
+
+    def test_startup_route_keeps_unadopted_state_on_the_fresh_guard(self):
+        before = (self.state / "controller.toml").read_bytes()
+        self.assertEqual(self.route(), "fresh")
+        self.assertEqual((self.state / "controller.toml").read_bytes(), before)
+        self.assertFalse((self.state / "fresh-birth.json").exists())
+
+    def test_confirmed_adoption_routes_read_only_and_retains_pause(self):
+        self.prepare(apply=True)
+        self.commit_adoption_fixture()
+        transition.confirm(self.state, apply=True)
+        transition.pause(self.state, "maintenance", apply=True)
+        before = {p: p.read_bytes() for p in self.state.rglob("*") if p.is_file()}
+        self.assertEqual(self.route(), "adopted")
+        self.assertEqual({p: p.read_bytes() for p in self.state.rglob("*") if p.is_file()}, before)
+        for session in ({"sandbox_name": "foreign"}, {"workspace": "/foreign"}, {"workspace": "relative"}):
+            with self.subTest(session=session), self.assertRaisesRegex(ValueError, "another Sandy"):
+                self.route(**session)
+
+    def test_prepared_or_malformed_adoption_never_falls_back_to_fresh(self):
+        self.prepare(apply=True)
+        with self.assertRaisesRegex(ValueError, "adoption is pending"):
+            self.route()
+        (self.state / transition.RECORD).write_text("{}")
+        with self.assertRaises(ValueError):
+            self.route()
+        self.assertFalse((self.state / "fresh-birth.json").exists())
+
+    def test_routing_requires_committed_adoption_not_only_a_confirmed_adapter_marker(self):
+        self.prepare(apply=True)
+        self.commit_adoption_fixture()
+        transition.confirm(self.state, apply=True)
+        with closing(sqlite3.connect(self.state / "journal.sqlite3")) as db, db:
+            db.execute("UPDATE unified_adoptions SET state='planned'")
+        with self.assertRaisesRegex(ValueError, "not confirmed"):
+            self.route()
+
+    def test_mixed_fresh_and_adopted_evidence_refuses_routing(self):
+        self.prepare(apply=True)
+        self.commit_adoption_fixture()
+        transition.confirm(self.state, apply=True)
+        (self.state / "fresh-birth.json").write_text("{}")
+        with self.assertRaisesRegex(ValueError, "cannot enter"):
+            self.route()
 
     def test_prepare_saves_original_before_gate_before_final_path_replacement(self):
         calls = []

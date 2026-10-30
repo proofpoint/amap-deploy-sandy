@@ -1900,9 +1900,10 @@ class VerifyEndToEndTest(SandboxFixture):
     would have stayed green over a `main()` that never called them."""
 
     def _run(self, selected=(None,), manifest_block=None, extra=None, host_args=(),
-             verify_args=()):
+             verify_args=(), verb="verify", state_delay=0):
         """`selected` is the slugs whose last launch selected the feature —
-        both, by default."""
+        both, by default. `state_delay` seconds pass before `--print-state`
+        answers."""
         chosen = list(selected) if selected != (None,) else [self.SLUG, self.OTHER]
         fake = self.root / "sandy"
         state = json.dumps({"sandboxes": [
@@ -1919,7 +1920,8 @@ class VerifyEndToEndTest(SandboxFixture):
                                                     "agent_args"]},
                              "agents": [{"name": "claude"}]})
         fake.write_text("#!/bin/sh\ncase \"$1\" in\n  --print-schema) cat <<'EOF'\n"
-                        + schema + "\nEOF\n;;\n  *) cat <<'EOF'\n" + state + "\nEOF\n;;\nesac\n")
+                        + schema + "\nEOF\n;;\n  *) sleep " + str(state_delay) + "\ncat <<'EOF'\n"
+                        + state + "\nEOF\n;;\nesac\n")
         fake.chmod(0o755)
         _select(self.home, *chosen)
         out, err = io.StringIO(), io.StringIO()
@@ -1927,8 +1929,52 @@ class VerifyEndToEndTest(SandboxFixture):
             rc = prov.main(["--sandy", str(fake),
                             "--sandy-home", str(self.home),
                             "--connector-src", str(self.src),
-                            *host_args, "verify", *verify_args])
+                            *host_args, verb, *verify_args])
         return rc, out.getvalue() + err.getvalue()
+
+    def _count_print_state(self, **kwargs):
+        """`(rc, output, calls)`: how many times the run asked sandy for `--print-state`."""
+        real = prov.discover_sandboxes
+        calls = []
+
+        def counted(sandy_bin="sandy"):
+            calls.append(sandy_bin)
+            return real(sandy_bin)
+
+        with unittest.mock.patch.object(prov, "discover_sandboxes", side_effect=counted):
+            rc, out = self._run(**kwargs)
+        return rc, out, len(calls)
+
+    def test_verify_asks_sandy_for_print_state_once(self):
+        """Both halves of verify, the install question and the live checks, judge one read."""
+        rc, out, calls = self._count_print_state()
+        self.assertIn("verify (2/2)", out)
+        self.assertEqual(calls, 1, out)
+
+    def test_install_asks_sandy_for_print_state_once(self):
+        rc, out, calls = self._count_print_state(verb="install")
+        self.assertIn("install (DRY RUN", out)
+        self.assertEqual(calls, 1, out)
+
+    def test_a_print_state_slower_than_the_bound_is_a_named_cannot_run(self):
+        original = prov.SANDY_PRINT_STATE_TIMEOUT_S
+        prov.SANDY_PRINT_STATE_TIMEOUT_S = 1
+        self.addCleanup(setattr, prov, "SANDY_PRINT_STATE_TIMEOUT_S", original)
+        facts = self.root / "host-facts.json"
+        rc, out = self._run(state_delay=3, verify_args=("--host-facts", str(facts)))
+        self.assertEqual(rc, 2, out)
+        self.assertIn("`sandy --print-state` did not answer within 1s, so the sandbox list is "
+                      "unknown and this command cannot run", out)
+        self.assertEqual(json.loads(facts.read_text())["exit_meaning"], "cannot_run")
+
+    def test_a_print_state_within_the_bound_still_verifies(self):
+        """The positive control for the bound: a slow answer inside it is read normally."""
+        original = prov.SANDY_PRINT_STATE_TIMEOUT_S
+        prov.SANDY_PRINT_STATE_TIMEOUT_S = 10
+        self.addCleanup(setattr, prov, "SANDY_PRINT_STATE_TIMEOUT_S", original)
+        rc, out = self._run(state_delay=1)
+        self.assertIn("verify (2/2)", out)
+        self.assertNotIn("did not answer within", out)
 
     def _row(self, out, condition):
         """The one printed row carrying `condition`, at a width that never

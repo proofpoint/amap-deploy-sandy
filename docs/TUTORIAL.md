@@ -590,8 +590,35 @@ checks; its results do not establish target-host acceptance.
 
 ### Experimental unified conversation: existing-instance transition
 
-The Codex pin names merged connector main commit
-`e10eb2cf22a1056d1506938ef0669bfde582ff75`. Before end-to-end execution,
+The unified Codex choice applies to Codex-served sandboxes. In a mixed sandbox
+containing Claude, the Claude daemon remains the sole AMAP receiver and the Codex
+pane starts with Sandy's native arguments, without the Codex supervisor's
+interactive tools. A fleet-wide unified choice does not disable that native
+pane. Retained Codex unified ownership requires explicit disposition before
+changing the sandbox to Claude-served operation.
+
+With the fleet choice set to unified, ordinary relay and interactive launches
+recognize an existing confirmed adoption. They verify its retained previous and
+target configurations, committed adoption and canonical binding, current pane
+settings, and Sandy instance/workspace/lane identity before selecting that
+runtime. The full native argv startup gate still applies on every new execution
+environment. No per-process separate-mode override is needed.
+
+The adopted service uses Sandy's system `/usr/bin/python3`, matching the
+`sandy --exec` maintenance environment. The protected activity-tool definition
+binds that interpreter path. Workspace virtualenv activation must not substitute
+another interpreter on restart. Fresh unified runtimes retain their own protected
+startup path.
+
+A prepared, malformed, mismatched or mixed fresh/adopted record holds; it is
+never interpreted as permission to initialize another conversation. Instances
+without an adoption record continue through the fresh-state guard, which refuses
+unexplained legacy state. The transition below retains the mailbox address and
+delivery journal; it does not reset the router or require stopping other
+instances. Keep only the target service and native clients stopped for adoption.
+
+The Codex pin names connector commit
+`197ed8bbcd6cecfee06ccf101c463e2e0c0e34d9`. Before end-to-end execution,
 require the approved deployment commit for the host's line, full exact-pin
 suite and canary evidence, the operator's unified-model precedence decision,
 and actual-host acceptance of the paused-restart procedure below.
@@ -801,6 +828,13 @@ sandy --exec --workspace "$WORKSPACE" -- python3 /opt/sandy/features/amap/codex/
 sandy --exec --workspace "$WORKSPACE" -- python3 /opt/sandy/features/amap/codex/transition prepare --thread "$THREAD" --apply
 ```
 
+If the installed native Codex build differs from the retained controller's
+build, add `--use-installed-codex-version` to both preparation commands. This
+explicitly measures `codex --version` and selects that build for the target.
+The retained previous controller and the journal keep their original identity
+until native adoption commits. A retry must select the same installed build;
+a failed or malformed version lookup refuses before writing transition state.
+
 Preparation takes the connector's controller and lane ownership, preserves
 `adapter-previous.toml`, durably records `adapter-transition.json` as `prepared`,
 then writes the target at its final `controller.toml` pathname. Original
@@ -828,6 +862,24 @@ policy hashes and effective model. It releases no pause and starts nothing.
 If acknowledgement was lost after native adoption committed, run confirmation;
 do not create another history or replay model input. If native maintenance is
 still planned, retain the hold and follow its explicit same-command recovery.
+
+An adoption confirmed by an older adapter can lack `previous_fingerprint` in
+its transition record. Startup and host verify hold that record for explicit
+revalidation. Preserve the record, previous controller, journal and native home.
+With the target relay held, all native clients and its Codex service stopped,
+and container exec available, preview and apply confirmation again:
+
+```sh
+sandy --exec --workspace "$WORKSPACE" -- /usr/bin/python3 /opt/sandy/features/amap/codex/transition confirm
+sandy --exec --workspace "$WORKSPACE" -- /usr/bin/python3 /opt/sandy/features/amap/codex/transition confirm --apply
+```
+
+This derives the expectation from the retained previous controller, validates
+its retained bytes and the committed native adoption, and adds only the missing
+expectation to an already confirmed record. It changes neither controller bytes
+nor journal rows and submits no native model input. A prepared record can be
+completed only if its native adoption already committed. Foreign or conflicting
+evidence refuses. Do not run `unified-adopt` again merely to add this field.
 
 Only after confirmation, release the adapter pause, with the service still
 stopped:

@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Prepare a stopped instance's explicit unified transition; never start it."""
 import argparse
-from contextlib import closing
 import json
 import os
 from pathlib import Path
@@ -10,6 +9,7 @@ import sys
 import time
 import subprocess
 
+import codex_adoption as adoptions
 import codex_assets as assets
 import codex_fleet as fleet
 import codex_settings as settings
@@ -93,7 +93,9 @@ def toml_bytes(doc):
     return ("\n".join(lines) + "\n").encode()
 
 
-def read_record(state):
+def read_record(state, *, legacy=False):
+    """The transition record. Only confirm's enrichment (`legacy=True`) accepts a record
+    from before the expected previous fingerprint was recorded."""
     value = json.loads(assets.regular(state / RECORD))
     if (not isinstance(value, dict) or type(value.get("schema")) is not int or value.get("schema") != 1
             or value.get("state") not in {"prepared", "confirmed"}
@@ -103,6 +105,18 @@ def read_record(state):
     for name in ("previous_sha256", "target_sha256", "fingerprint"):
         if not isinstance(value.get(name), str) or not re.fullmatch("[a-f0-9]{64}", value[name]):
             raise ValueError("invalid adapter transition " + name)
+    if "previous_fingerprint" not in value:
+        if legacy:
+            return value
+        if value["state"] == "prepared":
+            raise ValueError("prepared adapter transition records no expected previous fingerprint; it "
+                             "needs operator inspection: transition confirm --apply completes it only if "
+                             "its native adoption committed")
+        raise ValueError("adapter transition records no expected previous fingerprint; pending explicit "
+                         "revalidation: with the sandbox running, its relay held and no Codex service, "
+                         "run transition confirm, then confirm --apply")
+    if not isinstance(value["previous_fingerprint"], str) or not re.fullmatch("[a-f0-9]{64}", value["previous_fingerprint"]):
+        raise ValueError("invalid adapter transition previous_fingerprint")
     return value
 
 
@@ -125,35 +139,24 @@ def matching_status(config, *, fingerprint, thread=None):
 
 
 def confirmed_adoption(config, record):
-    """Require the connector's committed adoption and matching policy binding."""
-    import sqlite3
+    """Require the connector's committed adoption and matching policy binding (codex_adoption,
+    the rule host verify applies), plus the model this configuration selects."""
     from amap_codex.config import Config
     previous = Config.load(config.state_dir / PREVIOUS, create_state=False)
-    path = config.state_dir / "journal.sqlite3"
-    # Config/CLI enforce the same journal leaf rule. URI mode prevents creation.
-    if path.is_symlink() or not path.is_file():
-        raise ValueError("adoption journal must be an existing regular file")
-    with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as db:
-        db.row_factory = sqlite3.Row
-        try:
-            adoption = db.execute("SELECT * FROM unified_adoptions WHERE singleton=1").fetchone()
-            binding = db.execute("SELECT * FROM unified_binding WHERE instance_id=?", (config.instance_id,)).fetchone()
-        except sqlite3.Error as exc:
-            raise ValueError("confirmed native adoption evidence is unavailable") from exc
-    if (adoption is None or binding is None or adoption["state"] != "confirmed"
-            or adoption["thread_id"] != record["thread"] or binding["thread_id"] != record["thread"]
-            or adoption["fingerprint"] != config.fingerprint()
-            or adoption["fingerprint"] != record["fingerprint"]
-            or adoption["previous_fingerprint"] != previous.fingerprint()
-            or adoption["policy_hash"] != binding["policy_hash"]
-            or not re.fullmatch("[a-f0-9]{64}", adoption["policy_hash"])
-            or not re.fullmatch("[a-f0-9]{64}", adoption["history_sha256"])
-            or (config.codex_model is not None and binding["effective_model"] != config.codex_model)):
-        raise ValueError("native adoption, history or protected policy binding is not confirmed")
+    binding, adoption = adoptions.evidence(config.state_dir / "journal.sqlite3", config.instance_id)
+    found = ["durable unified binding is unavailable"] if binding is None else adoptions.problems(
+        adoption, thread=(record["thread"], binding["thread_id"]),
+        fingerprint=(config.fingerprint(), record["fingerprint"], binding["fingerprint"]),
+        previous_fingerprint=(previous.fingerprint(), record.get("previous_fingerprint")),
+        policy_hash=(binding["policy_hash"],))
+    if not found and config.codex_model is not None and binding["effective_model"] != config.codex_model:
+        found.append("durable binding names another model")
+    if found:
+        raise ValueError("native adoption, history or protected policy binding is not confirmed: " + "; ".join(found))
     return adoption["policy_hash"]
 
 
-def prepare(state, payload, thread, *, apply=False):
+def prepare(state, payload, thread, *, apply=False, use_installed_codex_version=False):
     import tomllib
     from dataclasses import replace
     from amap_codex.config import Config
@@ -207,6 +210,16 @@ def prepare(state, payload, thread, *, apply=False):
     config = (Config.load(state / PREVIOUS, create_state=False) if record is not None else config_at(state))
     selection = settings.resolve(os.environ)
     settings.require_unified_permissions(selection, config)
+    target_version = config.codex_version
+    if use_installed_codex_version:
+        # Only the target changes; the retained controller and journal still
+        # identify the original configuration until native adoption commits.
+        measured = subprocess.run(["codex", "--version"], check=True,
+                                  capture_output=True, text=True, timeout=10)
+        target_version = measured.stdout.strip()
+        if not re.fullmatch(r"codex-cli [0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?", target_version):
+            raise ValueError("installed Codex version is unavailable or malformed; retain the pause")
+        doc["codex_version"] = target_version
     if selection["selected_model"] is None:
         doc.pop("codex_model", None)
     else:
@@ -214,11 +227,13 @@ def prepare(state, payload, thread, *, apply=False):
     target = toml_bytes(doc)
     candidate = replace(config, conversation_mode="unified", unified_argv=["codex"],
                         codex_model=selection["selected_model"],
+                        codex_version=target_version,
                         operator_kickoff_enabled=False, operator_instructions=protected / assets.ASSETS[0],
                         trusted_config_file=protected / assets.ASSETS[1])
     candidate.validate(create_state=False)
     planned = {"schema": 1, "state": "prepared", "thread": thread,
                "previous_sha256": assets.digest(previous), "target_sha256": assets.digest(target),
+               "previous_fingerprint": config.fingerprint(),
                "fingerprint": candidate.fingerprint(), "instance_id": candidate.instance_id,
                "codex_model": candidate.codex_model, "codex_version": candidate.codex_version,
                "model_source": selection["model_source"],
@@ -241,35 +256,67 @@ def prepare(state, payload, thread, *, apply=False):
             raise ValueError("configuration changed while acquiring controller ownership")
         matching_status(config, fingerprint=config.fingerprint())
         assets.place(state / PREVIOUS, previous, mode=0o600)
+        # The expectation comes from the exact retained bytes, before the record names it.
+        if (assets.regular(state / PREVIOUS) != previous
+                or Config.load(state / PREVIOUS, create_state=False).fingerprint() != planned["previous_fingerprint"]):
+            raise ValueError("retained previous configuration does not yield the recorded previous fingerprint")
         assets.place(state / RECORD, assets.encoded(planned), mode=0o600)
         if current != target:
             assets.place(path, target, replace=True, mode=0o600)
     return {**planned, "apply": True, "next": "doctor, unified-adopt at controller.toml, then confirm"}
 
 
+# The record's settings fields, which prepare wrote from the target configuration.
+SETTINGS = ("instance_id", "codex_model", "codex_version", "sandbox", "approval_policy", "poll_interval_ms")
+
+
 def confirm(state, *, apply=False):
+    """Confirm a prepared transition, or enrich a record from before the expected previous
+    fingerprint was recorded.
+
+    For a record already confirmed, --apply adds only previous_fingerprint; its state and policy
+    hash must already agree. For a prepared record, --apply also sets state "confirmed" and writes
+    the policy hash, as confirmation always has. Controller bytes and journal rows are unchanged,
+    and nothing is started or adopted. Ownership refuses while a service holds the controller; it
+    does not stop one, so an --apply repeated after the relay has started the service refuses."""
+    from amap_codex.config import Config
     from amap_codex.supervisor import Ownership
-    record = read_record(state)
+    original = assets.regular(state / RECORD)
+    record = read_record(state, legacy=True)
     config = config_at(state)
-    if (config.conversation_mode != "unified"
-            or config.fingerprint() != record["fingerprint"]
-            or assets.digest(assets.regular(state / "controller.toml")) != record.get("target_sha256")
-            or assets.digest(assets.regular(state / PREVIOUS)) != record.get("previous_sha256")):
-        raise ValueError("transition target or retained previous configuration differs")
+
+    def checked():
+        if (config.conversation_mode != "unified"
+                or config.fingerprint() != record["fingerprint"]
+                or assets.digest(assets.regular(state / "controller.toml")) != record.get("target_sha256")
+                or assets.digest(assets.regular(state / PREVIOUS)) != record.get("previous_sha256")):
+            raise ValueError("transition target or retained previous configuration differs")
+        if (any(record.get(name) != getattr(config, name) for name in SETTINGS)
+                or record.get("state_dir") != str(config.state_dir)):
+            raise ValueError("transition settings differ from the target configuration")
+        derived = Config.load(state / PREVIOUS, create_state=False).fingerprint()
+        if record.get("previous_fingerprint", derived) != derived:
+            raise ValueError("recorded previous fingerprint differs from the retained previous configuration")
+        candidate = {**record, "previous_fingerprint": derived}
+        matching_status(config, fingerprint=record["fingerprint"], thread=record["thread"])
+        policy_hash = confirmed_adoption(config, candidate)
+        if record["state"] == "confirmed" and policy_hash != record.get("policy_hash"):
+            raise ValueError("confirmed adoption policy binding differs; retain the transition for inspection")
+        candidate.update(policy_hash=policy_hash, state="confirmed")
+        return candidate
+
     if not apply:
-        matching_status(config, fingerprint=record["fingerprint"], thread=record["thread"])
-        confirmed_adoption(config, record)
-        return {**record, "apply": False}
+        return {**checked(), "apply": False}
     with Ownership(config):
-        if config.fingerprint() != record["fingerprint"]:
-            raise ValueError("prepared target fingerprint differs; retain the transition hold")
-        matching_status(config, fingerprint=record["fingerprint"], thread=record["thread"])
-        record["policy_hash"] = confirmed_adoption(config, record)
-        record["state"] = "confirmed"
-        raw = assets.encoded(record)
-        if assets.regular(state / RECORD) != raw:
+        if assets.regular(state / RECORD) != original:
+            raise ValueError("adapter transition changed while acquiring controller ownership")
+        candidate = checked()
+        raw = assets.encoded(candidate)
+        if assets.regular(state / RECORD) != original:
+            raise ValueError("adapter transition changed during confirmation")
+        if raw != original:
             assets.place(state / RECORD, raw, replace=True, mode=0o600)
-    return {**record, "apply": True}
+    return {**candidate, "apply": True}
 
 
 def entry_mode(state, *, selected_model=None, observed_version=None, check_pane_settings=False):
@@ -306,6 +353,32 @@ def entry_mode(state, *, selected_model=None, observed_version=None, check_pane_
             raise ValueError("pane CODEX_MODEL/native model differs from the canonical configuration")
     matching_status(config, fingerprint=record["fingerprint"], thread=record["thread"])
     return "unified"
+
+
+def startup_route(state, session_path):
+    """Select an existing confirmed adoption without initializing or adopting it."""
+    if not os.path.lexists(state / RECORD):
+        return "fresh"
+    if entry_mode(state, check_pane_settings=True) != "unified":
+        raise ValueError("existing adapter transition is not confirmed unified state")
+    session = json.loads(assets.regular(session_path))
+    config = config_at(state)
+    record = read_record(state)
+    if confirmed_adoption(config, record) != record.get("policy_hash"):
+        raise ValueError("confirmed adoption policy binding differs")
+    if (not isinstance(session, dict) or not isinstance(session.get("workspace"), str)
+            or not Path(session["workspace"]).is_absolute()
+            or session.get("sandbox_name") != config.instance_id
+            or Path(session["workspace"]).resolve() != Path(config.cwd).resolve()):
+        raise ValueError("confirmed adoption belongs to another Sandy instance or workspace")
+    for lane in config.lanes:
+        export = {"mail": "AMAP_INBOX_DIR", "peer": "AMAP_PEER_DIR"}.get(lane.name)
+        root = os.environ.get(export) if export else None
+        if (not isinstance(root, str) or not Path(root).is_absolute()
+                or lane.notice_dir != Path(root) / "notices"
+                or lane.message_dir != Path(root) / "messages"):
+            raise ValueError("confirmed adoption delivery lanes differ from Sandy's mounts")
+    return "adopted"
 
 
 def pause(state, note, *, apply=False):
@@ -414,6 +487,8 @@ def main(argv=None):
     commands = parser.add_subparsers(dest="command", required=True)
     preparation = commands.add_parser("prepare")
     preparation.add_argument("--thread", required=True)
+    preparation.add_argument("--use-installed-codex-version", action="store_true",
+                             help="explicitly select the measured installed Codex build for the adoption target")
     preparation.add_argument("--apply", action="store_true")
     confirmation = commands.add_parser("confirm")
     confirmation.add_argument("--apply", action="store_true")
@@ -426,6 +501,8 @@ def main(argv=None):
     entry.add_argument("--model")
     entry.add_argument("--version")
     entry.add_argument("--check-pane-settings", action="store_true")
+    route = commands.add_parser("startup-route")
+    route.add_argument("--session", type=Path, required=True)
     startup = commands.add_parser("startup-gate")
     startup.add_argument("--generation", required=True)
     startup.add_argument("--apply", action="store_true")
@@ -441,13 +518,17 @@ def main(argv=None):
         if args.command != "entry-mode":
             require_native_runtime()
         if args.command == "prepare":
-            result = prepare(args.state, args.payload, args.thread, apply=args.apply)
+            result = prepare(args.state, args.payload, args.thread, apply=args.apply,
+                             use_installed_codex_version=args.use_installed_codex_version)
         elif args.command == "confirm":
             result = confirm(args.state, apply=args.apply)
         elif args.command == "pause":
             result = pause(args.state, args.note, apply=args.apply)
         elif args.command == "unpause":
             result = unpause(args.state, apply=args.apply)
+        elif args.command == "startup-route":
+            print(startup_route(args.state, args.session))
+            return 0
         elif args.command == "startup-gate":
             result = startup_gate(args.state, args.generation, apply=args.apply)
         elif args.command == "selection-ready":
