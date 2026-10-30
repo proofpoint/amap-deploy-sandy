@@ -16,9 +16,17 @@ O_NOFOLLOW, so a symbolic link anywhere on the way is a FAIL, never followed.
 
 What SEALSPEC does NOT cover, and what does (DS2 d8 §3.1):
   - D (Docker's store): it is evaluated on R only. "Builder cache pruned" and
-    "D holds exactly MAN's image Ids" are BAKE's own last-step assertions; D's
-    raw sha is then sealed at G-B4b and compared at B1-n, so D cannot change
-    after BAKE asserted it.
+    "D holds exactly MAN's image Ids" are proved by BAKE's step `assert-d`
+    (m1vm/bake.py, the same reviewed source whose sha NET's profile binds as
+    `bake_script_sha` through the bake script): after MAN is written it lists
+    every image (`docker image ls --all --quiet --no-trunc`) and the builder
+    cache (`docker builder du`), and requires the image Id set to equal MAN's
+    `images` values exactly and the cache to hold no record. Its PASS shape is
+    BAKE's last stdout line, exactly
+        M1-BAKE PASS man=<MAN sha256> ids=<sha256 of the sorted Ids, one per
+        line> builder_cache=0
+    and NET's G-B3 receipt (rc 0 plus the stdout sha) carries it. D's raw sha
+    is then sealed at G-B4b and compared at B1-n, so D cannot change after.
   - State and enrolment trees: LC d8 §2.3 puts SANDY_HOME, the registry and
     the identities tree under the state mount, so SS-10 (the mountpoint empty
     on R) is the complete state/enrolment root on R.
