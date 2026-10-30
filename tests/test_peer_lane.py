@@ -64,7 +64,7 @@ def _policy(**over):
         "version": 1, **fp.default_selection(), "groups": {},
         "default_peers": [], "peers": {},
         fp.FLEET_DOMAIN_KEY: DOMAIN,
-        fp.RECREATE_INTERVAL_KEY: 24,
+        fp.RECREATE_INTERVAL_KEY: 24, fp.MIN_SENDER_AGE_KEY: 86400,
         fp.TASK_GRAPH_KEY: {"bravo": ["alpha"]},
     }
     base.update(over)

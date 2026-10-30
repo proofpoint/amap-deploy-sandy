@@ -420,7 +420,7 @@ class RosterMountTest(unittest.TestCase):
         `instances` config has no `selected_json` and therefore publishes no
         roster (the router logs that and carries on). This adapter never
         renders the authored form, so here the convention always applies."""
-        policy = {**fp.default_policy(), fp.RECREATE_INTERVAL_KEY: 24,
+        policy = {**fp.default_policy(), fp.RECREATE_INTERVAL_KEY: 24, fp.MIN_SENDER_AGE_KEY: 86400,
                   fp.FLEET_DOMAIN_KEY: "agents.example.org", fp.TASK_GRAPH_KEY: fp.TASK_GRAPH_ALL}
         doc = prov.render_router_sibling(policy, {"alpha-1": {}}, self.home,
                                          self.home / "router-state")["_doc"]
@@ -1323,7 +1323,7 @@ class ManifestEntryTest(_ConnectorFixtureMixin, unittest.TestCase):
         doc = prov.render_manifest({
             "version": 1, "sandboxes": {"include": ["*"], "exclude": []},
             "agents": {"include": ["claude"], "exclude": []},
-            "container_recreate_interval_hours": 24})
+            "container_recreate_interval_hours": 24, "min_sender_age_s": 86400})
         self.assertEqual(doc["entry"], prov.MANIFEST_ENTRY)
         self.assertEqual(doc["entry"],
                          f"{prov.FEATURE_PAYLOAD_SUBDIR}/{prov.RELAY_WRAPPER_NAME}")
@@ -1515,7 +1515,7 @@ class SyncTest(_ConnectorFixtureMixin, unittest.TestCase):
     POLICY = {"version": 1, "sandboxes": {"include": ["*"], "exclude": ["*beta*"]},
               "agents": {"include": ["claude"], "exclude": []},
               "fleet_domain": "agents.example.org", "task_graph": "ALL",
-              "container_recreate_interval_hours": 24}
+              "container_recreate_interval_hours": 24, "min_sender_age_s": 86400}
 
     def test_a_dry_run_reports_the_three_states_and_writes_nothing(self):
         self._fleet()

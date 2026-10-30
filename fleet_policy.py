@@ -247,6 +247,11 @@ TASK_GRAPH_ALL = "ALL"
 # renderer that cannot carry the deny must not carry the graph without it.
 TASK_DENY_KEY = "task_deny"
 RECREATE_INTERVAL_KEY = "container_recreate_interval_hours"
+# The fleet's sender-age floor, in seconds: how long after its first
+# enrolment a sender's signed delegation is admitted. Rendered into the local
+# router's config, which enforces it. 0 means no wait; the ceiling is one year.
+MIN_SENDER_AGE_KEY = "min_sender_age_s"
+MIN_SENDER_AGE_MAX_S = 31536000
 
 # The router's own local part (amap-router-local, `router/config.py:
 # ROUTER_LOCAL_PART`). It is NEVER rendered into `may_task`/`tasked_by`: the
@@ -320,6 +325,9 @@ def derived_fleet_domain(runtime: str, hostname: str, base: str = DEFAULT_DOMAIN
         raise PolicyError(f"derived fleet domain {domain!r} is not a valid domain")
     return domain
 DEFAULT_RECREATE_INTERVAL_HOURS = 24
+# The template's sender-age floor: the router's own default when the key is
+# absent, written out so that every host's number is in its reviewed file.
+DEFAULT_MIN_SENDER_AGE_S = 86400
 
 
 def default_policy() -> Dict[str, Any]:
@@ -347,6 +355,7 @@ def default_policy() -> Dict[str, Any]:
         TASK_DENY_KEY: [],
         FLEET_DOMAIN_KEY: DEFAULT_FLEET_DOMAIN,
         RECREATE_INTERVAL_KEY: DEFAULT_RECREATE_INTERVAL_HOURS,
+        MIN_SENDER_AGE_KEY: DEFAULT_MIN_SENDER_AGE_S,
     }
 
 
@@ -684,6 +693,15 @@ def load_policy(path: Path) -> Dict[str, Any]:
                 "whole number of hours. Absent is also an answer here, and a different "
                 "one: `install` refuses to provision under a manifest that omits "
                 "this field, because the recreation job runs at it.")
+
+    age = raw.get(MIN_SENDER_AGE_KEY)
+    if age is not None:
+        if isinstance(age, bool) or not isinstance(age, int) or not 0 <= age <= MIN_SENDER_AGE_MAX_S:
+            raise PolicyError(
+                f"{path}: {MIN_SENDER_AGE_KEY!r} is {age!r} — expected a whole number of seconds "
+                f"from 0 to {MIN_SENDER_AGE_MAX_S}. Absent is also an answer here, and a different "
+                "one: `install` refuses to provision under a manifest that omits this field, "
+                "because the local router enforces it.")
 
     out = {
         "version": version,

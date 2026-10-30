@@ -129,7 +129,7 @@ class TestMcpServersJsonLayout(unittest.TestCase):
         self.assertEqual(tuple(prov.FEATURE_LANES), tuple(LANES))
         self.assertEqual({lane: tuple(leaves) for lane, leaves in prov.FEATURE_LANE_LEAVES.items()},
                          {lane: tuple(LANE_LEAVES[lane]) for lane in LANES})
-        policy = {**prov.fp.default_policy(), prov.fp.RECREATE_INTERVAL_KEY: 24}
+        policy = {**prov.fp.default_policy(), prov.fp.RECREATE_INTERVAL_KEY: 24, prov.fp.MIN_SENDER_AGE_KEY: 86400}
         create = prov.render_manifest(policy)["create"]
         want = [f"{prov.FEATURE_INSTANCES_SUBDIR}/{prov.MANIFEST_SLUG}/{lane}/{leaf}"
                 for lane in LANES for leaf in LANE_LEAVES[lane]]
@@ -373,7 +373,7 @@ class TheWildcardTokenIsTheRoutersTest(unittest.TestCase):
         except ImportError:
             self.skipTest("router.config.load_obj is not importable here")
         prov = _prov_sandboxes
-        policy = {**prov.fp.default_policy(), prov.fp.RECREATE_INTERVAL_KEY: 24,
+        policy = {**prov.fp.default_policy(), prov.fp.RECREATE_INTERVAL_KEY: 24, prov.fp.MIN_SENDER_AGE_KEY: 86400,
                   prov.fp.FLEET_DOMAIN_KEY: "agents.example.org",
                   prov.fp.TASK_GRAPH_KEY: prov.fp.TASK_GRAPH_ALL}
         with __import__("tempfile").TemporaryDirectory() as d:

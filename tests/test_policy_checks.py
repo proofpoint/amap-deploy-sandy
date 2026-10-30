@@ -51,7 +51,7 @@ _POLICY = {
     # Required: `install` refuses a policy that omits it, because writing it
     # in IS the operator's ratification of the recreation cadence. Every
     # fixture here carries it for the same reason every real policy must.
-    "container_recreate_interval_hours": 24,
+    "container_recreate_interval_hours": 24, "min_sender_age_s": 86400,
 }
 
 

@@ -185,7 +185,7 @@ class LoadPolicyValidationTest(unittest.TestCase):
                       "some-hub": ["ALLOW_ANY"]},
             "fleet_domain": "agents.example.org",
             "task_graph": {"bravo-22222222": ["alpha-11111111"]},
-            "container_recreate_interval_hours": 24,
+            "container_recreate_interval_hours": 24, "min_sender_age_s": 86400,
         }
         self._write(doc)
         policy = fp.load_policy(self.path)

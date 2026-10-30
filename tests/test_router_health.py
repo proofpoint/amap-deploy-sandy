@@ -69,7 +69,7 @@ class Fleet:
         self.slugs = list(slugs)
         (self.home / "sandboxes").mkdir(parents=True)
         self.state_dir.mkdir(parents=True)
-        prov.install_manifest(self.home, {**fp.default_policy(), fp.RECREATE_INTERVAL_KEY: 24},
+        prov.install_manifest(self.home, {**fp.default_policy(), fp.RECREATE_INTERVAL_KEY: 24, fp.MIN_SENDER_AGE_KEY: 86400},
                               dry_run=False)
         _select(self.home, *self.slugs)
         manifest = json.loads(prov.feature_manifest_path(self.home).read_text())
@@ -930,7 +930,7 @@ class TheRoutersExpansionOfTheRenderingIsThePolicysTest(unittest.TestCase):
     def test_with_a_deny_the_routers_graph_lacks_the_denied_edge(self):
         a, b = sorted(self.fleet.slugs)
         policy = {**fp.default_policy(), fp.FLEET_DOMAIN_KEY: DOMAIN,
-                  fp.RECREATE_INTERVAL_KEY: 24, fp.TASK_DENY_KEY: [[a, b]]}
+                  fp.RECREATE_INTERVAL_KEY: 24, fp.MIN_SENDER_AGE_KEY: 86400, fp.TASK_DENY_KEY: [[a, b]]}
         doc, graph = self.routers_graph(policy)
         self.assertNotIn(prov.SIBLING_TASK_GRAPH, doc)
         self.assertEqual(graph[f"{b}@{DOMAIN}"], [])
@@ -939,7 +939,7 @@ class TheRoutersExpansionOfTheRenderingIsThePolicysTest(unittest.TestCase):
 
     def test_without_a_deny_the_router_gets_its_word_and_the_same_graph(self):
         policy = {**fp.default_policy(), fp.FLEET_DOMAIN_KEY: DOMAIN,
-                  fp.RECREATE_INTERVAL_KEY: 24}
+                  fp.RECREATE_INTERVAL_KEY: 24, fp.MIN_SENDER_AGE_KEY: 86400}
         doc, graph = self.routers_graph(policy)
         self.assertEqual(doc[prov.SIBLING_TASK_GRAPH], prov.ROUTER_TASK_GRAPH_ALL)
         self.assertNotIn(prov.SIBLING_PEER_SENDERS, doc)
