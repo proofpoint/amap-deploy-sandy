@@ -17,16 +17,29 @@ O_NOFOLLOW, so a symbolic link anywhere on the way is a FAIL, never followed.
 What SEALSPEC does NOT cover, and what does (DS2 d8 §3.1):
   - D (Docker's store): it is evaluated on R only. "Builder cache pruned" and
     "D holds exactly MAN's image Ids" are proved by BAKE's step `assert-d`
-    (m1vm/bake.py, the same reviewed source whose sha NET's profile binds as
-    `bake_script_sha` through the bake script): after MAN is written it lists
-    every image (`docker image ls --all --quiet --no-trunc`) and the builder
-    cache (`docker builder du`), and requires the image Id set to equal MAN's
-    `images` values exactly and the cache to hold no record. Its PASS shape is
-    BAKE's last stdout line, exactly
-        M1-BAKE PASS man=<MAN sha256> ids=<sha256 of the sorted Ids, one per
-        line> builder_cache=0
-    and NET's G-B3 receipt (rc 0 plus the stdout sha) carries it. D's raw sha
-    is then sealed at G-B4b and compared at B1-n, so D cannot change after.
+    (`step_assert_d` in m1vm/bake.py). The hash route: NET's bake_script_sha
+    is the sha256 of ONE file, the rendered /var/lib/m1-bake/m1-bake.sh. That
+    file carries the sha256 of m1vm/bake.py, man.py, seed_copy.py and
+    state_check.py as constants and runs `sha256sum --check --strict` on them
+    in the deploy checkout (itself checked out at the constant commit) before
+    it execs bake.py; a mismatch exits non-zero before any step runs.
+    assert-d, exactly:
+      - man= is the sha256 of /opt/amap/MAN.json's bytes, which must equal
+        the sha m1-man printed when it wrote the file;
+      - `docker image ls --all --quiet --no-trunc` is read as the SET of
+        distinct Ids (one line per tag, repeats ignored), each kept as
+        `sha256:<64 hex>`, and must equal the SET of MAN's `images` values;
+      - the builder cache: `docker system df --format '{{json .}}'` must
+        print exactly one row with Type "Build Cache", whose TotalCount is "0";
+      - ids= is the sha256 of the distinct Ids, `sha256:` prefix kept, sorted
+        bytewise (LC_ALL=C order), each followed by one newline (so the input
+        ends with a newline);
+      - any mismatch makes bake.py exit 1 with no PASS line.
+    On success BAKE's LAST stdout line is exactly
+        M1-BAKE PASS man=<64 hex> ids=<64 hex> builder_cache=0
+    NET's wrapper (its local 2ef9ef1) requires rc 0, that last line, and an
+    untruncated output before BAKED. D's raw sha is then sealed at G-B4b and
+    compared at B1-n, so D cannot change after.
   - State and enrolment trees: LC d8 §2.3 puts SANDY_HOME, the registry and
     the identities tree under the state mount, so SS-10 (the mountpoint empty
     on R) is the complete state/enrolment root on R.
