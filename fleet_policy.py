@@ -248,8 +248,9 @@ TASK_GRAPH_ALL = "ALL"
 TASK_DENY_KEY = "task_deny"
 RECREATE_INTERVAL_KEY = "container_recreate_interval_hours"
 # The fleet's sender-age floor, in seconds: how long after its first
-# enrolment a sender's signed delegation is admitted. Rendered into the local
-# router's config, which enforces it. 0 means no wait; the ceiling is one year.
+# enrolment a sender's signed delegation is admitted. The policy carries it;
+# the router that receives it enforces it. 0 means no wait; the ceiling is one
+# year.
 MIN_SENDER_AGE_KEY = "min_sender_age_s"
 MIN_SENDER_AGE_MAX_S = 31536000
 
