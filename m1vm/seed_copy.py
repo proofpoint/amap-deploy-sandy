@@ -261,6 +261,14 @@ def plan(hdot, src_fd, dst_fd):
         if mode != int(entry["mode"], 8):
             raise Refused(f"{entry['name']}: the seed's mode {mode:04o} differs from MAN's {entry['mode']}")
         state = "copy"
+        for depth in range(1, len(parts)):
+            mid = _open_dir(dst_fd, parts[:depth], "the destination")
+            if mid is None:
+                break
+            try:
+                _check_owner(os.fstat(mid), f"{'/'.join(parts[:depth])}/ in the destination")
+            finally:
+                os.close(mid)
         ddir = _open_dir(dst_fd, parts[:-1], "the destination")
         if ddir is not None:
             try:

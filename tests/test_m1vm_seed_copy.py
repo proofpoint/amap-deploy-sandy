@@ -304,6 +304,23 @@ class OwnerTest(InProcessCase):
         self.assertIn("sandboxes/m1-one/ in the destination: owned by uid", err)
 
 
+    def test_destination_sandboxes_dir_owned_by_another_account(self):
+        (self.dst / "sandboxes").mkdir()
+        ino = os.stat(self.dst / "sandboxes").st_ino
+        real_fstat = os.fstat
+
+        def fstat(fd):
+            st = real_fstat(fd)
+            if st.st_ino == ino:
+                return os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, st.st_uid + 1,
+                                       st.st_gid, st.st_size, 0, 0, 0))
+            return st
+        with mock.patch.object(seed_copy.os, "fstat", fstat):
+            rc, out, err = self.main()
+        self.assertEqual(rc, 1)
+        self.assertIn("sandboxes/ in the destination: owned by uid", err)
+
+
 class FaultTest(InProcessCase):
     def test_failure_mid_write_leaves_a_prefix_and_reruns_clean(self):
         real_rename = os.rename

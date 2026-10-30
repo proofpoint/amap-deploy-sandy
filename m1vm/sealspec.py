@@ -332,6 +332,11 @@ def gitconfig_problem(data):
         text = data.decode("utf-8")
     except UnicodeDecodeError:
         return "not UTF-8"
+    # git reads a leading byte-order mark as nothing, and a trailing backslash
+    # as a continuation: both must be undone before any line is judged.
+    if text.startswith("\ufeff"):
+        text = text[1:]
+    text = re.sub(r"\\\r?\n", "", text)
     section = None
     for n, line in enumerate(text.splitlines(), 1):
         if _USERINFO_RE.search(line):

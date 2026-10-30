@@ -365,7 +365,8 @@ class GitconfigTest(unittest.TestCase):
                      b'[http "https://u:tok@h/"]\n\tsslVerify = true\n',
                      b'[remote "o\\"x"]\n\turl = /x\n',
                      b"[include]\n\tpath = /etc/other\n", b'[includeIf "gitdir:/x/"]\n\tpath = y\n',
-                     b"[core\n"):
+                     b"[core\n", b'\xef\xbb\xbf[remote "origin"]\n\turl = /x\n',
+                     b"[http]\n\textraHeader = https://u:\\\np@h/\n"):
             with self.subTest(text):
                 self.assertIsNotNone(sealspec.gitconfig_problem(text))
 
