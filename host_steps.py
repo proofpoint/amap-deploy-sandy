@@ -13,6 +13,10 @@ prints the calls; this module is what they run. Standard library only.
   python3 host_steps.py place SRC DEST --sha256 HEX --mode 0644
                                                   the same, root-owned 0644 (a LaunchDaemon's plist);
                                                   the mode is 0444 or 0644, nothing else
+  python3 host_steps.py install SRC DEST UID GID --sha256 HEX --mode 0600
+                                                  a file owned by UID:GID, 0600 or 0400, refused unless
+                                                  SRC has that sha256 and DEST's directory is UID's own
+                                                  0700 directory
 
 A runtime's secret file, in a directory that only that runtime's uid can open:
 
@@ -208,6 +212,46 @@ def place(src, dest, sha256=None, mode=OVERLAY_MODE):
         try:
             os.write(fd, data)
             os.fchown(fd, OWNER_UID, OWNER_GID)
+            os.fchmod(fd, mode)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.rename(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+
+
+#: The modes `install` may set: owner read-write, or owner read-only.
+INSTALL_MODES = (0o600, 0o400)
+
+
+def install(src, dest, uid, gid, sha256, mode):
+    """Copy `src` to `dest` as a file owned by `uid`:`gid`, mode 0600 or
+    0400, for a runtime's own configuration (a registry's host.json). The
+    bytes are checked against `sha256` before anything is written, and dest's
+    directory must already be that owner's 0700 directory, so the file never
+    lands where another principal can reach it. Written under a fresh
+    temporary name (O_EXCL, O_NOFOLLOW), then renamed over dest, as `place`."""
+    if mode not in INSTALL_MODES:
+        raise StepError(f"mode {mode:04o} is not one of " + ", ".join(f"{m:04o}" for m in INSTALL_MODES))
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", sha256 or ""):
+        raise StepError("--sha256 must be 64 hex characters")
+    parent, name = _split(dest)
+    data = _read_source(src)
+    if hashlib.sha256(data).hexdigest() != sha256.lower():
+        raise StepError(f"{src}: sha256 is not the pinned {sha256}; nothing installed")
+    dfd = open_dir(parent)
+    try:
+        st = os.fstat(dfd)
+        if (st.st_uid, st.st_gid, stat.S_IMODE(st.st_mode)) != (uid, gid, 0o700):
+            raise StepError(f"{parent} is {st.st_uid}:{st.st_gid} {stat.S_IMODE(st.st_mode):04o}, not "
+                            f"{uid}:{gid} 0700; nothing installed")
+        tmp = f".{name}.{os.getpid()}.tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dfd)
+        try:
+            os.write(fd, data)
+            os.fchown(fd, uid, gid)
             os.fchmod(fd, mode)
             os.fsync(fd)
         finally:
@@ -3249,6 +3293,10 @@ def main(argv):
             if not re.fullmatch(r"0?[0-7]{3}", argv[6]):
                 raise StepError(f"--mode {argv[6]!r} is not an octal mode; 0444 or 0644")
             place(argv[1], argv[2], sha256=argv[4], mode=int(argv[6], 8))
+        elif len(argv) == 9 and argv[0] == "install" and argv[5] == "--sha256" and argv[7] == "--mode":
+            if not re.fullmatch(r"0?[0-7]{3}", argv[8]):
+                raise StepError(f"--mode {argv[8]!r} is not an octal mode; 0600 or 0400")
+            install(argv[1], argv[2], int(argv[3]), int(argv[4]), argv[6], int(argv[8], 8))
         elif len(argv) == 2 and argv[0] == "marker":
             marker(argv[1])
         elif argv == ["noop"]:
