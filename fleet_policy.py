@@ -694,8 +694,8 @@ def load_policy(path: Path) -> Dict[str, Any]:
                 "one: `install` refuses to provision under a manifest that omits "
                 "this field, because the recreation job runs at it.")
 
-    age = raw.get(MIN_SENDER_AGE_KEY)
-    if age is not None:
+    if MIN_SENDER_AGE_KEY in raw:
+        age = raw[MIN_SENDER_AGE_KEY]
         if isinstance(age, bool) or not isinstance(age, int) or not 0 <= age <= MIN_SENDER_AGE_MAX_S:
             raise PolicyError(
                 f"{path}: {MIN_SENDER_AGE_KEY!r} is {age!r} — expected a whole number of seconds "

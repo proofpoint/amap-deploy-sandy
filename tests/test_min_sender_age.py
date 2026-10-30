@@ -46,7 +46,7 @@ class ShapeTest(unittest.TestCase):
             self.assertNotIn(fp.MIN_SENDER_AGE_KEY, fp.load_policy(_write(Path(d), pol)))
 
     def test_bad_shapes_are_refused(self):
-        for bad in (-1, fp.MIN_SENDER_AGE_MAX_S + 1, True, False, 1.5, "7200", ""):
+        for bad in (-1, fp.MIN_SENDER_AGE_MAX_S + 1, True, False, 1.5, "7200", "", None):
             with self.subTest(bad=bad), self.assertRaisesRegex(fp.PolicyError, fp.MIN_SENDER_AGE_KEY):
                 self.load(**{fp.MIN_SENDER_AGE_KEY: bad})
 
@@ -59,6 +59,13 @@ class AbsenceTest(unittest.TestCase):
         problems = checks.check_ratification(pol)
         self.assertEqual(len([p for p in problems if fp.MIN_SENDER_AGE_KEY in p]), 1)
         self.assertIn("is missing", problems[0])
+
+    def test_null_is_malformed_not_present_or_absent(self):
+        problems = checks.check_min_sender_age(_policy(**{fp.MIN_SENDER_AGE_KEY: None}))
+        self.assertEqual(len(problems), 1)
+        self.assertIn("is None, not a whole number", problems[0])
+        self.assertTrue([p for p in checks.check_ratification(_policy(**{fp.MIN_SENDER_AGE_KEY: None}))
+                         if fp.MIN_SENDER_AGE_KEY in p])
 
     def test_zero_is_present_not_absent(self):
         """V = 0 is the M1 value: it must never read as absent."""
@@ -90,6 +97,19 @@ class VerifyTest(unittest.TestCase):
         problems = [p for p in self.manifest_problems(pol) if fp.MIN_SENDER_AGE_KEY in p]
         self.assertEqual(len(problems), 1)
         self.assertTrue(problems[0].startswith("policy: "))
+
+    def test_a_policy_at_null_is_a_verify_problem(self):
+        pol = {**fp.default_policy(), fp.MIN_SENDER_AGE_KEY: None}
+        problems = [p for p in self.manifest_problems(pol) if fp.MIN_SENDER_AGE_KEY in p]
+        self.assertEqual(len(problems), 1)
+        self.assertIn("is None", problems[0])
+
+    def test_a_null_in_the_file_is_refused_by_the_loader(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "candidate.json"
+            path.write_text('{"version": %d, "%s": null}' % (fp.SCHEMA_VERSION, fp.MIN_SENDER_AGE_KEY))
+            with self.assertRaisesRegex(fp.PolicyError, "is None"):
+                fp.load_policy(path)
 
     def test_a_policy_at_zero_has_no_such_problem(self):
         pol = {**fp.default_policy(), fp.MIN_SENDER_AGE_KEY: 0}
