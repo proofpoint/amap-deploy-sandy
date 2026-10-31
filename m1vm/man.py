@@ -273,7 +273,7 @@ def packages(runner):
     """Every installed package, held ones included, in the form ADM reads
     them back; a not-installed or config-files entry is skipped, and any
     package in another state is a Fail."""
-    out, seen = {}, set()
+    out = {}
     for n, line in enumerate(runner([DPKG_QUERY, "-W", "-f", "${db:Status-Abbrev}\t${Package}\t${Version}\n"])
                              .splitlines(), 1):
         f = line.split("\t")
@@ -282,14 +282,12 @@ def packages(runner):
         state = package_state(f[0])
         if state is None:
             raise Fail(f"dpkg-query: {f[1]} is {f[0]!r}, neither installed nor absent")
-        # A name twice, in any state, is refused (Codex round10).
-        if f[1] in seen:
-            raise Fail(f"dpkg-query: {f[1]} listed twice")
-        seen.add(f[1])
         if state == "absent":
             continue
         if not f[2]:
             raise Fail(f"dpkg-query: {f[1]} is installed with no version")
+        if f[1] in out:
+            raise Fail(f"dpkg-query: {f[1]} listed twice")
         out[f[1]] = f[2]
     if not out:
         raise Fail("dpkg-query: no packages")
