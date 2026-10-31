@@ -62,7 +62,7 @@ _HEX64 = re.compile(r"[0-9a-f]{64}")
 _UTC = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
 _TOKEN = re.compile(r"([a-z0-9_]+)=(\S+)")
 
-#: The fixed start (DS r12 §6): the sudo that runs it, and the hop checkout's run.sh.
+#: The fixed start: the sudo that runs it, and the hop checkout's run.sh.
 SUDO = "/usr/bin/sudo"
 RUN_SH = "/opt/amap/src/amap-router-local-hop/docker/run.sh"
 SPEC_SCHEMA = "amap-m1-start-spec/1"
@@ -345,7 +345,7 @@ def load_start_spec(path: str, owner: int = 0) -> Dict[str, object]:
 
 
 def fixed_argv(spec: Dict[str, object]) -> List[str]:
-    """The one start, token for token (DS r12 §6)."""
+    """The one start, token for token."""
     return [SUDO, "-u", f"#{spec['uid_1']}", "--", RUN_SH, "--config", str(spec["config"]), "--image",
             str(spec["image"]), "--name", str(spec["name"]), "--group-add", str(spec["group_add"]), "--detach"]
 
