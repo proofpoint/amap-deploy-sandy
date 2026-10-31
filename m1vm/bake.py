@@ -26,8 +26,11 @@ Steps, in order:
                PIN's ids, <adm>'s one rule, Stage-S authorized_keys
   sources      the deploy checkout's siblings from the bundles, every repo at
                PIN's commit and tree, then no remote anywhere
-  images       pinned base images; router [1] from a clean export of the hop
-               pin, router [2] from RE's pin, sandy's --build-only seed
+  images       pinned base images; router [1] (the hop pin) and router [2]
+               (RE's pin) each by its own build script in a clean checkout of
+               its PIN commit, IMAGE from PIN, umask 022, FROM bound to the
+               pinned base digest and no pull; once both are built, each one's
+               revision label and base-layer prefix; sandy's --build-only seed
   programs     /opt/amap/bin: m1-seed-copy, m1-state-check (root, 0755); the
                pinned writer /opt/amap/libexec/host_steps.py (root 0444, sha
                before and after)
@@ -70,7 +73,10 @@ _PKG = re.compile(r"[a-z0-9][a-z0-9+.-]+\Z")
 _VERSION = re.compile(r"[A-Za-z0-9.+~:-]+\Z")
 _UNIT = re.compile(r"[A-Za-z0-9@._-]+\.(service|timer|socket|path|target)\Z")
 _REPO = re.compile(r"[a-z0-9][a-z0-9-]*\Z")
-_IMAGE = re.compile(r"[a-z0-9][a-z0-9._/-]*:[A-Za-z0-9._-]+\Z")
+# A router image or FROM tag: one unqualified repository component and Docker's tag grammar, with no
+# registry, namespace or docker.io/library/ prefix, so no two spellings can name one tag
+# (ROUTER-BUILD-TAG-FORM).
+_LOCAL_TAG = re.compile(r"[a-z0-9][a-z0-9._-]*:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}\Z")
 _DIGEST_REF = re.compile(r"[a-z0-9][a-z0-9._/:-]*@sha256:[0-9a-f]{64}\Z")
 _KEY = re.compile(r"(ssh-ed25519|ecdsa-sha2-nistp256|ssh-rsa) [A-Za-z0-9+/=]+( [!-~]+)?\Z")
 _ID = re.compile(r"sha256:[0-9a-f]{64}\Z")
@@ -81,6 +87,10 @@ QUIET_MASK = ("unattended-upgrades.service", "apt-daily.timer", "apt-daily-upgra
 QUIET_REMOVE = ("snapd", "apport")
 AGENT = "qemu-guest-agent"
 SUDOERS_DIR = "/etc/sudoers.d"
+
+
+BUILD_SCRIPT = ["./docker/build.sh"]
+REVISION_LABEL = "org.opencontainers.image.revision"
 
 
 class BakeFail(Exception):
@@ -164,14 +174,31 @@ def validate_pin(pin):
     for which in ("router1", "router2"):
         r = pin[which]
         _req(isinstance(r, dict) and set(r) == {"repo", "commit", "image", "build"} and r["repo"] in repos
-             and _HEX40.match(r["commit"]) and _IMAGE.match(r["image"])
+             and _HEX40.match(r["commit"]) and isinstance(r["image"], str) and _LOCAL_TAG.fullmatch(r["image"])
              and not r["image"].startswith("amap-router-local:"), f"{which}: {{repo in repos, commit, image, build}}, "
-                                                                   "not the factory default name")
-        _req(isinstance(r["build"], list) and r["build"] and all(isinstance(a, str) and a and "\n" not in a
-                                                                  for a in r["build"])
-             and r["build"][0].startswith("./") and ".." not in r["build"][0].split("/")
-             and r["image"] in r["build"], f"{which}.build: the router's own build argv, relative to the export, "
-                                           "naming the image")
+                                                                   "image an unqualified name:tag, not the factory name")
+        # The router's own build script, run in a clean checkout of its PIN commit, naming the image only
+        # through IMAGE (its scripts take no tag argument), with the Dockerfile's FROM tag bound to a pinned
+        # base digest (controller ruling (a) on the router build form).
+        b = r["build"]
+        _req(isinstance(b, dict) and set(b) == {"env", "argv", "from"}, f"{which}.build: exactly {{env, argv, from}}")
+        _req(b["env"] == {"IMAGE": r["image"]}, f"{which}.build.env: exactly {{\"IMAGE\": <image>}}")
+        # Closed exactly (controller ruling on r1): the script alone, or the script labelling its own
+        # PIN commit (router1's, whose script sets no label; the label then comes from PIN). Nothing
+        # else, so no --pull and no other argument can reach the build.
+        _req(b["argv"] in (BUILD_SCRIPT, BUILD_SCRIPT + ["--label", f"{REVISION_LABEL}={r['commit']}"]),
+             f"{which}.build.argv: exactly {BUILD_SCRIPT}, optionally with --label {REVISION_LABEL}=<its commit>")
+        _req(isinstance(pin.get("base_images"), list) and isinstance(b["from"], dict)
+             and set(b["from"]) == {"tag", "ref"} and isinstance(b["from"]["tag"], str)
+             and _LOCAL_TAG.fullmatch(b["from"]["tag"]) and not b["from"]["tag"].startswith("amap-router-local:")
+             and b["from"]["ref"] in pin["base_images"],
+             f"{which}.build.from: exactly {{tag, ref}}, ref one of base_images, tag not the factory name")
+    # The FROM tags never name a router's output, and the outputs differ, so one router's base tag or
+    # build cannot replace the other's image (Codex r1).
+    outputs = {pin["router1"]["image"], pin["router2"]["image"]}
+    _req(len(outputs) == 2, "router1 and router2 must build different images")
+    _req(not outputs & {pin[w]["build"]["from"]["tag"] for w in ("router1", "router2")},
+         "a router's build.from.tag names a router's output image")
     sandy = pin["sandy"]
     _req(isinstance(sandy, dict) and set(sandy) == {"repo", "install", "build"} and sandy["repo"] in repos,
          "sandy: exactly {repo, install, build}")
@@ -416,27 +443,64 @@ def step_sources(pin, host):
             raise BakeFail(f"sources: {name} still has a remote")
 
 
-def clean_export(host, repo, commit, dest):
-    """`git archive` of COMMIT into an empty DEST, with no attributes file: the
-    runbook's clean export (TUTORIAL.md:1271-1276)."""
-    host.run(["install", "-d", "-o", "root", "-g", "root", "-m", "0755", dest])
-    host.run(["sh", "-c", f'git -C "$1" -c core.attributesFile=/dev/null archive "$2" | tar -x -C "$3"',
-              "m1-export", f"{SRC}/{repo}", commit, dest])
+def clean_checkout(host, repo, commit, dest):
+    """A clean checkout of COMMIT at DEST: a local clone of the PIN-checked repository, detached at COMMIT,
+    with nothing modified or untracked. The routers' build scripts read their own repository (RE's labels
+    only a clean own-repo tree), so the build runs here, not in an export."""
+    # Under umask 022, so the files Docker COPYs from the checkout keep 0644/0755 (Opus r1 B2).
+    host.run(["sh", "-c", 'umask 022 && git clone -q --no-checkout --local "$1" "$2" '
+              '&& git -C "$2" -c core.hooksPath=/dev/null checkout -q --detach "$3"',
+              "m1-checkout", f"{SRC}/{repo}", dest, commit])
+    head = host.run(["git", "-C", dest, "rev-parse", "--verify", "HEAD^{commit}"]).strip()
+    dirty = host.run(["git", "-C", dest, "status", "--porcelain", "--ignored", "--untracked-files=all"])
+    if head != commit or dirty.strip():
+        raise BakeFail(f"images: the {repo} checkout is not exactly {commit}, clean")
+
+
+def layers(host, ref):
+    """The image's RootFS layer digests, in order."""
+    out = host.run(["docker", "image", "inspect", "--format", "{{json .RootFS.Layers}}", ref]).strip()
+    try:
+        got = json.loads(out)
+    except ValueError:
+        raise BakeFail(f"images: {ref}'s layers are not readable") from None
+    if not isinstance(got, list) or not all(isinstance(x, str) and _ID.match(x) for x in got):
+        raise BakeFail(f"images: {ref}'s layers are not sha256 digests")
+    return got
+
+
+def check_router(host, r):
+    """The image carries its PIN commit as the revision label, and its layers start with the pinned base's.
+    The layer prefix proves the image descends from that base; what binds FROM to it is the local tag of the
+    digest-pulled base and a build that cannot pull."""
+    label = host.run(["docker", "image", "inspect", "--format",
+                      '{{index .Config.Labels "org.opencontainers.image.revision"}}', r["image"]]).strip()
+    if label != r["commit"]:
+        raise BakeFail(f"images: {r['image']} is labelled {label!r}, not {r['commit']}")
+    ref = r["build"]["from"]["ref"]
+    base = layers(host, ref)
+    built = layers(host, r["image"])
+    if not base or built[:len(base)] != base:
+        raise BakeFail(f"images: {r['image']} is not built on {ref} (its layers do not start with the pinned base's)")
 
 
 def step_images(pin, host):
     for ref in pin["base_images"]:
         host.run(["docker", "pull", "--quiet", ref])
     for which in ("router1", "router2"):
-        r = pin[which]
-        dest = f"/run/m1-bake/export-{which}"
-        clean_export(host, r["repo"], r["commit"], dest)
-        host.run(["sh", "-c", 'cd "$1" && shift && exec "$@"', "m1-build", dest, *r["build"]])
-        label = host.run(["docker", "image", "inspect", "--format",
-                          '{{index .Config.Labels "org.opencontainers.image.revision"}}', r["image"]]).strip()
-        if label != r["commit"]:
-            raise BakeFail(f"images: {r['image']} is labelled {label!r}, not {r['commit']}")
+        r, b = pin[which], pin[which]["build"]
+        dest = f"/run/m1-bake/build-{which}"
+        clean_checkout(host, r["repo"], r["commit"], dest)
+        # FROM is bound by tagging the digest-pulled base as the FROM tag and building without a pull:
+        # validate_pin closes argv exactly, so no --pull can reach the build. IMAGE is set by the shell,
+        # never by env(1)'s assignment parsing (Opus r1 B1).
+        host.run(["docker", "tag", b["from"]["ref"], b["from"]["tag"]])
+        host.run(["sh", "-c", 'umask 022 && cd "$1" && IMAGE="$2" && export IMAGE && shift 2 && exec "$@"',
+                  "m1-build", dest, b["env"]["IMAGE"], *b["argv"]])
         host.run(["rm", "-rf", dest])
+    # Checked once both are built, so neither router's steps can have replaced the other's image unseen.
+    for which in ("router1", "router2"):
+        check_router(host, pin[which])
     op = pin["accounts"]["op"]["name"]
     print(f"M1-BAKE NPM-ROUTE {pin['npm_route']['kind']} "
           f"{pin['npm_route'].get('sandy_commit') or pin['npm_route'].get('go_sha256')}", flush=True)

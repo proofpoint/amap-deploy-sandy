@@ -29,6 +29,10 @@ KEY_ADMIN = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAd m1-admin"
 KEY_ADM = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAm adm"
 
 
+BASE = "docker.io/library/python@sha256:" + "9" * 64
+BASE_LAYERS = ["sha256:" + "1" * 64, "sha256:" + "2" * 64]
+
+
 def make_pin():
     return {
         "schema": "m1vm-pin/1",
@@ -50,11 +54,14 @@ def make_pin():
         "repos": {"amap-deploy-sandy": {"commit": H("a"), "tree": H("b"), "bundle_sha256": "c" * 64},
                   "amap-router-local": {"commit": H("d"), "tree": H("e"), "bundle_sha256": "f" * 64}},
         "router1": {"repo": "amap-router-local", "commit": H("d"), "image": "m1-hop:pin",
-                    "build": ["./docker/build.sh", "--tag", "m1-hop:pin"]},
+                    "build": {"env": {"IMAGE": "m1-hop:pin"},
+                              "argv": ["./docker/build.sh", "--label", "org.opencontainers.image.revision=" + H("d")],
+                              "from": {"tag": "python:3.11-slim", "ref": BASE}}},
         "router2": {"repo": "amap-router-local", "commit": H("d"), "image": "m1-hub:pin",
-                    "build": ["./docker/build.sh", "--tag", "m1-hub:pin"]},
+                    "build": {"env": {"IMAGE": "m1-hub:pin"}, "argv": ["./docker/build.sh"],
+                              "from": {"tag": "python:3.11-slim", "ref": BASE}}},
         "sandy": {"repo": "amap-router-local", "install": ["/usr/bin/true"], "build": ["/usr/local/bin/sandy", "--build-only"]},
-        "base_images": ["docker.io/library/python@sha256:" + "9" * 64],
+        "base_images": [BASE],
         "npm_route": {"kind": "sandy-pin", "sandy_commit": H("d")},
         "sandy_secrets": {"path": "/srv/m1-state/sandy/.secrets"},
         "man_files": [],
@@ -78,6 +85,13 @@ class FakeHost:
         self.findmnt_calls = 0
         self.bundle_scripts = []
         self.unmount_after = None
+        self.cloned = []
+        self.builds = 0
+        self.clobber = False
+        self.checkout_head = {}
+        self.dirty = ""
+        self.base_layers = list(BASE_LAYERS)
+        self.built_layers = BASE_LAYERS + ["sha256:" + "3" * 64]
         # UNIT_DIR as `find -printf '%P\t%y %m %u %g %l\0'` lists it; enable
         # adds what systemctl enable makes for a RequiredBy= unit in UNIT_DIR
         # (INFERRED from systemctl's documented behaviour, not measured).
@@ -164,6 +178,24 @@ class FakeHost:
         if a[0] == "sha256sum":
             name = a[1].rsplit("/", 1)[1][:-len(".bundle")]
             return f"{self.pin['repos'][name]['bundle_sha256']}  {a[1]}\n"
+        if a[:2] == ["sh", "-c"] and a[3:4] == ["m1-checkout"]:
+            self.cloned.append(a[5])
+            return ""
+        if a[:2] == ["sh", "-c"] and a[3:4] == ["m1-build"]:
+            self.builds += 1
+            return ""
+        if a[:2] == ["git", "-C"] and a[2].startswith("/run/m1-bake/build-"):
+            # Fail closed unless the argv is exactly bake's: a wrong head, or a dirty tree.
+            which = a[2].rsplit("-", 1)[1]
+            if a[3:] == ["rev-parse", "--verify", "HEAD^{commit}"]:
+                return self.checkout_head.get(which, self.pin[which]["commit"]) + "\n"
+            if a[3:] == ["status", "--porcelain", "--ignored", "--untracked-files=all"]:
+                return self.dirty
+            return H("0") + "\n" if "rev-parse" in a else "?? not-the-exact-argv\n"
+        if a[:3] == ["docker", "image", "inspect"] and "RootFS" in a[4]:
+            if a[5] == BASE:
+                return json.dumps(self.base_layers) + "\n"
+            return json.dumps(self.built_layers) + "\n"
         if a[0] == "git" and "rev-parse" in a:
             repo = a[2].rsplit("/", 1)[1]
             ref = a[-1]
@@ -178,6 +210,8 @@ class FakeHost:
             return ""
         if a[:3] == ["docker", "image", "inspect"]:
             if "revision" in a[4]:
+                if self.clobber and self.builds >= 2 and a[5] == self.pin["router1"]["image"]:
+                    return "\n"  # router2's steps replaced router1's image
                 return self.pin["router1"]["commit"] + "\n"
             return IMG1 + "\n"
         if a[:3] == ["docker", "image", "ls"]:
@@ -209,6 +243,10 @@ class PinTest(unittest.TestCase):
     def test_valid(self):
         bake.validate_pin(make_pin())
 
+    def test_reviewed_router_values_fit_the_tag_form(self):
+        for v in ("amap-router-local-hop:6d104e70", "amap-router-email:f42aa0af3938", "python:3.11-slim"):
+            self.assertTrue(bake._LOCAL_TAG.fullmatch(v), v)
+
     def test_every_field_required(self):
         for key in make_pin():
             with self.subTest(key):
@@ -237,10 +275,46 @@ class PinTest(unittest.TestCase):
             "shared admin key": lambda p: p["keys"].update({"m1-admin": [KEY_OP]}),
             "bad key": lambda p: p["keys"].update(adm=["not a key"]),
             "repo shape": lambda p: p["repos"]["amap-router-local"].update(commit="x"),
-            "factory image": lambda p: p["router1"].update(image="amap-router-local:latest",
-                                                          build=["./docker/build.sh", "amap-router-local:latest"]),
-            "build escapes": lambda p: p["router1"].update(build=["../x", "m1-hop:pin"]),
-            "build without image": lambda p: p["router1"].update(build=["./docker/build.sh"]),
+            "factory image": lambda p: p["router1"].update(image="amap-router-local:latest") or
+                                       p["router1"]["build"].update(env={"IMAGE": "amap-router-local:latest"}),
+            "build escapes": lambda p: p["router1"]["build"].update(argv=["../x"]),
+            "build absolute": lambda p: p["router1"]["build"].update(argv=["/usr/bin/docker", "build"]),
+            "build with --pull": lambda p: p["router2"]["build"].update(argv=["./docker/build.sh", "--pull"]),
+            "build with --pull=true": lambda p: p["router2"]["build"].update(argv=["./docker/build.sh", "--pull=true"]),
+            "label another commit": lambda p: p["router1"]["build"].update(
+                argv=["./docker/build.sh", "--label", "org.opencontainers.image.revision=" + H("0")]),
+            "env escape in argv[0]": lambda p: p["router1"]["build"].update(
+                argv=["./x=y", "IMAGE=evil:t", "/usr/bin/docker", "build", "--pull", "."]),
+            "another script": lambda p: p["router1"]["build"].update(argv=["./docker/other.sh"]),
+            "empty argv": lambda p: p["router1"]["build"].update(argv=[]),
+            "from tag is router1's image": lambda p: p["router2"]["build"]["from"].update(tag="m1-hop:pin"),
+            "from tag is its own image": lambda p: p["router1"]["build"]["from"].update(tag="m1-hop:pin"),
+            "from tag factory": lambda p: p["router1"]["build"]["from"].update(tag="amap-router-local:latest"),
+            "same image twice": lambda p: p["router2"].update(image="m1-hop:pin") or
+                                          p["router2"]["build"].update(env={"IMAGE": "m1-hop:pin"}),
+            "base_images a string": lambda p: p.update(base_images=BASE),
+            # ROUTER-BUILD-TAG-FORM: no qualified spelling of a local tag.
+            "output aliases router1's": lambda p: p["router2"].update(image="docker.io/library/m1-hop:pin") or
+                                                  p["router2"]["build"].update(env={"IMAGE": "docker.io/library/m1-hop:pin"}),
+            "from tag aliases an output": lambda p: p["router2"]["build"]["from"].update(tag="docker.io/library/m1-hop:pin"),
+            "factory by its long name": lambda p: p["router1"].update(image="docker.io/library/amap-router-local:latest") or
+                                                  p["router1"]["build"].update(env={"IMAGE": "docker.io/library/amap-router-local:latest"}),
+            "from tag in a namespace": lambda p: p["router1"]["build"]["from"].update(tag="library/python:3.11-slim"),
+            "image with a registry": lambda p: p["router1"].update(image="ghcr.io/x:1") or
+                                               p["router1"]["build"].update(env={"IMAGE": "ghcr.io/x:1"}),
+            "tagless image (means :latest)": lambda p: p["router1"].update(image="m1-hop") or
+                                                       p["router1"]["build"].update(env={"IMAGE": "m1-hop"}),
+            "tagless from tag": lambda p: p["router1"]["build"]["from"].update(tag="python"),
+            "tag starting with a dot": lambda p: p["router1"].update(image="m1-hop:.x") or
+                                                 p["router1"]["build"].update(env={"IMAGE": "m1-hop:.x"}),
+            "build a list (the old form)": lambda p: p["router1"].update(build=["./docker/build.sh"]),
+            "build extra key": lambda p: p["router1"]["build"].update(umask="077"),
+            "env another key": lambda p: p["router1"]["build"]["env"].update(PATH="/tmp"),
+            "env IMAGE not the image": lambda p: p["router1"]["build"].update(env={"IMAGE": "other:x"}),
+            "env empty": lambda p: p["router1"]["build"].update(env={}),
+            "from ref not pinned": lambda p: p["router2"]["build"]["from"].update(ref="python@sha256:" + "8" * 64),
+            "from tag bad": lambda p: p["router2"]["build"]["from"].update(tag="no tag"),
+            "from extra key": lambda p: p["router2"]["build"]["from"].update(digest="x"),
             "router repo unknown": lambda p: p["router2"].update(repo="nope"),
             "relative sandy": lambda p: p["sandy"].update(build=["sandy", "--build-only"]),
             "undigested base": lambda p: p.update(base_images=["python:3"]),
@@ -381,6 +455,47 @@ class SequenceTest(BakeCase):
     def test_enable_with_requires_dir_already_present(self):
         self.host.unit_dir["local-fs.target.requires"] = "d 755 root root "
         self.run_bake()
+
+    def test_router_build_form(self):
+        """Ruling (a): each router builds by its own script in a clean checkout of its PIN commit, with IMAGE
+        from PIN and umask 022, after its FROM tag is bound to the pinned base digest."""
+        self.run_bake()
+        log = self.host.log
+        for which in ("router1", "router2"):
+            b = self.pin[which]["build"]
+            dest = f"/run/m1-bake/build-{which}"
+            checkout = log.index(["sh", "-c", 'umask 022 && git clone -q --no-checkout --local "$1" "$2" '
+                                  '&& git -C "$2" -c core.hooksPath=/dev/null checkout -q --detach "$3"',
+                                  "m1-checkout", f"{bake.SRC}/amap-router-local", dest, self.pin[which]["commit"]])
+            head = log.index(["git", "-C", dest, "rev-parse", "--verify", "HEAD^{commit}"])
+            status = log.index(["git", "-C", dest, "status", "--porcelain", "--ignored", "--untracked-files=all"])
+            tag = [i for i, a in enumerate(log) if a == ["docker", "tag", BASE, "python:3.11-slim"]]
+            build = log.index(["sh", "-c", 'umask 022 && cd "$1" && IMAGE="$2" && export IMAGE && shift 2 && exec "$@"',
+                               "m1-build", dest, b["env"]["IMAGE"], *b["argv"]])
+            self.assertLess(checkout, head)
+            self.assertLess(head, build)
+            self.assertLess(status, build)
+            self.assertTrue(any(status < t < build for t in tag))
+            self.assertIn(["rm", "-rf", dest], log[build:])
+        # No export, and no build argv with --pull.
+        self.assertFalse([a for a in log if "/run/m1-bake/export-" in " ".join(a)])
+        self.assertFalse([a for a in log if "--pull" in a])
+
+    def test_router_build_refusals(self):
+        for name, (brk, needle) in {
+                "dirty checkout": (lambda h: setattr(h, "dirty", "?? stray.py\n"), "is not exactly"),
+                "checkout at another commit": (lambda h: h.checkout_head.update(router2=H("0")), "is not exactly"),
+                "built on another base": (lambda h: setattr(h, "built_layers", ["sha256:" + "7" * 64] + BASE_LAYERS),
+                                          "is not built on"),
+                "base without layers": (lambda h: setattr(h, "base_layers", []), "is not built on"),
+                "unreadable layers": (lambda h: h.over.update({"RootFS": "not json"}), "not readable"),
+                "layers not digests": (lambda h: setattr(h, "built_layers", ["x"]), "not sha256 digests"),
+                "router2 replaces router1's image": (lambda h: setattr(h, "clobber", True), "m1-hop:pin is labelled"),
+        }.items():
+            with self.subTest(name):
+                self.setUp()
+                brk(self.host)
+                self.assert_fails(needle)
 
     def test_d_mounted_before_docker_exists(self):
         self.run_bake()
