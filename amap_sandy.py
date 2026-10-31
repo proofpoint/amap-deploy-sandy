@@ -3906,8 +3906,8 @@ def activation_sequence(spec: Any, source: str, final: bytes, path: Path, pre_ac
         f"1. done: the activation config is {source} (sha256 {final_sha})",
         f"2. as root: {ai.place_step(spec, source, final)}",
         f"3. the host's {path} is byte for byte that file: sha256 {final_sha}",
-        f"4. A4: restart the local router: docker/run.sh --config {path} --detach{hk.run_sh_flags(spec.keys)}, "
-        f"from the hop checkout",
+        f"4. A4: restart the local router: docker/run.sh --config {path} --image {spec.router.image_digest} "
+        f"--name {container} --detach{hk.run_sh_flags(spec.keys)}, from the hop checkout",
         ("5. A5: python3 amap-sandy.py verify --a5; every check must PASS except the signing check's UNKNOWN for "
          "the VM file share, which --a5 excuses only by its exact reason"
          if spec.supervision is not None and spec.supervision.kind == hv.KINDS[1] else

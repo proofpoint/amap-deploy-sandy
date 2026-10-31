@@ -287,7 +287,8 @@ class CommandTest(unittest.TestCase):
             secrets=SimpleNamespace(run_dir=str(self.t / "run"), writer_dir="/opt/ex/libexec"),
             partition=SimpleNamespace(tools={"python3": "/usr/bin/python3"}), keys=SimpleNamespace(local_config="/x", group_add=(2100,)),
             gate=None, overlay_pin={"commit": "a" * 40}, hub=SimpleNamespace(host_label="alpha"),
-            router=SimpleNamespace(container="router-a"), supervision=SimpleNamespace(kind="systemd"))
+            router=SimpleNamespace(container="router-a", image_digest="sha256:" + "c" * 64),
+            supervision=SimpleNamespace(kind="systemd"))
         self.policy = {"fleet_domain": FLEET_DOMAIN, "hop_link": {"link": "link-a", "trusted_fleet_hosts": ["beta.internal"],
                                                                   "egress": True, "delegation": {"inbound": False}}}
         self.verdict = (None, ["(a) the harness gate does not hold"])
@@ -402,13 +403,34 @@ class CommandTest(unittest.TestCase):
         self.assertEqual(rc, 0, err)
         a4 = [l for l in self.out.getvalue().splitlines() if "4. A4:" in l]
         self.assertEqual(len(a4), 1, a4)
-        self.assertRegex(a4[0], r"docker/run\.sh --config \S+ --detach --group-add 2100, from the hop checkout$")
+        self.assertRegex(a4[0], r"docker/run\.sh --config \S+ --image \S+ --name \S+ --detach --group-add 2100, "
+                                r"from the hop checkout$")
         self.out.seek(0); self.out.truncate()
         self.spec.keys = __import__("types").SimpleNamespace(local_config="/x", group_add=())
         rc, _, _, err = self.install(self.args())
         self.assertEqual(rc, 0, err)
         a4 = [l for l in self.out.getvalue().splitlines() if "4. A4:" in l]
-        self.assertRegex(a4[0], r"docker/run\.sh --config \S+ --detach, from the hop checkout$")
+        self.assertRegex(a4[0], r"docker/run\.sh --config \S+ --image \S+ --name \S+ --detach, from the hop checkout$")
+
+    def test_a4s_restart_line_names_the_router_sections_image_id_and_container(self):
+        """A4 recreates [1], and run.sh without --image starts whatever image
+        carries its default name, so the line names the router section's
+        image by its Id and its container, which A5 compares. Two documents
+        that differ only there print two lines that differ only there."""
+        from types import SimpleNamespace
+        self.verdict = (b'{"activated": true}\n', [])
+        lines = []
+        for digest, container in (("sha256:" + "c" * 64, "router-a"), ("sha256:" + "e" * 64, "router-b")):
+            self.spec.router = SimpleNamespace(container=container, image_digest=digest)
+            rc, _, _, err = self.install(self.args())
+            self.assertEqual(rc, 0, err)
+            a4 = [l for l in self.out.getvalue().splitlines() if "4. A4:" in l]
+            self.out.seek(0); self.out.truncate()
+            self.assertEqual(len(a4), 1, a4)
+            self.assertIn(f" --image {digest} --name {container} --detach", a4[0])
+            self.assertNotIn(hp.FACTORY_IMAGE + " ", a4[0])
+            lines.append(a4[0])
+        self.assertEqual(lines[0].replace("c" * 64, "e" * 64).replace("router-a", "router-b"), lines[1])
 
     def test_a_launchd_host_s_a5_step_names_verify_a5(self):
         """A5 on a launchd host is `verify --a5`; a systemd host's is plain

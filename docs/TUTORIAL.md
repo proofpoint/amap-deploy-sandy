@@ -2365,7 +2365,13 @@ engine reads as not running.
 4. **A3.** `python3 amap-sandy.py install --apply --activate <A2's run id>
    --activation-sha256 <A1's printed digest>`, then the root place it prints.
    Add A3's printed sha256 line to the same file, labelled.
-5. **A4.** `docker/run.sh --config <the live config> --detach`.
+5. **A4.** `docker/run.sh --config <the live config> --image
+   <router.image.digest> --name <router.container> --detach`, from the hop
+   checkout, with the `--group-add` A3 printed. Without `--image`, run.sh
+   starts whatever image carries its default name, which is not the image
+   A5 compares. On a host where no image carries that name, give `verify`
+   the same image, `--image <router.image.digest>`: its router reads run
+   through run.sh under the image it names.
 6. **A5, preliminary.** `python3 amap-sandy.py partition-check --document <the
    unit argv's document> --document-sha256 <its sha256>`. Only V1 and V2 must
    PASS here. T1 FAILs until step 8 records a stop target (its remedy, "run
