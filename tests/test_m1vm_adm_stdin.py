@@ -116,6 +116,9 @@ class CliTest(unittest.TestCase):
         self.assertEqual(rc, 1)
         rc, _, _ = self.cli("--bogus", "x")
         self.assertEqual(rc, 2)
+        rc, _, _ = self.cli("--receipt", str(self.tmp / "r.json"), "--program-sha256", "0" * 64)  # a flag twice
+        self.assertEqual(rc, 2)
+        self.assertFalse((self.tmp / "stdin.bin").exists())
 
 
 if __name__ == "__main__":

@@ -325,7 +325,7 @@ class AdmCase(unittest.TestCase):
                                now=lambda: (2026, 10, 31, 0, 0, 0, 4, 304, 0), receipt_b64=receipt_b64)
         return rc, out.getvalue().splitlines()
 
-    OWED = {"agent-prov", "identity", "machine-id", "a1-remainder", "instances", "volumes",
+    OWED = {"agent-prov", "identity", "sandy-schema", "machine-id", "a1-remainder", "instances", "volumes",
             "enrolment-trees",
             "units-table", "clock", "router1", "router2", "fingerprint"}  # UNKNOWN by design until their inputs exist
 
@@ -362,7 +362,7 @@ class PassTest(AdmCase):
         rc, lines = self.admit("A2a")
         self.assertEqual(rc, 1)
         self.assertIn("CHECK A2a role-and-o-n PASS", "\n".join(lines))
-        self.assertTrue(lines[-1].startswith("VM-ADMIT A2a FAIL failed=0 unknown=11"))
+        self.assertTrue(lines[-1].startswith("VM-ADMIT A2a FAIL failed=0 unknown=12"))
 
 
 class BreakTest(AdmCase):
@@ -568,13 +568,24 @@ class RoleAndOnTest(AdmCase):
             "F lacks roster": lambda: self.f("roster").rmdir(),
             "selected.json before launch": lambda: self.f("selected.json").write_text("{}"),
             ".selected before launch": lambda: self.f(".selected").mkdir(),
+            # Codex ADM (a)2: a required or late name in the wrong form, or a link.
+            "roster a file": lambda: (self.f("roster").rmdir(), self.f("roster").write_text("")),
+            "roster a link": lambda: (os.rename(self.f("roster"), self.vm.root / "r2"),
+                                      os.symlink(self.vm.root / "r2", self.f("roster"))),
+            "instances a link": lambda: (shutil.rmtree(self.f("instances")),
+                                         os.symlink("/srv", self.f("instances"))),
+            "payload a link": lambda: (os.rename(self.f("payload"), self.vm.root / "pl"),
+                                       os.symlink(self.vm.root / "pl", self.f("payload"))),
             "fixed file over 1 MiB": lambda: self.put("deploy-overlay.json", b" " * ((1 << 20) + 1)),
         }
         for name, brk in cases.items():
             with self.subTest(name):
                 self.setUp()
                 brk()
-                self.assertIn(" FAIL ", self.row())
+                row = self.row()
+                self.assertIn(" FAIL ", row)
+                if name.startswith(("roster a", "instances a", "payload a")):
+                    self.assertIn(" FAIL F/", row)
 
     def test_late_names_may_appear_after_launch(self):
         self.f("selected.json").write_text("{}")
@@ -582,6 +593,20 @@ class RoleAndOnTest(AdmCase):
         self.assertIn(" FAIL ", self.row("A2b"))
         for phase in ("POST", "2ACC"):
             self.assertIn(" PASS ", self.row(phase))
+        # In their own forms only (Codex ADM (a)2).
+        for name, brk in {".selected a file": lambda: (self.f(".selected").rmdir(), self.f(".selected").write_text("")),
+                          ".selected a link": lambda: (os.rename(self.f(".selected"), self.vm.root / "sel"),
+                                                       os.symlink(self.vm.root / "sel", self.f(".selected"))),
+                          "selected.json a dir": lambda: (self.f("selected.json").unlink(),
+                                                          self.f("selected.json").mkdir()),
+                          "selected.json a link": lambda: (self.f("selected.json").unlink(),
+                                                           os.symlink("/etc/hostname", self.f("selected.json")))}.items():
+            with self.subTest(name):
+                self.setUp()
+                self.f("selected.json").write_text("{}")
+                self.f(".selected").mkdir()
+                brk()
+                self.assertIn(" FAIL F/", self.row("POST"))
 
     def test_owner(self):
         with mock.patch.object(vm_admit, "SEAL_OWNER", (0, 0)):
@@ -675,6 +700,51 @@ class RoleAndOnTest(AdmCase):
         self.vm.receipt_for()
         self.assertIn(" FAIL deploy-overlay.json: larger than 1 MiB", self.row())
 
+    def test_opus_adm_witnesses(self):
+        """Opus ADM (b)1: the fixed four's own forms, manifest/receipt agreement, ownership, payload."""
+        def vm1(**over):  # the receipt with vm1's entry changed (names self.vm, renewed by each setUp)
+            r = self.vm.receipt
+            self.vm.receipt = dict(r, vms=dict(r["vms"], vm1=dict(r["vms"]["vm1"], **over)))
+        cases = {
+            "fixed setuid": lambda: self.f("feature.json").chmod(0o4444),
+            "fixed hardlink": lambda: os.link(self.f("feature.json"), self.vm.root / "feature.copy"),
+            "fixed 0555, receipt agreeing": lambda: (self.f("feature.json").chmod(0o555), self.vm.receipt_for()),
+            "ids missing a key": lambda: self.vm.build_on(role=self.vm.role_manifest(
+                ids={"op": 2101, "m1-admin": 2102, "adm": 2103, "uid-1": 2104, "uid-2": 2105})),
+            "receipt start differs": lambda: vm1(start=dict(self.vm.receipt["vms"]["vm1"]["start"],
+                                                            config="/srv/other.json")),
+            "receipt vm differs": lambda: vm1(vm="m1-other"),
+            "wrong group": lambda: mock.patch.object(vm_admit, "SEAL_OWNER", (os.getuid(), os.getgid() + 1)).start(),
+            "receipt lists no payload": lambda: vm1(files={k: v for k, v in self.vm.receipt["vms"]["vm1"]["files"].items()
+                                                           if not k.startswith("payload/")}),
+        }
+        for name, brk in cases.items():
+            with self.subTest(name):
+                self.setUp()
+                self.addCleanup(mock.patch.stopall)
+                brk()
+                self.assertIn(" FAIL ", self.row())
+
+    def test_man_of_any_shape_is_a_fail(self):
+        for over in ({"checkouts": []}, {"builds": "x"}, {"checkouts": {"/opt/amap/src/amap-deploy-sandy": 1}}):
+            with self.subTest(over):
+                self.setUp()
+                self.vm.man.update(over)
+                self.vm.write_man()
+                self.vm.receipt["t0_manifest_sha256"] = None
+                rc, lines = self.admit("A2a", man_sha256=hashlib.sha256(
+                    (self.vm.root / "opt/amap/MAN.json").read_bytes()).hexdigest())
+                self.assertIn(" FAIL receipt: ", self.row())
+
+    def test_bool_age_self_consistent(self):
+        # X14 (Codex ADM): router.json false, the manifest carrying false's own digest, and the
+        # receipt's v 0; without the int guard False == 0 would carry it through.
+        body = json.dumps({"min_sender_age_s": False, "v": 1}, sort_keys=True, separators=(",", ":"))
+        digest = "sha256:" + hashlib.sha256(body.encode()).hexdigest()
+        self.vm.build_on(role=self.vm.role_manifest(fleet_policy_digest=digest),
+                         router=b'{"min_sender_age_s":false}\n')
+        self.assertIn(" FAIL router.json: min_sender_age_s not an int", self.row())
+
     def test_pass_line_carries_ovl_and_role(self):
         owed = mock.patch.object(vm_admit.Admission, "owed", lambda self, reason: (lambda: (True, "stand-in")))
         prov = mock.patch.object(vm_admit.Admission, "check_agent_prov", lambda self: (True, "stand-in"))
@@ -749,6 +819,21 @@ class StdinTest(unittest.TestCase):
                 r = self.run_bytes(header + self.program())
                 self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
                 self.assertTrue(r.stdout.startswith(b"VM-ADMIT USAGE "), r.stdout)
+
+    def test_params_line_refusals_through_entry(self):
+        # Opus ADM (a)1: line 1 refuses a CR or NUL as line 2 does; and the 64 KiB bound.
+        good = json.dumps(dict(self.P, phase="A1", adm="a" * 64))
+        # A CR between tokens is JSON whitespace, so only the byte rule refuses it.
+        self.assertEqual(json.loads(good.replace(", ", ",\r", 1)), json.loads(good))
+        for name, data in {"a CR": good.replace(", ", ",\r", 1).encode(),
+                           "a NUL": good.encode()[:-1] + b',"x":"\0"}',
+                           "over 64 KiB": json.dumps(dict(self.P, pad="x" * (1 << 16))).encode()}.items():
+            with self.subTest(name):
+                out = io.StringIO()
+                with redirect_stdout(out):
+                    rc = vm_admit.entry({"M1_ADM_PARAMS_B64": base64.b64encode(data).decode()})
+                self.assertEqual(rc, 2)
+                self.assertTrue(out.getvalue().startswith("VM-ADMIT USAGE M1_ADM_PARAMS_B64:"), out.getvalue())
 
     def test_receipt_line_only_from_a2a(self):
         a1 = self.emitted("A1")

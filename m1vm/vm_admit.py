@@ -640,8 +640,11 @@ class Admission:
     def _role_and_o_n(self):
         r = parse_receipt(receipt_from(self.receipt_b64, self.p[RECEIPT_KEY]))
         man_sha, man = self.man()
-        co = man.get("checkouts", {}).get(DEPLOY_CHECKOUT, {}) if isinstance(man, dict) else {}
-        r1 = man.get("builds", {}).get("router1", {}) if isinstance(man, dict) else {}
+        # MAN of any shape is a FAIL here, never a crash (Opus ADM (b)).
+        checkouts = man.get("checkouts") if isinstance(man, dict) else None
+        builds = man.get("builds") if isinstance(man, dict) else None
+        co = checkouts.get(DEPLOY_CHECKOUT) if isinstance(checkouts, dict) else None
+        r1 = builds.get("router1") if isinstance(builds, dict) else None
         _need(r["t0_manifest_sha256"] == man_sha, "receipt: t0_manifest_sha256 is not MAN's")
         _need(isinstance(co, dict) and (r["deploy_commit"], r["deploy_tree"]) == (co.get("head"), co.get("tree")),
               "receipt: deploy_commit or deploy_tree is not MAN's checkout")
@@ -770,6 +773,10 @@ class Admission:
             self.check("images", self.check_images)
             self.check("socket-acl", self.check_socket_acl)
             self.check("role-and-o-n", self.check_role_and_o_n)
+            # B6C d5.1 names ADM the consumer of the receipt's sandy_schema_version; no reviewed
+            # invocation of the guest's sandy exists yet, so this stays UNKNOWN (Codex ADM (a)1).
+            self.check("sandy-schema", self.owed("the guest's `sandy --print-schema` token vs the receipt's "
+                                                 "sandy_schema_version: no reviewed guest invocation yet"))
             if self.phase in ("A2a", "A2b"):
                 self.check("instances-empty", self.check_instances_empty)
             else:
@@ -829,8 +836,12 @@ def strict_json(data):
 
 
 def params_from(value):
-    """Line 1, `M1_ADM_PARAMS_B64 = "<base64>"`: the params object."""
-    return strict_json(b64_bytes(value, PARAMS_MAX))
+    """Line 1, `M1_ADM_PARAMS_B64 = "<base64>"`: the params object. Decoded as
+    line 2 is (B6C d5.1 §2c.1): ASCII, no CR, no NUL, then strict JSON."""
+    data = b64_bytes(value, PARAMS_MAX)
+    if b"\r" in data or b"\0" in data:
+        raise ValueError("params: a CR or NUL")
+    return strict_json(data)
 
 
 def receipt_from(value, want_sha):
@@ -1052,6 +1063,11 @@ def installed_on(phase):
         _need(top <= F_REQUIRED | F_LATE, f"F holds {sorted(top - F_REQUIRED - F_LATE)[:5]}, outside its closed set")
         _need(F_REQUIRED <= top, f"F lacks {sorted(F_REQUIRED - top)}")
         _need(not late or phase in ("POST", "2ACC"), f"F holds {sorted(late)} before the first launch")
+        # Each non-O-n name in its own form, never through a link (Codex ADM (a)2).
+        for name in sorted((F_REQUIRED - set(FIXED)) | late):
+            st = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            want = stat.S_ISREG if name == "selected.json" else stat.S_ISDIR
+            _need(want(st.st_mode), f"F/{name}: not a {'regular file' if name == 'selected.json' else 'directory'}")
         for name in FIXED:
             sha, data, st = _hash_at(fd, name, name, 1 << 20)
             _sealed(st, name)

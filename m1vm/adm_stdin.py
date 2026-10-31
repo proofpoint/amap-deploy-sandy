@@ -75,7 +75,7 @@ def build(params, program, program_sha256, receipt=None):
 
 def main(argv):
     opts = dict(zip(argv[0::2], argv[1::2]))
-    if len(argv) % 2 or not {"--params", "--program", "--program-sha256", "--out"} <= set(opts) \
+    if len(argv) % 2 or len(opts) != len(argv) // 2 or not {"--params", "--program", "--program-sha256", "--out"} <= set(opts) \
             or not set(opts) <= {"--params", "--program", "--program-sha256", "--out", "--receipt"}:
         print(__doc__.split("\n\n")[1], file=sys.stderr)
         return 2
