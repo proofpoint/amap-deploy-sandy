@@ -10,7 +10,7 @@
     {
       "name": "amap-router-local",
       "url": "https://github.com/proofpoint/amap-router-local",
-      "commit": "52eafa82c3f6c621828dffb1b4c2a3a94da73d88",
+      "commit": "6d104e705974b0f9c90507629f5371755fbe0ca4",
       "override": "AMAP_HOP_ROUTER_REPO",
       "dir": "amap-router-local-hop",
       "temporary": "the hop renderer's router, at a reviewed hop-integration commit; removed in the same PR that moves the main amap-router-local pin when hop-integration merges to main"
