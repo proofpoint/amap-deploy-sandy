@@ -58,6 +58,7 @@ def make_pin():
         "npm_route": {"kind": "sandy-pin", "sandy_commit": H("d")},
         "sandy_secrets": {"path": "/srv/m1-state/sandy/.secrets"},
         "man_files": [],
+        "writer_sha256": "8" * 64,
     }
 
 
@@ -75,6 +76,7 @@ class FakeHost:
         self.man = json.dumps({"images": {"m1-hop:pin": IMG1, "m1-hub:pin": IMG2}})
         self.removed = set()
         self.findmnt_calls = 0
+        self.bundle_scripts = []
         self.unmount_after = None
 
     def put(self, path, text, mode="0644", owner="root:root"):
@@ -89,6 +91,21 @@ class FakeHost:
                     raise out
                 return out
         a = argv
+        if a[0] == "sha256sum" and a[1].endswith("host_steps.py"):
+            return self.pin["writer_sha256"] + "  " + a[1] + "\n"
+        if a == ["cat", f"{bake.SRC}/amap-deploy-sandy/m1vm/bundle-lines.txt"]:
+            return (M1VM / "bundle-lines.txt").read_text()
+        if a[:4] == ["bash", "-e", "-o", "pipefail"]:
+            self.bundle_scripts.append(a[5])
+            return "END-OF-BLOCK\n" if len(self.bundle_scripts) == 1 else ""
+        if a[:2] == ["find", bake.EXEC_ROOT]:
+            return "bundle\0empty-home\0"
+        if a[:3] == ["git", "-C", f"{bake.SRC}/amap-deploy-sandy"] and a[3] == "show":
+            return "partition_job.py\npartition_store.py\n"
+        if a[:2] == ["find", f"{bake.EXEC_ROOT}/bundle"]:
+            return "" if "!" in a else "partition_job.py\0partition_store.py\0partition_weekly.closure\0PIN\0"
+        if a == ["cat", f"{bake.EXEC_ROOT}/bundle/PIN"]:
+            return self.pin["repos"]["amap-deploy-sandy"]["commit"] + "\n"
         if a[:2] == ["findmnt", "-n"]:
             self.findmnt_calls += 1
             if self.unmount_after is not None and self.findmnt_calls > self.unmount_after:
@@ -208,6 +225,7 @@ class PinTest(unittest.TestCase):
             "agent masked": lambda p: p["quiet"]["mask"].append("qemu-guest-agent.service"),
             "agent removed": lambda p: p["quiet"]["remove"].append("qemu-guest-agent"),
             "d_uuid": lambda p: p["docker"].update(d_uuid="x"),
+            "writer sha": lambda p: p.update(writer_sha256="x"),
         }
         for name, brk in breaks.items():
             with self.subTest(name):
@@ -225,7 +243,7 @@ class RenderTest(unittest.TestCase):
         self.assertIn(f"PIN_SHA256='{hashlib.sha256(pin_bytes).hexdigest()}'\n", script)
         self.assertIn(f"DEPLOY_COMMIT='{H('a')}'\n", script)
         self.assertIn("OP_HOME='/home/op'\n", script)
-        self.assertEqual(bake.PROGRAMS, ("bake.py", "man.py", "seed_copy.py", "state_check.py"))
+        self.assertEqual(bake.PROGRAMS, ("bake.py", "man.py", "seed_copy.py", "state_check.py", "bundle-lines.txt"))
         for name in bake.PROGRAMS:
             digest = hashlib.sha256((M1VM / name).read_bytes()).hexdigest()
             self.assertIn(f"{digest}  {name}", script)
@@ -379,6 +397,34 @@ class SequenceTest(BakeCase):
         self.assertNotIn(["docker", "image", "prune", "--force"], self.host.log)
         self.assertFalse(any(a[:3] == ["docker", "image", "prune"] for a in self.host.log))
 
+    def test_writer_placed_by_the_code_shape(self):
+        self.run_bake()
+        src = f"{bake.SRC}/amap-deploy-sandy/host_steps.py"
+        i = self.index(lambda a: a == ["sha256sum", src])
+        j = self.index(lambda a: a == ["install", "-o", "0", "-g", "0", "-m", "0444", src, bake.WRITER])
+        k = self.index(lambda a: a == ["sha256sum", bake.WRITER])
+        self.assertLess(i, j)
+        self.assertLess(j, k)
+
+    def test_bundle_runs_the_approved_lines_verbatim(self):
+        self.run_bake()
+        approved = (M1VM / "bundle-lines.txt").read_text()
+        filled = approved.replace("<DEPLOY_PIN>", H("a")).replace("<DEPLOY_BUNDLE>",
+                                                                 "/home/op/m1-bundles/amap-deploy-sandy.bundle")
+        self.assertEqual("".join(self.host.bundle_scripts), filled)
+        self.assertTrue(self.host.bundle_scripts[1].startswith(bake.CLOSURE_MARK))
+        self.assertEqual(hashlib.sha256(approved.encode()).hexdigest(), bake.BUNDLE_LINES_SHA256)
+        bundle = self.index(lambda a: a[:4] == ["bash", "-e", "-o", "pipefail"])
+        programs = self.index(lambda a: a[-1] == bake.WRITER and a[0] == "install")
+        units = self.index(lambda a: "render-units" in a)
+        clean = self.index(lambda a: a[:2] == ["rm", "-rf"] and a[2].endswith("/m1-bundles"))
+        self.assertLess(programs, bundle)
+        self.assertLess(bundle, units)
+        self.assertLess(bundle, clean)  # the deploy bundle is still there when the lines read it
+        plan = json.loads(self.host.files["/run/m1-bake/man-plan.json"][0])
+        self.assertIn(bake.WRITER, plan["files"])
+        self.assertIn(f"{bake.EXEC_ROOT}/bundle/PIN", plan["files"])
+
     def test_never_touches_var_lib_m1_bake(self):
         self.run_bake()
         for a in self.host.log:
@@ -443,6 +489,23 @@ class StepFailTest(BakeCase):
             "agent version": (lambda h: h.over.update({r"\$\{Version\} qemu-guest-agent": "1:9.0\n"}),
                               "never replaced"),
             "op not in docker": (lambda h: h.over.update({"^id -nG": "op\n"}), "not in the docker group"),
+            "writer source": (lambda h: h.over.update({"^sha256sum .*amap-deploy-sandy/host_steps.py$": "0" * 64 + "  x\n"}),
+                              "not the pinned writer"),
+            "writer placed wrong": (lambda h: h.over.update({"^sha256sum /opt/amap/libexec/host_steps.py$": "0" * 64 + "  x\n"}),
+                                    "not the pinned writer"),
+            "bundle lines changed": (lambda h: h.over.update({"^cat .*bundle-lines.txt$": "echo hi\n"}),
+                                     "not the approved bytes"),
+            "closure check output": (lambda h: h.over.update({"^bash -e -o pipefail -c # exec_root": "absent: /usr/bin/docker\nEND-OF-BLOCK\n"}),
+                                     "not exactly END-OF-BLOCK"),
+            "provisioning output": (lambda h: h.over.update({"^bash -e -o pipefail -c # Go on": "host_steps: x\n"}),
+                                    "provisioning printed"),
+            "exec root extra": (lambda h: h.over.update({"^find /opt/amap/partition -mindepth": "bundle\0empty-home\0src.new\0"}),
+                                "not exactly bundle/ and empty-home/"),
+            "bundle missing file": (lambda h: h.over.update({"^find /opt/amap/partition/bundle -mindepth 1 -type f -printf":
+                                                             "partition_job.py\0PIN\0"}), "not exactly the closure"),
+            "bundle pin": (lambda h: h.over.update({"^cat /opt/amap/partition/bundle/PIN$": H("0") + "\n"}),
+                           "bundle/PIN is not the deploy pin"),
+            "bundle mode": (lambda h: h.over.update({"^find /opt/amap/partition/bundle .* !": "PIN\0"}), "not root 0444"),
             "command fails": (lambda h: h.over.update({"^docker pull": bake.BakeFail("docker pull: exit 1")}),
                               "images: docker pull"),
             "admin sudoers broader": (lambda h: h.over.update({"^sha256sum /etc/sudoers.d/m1-admin$":

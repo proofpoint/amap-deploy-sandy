@@ -27,7 +27,11 @@ Steps, in order:
                PIN's commit and tree, then no remote anywhere
   images       pinned base images; router [1] from a clean export of the hop
                pin, router [2] from RE's pin, sandy's --build-only seed
-  programs     /opt/amap/bin: m1-seed-copy, m1-state-check (root, 0755)
+  programs     /opt/amap/bin: m1-seed-copy, m1-state-check (root, 0755); the
+               pinned writer /opt/amap/libexec/host_steps.py (root 0444, sha
+               before and after)
+  bundle       the partition-weekly bundle: DS-r12-ERRATUM-BUNDLE r2's lines
+               verbatim (two placeholders), closure check then provisioning
   units        the state-check and mount units rendered, NOT yet enabled
   clean        containers stopped, builder pruned, dangling images removed,
                proxy files and <bundle-dir> deleted
@@ -102,7 +106,7 @@ def validate_pin(pin):
     """Raise PinError unless PIN is exactly the reviewed shape. Every field is
     required; nothing is defaulted (controller ruling 0c2774ce)."""
     keys = {"schema", "op_home", "apt", "quiet", "docker", "accounts", "hop_gid", "keys", "repos", "router1",
-            "router2", "sandy", "base_images", "npm_route", "sandy_secrets", "man_files"}
+            "router2", "sandy", "base_images", "npm_route", "sandy_secrets", "man_files", "writer_sha256"}
     _req(isinstance(pin, dict) and set(pin) == keys, f"PIN must be exactly {sorted(keys)}")
     _req(pin["schema"] == PIN_SCHEMA, f"schema must be {PIN_SCHEMA}")
     _req(isinstance(pin["op_home"], str) and re.fullmatch(r"/home/[a-z_][a-z0-9_-]{0,31}", pin["op_home"]),
@@ -183,6 +187,8 @@ def validate_pin(pin):
     else:
         _req(set(npm) == {"kind", "go_sha256"} and isinstance(npm["go_sha256"], str) and _HEX64.match(npm["go_sha256"]),
              "npm_route: an operator exception names the sha256 of the operator's go")
+    _req(isinstance(pin["writer_sha256"], str) and _HEX64.match(pin["writer_sha256"]),
+         "writer_sha256: the sha256 of host_steps.py at the deploy pin (r12 §14)")
     # LC d8 §2.3: the model key is $SANDY_HOME/.secrets on the state disk. The
     # MAN-declared bind alternative is not in this PIN schema; adding it is a
     # schema change with its own review (Codex item 2 (2)).
@@ -199,7 +205,7 @@ def validate_pin(pin):
 # the bake script, which checks them in the deploy checkout before exec'ing
 # bake.py, so NET's bake_script_sha (the one file /var/lib/m1-bake/m1-bake.sh)
 # binds every byte the bake executes from m1vm/.
-PROGRAMS = ("bake.py", "man.py", "seed_copy.py", "state_check.py")
+PROGRAMS = ("bake.py", "man.py", "seed_copy.py", "state_check.py", "bundle-lines.txt")
 
 
 def program_shas(m1vm_dir):
@@ -433,11 +439,72 @@ def step_images(pin, host):
         raise BakeFail(f"images: the seed holds a .secrets; it belongs at {pin['sandy_secrets']['path']}")
 
 
+WRITER = "/opt/amap/libexec/host_steps.py"
+EXEC_ROOT = "/opt/amap/partition"
+BUNDLE_LINES_SHA256 = "2f1478d7f801b9f52ca542fc884a55f373e768f3123851acac74adbd7ac896c6"
+CLOSURE_MARK = "# Go on only when that printed exactly END-OF-BLOCK and exited 0."
+
+
+def writer_ok(host, path, want):
+    have = host.run(["sha256sum", path]).split()[:1]
+    if have != [want]:
+        raise BakeFail(f"{path} is not the pinned writer {want}")
+
+
 def step_programs(pin, host):
     host.run(["install", "-d", "-o", "root", "-g", "root", "-m", "0755", f"{OPT}/bin"])
     for src, name in (("seed_copy.py", "m1-seed-copy"), ("state_check.py", "m1-state-check")):
         host.run(["install", "-o", "root", "-g", "root", "-m", "0755", "-T",
                   f"{SRC}/amap-deploy-sandy/m1vm/{src}", f"{OPT}/bin/{name}"])
+    # The pinned writer, in the code's own install shape (DS 09509dab;
+    # secret_setup.py:375-379): sha before and after, root 0444, never run.
+    source = f"{SRC}/amap-deploy-sandy/host_steps.py"
+    writer_ok(host, source, pin["writer_sha256"])
+    host.run(["install", "-d", "-o", "0", "-g", "0", "-m", "0755", "/opt/amap/libexec"])
+    host.run(["install", "-o", "0", "-g", "0", "-m", "0444", source, WRITER])
+    writer_ok(host, WRITER, pin["writer_sha256"])
+
+
+def step_bundle(pin, host):
+    """The partition-weekly job's bundle (DS-r12-ERRATUM-BUNDLE r2, lines
+    2f1478d7, dual-APPROVED): exactly the reviewed lines with their two
+    placeholders filled, the closure check first (its stdout exactly
+    END-OF-BLOCK), then the provisioning lines (no output), then the result
+    checked: /opt/amap/partition holds exactly bundle/ and empty-home/, and
+    bundle/ exactly the closure's files, partition_weekly.closure and PIN."""
+    lines = host.run(["cat", f"{SRC}/amap-deploy-sandy/m1vm/bundle-lines.txt"])
+    if hashlib.sha256(lines.encode("utf-8")).hexdigest() != BUNDLE_LINES_SHA256:
+        raise BakeFail("bundle: bundle-lines.txt is not the approved bytes")
+    writer_ok(host, WRITER, pin["writer_sha256"])
+    pin_commit = pin["repos"]["amap-deploy-sandy"]["commit"]
+    text = lines.replace("<DEPLOY_PIN>", pin_commit).replace(
+        "<DEPLOY_BUNDLE>", f"{pin['op_home']}/m1-bundles/amap-deploy-sandy.bundle")
+    head, mark, tail = text.partition(CLOSURE_MARK)
+    if not mark or "<DEPLOY_" in text:
+        raise BakeFail("bundle: the lines do not have the reviewed shape")
+    out = host.run(["bash", "-e", "-o", "pipefail", "-c", head], root=False)
+    if out != "END-OF-BLOCK\n":
+        raise BakeFail(f"bundle: the closure check printed {out[-200:]!r}, not exactly END-OF-BLOCK")
+    out = host.run(["bash", "-e", "-o", "pipefail", "-c", mark + tail], root=False)
+    if out != "":
+        raise BakeFail(f"bundle: provisioning printed {out[-200:]!r}")
+    top = sorted(n for n in host.run(["find", EXEC_ROOT, "-mindepth", "1", "-maxdepth", "1",
+                                      "-printf", "%f\\0"]).split("\0") if n)
+    if top != ["bundle", "empty-home"]:
+        raise BakeFail(f"bundle: {EXEC_ROOT} holds {top}, not exactly bundle/ and empty-home/")
+    closure = host.run(["git", "-C", f"{SRC}/amap-deploy-sandy", "show", f"{pin_commit}:partition_weekly.closure"]).split()
+    want = sorted(set(closure) | {"partition_weekly.closure", "PIN"})
+    have = sorted(n for n in host.run(["find", f"{EXEC_ROOT}/bundle", "-mindepth", "1", "-type", "f",
+                                       "-printf", "%P\\0"]).split("\0") if n)
+    if have != want:
+        raise BakeFail(f"bundle: bundle/ holds {len(have)} file(s), not exactly the closure's {len(want)}")
+    if host.run(["cat", f"{EXEC_ROOT}/bundle/PIN"]) != pin_commit + "\n":
+        raise BakeFail("bundle: bundle/PIN is not the deploy pin")
+    modes = host.run(["find", f"{EXEC_ROOT}/bundle", "-mindepth", "1", "-type", "f", "!", "(", "-user", "root",
+                      "-perm", "0444", ")", "-printf", "%P\\0"]).split("\0")
+    if any(modes):
+        raise BakeFail("bundle: a bundle file is not root 0444")
+    return [f"{EXEC_ROOT}/bundle/{n}" for n in want]
 
 
 def step_units(pin, host):
@@ -475,6 +542,11 @@ def builds(pin, host):
     return out
 
 
+def bundle_files(pin, host):
+    return [f"{EXEC_ROOT}/bundle/{n}" for n in host.run(["find", f"{EXEC_ROOT}/bundle", "-mindepth", "1", "-type", "f",
+                                                          "-printf", "%P\\0"]).split("\0") if n]
+
+
 def step_man(pin, host, pin_sha):
     # Tagged images by name; the pinned bases by their digest refs, which
     # pulls by digest leave untagged (Opus item 2 B3). No `<none>` ref.
@@ -485,7 +557,7 @@ def step_man(pin, host, pin_sha):
         f"/etc/sudoers.d/{pin['accounts']['adm']['name']}", "/etc/sudoers.d/m1-admin", "/etc/docker/daemon.json",
         f"{UNIT_DIR}/docker.service.d/m1-mounts.conf", f"{UNIT_DIR}/docker.socket.d/m1-acl.conf",
         f"{UNIT_DIR}/m1-state-check.service", f"{UNIT_DIR}/srv-m1\\x2dstate.mount", f"{UNIT_DIR}/var-lib-docker.mount",
-        f"{OPT}/bin/m1-seed-copy", f"{OPT}/bin/m1-state-check"}),
+        f"{OPT}/bin/m1-seed-copy", f"{OPT}/bin/m1-state-check", WRITER} | set(bundle_files(pin, host))),
         "checkouts": [f"{SRC}/{n}" for n in sorted(pin["repos"])], "images": refs,
         "accounts": [pin["accounts"][a]["name"] for a in ACCOUNTS],
         "roles": {a: pin["accounts"][a]["name"] for a in ACCOUNTS}, "builds": builds(pin, host)}
@@ -539,7 +611,8 @@ def step_assert_d(pin, host, man_sha):
 def bake(pin, pin_sha, host):
     for name, step in (("mount-d", step_mount_d), ("apt", step_apt), ("quiet", step_quiet), ("docker", step_docker),
                        ("accounts", step_accounts), ("sources", step_sources), ("images", step_images),
-                       ("programs", step_programs), ("units", step_units), ("clean", step_clean)):
+                       ("programs", step_programs), ("bundle", step_bundle), ("units", step_units),
+                       ("clean", step_clean)):
         print(f"M1-BAKE STEP {name}", flush=True)
         try:
             step(pin, host)
