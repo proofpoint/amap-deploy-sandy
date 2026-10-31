@@ -890,6 +890,9 @@ class RoleAndOnTest(AdmCase):
             "router_container with a slash": lambda: vm1(router_container="amap/hop", start=dict(start, name="amap/hop")),
             "start.name starting with a dash": lambda: vm1(router_container="-hop", start=dict(start, name="-hop")),
             "manifest vm with a colon": lambda: self.vm.build_on(role=self.vm.role_manifest(vm="m1:h1")),
+            # Opus d5.7 O5: equality is exact; a case-only difference in both receipt and manifest FAILs.
+            "vm differs from hostname only in case": lambda: (self.vm.build_on(role=self.vm.role_manifest(vm="M1-H1")),
+                                                             vm1(vm="M1-H1")),
         }
         for name, brk in cases.items():
             with self.subTest(name):
@@ -907,6 +910,7 @@ class RoleAndOnTest(AdmCase):
         vm_admit.parse_receipt(receipt())  # control
         start = self.vm.role_manifest()["start"]
         for name, over, msg in (("vm not its hostname", {"vm": "m1-other"}, "vm is not its hostname"),
+                                ("vm differs only in case", {"vm": "M1-H1"}, "vm is not its hostname"),
                                 ("start.name grammar", {"router_container": "-hop", "start": dict(start, name="-hop")},
                                  "start: a field of the wrong form")):
             with self.subTest(name):
@@ -917,6 +921,7 @@ class RoleAndOnTest(AdmCase):
         vm_admit.parse_role(role())  # control
         vm_admit.parse_role(role(vm="a" * 64))  # 64 is the bound
         for name, over in (("vm with a colon", {"vm": "m1:h1"}), ("vm over 64", {"vm": "a" * 65}),
+                           ("vm starting with a dot", {"vm": ".m1"}), ("vm starting with a dash", {"vm": "-m1"}),
                            ("start.name with a slash", {"start": dict(start, name="amap/hop")})):
             with self.subTest(name):
                 with self.assertRaises(ValueError):
