@@ -8,6 +8,7 @@ command outputs (systemctl show, findmnt, docker inspect, getfacl) follow
 the tools' documented forms and are INFERRED until A1 runs on a clone.
 """
 
+import base64
 import hashlib
 import io
 import json
@@ -23,6 +24,7 @@ from unittest import mock
 
 M1VM = Path(__file__).resolve().parent.parent / "m1vm"
 sys.path.insert(0, str(M1VM))
+import adm_stdin  # noqa: E402
 import man  # noqa: E402
 import vm_admit  # noqa: E402
 
@@ -107,6 +109,12 @@ class Vm:
             (r / rel).write_text(text)
             (r / rel).chmod(0o644)
         (r / "proc/swaps").write_text("Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n")
+        self.man["checkouts"] = {"/opt/amap/src/amap-deploy-sandy": {"head": "a" * 40, "tree": "b" * 40}}
+        self.man["builds"] = {"router1": {"commit": "c" * 40, "tree": "d" * 40, "image": "m1-hop:pin", "id": IMG}}
+        (r / "etc/hostname").write_text("m1-h1\n")
+        (r / "etc/hostname").chmod(0o644)
+        (r / "proc/sys/kernel/hostname").write_text("m1-h1\n")
+        self.build_on()
         self.record_units()
         self.cmd = {}
 
@@ -122,6 +130,83 @@ class Vm:
         t.pop("qemu-guest-agent.service")
         self.man["trees"] = {"/etc/systemd/system": t}
         return self.write_man()
+
+    # -- the installed O-n and its receipt: a STAND-IN shaped by B6C d5.1 §2-§2d and
+    #    ROLE r3's text, not DS's renderer output (replaced by a real test render).
+
+    F = "srv/m1-state/sandy/features/amap"
+    PAYLOAD = {"payload/relay": (b"#!/bin/sh\nexec true\n", 0o555),
+               "payload/mcp-servers.json": (b'{"mcpServers":{}}\n', 0o444),
+               "payload/bin/inbox-mcp-vol": (b"#!/bin/sh\n", 0o555)}
+
+    def role_manifest(self, **over):
+        m = {"schema": "amap-m1-role/1", "role": "H1", "vm": "m1-vm1", "hostname": "m1-h1",
+             "fd": "sandy.m1-h1.internal", "own_domain": "h1.example.org",
+             "ids": {"op": 2101, "m1-admin": 2102, "adm": 2103, "uid-1": 2104, "uid-2": 2105, "registry": 2106},
+             "units": ["amap-hop.service", "amap-router2.service"],
+             "fleet_policy_digest": "sha256:1b3083aed757ac7358acb763ee1a383d6572e9836754b59966e3e08f0459f120",
+             "start": {"uid_1": 2104, "group_add": 2101, "config": "/srv/m1-state/sandy/features/amap/router.json",
+                       "image": IMG, "name": "amap-hop"}}
+        m.update(over)
+        return m
+
+    def build_on(self, role=None, router=b'{"min_sender_age_s":0,"state_dir":"/x"}\n'):
+        f = self.root / self.F
+        for d in ("payload/bin", "roster"):
+            (f / d).mkdir(parents=True, exist_ok=True)
+        files = {"feature.json": (b'{"fleet_domain":"sandy.m1-h1.internal","min_sender_age_s":0}\n', 0o444),
+                 "router.json": (router, 0o444),
+                 "m1-role.json": (json.dumps(role or self.role_manifest()).encode() + b"\n", 0o444),
+                 "deploy-overlay.json": (b'{"router":{"container":"amap-hop"}}\n', 0o444), **self.PAYLOAD}
+        for key, (data, mode) in files.items():
+            p = f / key
+            if p.exists():
+                p.chmod(0o644)
+            p.write_bytes(data)
+            p.chmod(mode)
+        self.receipt_for()
+
+    def receipt_for(self, **over):
+        """The receipt for what is installed now: its files map measured from the tree."""
+        f = self.root / self.F
+        files = {}
+        for key in ("feature.json", "router.json", "m1-role.json", "deploy-overlay.json", *self.PAYLOAD):
+            p = f / key
+            files[key] = {"mode": f"{stat.S_IMODE(p.stat().st_mode):04o}",
+                          "sha256": hashlib.sha256(p.read_bytes()).hexdigest()}
+        role = json.loads((f / "m1-role.json").read_bytes())
+        digest = role["fleet_policy_digest"]
+
+        def entry(n):
+            e = {"role": "H1", "vm": "m1-vm1", "hostname": "m1-h1", "own_domain": "h1.example.org",
+                 "fd": "sandy.m1-h1.internal", "files": files,
+                 "on_manifest_sha256": hashlib.sha256(vm_admit.canonical(files)).hexdigest(),
+                 "role_sha256": files["m1-role.json"]["sha256"], "carried_digest": digest,
+                 "router_min_sender_age_s": 0, "start": role["start"], "state_dir": "/srv/m1-state/router1",
+                 "run_dir": "/srv/m1-state/run1", "router_container": "amap-hop"}
+            if n == 2:
+                other = dict(files, **{"m1-role.json": {"mode": "0444", "sha256": "9" * 64}})
+                e.update(role="H2", vm="m1-vm2", hostname="m1-h2", own_domain="h2.example.org",
+                         fd="sandy.m1-h2.internal", files=other, role_sha256="9" * 64,
+                         on_manifest_sha256=hashlib.sha256(vm_admit.canonical(other)).hexdigest())
+            return e
+        rec = {"schema": "amap-m1-b6c-receipt/1", "deploy_commit": "a" * 40, "deploy_tree": "b" * 40,
+               "hop_pin": "c" * 40, "t0_manifest_sha256": None, "net_values_sha256": "5" * 64,
+               "sandy_schema_version": "2.7.0", "v": 0,
+               "fleet_artifact": {"path": "fleet-admission-policy.json", "sha256": digest[7:], "digest": digest,
+                                  "schema_v": 1, "min_sender_age_s": 0},
+               "vms": {"vm1": entry(1), "vm2": entry(2)},
+               "preflight": {k: True for k in vm_admit.PREFLIGHT_KEYS}}
+        rec.update(over)
+        self.receipt = rec
+        return rec
+
+    def receipt_bytes(self):
+        """The receipt file's bytes, bound to MAN as written now."""
+        rec = dict(self.receipt)
+        if rec["t0_manifest_sha256"] is None:
+            rec["t0_manifest_sha256"] = hashlib.sha256((self.root / "opt/amap/MAN.json").read_bytes()).hexdigest()
+        return vm_admit.canonical(rec) + b"\n"
 
     def write_man(self):
         p = self.root / "opt/amap/MAN.json"
@@ -166,13 +251,20 @@ class Vm:
         raise AssertionError(argv)
 
 
+# A STAND-IN receipt, shaped only by B6C d5 §2c.1's byte form (one ASCII line,
+# one final LF); not DS's renderer output. role-and-o-n's content rows replace it
+# with a real test render when one exists.
+RECEIPT = b'{"schema":"amap-m1-b6c-receipt/1","stand_in":true}\n'
+RECEIPT_B64 = base64.b64encode(RECEIPT).decode("ascii")
+
+
 def params(vm, phase="A1", **over):
     p = {"phase": phase, "host": "H1", "att": "ATT-1", "adm": "a" * 64, "prov": "b" * 64,
-         "env": "none", "exp": "none", "ovl": "none", "d7": "c" * 64, "dd": "d" * 64, "ctlr": "none",
+         "env": "none", "exp": "none", "d7": "c" * 64, "dd": "d" * 64, "ctlr": "none",
          "accounts": ACCOUNTS, "keys": KEYS, "state_uuid": STATE_UUID, "d_uuid": D_UUID,
          "man_sha256": hashlib.sha256((vm.root / "opt/amap/MAN.json").read_bytes()).hexdigest()}
     if phase not in ("A1", "A1r"):
-        p.update(env="e" * 64, exp="f" * 64, ovl="0" * 64)
+        p.update(env="e" * 64, exp="f" * 64, b6c_receipt_sha256=hashlib.sha256(vm.receipt_bytes()).hexdigest())
     p.update(over)
     return p
 
@@ -185,6 +277,10 @@ class AdmCase(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         # The fixture's mask link is the test user's, not root's.
+        # The sealed O-n is root:root on a real VM; here the test user stands in.
+        owner = mock.patch.object(vm_admit, "SEAL_OWNER", (os.getuid(), os.getgid()))
+        owner.start()
+        self.addCleanup(owner.stop)
         mask = mock.patch.object(vm_admit, "AGENT_MASK",
                                  ("qemu-guest-agent.service", {"type": "l", "uid": os.getuid(), "target": "/dev/null"}))
         mask.start()
@@ -220,14 +316,16 @@ class AdmCase(unittest.TestCase):
         # checks read, as BAKE records it on T0.
         self.vm.record_units()
 
-    def admit(self, phase="A1", **over):
+    def admit(self, phase="A1", receipt_b64=None, **over):
+        if receipt_b64 is None and phase not in ("A1", "A1r"):
+            receipt_b64 = base64.b64encode(self.vm.receipt_bytes()).decode("ascii")
         out = io.StringIO()
         with redirect_stdout(out):
             rc = vm_admit.main(params(self.vm, phase, **over), runner=self.vm.runner,
-                               now=lambda: (2026, 10, 31, 0, 0, 0, 4, 304, 0))
+                               now=lambda: (2026, 10, 31, 0, 0, 0, 4, 304, 0), receipt_b64=receipt_b64)
         return rc, out.getvalue().splitlines()
 
-    OWED = {"agent-prov", "role-and-o-n", "identity", "machine-id", "a1-remainder", "instances", "volumes",
+    OWED = {"agent-prov", "identity", "machine-id", "a1-remainder", "instances", "volumes",
             "enrolment-trees",
             "units-table", "clock", "router1", "router2", "fingerprint"}  # UNKNOWN by design until their inputs exist
 
@@ -260,11 +358,11 @@ class PassTest(AdmCase):
         self.assertTrue(all(l.startswith("CHECK A1 ") for l in lines[:-1]))
 
     def test_a2a_is_not_yet_complete(self):
-        # The B6c-bound rows are UNKNOWN until DS's receipt is reviewed: no PASS line.
+        # role-and-o-n PASSes on the stand-in receipt; the other A2a rows still owed keep the PASS line away.
         rc, lines = self.admit("A2a")
         self.assertEqual(rc, 1)
-        self.assertIn("CHECK A2a role-and-o-n UNKNOWN", "\n".join(lines))
-        self.assertTrue(lines[-1].startswith("VM-ADMIT A2a FAIL failed=0 unknown=12"))
+        self.assertIn("CHECK A2a role-and-o-n PASS", "\n".join(lines))
+        self.assertTrue(lines[-1].startswith("VM-ADMIT A2a FAIL failed=0 unknown=11"))
 
 
 class BreakTest(AdmCase):
@@ -356,7 +454,7 @@ class BreakTest(AdmCase):
 
 class ParamTest(AdmCase):
     def test_refusals(self):
-        for over in ({"phase": "A3"}, {"host": "H3"}, {"adm": "x"}, {"ctlr": "x"}, {"ovl": "0" * 64},
+        for over in ({"phase": "A3"}, {"host": "H3"}, {"adm": "x"}, {"ctlr": "x"}, {"ovl": "none"},
                      {"state_uuid": "x"}, {"att": "1"}, {"extra": 1}):
             with self.subTest(over):
                 p = params(self.vm)
@@ -372,33 +470,293 @@ class ParamTest(AdmCase):
         self.assertTrue(lines[-1].startswith("VM-ADMIT A1 FAIL "))
 
 
+class ReceiptLineTest(AdmCase):
+    """Line 2's checks (B6C d5 §2c.1, in the agreed order): each break FAILs
+    role-and-o-n at A2a and so yields no PASS line."""
+
+    def test_breaks(self):
+        def b64(data):
+            return base64.b64encode(data).decode("ascii")
+        cases = {
+            "not base64": "%%%%",
+            "whitespace": RECEIPT_B64[:4] + " " + RECEIPT_B64[4:],
+            "too long": "A" * (4 * -(-vm_admit.RECEIPT_MAX // 3) + 4),
+            "another file's sha": b64(b'{"other":1}\n'),
+            "two lines": b64(b'{"a":1}\n{"b":2}\n'),
+            "no final LF": b64(RECEIPT[:-1]),
+            "a CR": b64(RECEIPT[:-1] + b"\r\n"),
+            "a NUL": b64(RECEIPT[:-2] + b"\0}\n"),
+            "not ASCII": b64(RECEIPT[:-2] + "\u00e9}".encode() + b"\n"),
+        }
+        for name, value in cases.items():
+            with self.subTest(name):
+                _, lines = self.admit("A2a", receipt_b64=value)
+                self.assertIn("CHECK A2a role-and-o-n FAIL", "\n".join(lines))
+                self.assertTrue(lines[-1].startswith("VM-ADMIT A2a FAIL "))
+
+    def test_each_break_is_its_own(self):
+        # Bound to these very bytes by sha, so only the byte rule can refuse them.
+        for name, data in {"two lines": b'{"a":1}\n{"b":2}\n', "no final LF": RECEIPT[:-1],
+                           "a CR": RECEIPT[:-1] + b"\r\n", "a NUL": RECEIPT[:-2] + b"\0}\n",
+                           "not ASCII": RECEIPT[:-2] + "\u00e9}".encode() + b"\n"}.items():
+            with self.subTest(name):
+                # sha bound to these very bytes, so only the byte rule can refuse them
+                _, lines = self.admit("A2a", receipt_b64=base64.b64encode(data).decode("ascii"),
+                                      b6c_receipt_sha256=hashlib.sha256(data).hexdigest())
+                self.assertIn("CHECK A2a role-and-o-n FAIL receipt:", "\n".join(lines))
+        _, lines = self.admit("A2a")
+        self.assertIn("CHECK A2a role-and-o-n PASS", "\n".join(lines))
+
+    def test_padding_required(self):
+        data = b'{"a":1}\n'  # 8 bytes: its base64 ends in "="
+        padded = base64.b64encode(data).decode("ascii")
+        self.assertTrue(padded.endswith("="))
+        # Padded, the bytes pass line 2's checks and reach the strict parse; unpadded, they never decode.
+        for value, verdict in ((padded, "FAIL receipt: not exactly"), (padded.rstrip("="), "FAIL not padded")):
+            with self.subTest(value):
+                _, lines = self.admit("A2a", receipt_b64=value, b6c_receipt_sha256=hashlib.sha256(data).hexdigest())
+                self.assertIn(f"CHECK A2a role-and-o-n {verdict}", "\n".join(lines))
+
+    def test_bound_is_exact(self):
+        self.assertEqual(4 * -(-vm_admit.RECEIPT_MAX // 3), 1398104)
+        self.assertEqual(len(base64.b64encode(b"x" * vm_admit.RECEIPT_MAX)), 1398104)
+        with self.assertRaises(ValueError):
+            vm_admit.b64_bytes(base64.b64encode(b"x" * (vm_admit.RECEIPT_MAX + 1)).decode(), vm_admit.RECEIPT_MAX)
+
+
+class RoleAndOnTest(AdmCase):
+    """role-and-o-n (B6C d5.1 §2c-§2d, ROLE r3) against the stand-in receipt:
+    each break FAILs the row; the control PASSes and carries ovl= and role=."""
+
+    def row(self, phase="A2a"):
+        _, lines = self.admit(phase)
+        return next(l for l in lines if l.startswith(f"CHECK {phase} role-and-o-n "))
+
+    def f(self, rel=""):
+        return self.vm.root / self.vm.F / rel
+
+    def put(self, rel, data, mode=0o444):
+        p = self.f(rel)
+        if p.exists():
+            p.chmod(0o644)
+        p.write_bytes(data)
+        p.chmod(mode)
+
+    def test_control(self):
+        self.assertIn(" PASS 7 O-n files as the receipt", self.row())
+        for phase in ("A2b", "POST", "2ACC"):
+            self.assertIn(" PASS ", self.row(phase))
+
+    def test_installed_breaks(self):
+        """The installed O-n moved away from the receipt the operator reviewed."""
+        cases = {
+            "payload bytes": lambda: self.put("payload/relay", b"#!/bin/sh\nexec false\n", 0o555),
+            "executable lost x": lambda: self.f("payload/relay").chmod(0o444),
+            "data file gained x": lambda: self.f("payload/mcp-servers.json").chmod(0o555),
+            "writable": lambda: self.f("payload/relay").chmod(0o755),
+            "setuid": lambda: self.f("payload/relay").chmod(0o4555),
+            "fixed name executable": lambda: self.f("feature.json").chmod(0o555),
+            "extra payload file": lambda: self.put("payload/extra", b"x"),
+            "payload file gone": lambda: self.f("payload/bin/inbox-mcp-vol").unlink(),
+            "payload link": lambda: os.symlink("/etc/passwd", self.f("payload/ln")),
+            "payload fifo": lambda: os.mkfifo(self.f("payload/fifo")),
+            "empty payload dir": lambda: self.f("payload/empty").mkdir(),
+            "fixed name a link": lambda: (self.f("deploy-overlay.json").unlink(),
+                                          os.symlink(self.f("feature.json"), self.f("deploy-overlay.json"))),
+            "two links": lambda: os.link(self.f("payload/relay"), self.f("roster/relay")),
+            "F extra entry": lambda: self.f("notes.txt").write_text("x"),
+            "F lacks roster": lambda: self.f("roster").rmdir(),
+            "selected.json before launch": lambda: self.f("selected.json").write_text("{}"),
+            ".selected before launch": lambda: self.f(".selected").mkdir(),
+            "fixed file over 1 MiB": lambda: self.put("deploy-overlay.json", b" " * ((1 << 20) + 1)),
+        }
+        for name, brk in cases.items():
+            with self.subTest(name):
+                self.setUp()
+                brk()
+                self.assertIn(" FAIL ", self.row())
+
+    def test_late_names_may_appear_after_launch(self):
+        self.f("selected.json").write_text("{}")
+        self.f(".selected").mkdir()
+        self.assertIn(" FAIL ", self.row("A2b"))
+        for phase in ("POST", "2ACC"):
+            self.assertIn(" PASS ", self.row(phase))
+
+    def test_owner(self):
+        with mock.patch.object(vm_admit, "SEAL_OWNER", (0, 0)):
+            self.assertIn(" FAIL ", self.row())
+
+    def test_consistent_renders_that_fail(self):
+        """Self-consistent receipt and O-n (receipt rebuilt), wrong against the guest, MAN or ROLE r3."""
+        # Every case names self.vm, which each setUp renews.
+        cases = {
+            "router age not the digest's": lambda: self.vm.build_on(router=b'{"min_sender_age_s":5}\n'),
+            "router age a bool": lambda: self.vm.build_on(router=b'{"min_sender_age_s":false}\n'),
+            "router.json duplicate key": lambda: self.vm.build_on(router=b'{"min_sender_age_s":0,"min_sender_age_s":0}\n'),
+            "router.json without the key": lambda: self.vm.build_on(router=b'{"state_dir":"/x"}\n'),
+            "manifest digest not router's": lambda: self.vm.build_on(role=self.vm.role_manifest(
+                fleet_policy_digest="sha256:" + "0" * 64)),
+            "manifest hostname not the guest's": lambda: self.vm.build_on(role=self.vm.role_manifest(hostname="m1-hx")),
+            "manifest role not host=": lambda: self.vm.build_on(role=self.vm.role_manifest(role="H2")),
+            "manifest extra key": lambda: self.vm.build_on(role=dict(self.vm.role_manifest(), extra=1)),
+            "manifest ids a bool": lambda: self.vm.build_on(role=self.vm.role_manifest(
+                ids={"op": True, "m1-admin": 2102, "adm": 2103, "uid-1": 2104, "uid-2": 2105, "registry": 2106})),
+            "manifest units unsorted": lambda: self.vm.build_on(role=self.vm.role_manifest(units=["b.service", "a.service"])),
+            "etc hostname": lambda: (self.vm.root / "etc/hostname").write_text("m1-hx\n"),
+            "kernel hostname": lambda: (self.vm.root / "proc/sys/kernel/hostname").write_text("m1-hx\n"),
+            "receipt not MAN's deploy commit": lambda: self.vm.receipt_for(deploy_commit="e" * 40),
+            "receipt not MAN's deploy tree": lambda: self.vm.receipt_for(deploy_tree="e" * 40),
+            "receipt not MAN's hop pin": lambda: self.vm.receipt_for(hop_pin="e" * 40),
+            "receipt not this MAN": lambda: self.vm.receipt_for(t0_manifest_sha256="e" * 64),
+            "receipt v not router's": lambda: self.vm.receipt_for(v=7, fleet_artifact=dict(
+                self.vm.receipt["fleet_artifact"], min_sender_age_s=7)),
+            "receipt artifact digest not the manifest's": lambda: self.vm.receipt_for(fleet_artifact=dict(
+                self.vm.receipt["fleet_artifact"], sha256="0" * 64, digest="sha256:" + "0" * 64)),
+            "feature fleet_domain": lambda: (self.put("feature.json", b'{"fleet_domain":"other.internal"}\n'),
+                                             self.vm.receipt_for()),
+        }
+        for name, brk in cases.items():
+            with self.subTest(name):
+                self.setUp()
+                brk()
+                self.assertIn(" FAIL ", self.row())
+
+    def test_receipt_shape(self):
+        """The strict parse of §2b.1: each malformed receipt FAILs, sha-bound to its own bytes."""
+        def vm1(**over):
+            return dict(self.vm.receipt, vms=dict(self.vm.receipt["vms"], vm1=dict(self.vm.receipt["vms"]["vm1"], **over)))
+        cases = {
+            "extra top key": lambda r: dict(r, extra=1),
+            "a preflight false": lambda r: dict(r, preflight=dict(r["preflight"], fd_differ=False)),
+            "a preflight key missing": lambda r: dict(r, preflight={k: True for k in sorted(r["preflight"])[1:]}),
+            "v a bool": lambda r: dict(r, v=False),
+            "vm1 role swapped": lambda r: vm1(role="H2"),
+            "files: a dot key": lambda r: vm1(files=dict(r["vms"]["vm1"]["files"], **{"payload/./x": {
+                "mode": "0444", "sha256": "1" * 64}})),
+            "files: mode 0755": lambda r: vm1(files=dict(r["vms"]["vm1"]["files"], **{"payload/relay": {
+                "mode": "0755", "sha256": r["vms"]["vm1"]["files"]["payload/relay"]["sha256"]}})),
+            "on_manifest not its files": lambda r: vm1(on_manifest_sha256="0" * 64),
+            "router_container not start.name": lambda r: vm1(router_container="other"),
+            "same fd as the other VM": lambda r: dict(r, vms=dict(r["vms"], vm2=dict(r["vms"]["vm2"],
+                                                                                    fd="sandy.m1-h1.internal"))),
+        }
+        for name, mut in cases.items():
+            with self.subTest(name):
+                self.setUp()
+                self.vm.receipt = mut(self.vm.receipt)
+                self.assertIn(" FAIL ", self.row())
+        # Not canonical: the same object with a space, sha-bound to those bytes.
+        self.setUp()
+        data = self.vm.receipt_bytes().replace(b'{"deploy_commit"', b'{ "deploy_commit"', 1)
+        _, lines = self.admit("A2a", receipt_b64=base64.b64encode(data).decode(),
+                              b6c_receipt_sha256=hashlib.sha256(data).hexdigest())
+        self.assertIn("role-and-o-n FAIL receipt: not in canonical form", "\n".join(lines))
+
+    def test_mutant_witnesses(self):
+        """Each case is FAIL only through one guard (named in mutants-adm-role.py)."""
+        # T5: a well-formed receipt, but not the one params name.
+        data = self.vm.receipt_bytes()
+        _, lines = self.admit("A2a", receipt_b64=base64.b64encode(data).decode(), b6c_receipt_sha256="0" * 64)
+        self.assertIn("role-and-o-n FAIL receipt: sha256 is not", "\n".join(lines))
+        # R4: the two entries swapped under their keys; H1's entry would otherwise still be found.
+        self.setUp()
+        v = self.vm.receipt["vms"]
+        self.vm.receipt = dict(self.vm.receipt, vms={"vm1": v["vm2"], "vm2": v["vm1"]})
+        self.assertIn(" FAIL vms.vm1.role is not H1", self.row())
+        # R8: a writable payload file, with a receipt that records it as installed.
+        self.setUp()
+        self.f("payload/relay").chmod(0o755)
+        self.vm.receipt_for()
+        self.assertIn(" FAIL vms.vm1.files[payload/relay]", self.row())
+        # O9: a fixed file over 1 MiB, with a receipt that records it.
+        self.setUp()
+        self.put("deploy-overlay.json", b" " * ((1 << 20) + 1))
+        self.vm.receipt_for()
+        self.assertIn(" FAIL deploy-overlay.json: larger than 1 MiB", self.row())
+
+    def test_pass_line_carries_ovl_and_role(self):
+        owed = mock.patch.object(vm_admit.Admission, "owed", lambda self, reason: (lambda: (True, "stand-in")))
+        prov = mock.patch.object(vm_admit.Admission, "check_agent_prov", lambda self: (True, "stand-in"))
+        for p in (owed, prov):
+            p.start()
+            self.addCleanup(p.stop)
+        rc, lines = self.admit("A2a")
+        self.assertEqual(rc, 0, lines)
+        files = self.vm.receipt["vms"]["vm1"]
+        self.assertIn(f" ovl={files['on_manifest_sha256']} ", lines[-1])
+        self.assertIn(f" role={files['role_sha256']} ", lines[-1])
+        self.assertEqual(files["role_sha256"], hashlib.sha256(self.f("m1-role.json").read_bytes()).hexdigest())
+
+
 class StdinTest(unittest.TestCase):
     """The delivery shape: one parameter line, then the program, on stdin to
     `python3 -I -S -B -`. On this (non-VM) machine every row fails; what is
     proven is the shape: rows, a FAIL last line, exit 1, never a crash."""
 
-    def run_stdin(self, header):
+    def program(self):
         # The delivery shape against a FIXTURE root, never this machine's /:
         # the program's ROOT line is pointed at an empty temp tree.
-        import subprocess
         root = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, root)
         body = (M1VM / "vm_admit.py").read_bytes().replace(b'ROOT = "/"\n', f'ROOT = "{root}"\n'.encode(), 1)
         self.assertIn(root.encode(), body)
-        return subprocess.run([sys.executable, "-I", "-S", "-B", "-"], input=header + body, capture_output=True)
+        return body
+
+    P = {"phase": "A1", "host": "H1", "att": "ATT-1", "prov": "b" * 64, "env": "none",
+         "exp": "none", "d7": "c" * 64, "dd": "d" * 64, "ctlr": "none", "accounts": ACCOUNTS,
+         "keys": KEYS, "state_uuid": STATE_UUID, "d_uuid": D_UUID, "man_sha256": "e" * 64}
+
+    def emitted(self, phase, receipt=None, **over):
+        """ADM's stdin as adm_stdin.build makes it, over the fixture-rooted program."""
+        body = self.program()
+        p = dict(self.P, phase=phase, adm=hashlib.sha256(body).hexdigest(), **over)
+        if phase not in ("A1", "A1r"):
+            p.update(env="e" * 64, exp="f" * 64, b6c_receipt_sha256=hashlib.sha256(receipt).hexdigest())
+        return adm_stdin.build(p, body, p["adm"], receipt)
+
+    def run_bytes(self, data):
+        import subprocess
+        return subprocess.run([sys.executable, "-I", "-S", "-B", "-"], input=data, capture_output=True)
 
     def test_params_line_then_program(self):
-        p = {"phase": "A1", "host": "H1", "att": "ATT-1", "adm": "a" * 64, "prov": "b" * 64, "env": "none",
-             "exp": "none", "ovl": "none", "d7": "c" * 64, "dd": "d" * 64, "ctlr": "none", "accounts": ACCOUNTS,
-             "keys": KEYS, "state_uuid": STATE_UUID, "d_uuid": D_UUID, "man_sha256": "e" * 64}
-        r = self.run_stdin(f"M1_ADM_PARAMS = {json.dumps(p)}\n".encode())
+        r = self.run_bytes(self.emitted("A1"))
         lines = r.stdout.decode().splitlines()
         self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
         self.assertTrue(lines[-1].startswith("VM-ADMIT A1 FAIL "), lines[-1:])
         self.assertTrue(all(l.startswith("CHECK A1 ") for l in lines[:-1]))
 
+    def test_receipt_line_from_a2a(self):
+        # A receipt with JSON true, an escaped quote and a non-ASCII escape:
+        # line 2 delivers its exact bytes, and the row reaches the receipt.
+        receipt = json.dumps({"preflight": {"x": True}, "q": "a\"b", "e": "\u00e9"}, sort_keys=True,
+                             separators=(",", ":"), ensure_ascii=True).encode() + b"\n"
+        r = self.run_bytes(self.emitted("A2a", receipt))
+        out = r.stdout.decode()
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        # Delivered exactly (its sha matched), then refused by the strict parse: it is no receipt.
+        self.assertIn("CHECK A2a role-and-o-n FAIL receipt: not exactly", out)
+        self.assertTrue(out.splitlines()[-1].startswith("VM-ADMIT A2a FAIL "))
+
     def test_bad_params_is_usage(self):
-        r = self.run_stdin(b'M1_ADM_PARAMS = {"phase": "A1"}\n')
+        for header in (b'M1_ADM_PARAMS_B64 = "' + base64.b64encode(b'{"phase": "A1"}') + b'"\n',
+                       b'M1_ADM_PARAMS_B64 = "' + base64.b64encode(b'{"phase":"A1","phase":"A1"}') + b'"\n',
+                       b'M1_ADM_PARAMS_B64 = "' + base64.b64encode(b'{"x":NaN}') + b'"\n',
+                       b'M1_ADM_PARAMS_B64 = "e30 "\n',  # whitespace in the base64
+                       b'M1_ADM_PARAMS_B64 = b"e30="\n',  # bytes, not a str
+                       b'M1_ADM_PARAMS = {"phase": "A1"}\n'):  # the retired line-1 form
+            with self.subTest(header):
+                r = self.run_bytes(header + self.program())
+                self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+                self.assertTrue(r.stdout.startswith(b"VM-ADMIT USAGE "), r.stdout)
+
+    def test_receipt_line_only_from_a2a(self):
+        a1 = self.emitted("A1")
+        extra = b'M1_ADM_RECEIPT_B64 = "' + base64.b64encode(RECEIPT) + b'"\n'
+        r = self.run_bytes(a1.replace(b"\n", b"\n" + extra, 1))
+        self.assertEqual(r.returncode, 2, r.stdout)
+        a2a = self.emitted("A2a", RECEIPT)
+        r = self.run_bytes(b"\n".join(l for l in a2a.split(b"\n") if not l.startswith(b"M1_ADM_RECEIPT_B64")))
         self.assertEqual(r.returncode, 2, r.stdout)
 
 

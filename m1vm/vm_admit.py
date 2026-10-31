@@ -4,29 +4,36 @@ Standard library only. Run on the VM as root through `<adm>`'s one sudo rule,
   sudo /usr/bin/python3 -I -S -B -
 
 with the program on stdin. The rule allows no arguments, so the operator's
-wrapper sends ONE parameter line first, then these bytes unchanged:
+emitter (adm_stdin.py) sends its inputs as Python lines first, each binding a
+str of padded standard base64 whose value is exact bytes (B6C d5.1 §2c.1),
+then these bytes unchanged:
 
-  M1_ADM_PARAMS = {...JSON...}
+  M1_ADM_PARAMS_B64 = "<base64 of the params JSON>"
+  M1_ADM_RECEIPT_B64 = "<base64 of DS's B6c receipt file>"     (A2a on only)
   <this file>
 
-and supplies `adm=` itself: the sha256 of this file's bytes, which it
-checked against the reviewed value before sending.
+The params carry `adm=`: the sha256 of this file's bytes, which the emitter
+checked against the reviewed value before sending. From A2a on they also
+carry `b6c_receipt_sha256`, the receipt's sha256.
 
 Every check prints one `CHECK <phase> <name> PASS|FAIL|UNKNOWN <detail>` row.
 UNKNOWN is never PASS. The LAST line is printed only when every row passed:
 
   VM-ADMIT <phase> PASS host= att= boot_id= adm= man= ovl= prov= env= exp= d7= dd= ctlr= role= utc=
 
-`utc=` is YYYY-MM-DDTHH:MM:SSZ; `boot_id=` is the kernel's lowercase UUID;
-`role=` is `none` on A1 and A1r. Otherwise the last line is
-`VM-ADMIT <phase> FAIL failed=<n> unknown=<n>`.
+`utc=` is YYYY-MM-DDTHH:MM:SSZ; `boot_id=` is the kernel's lowercase UUID.
+`ovl=` and `role=` are `none` on A1 and A1r; from A2a on they are ADM's own
+measurements of the installed O-n (the recomputed on_manifest_sha256) and of
+m1-role.json, printed only after role-and-o-n has verified them against the
+receipt. Otherwise the last line is `VM-ADMIT <phase> FAIL failed=<n> unknown=<n>`.
 
 This file holds the phase-independent checks (A1's identity, accounts, keys,
-sudoers, agent seal, mounts, MAN, HDOT, the socket ACL). The rows that bind
-DS's B6c pre-flight receipt (O-n, role manifest, router [1]'s fingerprint)
-and the running-router rows are added as their inputs are reviewed.
+sudoers, agent seal, mounts, MAN, HDOT, the socket ACL) and role-and-o-n
+(B6C d5.1 §2c-§2d, ROLE-MANIFEST-INTERFACE r3). The running-router rows are
+added as their inputs are reviewed.
 """
 
+import base64
 import errno
 import hashlib
 import json
@@ -60,8 +67,13 @@ _DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 # Every path is resolved under ROOT (the real `/`; tests point it at a tree).
 ROOT = "/"
 
-PARAM_KEYS = {"phase", "host", "att", "adm", "prov", "env", "exp", "ovl", "d7", "dd", "ctlr",
+PARAM_KEYS = {"phase", "host", "att", "adm", "prov", "env", "exp", "d7", "dd", "ctlr",
               "accounts", "keys", "state_uuid", "d_uuid", "man_sha256"}
+# From A2a on, also the sha256 of DS's B6c receipt (B6C d5 §2c.1).
+RECEIPT_KEY = "b6c_receipt_sha256"
+PARAMS_MAX = 1 << 16    # bytes of the params JSON
+RECEIPT_MAX = 1 << 20   # bytes of the receipt file (B6C d5 §2c.1)
+_B64 = re.compile(r"[A-Za-z0-9+/]*={0,2}\Z")
 
 
 class Unknown(Exception):
@@ -312,8 +324,10 @@ def run(argv):
 # ------------------------------------------------------------------ the record
 
 class Admission:
-    def __init__(self, params, runner=run):
+    def __init__(self, params, runner=run, receipt_b64=None):
         self.p = params
+        self.receipt_b64 = receipt_b64
+        self.ovl = self.role = None   # set only by a role-and-o-n PASS
         self.phase = params["phase"]
         self.runner = runner
         self.rows = []
@@ -614,7 +628,54 @@ class Admission:
         return not ids, f"{len(ids)} container(s)"
 
     def check_role_and_o_n(self):
-        raise Unknown("binds DS's B6c pre-flight receipt, not yet reviewed")
+        """B6C d5.1 §2c with ROLE r3: the receipt on line 2, the installed O-n
+        against this VM's entry, the role manifest against both and the guest,
+        and the policy digest from the installed router.json. Only a PASS sets
+        what the final line prints as ovl= and role=."""
+        try:
+            return self._role_and_o_n()
+        except ValueError as exc:
+            return False, str(exc)
+
+    def _role_and_o_n(self):
+        r = parse_receipt(receipt_from(self.receipt_b64, self.p[RECEIPT_KEY]))
+        man_sha, man = self.man()
+        co = man.get("checkouts", {}).get(DEPLOY_CHECKOUT, {}) if isinstance(man, dict) else {}
+        r1 = man.get("builds", {}).get("router1", {}) if isinstance(man, dict) else {}
+        _need(r["t0_manifest_sha256"] == man_sha, "receipt: t0_manifest_sha256 is not MAN's")
+        _need(isinstance(co, dict) and (r["deploy_commit"], r["deploy_tree"]) == (co.get("head"), co.get("tree")),
+              "receipt: deploy_commit or deploy_tree is not MAN's checkout")
+        _need(isinstance(r1, dict) and r["hop_pin"] == r1.get("commit"), "receipt: hop_pin is not MAN's router1")
+        mine = [e for e in r["vms"].values() if e["role"] == self.p["host"]]
+        _need(len(mine) == 1, f"receipt: not exactly one vms entry for {self.p['host']}")
+        e = mine[0]
+        other = next(o for o in r["vms"].values() if o is not e)
+        found, fixed = installed_on(self.phase)
+        _need(found == e["files"], "the installed O-n is not the receipt's files: "
+              + str(sorted(set(found) ^ set(e["files"]) or {k for k in found if found[k] != e["files"].get(k)})[:5]))
+        ovl = hashlib.sha256(canonical(found)).hexdigest()
+        _need(ovl == e["on_manifest_sha256"], "on_manifest_sha256 recomputed is not the receipt's")
+        role_sha = hashlib.sha256(fixed["m1-role.json"]).hexdigest()
+        _need(role_sha == e["role_sha256"], "m1-role.json is not role_sha256")
+        m = parse_role(fixed["m1-role.json"])
+        for k in ("role", "vm", "hostname", "fd", "own_domain"):
+            _need(m[k] == e[k], f"m1-role.json {k} is not the receipt's")
+        _need(m["role"] == self.p["host"], "m1-role.json role is not host=")
+        _need(m["fd"] != other["fd"] and m["own_domain"] != other["own_domain"], "fd or own_domain equals the other VM's")
+        _need(m["start"] == e["start"], "m1-role.json start is not the receipt's")
+        age, digest = policy_digest(fixed["router.json"])
+        _need(digest == m["fleet_policy_digest"], "fleet_policy_digest is not router.json's policy digest (ROLE r3)")
+        _need(m["fleet_policy_digest"] == r["fleet_artifact"]["digest"] == e["carried_digest"],
+              "fleet_policy_digest is not the receipt's artifact digest")
+        _need(age == r["v"] == e["router_min_sender_age_s"], "router.json min_sender_age_s is not the receipt's v")
+        feature = strict_json(fixed["feature.json"])
+        _need(isinstance(feature, dict) and feature.get("fleet_domain") == m["fd"], "feature.json fleet_domain is not fd")
+        etc = read_protected("/etc/hostname", 0, 0o644, "/").decode("ascii", "replace")
+        kernel = read_proc("sys/kernel/hostname", 256).decode("ascii", "replace")
+        _need(etc == m["hostname"] + "\n" and kernel == m["hostname"] + "\n",
+              f"the guest's hostname ({etc.strip()!r}, kernel {kernel.strip()!r}) is not the manifest's")
+        self.ovl, self.role = ovl, role_sha
+        return True, f"{len(found)} O-n files as the receipt; ovl={ovl} role={role_sha} digest={digest}"
 
     def owed(self, reason):
         def row():
@@ -693,7 +754,10 @@ class Admission:
         self.check("op-sandy-absent", self.check_op_sandy)
         # The rest of A1's row set (LC d3 §4.2, LC d8 §4.2, DS2 d8 §5), held
         # UNKNOWN until built, so A1 cannot PASS early (Opus ADM 2).
-        self.check("identity", self.owed("hostname, VM, role and domain vs the role manifest and meta-data"))
+        # role-and-o-n binds the manifest's role, vm, hostname (/etc and kernel), fd and own_domain to the
+        # receipt; these ROLE r3 (c) facts have no reviewed guest source yet.
+        self.check("identity", self.owed("meta-data local-hostname, ids vs MAN and passwd, and units vs D-UNITS "
+                                         "against the role manifest (ROLE r3 (c))"))
         self.check("machine-id", self.owed("machine-id and host keys distinct from the other VM (from PROV)"))
         self.check("auto-change-off", self.check_auto_change_off)
         self.check("packages", self.check_packages)
@@ -727,25 +791,320 @@ class Admission:
         if self.failed or self.unknown:
             return f"VM-ADMIT {self.phase} FAIL failed={self.failed} unknown={self.unknown}"
         p = self.p
-        role = "none"
+        # ovl= and role= are ADM's own measurements, set only by a role-and-o-n PASS (B6C d5.1 §2c.4).
+        ovl, role = (self.ovl, self.role) if self.phase not in ("A1", "A1r") else ("none", "none")
         return (f"VM-ADMIT {self.phase} PASS host={p['host']} att={p['att']} boot_id={self.boot_id()} adm={p['adm']} "
-                f"man={p['man_sha256']} ovl={p['ovl']} prov={p['prov']} env={p['env']} exp={p['exp']} d7={p['d7']} "
+                f"man={p['man_sha256']} ovl={ovl} prov={p['prov']} env={p['env']} exp={p['exp']} d7={p['d7']} "
                 f"dd={p['dd']} ctlr={p['ctlr']} role={role} utc={utc}")
 
 
+def b64_bytes(value, limit):
+    """The bytes VALUE encodes: a str of padded standard base64 (RFC 4648
+    §4), no whitespace, decoding to at most LIMIT bytes. ValueError otherwise."""
+    if not (isinstance(value, str) and _B64.match(value) and len(value) % 4 == 0
+            and len(value) <= 4 * -(-limit // 3)):
+        raise ValueError("not padded standard base64 within its bound")
+    data = base64.b64decode(value, validate=True)
+    if len(data) > limit:
+        raise ValueError(f"more than {limit} bytes")
+    return data
+
+
+def _no_duplicates(pairs):
+    keys = [k for k, _ in pairs]
+    if len(set(keys)) != len(keys):
+        raise ValueError("a duplicate key")
+    return dict(pairs)
+
+
+def _no_constant(name):
+    raise ValueError(f"{name} is not JSON")
+
+
+def strict_json(data):
+    """DATA (ASCII bytes) parsed as JSON: duplicate keys, NaN and Infinity refused."""
+    if not data.isascii():
+        raise ValueError("not ASCII")
+    return json.loads(data.decode("ascii"), object_pairs_hook=_no_duplicates, parse_constant=_no_constant)
+
+
+def params_from(value):
+    """Line 1, `M1_ADM_PARAMS_B64 = "<base64>"`: the params object."""
+    return strict_json(b64_bytes(value, PARAMS_MAX))
+
+
+def receipt_from(value, want_sha):
+    """Line 2, `M1_ADM_RECEIPT_B64 = "<base64>"` (B6C d5 §2c.1): the receipt
+    file's exact bytes, checked in the agreed order. ValueError otherwise."""
+    data = b64_bytes(value, RECEIPT_MAX)
+    if not data.isascii() or b"\r" in data or b"\0" in data:
+        raise ValueError("receipt: not ASCII, or holds a CR or NUL")
+    if data.count(b"\n") != 1 or not data.endswith(b"\n"):
+        raise ValueError("receipt: not exactly one line ending in LF")
+    if hashlib.sha256(data).hexdigest() != want_sha:
+        raise ValueError(f"receipt: sha256 is not {RECEIPT_KEY}")
+    return data
+
+
+# -- B6c receipt and the installed O-n (B6C d5.1 §2-§2d; ROLE r3 fold) ------
+
+FEATURE_ROOT = "/srv/m1-state/sandy/features/amap"
+FIXED = ("feature.json", "router.json", "m1-role.json", "deploy-overlay.json")
+F_REQUIRED = set(FIXED) | {"payload", "roster", "instances"}
+F_LATE = {"selected.json", ".selected"}   # sandy's, from the first launch (POST, 2ACC)
+SEAL_OWNER = (0, 0)                        # root:root (tests stand in their own ids)
+DEPLOY_CHECKOUT = "/opt/amap/src/amap-deploy-sandy"
+MAX_AGE = 31536000
+RECEIPT_TOP = {"schema", "deploy_commit", "deploy_tree", "hop_pin", "t0_manifest_sha256", "net_values_sha256",
+               "sandy_schema_version", "v", "fleet_artifact", "vms", "preflight"}
+ARTIFACT_KEYS = {"path", "sha256", "digest", "schema_v", "min_sender_age_s"}
+VM_KEYS = {"role", "vm", "hostname", "own_domain", "fd", "files", "on_manifest_sha256", "role_sha256",
+           "carried_digest", "router_min_sender_age_s", "start", "state_dir", "run_dir", "router_container"}
+START_KEYS = {"uid_1", "group_add", "config", "image", "name"}
+PREFLIGHT_KEYS = {"artifact_known_answer", "artifact_value_is_v", "v_in_range", "hop_pin_has_enrol",
+                  "deploy_commit_is_man", "deploy_tree_is_man", "hop_pin_is_man", "role_differ", "fd_differ",
+                  "own_domain_differ"} | {f"{k}_vm{n}" for n in (1, 2) for k in (
+                      "modes_match", "net_values_match", "manifest_is_receipt", "role_digest", "feature_value",
+                      "feature_fd", "router_value", "start_is_role", "container_is_start_name")}
+ROLE_KEYS = {"schema", "role", "vm", "hostname", "fd", "own_domain", "ids", "units", "fleet_policy_digest", "start"}
+ID_ROLES = {"op", "m1-admin", "adm", "uid-1", "uid-2", "registry"}
+_HEX40 = re.compile(r"[0-9a-f]{40}\Z")
+_DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+_HOSTNAME = re.compile(_LABEL + r"\Z")
+_DNS = re.compile(rf"{_LABEL}(?:\.{_LABEL})*\Z")
+_UNIT_NAME = re.compile(r"[A-Za-z0-9@._\\-]+\.[a-z]+\Z")
+
+
+def canonical(x):
+    """B6C d5.1 §2's canonical JSON bytes."""
+    return json.dumps(x, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode("ascii")
+
+
+def _need(ok, what):
+    if not ok:
+        raise ValueError(what)
+
+
+def _int(x, low=None, high=None):
+    return type(x) is int and (low is None or x >= low) and (high is None or x <= high)
+
+
+def _str(x, pattern=None):
+    return isinstance(x, str) and bool(x) and x.isascii() and x.isprintable() and (
+        pattern is None or pattern.match(x) is not None)
+
+
+def _abs_path(x):
+    return _str(x) and x.startswith("/") and not x.startswith("//") and os.path.normpath(x) == x
+
+
+def _dns(x):
+    return _str(x, _DNS) and len(x) <= 253
+
+
+def _closed(obj, keys, what):
+    _need(isinstance(obj, dict) and set(obj) == keys, f"{what}: not exactly {sorted(keys)}")
+
+
+def file_key(key):
+    """B6C d5.1 §2's key rules (relative, normalised, ASCII, inside F)."""
+    return (_str(key) and not key.startswith("/") and "\\" not in key
+            and all(c not in ("", ".", "..") for c in key.split("/")) and os.path.normpath(key) == key)
+
+
+def parse_start(st, what):
+    _closed(st, START_KEYS, what)
+    _need(_int(st["uid_1"], 1) and _int(st["group_add"], 1) and _abs_path(st["config"])
+          and _str(st["image"], _DIGEST) and _str(st["name"]), f"{what}: a field of the wrong form")
+
+
+def parse_receipt(data):
+    """B6C d5.1 §2b.1's strict parse of the receipt bytes (one line plus LF):
+    closed keys at every level, typed fields, every preflight key true, and
+    the bytes canonical. The receipt's own internal equalities are checked
+    too. ValueError otherwise."""
+    r = strict_json(data[:-1])
+    _closed(r, RECEIPT_TOP, "receipt")
+    _need(data[:-1] == canonical(r), "receipt: not in canonical form")
+    _need(r["schema"] == "amap-m1-b6c-receipt/1", "receipt: schema")
+    _need(all(_str(r[k], _HEX40) for k in ("deploy_commit", "deploy_tree", "hop_pin")), "receipt: a commit or tree")
+    _need(all(_str(r[k], _HEX64) for k in ("t0_manifest_sha256", "net_values_sha256")), "receipt: a sha256")
+    _need(_str(r["sandy_schema_version"], re.compile(r"[A-Za-z0-9._-]{1,32}\Z")), "receipt: sandy_schema_version")
+    _need(_int(r["v"], 0, MAX_AGE), "receipt: v")
+    a = r["fleet_artifact"]
+    _closed(a, ARTIFACT_KEYS, "fleet_artifact")
+    _need(a["path"] == "fleet-admission-policy.json" and _str(a["sha256"], _HEX64)
+          and a["digest"] == "sha256:" + a["sha256"] and a["schema_v"] == 1 and _int(a["schema_v"])
+          and _int(a["min_sender_age_s"], 0, MAX_AGE) and a["min_sender_age_s"] == r["v"], "fleet_artifact")
+    _closed(r["vms"], {"vm1", "vm2"}, "vms")
+    for n, role in (("vm1", "H1"), ("vm2", "H2")):
+        e = r["vms"][n]
+        _closed(e, VM_KEYS, f"vms.{n}")
+        _need(e["role"] == role, f"vms.{n}.role is not {role}")
+        _need(_str(e["vm"]) and _str(e["hostname"], _HOSTNAME) and _dns(e["own_domain"]) and _dns(e["fd"]),
+              f"vms.{n}: vm, hostname, own_domain or fd")
+        files = e["files"]
+        _need(isinstance(files, dict) and all(file_key(k) for k in files), f"vms.{n}.files: a key")
+        for k, v in files.items():
+            _closed(v, {"mode", "sha256"}, f"vms.{n}.files[{k}]")
+            _need(v["mode"] in ("0444", "0555") and _str(v["sha256"], _HEX64), f"vms.{n}.files[{k}]")
+        _need(set(FIXED) <= set(files) and all(k in FIXED or k.startswith("payload/") for k in files)
+              and any(k.startswith("payload/") for k in files), f"vms.{n}.files: not the fixed four plus payload/")
+        _need(all(files[k]["mode"] == "0444" for k in FIXED), f"vms.{n}.files: a fixed name not 0444")
+        _need(_str(e["on_manifest_sha256"], _HEX64)
+              and e["on_manifest_sha256"] == hashlib.sha256(canonical(files)).hexdigest(),
+              f"vms.{n}.on_manifest_sha256 is not its files")
+        _need(e["role_sha256"] == files["m1-role.json"]["sha256"], f"vms.{n}.role_sha256")
+        _need(_str(e["carried_digest"], _DIGEST) and _int(e["router_min_sender_age_s"], 0, MAX_AGE),
+              f"vms.{n}: carried_digest or router_min_sender_age_s")
+        parse_start(e["start"], f"vms.{n}.start")
+        _need(_abs_path(e["state_dir"]) and _abs_path(e["run_dir"]) and e["router_container"] == e["start"]["name"],
+              f"vms.{n}: state_dir, run_dir or router_container")
+    p = r["preflight"]
+    _closed(p, PREFLIGHT_KEYS, "preflight")
+    _need(all(v is True for v in p.values()), "preflight: a key not true")
+    return r
+
+
+def parse_role(data):
+    """ROLE-MANIFEST-INTERFACE r3's closed `amap-m1-role/1`. ValueError otherwise."""
+    m = strict_json(data)
+    _closed(m, ROLE_KEYS, "m1-role.json")
+    _need(m["schema"] == "amap-m1-role/1" and m["role"] in ("H1", "H2"), "m1-role.json: schema or role")
+    _need(_str(m["vm"]) and _str(m["hostname"], _HOSTNAME) and _dns(m["fd"]) and _dns(m["own_domain"]),
+          "m1-role.json: vm, hostname, fd or own_domain")
+    _closed(m["ids"], ID_ROLES, "m1-role.json ids")
+    _need(all(_int(v, 1) for v in m["ids"].values()), "m1-role.json: ids")
+    u = m["units"]
+    _need(isinstance(u, list) and all(_str(x, _UNIT_NAME) for x in u) and u == sorted(set(u)),
+          "m1-role.json: units not sorted, distinct unit names")
+    _need(_str(m["fleet_policy_digest"], _DIGEST), "m1-role.json: fleet_policy_digest")
+    parse_start(m["start"], "m1-role.json start")
+    return m
+
+
+def policy_digest(router_bytes):
+    """ROLE r3's comparand from the installed router.json: (X, RL's digest)."""
+    x = strict_json(router_bytes)
+    _need(isinstance(x, dict) and "min_sender_age_s" in x, "router.json: no top-level min_sender_age_s")
+    age = x["min_sender_age_s"]
+    _need(_int(age, 0, MAX_AGE), "router.json: min_sender_age_s not an int in 0..31536000")
+    body = json.dumps({"min_sender_age_s": age, "v": 1}, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False, allow_nan=False).encode("utf-8")
+    return age, "sha256:" + hashlib.sha256(body).hexdigest()
+
+
+def _sealed(st, what):
+    _need(stat.S_ISREG(st.st_mode) and st.st_nlink == 1 and (st.st_uid, st.st_gid) == SEAL_OWNER,
+          f"{what}: not a root:root regular file with one link")
+
+
+def _open_dir(path):
+    fd = os.open(ROOT, _DIR_FLAGS)
+    try:
+        for part in [x for x in path.split("/") if x]:
+            nfd = os.open(part, _DIR_FLAGS, dir_fd=fd)
+            os.close(fd)
+            fd = nfd
+    except OSError:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _hash_at(dfd, name, what, limit=None):
+    """(sha256, bytes or None, stat) of regular file NAME in DFD, never
+    following a link; bytes are kept (and bounded) only when LIMIT is given."""
+    lst = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+    _need(stat.S_ISREG(lst.st_mode), f"{what}: not a regular file")
+    ffd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, dir_fd=dfd)
+    try:
+        st = os.fstat(ffd)
+        _need((st.st_dev, st.st_ino) == (lst.st_dev, lst.st_ino), f"{what}: replaced while read")
+        h, kept, total = hashlib.sha256(), [], 0
+        while True:
+            chunk = os.read(ffd, 65536)
+            if not chunk:
+                break
+            total += len(chunk)
+            _need(limit is None or total <= limit, f"{what}: larger than 1 MiB")
+            h.update(chunk)
+            if limit is not None:
+                kept.append(chunk)
+        end = os.fstat(ffd)
+        _need((end.st_ino, end.st_size, end.st_mtime_ns) == (st.st_ino, total, st.st_mtime_ns),
+              f"{what}: changed while read")
+        return h.hexdigest(), (b"".join(kept) if limit is not None else None), st
+    finally:
+        os.close(ffd)
+
+
+def installed_on(phase):
+    """B6C d5.1 §2c.3-4: ({key: {mode, sha256}}, {fixed name: bytes}) of the
+    installed O-n under FEATURE_ROOT, with F's top level closed and the
+    payload walk exact. ValueError (or OSError) on any deviation."""
+    fd = _open_dir(FEATURE_ROOT)
+    found, fixed = {}, {}
+    try:
+        top = set(os.listdir(fd))
+        late = F_LATE & top
+        _need(top <= F_REQUIRED | F_LATE, f"F holds {sorted(top - F_REQUIRED - F_LATE)[:5]}, outside its closed set")
+        _need(F_REQUIRED <= top, f"F lacks {sorted(F_REQUIRED - top)}")
+        _need(not late or phase in ("POST", "2ACC"), f"F holds {sorted(late)} before the first launch")
+        for name in FIXED:
+            sha, data, st = _hash_at(fd, name, name, 1 << 20)
+            _sealed(st, name)
+            found[name] = {"mode": f"{stat.S_IMODE(st.st_mode):04o}", "sha256": sha}
+            fixed[name] = data
+        dirs = []
+
+        def walk(dfd, rel):
+            for name in sorted(os.listdir(dfd)):
+                sub = f"{rel}/{name}"
+                st = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+                if stat.S_ISDIR(st.st_mode):
+                    dirs.append(sub)
+                    nfd = os.open(name, _DIR_FLAGS, dir_fd=dfd)
+                    try:
+                        walk(nfd, sub)
+                    finally:
+                        os.close(nfd)
+                else:
+                    _need(stat.S_ISREG(st.st_mode), f"{sub}: neither a regular file nor a directory")
+                    sha, _, fst = _hash_at(dfd, name, sub)
+                    _sealed(fst, sub)
+                    found[sub] = {"mode": f"{stat.S_IMODE(fst.st_mode):04o}", "sha256": sha}
+        pfd = os.open("payload", _DIR_FLAGS, dir_fd=fd)
+        try:
+            walk(pfd, "payload")
+        finally:
+            os.close(pfd)
+    finally:
+        os.close(fd)
+    keys = [k for k in found if k.startswith("payload/")]
+    bare = [d for d in dirs if not any(k.startswith(d + "/") for k in keys)]
+    _need(not bare, f"{bare[:5]}: a directory that holds no listed file")
+    return found, fixed
+
+
 def validate_params(p):
-    if not isinstance(p, dict) or set(p) != PARAM_KEYS:
-        raise ValueError(f"M1_ADM_PARAMS must be exactly {sorted(PARAM_KEYS)}")
+    early = isinstance(p, dict) and p.get("phase") in ("A1", "A1r")
+    keys = PARAM_KEYS if early else PARAM_KEYS | {RECEIPT_KEY}
+    if not isinstance(p, dict) or set(p) != keys:
+        raise ValueError(f"params must be exactly {sorted(keys)}")
     if p["phase"] not in PHASES or p["host"] not in ("H1", "H2"):
         raise ValueError("phase or host")
+    if not early and not (isinstance(p[RECEIPT_KEY], str) and _HEX64.match(p[RECEIPT_KEY])):
+        raise ValueError(f"{RECEIPT_KEY}: 64 lowercase hex")
     for k in ("adm", "prov", "man_sha256"):
         if not isinstance(p[k], str) or not _HEX64.match(p[k]):
             raise ValueError(f"{k}: 64 lowercase hex")
-    for k in ("env", "exp", "ovl", "d7", "dd", "ctlr"):
+    for k in ("env", "exp", "d7", "dd", "ctlr"):
         if not (p[k] == "none" or (isinstance(p[k], str) and _HEX64.match(p[k]))):
             raise ValueError(f"{k}: 64 lowercase hex or none")
-    if p["phase"] in ("A1", "A1r") and any(p[k] != "none" for k in ("ovl", "env", "exp")):
-        raise ValueError("A1 and A1r carry ovl, env and exp as none")
+    if p["phase"] in ("A1", "A1r") and any(p[k] != "none" for k in ("env", "exp")):
+        raise ValueError("A1 and A1r carry env and exp as none")
     for k in ("state_uuid", "d_uuid"):
         if not isinstance(p[k], str) or not _UUID.match(p[k]):
             raise ValueError(f"{k}: a lowercase UUID")
@@ -767,13 +1126,16 @@ def validate_params(p):
         raise ValueError("keys: exactly {op, m1-admin, adm}, each a list of key lines")
 
 
-def main(params, runner=run, now=time.gmtime):
+def main(params, runner=run, now=time.gmtime, receipt_b64=None):
     try:
         validate_params(params)
+        early = params["phase"] in ("A1", "A1r")
+        if early != (receipt_b64 is None):
+            raise ValueError("line 2 (M1_ADM_RECEIPT_B64) is sent from A2a on, never on A1 or A1r")
     except ValueError as exc:
         print(f"VM-ADMIT USAGE {exc}")
         return 2
-    a = Admission(params, runner)
+    a = Admission(params, runner, receipt_b64)
     a.phase_rows()
     for row in a.rows:
         print(row)
@@ -786,9 +1148,20 @@ def main(params, runner=run, now=time.gmtime):
     return 0 if " PASS " in line else 1
 
 
+def entry(names):
+    """The program as `<adm>`'s rule runs it: line 1 (and from A2a line 2)
+    bound names in NAMES before this file's bytes."""
+    try:
+        params = params_from(names.get("M1_ADM_PARAMS_B64"))
+    except ValueError as exc:
+        print(f"VM-ADMIT USAGE M1_ADM_PARAMS_B64: {exc}")
+        return 2
+    return main(params, receipt_b64=names.get("M1_ADM_RECEIPT_B64"))
+
+
 if __name__ == "__main__":
     try:
-        sys.exit(main(globals()["M1_ADM_PARAMS"]))
+        sys.exit(entry(globals()))
     except Exception as exc:  # the guard: a crash never prints a PASS line
         print(f"internal-error {type(exc).__name__}")
         sys.exit(3)
