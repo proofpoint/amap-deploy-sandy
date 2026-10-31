@@ -851,6 +851,13 @@ sandy --exec --workspace "$WORKSPACE" -- python3 /opt/sandy/features/amap/codex/
 sandy --exec --workspace "$WORKSPACE" -- python3 /opt/sandy/features/amap/codex/transition prepare --thread "$THREAD" --apply
 ```
 
+If the installed native Codex build differs from the retained controller's
+build, add `--use-installed-codex-version` to both preparation commands. This
+explicitly measures `codex --version` and selects that build for the target.
+The retained previous controller and the journal keep their original identity
+until native adoption commits. A retry must select the same installed build;
+a failed or malformed version lookup refuses before writing transition state.
+
 Preparation takes the connector's controller and lane ownership, preserves
 `adapter-previous.toml`, durably records `adapter-transition.json` as `prepared`,
 then writes the target at its final `controller.toml` pathname. Original
