@@ -832,6 +832,20 @@ class AptCensusTest(BakeCase):
         self.run_bake()
 
 
+class ProxyCleanTest(BakeCase):
+    def test_every_proxy_setting_is_deleted_after_the_builds_and_before_man(self):
+        # NET's 208 user-data writes them; MAN must never record one (BAKE-BUILD-PROXY).
+        self.run_bake()
+        sandy_build = self.index(lambda a: a[:1] == ["runuser"])
+        man = self.index(lambda a: "man.py" in " ".join(a))
+        for path in ("/etc/apt/apt.conf.d/95m1-proxy", f"{bake.UNIT_DIR}/docker.service.d/m1-proxy.conf",
+                     "/home/op/.docker/config.json"):
+            with self.subTest(path):
+                removed = self.index(lambda a: a == ["rm", "-f", path])
+                self.assertLess(sandy_build, removed)
+                self.assertLess(removed, man)
+
+
 class StepFailTest(BakeCase):
     def test_breaks(self):
         breaks = {

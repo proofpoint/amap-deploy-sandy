@@ -648,7 +648,11 @@ def step_clean(pin, host):
     host.run(["docker", "builder", "prune", "--all", "--force"])
     # No `docker image prune`: it removes the untagged, digest-pulled bases MAN
     # names (Opus item 2 A2). assert-d's exact-set check catches any stray.
-    for path in ("/etc/apt/apt.conf.d/95m1-proxy", f"{UNIT_DIR}/docker.service.d/m1-proxy.conf"):
+    # NET's proxy settings: apt's, the daemon's (pulls), and <op>'s Docker
+    # client config, which gives sandy's RUN steps theirs (sandy forwards none;
+    # BAKE-BUILD-PROXY). The seal checks each absent (SS-14, SS-15, SS-18).
+    for path in ("/etc/apt/apt.conf.d/95m1-proxy", f"{UNIT_DIR}/docker.service.d/m1-proxy.conf",
+                 f"{pin['op_home']}/.docker/config.json"):
         host.run(["rm", "-f", path])
     host.run(["rm", "-rf", f"{pin['op_home']}/m1-bundles"])
 
