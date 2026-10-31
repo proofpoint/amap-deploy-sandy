@@ -259,17 +259,33 @@ def image_id(ref, runner):
     return out
 
 
+def package_state(abbrev):
+    """dpkg's ${db:Status-Abbrev} (desired, status, error flag) read as
+    "installed", "absent" or None (neither: half-installed, unpacked,
+    triggers pending, or an error flag). Desired is ignored, so a held
+    package (`hi `) is installed (Opus round9 (a)2)."""
+    if len(abbrev) != 3 or abbrev[2] != " ":
+        return None
+    return {"i": "installed", "n": "absent", "c": "absent"}.get(abbrev[1])
+
+
 def packages(runner):
-    """Installed packages only ("ii"), in the form ADM reads them back; a
-    removed package's leftover config state is not an installed package."""
+    """Every installed package, held ones included, in the form ADM reads
+    them back; a not-installed or config-files entry is skipped, and any
+    package in another state is a Fail."""
     out = {}
     for n, line in enumerate(runner([DPKG_QUERY, "-W", "-f", "${db:Status-Abbrev}\t${Package}\t${Version}\n"])
                              .splitlines(), 1):
         f = line.split("\t")
-        if len(f) != 3 or not f[1] or not f[2]:
+        if len(f) != 3 or not f[1]:
             raise Fail(f"dpkg-query: line {n} is not one package")
-        if not f[0].startswith("ii"):
+        state = package_state(f[0])
+        if state is None:
+            raise Fail(f"dpkg-query: {f[1]} is {f[0]!r}, neither installed nor absent")
+        if state == "absent":
             continue
+        if not f[2]:
+            raise Fail(f"dpkg-query: {f[1]} is installed with no version")
         if f[1] in out:
             raise Fail(f"dpkg-query: {f[1]} listed twice")
         out[f[1]] = f[2]

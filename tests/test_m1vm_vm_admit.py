@@ -90,7 +90,7 @@ class Vm:
         (sandy / ".base_build_hash").write_bytes(b"b\n")
         (sandy / ".base_build_hash").chmod(0o644)
         (r / "opt/amap").mkdir(parents=True)
-        self.man = {"schema": "m1vm-man/1", "images": {"m1-hop:pin": IMG}, "packages": {"docker-ce": "5:27.0.0-1"},
+        self.man = {"schema": "m1vm-man/1", "images": {"m1-hop:pin": IMG}, "packages": {"docker-ce": "5:27.0.0-1", "qemu-guest-agent": "1:8.2.2"},
                     "hdot": [{"name": ".base_build_hash", "mode": "0644", "sha256": hashlib.sha256(b"b\n").hexdigest()}],
                     "files": {"/etc/systemd/system/docker.socket.d/m1-acl.conf":
                               {"sha256": hashlib.sha256(DROPIN).hexdigest(), "mode": "0644", "uid": 0, "gid": 0}},
@@ -139,7 +139,9 @@ class Vm:
         if argv[:4] == ["/usr/bin/systemctl", "show", "-p", "UnitFileState"]:
             return 0, "".join("UnitFileState=masked\n" for _ in argv[5:])
         if argv[0] == "/usr/bin/dpkg-query" and "${db:Status-Abbrev}\t${Package}\t${Version}\n" in argv:
-            return 0, "ii \tdocker-ce\t5:27.0.0-1\nrc \tsnapd\t2.66\n"
+            return 0, "ii \tdocker-ce\t5:27.0.0-1\nhi \tqemu-guest-agent\t1:8.2.2\nrc \tsnapd\t2.66\n"
+        if argv == ["/usr/bin/dpkg-query", "-W", "-f", "${Status}", "systemd-coredump"]:
+            return 0, "install ok installed"
         if argv[0] == "/usr/bin/dpkg-query":
             return 1, ""
         if argv[:3] == ["/usr/bin/docker", "ps", "--all"]:
@@ -361,10 +363,6 @@ class ParamTest(AdmCase):
         rc, lines = self.admit()
         self.assertEqual(rc, 1)
         self.assertTrue(lines[-1].startswith("VM-ADMIT A1 FAIL "))
-
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class StdinTest(unittest.TestCase):
@@ -667,6 +665,25 @@ class Round7Test(AdmCase):
         sha = self.vm.write_man()
         self.assertIn("CHECK A1 systemd-tree UNKNOWN", self.lines(man_sha256=sha))
 
+    def test_coredump_and_dropins(self):
+        conf = self.vm.root / "etc/systemd/coredump.conf.d"
+        for name, brk in {
+                "systemd-coredump absent": lambda: self.vm.cmd.update(
+                    {"dpkg-query -W -f ${Status} systemd-coredump": (1, "")}),
+                "systemd-coredump config only": lambda: self.vm.cmd.update(
+                    {"dpkg-query -W -f ${Status} systemd-coredump": (0, "deinstall ok config-files")}),
+                "drop-in with more bytes": lambda: (conf / "m1.conf").write_text("[Coredump]\nStorage=none\nX=1\n"),
+                "a later drop-in": lambda: (conf / "zz.conf").write_text("[Coredump]\nStorage=external\n"),
+        }.items():
+            with self.subTest(name):
+                self.setUp()
+                conf = self.vm.root / "etc/systemd/coredump.conf.d"
+                brk()
+                self.assertIn("CHECK A1 auto-change-off FAIL", self.lines())
+        self.setUp()
+        self.vm.cmd["dpkg-query -W -f ${Status} systemd-coredump"] = (2, "")
+        self.assertIn("CHECK A1 auto-change-off UNKNOWN", self.lines())
+
     def test_dpkg_query_error_is_unknown(self):
         self.vm.cmd["dpkg-query -W -f ${Status} snapd"] = (2, "")
         self.assertIn("CHECK A1 auto-change-off UNKNOWN", self.lines())
@@ -691,11 +708,26 @@ class Round7Test(AdmCase):
 class PackagesTest(AdmCase):
     def test_packages_exact(self):
         self.assertNotIn("packages", self.failing())
-        for out in ("ii \tdocker-ce\t5:27.0.0-2\n", "ii \tdocker-ce\t5:27.0.0-1\nii \tcurl\t8\n", ""):
+        agent = "hi \tqemu-guest-agent\t1:8.2.2\n"
+        for out in ("ii \tdocker-ce\t5:27.0.0-2\n" + agent, "ii \tdocker-ce\t5:27.0.0-1\nii \tcurl\t8\n" + agent, "",
+                    "ii \tdocker-ce\t5:27.0.0-1\n",  # the held agent gone
+                    "ii \tdocker-ce\t5:27.0.0-1\nhi \tqemu-guest-agent\t1:9.9\n",  # held at another version
+                    "ii \tdocker-ce\t5:27.0.0-1\n" + agent + "iF \tcurl\t8\n",  # half-configured
+                    "ii \tdocker-ce\t5:27.0.0-1\n" + agent + "iiR\tcurl\t8\n",  # error flag
+                    "ii \tdocker-ce\t5:27.0.0-1\n" + agent + "ii \tdocker-ce\t5:27.0.0-1\n"):  # listed twice
             with self.subTest(out):
                 self.setUp()
                 self.vm.cmd["${db:Status-Abbrev}"] = (0, out)
                 self.assertIn("packages", self.failing())
+
+    def test_dpkg_error_is_unknown(self):
+        self.vm.cmd["${db:Status-Abbrev}"] = (2, "ii \tdocker-ce\t5:27.0.0-1\n")
+        self.assertIn("CHECK A1 packages UNKNOWN", "\n".join(self.admit()[1]))
+
+    def test_state_rule_is_m1_mans(self):
+        import man
+        for ab in ("ii ", "hi ", "rc ", "un ", "pn ", "iF ", "iU ", "iiR", "hH ", "it ", "iW ", "ii", "i", "ii  "):
+            self.assertEqual(vm_admit.package_state(ab), man.package_state(ab), ab)
 
     def test_remainder_keeps_a1_from_passing(self):
         owed = {n: mock.patch.object(vm_admit.Admission, n, lambda self: (True, "stand-in"))
@@ -714,3 +746,7 @@ class SharedConstantsTest(unittest.TestCase):
         self.assertEqual(vm_admit.QUIET_MASK, bake.QUIET_MASK)
         self.assertEqual(vm_admit.QUIET_REMOVE, bake.QUIET_REMOVE)
         self.assertEqual(vm_admit.UNIT_DIR, bake.UNIT_DIR)
+
+
+if __name__ == "__main__":
+    unittest.main()

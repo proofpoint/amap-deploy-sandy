@@ -35,7 +35,7 @@ def make_pin():
         "op_home": "/home/op",
         "apt": {"sources": ["deb [signed-by=/usr/share/keyrings/u.gpg] https://snapshot.example.org/ubuntu/20261030T000000Z noble main"],
                 "packages": {"docker-ce": "5:27.0.0-1", "git": "1:2.43.0-1", "acl": "2.3.2-1",
-                             "qemu-guest-agent": "1:8.2.2", "python3": "3.12.3-0"}},
+                             "qemu-guest-agent": "1:8.2.2", "python3": "3.12.3-0", "systemd-coredump": "255.4-1"}},
         "quiet": {"mask": ["unattended-upgrades.service", "apt-daily.timer", "apt-daily-upgrade.timer",
                            "motd-news.timer"], "remove": ["snapd", "apport"]},
         "docker": {"d_uuid": "11111111-2222-4333-8444-555555555555", "log_max_size": "10m", "log_max_file": 3},
@@ -81,6 +81,8 @@ class FakeHost:
         # UNIT_DIR as `find -printf '%P\t%y %m %u %g %l\0'` lists it; enable
         # adds what systemctl enable makes for a RequiredBy= unit in UNIT_DIR
         # (INFERRED from systemctl's documented behaviour, not measured).
+        self.enable_drops = []
+        self.fstab = "# /etc/fstab\nUUID=abc / ext4 defaults 0 1\n#/swap.img none swap sw 0 0\n"
         self.unit_dir = {"": "d 755 root root ", "m1-state-check.service": "f 644 root root ",
                          "srv-m1\\x2dstate.mount": "f 644 root root ", "var-lib-docker.mount": "f 644 root root "}
         self.enable_adds = {"local-fs.target.requires": "d 755 root root ", **{
@@ -88,6 +90,7 @@ class FakeHost:
             for u in ("srv-m1\\x2dstate.mount", "var-lib-docker.mount")}}
 
     def put(self, path, text, mode="0644", owner="root:root"):
+        self.log.append(["<put>", path])
         self.files[path] = (text, mode, owner)
 
     def run(self, argv, root=True, stdin=None, env=None):
@@ -100,8 +103,14 @@ class FakeHost:
                 return out
         a = argv
         if a[:2] == ["systemctl", "enable"]:
-            self.unit_dir.update(self.enable_adds)
+            # A link only for each unit named, as systemctl makes them.
+            self.unit_dir.update({k: v for k, v in self.enable_adds.items()
+                                  if not k.startswith("local-fs.target.requires/") or k.split("/", 1)[1] in a[2:]})
+            for k in self.enable_drops:
+                self.unit_dir.pop(k)
             return ""
+        if a == ["cat", "/etc/fstab"]:
+            return self.fstab
         if a[:2] == ["find", bake.UNIT_DIR]:
             if a[2:] != ["-printf", "%P\\t%y %m %u %g %l\\0"]:
                 raise AssertionError(f"unmodelled find {a[2:]!r}")
@@ -217,6 +226,7 @@ class PinTest(unittest.TestCase):
             "op_home space": lambda p: p.update(op_home="/home/o p"),
             "op_home nested": lambda p: p.update(op_home="/home/op/x"),
             "missing docker-ce pin": lambda p: p["apt"]["packages"].pop("docker-ce"),
+            "missing systemd-coredump pin": lambda p: p["apt"]["packages"].pop("systemd-coredump"),
             "bad version": lambda p: p["apt"]["packages"].update(git="1 2"),
             "non-deb source": lambda p: p["apt"].update(sources=["http://x"]),
             "unit name": lambda p: p["quiet"].update(mask=["rm -rf"]),
@@ -361,6 +371,12 @@ class SequenceTest(BakeCase):
         last_find = max(i for i, a in enumerate(self.host.log) if a[:2] == ["find", bake.UNIT_DIR])
         self.assertLess(last_find, man)
         self.assertIn("local-fs.target.requires/var-lib-docker.mount", self.host.unit_dir)
+
+    def test_dropin_dirs_made_first(self):
+        self.run_bake()
+        for d in ("/etc/systemd/journald.conf.d", "/etc/systemd/coredump.conf.d"):
+            made = self.index(lambda a: a == ["install", "-d", "-o", "root", "-g", "root", "-m", "0755", d])
+            self.assertLess(made, self.index(lambda a: a == ["<put>", f"{d}/m1.conf"]))
 
     def test_enable_with_requires_dir_already_present(self):
         self.host.unit_dir["local-fs.target.requires"] = "d 755 root root "
@@ -568,6 +584,14 @@ class StepFailTest(BakeCase):
                                      "enable: /etc/systemd/system changed beyond"),
             "enable changes a unit": (lambda h: h.enable_adds.update({"var-lib-docker.mount": "f 600 root root "}),
                                       "enable: /etc/systemd/system changed beyond"),
+            "enable removes an entry": (lambda h: h.enable_drops.append("m1-state-check.service"),
+                                        "enable: /etc/systemd/system changed beyond"),
+            "requires dir mode": (lambda h: h.enable_adds.update({"local-fs.target.requires": "d 775 root root "}),
+                                  "enable: /etc/systemd/system changed beyond"),
+            "fstab swap": (lambda h: setattr(h, "fstab", "UUID=abc / ext4 defaults 0 1\n/swap.img none swap sw 0 0\n"),
+                           "quiet: /etc/fstab activates swap"),
+            "enable command fails": (lambda h: h.over.update({"^systemctl enable": bake.BakeFail("systemctl enable: exit 1")}),
+                                     "enable: systemctl enable"),
             "command fails": (lambda h: h.over.update({"^docker pull": bake.BakeFail("docker pull: exit 1")}),
                               "images: docker pull"),
             "admin sudoers broader": (lambda h: h.over.update({"^sha256sum /etc/sudoers.d/m1-admin$":
@@ -624,10 +648,6 @@ class CliTest(unittest.TestCase):
             self.assertEqual(bake.main(["frob"]), 2)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class ProgramCheckTest(unittest.TestCase):
     """The rendered script's program check, run by the real sha256sum."""
 
@@ -650,3 +670,7 @@ class ProgramCheckTest(unittest.TestCase):
         self.assertNotEqual(self.check(script, d), 0)
         (Path(d) / "man.py").unlink()
         self.assertNotEqual(self.check(script, d), 0)
+
+
+if __name__ == "__main__":
+    unittest.main()

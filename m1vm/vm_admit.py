@@ -162,6 +162,15 @@ def read_protected(path, uid, mode, mount, limit=1 << 22):
     return data
 
 
+def package_state(abbrev):
+    """dpkg's ${db:Status-Abbrev} read as "installed", "absent" or None:
+    m1-man's rule (man.package_state), copied because ADM runs as one
+    program on stdin."""
+    if len(abbrev) != 3 or abbrev[2] != " ":
+        return None
+    return {"i": "installed", "n": "absent", "c": "absent"}.get(abbrev[1])
+
+
 def guest_tree(root):
     """{relpath: entry} of ROOT on the guest, in m1-man's `trees` form."""
     out = {}
@@ -462,6 +471,15 @@ class Admission:
         states = [l.partition("=")[2] for l in out.splitlines() if l.startswith("UnitFileState=")]
         if rc != 0 or states != ["masked"] * len(QUIET_MASK):
             return False, f"{list(QUIET_MASK)}: {states}"
+        # systemd-coredump installed, so Storage=none governs cores (Opus
+        # round9 (a)1); its answer also proves dpkg reads a database, so an
+        # rc 1 below is a package dpkg does not know, never a missing db
+        # (Opus round9 (b)8).
+        rc, out = self.runner(["/usr/bin/dpkg-query", "-W", "-f", "${Status}", "systemd-coredump"])
+        if rc not in (0, 1):
+            raise Unknown(f"dpkg-query systemd-coredump: rc {rc}")
+        if rc != 0 or out.strip() != "install ok installed":
+            return False, f"systemd-coredump is not installed: {out.strip()!r}"
         # Purged means unknown to dpkg (rc 1), or known only as not-installed
         # with no config files left (Codex round7 1). Any other rc is a dpkg
         # that did not answer (Opus round7 (b)3).
@@ -480,22 +498,36 @@ class Admission:
                            ("/etc/systemd/journald.conf.d/m1.conf", "[Journal]\nStorage=volatile\n")):
             if read_protected(path, 0, 0o644, "/") != text.encode("utf-8"):
                 return False, f"{path}: not the reviewed setting"
+            # m1.conf alone in its .d dir, so no later drop-in there overrides it
+            # (Opus round9 (b)5).
+            names = sorted(guest_tree(os.path.dirname(path)))
+            if names != [".", "m1.conf"]:
+                return False, f"{os.path.dirname(path)}: holds {names[1:6]}, not m1.conf alone"
         swaps = read_proc("swaps").decode("utf-8", "replace").splitlines()
         if len(swaps) != 1 or not swaps[0].startswith("Filename"):
             return False, f"swap is on: {swaps[1:3]}"
-        return True, f"{len(QUIET_MASK)} masked; {list(QUIET_REMOVE)} purged; coredump none; journal volatile; no swap"
+        return True, (f"{len(QUIET_MASK)} masked; {list(QUIET_REMOVE)} purged; systemd-coredump installed, "
+                      f"coredump none; journal volatile; no swap")
 
     def check_packages(self):
-        """Every installed package and version exactly MAN's (A1)."""
+        """Every installed package (held ones included) and version exactly
+        MAN's (A1); a package neither installed nor absent FAILs."""
         _, man = self.man()
         rc, out = self.runner(["/usr/bin/dpkg-query", "-W", "-f", "${db:Status-Abbrev}\t${Package}\t${Version}\n"])
         if rc != 0:
             raise Unknown("dpkg-query failed")
-        have = {}
+        have, odd = {}, []
         for line in out.splitlines():
             f = line.split("\t")
-            if len(f) == 3 and f[0].startswith("ii"):
+            state = package_state(f[0]) if len(f) == 3 and f[1] else None
+            if state is None:
+                odd.append(line)
+            elif state == "installed":
+                if f[1] in have:
+                    odd.append(line)
                 have[f[1]] = f[2]
+        if odd:
+            return False, f"neither installed nor absent: {odd[:4]}"
         want = man.get("packages")
         if not isinstance(want, dict) or not want:
             raise Unknown("MAN records no packages")

@@ -437,10 +437,6 @@ class CliTest(TreeCase):
                 self.assertEqual(self.cli(*args)[0], 2)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class RenderNetTest(unittest.TestCase):
     """render-net: NET's seal input, canonical bytes, no claims it lacks."""
 
@@ -492,3 +488,7 @@ class RenderNetTest(unittest.TestCase):
                               "--spec", str(SPEC_PATH), "--param", "op_user=op"], capture_output=True)
         self.assertEqual(bad.returncode, 2)
         self.assertEqual(bad.stdout, b"")
+
+
+if __name__ == "__main__":
+    unittest.main()

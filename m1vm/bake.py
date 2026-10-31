@@ -18,7 +18,8 @@ which is the `assert-d` step's result (named in sealspec.py's coverage note).
 Steps, in order:
   apt          the snapshot sources, then exactly PIN's package versions
   quiet        no automatic change: units masked, packages removed, journal
-               volatile, coredumps not stored, swap off
+               volatile, coredumps not stored (systemd-coredump pinned),
+               swap off and no swap line in /etc/fstab
   docker       daemon.json, the docker.service drop-in (RequiresMountsFor the
                D and state mounts), the docker.socket ACL drop-in for uid-1
   accounts     the Stage-U accounts checked, the baked accounts created with
@@ -121,7 +122,7 @@ def validate_pin(pin):
     _req(isinstance(apt["packages"], dict) and apt["packages"]
          and all(_PKG.match(k) and isinstance(v, str) and _VERSION.match(v) for k, v in apt["packages"].items()),
          "apt.packages: {name: version}")
-    for need in ("docker-ce", "git", "acl", "qemu-guest-agent", "python3"):
+    for need in ("docker-ce", "git", "acl", "qemu-guest-agent", "python3", "systemd-coredump"):
         _req(need in apt["packages"], f"apt.packages must pin {need}")
     quiet = pin["quiet"]
     _req(isinstance(quiet, dict) and set(quiet) == {"mask", "remove"}, "quiet: exactly {mask, remove}")
@@ -321,8 +322,15 @@ def step_quiet(pin, host):
     host.run(["systemctl", "mask", *pin["quiet"]["mask"]])
     if pin["quiet"]["remove"]:
         host.run([*APT_ENV, "apt-get", "purge", "-y", *pin["quiet"]["remove"]])
+    for d in ("/etc/systemd/journald.conf.d", "/etc/systemd/coredump.conf.d"):
+        host.run(["install", "-d", "-o", "root", "-g", "root", "-m", "0755", d])
     host.put("/etc/systemd/journald.conf.d/m1.conf", "[Journal]\nStorage=volatile\n")
     host.put("/etc/systemd/coredump.conf.d/m1.conf", "[Coredump]\nStorage=none\n")
+    # swapoff lasts one boot; an fstab swap line would return on every clone.
+    for line in host.run(["cat", "/etc/fstab"], root=False).splitlines():
+        f = line.split()
+        if len(f) >= 3 and not f[0].startswith("#") and f[2] == "swap":
+            raise BakeFail(f"quiet: /etc/fstab activates swap: {f[0]}")
     host.run(["swapoff", "-a"])
     if host.run(["swapon", "--show", "--noheadings"], root=False).strip():
         raise BakeFail("quiet: swap is still on")
@@ -649,25 +657,27 @@ def step_assert_d(pin, host, man_sha):
     return f"M1-BAKE PASS man={man_sha} ids={ids_sha} builder_cache=0"
 
 
+def run_step(name, fn, *args):
+    """FN(*ARGS) as step NAME: announced, and any failure prefixed `NAME: `."""
+    print(f"M1-BAKE STEP {name}", flush=True)
+    try:
+        return fn(*args)
+    except BakeFail as exc:
+        msg = str(exc)
+        raise BakeFail(msg if msg.startswith(f"{name}: ") else f"{name}: {msg}") from None
+
+
 def bake(pin, pin_sha, host):
     for name, step in (("mount-d", step_mount_d), ("apt", step_apt), ("quiet", step_quiet), ("docker", step_docker),
                        ("accounts", step_accounts), ("sources", step_sources), ("images", step_images),
                        ("programs", step_programs), ("bundle", step_bundle), ("units", step_units),
                        ("clean", step_clean)):
-        print(f"M1-BAKE STEP {name}", flush=True)
-        try:
-            step(pin, host)
-        except BakeFail as exc:
-            msg = str(exc)
-            raise BakeFail(msg if msg.startswith(f"{name}: ") else f"{name}: {msg}") from None
+        run_step(name, step, pin, host)
     # Enable before MAN, so MAN's UNIT_DIR tree holds enable's links (Opus
     # round7 (a)1). MAN writes its plan and MAN.json and changes no unit.
-    print("M1-BAKE STEP enable", flush=True)
-    step_enable(pin, host)
-    print("M1-BAKE STEP man", flush=True)
-    man_sha = step_man(pin, host, pin_sha)
-    print("M1-BAKE STEP assert-d", flush=True)
-    return step_assert_d(pin, host, man_sha)
+    run_step("enable", step_enable, pin, host)
+    man_sha = run_step("man", step_man, pin, host, pin_sha)
+    return run_step("assert-d", step_assert_d, pin, host, man_sha)
 
 
 # ------------------------------------------------------------------ the CLI

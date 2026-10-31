@@ -37,7 +37,9 @@ class Runner:
             "rev-parse HEAD^{commit}": HEAD + "\n",
             "rev-parse HEAD^{tree}": TREE + "\n",
             "image": IMAGE + "\n",
-            "dpkg": "ii \tdocker-ce\t5:27.0.0-1\nii \tpython3\t3.12.3-0\nrc \tsnapd\t2.66\n",
+            # bake holds the agent, so dpkg lists it `hi ` (Opus round9 (a)2, MEASURED there).
+            "dpkg": ("ii \tdocker-ce\t5:27.0.0-1\nii \tpython3\t3.12.3-0\nrc \tsnapd\t2.66\n"
+                     "hi \tqemu-guest-agent\t1:8.2.2\nun \tapport\t\n"),
         }
 
     def __call__(self, argv):
@@ -94,7 +96,8 @@ class BuildTest(ManCase):
         self.assertEqual((rec["mode"], rec["uid"]), ("0440", os.getuid()))
         self.assertEqual(m["checkouts"][str(self.repo)], {"head": HEAD, "tree": TREE})
         self.assertEqual(m["images"], {"amap-router-local:m1": IMAGE})
-        self.assertEqual(m["packages"], {"docker-ce": "5:27.0.0-1", "python3": "3.12.3-0"})
+        self.assertEqual(m["packages"], {"docker-ce": "5:27.0.0-1", "python3": "3.12.3-0",
+                                         "qemu-guest-agent": "1:8.2.2"})
         self.assertEqual(m["accounts"][ME]["uid"], os.getuid())
         self.assertIsInstance(m["accounts"][ME]["groups"], list)
 
@@ -179,6 +182,10 @@ class FailTest(ManCase):
             "duplicate package": (lambda: self.runner.out.update(dpkg="ii \ta\t1\nii \ta\t2\n"), "listed twice"),
             "malformed line": (lambda: self.runner.out.update(dpkg="ii a 1\n"), "not one package"),
             "no packages": (lambda: self.runner.out.update(dpkg=""), "no packages"),
+            "half-configured": (lambda: self.runner.out.update(dpkg="ii \ta\t1\niF \tb\t2\n"), "neither installed"),
+            "unpacked": (lambda: self.runner.out.update(dpkg="ii \ta\t1\niU \tb\t2\n"), "neither installed"),
+            "error flag": (lambda: self.runner.out.update(dpkg="ii \ta\t1\niiR\tb\t2\n"), "neither installed"),
+            "installed, no version": (lambda: self.runner.out.update(dpkg="ii \ta\t1\nii \tb\t\n"), "no version"),
             "unknown account": (lambda: self.plan.update(accounts=["nosuchaccount9"],
                                                          roles={r: "nosuchaccount9" for r in self.plan["roles"]}),
                                 "absent"),

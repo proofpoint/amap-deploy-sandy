@@ -220,10 +220,6 @@ class CliTest(unittest.TestCase):
         self.assertEqual(out.getvalue().splitlines()[-1], "M1-B6 b6d PASS")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class GraphTest(unittest.TestCase):
     """phase graph against `systemctl show` KEY=VALUE output (INFERRED form
     until 206; the property names are systemd's documented ones)."""
@@ -469,3 +465,7 @@ class EgressTest(unittest.TestCase):
         self.assertEqual(seen[0][:3], [b6.PYTHON, "-I", "-c"])
         self.assertEqual(seen[0][3], (M1VM / "net_probe_d94fe842.py").read_text())
         self.assertTrue(seen[0][3].endswith("\n"))
+
+
+if __name__ == "__main__":
+    unittest.main()
