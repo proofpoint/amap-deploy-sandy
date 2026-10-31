@@ -86,6 +86,8 @@ class FakeHost:
         self.bundle_scripts = []
         self.unmount_after = None
         self.cloned = []
+        self.builds = 0
+        self.clobber = False
         self.checkout_head = {}
         self.dirty = ""
         self.base_layers = list(BASE_LAYERS)
@@ -176,16 +178,20 @@ class FakeHost:
         if a[0] == "sha256sum":
             name = a[1].rsplit("/", 1)[1][:-len(".bundle")]
             return f"{self.pin['repos'][name]['bundle_sha256']}  {a[1]}\n"
-        if a[:2] == ["git", "clone"]:
-            self.cloned.append(a[-1])
+        if a[:2] == ["sh", "-c"] and a[3:4] == ["m1-checkout"]:
+            self.cloned.append(a[5])
+            return ""
+        if a[:2] == ["sh", "-c"] and a[3:4] == ["m1-build"]:
+            self.builds += 1
             return ""
         if a[:2] == ["git", "-C"] and a[2].startswith("/run/m1-bake/build-"):
+            # Fail closed unless the argv is exactly bake's: a wrong head, or a dirty tree.
             which = a[2].rsplit("-", 1)[1]
-            if "rev-parse" in a:
+            if a[3:] == ["rev-parse", "--verify", "HEAD^{commit}"]:
                 return self.checkout_head.get(which, self.pin[which]["commit"]) + "\n"
-            if "status" in a:
+            if a[3:] == ["status", "--porcelain", "--ignored", "--untracked-files=all"]:
                 return self.dirty
-            return ""
+            return H("0") + "\n" if "rev-parse" in a else "?? not-the-exact-argv\n"
         if a[:3] == ["docker", "image", "inspect"] and "RootFS" in a[4]:
             if a[5] == BASE:
                 return json.dumps(self.base_layers) + "\n"
@@ -204,6 +210,8 @@ class FakeHost:
             return ""
         if a[:3] == ["docker", "image", "inspect"]:
             if "revision" in a[4]:
+                if self.clobber and self.builds >= 2 and a[5] == self.pin["router1"]["image"]:
+                    return "\n"  # router2's steps replaced router1's image
                 return self.pin["router1"]["commit"] + "\n"
             return IMG1 + "\n"
         if a[:3] == ["docker", "image", "ls"]:
@@ -267,6 +275,20 @@ class PinTest(unittest.TestCase):
                                        p["router1"]["build"].update(env={"IMAGE": "amap-router-local:latest"}),
             "build escapes": lambda p: p["router1"]["build"].update(argv=["../x"]),
             "build absolute": lambda p: p["router1"]["build"].update(argv=["/usr/bin/docker", "build"]),
+            "build with --pull": lambda p: p["router2"]["build"].update(argv=["./docker/build.sh", "--pull"]),
+            "build with --pull=true": lambda p: p["router2"]["build"].update(argv=["./docker/build.sh", "--pull=true"]),
+            "label another commit": lambda p: p["router1"]["build"].update(
+                argv=["./docker/build.sh", "--label", "org.opencontainers.image.revision=" + H("0")]),
+            "env escape in argv[0]": lambda p: p["router1"]["build"].update(
+                argv=["./x=y", "IMAGE=evil:t", "/usr/bin/docker", "build", "--pull", "."]),
+            "another script": lambda p: p["router1"]["build"].update(argv=["./docker/other.sh"]),
+            "empty argv": lambda p: p["router1"]["build"].update(argv=[]),
+            "from tag is router1's image": lambda p: p["router2"]["build"]["from"].update(tag="m1-hop:pin"),
+            "from tag is its own image": lambda p: p["router1"]["build"]["from"].update(tag="m1-hop:pin"),
+            "from tag factory": lambda p: p["router1"]["build"]["from"].update(tag="amap-router-local:latest"),
+            "same image twice": lambda p: p["router2"].update(image="m1-hop:pin") or
+                                          p["router2"]["build"].update(env={"IMAGE": "m1-hop:pin"}),
+            "base_images a string": lambda p: p.update(base_images=BASE),
             "build a list (the old form)": lambda p: p["router1"].update(build=["./docker/build.sh"]),
             "build extra key": lambda p: p["router1"]["build"].update(umask="077"),
             "env another key": lambda p: p["router1"]["build"]["env"].update(PATH="/tmp"),
@@ -424,14 +446,18 @@ class SequenceTest(BakeCase):
         for which in ("router1", "router2"):
             b = self.pin[which]["build"]
             dest = f"/run/m1-bake/build-{which}"
-            clone = log.index(["git", "clone", "-q", "--no-checkout", "--local", f"{bake.SRC}/amap-router-local", dest])
-            checkout = log.index(["git", "-C", dest, "-c", "core.hooksPath=/dev/null", "checkout", "-q", "--detach",
-                                  self.pin[which]["commit"]])
+            checkout = log.index(["sh", "-c", 'umask 022 && git clone -q --no-checkout --local "$1" "$2" '
+                                  '&& git -C "$2" -c core.hooksPath=/dev/null checkout -q --detach "$3"',
+                                  "m1-checkout", f"{bake.SRC}/amap-router-local", dest, self.pin[which]["commit"]])
+            head = log.index(["git", "-C", dest, "rev-parse", "--verify", "HEAD^{commit}"])
+            status = log.index(["git", "-C", dest, "status", "--porcelain", "--ignored", "--untracked-files=all"])
             tag = [i for i, a in enumerate(log) if a == ["docker", "tag", BASE, "python:3.11-slim"]]
-            build = log.index(["sh", "-c", 'umask 022 && cd "$1" && shift && exec env "$@"', "m1-build", dest,
-                               f"IMAGE={b['env']['IMAGE']}", *b["argv"]])
-            self.assertLess(clone, checkout)
-            self.assertTrue(any(checkout < t < build for t in tag))
+            build = log.index(["sh", "-c", 'umask 022 && cd "$1" && IMAGE="$2" && export IMAGE && shift 2 && exec "$@"',
+                               "m1-build", dest, b["env"]["IMAGE"], *b["argv"]])
+            self.assertLess(checkout, head)
+            self.assertLess(head, build)
+            self.assertLess(status, build)
+            self.assertTrue(any(status < t < build for t in tag))
             self.assertIn(["rm", "-rf", dest], log[build:])
         # No export, and no build argv with --pull.
         self.assertFalse([a for a in log if "/run/m1-bake/export-" in " ".join(a)])
@@ -446,6 +472,7 @@ class SequenceTest(BakeCase):
                 "base without layers": (lambda h: setattr(h, "base_layers", []), "is not built on"),
                 "unreadable layers": (lambda h: h.over.update({"RootFS": "not json"}), "not readable"),
                 "layers not digests": (lambda h: setattr(h, "built_layers", ["x"]), "not sha256 digests"),
+                "router2 replaces router1's image": (lambda h: setattr(h, "clobber", True), "m1-hop:pin is labelled"),
         }.items():
             with self.subTest(name):
                 self.setUp()
