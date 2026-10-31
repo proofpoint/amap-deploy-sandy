@@ -243,6 +243,10 @@ class PinTest(unittest.TestCase):
     def test_valid(self):
         bake.validate_pin(make_pin())
 
+    def test_reviewed_router_values_fit_the_tag_form(self):
+        for v in ("amap-router-local-hop:6d104e70", "amap-router-email:f42aa0af3938", "python:3.11-slim"):
+            self.assertTrue(bake._LOCAL_TAG.fullmatch(v), v)
+
     def test_every_field_required(self):
         for key in make_pin():
             with self.subTest(key):
@@ -289,6 +293,20 @@ class PinTest(unittest.TestCase):
             "same image twice": lambda p: p["router2"].update(image="m1-hop:pin") or
                                           p["router2"]["build"].update(env={"IMAGE": "m1-hop:pin"}),
             "base_images a string": lambda p: p.update(base_images=BASE),
+            # ROUTER-BUILD-TAG-FORM: no qualified spelling of a local tag.
+            "output aliases router1's": lambda p: p["router2"].update(image="docker.io/library/m1-hop:pin") or
+                                                  p["router2"]["build"].update(env={"IMAGE": "docker.io/library/m1-hop:pin"}),
+            "from tag aliases an output": lambda p: p["router2"]["build"]["from"].update(tag="docker.io/library/m1-hop:pin"),
+            "factory by its long name": lambda p: p["router1"].update(image="docker.io/library/amap-router-local:latest") or
+                                                  p["router1"]["build"].update(env={"IMAGE": "docker.io/library/amap-router-local:latest"}),
+            "from tag in a namespace": lambda p: p["router1"]["build"]["from"].update(tag="library/python:3.11-slim"),
+            "image with a registry": lambda p: p["router1"].update(image="ghcr.io/x:1") or
+                                               p["router1"]["build"].update(env={"IMAGE": "ghcr.io/x:1"}),
+            "tagless image (means :latest)": lambda p: p["router1"].update(image="m1-hop") or
+                                                       p["router1"]["build"].update(env={"IMAGE": "m1-hop"}),
+            "tagless from tag": lambda p: p["router1"]["build"]["from"].update(tag="python"),
+            "tag starting with a dot": lambda p: p["router1"].update(image="m1-hop:.x") or
+                                                 p["router1"]["build"].update(env={"IMAGE": "m1-hop:.x"}),
             "build a list (the old form)": lambda p: p["router1"].update(build=["./docker/build.sh"]),
             "build extra key": lambda p: p["router1"]["build"].update(umask="077"),
             "env another key": lambda p: p["router1"]["build"]["env"].update(PATH="/tmp"),

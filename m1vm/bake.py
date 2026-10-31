@@ -73,7 +73,10 @@ _PKG = re.compile(r"[a-z0-9][a-z0-9+.-]+\Z")
 _VERSION = re.compile(r"[A-Za-z0-9.+~:-]+\Z")
 _UNIT = re.compile(r"[A-Za-z0-9@._-]+\.(service|timer|socket|path|target)\Z")
 _REPO = re.compile(r"[a-z0-9][a-z0-9-]*\Z")
-_IMAGE = re.compile(r"[a-z0-9][a-z0-9._/-]*:[A-Za-z0-9._-]+\Z")
+# A router image or FROM tag: one unqualified repository component and Docker's tag grammar, with no
+# registry, namespace or docker.io/library/ prefix, so no two spellings can name one tag
+# (ROUTER-BUILD-TAG-FORM).
+_LOCAL_TAG = re.compile(r"[a-z0-9][a-z0-9._-]*:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}\Z")
 _DIGEST_REF = re.compile(r"[a-z0-9][a-z0-9._/:-]*@sha256:[0-9a-f]{64}\Z")
 _KEY = re.compile(r"(ssh-ed25519|ecdsa-sha2-nistp256|ssh-rsa) [A-Za-z0-9+/=]+( [!-~]+)?\Z")
 _ID = re.compile(r"sha256:[0-9a-f]{64}\Z")
@@ -171,9 +174,9 @@ def validate_pin(pin):
     for which in ("router1", "router2"):
         r = pin[which]
         _req(isinstance(r, dict) and set(r) == {"repo", "commit", "image", "build"} and r["repo"] in repos
-             and _HEX40.match(r["commit"]) and _IMAGE.match(r["image"])
+             and _HEX40.match(r["commit"]) and isinstance(r["image"], str) and _LOCAL_TAG.fullmatch(r["image"])
              and not r["image"].startswith("amap-router-local:"), f"{which}: {{repo in repos, commit, image, build}}, "
-                                                                   "not the factory default name")
+                                                                   "image an unqualified name:tag, not the factory name")
         # The router's own build script, run in a clean checkout of its PIN commit, naming the image only
         # through IMAGE (its scripts take no tag argument), with the Dockerfile's FROM tag bound to a pinned
         # base digest (controller ruling (a) on the router build form).
@@ -187,7 +190,7 @@ def validate_pin(pin):
              f"{which}.build.argv: exactly {BUILD_SCRIPT}, optionally with --label {REVISION_LABEL}=<its commit>")
         _req(isinstance(pin.get("base_images"), list) and isinstance(b["from"], dict)
              and set(b["from"]) == {"tag", "ref"} and isinstance(b["from"]["tag"], str)
-             and _IMAGE.match(b["from"]["tag"]) and not b["from"]["tag"].startswith("amap-router-local:")
+             and _LOCAL_TAG.fullmatch(b["from"]["tag"]) and not b["from"]["tag"].startswith("amap-router-local:")
              and b["from"]["ref"] in pin["base_images"],
              f"{which}.build.from: exactly {{tag, ref}}, ref one of base_images, tag not the factory name")
     # The FROM tags never name a router's output, and the outputs differ, so one router's base tag or
