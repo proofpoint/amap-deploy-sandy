@@ -174,7 +174,9 @@ class AdmCase(unittest.TestCase):
                                now=lambda: (2026, 10, 31, 0, 0, 0, 4, 304, 0))
         return rc, out.getvalue().splitlines()
 
-    OWED = {"agent-prov", "systemd-tree", "role-and-o-n"}  # UNKNOWN by design until their inputs exist
+    OWED = {"agent-prov", "systemd-tree", "role-and-o-n", "identity", "machine-id", "auto-change-off",
+            "instances-empty", "enrolment-trees", "containers", "units-table", "clock", "router1", "router2",
+            "fingerprint"}  # UNKNOWN by design until their inputs exist
 
     def failing(self, phase="A1", owed=False, **over):
         _, lines = self.admit(phase, **over)
@@ -186,12 +188,14 @@ class PassTest(AdmCase):
     def test_a1_owes_two_rows(self):
         rc, lines = self.admit()
         self.assertEqual(rc, 1)
-        self.assertEqual(self.failing(owed=True), ["agent-prov", "systemd-tree"])
-        self.assertTrue(lines[-1].startswith("VM-ADMIT A1 FAIL failed=0 unknown=2"))
+        self.assertEqual(self.failing(owed=True), ["agent-prov", "auto-change-off", "identity", "machine-id",
+                                                    "systemd-tree"])
+        self.assertTrue(lines[-1].startswith("VM-ADMIT A1 FAIL failed=0 unknown=5"))
 
     def test_a1_pass_line(self):
         owed = {n: mock.patch.object(vm_admit.Admission, n, lambda self: (True, "stand-in"))
                 for n in ("check_agent_prov", "check_systemd_tree")}
+        owed["owed"] = mock.patch.object(vm_admit.Admission, "owed", lambda self, reason: (lambda: (True, "stand-in")))
         for p in owed.values():
             p.start()
             self.addCleanup(p.stop)
@@ -208,7 +212,7 @@ class PassTest(AdmCase):
         rc, lines = self.admit("A2a")
         self.assertEqual(rc, 1)
         self.assertIn("CHECK A2a role-and-o-n UNKNOWN", "\n".join(lines))
-        self.assertTrue(lines[-1].startswith("VM-ADMIT A2a FAIL failed=0 unknown=3"))
+        self.assertTrue(lines[-1].startswith("VM-ADMIT A2a FAIL failed=0 unknown=14"))
 
 
 class BreakTest(AdmCase):
@@ -252,8 +256,13 @@ class BreakTest(AdmCase):
             "agent active": (lambda: self.vm.cmd.update({"qemu-guest-agent.service":
                                                          (0, "ActiveState=active\nUnitFileState=masked\n")}),
                              "agent-sealed"),
-            "agent port held": (lambda: os.symlink(vm_admit.AGENT_PORT, self.vm.root / "proc/1/fd/3"),
+            "agent port held": (lambda: ((self.vm.root / "dev/virtio-ports").mkdir(parents=True),
+                                         (self.vm.root / "dev/vport2p1").write_text(""),
+                                         os.symlink("../vport2p1", self.vm.root / "dev/virtio-ports/org.qemu.guest_agent.0"),
+                                         # /proc shows the RESOLVED object, never the alias
+                                         os.symlink(self.vm.root / "dev/vport2p1", self.vm.root / "proc/1/fd/3")),
                                 "agent-sealed"),
+            "op sandy home on R": (lambda: (self.vm.root / "home/op/.sandy").mkdir(), "op-sandy-absent"),
             "docker not D": (lambda: self.vm.cmd.update({"--target /var/lib/docker": (0, STATE_UUID + "\n")}),
                              "mounts"),
             "op not in docker": (lambda: (self.vm.man["accounts"]["op"].update(groups=[]), self.vm.write_man()),
@@ -309,8 +318,13 @@ class StdinTest(unittest.TestCase):
     proven is the shape: rows, a FAIL last line, exit 1, never a crash."""
 
     def run_stdin(self, header):
+        # The delivery shape against a FIXTURE root, never this machine's /:
+        # the program's ROOT line is pointed at an empty temp tree.
         import subprocess
-        body = (M1VM / "vm_admit.py").read_bytes()
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root)
+        body = (M1VM / "vm_admit.py").read_bytes().replace(b'ROOT = "/"\n', f'ROOT = "{root}"\n'.encode(), 1)
+        self.assertIn(root.encode(), body)
         return subprocess.run([sys.executable, "-I", "-S", "-B", "-"], input=header + body, capture_output=True)
 
     def test_params_line_then_program(self):

@@ -309,21 +309,40 @@ class Admission:
         props = dict(l.split("=", 1) for l in out.splitlines() if "=" in l)
         if rc != 0 or props.get("ActiveState") != "inactive" or props.get("UnitFileState") != "masked":
             return False, f"systemctl: {props}"
+        # /proc shows the resolved device, never the alias, so compare the
+        # opened objects themselves: a character device by its rdev, anything
+        # else by (dev, ino) (Opus ADM 1). After agent=0 applies, the port is
+        # gone and nothing can hold it.
+        try:
+            port = os.stat(os.path.join(ROOT, AGENT_PORT.lstrip("/")))
+        except FileNotFoundError:
+            return True, "masked to /dev/null, inactive, and the port device is gone"
+
+        def same(st):
+            if stat.S_ISCHR(port.st_mode):
+                return stat.S_ISCHR(st.st_mode) and st.st_rdev == port.st_rdev
+            return (st.st_dev, st.st_ino) == (port.st_dev, port.st_ino)
         holders = []
         proc = os.path.join(ROOT, "proc")
         for pid in (d for d in os.listdir(proc) if d.isdigit()):
             try:
-                for fd in os.listdir(f"{proc}/{pid}/fd"):
-                    try:
-                        if os.readlink(f"{proc}/{pid}/fd/{fd}") == AGENT_PORT:
-                            holders.append(pid)
-                    except OSError:
-                        continue
+                fds = os.listdir(f"{proc}/{pid}/fd")
             except OSError:
                 continue
+            for fd in fds:
+                try:
+                    if same(os.stat(f"{proc}/{pid}/fd/{fd}")):
+                        holders.append(pid)
+                except OSError:
+                    continue
         if holders:
-            return False, f"{AGENT_PORT} held by pid(s) {holders}"
+            return False, f"{AGENT_PORT} held by pid(s) {sorted(set(holders))}"
         return True, "masked to /dev/null, inactive, port unheld"
+
+    def check_op_sandy(self):
+        """LC d8 §2.3: ~<op>/.sandy never exists (SANDY_HOME is on the state disk)."""
+        home = self.home_of(self.p["accounts"]["op"]["name"])
+        return self.check_absent(f"{home.rstrip('/')}/.sandy")()
 
     def check_agent_prov(self):
         raise Unknown("PROV-n agent_sealed / qm agent=0 not yet bound into the parameters")
@@ -333,6 +352,11 @@ class Admission:
 
     def check_role_and_o_n(self):
         raise Unknown("binds DS's B6c pre-flight receipt, not yet reviewed")
+
+    def owed(self, reason):
+        def row():
+            raise Unknown(reason)
+        return row
 
     def check_state_mount(self):
         rc, out = self.runner(["/usr/bin/findmnt", "-n", "-o", "UUID,SOURCE,FSTYPE", "--target", STATE])
@@ -403,11 +427,26 @@ class Admission:
         self.check("root-ssh-absent", self.check_absent("/root/.ssh"))
         self.check("bake-copy-absent", self.check_absent("/var/lib/m1-bake"))
         self.check("mounts", self.check_state_mount)
+        self.check("op-sandy-absent", self.check_op_sandy)
+        # The rest of A1's row set (LC d3 §4.2, LC d8 §4.2, DS2 d8 §5), held
+        # UNKNOWN until built, so A1 cannot PASS early (Opus ADM 2).
+        self.check("identity", self.owed("hostname, VM, role and domain vs the role manifest and meta-data"))
+        self.check("machine-id", self.owed("machine-id and host keys distinct from the other VM (from PROV)"))
+        self.check("auto-change-off", self.owed("unattended-upgrades/apt-daily/motd-news masked, snapd and apport absent"))
         if self.phase not in ("A1", "A1r"):
             self.check("hdot", self.check_hdot)
             self.check("images", self.check_images)
             self.check("socket-acl", self.check_socket_acl)
             self.check("role-and-o-n", self.check_role_and_o_n)
+            for name, reason in (("instances-empty", "the router's instances/ empty (A2a) or D-S's set (POST)"),
+                                 ("enrolment-trees", "the registry and identities trees against EXP-n and ENV-n"),
+                                 ("containers", "the closed container and volume sets for this phase"),
+                                 ("units-table", "DS r12 §7's unit table"),
+                                 ("clock", "time-sync on and the inter-VM skew within NET's bound"),
+                                 ("router1", "[1]'s delivered file vs the render; from A2b its nested health rule"),
+                                 ("router2", "[2]'s D7 vs the render and RE's validator; at 2ACC policy_reloaded"),
+                                 ("fingerprint", "router [1]'s capture rule (agreed with DS) against MAN's builds")):
+                self.check(name, self.owed(f"{reason}: not yet built"))
 
     def final_line(self, utc):
         if self.failed or self.unknown:
