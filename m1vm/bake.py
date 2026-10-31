@@ -16,7 +16,9 @@ exactly
 which is the `assert-d` step's result (named in sealspec.py's coverage note).
 
 Steps, in order:
-  apt          the snapshot sources, then exactly PIN's package versions
+  apt          the snapshot sources, the source census (exactly PIN's list and
+               ubuntu.sources at PIN's sha, no legacy list), then exactly
+               PIN's package versions
   quiet        no automatic change: units masked, packages removed, journal
                volatile, coredumps not stored (systemd-coredump pinned),
                swap off and no swap line in /etc/fstab
@@ -125,7 +127,10 @@ def validate_pin(pin):
     _req(isinstance(pin["op_home"], str) and re.fullmatch(r"/home/[a-z_][a-z0-9_-]{0,31}", pin["op_home"]),
          "op_home: /home/<a plain account name>, nothing a shell would read")
     apt = pin["apt"]
-    _req(isinstance(apt, dict) and set(apt) == {"sources", "packages"}, "apt: exactly {sources, packages}")
+    _req(isinstance(apt, dict) and set(apt) == {"sources", "packages", "ubuntu_sources_sha256"},
+         "apt: exactly {sources, packages, ubuntu_sources_sha256}")
+    _req(isinstance(apt["ubuntu_sources_sha256"], str) and _HEX64.match(apt["ubuntu_sources_sha256"]),
+         "apt.ubuntu_sources_sha256: the sha256 of NET's snapshot ubuntu.sources")
     _req(isinstance(apt["sources"], list) and apt["sources"]
          and all(isinstance(l, str) and l.startswith("deb ") and "\n" not in l for l in apt["sources"]),
          "apt.sources: deb lines")
@@ -318,9 +323,27 @@ def step_mount_d(pin, host):
 APT_ENV = ["env", "DEBIAN_FRONTEND=noninteractive", "NEEDRESTART_MODE=l", "NEEDRESTART_SUSPEND=1"]
 
 
+APT_DIR = "/etc/apt/sources.list.d"
+APT_SOURCES = ("m1-snapshot.list", "ubuntu.sources")
+
+
 def step_apt(pin, host):
-    host.put("/etc/apt/sources.list.d/m1-snapshot.list", "\n".join(pin["apt"]["sources"]) + "\n")
+    host.put(f"{APT_DIR}/m1-snapshot.list", "\n".join(pin["apt"]["sources"]) + "\n")
     host.run(["rm", "-f", "/etc/apt/sources.list"])
+    # The source census (PIN-RESIDUAL-3-CENSUS), before any fetch: apt reads
+    # every file in APT_DIR, so it holds exactly PIN's list and NET's snapshot
+    # ubuntu.sources, both regular files, and the legacy list is gone.
+    got = sorted(e for e in host.run(["find", APT_DIR, "-mindepth", "1", "-maxdepth", "1",
+                                      "-printf", "%y %f\\0"]).split("\0") if e)
+    want = sorted(f"f {n}" for n in APT_SOURCES)
+    if got != want:
+        raise BakeFail(f"apt: {APT_DIR} holds {got}, not exactly {want}")
+    have = host.run(["sha256sum", f"{APT_DIR}/ubuntu.sources"]).split()[0]
+    if have != pin["apt"]["ubuntu_sources_sha256"]:
+        raise BakeFail(f"apt: {APT_DIR}/ubuntu.sources is {have}, not PIN's {pin['apt']['ubuntu_sources_sha256']}")
+    if host.run(["find", "/etc/apt", "-mindepth", "1", "-maxdepth", "1", "-name", "sources.list",
+                 "-printf", "%y\\n"]).strip():
+        raise BakeFail("apt: /etc/apt/sources.list is still present")
     # needrestart only lists, never restarts: the guest agent (and anything
     # else) is not restarted under the bake (Opus item 2 B4).
     host.put("/etc/needrestart/conf.d/m1.conf", "$nrconf{restart} = 'l';\n")

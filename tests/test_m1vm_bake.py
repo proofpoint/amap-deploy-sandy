@@ -39,7 +39,8 @@ def make_pin():
         "op_home": "/home/op",
         "apt": {"sources": ["deb [signed-by=/usr/share/keyrings/u.gpg] https://snapshot.example.org/ubuntu/20261030T000000Z noble main"],
                 "packages": {"docker-ce": "5:27.0.0-1", "git": "1:2.43.0-1", "acl": "2.3.2-1",
-                             "qemu-guest-agent": "1:8.2.2", "python3": "3.12.3-0", "systemd-coredump": "255.4-1"}},
+                             "qemu-guest-agent": "1:8.2.2", "python3": "3.12.3-0", "systemd-coredump": "255.4-1"},
+                "ubuntu_sources_sha256": "5" * 64},
         "quiet": {"mask": ["unattended-upgrades.service", "apt-daily.timer", "apt-daily-upgrade.timer",
                            "motd-news.timer"], "remove": ["snapd", "apport"]},
         "docker": {"d_uuid": "11111111-2222-4333-8444-555555555555", "log_max_size": "10m", "log_max_file": 3},
@@ -102,6 +103,12 @@ class FakeHost:
         self.enable_adds = {"local-fs.target.requires": "d 755 root root ", **{
             f"local-fs.target.requires/{u}": f"l 777 root root {bake.UNIT_DIR}/{u}"
             for u in ("srv-m1\\x2dstate.mount", "var-lib-docker.mount")}}
+        # /etc/apt/sources.list.d as `find -printf '%y %f\0'` lists it once bake's
+        # list is written, ubuntu.sources' sha, and what `find /etc/apt -name
+        # sources.list` prints after bake's rm -f.
+        self.apt_dir = {"m1-snapshot.list": "f", "ubuntu.sources": "f"}
+        self.ubuntu_sources_sha = pin["apt"]["ubuntu_sources_sha256"]
+        self.legacy_list = ""
 
     def put(self, path, text, mode="0644", owner="root:root"):
         self.log.append(["<put>", path])
@@ -125,6 +132,16 @@ class FakeHost:
             return ""
         if a == ["cat", "/etc/fstab"]:
             return self.fstab
+        if a[:2] == ["find", bake.APT_DIR]:
+            if a[2:] != ["-mindepth", "1", "-maxdepth", "1", "-printf", "%y %f\\0"]:
+                raise AssertionError(f"unmodelled find {a[2:]!r}")
+            return "".join(f"{t} {n}\0" for n, t in sorted(self.apt_dir.items()))
+        if a[:2] == ["find", "/etc/apt"]:
+            if a[2:] != ["-mindepth", "1", "-maxdepth", "1", "-name", "sources.list", "-printf", "%y\\n"]:
+                raise AssertionError(f"unmodelled find {a[2:]!r}")
+            return self.legacy_list
+        if a == ["sha256sum", f"{bake.APT_DIR}/ubuntu.sources"]:
+            return f"{self.ubuntu_sources_sha}  {a[1]}\n"
         if a[:2] == ["find", bake.UNIT_DIR]:
             if a[2:] != ["-printf", "%P\\t%y %m %u %g %l\\0"]:
                 raise AssertionError(f"unmodelled find {a[2:]!r}")
@@ -267,6 +284,10 @@ class PinTest(unittest.TestCase):
             "missing systemd-coredump pin": lambda p: p["apt"]["packages"].pop("systemd-coredump"),
             "bad version": lambda p: p["apt"]["packages"].update(git="1 2"),
             "non-deb source": lambda p: p["apt"].update(sources=["http://x"]),
+            "no ubuntu.sources sha": lambda p: p["apt"].pop("ubuntu_sources_sha256"),
+            "short ubuntu.sources sha": lambda p: p["apt"].update(ubuntu_sources_sha256="5" * 63),
+            "uppercase ubuntu.sources sha": lambda p: p["apt"].update(ubuntu_sources_sha256="A" * 64),
+            "extra apt key": lambda p: p["apt"].update(keyring_sha256="5" * 64),
             "unit name": lambda p: p["quiet"].update(mask=["rm -rf"]),
             "low uid": lambda p: p["accounts"]["uid-1"].update(uid=20),
             "duplicate uid": lambda p: p["accounts"]["uid-2"].update(uid=2104),
@@ -631,6 +652,59 @@ class SequenceTest(BakeCase):
         plan = json.loads(self.host.files["/run/m1-bake/man-plan.json"][0])
         self.assertEqual(plan["builds"]["router1"], {"commit": H("d"), "tree": H("e"), "image": "m1-hop:pin"})
         self.assertEqual(plan["images"], sorted(["m1-hop:pin", "m1-hub:pin", self.pin["base_images"][0]]))
+
+
+class AptCensusTest(BakeCase):
+    """PIN-RESIDUAL-3-CENSUS: before any fetch, sources.list.d is exactly bake's
+    list and ubuntu.sources at PIN's sha, and the legacy list is gone."""
+
+    def fetches(self):
+        return [a for a in self.host.log if "apt-get" in a]
+
+    def test_census_runs_between_the_list_and_the_first_fetch(self):
+        self.run_bake()
+        written = self.index(lambda a: a == ["<put>", f"{bake.APT_DIR}/m1-snapshot.list"])
+        removed = self.index(lambda a: a == ["rm", "-f", "/etc/apt/sources.list"])
+        listed = self.index(lambda a: a[:2] == ["find", bake.APT_DIR])
+        hashed = self.index(lambda a: a == ["sha256sum", f"{bake.APT_DIR}/ubuntu.sources"])
+        legacy = self.index(lambda a: a[:2] == ["find", "/etc/apt"])
+        update = self.index(lambda a: a[:2] == ["apt-get", "update"])
+        first_fetch = min(i for i, a in enumerate(self.host.log) if "apt-get" in a)
+        self.assertEqual(update, first_fetch)
+        self.assertLess(written, listed)
+        self.assertLess(removed, legacy)
+        self.assertLess(max(listed, hashed, legacy), update)
+
+    def test_breaks(self):
+        breaks = {
+            "extra source file": (lambda h: h.apt_dir.update({"other.list": "f"}), "not exactly"),
+            "extra .sources file": (lambda h: h.apt_dir.update({"docker.sources": "f"}), "not exactly"),
+            "stray backup": (lambda h: h.apt_dir.update({"ubuntu.sources.curtin.orig": "f"}), "not exactly"),
+            "ubuntu.sources missing": (lambda h: h.apt_dir.pop("ubuntu.sources"), "not exactly"),
+            "ubuntu.sources a link": (lambda h: h.apt_dir.update({"ubuntu.sources": "l"}), "not exactly"),
+            "ubuntu.sources a directory": (lambda h: h.apt_dir.update({"ubuntu.sources": "d"}), "not exactly"),
+            "bake's list a link": (lambda h: h.apt_dir.update({"m1-snapshot.list": "l"}), "not exactly"),
+            "a subdirectory": (lambda h: h.apt_dir.update({"x": "d"}), "not exactly"),
+            "ubuntu.sources changed": (lambda h: setattr(h, "ubuntu_sources_sha", "6" * 64),
+                                       "ubuntu.sources is " + "6" * 64),
+            "legacy list left": (lambda h: setattr(h, "legacy_list", "f\n"), "/etc/apt/sources.list is still present"),
+            "legacy list a directory": (lambda h: setattr(h, "legacy_list", "d\n"), "/etc/apt/sources.list is still present"),
+        }
+        for name, (brk, needle) in breaks.items():
+            with self.subTest(name):
+                self.setUp()
+                brk(self.host)
+                with self.assertRaises(bake.BakeFail) as cm:
+                    self.run_bake()
+                self.assertTrue(str(cm.exception).startswith("apt: "), str(cm.exception))
+                self.assertIn(needle, str(cm.exception))
+                self.assertEqual(self.fetches(), [], "a fetch ran before the census refused")
+
+    def test_sha_compared_with_pin_not_a_constant(self):
+        # Witness: PIN carries another sha and the host's file has it; the census passes.
+        self.pin["apt"]["ubuntu_sources_sha256"] = "7" * 64
+        self.host.ubuntu_sources_sha = "7" * 64
+        self.run_bake()
 
 
 class StepFailTest(BakeCase):
