@@ -253,6 +253,18 @@ class OneMissingContainerIsOneFailureTest(FleetTestCase):
         self.assertIn(str(self.fleet.config), c.remedy)
         self.assertNotIn("amap-sandy", c.remedy, "verify starts nothing")
 
+    def test_the_absent_remedy_starts_the_image_verify_was_given(self):
+        """run.sh without --image starts whatever image carries its default
+        name, so the start names verify's own --image: two runs that differ
+        only in that flag give remedies that differ only there."""
+        got = []
+        for image in ("sha256:" + "c" * 64, "example.org/hop-router:abc"):
+            with self.subTest(image=image):
+                c = self.one(self._checks(self.proc(0, ""), self.ctx(image=image)), rh.CONTAINER_RUNNING)
+                self.assertIn(f" --image {image} --name {self.CONTAINER} --detach", c.remedy)
+                got.append(c.remedy)
+        self.assertEqual(got[0].replace("sha256:" + "c" * 64, "example.org/hop-router:abc"), got[1])
+
     def test_the_properties_of_a_container_that_is_not_there_are_unknown(self):
         cs = self._checks(self.proc(0, ""))
         posture = self.one(cs, rh.CONTAINER_POSTURE)

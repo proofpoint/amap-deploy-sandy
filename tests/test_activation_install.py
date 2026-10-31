@@ -432,14 +432,34 @@ class CommandTest(unittest.TestCase):
             lines.append(a4[0])
         self.assertEqual(lines[0].replace("c" * 64, "e" * 64).replace("router-a", "router-b"), lines[1])
 
+    def test_a5s_verify_line_names_the_image_and_container_a4_started(self):
+        """verify's router reads run the image and container it is given,
+        which default to run.sh's names, so A5's verify line names the router
+        section's image Id and container: the ones A4 started. Two documents
+        that differ only there print A5 lines that differ only there."""
+        from types import SimpleNamespace
+        self.verdict = (b'{"activated": true}\n', [])
+        lines = []
+        for digest, container in (("sha256:" + "c" * 64, "router-a"), ("sha256:" + "e" * 64, "router-b")):
+            self.spec.router = SimpleNamespace(container=container, image_digest=digest)
+            rc, _, _, err = self.install(self.args())
+            self.assertEqual(rc, 0, err)
+            a5 = [l for l in self.out.getvalue().splitlines() if "5. A5:" in l]
+            self.out.seek(0); self.out.truncate()
+            self.assertEqual(len(a5), 1, a5)
+            self.assertIn(f"amap-sandy.py verify --image {digest} --container {container};", a5[0])
+            lines.append(a5[0])
+        self.assertEqual(lines[0].replace("c" * 64, "e" * 64).replace("router-a", "router-b"), lines[1])
+
     def test_a_launchd_host_s_a5_step_names_verify_a5(self):
         """A5 on a launchd host is `verify --a5`; a systemd host's is plain
         verify, whose signing check must pass."""
         from types import SimpleNamespace
         self.verdict = (b'{"activated": true}\n', [])
-        for kind, want, never in (("launchd", "5. A5: python3 amap-sandy.py verify --a5;", None),
-                                  ("systemd", "5. A5: python3 amap-sandy.py verify; the signing check must PASS",
-                                   "--a5")):
+        named = f" --image sha256:{'c' * 64} --container router-a"
+        for kind, want, never in (("launchd", f"5. A5: python3 amap-sandy.py verify --a5{named};", None),
+                                  ("systemd", f"5. A5: python3 amap-sandy.py verify{named}; the signing check must "
+                                              "PASS", "--a5")):
             with self.subTest(kind=kind):
                 self.spec.supervision = SimpleNamespace(kind=kind)
                 rc, _, _, err = self.install(self.args())

@@ -1641,7 +1641,7 @@ def _start_checks(spec: Spec, *, lstat: Callable = os.lstat, digest: Callable[[s
         if live is hk.ASK:
             live = hk.ask_live_config(spec, hk.local_container(spec, spec.keys))
         out += hk.verify_start_delegation(spec.keys, live, k.get("read_bytes_", hk.read_bytes),
-                                          start_inputs(spec, policy_on, partition or {}))
+                                          start_inputs(spec, policy_on, partition or {}), router=spec.router)
         out += hk.verify_evidence_dir(spec.keys, lstat)
         out += hk.verify_evidence_binds(spec.keys, hk.ask_containers(spec) if k.get("containers", hr.ASK)
                                         is hr.ASK else k["containers"])

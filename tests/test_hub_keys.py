@@ -519,6 +519,41 @@ class VerifyTest(unittest.TestCase):
         self.assertEqual(self.claim(found, "byte for byte").result, rh.FAIL)
         self.assertEqual(self.claim(found, "signs exactly").result, rh.UNKNOWN)
 
+    def test_the_binding_remedy_starts_the_router_sections_image_by_id_and_its_container(self):
+        """run.sh without --image starts whatever image carries its default
+        name, so the binding's remedy names the router section's image Id and
+        container, through both checks that bind the config. Two sections
+        that differ only there give remedies that differ only there; with no
+        section the start names neither."""
+        from types import SimpleNamespace
+        for digest, container in (("sha256:" + "c" * 64, "router-a"), ("sha256:" + "e" * 64, "router-b")):
+            r = SimpleNamespace(image_digest=digest, container=container)
+            for name, found in (("no-delegation", hk.verify_no_delegation(self.k, (LOCAL, "b" * 64),
+                                                                          lambda p: b"{}", router=r)),
+                                ("start", hk.verify_start_delegation(self.k, (LOCAL, "b" * 64),
+                                                                     lambda p: b"{}", router=r))):
+                with self.subTest(section=container, check=name):
+                    c = self.claim(found, "byte for byte")
+                    self.assertEqual(c.result, rh.FAIL)
+                    self.assertIn(f"docker/run.sh --config {LOCAL} --image {digest} --name {container} --detach",
+                                  c.remedy)
+                    self.assertNotIn(hp.FACTORY_IMAGE + " ", c.remedy)
+        bare = self.claim(hk.verify_no_delegation(self.k, (LOCAL, "b" * 64), lambda p: b"{}"), "byte for byte")
+        self.assertIn(f"docker/run.sh --config {LOCAL}{hk.run_sh_flags(self.k)}, the file", bare.remedy)
+        self.assertNotIn("--image", bare.remedy)
+
+    def test_checks_hand_the_documents_router_section_to_the_binding_remedy(self):
+        """hub_keys.checks passes the spec's router section to the binding:
+        the remedy names that section's image Id, which nothing else in the
+        call carries."""
+        import dataclasses
+        from types import SimpleNamespace
+        self.spec = dataclasses.replace(self.spec, router=SimpleNamespace(image_digest="sha256:" + "d" * 64,
+                                                                          container="router-z"))
+        c = self.claim(self.run_checks(live=(LOCAL, "b" * 64)), "byte for byte")
+        self.assertEqual(c.result, rh.FAIL)
+        self.assertIn(f" --image sha256:{'d' * 64} --name router-z --detach", c.remedy)
+
     def test_the_bytes_hashed_are_the_bytes_judged(self):
         """A file replaced between two reads must not split the decision from
         the binding: one read is both hashed and parsed."""

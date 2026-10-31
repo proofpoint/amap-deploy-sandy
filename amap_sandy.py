@@ -3900,6 +3900,9 @@ def activation_sequence(spec: Any, source: str, final: bytes, path: Path, pre_ac
     file, the bind's source: a running single-file bind may still show the
     inode it was started with."""
     container = hk.local_container(spec, spec.keys)
+    # verify's router reads run the image and container it is given, which
+    # default to run.sh's names: A5 gives it the ones A4 started.
+    named = f" --image {spec.router.image_digest} --container {container}"
     final_sha = hashlib.sha256(final).hexdigest()
     pre = hashlib.sha256(pre_activation).hexdigest()
     return [
@@ -3908,10 +3911,10 @@ def activation_sequence(spec: Any, source: str, final: bytes, path: Path, pre_ac
         f"3. the host's {path} is byte for byte that file: sha256 {final_sha}",
         f"4. A4: restart the local router: docker/run.sh --config {path} --image {spec.router.image_digest} "
         f"--name {container} --detach{hk.run_sh_flags(spec.keys)}, from the hop checkout",
-        ("5. A5: python3 amap-sandy.py verify --a5; every check must PASS except the signing check's UNKNOWN for "
-         "the VM file share, which --a5 excuses only by its exact reason"
+        (f"5. A5: python3 amap-sandy.py verify --a5{named}; every check must PASS except the signing check's "
+         "UNKNOWN for the VM file share, which --a5 excuses only by its exact reason"
          if spec.supervision is not None and spec.supervision.kind == hv.KINDS[1] else
-         "5. A5: python3 amap-sandy.py verify; the signing check must PASS"),
+         f"5. A5: python3 amap-sandy.py verify{named}; the signing check must PASS"),
         f"if step 2, 3, 4 or 5 fails, back out in this order (pre-activation sha256 {pre}); stopping the "
         f"router first (docker stop {container}) shortens the time it may sign:",
         "B1. python3 amap-sandy.py install            (read the diff it prints)",

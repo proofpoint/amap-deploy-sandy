@@ -199,6 +199,15 @@ def run_sh_flags(ks: KeySpec) -> str:
     return "".join(f" --group-add {g}" for g in ks.group_add)
 
 
+def run_sh_start(ks: KeySpec, router: Any = None) -> str:
+    """The local router's run.sh start on `keys.local_config`. With the
+    host-setup document's router section, it names that image by its Id and
+    that container, as A4 does: without --image, run.sh starts whatever image
+    carries its default name. Without one, the start names neither."""
+    named = f" --image {router.image_digest} --name {router.container} --detach" if router is not None else ""
+    return f"docker/run.sh --config {ks.local_config}{named}{run_sh_flags(ks)}"
+
+
 # --- The probe ------------------------------------------------------------------
 
 
@@ -889,10 +898,11 @@ def ask_status(spec: Any, container: str) -> Any:
     return doc if isinstance(doc, dict) else rh.Unresolved(f"{container}'s status.json is not an object")
 
 
-def _bind(ks: KeySpec, live: Any, read_bytes_: Callable[[str], bytes]) -> Tuple[Any, rh.Check]:
+def _bind(ks: KeySpec, live: Any, read_bytes_: Callable[[str], bytes], router: Any = None) -> Tuple[Any, rh.Check]:
     """One read of `local_config` (its bytes, or an Unresolved) and the
     check that the running local router reads it byte for byte (`live`,
-    from inside its container)."""
+    from inside its container). `router` is the router section its remedy's
+    start names (`run_sh_start`)."""
     bind_claim = f"the local router reads {ks.local_config}, byte for byte the host's copy"
     try:
         raw: Any = read_bytes_(ks.local_config)
@@ -904,7 +914,7 @@ def _bind(ks: KeySpec, live: Any, read_bytes_: Callable[[str], bytes]) -> Tuple[
     bind_want = _fact("live config", (ks.local_config, host_sha if isinstance(host_sha, str) else None),
                       "keys.local_config, which install binds to the router.json it renders, and its bytes "
                       "on the host")
-    bind_remedy = (f"start the local router with docker/run.sh --config {ks.local_config}{run_sh_flags(ks)}, "
+    bind_remedy = (f"start the local router with {run_sh_start(ks, router)}, "
                    "the file install renders, and never a copy")
     if isinstance(host_sha, rh.Unresolved):
         return raw, rh.unknown(bind_claim, bind_want, host_sha.reason, "render and place the local router's config")
@@ -932,14 +942,16 @@ def static_verdict(doc: Dict[str, Any], sg: Signing) -> Tuple[str, str]:
 
 
 def verify_start_delegation(ks: KeySpec, live: Any = None, read_bytes_: Callable[[str], bytes] = read_bytes,
-                            signing: Optional[Signing] = None) -> List[rh.Check]:
+                            signing: Optional[Signing] = None, router: Any = None) -> List[rh.Check]:
     """The hub-link router's start gate on the local router's config: the
     router reads `local_config`, byte for byte, and that file carries no
     delegation block, or exactly A1's approved block with the static matrix
     holding (`static_verdict`, over `signing`'s real inputs). Without
     `signing`, any block is UNKNOWN. The adoption witness is verify's: the
-    hub-link router's start changes nothing the local router signs or reads."""
-    raw, bind = _bind(ks, live, read_bytes_)
+    hub-link router's start changes nothing the local router signs or reads.
+    `router` is the host-setup document's router section, which the
+    binding's remedy names."""
+    raw, bind = _bind(ks, live, read_bytes_, router)
     claim = START_CLAIM.format(path=ks.local_config)
     want = _fact("delegation", True, "the hub-link router starts beside a local router that signs nothing, or "
                                      "signs only as A1 approved under current passing evidence")
@@ -970,14 +982,15 @@ def verify_start_delegation(ks: KeySpec, live: Any = None, read_bytes_: Callable
 
 
 def verify_no_delegation(ks: KeySpec, live: Any = None,
-                         read_bytes_: Callable[[str], bytes] = read_bytes, signing: Optional[Signing] = None
-                         ) -> List[rh.Check]:
+                         read_bytes_: Callable[[str], bytes] = read_bytes, signing: Optional[Signing] = None,
+                         router: Any = None) -> List[rh.Check]:
     """The local router reads `local_config`, byte for byte (`live`, from
     inside its container), and signs exactly as the policy and the gate
     allow (`verify_signing`). One read of the file is both hashed and
-    judged, so the decision is about the bytes the binding compared."""
+    judged, so the decision is about the bytes the binding compared.
+    `router` is the router section the binding's remedy names."""
     out: List[rh.Check] = []
-    raw, bind = _bind(ks, live, read_bytes_)
+    raw, bind = _bind(ks, live, read_bytes_, router)
     out.append(bind)
     sg = signing or Signing(policy_on=rh.Unresolved("the policy was not read"),
                             gate_ok=rh.Unresolved("the harness gate was not read"),
@@ -1126,7 +1139,7 @@ def checks(spec: Any, ks: KeySpec, *, lstat: Callable = os.lstat, read_json_: Ca
            read_bytes_: Callable[[str], bytes] = read_bytes, signing: Optional[Signing] = None) -> List[rh.Check]:
     out = verify_placement(ks, lstat)
     out += verify_no_delegation(ks, ask_live_config(spec, local_container(spec, ks)) if live is ASK else live,
-                                read_bytes_, signing)
+                                read_bytes_, signing, router=getattr(spec, "router", None))
     out += verify_evidence_dir(ks, lstat)
     out += verify_evidence_binds(ks, ask_containers(spec) if containers is ASK else containers, stat_, realpath)
     out += verify_evidence(spec, ks, lstat, read_json_)
