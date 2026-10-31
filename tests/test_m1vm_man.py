@@ -184,6 +184,8 @@ class FailTest(ManCase):
             "no packages": (lambda: self.runner.out.update(dpkg=""), "no packages"),
             "half-configured": (lambda: self.runner.out.update(dpkg="ii \ta\t1\niF \tb\t2\n"), "neither installed"),
             "unpacked": (lambda: self.runner.out.update(dpkg="ii \ta\t1\niU \tb\t2\n"), "neither installed"),
+            "absent twice": (lambda: self.runner.out.update(dpkg="ii \ta\t1\nrc \tb\t2\nun \tb\t\n"), "listed twice"),
+            "installed and absent": (lambda: self.runner.out.update(dpkg="ii \ta\t1\nrc \ta\t1\n"), "listed twice"),
             "error flag": (lambda: self.runner.out.update(dpkg="ii \ta\t1\niiR\tb\t2\n"), "neither installed"),
             "installed, no version": (lambda: self.runner.out.update(dpkg="ii \ta\t1\nii \tb\t\n"), "no version"),
             "unknown account": (lambda: self.plan.update(accounts=["nosuchaccount9"],

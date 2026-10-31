@@ -144,6 +144,13 @@ class Vm:
             return 0, "install ok installed"
         if argv[0] == "/usr/bin/dpkg-query":
             return 1, ""
+        if argv[:2] == ["/usr/bin/systemd-analyze", "cat-config"]:
+            # The documented form: each file under a `# <path>` comment, in merge order.
+            sec, val = {"systemd/journald.conf": ("Journal", "volatile"),
+                        "systemd/coredump.conf": ("Coredump", "none")}[argv[2]]
+            name = argv[2].split("/")[1]
+            return 0, (f"# /etc/{argv[2]}\n[{sec}]\n#Storage=auto\n\n"
+                       f"# /etc/systemd/{name}.d/m1.conf\n[{sec}]\nStorage={val}\n")
         if argv[:3] == ["/usr/bin/docker", "ps", "--all"]:
             return 0, ""
         if "qemu-guest-agent.service" in argv:
@@ -674,6 +681,17 @@ class Round7Test(AdmCase):
                     {"dpkg-query -W -f ${Status} systemd-coredump": (0, "deinstall ok config-files")}),
                 "drop-in with more bytes": lambda: (conf / "m1.conf").write_text("[Coredump]\nStorage=none\nX=1\n"),
                 "a later drop-in": lambda: (conf / "zz.conf").write_text("[Coredump]\nStorage=external\n"),
+                "systemd-coredump unknown to dpkg": lambda: self.vm.cmd.update(
+                    {"dpkg-query -W -f ${Status} systemd-coredump": (0, "unknown ok not-installed")}),
+                "a second journald drop-in": lambda: (self.vm.root / "etc/systemd/journald.conf.d/00-x.conf")
+                .write_text("[Journal]\nStorage=volatile\n"),
+                "overridden from /run": lambda: self.vm.cmd.update({"cat-config systemd/coredump.conf": (0,
+                    "# /etc/systemd/coredump.conf\n[Coredump]\n\n# /etc/systemd/coredump.conf.d/m1.conf\n"
+                    "[Coredump]\nStorage=none\n\n# /run/systemd/coredump.conf.d/zz.conf\n[Coredump]\n"
+                    "Storage=external\n")}),
+                "set in another section": lambda: self.vm.cmd.update({"cat-config systemd/journald.conf": (0,
+                    "# /etc/systemd/journald.conf\n[Journal]\n#Storage=auto\n[Other]\nStorage=volatile\n")}),
+                "never set": lambda: self.vm.cmd.update({"cat-config systemd/journald.conf": (0, "[Journal]\n")}),
         }.items():
             with self.subTest(name):
                 self.setUp()
@@ -683,6 +701,11 @@ class Round7Test(AdmCase):
         self.setUp()
         self.vm.cmd["dpkg-query -W -f ${Status} systemd-coredump"] = (2, "")
         self.assertIn("CHECK A1 auto-change-off UNKNOWN", self.lines())
+        self.setUp()
+        self.vm.cmd["cat-config systemd/journald.conf"] = (1, "")
+        self.assertIn("CHECK A1 auto-change-off UNKNOWN", self.lines())
+        self.setUp()
+        self.assertIn("CHECK A1 auto-change-off PASS", self.lines())
 
     def test_dpkg_query_error_is_unknown(self):
         self.vm.cmd["dpkg-query -W -f ${Status} snapd"] = (2, "")
@@ -714,7 +737,8 @@ class PackagesTest(AdmCase):
                     "ii \tdocker-ce\t5:27.0.0-1\nhi \tqemu-guest-agent\t1:9.9\n",  # held at another version
                     "ii \tdocker-ce\t5:27.0.0-1\n" + agent + "iF \tcurl\t8\n",  # half-configured
                     "ii \tdocker-ce\t5:27.0.0-1\n" + agent + "iiR\tcurl\t8\n",  # error flag
-                    "ii \tdocker-ce\t5:27.0.0-1\n" + agent + "ii \tdocker-ce\t5:27.0.0-1\n"):  # listed twice
+                    "ii \tdocker-ce\t5:27.0.0-1\n" + agent + "ii \tdocker-ce\t5:27.0.0-1\n",  # listed twice
+                    "ii \tdocker-ce\t5:27.0.0-1\n" + agent + "rc \tsnapd\t1\nun \tsnapd\t\n"):  # absent twice
             with self.subTest(out):
                 self.setUp()
                 self.vm.cmd["${db:Status-Abbrev}"] = (0, out)

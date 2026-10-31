@@ -162,6 +162,28 @@ def read_protected(path, uid, mode, mount, limit=1 << 22):
     return data
 
 
+def effective(runner, conf, section, key):
+    """The last value of KEY in [SECTION] of `systemd-analyze cat-config
+    CONF`, which prints the main file and every drop-in in the order
+    systemd applies them (form INFERRED from systemd's documentation until
+    the native control); None if KEY is never set. A command failure is
+    Unknown."""
+    rc, out = runner(["/usr/bin/systemd-analyze", "cat-config", conf])
+    if rc != 0:
+        raise Unknown(f"systemd-analyze cat-config {conf}: rc {rc}")
+    value, current = None, None
+    for line in out.splitlines():
+        line = line.strip()
+        # A comment ("#" or ";") never parses as KEY= or [SECTION].
+        if line.startswith("[") and line.endswith("]"):
+            current = line[1:-1]
+        elif current == section:
+            name, sep, val = line.partition("=")
+            if sep and name.strip() == key:
+                value = val.strip()
+    return value
+
+
 def package_state(abbrev):
     """dpkg's ${db:Status-Abbrev} read as "installed", "absent" or None:
     m1-man's rule (man.package_state), copied because ADM runs as one
@@ -494,8 +516,11 @@ class Admission:
             return False, f"not purged: {present}"
         # DS2 d8 §1.1 step 2's other three: coredumps not stored, the journal
         # volatile, swap off.
-        for path, text in (("/etc/systemd/coredump.conf.d/m1.conf", "[Coredump]\nStorage=none\n"),
-                           ("/etc/systemd/journald.conf.d/m1.conf", "[Journal]\nStorage=volatile\n")):
+        for path, text, conf, section, want in (
+                ("/etc/systemd/coredump.conf.d/m1.conf", "[Coredump]\nStorage=none\n",
+                 "systemd/coredump.conf", "Coredump", "none"),
+                ("/etc/systemd/journald.conf.d/m1.conf", "[Journal]\nStorage=volatile\n",
+                 "systemd/journald.conf", "Journal", "volatile")):
             if read_protected(path, 0, 0o644, "/") != text.encode("utf-8"):
                 return False, f"{path}: not the reviewed setting"
             # m1.conf alone in its .d dir, so no later drop-in there overrides it
@@ -503,6 +528,13 @@ class Admission:
             names = sorted(guest_tree(os.path.dirname(path)))
             if names != [".", "m1.conf"]:
                 return False, f"{os.path.dirname(path)}: holds {names[1:6]}, not m1.conf alone"
+            # The setting in effect across every config dir (/etc, /run,
+            # /usr/local/lib, /usr/lib), in systemd's own merge order: a
+            # later drop-in elsewhere would override m1.conf (Opus round10
+            # (b)2, Codex round10).
+            have = effective(self.runner, conf, section, "Storage")
+            if have != want:
+                return False, f"{conf}: Storage in effect is {have!r}, not {want}"
         swaps = read_proc("swaps").decode("utf-8", "replace").splitlines()
         if len(swaps) != 1 or not swaps[0].startswith("Filename"):
             return False, f"swap is on: {swaps[1:3]}"
@@ -516,18 +548,19 @@ class Admission:
         rc, out = self.runner(["/usr/bin/dpkg-query", "-W", "-f", "${db:Status-Abbrev}\t${Package}\t${Version}\n"])
         if rc != 0:
             raise Unknown("dpkg-query failed")
-        have, odd = {}, []
+        have, seen, odd = {}, set(), []
         for line in out.splitlines():
             f = line.split("\t")
             state = package_state(f[0]) if len(f) == 3 and f[1] else None
-            if state is None:
+            # A name twice, in any state, is refused (Codex round10).
+            if state is None or f[1] in seen:
                 odd.append(line)
-            elif state == "installed":
-                if f[1] in have:
-                    odd.append(line)
+                continue
+            seen.add(f[1])
+            if state == "installed":
                 have[f[1]] = f[2]
         if odd:
-            return False, f"neither installed nor absent: {odd[:4]}"
+            return False, f"neither installed nor absent, or listed twice: {odd[:4]}"
         want = man.get("packages")
         if not isinstance(want, dict) or not want:
             raise Unknown("MAN records no packages")
