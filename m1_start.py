@@ -20,7 +20,9 @@ It refuses unless:
     equals the sha256 of the record named for it;
   - the PSR receipt parses exactly as NET's closed `PSR v1` grammar
     (PSR-GRAMMAR-v1, FROZEN): 33 lines in a fixed order, the 25 items in
-    their fixed order, its `ctlr` line equal to the go's ctlr=, its `result`
+    their fixed order, each item MATCH exactly when its observed and
+    reference shas are equal, each vmN render referenced to its clone item's
+    observed sha, its `ctlr` line equal to the go's ctlr=, its `result`
     equal to the result re-derived from the items and `prewindow_acceptance`,
     and that result PASS;
   - psr_recheck= appears only on the later go, exactly when --psr-recheck is
@@ -85,7 +87,11 @@ PSR_ITEMS = (
 _PSR_SHA_LINE = re.compile(r"psr ([0-9a-f]{64})")
 _CTLR_LINE = re.compile(r"ctlr ([0-9a-f]{64})")
 _CLONE_HEAD = re.compile(r"clone_head [0-9a-f]{40}")
-_ITEM = re.compile(r"item ([a-z0-9_.-]+) [0-9a-f]{64} [0-9a-f]{64} (MATCH|DIFF)")
+_ITEM = re.compile(r"item ([a-z0-9_.-]+) ([0-9a-f]{64}) ([0-9a-f]{64}) (MATCH|DIFF)")
+#: Grammar §3: each vmN render's ref is the observed sha of its clone item.
+PSR_RENDER_REFS = tuple((f"vm{n}.{render}", clone) for n in (1, 2) for render, clone in (
+    ("mailhub-d7-m1.json", "clone.mailhub-d7-m1.json"),
+    ("delivered_domains_file", f"clone.delivered-domains.vm{n}")))
 _LOGIN = r"router@[a-z0-9-]+\.hosts\.internal"
 _USERS_X = re.compile(rf"users_x (-|{_LOGIN}(?:,{_LOGIN})?)")
 _PREWINDOW = re.compile(r"prewindow_acceptance (PASS|FAIL) [0-9a-f]{64}")
@@ -124,22 +130,48 @@ def parse_go(text: str) -> Dict[str, str]:
     return fields
 
 
+def _read_all(fd: int, what: str) -> bytes:
+    """Every byte up to EOF, however many reads that takes, refusing more than
+    RECORD_MAX."""
+    chunks: List[bytes] = []
+    n = 0
+    while True:
+        try:
+            chunk = os.read(fd, RECORD_MAX + 1 - n)
+        except OSError as e:
+            raise Refused(f"{what} cannot be read ({e.strerror})") from None
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+        n += len(chunk)
+        if n > RECORD_MAX:
+            raise Refused(f"{what} is larger than {RECORD_MAX} bytes")
+
+
+def _open_record(path: str, what: str) -> int:
+    try:
+        return os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))
+    except OSError as e:
+        raise Refused(f"{what} cannot be read ({e.strerror})") from None
+
+
+def _fstat(fd: int, what: str) -> os.stat_result:
+    try:
+        return os.fstat(fd)
+    except OSError as e:
+        raise Refused(f"{what} cannot be read ({e.strerror})") from None
+
+
 def read_record(path: str) -> bytes:
     """A record's bytes: a regular file, never through a link, at most
     RECORD_MAX bytes."""
+    fd = _open_record(path, path)
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))
-    except OSError as e:
-        raise Refused(f"{path} cannot be read ({e.strerror})") from None
-    try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
+        if not stat.S_ISREG(_fstat(fd, path).st_mode):
             raise Refused(f"{path} is not a regular file")
-        data = os.read(fd, RECORD_MAX + 1)
+        return _read_all(fd, path)
     finally:
         os.close(fd)
-    if len(data) > RECORD_MAX:
-        raise Refused(f"{path} is larger than {RECORD_MAX} bytes")
-    return data
 
 
 def _sha(data: bytes) -> str:
@@ -217,12 +249,21 @@ def parse_psr(data: bytes, recheck: bool) -> Dict[str, object]:
         raise Refused(f"the {what} receipt's clone_head line is malformed or out of place")
     i += 1
     any_diff = False
+    obs: Dict[str, str] = {}
+    ref: Dict[str, str] = {}
     for name in PSR_ITEMS:
         m = _ITEM.fullmatch(lines[i])
         if not m or m.group(1) != name:
             raise Refused(f"the {what} receipt's line {i + 1} is not item {name}")
-        any_diff = any_diff or m.group(2) == "DIFF"
+        _, obs[name], ref[name], verdict = m.groups()
+        if (verdict == "MATCH") != (obs[name] == ref[name]):
+            raise Refused(f"the {what} receipt's item {name} says {verdict}, but its observed and reference "
+                          f"shas are {'equal' if obs[name] == ref[name] else 'unequal'}")
+        any_diff = any_diff or verdict == "DIFF"
         i += 1
+    for render, clone in PSR_RENDER_REFS:
+        if ref[render] != obs[clone]:
+            raise Refused(f"the {what} receipt's item {render} is not referenced to {clone}'s observed sha")
     m = _USERS_X.fullmatch(lines[i])
     if not m:
         raise Refused(f"the {what} receipt's users_x line is malformed or out of place")
@@ -310,18 +351,16 @@ def check(go: Dict[str, str], order: str, records: Dict[str, bytes], boot_id: st
 def load_start_spec(path: str, owner: int = 0) -> Dict[str, object]:
     """The start spec: a closed JSON object in a regular, single-link file,
     owned by `owner` (root) at 0444, never read through a link."""
+    what = f"the start spec {path}"
+    fd = _open_record(path, what)
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))
-    except OSError as e:
-        raise Refused(f"the start spec {path} cannot be read ({e.strerror})") from None
-    try:
-        st = os.fstat(fd)
+        st = _fstat(fd, what)
         if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
             raise Refused("the start spec is not a regular file with one link")
         if st.st_uid != owner or stat.S_IMODE(st.st_mode) != SPEC_MODE:
             raise Refused(f"the start spec is {st.st_uid} {stat.S_IMODE(st.st_mode):04o}, not {owner} 0444 "
                           f"(a sealed overlay file)")
-        data = os.read(fd, RECORD_MAX + 1)
+        data = _read_all(fd, what)
     finally:
         os.close(fd)
     try:

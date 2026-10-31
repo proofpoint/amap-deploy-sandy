@@ -28,14 +28,16 @@ SPEC = {"schema": "amap-m1-start-spec/1", "uid_1": 1001, "group_add": 1002,
 def psr_bytes(ctlr, recheck_of=None, diff=(), prewindow="PASS", result=None, users_x="-", tweak=None):
     """A receipt in NET's PSR v1 / PSR-RECHECK v1 grammar (PSR-GRAMMAR-v1 §1-§4,
     FROZEN; NET has no producer bytes yet, so this is the specified form).
-    `diff` names items written DIFF; `result` defaults to the §4 rule;
-    `tweak(lines)` edits the line list before it is joined."""
+    `diff` names items written DIFF, whose observed sha differs from their
+    reference; `result` defaults to the §4 rule; `tweak(lines)` edits the line
+    list before it is joined."""
     lines = ["PSR-RECHECK v1" if recheck_of else "PSR v1"]
     if recheck_of:
         lines.append(f"psr {recheck_of}")
     lines += [f"ctlr {ctlr}", "clone_head " + "2" * 40]
     for name in ms.PSR_ITEMS:
-        lines.append(f"item {name} {'3' * 64} {'3' * 64} {'DIFF' if name in diff else 'MATCH'}")
+        lines.append(f"item {name} {('5' if name in diff else '3') * 64} {'3' * 64} "
+                     f"{'DIFF' if name in diff else 'MATCH'}")
     derived = "PASS" if not diff and prewindow == "PASS" else "FAIL"
     lines += [f"users_x {users_x}", f"prewindow_acceptance {prewindow} {'4' * 64}", "at 2026-10-30T17:58:00Z",
               f"result {result or derived}", "DONE"]
@@ -483,6 +485,60 @@ class PsrGrammarTest(Fixture):
         self.go["psr"] = self.sha("psr")
         self.refused("the PSR receipt's ctlr is not the go's ctlr=")
 
+    def item(self, name, obs, ref, verdict):
+        def tweak(ls):
+            i = 3 + ms.PSR_ITEMS.index(name)
+            return ls[:i] + [f"item {name} {obs} {ref} {verdict}"] + ls[i + 1:]
+        return tweak
+
+    def test_match_with_unequal_shas_is_refused(self):
+        self.psr_refused("item hub.main.cf says MATCH, but its observed and reference shas are unequal",
+                         tweak=self.item("hub.main.cf", "a" * 64, "b" * 64, "MATCH"))
+
+    def test_every_item_says_match_with_unequal_shas_is_refused(self):
+        def tweak(ls):
+            for name in ms.PSR_ITEMS:
+                ls = self.item(name, "a" * 64, "b" * 64, "MATCH")(ls)
+            return ls
+        self.psr_refused("says MATCH, but its observed and reference shas are unequal", tweak=tweak)
+
+    def test_diff_with_equal_shas_is_refused(self):
+        self.psr_refused("item hub.users_keys says DIFF, but its observed and reference shas are equal",
+                         tweak=self.item("hub.users_keys", "3" * 64, "3" * 64, "DIFF"))
+
+    def test_a_recheck_match_with_unequal_shas_is_refused(self):
+        self.recheck, self.order = True, "later"
+        self.write_recheck(tweak=lambda ls: ls[:4] + [f"item hub.main.cf {'a' * 64} {'b' * 64} MATCH"] + ls[5:])
+        self.go["psr_recheck"] = self.sha("recheck")
+        self.refused("PSR-RECHECK receipt's item hub.main.cf says MATCH")
+
+    def test_a_render_not_referenced_to_its_clone_is_refused(self):
+        for render, clone in ms.PSR_RENDER_REFS:
+            with self.subTest(render=render):
+                self.psr_refused(f"item {render} is not referenced to {clone}'s observed sha",
+                                 tweak=self.item(render, "6" * 64, "6" * 64, "MATCH"))
+
+    def test_a_render_referenced_to_another_clone_is_refused(self):
+        def tweak(ls):
+            ls = self.item("clone.delivered-domains.vm2", "7" * 64, "7" * 64, "MATCH")(ls)
+            return self.item("vm1.delivered_domains_file", "7" * 64, "7" * 64, "MATCH")(ls)
+        self.psr_refused("item vm1.delivered_domains_file is not referenced to clone.delivered-domains.vm1",
+                         tweak=tweak)
+
+    def test_distinct_shas_referenced_correctly_start(self):
+        def tweak(ls):
+            for n, name in enumerate(ms.PSR_ITEMS):
+                ls = self.item(name, f"{n:064x}", f"{n:064x}", "MATCH")(ls)
+            for render, clone in ms.PSR_RENDER_REFS:
+                sha = f"{ms.PSR_ITEMS.index(clone):064x}"
+                ls = self.item(render, sha, sha, "MATCH")(ls)
+            return ls
+        self.write("psr", psr_bytes(self.sha("ctlr"), tweak=tweak))
+        self.go["psr"] = self.sha("psr")
+        rc, err = self.run_wrapper()
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(len(self.execd), 1)
+
     def test_a_recheck_of_another_psr_is_refused(self):
         self.order, self.recheck = "later", True
         self.write("recheck", psr_bytes(self.sha("ctlr"), recheck_of="9" * 64))
@@ -538,6 +594,64 @@ class OpusOptionalTest(Fixture):
                          spec_owner=os.getuid())
         self.assertEqual(rc, ms.EXIT_REFUSED)
         self.assertIn(ms.BOOT_ID, e.getvalue())
+
+
+class CompleteReadTest(Fixture):
+    """Both readers read to EOF however the bytes arrive, and refuse more than
+    RECORD_MAX: a record and the start spec alike."""
+
+    def short_reads(self):
+        real = os.read
+        self.addCleanup(setattr, os, "read", real)
+        os.read = lambda fd, n: real(fd, min(n, 7))
+
+    def test_short_reads_still_read_every_record_and_the_spec(self):
+        self.short_reads()
+        rc, err = self.run_wrapper()
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(len(self.execd), 1)
+
+    def test_a_spec_split_across_reads_is_read_whole(self):
+        self.short_reads()
+        self.assertEqual(ms.load_start_spec(self.path("spec"), owner=os.getuid()), SPEC)
+
+    def test_an_oversized_start_spec_is_refused(self):
+        import json
+        doc = json.dumps(SPEC)[:-1] + ', "pad": "' + "x" * ms.RECORD_MAX + '"}'
+        path = self.path("spec")
+        os.chmod(path, 0o644)
+        with open(path, "w") as f:
+            f.write(doc)
+        os.chmod(path, 0o444)
+        self.refused(f"is larger than {ms.RECORD_MAX} bytes")
+
+    def test_an_oversized_start_spec_is_refused_under_short_reads(self):
+        path = self.path("spec")
+        os.chmod(path, 0o644)
+        with open(path, "wb") as f:
+            f.write(b" " * (ms.RECORD_MAX + 1))
+        os.chmod(path, 0o444)
+        self.short_reads()
+        with self.assertRaisesRegex(ms.Refused, "larger than"):
+            ms.load_start_spec(path, owner=os.getuid())
+
+    def test_an_oversized_record_is_refused_under_short_reads(self):
+        self.write("harpf", b"x" * (ms.RECORD_MAX + 1))
+        self.short_reads()
+        with self.assertRaisesRegex(ms.Refused, "larger than"):
+            ms.read_record(self.path("harpf"))
+
+    def test_a_record_of_exactly_record_max_is_read(self):
+        self.write("harpf", b"x" * ms.RECORD_MAX)
+        self.short_reads()
+        self.assertEqual(len(ms.read_record(self.path("harpf"))), ms.RECORD_MAX)
+
+    def test_a_read_error_is_a_refusal(self):
+        def fail(fd, n):
+            raise OSError(5, "Input/output error")
+        self.addCleanup(setattr, os, "read", os.read)
+        os.read = fail
+        self.refused("cannot be read (Input/output error)")
 
 
 class UsageTest(Fixture):
