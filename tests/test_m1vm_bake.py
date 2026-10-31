@@ -98,6 +98,8 @@ class FakeHost:
         # (INFERRED from systemctl's documented behaviour, not measured).
         self.enable_drops = []
         self.fstab = "# /etc/fstab\nUUID=abc / ext4 defaults 0 1\n#/swap.img none swap sw 0 0\n"
+        # What clean's absence test prints for a path that is still there.
+        self.clean_left = {}
         self.unit_dir = {"": "d 755 root root ", "m1-state-check.service": "f 644 root root ",
                          "srv-m1\\x2dstate.mount": "f 644 root root ", "var-lib-docker.mount": "f 644 root root "}
         self.enable_adds = {"local-fs.target.requires": "d 755 root root ", **{
@@ -190,6 +192,10 @@ class FakeHost:
                 self.unaccounted.append(list(a))
         if a == ["sha256sum", f"{bake.APT_DIR}/ubuntu.sources"]:
             return f"{self.ubuntu_sources_sha}  {a[1]}\n"
+        if a[:2] == ["sh", "-c"] and a[3:4] == ["m1-clean"]:
+            if a[2] != 'if [ -e "$1" ] || [ -L "$1" ]; then echo present; else echo absent; fi' or len(a) != 5:
+                raise AssertionError(f"unmodelled clean test {a[2:]!r}")
+            return self.clean_left.get(a[4], "absent\n")
         if a[:2] == ["find", bake.UNIT_DIR]:
             if a[2:] != ["-printf", "%P\\t%y %m %u %g %l\\0"]:
                 raise AssertionError(f"unmodelled find {a[2:]!r}")
@@ -832,18 +838,36 @@ class AptCensusTest(BakeCase):
         self.run_bake()
 
 
+PROXY_PATHS = ("/etc/apt/apt.conf.d/95m1-proxy", f"{bake.UNIT_DIR}/docker.service.d/m1-proxy.conf",
+               "/home/op/.docker/config.json", "/root/.docker/config.json")
+
+
 class ProxyCleanTest(BakeCase):
-    def test_every_proxy_setting_is_deleted_after_the_builds_and_before_man(self):
-        # NET's 208 user-data writes them; MAN must never record one (BAKE-BUILD-PROXY).
+    """BAKE-BUILD-PROXY: NET's 208 user-data writes the proxy settings; clean
+    deletes each and proves it gone, so MAN never records one."""
+
+    def test_every_proxy_setting_is_deleted_and_proven_gone_after_the_builds_and_before_man(self):
         self.run_bake()
         sandy_build = self.index(lambda a: a[:1] == ["runuser"])
         man = self.index(lambda a: "man.py" in " ".join(a))
-        for path in ("/etc/apt/apt.conf.d/95m1-proxy", f"{bake.UNIT_DIR}/docker.service.d/m1-proxy.conf",
-                     "/home/op/.docker/config.json"):
+        for path in PROXY_PATHS:
             with self.subTest(path):
                 removed = self.index(lambda a: a == ["rm", "-f", path])
+                tested = self.index(lambda a: a[3:5] == ["m1-clean", path])
                 self.assertLess(sandy_build, removed)
-                self.assertLess(removed, man)
+                self.assertLess(removed, tested)
+                self.assertLess(tested, man)
+
+    def test_a_path_still_present_fails_before_man(self):
+        for path in PROXY_PATHS:
+            for name, out in {"present": "present\n", "test printed nothing": ""}.items():
+                with self.subTest(path=path, case=name):
+                    self.setUp()
+                    self.host.clean_left[path] = out
+                    with self.assertRaises(bake.BakeFail) as cm:
+                        self.run_bake()
+                    self.assertTrue(str(cm.exception).startswith(f"clean: {path} is still present"), str(cm.exception))
+                    self.assertFalse(any("man.py" in " ".join(a) for a in self.host.log))
 
 
 class StepFailTest(BakeCase):

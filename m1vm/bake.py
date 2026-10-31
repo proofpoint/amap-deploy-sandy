@@ -648,12 +648,17 @@ def step_clean(pin, host):
     host.run(["docker", "builder", "prune", "--all", "--force"])
     # No `docker image prune`: it removes the untagged, digest-pulled bases MAN
     # names (Opus item 2 A2). assert-d's exact-set check catches any stray.
-    # NET's proxy settings: apt's, the daemon's (pulls), and <op>'s Docker
-    # client config, which gives sandy's RUN steps theirs (sandy forwards none;
-    # BAKE-BUILD-PROXY). The seal checks each absent (SS-14, SS-15, SS-18).
+    # NET's proxy settings: apt's, the daemon's (pulls), and the Docker client
+    # configs of <op> (sandy's RUN steps; sandy forwards none) and root (the
+    # router builds), BAKE-BUILD-PROXY. Each must be gone before MAN; the seal
+    # checks them absent again (SS-14, SS-15, SS-18).
     for path in ("/etc/apt/apt.conf.d/95m1-proxy", f"{UNIT_DIR}/docker.service.d/m1-proxy.conf",
-                 f"{pin['op_home']}/.docker/config.json"):
+                 f"{pin['op_home']}/.docker/config.json", "/root/.docker/config.json"):
         host.run(["rm", "-f", path])
+        gone = host.run(["sh", "-c", 'if [ -e "$1" ] || [ -L "$1" ]; then echo present; else echo absent; fi',
+                         "m1-clean", path])
+        if gone != "absent\n":
+            raise BakeFail(f"clean: {path} is still present (the test printed {gone!r})")
     host.run(["rm", "-rf", f"{pin['op_home']}/m1-bundles"])
 
 
