@@ -343,7 +343,7 @@ ROOT_GID = 0
 
 
 def enable_links(unit_dir=UNIT_DIR):
-    """(dir uid, gid, mode, {unit: (link uid, target)}) of UNIT_DIR's
+    """(dir uid, gid, mode, {unit: (link uid, gid, target)}) of UNIT_DIR's
     local-fs.target.requires, walked from / with O_NOFOLLOW; links are read,
     never followed. OSError if any step is not a plain directory or link."""
     fd = os.open("/", _DIR_FLAGS)
@@ -357,7 +357,7 @@ def enable_links(unit_dir=UNIT_DIR):
         for unit in (DATA_MOUNT, DOCKER_MOUNT):
             # readlink refuses anything but a link (EINVAL).
             lst = os.stat(unit, dir_fd=fd, follow_symlinks=False)
-            links[unit] = (lst.st_uid, os.readlink(unit, dir_fd=fd))
+            links[unit] = (lst.st_uid, lst.st_gid, os.readlink(unit, dir_fd=fd))
     finally:
         os.close(fd)
     return st.st_uid, st.st_gid, stat.S_IMODE(st.st_mode), links
@@ -373,9 +373,12 @@ def phase_graph(runner=run, unit_dir=UNIT_DIR):
     except OSError as exc:
         p.row("enable-links", False, f"{unit_dir}/{REQUIRES_DIR}: {exc}")
     else:
-        want = {u: (ROOT_UID, f"{UNIT_DIR}/{u}") for u in (DATA_MOUNT, DOCKER_MOUNT)}
+        # bake's enable check's form for each link: "l 777 root root <target>".
+        want = {u: (ROOT_UID, ROOT_GID, f"{UNIT_DIR}/{u}") for u in (DATA_MOUNT, DOCKER_MOUNT)}
+        # Plain text, not a repr, so a unit name's backslash prints as one byte.
+        seen = "; ".join(f"{u} {lu}:{lg} -> {t}" for u, (lu, lg, t) in sorted(links.items()))
         p.row("enable-links", (uid, gid, mode) == (ROOT_UID, ROOT_GID, 0o755) and links == want,
-              f"{REQUIRES_DIR} {uid}:{gid} {mode:04o} {links}")
+              f"{REQUIRES_DIR} {uid}:{gid} {mode:04o}; {seen}")
     c = show(CHECK_UNIT, ("Type", "RemainAfterExit", "ActiveState", "Result"), runner)
     p.row("check-unit", c is not None, f"{CHECK_UNIT}: {c}")
     if c:

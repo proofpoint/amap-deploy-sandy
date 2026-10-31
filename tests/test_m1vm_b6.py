@@ -254,6 +254,30 @@ class GraphTest(unittest.TestCase):
             self.addCleanup(p.stop)
 
     @staticmethod
+    def dir_owner(uid):
+        """os.fstat, with UID as the owner: the .requires directory alone,
+        since enable_links takes only its metadata by fstat."""
+        real = os.fstat
+
+        def fstat_(fd):
+            st = real(fd)
+            return os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, uid) + tuple(st)[5:])
+        return fstat_
+
+    @staticmethod
+    def link_group(gid):
+        """os.stat, with GID as the group of what it reports without following
+        a link: the links alone."""
+        real = os.stat
+
+        def stat_(path, *a, **kw):
+            st = real(path, *a, **kw)
+            if kw.get("follow_symlinks") is False:
+                st = os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, st.st_uid, gid) + tuple(st)[6:])
+            return st
+        return stat_
+
+    @staticmethod
     def link_owner(uid):
         """os.stat, with UID as the owner of what it reports without following
         a link: the links, while the directory's fstat is untouched."""
@@ -311,7 +335,10 @@ class GraphTest(unittest.TestCase):
                 self.assertFalse(self.graph(self.runner(units)).ok)
 
     def test_enable_links(self):
-        self.assertIn("B6 enable-links PASS", "\n".join(self.graph(self.runner(self.units())).lines()))
+        ok = "\n".join(self.graph(self.runner(self.units())).lines())
+        self.assertIn("B6 enable-links PASS", ok)
+        # The detail prints the unit name's one backslash as itself, and each link's owner and group.
+        self.assertIn(f"srv-m1\\x2dstate.mount {os.getuid()}:{os.getgid()} -> /etc/systemd/system/srv-m1\\x2dstate.mount", ok)
         # Every break names its paths through self, which each setUp renews.
         def link():
             return self.req / b6.DOCKER_MOUNT
@@ -331,10 +358,14 @@ class GraphTest(unittest.TestCase):
             "not root's": lambda: mock.patch.object(b6, "ROOT_UID", os.getuid() + 1).start(),
             "group not root's": lambda: mock.patch.object(b6, "ROOT_GID", os.getgid() + 1).start(),
             "link not root's": lambda: mock.patch.object(b6.os, "stat", self.link_owner(os.getuid() + 1)).start(),
+            "link group not root's": lambda: mock.patch.object(b6.os, "stat", self.link_group(os.getgid() + 1)).start(),
+            "dir not root's": lambda: mock.patch.object(b6.os, "fstat", self.dir_owner(os.getuid() + 1)).start(),
+            "dir sticky": lambda: self.req.chmod(0o1755),
         }
         for name, brk in breaks.items():
             with self.subTest(name):
                 self.setUp()
+                self.addCleanup(mock.patch.stopall)  # even if phase_graph raises
                 brk()
                 lines = "\n".join(self.graph(self.runner(self.units())).lines())
                 mock.patch.stopall()
