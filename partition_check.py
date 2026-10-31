@@ -202,7 +202,8 @@ def v2_check(bytes_check: rh.Check, status: Any) -> rh.Check:
         return bytes_check
     result, why = status_problem(status)
     want = rh.Fact("status", True, "the router's own status.json, fresh on its clock, with no refused reload")
-    remedy = "restart the local router on the activated config (A4: docker/run.sh --config <the live config> --detach)"
+    remedy = "restart the local router on the activated config (A4: docker/run.sh --config <the live config> " \
+             "--image <router.image.digest> --name <router.container> --detach)"
     if result == rh.PASS:
         return bytes_check
     if result == rh.FAIL:
