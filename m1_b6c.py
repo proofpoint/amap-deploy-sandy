@@ -103,6 +103,9 @@ _DNS = re.compile(rf"{_LABEL}(\.{_LABEL})*")
 _CONTAINER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 _IMAGE_ID = re.compile(r"sha256:[0-9a-f]{64}")
 _IMAGE_NAME = re.compile(r"[a-z0-9][a-z0-9._/-]*")
+#: The factory router's own image tag, which hop_router.load refuses as the hop
+#: router's image name (as a basename); a test holds it equal to hop_router's.
+FACTORY_IMAGE = "amap-router-local"
 _OWN = re.compile(rf"{_LABEL}\.internal")
 _STATEMENT = re.compile(r"[ -~]{1,400}")
 _REPO_PATH = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]*(/[A-Za-z0-9_][A-Za-z0-9._-]*)*")
@@ -471,7 +474,8 @@ def parse_overlay(data: bytes) -> Dict[str, str]:
         raise Refused("the overlay names no router.container")
     _closed(router, frozenset({"image", "container"}), "the overlay's router")
     image = _closed(router["image"], frozenset({"name", "digest", "commit"}), "the overlay's router.image")
-    _match(image["name"], _IMAGE_NAME, "the overlay's router.image.name")
+    if posixpath.basename(_match(image["name"], _IMAGE_NAME, "the overlay's router.image.name")) == FACTORY_IMAGE:
+        raise Refused(f"the overlay's router.image.name is the factory router's own tag ({FACTORY_IMAGE})")
     if not isinstance(secrets, dict) or "run_dir" not in secrets:
         raise Refused("the overlay names no run_dir")
     return {"run_dir": _abs_path(secrets["run_dir"], "the overlay's secrets.run_dir"),

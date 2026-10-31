@@ -598,10 +598,19 @@ class ParsersTest(unittest.TestCase):
             "router.image.commit": bad(lambda d: d["host_setup"]["router"]["image"].__setitem__("commit", 1)),
             "router.image.name": bad(lambda d: d["host_setup"]["router"]["image"].__setitem__("name", 7)),
             "router.image.name ": bad(lambda d: d["host_setup"]["router"]["image"].__setitem__("name", "Hop:1")),
+            "the factory router's own tag": bad(
+                lambda d: d["host_setup"]["router"]["image"].__setitem__("name", b.FACTORY_IMAGE)),
+            "the factory router's own tag ": bad(
+                lambda d: d["host_setup"]["router"]["image"].__setitem__("name", "registry.example.org/x/" + b.FACTORY_IMAGE)),
         }
         for pattern, data in cases.items():
             with self.subTest(pattern=pattern), self.assertRaisesRegex(b.Refused, pattern.strip()):
                 b.parse_overlay(data)
+
+    def test_the_factory_tag_is_hop_routers(self):
+        import hop_router
+        self.assertEqual(b.FACTORY_IMAGE, hop_router.FACTORY_IMAGE)
+        self.assertEqual(b._IMAGE_NAME.pattern, hop_router._NAME.pattern)
 
     def test_the_artifact_must_be_canonical(self):
         self.assertEqual(b.parse_artifact(ART), 0)
