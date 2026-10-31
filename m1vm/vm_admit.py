@@ -164,22 +164,31 @@ def read_protected(path, uid, mode, mount, limit=1 << 22):
 
 def effective(runner, conf, section, key):
     """The last value of KEY in [SECTION] of `systemd-analyze cat-config
-    CONF`, which prints the main file and every drop-in in the order
-    systemd applies them (form INFERRED from systemd's documentation until
-    the native control); None if KEY is never set. A command failure is
-    Unknown."""
+    CONF`, which prints the main file and every drop-in, each under a
+    `# /<path>` comment, in the order systemd applies them (form INFERRED
+    from systemd's documentation until the native control); None if KEY is
+    never set. Each file starts outside any section, as systemd reads it
+    (Opus followup10 (b)1, Codex). A command failure is Unknown; a continued
+    line inside SECTION, which this reading would not join, is ValueError."""
     rc, out = runner(["/usr/bin/systemd-analyze", "cat-config", conf])
     if rc != 0:
         raise Unknown(f"systemd-analyze cat-config {conf}: rc {rc}")
     value, current = None, None
-    for line in out.splitlines():
+    # systemd splits on newlines only; splitlines() would also split on \v, \f, \x85, ...
+    for line in out.split("\n"):
         line = line.strip()
-        # A comment ("#" or ";") never parses as KEY= or [SECTION].
-        if line.startswith("[") and line.endswith("]"):
+        # A comment ("#" or ";") never parses as KEY= or [SECTION]; a "# /"
+        # comment is cat-config's file header.
+        if line.startswith("# /"):
+            current = None  # each file starts outside any section, as systemd reads it
+        elif line.startswith("[") and line.endswith("]"):
             current = line[1:-1]
-        elif current == section:
+        else:
             name, sep, val = line.partition("=")
-            if sep and name.strip() == key:
+            if current == section and line.endswith("\\"):
+                raise ValueError(f"{conf}: a continued line in [{section}]")
+            # Outside any section (current None), systemd ignores KEY, and so does this.
+            if sep and name.strip() == key and current == section:
                 value = val.strip()
     return value
 
@@ -532,7 +541,10 @@ class Admission:
             # /usr/local/lib, /usr/lib), in systemd's own merge order: a
             # later drop-in elsewhere would override m1.conf (Opus round10
             # (b)2, Codex round10).
-            have = effective(self.runner, conf, section, "Storage")
+            try:
+                have = effective(self.runner, conf, section, "Storage")
+            except ValueError as exc:
+                return False, str(exc)
             if have != want:
                 return False, f"{conf}: Storage in effect is {have!r}, not {want}"
         swaps = read_proc("swaps").decode("utf-8", "replace").splitlines()

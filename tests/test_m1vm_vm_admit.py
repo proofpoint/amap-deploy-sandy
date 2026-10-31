@@ -692,6 +692,9 @@ class Round7Test(AdmCase):
                 "set in another section": lambda: self.vm.cmd.update({"cat-config systemd/journald.conf": (0,
                     "# /etc/systemd/journald.conf\n[Journal]\n#Storage=auto\n[Other]\nStorage=volatile\n")}),
                 "never set": lambda: self.vm.cmd.update({"cat-config systemd/journald.conf": (0, "[Journal]\n")}),
+                # Opus followup10 (b)1-2: each reading below differs from systemd's, or is not volatile.
+                **{name: (lambda tail=tail: self.vm.cmd.update({"cat-config systemd/journald.conf": (0, JOURNAL + tail)}))
+                   for name, tail in CAT_CONFIG_BREAKS.items()},
         }.items():
             with self.subTest(name):
                 self.setUp()
@@ -701,6 +704,11 @@ class Round7Test(AdmCase):
         self.setUp()
         self.vm.cmd["dpkg-query -W -f ${Status} systemd-coredump"] = (2, "")
         self.assertIn("CHECK A1 auto-change-off UNKNOWN", self.lines())
+        # Control for CAT_CONFIG_BREAKS: the same base, ended by a real volatile, PASSes.
+        self.setUp()
+        self.vm.cmd["cat-config systemd/journald.conf"] = (
+            0, JOURNAL + "\n# /run/systemd/journald.conf.d/zzz.conf\n[Journal]\nStorage=volatile\n")
+        self.assertIn("CHECK A1 auto-change-off PASS", self.lines())
         self.setUp()
         self.vm.cmd["cat-config systemd/journald.conf"] = (1, "")
         self.assertIn("CHECK A1 auto-change-off UNKNOWN", self.lines())
@@ -726,6 +734,21 @@ class Round7Test(AdmCase):
         self.assertNotIn("instances-empty", post)
         self.assertIn("CHECK POST instances UNKNOWN", post)
         self.assertIn("CHECK A2b containers UNKNOWN", self.lines("A2b"))
+
+
+# journald's cat-config with m1.conf in effect, and endings that must not read as volatile.
+JOURNAL = ("# /etc/systemd/journald.conf\n[Journal]\n#Storage=auto\n\n"
+           "# /etc/systemd/journald.conf.d/m1.conf\n[Journal]\nStorage=volatile\n\n"
+           "# /run/systemd/journald.conf.d/zz.conf\n[Journal]\nStorage=persistent\n")
+CAT_CONFIG_BREAKS = {
+    "commented value after persistent": "#Storage=volatile\n;Storage=volatile\n",
+    "value with a prefix": "Storage=xvolatile\n",
+    "key in another case": "STORAGE=volatile\n",
+    "section in another case": "[journal]\nStorage=volatile\n",
+    "headerless later drop-in": "\n# /run/systemd/journald.conf.d/zzz.conf\nStorage=volatile\n",
+    "continued line": "X=a\\\nStorage=volatile\n",
+    "split only on newline": "X=a\x0bStorage=volatile\n",
+}
 
 
 class PackagesTest(AdmCase):

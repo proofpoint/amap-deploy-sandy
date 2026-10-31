@@ -265,6 +265,16 @@ class GraphTest(unittest.TestCase):
         return fstat_
 
     @staticmethod
+    def dir_group(gid):
+        """os.fstat, with GID as the group: the .requires directory alone."""
+        real = os.fstat
+
+        def fstat_(fd):
+            st = real(fd)
+            return os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, st.st_uid, gid) + tuple(st)[6:])
+        return fstat_
+
+    @staticmethod
     def link_group(gid):
         """os.stat, with GID as the group of what it reports without following
         a link: the links alone."""
@@ -361,6 +371,7 @@ class GraphTest(unittest.TestCase):
             "link group not root's": lambda: mock.patch.object(b6.os, "stat", self.link_group(os.getgid() + 1)).start(),
             "dir not root's": lambda: mock.patch.object(b6.os, "fstat", self.dir_owner(os.getuid() + 1)).start(),
             "dir sticky": lambda: self.req.chmod(0o1755),
+            "dir group not root's": lambda: mock.patch.object(b6.os, "fstat", self.dir_group(os.getgid() + 1)).start(),
         }
         for name, brk in breaks.items():
             with self.subTest(name):
