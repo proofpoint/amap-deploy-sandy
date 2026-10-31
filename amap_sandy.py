@@ -3732,9 +3732,9 @@ def sibling_diff(existing: Any, rendered: Dict[str, Any]) -> List[str]:
     if not isinstance(existing, dict):
         return ["the file on disk is not a JSON object"]
     out: List[str] = []
-    for key in sorted(set(existing) - set(SIBLING_KEYS) - set(hp.HOP_KEYS)):
+    for key in sorted(set(existing) - set(SIBLING_KEYS) - set(hp.HOP_KEYS) - set(SENDER_AGE_KEYS)):
         out.append(f"- {key}: not a key the router reads — it refuses the file over it")
-    for key in SIBLING_KEYS + hp.HOP_KEYS:
+    for key in SIBLING_KEYS + hp.HOP_KEYS + SENDER_AGE_KEYS:
         have, want = existing.get(key), rendered.get(key)
         if key in (SIBLING_PEER_SENDERS, SIBLING_PEERS) and isinstance(have, dict) \
                 and isinstance(want, dict):
@@ -3757,6 +3757,28 @@ def sibling_diff(existing: Any, rendered: Dict[str, Any]) -> List[str]:
     return out
 
 
+#: The key `sender_age_key` renders: the hop pin's router reads it, the
+#: primary pin's does not, so it is neither a SIBLING_KEYS member nor a hop key.
+SENDER_AGE_KEYS = (fp.MIN_SENDER_AGE_KEY,)
+
+
+def sender_age_key(policy: Dict[str, Any]) -> Dict[str, Any]:
+    """The hop router's top-level `min_sender_age_s`, from the policy's own
+    key: the sender-age floor in seconds, which that router enforces (its
+    loader takes an int from 0 to one year and refuses a bool). It is
+    rendered only into a configuration the hop pin's loader validates; the
+    primary pin's router has no such key and would refuse it. Absent in the
+    policy is absent here: `policy_checks` decides absence, and the router's
+    own default applies. A present value that is not that shape refuses."""
+    if fp.MIN_SENDER_AGE_KEY not in policy:
+        return {}
+    age = policy[fp.MIN_SENDER_AGE_KEY]
+    if isinstance(age, bool) or not isinstance(age, int) or not 0 <= age <= fp.MIN_SENDER_AGE_MAX_S:
+        raise ProvisionError(f"the policy's {fp.MIN_SENDER_AGE_KEY!r} is {age!r}, not a whole number of seconds "
+                             f"from 0 to {fp.MIN_SENDER_AGE_MAX_S}")
+    return {fp.MIN_SENDER_AGE_KEY: age}
+
+
 def hop_router_keys(policy: Dict[str, Any], state_dir: Path, overlay: Optional[Path], *,
                     decommission: bool = False, spec_out: Optional[List[Any]] = None,
                     rendered: Optional[Path] = None) -> Tuple[Optional[Dict[str, Any]], List[str]]:
@@ -3775,8 +3797,8 @@ def hop_router_keys(policy: Dict[str, Any], state_dir: Path, overlay: Optional[P
         return None, [] if decommission else hp.state_problems(str(state_dir), None)
     try:
         spec = hsu.load_spec(hsu.read_spec(None, overlay))
-        keys = hp.hop_keys(spec, link, policy.get(fp.FLEET_DOMAIN_KEY))
-    except ValueError as e:     # SpecError and HopRenderError
+        keys = dict(hp.hop_keys(spec, link, policy.get(fp.FLEET_DOMAIN_KEY)), **sender_age_key(policy))
+    except (ValueError, ProvisionError) as e:     # SpecError, HopRenderError; a malformed sender age
         return None, [f"a hop host (the policy has {hp.HOP_LINK_KEY}): {e}"]
     if spec_out is not None:
         spec_out.append(spec)
@@ -3822,7 +3844,11 @@ def registry_router_keys(policy: Dict[str, Any], overlay: Optional[Path],
                           f"{hop_keys.get('registry_dir')} is not the overlay's registry.directory "
                           f"{directory}: one host has one registry"]
         return None, []
-    return {"registry_dir": directory}, hp.checkout_problems(hp.hop_checkout(), hp.hop_pin())
+    try:
+        age = sender_age_key(policy)
+    except ProvisionError as e:
+        return None, [str(e)]
+    return dict({"registry_dir": directory}, **age), hp.checkout_problems(hp.hop_checkout(), hp.hop_pin())
 
 
 def run_activation(args: argparse.Namespace, policy: Dict[str, Any], doc: Dict[str, Any], path: Path, *,
