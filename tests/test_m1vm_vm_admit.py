@@ -44,6 +44,16 @@ HOMES = {"op": "/home/op", "m1-admin": "/home/m1admin", "adm": "/var/lib/m1adm"}
 DROPIN = b"[Socket]\nExecStartPost=/usr/bin/setfacl -m u:2104:rw /run/docker.sock\n"
 
 
+def remove_tree(root):
+    """rmtree, after giving every directory back its owner's write bit (the fixture seals some at 0555)."""
+    for dirpath, dirnames, _ in os.walk(root):
+        for d in dirnames:
+            p = os.path.join(dirpath, d)
+            if not os.path.islink(p):
+                os.chmod(p, 0o755)
+    shutil.rmtree(root)
+
+
 class Vm:
     """A fixture VM rooted at a temp dir."""
 
@@ -142,7 +152,8 @@ class Vm:
     def role_manifest(self, **over):
         m = {"schema": "amap-m1-role/1", "role": "H1", "vm": "m1-vm1", "hostname": "m1-h1",
              "fd": "sandy.m1-h1.internal", "own_domain": "h1.example.org",
-             "ids": {"op": 2101, "m1-admin": 2102, "adm": 2103, "uid-1": 2104, "uid-2": 2105, "registry": 2106},
+             # ids.op is F's owner (B6C d5.3 §2c.3): the test user stands in for <op>.
+             "ids": {"op": os.getuid(), "m1-admin": 2102, "adm": 2103, "uid-1": 2104, "uid-2": 2105, "registry": 2106},
              "units": ["amap-hop.service", "amap-router2.service"],
              "fleet_policy_digest": "sha256:1b3083aed757ac7358acb763ee1a383d6572e9836754b59966e3e08f0459f120",
              "start": {"uid_1": 2104, "group_add": 2101, "config": "/srv/m1-state/sandy/features/amap/router.json",
@@ -150,10 +161,26 @@ class Vm:
         m.update(over)
         return m
 
+    def payload_writable(self, writable=True):
+        """payload/ and its directories at 0755 to change them, back to D-SEAL's 0555 after."""
+        for d in ("payload", "payload/bin"):
+            p = self.root / self.F / d
+            if p.is_dir() and not p.is_symlink():
+                p.chmod(0o755 if writable else 0o555)
+
+    def in_payload(self, fn):
+        self.payload_writable()
+        try:
+            return fn()
+        finally:
+            self.payload_writable(False)
+
     def build_on(self, role=None, router=b'{"min_sender_age_s":0,"state_dir":"/x"}\n'):
         f = self.root / self.F
         for d in ("payload/bin", "roster"):
             (f / d).mkdir(parents=True, exist_ok=True)
+        f.chmod(0o700)  # F: <op>'s, owner rwx (B6C d5.3 §2c.3)
+        self.payload_writable()
         files = {"feature.json": (b'{"fleet_domain":"sandy.m1-h1.internal","min_sender_age_s":0}\n', 0o444),
                  "router.json": (router, 0o444),
                  "m1-role.json": (json.dumps(role or self.role_manifest()).encode() + b"\n", 0o444),
@@ -164,6 +191,7 @@ class Vm:
                 p.chmod(0o644)
             p.write_bytes(data)
             p.chmod(mode)
+        self.payload_writable(False)
         self.receipt_for()
 
     def receipt_for(self, **over):
@@ -272,7 +300,7 @@ def params(vm, phase="A1", **over):
 class AdmCase(unittest.TestCase):
     def setUp(self):
         self.vm = Vm()
-        self.addCleanup(shutil.rmtree, self.vm.root)
+        self.addCleanup(remove_tree, self.vm.root)
         patcher = mock.patch.object(vm_admit, "ROOT", str(self.vm.root))
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -556,11 +584,11 @@ class RoleAndOnTest(AdmCase):
             "writable": lambda: self.f("payload/relay").chmod(0o755),
             "setuid": lambda: self.f("payload/relay").chmod(0o4555),
             "fixed name executable": lambda: self.f("feature.json").chmod(0o555),
-            "extra payload file": lambda: self.put("payload/extra", b"x"),
-            "payload file gone": lambda: self.f("payload/bin/inbox-mcp-vol").unlink(),
-            "payload link": lambda: os.symlink("/etc/passwd", self.f("payload/ln")),
-            "payload fifo": lambda: os.mkfifo(self.f("payload/fifo")),
-            "empty payload dir": lambda: self.f("payload/empty").mkdir(),
+            "extra payload file": lambda: self.vm.in_payload(lambda: self.put("payload/extra", b"x")),
+            "payload file gone": lambda: self.vm.in_payload(self.f("payload/bin/inbox-mcp-vol").unlink),
+            "payload link": lambda: self.vm.in_payload(lambda: os.symlink("/etc/passwd", self.f("payload/ln"))),
+            "payload fifo": lambda: self.vm.in_payload(lambda: os.mkfifo(self.f("payload/fifo"))),
+            "empty payload dir": lambda: self.vm.in_payload(lambda: self.f("payload/empty").mkdir(0o555)),
             "fixed name a link": lambda: (self.f("deploy-overlay.json").unlink(),
                                           os.symlink(self.f("feature.json"), self.f("deploy-overlay.json"))),
             "two links": lambda: os.link(self.f("payload/relay"), self.f("roster/relay")),
@@ -574,7 +602,7 @@ class RoleAndOnTest(AdmCase):
                                       os.symlink(self.vm.root / "r2", self.f("roster"))),
             "instances a link": lambda: (shutil.rmtree(self.f("instances")),
                                          os.symlink("/srv", self.f("instances"))),
-            "payload a link": lambda: (os.rename(self.f("payload"), self.vm.root / "pl"),
+            "payload a link": lambda: (self.vm.payload_writable(), os.rename(self.f("payload"), self.vm.root / "pl"),
                                        os.symlink(self.vm.root / "pl", self.f("payload"))),
             "fixed file over 1 MiB": lambda: self.put("deploy-overlay.json", b" " * ((1 << 20) + 1)),
         }
@@ -611,6 +639,16 @@ class RoleAndOnTest(AdmCase):
     def test_owner(self):
         with mock.patch.object(vm_admit, "SEAL_OWNER", (0, 0)):
             self.assertIn(" FAIL ", self.row())
+        # Regular files alone under another owner, directories untouched: the file rule alone refuses.
+        real = os.fstat
+
+        def file_uid(fd):
+            st = real(fd)
+            if stat.S_ISREG(st.st_mode):
+                st = os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, st.st_uid + 1) + tuple(st)[5:])
+            return st
+        with mock.patch.object(vm_admit.os, "fstat", file_uid):
+            self.assertIn(": not a root:root regular file with one link", self.row())
 
     def test_consistent_renders_that_fail(self):
         """Self-consistent receipt and O-n (receipt rebuilt), wrong against the guest, MAN or ROLE r3."""
@@ -715,8 +753,6 @@ class RoleAndOnTest(AdmCase):
                                                             config="/srv/other.json")),
             "receipt vm differs": lambda: vm1(vm="m1-other"),
             "wrong group": lambda: mock.patch.object(vm_admit, "SEAL_OWNER", (os.getuid(), os.getgid() + 1)).start(),
-            "receipt lists no payload": lambda: vm1(files={k: v for k, v in self.vm.receipt["vms"]["vm1"]["files"].items()
-                                                           if not k.startswith("payload/")}),
         }
         for name, brk in cases.items():
             with self.subTest(name):
@@ -724,6 +760,38 @@ class RoleAndOnTest(AdmCase):
                 self.addCleanup(mock.patch.stopall)
                 brk()
                 self.assertIn(" FAIL ", self.row())
+
+    def test_no_payload_at_all(self):
+        # Opus fu1 1: no payload installed and a receipt rebuilt to match, so only the
+        # "one or more payload/ keys" rule (B6C d5.1 §2) can refuse it.
+        def strip():
+            for k in self.vm.PAYLOAD:
+                self.f(k).unlink()
+            self.f("payload/bin").rmdir()
+        self.vm.in_payload(strip)
+        self.vm.PAYLOAD = {}
+        self.vm.receipt_for()
+        self.assertIn(" FAIL vms.vm1.files: not the fixed four plus payload/", self.row())
+
+    def test_sandy_schema_owed_at_every_a2_phase(self):
+        for phase in ("A2a", "A2b", "POST", "2ACC"):
+            _, lines = self.admit(phase)
+            self.assertIn(f"CHECK {phase} sandy-schema UNKNOWN ", "\n".join(lines))
+            self.assertTrue(lines[-1].startswith(f"VM-ADMIT {phase} FAIL "))
+
+    def test_man_not_an_object(self):
+        # Opus fu1 3: FAIL rows and a FAIL line, never an internal error.
+        for body in (b"[]", b"1", b"not json"):
+            with self.subTest(body):
+                self.setUp()
+                p = self.vm.root / "opt/amap/MAN.json"
+                p.chmod(0o644)
+                p.write_bytes(body)
+                p.chmod(0o444)
+                rc, lines = self.admit("A2a", man_sha256=hashlib.sha256(body).hexdigest())
+                self.assertEqual(rc, 1)
+                self.assertIn(" FAIL /opt/amap/MAN.json: not a JSON object", "\n".join(lines))
+                self.assertTrue(lines[-1].startswith("VM-ADMIT A2a FAIL "))
 
     def test_man_of_any_shape_is_a_fail(self):
         for over in ({"checkouts": []}, {"builds": "x"}, {"checkouts": {"/opt/amap/src/amap-deploy-sandy": 1}}):
@@ -735,6 +803,51 @@ class RoleAndOnTest(AdmCase):
                 rc, lines = self.admit("A2a", man_sha256=hashlib.sha256(
                     (self.vm.root / "opt/amap/MAN.json").read_bytes()).hexdigest())
                 self.assertIn(" FAIL receipt: ", self.row())
+
+    def test_feature_root_rule(self):
+        """B6C d5.3 §2c.3's witnesses for F, on the rule itself: FAIL 0500, 0600, 0770, 02700
+        and another uid; PASS 0700 with uid == ids.op. (Unprivileged, the walk could not
+        traverse a real 0500 or 0600 F, so those two are shown on the rule.)"""
+        def st(mode, uid=1234):
+            return os.stat_result((stat.S_IFDIR | mode, 0, 0, 2, uid, 0, 0, 0, 0, 0))
+        vm_admit.check_feature_root(st(0o700), 1234)
+        for mode, uid in ((0o500, 1234), (0o600, 1234), (0o770, 1234), (0o2700, 1234), (0o700, 1235)):
+            with self.subTest(oct(mode), uid=uid):
+                with self.assertRaises(ValueError):
+                    vm_admit.check_feature_root(st(mode, uid), 1234)
+        with self.assertRaises(ValueError):  # a regular file named F
+            vm_admit.check_feature_root(os.stat_result((stat.S_IFREG | 0o700, 0, 0, 1, 1234, 0, 0, 0, 0, 0)), 1234)
+
+    def test_feature_root_on_the_tree(self):
+        self.assertIn(" PASS ", self.row())  # F 0700, the test user's, = ids.op
+        for name, brk in {"F 0770": lambda: self.f().chmod(0o770),
+                          "F 02700": lambda: self.f().chmod(0o2700),
+                          "F not ids.op's": lambda: self.vm.build_on(role=self.vm.role_manifest(ids=dict(
+                              self.vm.role_manifest()["ids"], op=os.getuid() + 1)))}.items():
+            with self.subTest(name):
+                self.setUp()
+                brk()
+                self.assertIn(" FAIL F: uid ", self.row())
+
+    def test_payload_directories(self):
+        real = os.stat
+
+        def dir_uid(path, *a, **kw):  # directories alone reported under another owner
+            st = real(path, *a, **kw)
+            if stat.S_ISDIR(st.st_mode) and kw.get("follow_symlinks") is False:
+                st = os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, st.st_uid + 1) + tuple(st)[5:])
+            return st
+        for name, brk in {"payload 0755": lambda: self.f("payload").chmod(0o755),
+                          "payload/bin 0755": lambda: self.f("payload/bin").chmod(0o755),
+                          "payload/bin 01555": lambda: self.f("payload/bin").chmod(0o1555),
+                          "payload/bin 0577": lambda: self.f("payload/bin").chmod(0o577),
+                          "a directory not root's": lambda: mock.patch.object(vm_admit.os, "stat", dir_uid).start(),
+                          }.items():
+            with self.subTest(name):
+                self.setUp()
+                self.addCleanup(mock.patch.stopall)
+                brk()
+                self.assertIn(" FAIL payload", self.row())
 
     def test_bool_age_self_consistent(self):
         # X14 (Codex ADM): router.json false, the manifest carrying false's own digest, and the

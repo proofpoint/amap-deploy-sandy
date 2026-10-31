@@ -358,7 +358,14 @@ class Admission:
     def man(self):
         data = read_protected(MAN_PATH, 0, 0o444, "/")
         sha = hashlib.sha256(data).hexdigest()
-        return sha, json.loads(data.decode("utf-8"))
+        # A MAN that is not one JSON object is every reading row's FAIL, never a crash (Opus ADM fu1).
+        try:
+            man = json.loads(data.decode("utf-8"))
+        except ValueError:
+            man = None
+        if not isinstance(man, dict):
+            raise OSError(errno.EINVAL, f"{MAN_PATH}: not a JSON object")
+        return sha, man
 
     def check_man(self):
         sha, _ = self.man()
@@ -653,7 +660,7 @@ class Admission:
         _need(len(mine) == 1, f"receipt: not exactly one vms entry for {self.p['host']}")
         e = mine[0]
         other = next(o for o in r["vms"].values() if o is not e)
-        found, fixed = installed_on(self.phase)
+        found, fixed, f_stat = installed_on(self.phase)
         _need(found == e["files"], "the installed O-n is not the receipt's files: "
               + str(sorted(set(found) ^ set(e["files"]) or {k for k in found if found[k] != e["files"].get(k)})[:5]))
         ovl = hashlib.sha256(canonical(found)).hexdigest()
@@ -666,6 +673,7 @@ class Admission:
         _need(m["role"] == self.p["host"], "m1-role.json role is not host=")
         _need(m["fd"] != other["fd"] and m["own_domain"] != other["own_domain"], "fd or own_domain equals the other VM's")
         _need(m["start"] == e["start"], "m1-role.json start is not the receipt's")
+        check_feature_root(f_stat, m["ids"]["op"])
         age, digest = policy_digest(fixed["router.json"])
         _need(digest == m["fleet_policy_digest"], "fleet_policy_digest is not router.json's policy digest (ROLE r3)")
         _need(m["fleet_policy_digest"] == r["fleet_artifact"]["digest"] == e["carried_digest"],
@@ -1054,10 +1062,13 @@ def _hash_at(dfd, name, what, limit=None):
 def installed_on(phase):
     """B6C d5.1 §2c.3-4: ({key: {mode, sha256}}, {fixed name: bytes}) of the
     installed O-n under FEATURE_ROOT, with F's top level closed and the
-    payload walk exact. ValueError (or OSError) on any deviation."""
+    payload walk exact, and F's own stat for the caller's check once the
+    manifest naming ids.op is verified. ValueError (or OSError) on any
+    deviation."""
     fd = _open_dir(FEATURE_ROOT)
     found, fixed = {}, {}
     try:
+        f_stat = os.fstat(fd)  # reached with O_NOFOLLOW at every component
         top = set(os.listdir(fd))
         late = F_LATE & top
         _need(top <= F_REQUIRED | F_LATE, f"F holds {sorted(top - F_REQUIRED - F_LATE)[:5]}, outside its closed set")
@@ -1075,11 +1086,17 @@ def installed_on(phase):
             fixed[name] = data
         dirs = []
 
+        def sealed_dir(st, rel):
+            # payload/ and every directory under it: root:root, exactly 0555 (B6C d5.3 §2c.3).
+            _need(stat.S_ISDIR(st.st_mode) and (st.st_uid, st.st_gid) == SEAL_OWNER
+                  and stat.S_IMODE(st.st_mode) == 0o555, f"{rel}/: not a root:root 0555 directory")
+
         def walk(dfd, rel):
             for name in sorted(os.listdir(dfd)):
                 sub = f"{rel}/{name}"
                 st = os.stat(name, dir_fd=dfd, follow_symlinks=False)
                 if stat.S_ISDIR(st.st_mode):
+                    sealed_dir(st, sub)
                     dirs.append(sub)
                     nfd = os.open(name, _DIR_FLAGS, dir_fd=dfd)
                     try:
@@ -1091,6 +1108,7 @@ def installed_on(phase):
                     sha, _, fst = _hash_at(dfd, name, sub)
                     _sealed(fst, sub)
                     found[sub] = {"mode": f"{stat.S_IMODE(fst.st_mode):04o}", "sha256": sha}
+        sealed_dir(os.stat("payload", dir_fd=fd, follow_symlinks=False), "payload")
         pfd = os.open("payload", _DIR_FLAGS, dir_fd=fd)
         try:
             walk(pfd, "payload")
@@ -1101,7 +1119,18 @@ def installed_on(phase):
     keys = [k for k in found if k.startswith("payload/")]
     bare = [d for d in dirs if not any(k.startswith(d + "/") for k in keys)]
     _need(not bare, f"{bare[:5]}: a directory that holds no listed file")
-    return found, fixed
+    return found, fixed, f_stat
+
+
+def check_feature_root(st, op_uid):
+    """B6C d5.3 §2c.3's interim rule for F itself, run after role= has verified
+    the manifest that names ids.op: <op>'s, owner rwx, no group or world write,
+    no setuid or setgid. Its gid and sticky bit are left open until D-ROOTS'
+    S4 mode for F is reviewed text."""
+    mode = stat.S_IMODE(st.st_mode)
+    _need(stat.S_ISDIR(st.st_mode) and st.st_uid == op_uid and mode & 0o700 == 0o700
+          and mode & 0o022 == 0 and mode & 0o6000 == 0,
+          f"F: uid {st.st_uid} mode {mode:04o}, not ids.op's with owner rwx, no group/world write, no setuid/setgid")
 
 
 def validate_params(p):
