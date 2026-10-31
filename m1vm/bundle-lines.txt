@@ -1,0 +1,82 @@
+# exec_root (partition_setup.plan's line, run as root):
+sudo install -d -o 0 -g 0 -m 0700 /opt/amap/partition
+# The tools the weekly job runs as root, and their startup closure: run these steps at install AND again
+# after any operating-system, interpreter or docker update, before the next weekly run. Those updates
+# change the startup closure the per-run tripwire holds to the install-time state.
+# Discovery runs as nobody (it must hold no sudoers rule and own nothing in the closure), with no
+# terminal and an empty environment; judging runs as root and executes only the operating system's own
+# tools. sudo's default closefrom must hold (no closefrom_override or preserve_fds for these steps).
+# Trusted as given: the completeness of P, Z, L and Lw beyond the tools and the self-checks, and only as far
+# as no hostile process runs as nobody; P and Z come from the interpreter's own sysconfig, so whoever
+# can already write its standard library can make it misreport them. A process discovery leaves behind
+# that holds the pipe makes step 3 hang visibly: interrupt it, and run nothing after it.
+# judge.sh sha256 09b324e832e2546918669aa81862c98025dec1d9e3bdf1810df18a8476b071ad
+# discover.sh sha256 1afae08a70688e8f1695eb4a7d9f393393ad32b99b3b47005579c9d3ad1497ee
+R=$(sudo mktemp -d /tmp/amap-judge.XXXXXXXX)
+sudo sh -c 'umask 077; cat > "$1"' sh "$R/judge.sh" <<'END-OF-JUDGE'
+# Half B, judging: run as root, over closure.env as data. It executes only the operating system's find,
+# readlink, realpath, dirname, basename, sed, grep and sh; never the interpreter, ldd, otool or xcode-select.
+PY=/usr/bin/python3
+DOCKER=/usr/bin/docker
+DARWIN=0
+NL='
+'
+set -f
+IFS=' '
+refuse() { echo "discovery failed: closure.env is not the discovery's output: $1"; }
+omits() { echo "discovery failed: closure.env omits $1"; }
+chk() { find "$1" -maxdepth 0 \( -type l ! -user root -o ! -type l \( ! -user root -o -perm -g+w -o -perm -o+w \) \) -print 2>/dev/null; }
+norm() { local c o f IFS=/; case $- in *f*) f=1;; *) f=;; esac; o=; set -f; for c in $1; do case $c in ''|.) ;; ..) o=${o%/*};; *) o="$o/$c";; esac; done; [ -n "$f" ] || set +f; echo "${o:-/}"; }
+ent() { local p; p=$(realpath "$(dirname "$1")" 2>/dev/null) && echo "$p/$(basename "$1")" || echo "?$(norm "$1")"; }
+up() { local x=$1 k; while [ "$x" != / ] && [ "$x" != . ]; do x=$(dirname "$x"); k="$(norm "$x")|$(realpath "$x" 2>/dev/null)"; case " $ups " in *" $k "*) return;; esac; ups="$ups $k"; chk "$x"; [ -L "$x" ] && hop "$x" chain; done; }
+hop() { local r t l k found; r=$(readlink "$1"); case "$r" in /*) t=$r;; *) t="$(dirname "$1")/$r";; esac; case "$t" in *[[:space:]]*) echo "discovery failed: whitespace in $t"; return;; esac; up "$t"; k=$(ent "$t"); if [ "$2" = tree ]; then case " $trees " in *" $k "*) return;; esac; trees="$trees $k"; { find "$t" \( -type l ! -user root -o ! -type l \( ! -user root -o -perm -g+w -o -perm -o+w \) \) -print 2>&1 1>&3 | sed 's/^/discovery failed: /'; } 3>&1; find "$t" -name '*[[:space:]]*' -print 2>/dev/null | sed 's/^/discovery failed: whitespace in /'; found=$(find "$t" -type l 2>/dev/null); IFS=$NL; for l in $found; do IFS=' '; hop "$l" tree; done; IFS=' '; else case " $trees $chains " in *" $k "*) return;; esac; chains="$chains $k"; chk "$t"; [ -L "$t" ] && hop "$t" chain; fi; }
+fixed() { local found; trees=; chains=; ups=; for x in "$PY" "$DOCKER"; do [ -e "$x" ] || echo "absent: $x"; done; [ -n "$PYR" ] || echo "discovery failed: cannot resolve $PY"; [ -n "$DR" ] || echo "discovery failed: cannot resolve $DOCKER"; { find "$PY" "$DOCKER" $PYR $DR \( -type l ! -user root -o ! -type l \( ! -user root -o -perm -g+w -o -perm -o+w \) \) -print 2>&1 1>&3 | sed 's/^/discovery failed: /'; } 3>&1; find -L "$PY" "$DOCKER" $PYR $DR \( ! -user root -o -perm -g+w -o -perm -o+w \) -print 2>/dev/null; found=$(find "$PY" "$DOCKER" -type l 2>/dev/null); IFS=$NL; for l in $found; do IFS=' '; hop "$l" tree; done; IFS=' '; for p in "$PY" "$DOCKER"; do for x in "$p" "$(realpath "$p" 2>/dev/null)"; do while [ -n "$x" ] && [ "$x" != / ]; do x=$(dirname "$x"); chk "$x"; done; done; done; }
+parse() { local line n v e rest; [ -f "$1" ] && [ ! -h "$1" ] || { refuse "not a regular file"; return 1; }; [ -z "$(find "$1" -size +1048576c -print)" ] || { refuse "larger than 1048576 bytes"; return 1; }; ! LC_ALL=C grep -q '[^ -~]' "$1" || { refuse "a character that is not printable"; return 1; }; rest="P Z T L Lw X"; line=; while IFS= read -r line; do case $line in "discovery failed: "*) echo "$line"; continue;; *=*) ;; *) refuse "a line that is not a list"; return 1;; esac; n=${line%%=*}; v=${line#*=}; [ -n "$rest" ] && [ "$n" = "${rest%% *}" ] || { refuse "a list out of order: $n"; return 1; }; case $rest in *" "*) rest=${rest#* };; *) rest=;; esac; case $v in *[!\ A-Za-z0-9._+,@%=:~/-]*) refuse "a character outside the grammar in $n"; return 1;; " "*|*" "|*"  "*) refuse "spacing in $n"; return 1;; esac; for e in $v; do case $e in /*) ;; *) refuse "an entry of $n that is not absolute"; return 1;; esac; done; case $n in P) P=$v;; Z) Z=$v;; T) T=$v;; L) L=$v;; Lw) Lw=$v;; X) X=$v;; esac; line=; done < "$1"; [ -z "$line" ] || { refuse "its last line does not end"; return 1; }; [ -z "$rest" ] || { refuse "missing ${rest%% *}"; return 1; }; }
+selfcheck() { local x ld ldr; [ -n "$P" ] || omits P; for x in "$PY" "$PYR" "$DOCKER" "$DR"; do case " $T " in *" $x "*) ;; *) omits "$x";; esac; done; [ "$DARWIN" = 1 ] && return; if [ -z "$fixedout" ] && [ -f "$PYR" ] && [ ! -h "$PYR" ]; then ld=$(LC_ALL=C grep -a -o '/[A-Za-z0-9._/-]*/ld-[A-Za-z0-9._-]*\.so[.0-9]*' "$PYR" | sed -n 1p); [ -z "$ld" ] && return; ldr=$(realpath "$ld" 2>/dev/null); case " $L " in *" $ld "*|*" ${ldr:-//} "*) ;; *) omits "the loader $ld";; esac; else echo "discovery failed: the interpreter's loader cannot be checked"; fi; }
+lists() { local x z found ZP=; for z in $Z; do [ -e "$z" ] && ZP="$ZP $z"; done; for x in $P; do [ -e "$x" ] || echo "absent: $x"; done   # required: never excused
+for x in $L; do [ -e "$x" ] || { [ "$DARWIN" = 1 ] && case $x in /usr/lib/*|/System/Library/*) true;; *) false;; esac; } || echo "absent: $x"; done   # a system library may be only in macOS's shared cache
+if [ -n "$P$Lw" ]; then { find $P $Lw \( -type l ! -user root -o ! -type l \( ! -user root -o -perm -g+w -o -perm -o+w \) \) -print 2>&1 1>&3 | sed 's/^/discovery failed: /'; } 3>&1; find -L $P $Lw \( ! -user root -o -perm -g+w -o -perm -o+w \) -print 2>/dev/null; fi
+for z in $ZP; do { find "$z" \( -type l ! -user root -o ! -type l \( ! -user root -o -perm -g+w -o -perm -o+w \) \) -print 2>&1 1>&3 | sed 's/^/discovery failed: /'; } 3>&1; find -L "$z" \( ! -user root -o -perm -g+w -o -perm -o+w \) -print 2>/dev/null; done   # a zip present
+if [ -n "$X" ]; then { find "$X" \( -type l ! -user root -o ! -type l \( ! -user root -o -perm -g+w -o -perm -o+w \) \) -print 2>&1 1>&3 | sed 's/^/discovery failed: /'; } 3>&1; find -L "$X" \( ! -user root -o -perm -g+w -o -perm -o+w \) -print 2>/dev/null; fi
+if [ -n "$P$Lw$ZP$X" ]; then find $P $Lw $ZP $X -name '*[[:space:]]*' -print 2>/dev/null | sed 's/^/discovery failed: whitespace in /'; found=$(find $P $Lw $ZP $X -type l 2>/dev/null); IFS=$NL; for l in $found; do IFS=' '; hop "$l" tree; done; IFS=' '; fi
+for p in $P $Z $L $X; do for x in "$p" "$(realpath "$p" 2>/dev/null)"; do while [ -n "$x" ] && [ "$x" != / ]; do x=$(dirname "$x"); chk "$x"; done; done; done; }   # every directory above each, and above its realpath
+body() { PYR=$(realpath "$PY" 2>/dev/null); DR=$(realpath "$DOCKER" 2>/dev/null); fixedout=$(fixed); [ -z "$fixedout" ] || printf '%s\n' "$fixedout"; if parse "$1"; then selfcheck; trees=; chains=; ups=; lists; fi; echo BODY-COMPLETE; }
+body "$1" | { n=0; fin=; while IFS= read -r l; do if [ "$l" = BODY-COMPLETE ]; then fin=1; continue; fi; fin=; printf '%s\n' "$l"; n=1; done; if [ -n "$fin" ]; then echo END-OF-BLOCK; exit $n; fi; echo "discovery failed: the judging did not run to its end"; exit 1; }
+END-OF-JUDGE
+sudo sh -c 'umask 077; cat > "$1"' sh "$R/discover.sh" <<'END-OF-DISCOVER'
+# Half A, discovery: run by root as nobody, never as root; prints the six lists as data.
+fail() { echo "discovery failed: $*"; }
+bad() { for x in $1; do case $x in *[!A-Za-z0-9._+,@%=:~/-]*|[!/]*) fail "cannot be listed: $x";; esac; done; }
+good() { for x in $1; do case $x in *[!A-Za-z0-9._+,@%=:~/-]*|[!/]*) ;; *) echo "$x";; esac; done | sort -u | tr '\n' ' ' | sed 's/ $//'; }
+P=$(/usr/bin/python3 -I -S -B -c 'import os,sys,sysconfig; g=sysconfig.get_paths(); print(g["stdlib"], g["platstdlib"], sysconfig.get_config_var("DESTSHARED") or os.path.join(g["platstdlib"], "lib-dynload"))') || fail "the interpreter cannot name its library"
+Z=$(/usr/bin/python3 -I -S -B -c 'import os,sys,sysconfig; g=sysconfig.get_paths(); print(*[x for x in sys.path if x.endswith(".zip")])') || fail "the interpreter cannot name its path"
+T="/usr/bin/python3 $(realpath /usr/bin/python3) /usr/bin/docker $(realpath /usr/bin/docker) $(for d in $P; do ls "$d"/*.so 2>/dev/null; done)"
+for f in $T; do ldd "$f" >/dev/null 2>&1 || { file "$f" | grep -q 'statically linked' || fail "$f"; }; done
+ldd $T 2>/dev/null | awk '/=> not found/ { print "discovery failed: " $1 " not found"; next } /=>/ { sub(/^.*=> /, ""); sub(/ \(0x[0-9a-f]+\)$/, ""); if ($0 ~ /[[:space:]]/) print "discovery failed: whitespace in " $0 }'
+L=$(ldd $T 2>/dev/null | awk '/=> not found/ {next} /=>/ {print $3} /^[[:space:]]+\// {print $1}' | sort -u)
+Lw=$L
+X=
+set -f   # the lists hold no glob, and are never expanded as one
+bad "$P"; echo "P=$(good "$P")"
+bad "$Z"; echo "Z=$(good "$Z")"
+bad "$T"; echo "T=$(good "$T")"
+bad "$L"; echo "L=$(good "$L")"
+bad "$Lw"; echo "Lw=$(good "$Lw")"
+bad "$X"; echo "X=$(good "$X")"
+END-OF-DISCOVER
+sudo chmod 0400 "$R/judge.sh" "$R/discover.sh"
+printf '%s  %s\n' 09b324e832e2546918669aa81862c98025dec1d9e3bdf1810df18a8476b071ad "$R/judge.sh" 1afae08a70688e8f1695eb4a7d9f393393ad32b99b3b47005579c9d3ad1497ee "$R/discover.sh" | sudo sh -c 'umask 077; cat > "$1"' sh "$R/judge.sha256"
+sudo sh -c 'sha256sum --status -c "$1/judge.sha256" || { echo "discovery failed: the judging scripts do not match their digests; nothing is run"; exit 1; }; ( cd / && setsid -w runuser -u nobody -- env -i PATH=/usr/bin:/bin HOME=/ LC_ALL=C sh -c "$(cat "$1/discover.sh")" </dev/null 2>/dev/null ) | head -c 1048577 > "$1/closure.env"; chmod 0400 "$1/closure.env" && sh "$1/judge.sh" "$1/closure.env"' sh "$R"
+# Go on only when that printed exactly END-OF-BLOCK and exited 0. The plan prints this check first, so every
+# later step that runs an interpreter as root comes after it.
+# The weekly job's bundle, at the deploy pin, as root, from the reviewed deploy git bundle (DS-r12-ERRATUM-BUNDLE: DEVIATION from provision_steps' https clone):
+sudo install -d -o 0 -g 0 -m 0700 /opt/amap/partition/empty-home
+sudo env GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null HOME=/opt/amap/partition/empty-home git -c core.hooksPath=/dev/null -c protocol.allow=never -c protocol.file.allow=always init -q --bare /opt/amap/partition/src.new
+sudo env GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null HOME=/opt/amap/partition/empty-home git -c core.hooksPath=/dev/null -c protocol.allow=never -c protocol.file.allow=always -C /opt/amap/partition/src.new fetch -q --no-tags <DEPLOY_BUNDLE> '+refs/*:refs/bundle/*'
+sudo env GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null HOME=/opt/amap/partition/empty-home git -c core.hooksPath=/dev/null -c protocol.allow=never -c protocol.file.allow=always -C /opt/amap/partition/src.new cat-file -e <DEPLOY_PIN>^{commit}
+sudo install -d -o 0 -g 0 -m 0755 /opt/amap/partition/bundle.new
+sudo env GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null HOME=/opt/amap/partition/empty-home git -c core.hooksPath=/dev/null -c protocol.allow=never -c protocol.file.allow=always -C /opt/amap/partition/src.new archive --format=tar <DEPLOY_PIN> -- partition_weekly.closure $(sudo env GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null HOME=/opt/amap/partition/empty-home git -c core.hooksPath=/dev/null -c protocol.allow=never -c protocol.file.allow=always -C /opt/amap/partition/src.new show <DEPLOY_PIN>:partition_weekly.closure) | sudo tar -x --no-same-owner -C /opt/amap/partition/bundle.new
+echo <DEPLOY_PIN> | sudo tee /opt/amap/partition/bundle.new/PIN >/dev/null
+sudo sh -c 'chmod 0444 /opt/amap/partition/bundle.new/* && chmod 0555 /opt/amap/partition/bundle.new'
+sudo /usr/bin/python3 -I -S -B /opt/amap/libexec/host_steps.py partition-provision /opt/amap/partition
+sudo rm -rf /opt/amap/partition/src.new
