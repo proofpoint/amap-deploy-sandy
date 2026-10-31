@@ -31,10 +31,21 @@ class ShippedSpecTest(unittest.TestCase):
         self.assertEqual(len(sha), 64)
         self.assertEqual(spec["schema"], sealspec.SCHEMA)
 
-    def test_bundle_headers_are_patterns(self):
-        # DS2 d8 §3.2: no git bundle file may survive anywhere on R or D.
-        self.assertIn("# v2 git bundle\n", shipped()["patterns"])
-        self.assertIn("# v3 git bundle\n", shipped()["patterns"])
+    def test_no_patterns_and_the_bundle_dir_by_path(self):
+        # git's own bundle signatures are in /usr/bin/git, and any literal here would also be
+        # in this file in the deploy checkout on R: the list ships empty, and the bundle
+        # directory's absence is asserted by path (NET 97e999ac).
+        spec = shipped()
+        self.assertEqual(spec["patterns"], [])
+        ss02 = next(i for i in spec["items"] if i["id"] == "SS-02")
+        self.assertEqual((ss02["path"], ss02["expect"]), ("{op_home}/m1-bundles", "absent"))
+
+    def test_patterns_list_may_be_empty_or_hold_distinct_literals(self):
+        for patterns in ([], ["abc"], ["abc", "def"]):
+            with self.subTest(patterns):
+                spec = shipped()
+                spec["patterns"] = patterns
+                sealspec.validate(spec)
 
     def test_check_cli_prints_the_file_sha(self):
         out = subprocess.run([sys.executable, "-I", "-S", "-B", str(M1VM / "sealspec.py"), "check", str(SPEC_PATH)],
@@ -66,7 +77,8 @@ class ValidateRefusesTest(unittest.TestCase):
             "mid placeholder": lambda s: s["items"][2].update(path="/var/{op_home}/x"),
             "home absolute": lambda s: s["items"][7].update(home="/root/.gitconfig"),
             "no why": lambda s: s["items"][0].pop("why"),
-            "empty patterns": lambda s: s.update(patterns=[]),
+            "patterns not a list": lambda s: s.update(patterns="abc"),
+            "empty-string pattern": lambda s: s.update(patterns=[""]),
             "dup patterns": lambda s: s.update(patterns=["a", "a"]),
             "bad allowlist sha": lambda s: s.update(allowlist=[{"path": "/x", "sha256": "ab"}]),
             "min with none": lambda s: s["items"][11].update(min=1),
