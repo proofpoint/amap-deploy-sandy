@@ -8,7 +8,7 @@ one fixed run.sh argv. A refusal starts nothing.
 
   python3 -I -S amap-m1-start.py --go GO_TEXT_FILE --order earlier|later
       --a2a FILE --ctlr FILE --psr FILE --harpf FILE [--psr-recheck FILE]
-      --start-spec FILE -- ARGV...
+      -- ARGV...
 
 The go text's fields:
   a2a=<sha> boot_id=<id> a2a_utc=<UTC> ctlr=<sha> psr=<sha> harpf=<sha>
@@ -35,11 +35,13 @@ It refuses unless:
   - the go's boot_id equals that line's and this machine's current one;
   - the go's a2a_utc equals that line's `utc=`, and now is within W1 (900 s)
     after it, never before it;
-  - ARGV is exactly the fixed start built from the start spec, token for
-    token: `/usr/bin/sudo -u #<uid-1> -- <run.sh> --config <cfg> --image
-    sha256:<64 hex> --name <name> --group-add <gid> --detach`. The start spec
-    is one of the role overlay's sealed files (root-owned, 0444, one link),
-    whose bytes A2a's overlay check covers.
+  - the role manifest, at the one path ROLE_MANIFEST, reached from `/`
+    without following a link, is a regular single-link root:root 0444 file
+    of at most RECORD_MAX bytes, whose sha256 is the A2a line's `role=`,
+    and which parses as the closed `amap-m1-role/1` schema;
+  - ARGV is exactly the fixed start built from the role manifest's `start`,
+    token for token: `/usr/bin/sudo -u #<uid-1> -- <run.sh> --config <cfg>
+    --image sha256:<64 hex> --name <name> --group-add <gid> --detach`.
 
 Exit codes: the exec'd program's own on success; 3 refused (one line,
 `refused: <rule>`); 2 usage."""
@@ -67,9 +69,13 @@ _TOKEN = re.compile(r"([a-z0-9_]+)=(\S+)")
 #: The fixed start: the sudo that runs it, and the hop checkout's run.sh.
 SUDO = "/usr/bin/sudo"
 RUN_SH = "/opt/amap/src/amap-router-local-hop/docker/run.sh"
-SPEC_SCHEMA = "amap-m1-start-spec/1"
-SPEC_KEYS = frozenset({"schema", "uid_1", "group_add", "config", "image", "name"})
-SPEC_MODE = 0o444
+#: The role manifest: one sealed O-n file, whose sha ADM's A2a line prints
+#: as `role=`, carrying the start's values.
+ROLE_MANIFEST = "/srv/m1-state/sandy/features/amap/m1-role.json"
+ROLE_SCHEMA = "amap-m1-role/1"
+ROLE_KEYS = frozenset({"schema", "role", "vm", "hostname", "fd", "own_domain", "ids", "units", "start"})
+START_KEYS = frozenset({"uid_1", "group_add", "config", "image", "name"})
+ROLE_MODE = 0o444
 _IMAGE_ID = re.compile(r"sha256:[0-9a-f]{64}")
 _NAME = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_.-]*")
 
@@ -348,49 +354,105 @@ def check(go: Dict[str, str], order: str, records: Dict[str, bytes], boot_id: st
         raise Refused(f"the A2a PASS is older than W1 ({W1_S} s)")
 
 
-def load_start_spec(path: str, owner: int = 0) -> Dict[str, object]:
-    """The start spec: a closed JSON object in a regular, single-link file,
-    owned by `owner` (root) at 0444, never read through a link."""
-    what = f"the start spec {path}"
-    fd = _open_record(path, what)
+def _open_without_links(path: str, what: str) -> int:
+    """`path` opened from `/` one component at a time, following no link
+    anywhere along it."""
+    parts = path.split("/")
+    if not path.startswith("/") or os.path.normpath(path) != path or not parts[-1]:
+        raise Refused(f"{what} is not an absolute, normalised path")
+    nofollow = os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY | nofollow)
+    except OSError as e:
+        raise Refused(f"{what} cannot be read ({e.strerror})") from None
+    try:
+        for part in parts[1:-1]:
+            try:
+                nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | nofollow, dir_fd=fd)
+            except OSError as e:
+                raise Refused(f"{what} cannot be reached without following a link ({e.strerror} at {part!r})") from None
+            os.close(fd)
+            fd = nxt
+        try:
+            return os.open(parts[-1], os.O_RDONLY | os.O_NONBLOCK | nofollow, dir_fd=fd)
+        except OSError as e:
+            raise Refused(f"{what} cannot be read ({e.strerror})") from None
+    finally:
+        os.close(fd)
+
+
+def read_role_manifest(path: str = ROLE_MANIFEST, owner: int = 0, group: int = 0) -> bytes:
+    """The role manifest's bytes: a regular, single-link file owned by
+    `owner`:`group` (root:root) at 0444, reached without following a link,
+    at most RECORD_MAX bytes."""
+    what = f"the role manifest {path}"
+    fd = _open_without_links(path, what)
     try:
         st = _fstat(fd, what)
         if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
-            raise Refused("the start spec is not a regular file with one link")
-        if st.st_uid != owner or stat.S_IMODE(st.st_mode) != SPEC_MODE:
-            raise Refused(f"the start spec is {st.st_uid} {stat.S_IMODE(st.st_mode):04o}, not {owner} 0444 "
-                          f"(a sealed overlay file)")
-        data = _read_all(fd, what)
+            raise Refused(f"{what} is not a regular file with one link")
+        if (st.st_uid, st.st_gid, stat.S_IMODE(st.st_mode)) != (owner, group, ROLE_MODE):
+            raise Refused(f"{what} is {st.st_uid}:{st.st_gid} {stat.S_IMODE(st.st_mode):04o}, not "
+                          f"{owner}:{group} 0444 (a sealed overlay file)")
+        return _read_all(fd, what)
     finally:
         os.close(fd)
+
+
+def _no_duplicate_keys(pairs: List[tuple]) -> Dict[str, object]:
+    out: Dict[str, object] = {}
+    for k, v in pairs:
+        if k in out:
+            raise Refused(f"the role manifest repeats the key {k!r}")
+        out[k] = v
+    return out
+
+
+def parse_role(data: bytes) -> Dict[str, object]:
+    """The role manifest's `start`, from the closed `amap-m1-role/1` object:
+    exactly ROLE_KEYS at the top and START_KEYS in `start`, no key twice."""
     try:
-        doc = json.loads(data.decode("utf-8"))
+        doc = json.loads(data.decode("utf-8"), object_pairs_hook=_no_duplicate_keys)
     except (UnicodeDecodeError, ValueError):
-        raise Refused("the start spec is not JSON") from None
-    if not isinstance(doc, dict) or set(doc) != SPEC_KEYS or doc["schema"] != SPEC_SCHEMA:
-        raise Refused("the start spec must have exactly: " + ", ".join(sorted(SPEC_KEYS)))
+        raise Refused("the role manifest is not JSON") from None
+    if not isinstance(doc, dict) or set(doc) != ROLE_KEYS or doc["schema"] != ROLE_SCHEMA:
+        raise Refused(f"the role manifest must be {ROLE_SCHEMA} with exactly: " + ", ".join(sorted(ROLE_KEYS)))
+    start = doc["start"]
+    if not isinstance(start, dict) or set(start) != START_KEYS:
+        raise Refused("the role manifest's start must have exactly: " + ", ".join(sorted(START_KEYS)))
     for k in ("uid_1", "group_add"):
-        v = doc[k]
+        v = start[k]
         if isinstance(v, bool) or not isinstance(v, int) or v < 1:
-            raise Refused(f"the start spec's {k} is not a positive integer")
-    c = doc["config"]
+            raise Refused(f"the role manifest's start.{k} is not a positive integer")
+    c = start["config"]
     if not isinstance(c, str) or not c.startswith("/") or os.path.normpath(c) != c:
-        raise Refused("the start spec's config is not an absolute, normalised path")
-    if not isinstance(doc["image"], str) or not _IMAGE_ID.fullmatch(doc["image"]):
-        raise Refused("the start spec's image is not an image Id (sha256:<64 hex>)")
-    if not isinstance(doc["name"], str) or not _NAME.fullmatch(doc["name"]):
-        raise Refused("the start spec's name is not a container name")
-    return doc
+        raise Refused("the role manifest's start.config is not an absolute, normalised path")
+    if not isinstance(start["image"], str) or not _IMAGE_ID.fullmatch(start["image"]):
+        raise Refused("the role manifest's start.image is not an image Id (sha256:<64 hex>)")
+    if not isinstance(start["name"], str) or not _NAME.fullmatch(start["name"]):
+        raise Refused("the role manifest's start.name is not a container name")
+    return start
 
 
-def fixed_argv(spec: Dict[str, object]) -> List[str]:
+def check_role(a2a: bytes, data: bytes) -> Dict[str, object]:
+    """The role manifest is the bytes A2a admitted: its sha256 is the A2a
+    line's one `role=`, compared before anything in it is read."""
+    role = _one(a2a_fields(a2a), "role", "A2a")
+    if not _HEX64.fullmatch(role):
+        raise Refused("the A2a record's role= is not 64 lowercase hex")
+    if _sha(data) != role:
+        raise Refused("the role manifest is not the one A2a admitted (its sha256 is not A2a's role=)")
+    return parse_role(data)
+
+
+def fixed_argv(start: Dict[str, object]) -> List[str]:
     """The one start, token for token."""
-    return [SUDO, "-u", f"#{spec['uid_1']}", "--", RUN_SH, "--config", str(spec["config"]), "--image",
-            str(spec["image"]), "--name", str(spec["name"]), "--group-add", str(spec["group_add"]), "--detach"]
+    return [SUDO, "-u", f"#{start['uid_1']}", "--", RUN_SH, "--config", str(start["config"]), "--image",
+            str(start["image"]), "--name", str(start["name"]), "--group-add", str(start["group_add"]), "--detach"]
 
 
-def check_argv(argv: List[str], spec: Dict[str, object]) -> None:
-    want = fixed_argv(spec)
+def check_argv(argv: List[str], start: Dict[str, object]) -> None:
+    want = fixed_argv(start)
     if argv != want:
         first = next(i for i in range(max(len(argv), len(want)))
                      if i >= len(argv) or i >= len(want) or argv[i] != want[i])
@@ -413,7 +475,7 @@ def _parse_args(argv: List[str]) -> Optional[Dict[str, object]]:
     pairs = dict(zip(opts[0::2], opts[1::2]))
     if len(pairs) != len(opts) // 2:
         return None
-    need = {"--go", "--order", "--a2a", "--ctlr", "--psr", "--harpf", "--start-spec"}
+    need = {"--go", "--order", "--a2a", "--ctlr", "--psr", "--harpf"}
     if not need <= set(pairs) or set(pairs) - need - {"--psr-recheck"}:
         return None
     if pairs["--order"] not in ("earlier", "later"):
@@ -423,7 +485,7 @@ def _parse_args(argv: List[str]) -> Optional[Dict[str, object]]:
 
 def main(argv: List[str], execv: Callable[[str, List[str]], None] = os.execv,
          boot_id: Callable[[], str] = _boot_id, now: Callable[[], float] = time.time,
-         spec_owner: int = 0) -> int:
+         role_path: str = ROLE_MANIFEST, role_owner: int = 0, role_group: int = 0) -> int:
     parsed = _parse_args(argv)
     if parsed is None:
         print(__doc__.split("\n\n")[2], file=sys.stderr)
@@ -439,7 +501,8 @@ def main(argv: List[str], execv: Callable[[str, List[str]], None] = os.execv,
         except OSError as e:
             raise Refused(f"{BOOT_ID} cannot be read ({e.strerror})") from None
         check(go, pairs["--order"], records, current_boot, now())
-        check_argv(run, load_start_spec(pairs["--start-spec"], owner=spec_owner))
+        start = check_role(records["a2a"], read_role_manifest(role_path, role_owner, role_group))
+        check_argv(run, start)
     except Refused as e:
         print(f"m1-start: refused: {e}; nothing was started", file=sys.stderr)
         return EXIT_REFUSED

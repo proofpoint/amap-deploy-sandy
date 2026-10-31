@@ -10,6 +10,7 @@ import contextlib
 import hashlib
 import io
 import os
+import shutil
 import tempfile
 import time
 import unittest
@@ -21,8 +22,13 @@ IMAGE = "sha256:" + "d" * 64
 RUN = ["/usr/bin/sudo", "-u", "#1001", "--", "/opt/amap/src/amap-router-local-hop/docker/run.sh", "--config",
        "/srv/data/sandy/features/amap/router.json", "--image", IMAGE, "--name", "amap-rl", "--group-add", "1002",
        "--detach"]
-SPEC = {"schema": "amap-m1-start-spec/1", "uid_1": 1001, "group_add": 1002,
-        "config": "/srv/data/sandy/features/amap/router.json", "image": IMAGE, "name": "amap-rl"}
+START = {"uid_1": 1001, "group_add": 1002, "config": "/srv/data/sandy/features/amap/router.json", "image": IMAGE,
+         "name": "amap-rl"}
+#: The agreed `amap-m1-role/1` shape (DS and DS2, under the controller's ruling (A)); ADM has no bytes yet.
+ROLE = {"schema": "amap-m1-role/1", "role": "H1", "vm": "m1vm1", "hostname": "m1vm1", "fd": "sandy.m1vm1.internal",
+        "own_domain": "m1vm1.example.org", "ids": {"op": 1000, "m1-admin": 1003, "adm": 1004, "uid-1": 1001,
+                                                    "uid-2": 1005, "registry": 1006},
+        "units": ["m1-state-check.service", "srv-m1\\x2dstate.mount"], "start": START}
 
 
 def psr_bytes(ctlr, recheck_of=None, diff=(), prewindow="PASS", result=None, users_x="-", tweak=None):
@@ -54,12 +60,13 @@ class Fixture(unittest.TestCase):
 
     def setUp(self):
         self.t = os.path.realpath(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.t)
         self.now = calendar.timegm(time.strptime("2026-10-30T18:00:00Z", "%Y-%m-%dT%H:%M:%SZ"))
         self.a2a_t = self.now - 60
         self.files = {}
         self.write("ctlr", b"ctlr record\n")
         self.write("psr", psr_bytes(self.sha("ctlr")))
-        self.write_spec(SPEC)
+        self.write_role(ROLE)
         self.write("harpf", b"har-pfv receipt\nresult PASS\n")
         self.write_a2a(ctlr=self.sha("ctlr"))
         self.order = "earlier"
@@ -75,22 +82,30 @@ class Fixture(unittest.TestCase):
             f.write(data)
         self.files[name] = data
 
-    def write_a2a(self, ctlr, boot=BOOT, at=None):
+    def write_a2a(self, ctlr, boot=BOOT, at=None, role=None):
         at = self.a2a_t if at is None else at
+        role = self.sha("role") if role is None else role
         self.write("a2a", (f"CHECK mount PASS ctlr=decoy\n"
                            f"VM-ADMIT A2a PASS host=H1 att=ATT-1 boot_id={boot} adm={'1' * 64} man={'2' * 64} "
                            f"ovl=none prov={'3' * 64} env=none exp=none d7={'4' * 64} dd={'5' * 64} ctlr={ctlr} "
-                           f"utc={utc(at)}\n").encode())
+                           f"role={role} utc={utc(at)}\n").encode())
 
-    def write_spec(self, spec, mode=0o444):
+    def write_role(self, doc, mode=0o444, raw=None):
+        """The role manifest, sealed, and its sha in a fresh A2a line."""
         import json
-        path = self.path("spec")
-        if os.path.exists(path):
-            os.chmod(path, 0o644)
+        path = self.path("role")
+        if os.path.lexists(path):
+            if not os.path.islink(path):
+                os.chmod(path, 0o644)
             os.unlink(path)
-        with open(path, "w") as f:
-            json.dump(spec, f)
+        data = raw if raw is not None else json.dumps(doc).encode()
+        with open(path, "wb") as f:
+            f.write(data)
         os.chmod(path, mode)
+        self.files["role"] = data
+        if "a2a" in self.files:
+            self.write_a2a(ctlr=self.sha("ctlr"))
+            self.go["a2a"] = self.sha("a2a")
 
     def write_recheck(self, **kw):
         self.write("recheck", psr_bytes(self.sha("ctlr"), recheck_of=self.sha("psr"), **kw))
@@ -107,15 +122,15 @@ class Fixture(unittest.TestCase):
         with open(self.path("go"), "w") as f:
             f.write(text + "\n")
         argv = ["--go", self.path("go"), "--order", self.order, "--a2a", self.path("a2a"), "--ctlr",
-                self.path("ctlr"), "--psr", self.path("psr"), "--harpf", self.path("harpf"), "--start-spec",
-                self.path("spec")]
+                self.path("ctlr"), "--psr", self.path("psr"), "--harpf", self.path("harpf")]
         if self.recheck:
             argv += ["--psr-recheck", self.path("recheck")]
         argv += ["--"] + (run if run is not None else RUN)
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
             rc = ms.main(argv, execv=lambda p, a: self.execd.append((p, a)), boot_id=lambda: BOOT,
-                         now=lambda: self.now, spec_owner=os.getuid())
+                         now=lambda: self.now, role_path=self.path("role"), role_owner=os.getuid(),
+                         role_group=os.getgid())
         return rc, err.getvalue()
 
     def refused(self, words, **kw):
@@ -256,7 +271,7 @@ class CtlrTest(Fixture):
     def test_a_ctlr_in_a_check_row_is_not_read(self):
         a2a = self.files["a2a"].replace(b"CHECK mount PASS ctlr=decoy", b"CHECK mount PASS ctlr=" +
                                         self.sha("ctlr").encode())
-        a2a = a2a.replace(b" ctlr=" + self.sha("ctlr").encode() + b" utc=", b" ctlr=none utc=")
+        a2a = a2a.replace(b" ctlr=" + self.sha("ctlr").encode() + b" role=", b" ctlr=none role=")
         self.write("a2a", a2a)
         self.go["a2a"] = self.sha("a2a")
         self.refused("ctlr=none")
@@ -313,13 +328,13 @@ class GoTextTest(Fixture):
 
 
 class ArgvTest(Fixture):
-    """ARGV must be exactly the fixed start the start spec builds."""
+    """ARGV must be exactly the fixed start the role manifest's `start` builds."""
 
     def argv_refused(self, run):
         self.refused("ARGV is not the fixed start", run=run)
 
-    def test_the_fixed_start_is_exactly_built_from_the_spec(self):
-        self.assertEqual(ms.fixed_argv(SPEC), RUN)
+    def test_the_fixed_start_is_exactly_built_from_the_role_manifest(self):
+        self.assertEqual(ms.fixed_argv(START), RUN)
 
     def test_another_program_is_refused(self):
         self.argv_refused(["/bin/sh"] + RUN[1:])
@@ -363,41 +378,175 @@ class ArgvTest(Fixture):
                 i = RUN.index(flag)
                 self.argv_refused(RUN[:i + 1] + [bad] + RUN[i + 2:])
 
-    def test_a_start_spec_that_is_not_sealed_is_refused(self):
-        self.write_spec(SPEC, mode=0o644)
-        self.refused("0644, not")
+class RoleManifestTest(Fixture):
+    """The role manifest binds the start to A2a: its sha is A2a's role=, it is
+    sealed and reached without a link, and it is the closed schema."""
 
-    def test_a_start_spec_owned_by_another_uid_is_refused(self):
-        rc, err = None, None
-        argv_owner = os.getuid() + 1
+    def other_owner(self, owner, group):
+        rc, err = None, io.StringIO()
         with open(self.path("go"), "w") as f:
             f.write(" ".join(f"{k}={v}" for k, v in self.go.items()) + "\n")
         argv = ["--go", self.path("go"), "--order", self.order, "--a2a", self.path("a2a"), "--ctlr", self.path("ctlr"),
-                "--psr", self.path("psr"), "--harpf", self.path("harpf"), "--start-spec", self.path("spec"), "--"] + RUN
-        e = io.StringIO()
-        with contextlib.redirect_stderr(e):
+                "--psr", self.path("psr"), "--harpf", self.path("harpf"), "--"] + RUN
+        with contextlib.redirect_stderr(err):
             rc = ms.main(argv, execv=lambda p, a: self.execd.append((p, a)), boot_id=lambda: BOOT,
-                         now=lambda: self.now, spec_owner=argv_owner)
+                         now=lambda: self.now, role_path=self.path("role"), role_owner=owner, role_group=group)
         self.assertEqual(rc, ms.EXIT_REFUSED)
-        self.assertIn("a sealed overlay file", e.getvalue())
+        self.assertIn("a sealed overlay file", err.getvalue())
         self.assertEqual(self.execd, [])
 
-    def test_a_linked_start_spec_is_refused(self):
-        os.rename(self.path("spec"), self.path("spec.real"))
-        os.symlink(self.path("spec.real"), self.path("spec"))
-        self.refused("the start spec")
+    def test_the_default_path_is_the_pinned_overlay_file(self):
+        self.assertEqual(ms.ROLE_MANIFEST, "/srv/m1-state/sandy/features/amap/m1-role.json")
+        import inspect
+        self.assertEqual(inspect.signature(ms.main).parameters["role_path"].default, ms.ROLE_MANIFEST)
 
-    def test_a_start_spec_with_another_key_is_refused(self):
-        self.write_spec({**SPEC, "extra": 1})
-        self.refused("the start spec must have exactly")
+    def test_there_is_no_start_spec_option(self):
+        argv = ["--go", "g", "--order", "earlier", "--a2a", "a", "--ctlr", "c", "--psr", "p", "--harpf", "h",
+                "--start-spec", "s", "--", "/bin/true"]
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(ms.main(argv), ms.EXIT_USAGE)
 
-    def test_a_start_spec_with_a_tag_image_is_refused(self):
-        self.write_spec({**SPEC, "image": "amap-router-local"})
-        self.refused("is not an image Id")
+    def test_another_role_manifest_than_a2a_admitted_is_refused(self):
+        self.write_role(ROLE)
+        import json
+        path = self.path("role")
+        os.chmod(path, 0o644)
+        with open(path, "w") as f:
+            json.dump({**ROLE, "start": {**START, "uid_1": 1002}}, f)
+        os.chmod(path, 0o444)
+        self.refused("the role manifest is not the one A2a admitted")
 
-    def test_a_start_spec_with_uid_0_is_refused(self):
-        self.write_spec({**SPEC, "uid_1": 0})
-        self.refused("uid_1 is not a positive integer")
+    def test_a_valid_role_manifest_with_other_start_values_is_refused(self):
+        """A second sealed, well-formed manifest that picks other values: the
+        argv it would build differs, but the sha binding refuses first."""
+        good_a2a = self.files["a2a"]
+        self.write_role({**ROLE, "start": {**START, "uid_1": 1002, "group_add": 1003, "name": "other"}})
+        self.write("a2a", good_a2a)
+        self.go["a2a"] = self.sha("a2a")
+        self.refused("the role manifest is not the one A2a admitted",
+                     run=ms.fixed_argv({**START, "uid_1": 1002, "group_add": 1003, "name": "other"}))
+
+    def test_an_a2a_without_role_is_refused(self):
+        self.write("a2a", self.files["a2a"].replace(f" role={self.sha('role')}".encode(), b""))
+        self.go["a2a"] = self.sha("a2a")
+        self.refused("carries 0 role= field(s)")
+
+    def test_an_a2a_with_two_role_fields_is_refused(self):
+        self.write("a2a", self.files["a2a"].replace(b" utc=", f" role={self.sha('role')} utc=".encode()))
+        self.go["a2a"] = self.sha("a2a")
+        self.refused("carries 2 role= field(s)")
+
+    def test_an_a2a_with_role_none_is_refused(self):
+        self.write_a2a(ctlr=self.sha("ctlr"), role="none")
+        self.go["a2a"] = self.sha("a2a")
+        self.refused("role= is not 64 lowercase hex")
+
+    def test_a_role_in_a_check_row_is_not_read(self):
+        self.write("a2a", f"CHECK role PASS role={self.sha('role')}\n".encode() + self.files["a2a"].replace(
+            f" role={self.sha('role')}".encode(), b""))
+        self.go["a2a"] = self.sha("a2a")
+        self.refused("carries 0 role= field(s)")
+
+    def test_an_unsealed_role_manifest_is_refused(self):
+        self.write_role(ROLE, mode=0o644)
+        self.refused("0644, not")
+
+    def test_a_role_manifest_owned_by_another_uid_is_refused(self):
+        self.other_owner(os.getuid() + 1, os.getgid())
+
+    def test_a_role_manifest_of_another_group_is_refused(self):
+        self.other_owner(os.getuid(), os.getgid() + 1)
+
+    def test_a_linked_role_manifest_is_refused(self):
+        os.rename(self.path("role"), self.path("role.real"))
+        os.symlink(self.path("role.real"), self.path("role"))
+        self.refused("the role manifest")
+
+    def test_a_hard_linked_role_manifest_is_refused(self):
+        os.link(self.path("role"), self.path("role.second"))
+        self.refused("not a regular file with one link")
+
+    def test_a_role_manifest_under_a_linked_directory_is_refused(self):
+        real = os.path.join(self.t, "real")
+        os.mkdir(real)
+        os.rename(self.path("role"), os.path.join(real, "role"))
+        os.symlink(real, os.path.join(self.t, "via"))
+        rc, err = None, io.StringIO()
+        with open(self.path("go"), "w") as f:
+            f.write(" ".join(f"{k}={v}" for k, v in self.go.items()) + "\n")
+        argv = ["--go", self.path("go"), "--order", self.order, "--a2a", self.path("a2a"), "--ctlr", self.path("ctlr"),
+                "--psr", self.path("psr"), "--harpf", self.path("harpf"), "--"] + RUN
+        with contextlib.redirect_stderr(err):
+            rc = ms.main(argv, execv=lambda p, a: self.execd.append((p, a)), boot_id=lambda: BOOT,
+                         now=lambda: self.now, role_path=os.path.join(self.t, "via", "role"),
+                         role_owner=os.getuid(), role_group=os.getgid())
+        self.assertEqual(rc, ms.EXIT_REFUSED, err.getvalue())
+        self.assertIn("cannot be reached without following a link", err.getvalue())
+        self.assertEqual(self.execd, [])
+        # the same file by its real path is admitted
+        self.assertEqual(ms.read_role_manifest(os.path.join(real, "role"), os.getuid(), os.getgid()),
+                         self.files["role"])
+
+    def test_a_relative_or_unnormalised_path_is_refused(self):
+        for p in ("m1-role.json", self.t + "/./role", self.t + "/x/../role", self.t + "/"):
+            with self.subTest(p=p), self.assertRaisesRegex(ms.Refused, "not an absolute, normalised path"):
+                ms.read_role_manifest(p, os.getuid(), os.getgid())
+
+    def test_an_oversized_role_manifest_is_refused(self):
+        self.write_role(None, raw=b" " * (ms.RECORD_MAX + 1))
+        self.refused(f"is larger than {ms.RECORD_MAX} bytes")
+
+    def test_a_role_manifest_that_is_not_json_is_refused(self):
+        self.write_role(None, raw=b"role\n")
+        self.refused("the role manifest is not JSON")
+
+    def test_a_duplicate_key_is_refused(self):
+        import json
+        raw = json.dumps(ROLE)[:-1] + ', "role": "H2"}'
+        self.write_role(None, raw=raw.encode())
+        self.refused("repeats the key 'role'")
+
+    def test_a_duplicate_start_key_is_refused(self):
+        import json
+        raw = json.dumps(ROLE).replace('"uid_1": 1001', '"uid_1": 1001, "uid_1": 1002')
+        self.write_role(None, raw=raw.encode())
+        self.refused("repeats the key 'uid_1'")
+
+    def test_another_schema_is_refused(self):
+        self.write_role({**ROLE, "schema": "amap-m1-start-spec/1"})
+        self.refused("must be amap-m1-role/1")
+
+    def test_a_missing_or_extra_top_level_key_is_refused(self):
+        for doc in ({k: v for k, v in ROLE.items() if k != "units"}, {**ROLE, "extra": 1}):
+            with self.subTest(keys=sorted(doc)):
+                self.write_role(doc)
+                self.refused("with exactly:")
+
+    def test_a_missing_or_extra_start_key_is_refused(self):
+        for start in ({k: v for k, v in START.items() if k != "name"}, {**START, "detach": True}):
+            with self.subTest(keys=sorted(start)):
+                self.write_role({**ROLE, "start": start})
+                self.refused("start must have exactly")
+
+    def test_bad_start_values_are_refused(self):
+        for k, bad, words in (("uid_1", 0, "start.uid_1 is not a positive integer"),
+                              ("uid_1", True, "start.uid_1 is not a positive integer"),
+                              ("group_add", "1002", "start.group_add is not a positive integer"),
+                              ("config", "router.json", "start.config is not an absolute"),
+                              ("config", "/srv/../etc/passwd", "start.config is not an absolute"),
+                              ("image", "amap-router-local", "start.image is not an image Id"),
+                              ("name", "-x", "start.name is not a container name"),
+                              ("name", "a\nb", "start.name is not a container name")):
+            with self.subTest(k=k, bad=bad):
+                self.write_role({**ROLE, "start": {**START, k: bad}})
+                self.refused(words)
+
+    def test_the_start_is_built_from_the_role_manifest(self):
+        other = {**START, "uid_1": 2001, "group_add": 2002, "name": "amap-rl-2"}
+        self.write_role({**ROLE, "start": other})
+        rc, err = self.run_wrapper(run=ms.fixed_argv(other))
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.execd, [(ms.SUDO, ms.fixed_argv(other))])
 
 
 class PsrGrammarTest(Fixture):
@@ -584,56 +733,42 @@ class OpusOptionalTest(Fixture):
         with open(self.path("go"), "w") as f:
             f.write(" ".join(f"{k}={v}" for k, v in self.go.items()) + "\n")
         argv = ["--go", self.path("go"), "--order", self.order, "--a2a", self.path("a2a"), "--ctlr", self.path("ctlr"),
-                "--psr", self.path("psr"), "--harpf", self.path("harpf"), "--start-spec", self.path("spec"), "--"] + RUN
+                "--psr", self.path("psr"), "--harpf", self.path("harpf"), "--"] + RUN
 
         def broken():
             raise OSError(2, "No such file or directory")
         e = io.StringIO()
         with contextlib.redirect_stderr(e):
             rc = ms.main(argv, execv=lambda p, a: self.execd.append((p, a)), boot_id=broken, now=lambda: self.now,
-                         spec_owner=os.getuid())
+                         role_path=self.path("role"), role_owner=os.getuid(), role_group=os.getgid())
         self.assertEqual(rc, ms.EXIT_REFUSED)
         self.assertIn(ms.BOOT_ID, e.getvalue())
 
 
 class CompleteReadTest(Fixture):
     """Both readers read to EOF however the bytes arrive, and refuse more than
-    RECORD_MAX: a record and the start spec alike."""
+    RECORD_MAX: a record and the role manifest alike."""
 
     def short_reads(self):
         real = os.read
         self.addCleanup(setattr, os, "read", real)
         os.read = lambda fd, n: real(fd, min(n, 7))
 
-    def test_short_reads_still_read_every_record_and_the_spec(self):
+    def test_short_reads_still_read_every_record_and_the_role_manifest(self):
         self.short_reads()
         rc, err = self.run_wrapper()
         self.assertEqual(rc, 0, err)
         self.assertEqual(len(self.execd), 1)
 
-    def test_a_spec_split_across_reads_is_read_whole(self):
+    def test_a_role_manifest_split_across_reads_is_read_whole(self):
         self.short_reads()
-        self.assertEqual(ms.load_start_spec(self.path("spec"), owner=os.getuid()), SPEC)
+        self.assertEqual(ms.read_role_manifest(self.path("role"), os.getuid(), os.getgid()), self.files["role"])
 
-    def test_an_oversized_start_spec_is_refused(self):
-        import json
-        doc = json.dumps(SPEC)[:-1] + ', "pad": "' + "x" * ms.RECORD_MAX + '"}'
-        path = self.path("spec")
-        os.chmod(path, 0o644)
-        with open(path, "w") as f:
-            f.write(doc)
-        os.chmod(path, 0o444)
-        self.refused(f"is larger than {ms.RECORD_MAX} bytes")
-
-    def test_an_oversized_start_spec_is_refused_under_short_reads(self):
-        path = self.path("spec")
-        os.chmod(path, 0o644)
-        with open(path, "wb") as f:
-            f.write(b" " * (ms.RECORD_MAX + 1))
-        os.chmod(path, 0o444)
+    def test_an_oversized_role_manifest_is_refused_under_short_reads(self):
+        self.write_role(None, raw=b" " * (ms.RECORD_MAX + 1))
         self.short_reads()
         with self.assertRaisesRegex(ms.Refused, "larger than"):
-            ms.load_start_spec(path, owner=os.getuid())
+            ms.read_role_manifest(self.path("role"), os.getuid(), os.getgid())
 
     def test_an_oversized_record_is_refused_under_short_reads(self):
         self.write("harpf", b"x" * (ms.RECORD_MAX + 1))
@@ -663,7 +798,7 @@ class UsageTest(Fixture):
     def test_an_unknown_order_exits_2(self):
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(ms.main(["--go", "x", "--order", "first", "--a2a", "a", "--ctlr", "c", "--psr", "p",
-                                      "--harpf", "h", "--start-spec", "s", "--", "/bin/true"]), ms.EXIT_USAGE)
+                                      "--harpf", "h", "--", "/bin/true"]), ms.EXIT_USAGE)
 
 
 if __name__ == "__main__":
