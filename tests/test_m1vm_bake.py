@@ -104,11 +104,39 @@ class FakeHost:
             f"local-fs.target.requires/{u}": f"l 777 root root {bake.UNIT_DIR}/{u}"
             for u in ("srv-m1\\x2dstate.mount", "var-lib-docker.mount")}}
         # /etc/apt/sources.list.d as `find -printf '%y %f\0'` lists it once bake's
-        # list is written, ubuntu.sources' sha, and what `find /etc/apt -name
-        # sources.list` prints after bake's rm -f.
+        # list is written, ubuntu.sources' sha, and what bake's legacy-list test
+        # prints after its rm -f.
         self.apt_dir = {"m1-snapshot.list": "f", "ubuntu.sources": "f"}
         self.ubuntu_sources_sha = pin["apt"]["ubuntu_sources_sha256"]
         self.legacy_list = ""
+        # apt's configuration, resolved as apt does (READ, apt-config(8); the
+        # -o order MEASURED by Opus on apt 3.0.3): the defaults, then
+        # apt.conf and apt.conf.d (apt_conf), then an inherited APT_CONFIG
+        # file (apt_config_env) unless env -u APT_CONFIG removed it, then
+        # each command-line -o, last. Every apt-get that resolves to other
+        # paths, or ran under APT_CONFIG, is recorded.
+        self.apt_conf = {}
+        self.apt_config_env = None
+        self.unaccounted = []
+        self.under_apt_config = []
+
+    def apt_resolve(self, a):
+        prog = next(i for i, x in enumerate(a) if x in ("apt-get", "apt-config"))
+        unset = any(a[i:i + 2] == ["-u", "APT_CONFIG"] for i in range(prog))
+        cfg = {"Dir::Etc": "/etc/apt/", "Dir::Etc::sourcelist": "sources.list", "Dir::Etc::sourceparts": "sources.list.d"}
+        cfg.update(self.apt_conf)
+        if self.apt_config_env is not None and not unset:
+            cfg.update(self.apt_config_env)
+            self.under_apt_config.append(list(a))
+        for i in range(prog + 1, len(a) - 1):
+            if a[i] == "-o":
+                k, v = a[i + 1].split("=", 1)
+                cfg[k] = v
+
+        def path(k):
+            v = cfg[k]
+            return v if v.startswith("/") else cfg["Dir::Etc"].rstrip("/") + "/" + v
+        return (cfg["Dir::Etc"], path("Dir::Etc::sourcelist"), path("Dir::Etc::sourceparts").rstrip("/") + "/")
 
     def put(self, path, text, mode="0644", owner="root:root"):
         self.log.append(["<put>", path])
@@ -136,10 +164,21 @@ class FakeHost:
             if a[2:] != ["-mindepth", "1", "-maxdepth", "1", "-printf", "%y %f\\0"]:
                 raise AssertionError(f"unmodelled find {a[2:]!r}")
             return "".join(f"{t} {n}\0" for n, t in sorted(self.apt_dir.items()))
-        if a[:2] == ["find", "/etc/apt"]:
-            if a[2:] != ["-mindepth", "1", "-maxdepth", "1", "-name", "sources.list", "-printf", "%y\\n"]:
-                raise AssertionError(f"unmodelled find {a[2:]!r}")
+        if a[:2] == ["sh", "-c"] and a[3:4] == ["m1-legacy"]:
+            if a[2:] != ['if [ -e "$1" ] || [ -L "$1" ]; then echo present; fi', "m1-legacy", "/etc/apt/sources.list"]:
+                raise AssertionError(f"unmodelled legacy test {a[2:]!r}")
             return self.legacy_list
+        if "apt-config" in a or "apt-get" in a:
+            got = self.apt_resolve(a)
+            if "apt-config" in a:
+                tail, rest = a[a.index("apt-config") + 1:], []
+                while tail:
+                    tail = tail[2:] if tail[0] == "-o" else (rest.append(tail[0]) or tail[1:])
+                if rest != ["shell", "L", "Dir::Etc::sourcelist/f", "P", "Dir::Etc::sourceparts/d"]:
+                    raise AssertionError(f"unmodelled apt-config {a!r}")
+                return f"L='{got[1]}'\nP='{got[2]}'\n"
+            if got != ("/etc/apt/", "/etc/apt/sources.list", f"{bake.APT_DIR}/"):
+                self.unaccounted.append(list(a))
         if a == ["sha256sum", f"{bake.APT_DIR}/ubuntu.sources"]:
             return f"{self.ubuntu_sources_sha}  {a[1]}\n"
         if a[:2] == ["find", bake.UNIT_DIR]:
@@ -656,7 +695,8 @@ class SequenceTest(BakeCase):
 
 class AptCensusTest(BakeCase):
     """PIN-RESIDUAL-3-CENSUS: before any fetch, sources.list.d is exactly bake's
-    list and ubuntu.sources at PIN's sha, and the legacy list is gone."""
+    list and ubuntu.sources at PIN's sha, the legacy list is gone, and every
+    fetch reads only those paths (BAKE-APT-CENSUS-R2)."""
 
     def fetches(self):
         return [a for a in self.host.log if "apt-get" in a]
@@ -667,13 +707,45 @@ class AptCensusTest(BakeCase):
         removed = self.index(lambda a: a == ["rm", "-f", "/etc/apt/sources.list"])
         listed = self.index(lambda a: a[:2] == ["find", bake.APT_DIR])
         hashed = self.index(lambda a: a == ["sha256sum", f"{bake.APT_DIR}/ubuntu.sources"])
-        legacy = self.index(lambda a: a[:2] == ["find", "/etc/apt"])
-        update = self.index(lambda a: a[:2] == ["apt-get", "update"])
+        legacy = self.index(lambda a: a[3:4] == ["m1-legacy"])
+        resolved = self.index(lambda a: "apt-config" in a)
+        update = self.index(lambda a: "apt-get" in a and "update" in a)
         first_fetch = min(i for i, a in enumerate(self.host.log) if "apt-get" in a)
         self.assertEqual(update, first_fetch)
         self.assertLess(written, listed)
         self.assertLess(removed, legacy)
-        self.assertLess(max(listed, hashed, legacy), update)
+        self.assertLess(max(listed, hashed, legacy, resolved), update)
+
+    def test_redirects_are_overridden(self):
+        # Each redirect would make apt read a source the census never saw; the
+        # command-line -o and env -u APT_CONFIG leave every fetch on the census's paths.
+        redirects = {
+            "apt.conf main list": lambda h: h.apt_conf.update({"Dir::Etc::sourcelist": "/etc/apt/other.list"}),
+            "apt.conf.d sourceparts": lambda h: h.apt_conf.update({"Dir::Etc::sourceparts": "/var/lib/other.d"}),
+            "Dir::Etc": lambda h: h.apt_conf.update({"Dir::Etc": "/var/lib/other-etc/"}),
+            "inherited APT_CONFIG": lambda h: setattr(h, "apt_config_env", {"Dir::Etc::sourceparts": "/var/lib/other.d"}),
+        }
+        for name, redirect in redirects.items():
+            with self.subTest(name):
+                self.setUp()
+                redirect(self.host)
+                self.run_bake()
+                self.assertTrue(any("update" in a for a in self.fetches()))
+                self.assertTrue(any("install" in a for a in self.fetches()))
+                self.assertEqual(self.host.unaccounted, [])
+                self.assertEqual(self.host.under_apt_config, [])
+
+    def test_resolution_other_than_the_census_paths_is_refused_before_fetch(self):
+        for name, out in {"another list": "L='/etc/apt/other.list'\nP='/etc/apt/sources.list.d/'\n",
+                          "another parts dir": "L='/etc/apt/sources.list'\nP='/var/lib/other.d/'\n",
+                          "no final newline": "L='/etc/apt/sources.list'\nP='/etc/apt/sources.list.d/'"}.items():
+            with self.subTest(name):
+                self.setUp()
+                self.host.over["apt-config"] = out
+                with self.assertRaises(bake.BakeFail) as cm:
+                    self.run_bake()
+                self.assertIn("apt: apt resolves its sources to", str(cm.exception))
+                self.assertEqual(self.fetches(), [])
 
     def test_breaks(self):
         breaks = {
@@ -687,8 +759,8 @@ class AptCensusTest(BakeCase):
             "a subdirectory": (lambda h: h.apt_dir.update({"x": "d"}), "not exactly"),
             "ubuntu.sources changed": (lambda h: setattr(h, "ubuntu_sources_sha", "6" * 64),
                                        "ubuntu.sources is " + "6" * 64),
-            "legacy list left": (lambda h: setattr(h, "legacy_list", "f\n"), "/etc/apt/sources.list is still present"),
-            "legacy list a directory": (lambda h: setattr(h, "legacy_list", "d\n"), "/etc/apt/sources.list is still present"),
+            "legacy list left": (lambda h: setattr(h, "legacy_list", "present\n"),
+                                 "/etc/apt/sources.list is still present"),
         }
         for name, (brk, needle) in breaks.items():
             with self.subTest(name):

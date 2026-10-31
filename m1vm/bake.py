@@ -17,8 +17,8 @@ which is the `assert-d` step's result (named in sealspec.py's coverage note).
 
 Steps, in order:
   apt          the snapshot sources, the source census (exactly PIN's list and
-               ubuntu.sources at PIN's sha, no legacy list), then exactly
-               PIN's package versions
+               ubuntu.sources at PIN's sha, no legacy list, and apt resolving
+               exactly those paths), then exactly PIN's package versions
   quiet        no automatic change: units masked, packages removed, journal
                volatile, coredumps not stored (systemd-coredump pinned),
                swap off and no swap line in /etc/fstab
@@ -320,11 +320,17 @@ def step_mount_d(pin, host):
     d_mounted(host, pin["docker"]["d_uuid"])
 
 
-APT_ENV = ["env", "DEBIAN_FRONTEND=noninteractive", "NEEDRESTART_MODE=l", "NEEDRESTART_SUSPEND=1"]
+APT_ENV = ["env", "-u", "APT_CONFIG", "DEBIAN_FRONTEND=noninteractive", "NEEDRESTART_MODE=l", "NEEDRESTART_SUSPEND=1"]
 
 
 APT_DIR = "/etc/apt/sources.list.d"
 APT_SOURCES = ("m1-snapshot.list", "ubuntu.sources")
+# apt reads the paths its configuration resolves, and apt.conf, apt.conf.d or
+# APT_CONFIG can redirect them. A command-line -o is applied last, so these pin
+# every fetch to the paths the census checks (BAKE-APT-CENSUS-R2).
+APT_DIRS = ["-o", "Dir::Etc=/etc/apt/", "-o", "Dir::Etc::sourcelist=/etc/apt/sources.list",
+            "-o", f"Dir::Etc::sourceparts={APT_DIR}/"]
+APT_RESOLVED = f"L='/etc/apt/sources.list'\nP='{APT_DIR}/'\n"
 
 
 def step_apt(pin, host):
@@ -341,20 +347,24 @@ def step_apt(pin, host):
     have = host.run(["sha256sum", f"{APT_DIR}/ubuntu.sources"]).split()[0]
     if have != pin["apt"]["ubuntu_sources_sha256"]:
         raise BakeFail(f"apt: {APT_DIR}/ubuntu.sources is {have}, not PIN's {pin['apt']['ubuntu_sources_sha256']}")
-    if host.run(["find", "/etc/apt", "-mindepth", "1", "-maxdepth", "1", "-name", "sources.list",
-                 "-printf", "%y\\n"]).strip():
+    if host.run(["sh", "-c", 'if [ -e "$1" ] || [ -L "$1" ]; then echo present; fi', "m1-legacy",
+                 "/etc/apt/sources.list"]).strip():
         raise BakeFail("apt: /etc/apt/sources.list is still present")
+    resolved = host.run([*APT_ENV, "apt-config", *APT_DIRS, "shell", "L", "Dir::Etc::sourcelist/f",
+                         "P", "Dir::Etc::sourceparts/d"])
+    if resolved != APT_RESOLVED:
+        raise BakeFail(f"apt: apt resolves its sources to {resolved!r}, not {APT_RESOLVED!r}")
     # needrestart only lists, never restarts: the guest agent (and anything
     # else) is not restarted under the bake (Opus item 2 B4).
     host.put("/etc/needrestart/conf.d/m1.conf", "$nrconf{restart} = 'l';\n")
-    host.run(["apt-get", "update", "-o", "Dir::Etc::sourceparts=sources.list.d"])
+    host.run([*APT_ENV, "apt-get", *APT_DIRS, "update"])
     agent_have = host.run(["dpkg-query", "-W", "-f", "${Version}", AGENT], root=False).strip()
     if agent_have != pin["apt"]["packages"][AGENT]:
         raise BakeFail(f"apt: {AGENT} is {agent_have!r}, not PIN's {pin['apt']['packages'][AGENT]}; the image's "
                        "agent is never replaced under the bake")
     host.run(["apt-mark", "hold", AGENT])
     pkgs = [f"{n}={v}" for n, v in sorted(pin["apt"]["packages"].items()) if n != AGENT]
-    host.run([*APT_ENV, "apt-get", "install", "-y", "--no-install-recommends", "--allow-downgrades", *pkgs])
+    host.run([*APT_ENV, "apt-get", *APT_DIRS, "install", "-y", "--no-install-recommends", "--allow-downgrades", *pkgs])
     # B2: sandy's build runs as <op>, which drives the engine (LC d8 §4.1).
     op = pin["accounts"]["op"]["name"]
     host.run(["usermod", "-aG", "docker", op])
@@ -371,7 +381,7 @@ def step_apt(pin, host):
 def step_quiet(pin, host):
     host.run(["systemctl", "mask", *pin["quiet"]["mask"]])
     if pin["quiet"]["remove"]:
-        host.run([*APT_ENV, "apt-get", "purge", "-y", *pin["quiet"]["remove"]])
+        host.run([*APT_ENV, "apt-get", *APT_DIRS, "purge", "-y", *pin["quiet"]["remove"]])
     for d in ("/etc/systemd/journald.conf.d", "/etc/systemd/coredump.conf.d"):
         host.run(["install", "-d", "-o", "root", "-g", "root", "-m", "0755", d])
     host.put("/etc/systemd/journald.conf.d/m1.conf", "[Journal]\nStorage=volatile\n")
