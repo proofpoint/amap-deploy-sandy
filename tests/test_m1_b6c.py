@@ -53,7 +53,7 @@ def role_doc(n):
 
 def overlay_doc(n):
     return {"registry": {}, "host_setup": {
-        "router": {"image": {"name": "amap-router-local", "digest": IMAGE, "commit": b.ENROL_COMMIT},
+        "router": {"image": {"name": "example/hop-image", "digest": IMAGE, "commit": b.ENROL_COMMIT},
                    "container": f"amap-rl-{n}"},
         "secrets": {"run_dir": RUN_DIR}}}
 
@@ -417,6 +417,19 @@ class RoleManifestTest(unittest.TestCase):
 
 class ParsersTest(unittest.TestCase):
 
+    def test_a_dns_name_is_at_most_253_characters(self):
+        ok = ".".join(["a" * 63] * 3 + ["b" * 61])
+        self.assertEqual(len(ok), 253)
+        self.assertEqual(b._dns(ok, "x"), ok)
+        with self.assertRaisesRegex(b.Refused, "is not a DNS name"):
+            b._dns(ok + "b", "x")
+
+    def test_a_path_with_a_leading_double_slash_refuses(self):
+        self.assertEqual(b._abs_path("/srv/x", "x"), "/srv/x")
+        for v in ("//srv/x", "//"):
+            with self.subTest(v=v), self.assertRaisesRegex(b.Refused, "not an absolute, normalised"):
+                b._abs_path(v, "x")
+
     def test_router_json_gives_an_int_age_and_its_state_dir(self):
         self.assertEqual(b.parse_router(b'{"min_sender_age_s":0,"state_dir":"/s"}'), (0, "/s"))
         for data, pattern in ((b'{"state_dir":"/s"}', "carries no min_sender_age_s"),
@@ -458,6 +471,8 @@ class ParsersTest(unittest.TestCase):
             "secrets.run_dir ": bad(lambda d: d["host_setup"]["secrets"].__setitem__("run_dir", "run")),
             "router.image.digest": bad(lambda d: d["host_setup"]["router"]["image"].__setitem__("digest", "x")),
             "router.image.commit": bad(lambda d: d["host_setup"]["router"]["image"].__setitem__("commit", 1)),
+            "router.image.name": bad(lambda d: d["host_setup"]["router"]["image"].__setitem__("name", 7)),
+            "router.image.name ": bad(lambda d: d["host_setup"]["router"]["image"].__setitem__("name", "Hop:1")),
         }
         for pattern, data in cases.items():
             with self.subTest(pattern=pattern), self.assertRaisesRegex(b.Refused, pattern.strip()):
@@ -479,6 +494,14 @@ class ParsersTest(unittest.TestCase):
             b.known_answer(json.dumps(doubled).encode(), 0)
         with self.assertRaisesRegex(b.Refused, "not exactly one"):
             b.known_answer(VECTORS.read_bytes(), 17)
+
+    def test_a_bool_vectors_case_is_not_v_0(self):
+        doc = json.loads(VECTORS.read_text())
+        for c in doc["cases"]:
+            if c["min_sender_age_s"] == 0:
+                c["min_sender_age_s"] = False
+        with self.assertRaisesRegex(b.Refused, "has 0 cases for V 0"):
+            b.known_answer(json.dumps(doc).encode(), 0)
 
     def test_man_is_read_by_key_lookup(self):
         man = {"checkouts": {b.DEPLOY_CHECKOUT: {"head": HEX40, "tree": TREE40}}, "builds": {"router1": {"commit": HEX40}}}
@@ -547,6 +570,10 @@ class ParseReceiptTest(TempCase):
         for k, v in (("uid_1", 1001.0), ("group_add", True), ("config", "x"), ("image", "x"), ("name", "")):
             with self.subTest(k=k, v=v):
                 self.refuses(lambda d: d["vms"]["vm2"]["start"].__setitem__(k, v), f"vms.vm2.start.{k}")
+
+    def test_an_extra_vms_key_refuses(self):
+        self.refuses(lambda d: d["vms"].__setitem__("vm3", d["vms"]["vm1"]), "vms must have exactly")
+        self.refuses(lambda d: d["vms"].pop("vm2"), "vms must have exactly")
 
     def test_the_files_map_is_typed(self):
         self.refuses(lambda d: d["vms"]["vm1"]["files"]["router.json"].__setitem__("mode", "0644"), "0444 or 0555")
@@ -798,6 +825,23 @@ class ReadReceiptTest(TempCase):
                 b._read_bound(fd, "router.json", files, "router.json")
         finally:
             os.close(fd)
+
+    def test_each_fixed_file_is_read_as_the_walk_hashed_it(self):
+        """vm_facts reads each fixed file again after the walk; a read that
+        returns other bytes than the walk hashed refuses, for all four names."""
+        real = b._read
+        for name in b.FIXED_FILES:
+            with self.subTest(name=name):
+                t = self.t / name
+                t.mkdir()
+                built = build_out(t)
+
+                def changed(dir_fd, n, what, name=name):
+                    data = real(dir_fd, n, what)
+                    return data + b" " if n == name else data
+                with mock.patch.object(b, "_read", changed), \
+                        self.assertRaisesRegex(b.Refused, f"OUT/vm1/{name} is not the file the walk hashed"):
+                    self.read(built)
 
     def test_a_changed_payload_byte_refuses(self):
         built = build_out(self.t)

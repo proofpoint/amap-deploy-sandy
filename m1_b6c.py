@@ -90,6 +90,7 @@ _HOSTNAME = re.compile(_LABEL)
 _DNS = re.compile(rf"{_LABEL}(\.{_LABEL})*")
 _CONTAINER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 _IMAGE_ID = re.compile(r"sha256:[0-9a-f]{64}")
+_IMAGE_NAME = re.compile(r"[a-z0-9][a-z0-9._/-]*")
 _UNIT = re.compile(r"[A-Za-z0-9:_.@\\-]+\.(service|mount|timer|socket|target|path)")
 _KEY_PART = re.compile(r"[\x21-\x7e]+")
 _OPEN = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
@@ -403,9 +404,13 @@ def parse_feature(data: bytes) -> Tuple[int, str]:
 
 def parse_overlay(data: bytes) -> Dict[str, str]:
     """deploy-overlay.json, strictly: exactly the `registry` and `host_setup`
-    sections; from host_setup, the router section (closed: image {name,
-    digest, commit} and container) and the secrets section's run_dir. A
-    value it does not name refuses by name."""
+    sections; from host_setup (the host-setup document), its router section,
+    closed as hop_router.load closes it (image {name, digest, commit} and
+    container, each in that module's grammar), and its secrets section's
+    run_dir. A value it does not name refuses by name. Nothing else in the
+    overlay is read: registry, the host-setup document's other sections and
+    secrets' other keys stay open here, since the overlay's bytes are bound
+    by its files sha and their own parsers type them."""
     doc = _closed(strict_loads(data, "the overlay"), frozenset({"registry", "host_setup"}), "the overlay")
     hs = doc["host_setup"]
     if not isinstance(hs, dict):
@@ -415,6 +420,7 @@ def parse_overlay(data: bytes) -> Dict[str, str]:
         raise Refused("the overlay names no router.container")
     _closed(router, frozenset({"image", "container"}), "the overlay's router")
     image = _closed(router["image"], frozenset({"name", "digest", "commit"}), "the overlay's router.image")
+    _match(image["name"], _IMAGE_NAME, "the overlay's router.image.name")
     if not isinstance(secrets, dict) or "run_dir" not in secrets:
         raise Refused("the overlay names no run_dir")
     return {"run_dir": _abs_path(secrets["run_dir"], "the overlay's secrets.run_dir"),
