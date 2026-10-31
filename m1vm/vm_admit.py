@@ -884,7 +884,10 @@ PREFLIGHT_KEYS = {"artifact_known_answer", "artifact_value_is_v", "v_in_range", 
                   "deploy_commit_is_man", "deploy_tree_is_man", "hop_pin_is_man", "role_differ", "fd_differ",
                   "own_domain_differ"} | {f"{k}_vm{n}" for n in (1, 2) for k in (
                       "modes_match", "net_values_match", "manifest_is_receipt", "role_digest", "feature_value",
-                      "feature_fd", "router_value", "start_is_role", "container_is_start_name")}
+                      "feature_fd", "router_value", "start_is_role", "container_is_start_name",
+                      # B6C d5.4-d5.7 §3: the overlay's router and secrets, and router.json's state_dir
+                      "state_dir_is_router", "run_dir_is_overlay", "container_is_overlay", "image_is_overlay",
+                      "image_commit_is_hop_pin")}
 ROLE_KEYS = {"schema", "role", "vm", "hostname", "fd", "own_domain", "ids", "units", "fleet_policy_digest", "start"}
 ID_ROLES = {"op", "m1-admin", "adm", "uid-1", "uid-2", "registry"}
 _HEX40 = re.compile(r"[0-9a-f]{40}\Z")
@@ -892,6 +895,8 @@ _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
 _HOSTNAME = re.compile(_LABEL + r"\Z")
 _DNS = re.compile(rf"{_LABEL}(?:\.{_LABEL})*\Z")
+_VM = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")         # B6C d5.7 §2 vms.<n>.vm
+_CONTAINER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\Z")        # B6C d5.7 §2 router_container (= start.name)
 _UNIT_NAME = re.compile(r"[A-Za-z0-9@._\\-]+\.[a-z]+\Z")
 
 
@@ -935,7 +940,7 @@ def file_key(key):
 def parse_start(st, what):
     _closed(st, START_KEYS, what)
     _need(_int(st["uid_1"], 1) and _int(st["group_add"], 1) and _abs_path(st["config"])
-          and _str(st["image"], _DIGEST) and _str(st["name"]), f"{what}: a field of the wrong form")
+          and _str(st["image"], _DIGEST) and _str(st["name"], _CONTAINER), f"{what}: a field of the wrong form")
 
 
 def parse_receipt(data):
@@ -961,8 +966,10 @@ def parse_receipt(data):
         e = r["vms"][n]
         _closed(e, VM_KEYS, f"vms.{n}")
         _need(e["role"] == role, f"vms.{n}.role is not {role}")
-        _need(_str(e["vm"]) and _str(e["hostname"], _HOSTNAME) and _dns(e["own_domain"]) and _dns(e["fd"]),
+        _need(_str(e["vm"], _VM) and _str(e["hostname"], _HOSTNAME) and _dns(e["own_domain"]) and _dns(e["fd"]),
               f"vms.{n}: vm, hostname, own_domain or fd")
+        # NET-VALUES-SHAPE r5 C5: NET writes vm equal to hostname.
+        _need(e["vm"] == e["hostname"], f"vms.{n}.vm is not its hostname")
         files = e["files"]
         _need(isinstance(files, dict) and all(file_key(k) for k in files), f"vms.{n}.files: a key")
         for k, v in files.items():
@@ -978,7 +985,8 @@ def parse_receipt(data):
         _need(_str(e["carried_digest"], _DIGEST) and _int(e["router_min_sender_age_s"], 0, MAX_AGE),
               f"vms.{n}: carried_digest or router_min_sender_age_s")
         parse_start(e["start"], f"vms.{n}.start")
-        _need(_abs_path(e["state_dir"]) and _abs_path(e["run_dir"]) and e["router_container"] == e["start"]["name"],
+        _need(_abs_path(e["state_dir"]) and _abs_path(e["run_dir"]) and _str(e["router_container"], _CONTAINER)
+              and e["router_container"] == e["start"]["name"],
               f"vms.{n}: state_dir, run_dir or router_container")
     p = r["preflight"]
     _closed(p, PREFLIGHT_KEYS, "preflight")
@@ -991,7 +999,7 @@ def parse_role(data):
     m = strict_json(data)
     _closed(m, ROLE_KEYS, "m1-role.json")
     _need(m["schema"] == "amap-m1-role/1" and m["role"] in ("H1", "H2"), "m1-role.json: schema or role")
-    _need(_str(m["vm"]) and _str(m["hostname"], _HOSTNAME) and _dns(m["fd"]) and _dns(m["own_domain"]),
+    _need(_str(m["vm"], _VM) and _str(m["hostname"], _HOSTNAME) and _dns(m["fd"]) and _dns(m["own_domain"]),
           "m1-role.json: vm, hostname, fd or own_domain")
     _closed(m["ids"], ID_ROLES, "m1-role.json ids")
     _need(all(_int(v, 1) for v in m["ids"].values()), "m1-role.json: ids")

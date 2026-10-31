@@ -150,7 +150,7 @@ class Vm:
                "payload/bin/inbox-mcp-vol": (b"#!/bin/sh\n", 0o555)}
 
     def role_manifest(self, **over):
-        m = {"schema": "amap-m1-role/1", "role": "H1", "vm": "m1-vm1", "hostname": "m1-h1",
+        m = {"schema": "amap-m1-role/1", "role": "H1", "vm": "m1-h1", "hostname": "m1-h1",
              "fd": "sandy.m1-h1.internal", "own_domain": "h1.example.org",
              # ids.op is F's owner (B6C d5.3 §2c.3): the test user stands in for <op>.
              "ids": {"op": os.getuid(), "m1-admin": 2102, "adm": 2103, "uid-1": 2104, "uid-2": 2105, "registry": 2106},
@@ -206,7 +206,7 @@ class Vm:
         digest = role["fleet_policy_digest"]
 
         def entry(n):
-            e = {"role": "H1", "vm": "m1-vm1", "hostname": "m1-h1", "own_domain": "h1.example.org",
+            e = {"role": "H1", "vm": "m1-h1", "hostname": "m1-h1", "own_domain": "h1.example.org",
                  "fd": "sandy.m1-h1.internal", "files": files,
                  "on_manifest_sha256": hashlib.sha256(vm_admit.canonical(files)).hexdigest(),
                  "role_sha256": files["m1-role.json"]["sha256"], "carried_digest": digest,
@@ -214,7 +214,7 @@ class Vm:
                  "run_dir": "/srv/m1-state/run1", "router_container": "amap-hop"}
             if n == 2:
                 other = dict(files, **{"m1-role.json": {"mode": "0444", "sha256": "9" * 64}})
-                e.update(role="H2", vm="m1-vm2", hostname="m1-h2", own_domain="h2.example.org",
+                e.update(role="H2", vm="m1-h2", hostname="m1-h2", own_domain="h2.example.org",
                          fd="sandy.m1-h2.internal", files=other, role_sha256="9" * 64,
                          on_manifest_sha256=hashlib.sha256(vm_admit.canonical(other)).hexdigest())
             return e
@@ -857,6 +857,70 @@ class RoleAndOnTest(AdmCase):
         self.vm.build_on(role=self.vm.role_manifest(fleet_policy_digest=digest),
                          router=b'{"min_sender_age_s":false}\n')
         self.assertIn(" FAIL router.json: min_sender_age_s not an int", self.row())
+
+    def test_preflight_is_d57s_38_keys(self):
+        # B6C d5.7 §3's table, transcribed: 10 global keys and 14 per VM.
+        glob = {"artifact_known_answer", "artifact_value_is_v", "v_in_range", "hop_pin_has_enrol",
+                "deploy_commit_is_man", "deploy_tree_is_man", "hop_pin_is_man", "role_differ", "fd_differ",
+                "own_domain_differ"}
+        per_vm = ("modes_match", "net_values_match", "manifest_is_receipt", "role_digest", "feature_value",
+                  "feature_fd", "router_value", "start_is_role", "container_is_start_name", "state_dir_is_router",
+                  "run_dir_is_overlay", "container_is_overlay", "image_is_overlay", "image_commit_is_hop_pin")
+        want = glob | {f"{k}_vm{n}" for k in per_vm for n in (1, 2)}
+        self.assertEqual(len(want), 38)
+        self.assertEqual(vm_admit.PREFLIGHT_KEYS, want)
+        # A d5.3 receipt (the 28 keys, without d5.4's ten) is refused.
+        d53 = {k for k in want if not k.startswith(("state_dir_is_router", "run_dir_is_overlay", "container_is_overlay",
+                                                     "image_is_overlay", "image_commit_is_hop_pin"))}
+        self.assertEqual(len(d53), 28)
+        self.vm.receipt = dict(self.vm.receipt, preflight={k: True for k in d53})
+        self.assertIn(" FAIL preflight: not exactly", self.row())
+
+    def test_d57_grammars(self):
+        """B6C d5.7 §2: vm's grammar and vm == hostname; router_container's and start.name's grammar."""
+        def vm1(**over):
+            r = self.vm.receipt
+            self.vm.receipt = dict(r, vms=dict(r["vms"], vm1=dict(r["vms"]["vm1"], **over)))
+        start = self.vm.role_manifest()["start"]
+        cases = {
+            "vm not its hostname": lambda: vm1(vm="m1-other"),
+            "vm with a space": lambda: vm1(vm="m1 h1"),
+            "vm starting with a dot": lambda: vm1(vm=".m1-h1"),
+            "vm over 64": lambda: vm1(vm="a" * 65),
+            "router_container with a slash": lambda: vm1(router_container="amap/hop", start=dict(start, name="amap/hop")),
+            "start.name starting with a dash": lambda: vm1(router_container="-hop", start=dict(start, name="-hop")),
+            "manifest vm with a colon": lambda: self.vm.build_on(role=self.vm.role_manifest(vm="m1:h1")),
+        }
+        for name, brk in cases.items():
+            with self.subTest(name):
+                self.setUp()
+                brk()
+                self.assertIn(" FAIL ", self.row())
+
+    def test_d57_grammars_in_the_parsers(self):
+        """Each rule on its own, at the strict parse it lives in (the full row would also refuse these
+        through the manifest-vs-receipt equalities)."""
+        def receipt(**vm1):
+            r = dict(self.vm.receipt, t0_manifest_sha256="0" * 64)
+            r["vms"] = dict(r["vms"], vm1=dict(r["vms"]["vm1"], **vm1))
+            return vm_admit.canonical(r) + b"\n"
+        vm_admit.parse_receipt(receipt())  # control
+        start = self.vm.role_manifest()["start"]
+        for name, over, msg in (("vm not its hostname", {"vm": "m1-other"}, "vm is not its hostname"),
+                                ("start.name grammar", {"router_container": "-hop", "start": dict(start, name="-hop")},
+                                 "start: a field of the wrong form")):
+            with self.subTest(name):
+                with self.assertRaisesRegex(ValueError, msg):
+                    vm_admit.parse_receipt(receipt(**over))
+        def role(**over):
+            return json.dumps(self.vm.role_manifest(**over)).encode()
+        vm_admit.parse_role(role())  # control
+        vm_admit.parse_role(role(vm="a" * 64))  # 64 is the bound
+        for name, over in (("vm with a colon", {"vm": "m1:h1"}), ("vm over 64", {"vm": "a" * 65}),
+                           ("start.name with a slash", {"start": dict(start, name="amap/hop")})):
+            with self.subTest(name):
+                with self.assertRaises(ValueError):
+                    vm_admit.parse_role(role(**over))
 
     def test_pass_line_carries_ovl_and_role(self):
         owed = mock.patch.object(vm_admit.Admission, "owed", lambda self, reason: (lambda: (True, "stand-in")))
