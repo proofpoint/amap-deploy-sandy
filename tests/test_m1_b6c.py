@@ -5,6 +5,7 @@ the hop pin, read by path here, never retyped). No real B6c render exists
 yet, so every other value is invented, in the shapes the module's parsers
 take."""
 
+import hashlib
 import json
 import os
 import shutil
@@ -26,7 +27,26 @@ ART_DIGEST = b.digest(b.sha256(ART))
 STATE_DIR = "/srv/m1-state/router-state"
 RUN_DIR = "/srv/m1-state/run"
 IMAGE = "sha256:" + "d" * 64
-NET_BYTES = b'{"stand-in":"NET has not fixed its shape"}\n'
+D7_FROM = "generated/d7-m1.json"
+STATEMENT = "A stand-in for the adopted attestation statement."
+
+#: The fixture's invented login and probe names. m1_b6c pins the hub's real,
+#: frozen ones by sha256 (as hub_runtime does); these tests point the pins at
+#: the fixture's values for the module and restore them afterwards.
+FIXTURE_PINS = {"LOGIN_LOCAL_SHA256": "rt", "LOGIN_DOMAIN_SHA256": "logins.internal",
+                "PROBE_DOMAIN_SHA256": "probe-x.internal"}
+_saved = {}
+
+
+def setUpModule():
+    for name, value in FIXTURE_PINS.items():
+        _saved[name] = getattr(b, name)
+        setattr(b, name, hashlib.sha256(value.encode()).hexdigest())
+
+
+def tearDownModule():
+    for name, value in _saved.items():
+        setattr(b, name, value)
 
 
 def open_dir(path) -> int:
@@ -58,6 +78,20 @@ def overlay_doc(n):
         "secrets": {"run_dir": RUN_DIR}}}
 
 
+def net_vm(role, other_role):
+    return {"vm": role["vm"], "hostname": role["hostname"], "own_domain": role["own_domain"],
+            "login": {"local": FIXTURE_PINS["LOGIN_LOCAL_SHA256"], "domain": FIXTURE_PINS["LOGIN_DOMAIN_SHA256"]},
+            "probe_domain": FIXTURE_PINS["PROBE_DOMAIN_SHA256"], "statement": STATEMENT,
+            "fleet_hosts": [other_role["own_domain"]],
+            "d7_source": {"sha256": "a" * 64, "commit": "4" * 40, "from": D7_FROM}}
+
+
+def net_doc(roles):
+    """NET's file in NET-VALUES-SHAPE r2, from the two manifests: each VM's
+    fleet is the other VM's own domain."""
+    return {"version": 1, "vm1": net_vm(roles["vm1"], roles["vm2"]), "vm2": net_vm(roles["vm2"], roles["vm1"])}
+
+
 def default_parts():
     man = {"checkouts": {b.DEPLOY_CHECKOUT: {"head": HEX40, "tree": TREE40}},
            "builds": {"router1": {"commit": b.ENROL_COMMIT}}}
@@ -68,16 +102,17 @@ def default_parts():
                   "feature": {"feature": {"min_sender_age_s": 0, "fleet_domain": role["fd"]}},
                   "overlay": overlay_doc(n),
                   "payload": {"payload/relay": b"#!/bin/sh\n", "payload/INBOX-POLICY.md": b"policy\n"}}
-    return {"artifact": ART, "net_bytes": NET_BYTES, "net": None, "vectors": VECTORS.read_bytes(),
+    return {"artifact": ART, "net_bytes": None, "net": None, "vectors": VECTORS.read_bytes(),
             "ancestry": True, "man": man, "vms": vms}
 
 
 def build_out(t: Path, mutate=None, edit=None, after=None, write=True):
     """A complete OUT, built from the module's own parsers, since no real B6c
-    render exists yet. NET's values default to the manifests' own (vm,
-    hostname, own_domain), given straight to preflight(), because
-    net_values() refuses every input until NET fixes its shape.
-    `mutate(parts)` edits the inputs before anything is written; `edit(doc)`
+    render exists yet. NET's file is net_doc() of the manifests, as bytes,
+    unless `parts["net_bytes"]` is set, and the pre-flight is given
+    net_values() of it, unless `parts["net"]` is set (a break whose file
+    net_values() would refuse). `mutate(parts)` edits the inputs before
+    anything is written; `edit(doc)`
     edits the receipt before its pre-flight is computed; `after(doc)` edits
     it after, so the stored pre-flight stays all true. Files are written at
     exactly their sealed modes, 0444 and 0555."""
@@ -86,6 +121,8 @@ def build_out(t: Path, mutate=None, edit=None, after=None, write=True):
         mutate(parts)
     out = t / "OUT"
     out.mkdir()
+    if parts["net_bytes"] is None:
+        parts["net_bytes"] = b.receipt_bytes(net_doc({n: parts["vms"][n]["role"] for n in b.VMS}))
     (out / b.ARTIFACT_NAME).write_bytes(parts["artifact"])
     (out / b.NET_VALUES_NAME).write_bytes(parts["net_bytes"])
     for n in b.VMS:
@@ -103,7 +140,7 @@ def build_out(t: Path, mutate=None, edit=None, after=None, write=True):
         facts = {n: b.vm_facts(dfd, n) for n in b.VMS}
     finally:
         os.close(dfd)
-    net = parts["net"] or {n: {k: facts[n]["role"][k] for k in ("vm", "hostname", "own_domain")} for n in b.VMS}
+    net = parts["net"] or b.net_values(parts["net_bytes"])
     man = json.dumps(parts["man"]).encode()
     vms = {}
     for n in b.VMS:
@@ -355,11 +392,99 @@ class WalkTest(TempCase):
 # --- the parsers ------------------------------------------------------------------
 
 class NetValuesTest(unittest.TestCase):
+    """NET's file under NET-VALUES-SHAPE r2, each rule broken alone."""
 
-    def test_every_input_refuses_until_the_shape_is_fixed(self):
-        for data in (b"{}", b'{"vm1":{}}', b""):
-            with self.subTest(data=data), self.assertRaisesRegex(b.Refused, "not fixed yet"):
-                b.net_values(data)
+    def setUp(self):
+        self.doc = net_doc({n: role_doc(n) for n in b.VMS})
+
+    def refuses(self, edit, pattern, raw=None):
+        doc = json.loads(json.dumps(self.doc))
+        if edit:
+            edit(doc)
+        with self.assertRaisesRegex(b.Refused, pattern):
+            b.net_values(b.receipt_bytes(doc) if raw is None else raw(doc))
+
+    def test_the_file_parses_to_each_vms_object(self):
+        got = b.net_values(b.receipt_bytes(self.doc))
+        self.assertEqual(got, {n: self.doc[n] for n in b.VMS})
+        self.assertEqual(got["vm1"]["fleet_hosts"], ["m1vm2.internal"])
+
+    def test_the_bytes_are_canonical_and_one_lf(self):
+        for name, raw in (("no LF", lambda d: b.canonical(d)), ("two LFs", lambda d: b.canonical(d) + b"\n\n"),
+                          ("indented", lambda d: json.dumps(d, indent=1, sort_keys=True).encode() + b"\n"),
+                          ("unsorted", lambda d: json.dumps(d, separators=(",", ":")).encode() + b"\n")):
+            with self.subTest(name=name):
+                self.refuses(None, "not canonical JSON and one LF", raw)
+
+    def test_the_top_level_is_closed_and_version_is_the_int_1(self):
+        self.refuses(lambda d: d.pop("version"), "must have exactly")
+        self.refuses(lambda d: d.__setitem__("vm3", d["vm1"]), "must have exactly")
+        for v in (True, 1.0, 2, "1"):
+            with self.subTest(version=v):
+                self.refuses(lambda d: d.__setitem__("version", v), "version is not the int 1")
+
+    def test_each_vm_is_closed(self):
+        self.refuses(lambda d: d["vm2"].pop("d7_source"), "values for vm2 must have exactly")
+        self.refuses(lambda d: d["vm1"].__setitem__("host_label", "m1vm1"), "values for vm1 must have exactly")
+        self.refuses(lambda d: d["vm1"]["login"].__setitem__("x", 1), "login must have exactly")
+        self.refuses(lambda d: d["vm1"]["d7_source"].__setitem__("path", "/x"), "d7_source must have exactly")
+
+    def test_vm_is_hostname(self):
+        self.refuses(lambda d: d["vm1"].__setitem__("vm", "m1vm2"), "vm1: vm is not hostname")
+        self.refuses(lambda d: d["vm1"].__setitem__("vm", "210"), "vm1: vm is not hostname")
+        for k, v in (("vm", "vm_1"), ("hostname", "M1VM1"), ("hostname", 7)):
+            with self.subTest(k=k, v=v):
+                self.refuses(lambda d: d["vm2"].__setitem__(k, v), f"vm2: {k}")
+
+    def test_own_domain_is_one_label_dot_internal(self):
+        for v in ("m1vm1.example.org", "a.b.internal", "internal", 7):
+            with self.subTest(v=v):
+                self.refuses(lambda d: d["vm1"].__setitem__("own_domain", v), "vm1: own_domain")
+
+    def test_the_login_and_probe_are_the_pinned_values(self):
+        for k, v in (("local", "router2"), ("domain", "m1vm1.logins.internal"), ("local", 7), ("domain", None)):
+            with self.subTest(k=k, v=v):
+                self.refuses(lambda d: d["vm1"]["login"].__setitem__(k, v), "vm1: login is not the hub's frozen")
+        self.refuses(lambda d: d["vm2"].__setitem__("probe_domain", "probe-y.internal"),
+                     "vm2: probe_domain is not the hub's frozen")
+        self.refuses(lambda d: d["vm2"].__setitem__("probe_domain", True), "vm2: probe_domain")
+
+    def test_the_statement_is_printable_ascii_up_to_400(self):
+        for v in ("", "x" * 401, "tab\there", None):
+            with self.subTest(v=repr(v)[:12]):
+                self.refuses(lambda d: d["vm1"].__setitem__("statement", v), "vm1: statement")
+        doc = json.loads(json.dumps(self.doc))
+        doc["vm1"]["statement"] = "x" * 400
+        b.net_values(b.receipt_bytes(doc))
+
+    def test_fleet_hosts(self):
+        cases = ((["m1vm2.internal", "m1vm0.internal"], "sorted, distinct"),
+                 (["m1vm2.internal", "m1vm2.internal"], "sorted, distinct"), ([], "sorted, distinct"),
+                 (["m1vm1.internal", "m1vm2.internal"], "without own_domain"),
+                 (["m1vm2.example.org"], "a fleet host"), ([{"d": 1}], "a fleet host"), ([1, "a"], "a fleet host"),
+                 ("m1vm2.internal", "fleet_hosts is not a list"))
+        for v, pattern in cases:
+            with self.subTest(v=v):
+                self.refuses(lambda d: d["vm1"].__setitem__("fleet_hosts", v), pattern)
+
+    def test_d7_source(self):
+        for k, v in (("sha256", "A" * 64), ("sha256", "a" * 63), ("commit", "4" * 39), ("commit", 4),
+                     ("from", "/abs/d7.json"), ("from", "../d7.json"), ("from", ".hidden/d7.json"), ("from", "a" * 64 + " ")):
+            with self.subTest(k=k, v=v):
+                self.refuses(lambda d: d["vm2"]["d7_source"].__setitem__(k, v), f"vm2: d7_source.{k}")
+
+    def test_strict_json(self):
+        data = b.receipt_bytes(self.doc)
+        for bad in (data.replace(b'"version":1', b'"version":1,"version":1'),
+                    data.replace(b'"version":1', b'"version":NaN'), data.replace(STATEMENT.encode(), "\u00e9".encode())):
+            with self.subTest(bad=bad[:20]), self.assertRaises(b.Refused):
+                b.net_values(bad)
+
+    def test_the_pins_are_hub_runtimes(self):
+        import hub_runtime as hr
+        for name in FIXTURE_PINS:
+            with self.subTest(name=name):
+                self.assertEqual(_saved[name], getattr(hr, name))
 
 
 class RoleManifestTest(unittest.TestCase):
@@ -622,16 +747,21 @@ def _artifact_for_seven(parts):
 
 
 def _same_as_vm1(key):
+    """vm2's manifest takes vm1's `key`. A shared own_domain puts each VM's
+    own domain in its fleet, which net_values() refuses, so the pre-flight is
+    given the manifests' projection directly."""
     def f(parts):
         parts["vms"]["vm2"]["role"][key] = parts["vms"]["vm1"]["role"][key]
         parts["vms"]["vm2"]["feature"]["feature"]["fleet_domain"] = parts["vms"]["vm2"]["role"]["fd"]
+        parts["net"] = {m: {k: parts["vms"][m]["role"][k] for k in b.NET_MATCH_KEYS} for m in b.VMS}
     return f
 
 
 def _net(n, key, value):
     def f(parts):
-        parts["net"] = {m: {k: parts["vms"][m]["role"][k] for k in ("vm", "hostname", "own_domain")} for m in b.VMS}
-        parts["net"][n][key] = value
+        doc = net_doc({m: parts["vms"][m]["role"] for m in b.VMS})
+        doc[n][key] = value
+        parts["net_bytes"] = b.receipt_bytes(doc)
     return f
 
 
@@ -649,7 +779,7 @@ def vm_breaks(n):
     breaks it alone."""
     v = ["vms", n]
     return {
-        f"net_values_match_{n}": (_net(n, "hostname", "other"), None),
+        f"net_values_match_{n}": (_net(n, "own_domain", "other.internal"), None),
         f"manifest_is_receipt_{n}": (None, _edit_vm(n, ["hostname"], "other")),
         f"role_digest_{n}": (_set(v + ["role", "fleet_policy_digest"], "sha256:" + "0" * 64), None),
         f"feature_value_{n}": (_set(v + ["feature", "feature", "min_sender_age_s"], 9), None),
@@ -725,16 +855,34 @@ class PreflightTest(TempCase):
 # --- the reader -------------------------------------------------------------------
 
 class ReadReceiptTest(TempCase):
-    """A correct OUT passes every check and refuses only at NET's step; one
-    tampering at a time refuses earlier, by the name of its guard."""
+    """A correct OUT passes every check; one tampering at a time refuses, by
+    the name of its guard."""
 
     def read(self, built, man=None, vectors=None, ancestry=True):
         return b.read_receipt(str(built.out), built.man if man is None else man,
                               built.vectors if vectors is None else vectors, ancestry)
 
-    def test_a_correct_out_reaches_nets_refusal(self):
-        with self.assertRaisesRegex(b.Refused, "NET's net-values shape is not fixed yet"):
-            self.read(build_out(self.t))
+    def test_a_correct_out_returns_the_projection(self):
+        built = build_out(self.t)
+        got = self.read(built)
+        doc = built.doc
+        self.assertEqual(got["projection"], {
+            "result": "PASS", "artifact_sha256": doc["fleet_artifact"]["sha256"],
+            "render_sha256": {"H1": doc["vms"]["vm1"]["files"]["router.json"]["sha256"],
+                              "H2": doc["vms"]["vm2"]["files"]["router.json"]["sha256"]},
+            "manifest_sha256": {"H1": doc["vms"]["vm1"]["role_sha256"], "H2": doc["vms"]["vm2"]["role_sha256"]}})
+        self.assertEqual(got["carried_digest"], {"H1": ART_DIGEST, "H2": ART_DIGEST})
+
+    def test_a_net_file_net_values_refuses_refuses(self):
+        built = build_out(self.t)
+        bad = json.loads((built.out / b.NET_VALUES_NAME).read_bytes())
+        bad["version"] = 2
+        data = b.receipt_bytes(bad)
+        (built.out / b.NET_VALUES_NAME).unlink()
+        (built.out / b.NET_VALUES_NAME).write_bytes(data)
+        rewrite_receipt(built.out, dict(built.doc, net_values_sha256=b.sha256(data)))
+        with self.assertRaisesRegex(b.Refused, "version is not the int 1"):
+            self.read(built)
 
     def tampered(self, after, pattern):
         built = build_out(self.t, after=after)
@@ -893,39 +1041,17 @@ class ReadReceiptTest(TempCase):
                 b.read_receipt(str(built.out), *args)
 
 
-class ReadPastNetTest(TempCase):
-    """With NET's step stood in (net_values replaced, restored after each
-    test), a correct OUT returns HAR-PFV's projection; a stored all-true
-    pre-flight that the inputs do not reproduce refuses, naming the key."""
-
-    def setUp(self):
-        super().setUp()
-        self.addCleanup(setattr, b, "net_values", b.net_values)
-
-    def stand_in(self, net):
-        b.net_values = lambda data: net
-
-    def test_a_correct_out_returns_the_projection(self):
-        built = build_out(self.t)
-        self.stand_in(built.net)
-        got = b.read_receipt(str(built.out), built.man, built.vectors, True)
-        doc = built.doc
-        self.assertEqual(got["projection"], {
-            "result": "PASS", "artifact_sha256": doc["fleet_artifact"]["sha256"],
-            "render_sha256": {"H1": doc["vms"]["vm1"]["files"]["router.json"]["sha256"],
-                              "H2": doc["vms"]["vm2"]["files"]["router.json"]["sha256"]},
-            "manifest_sha256": {"H1": doc["vms"]["vm1"]["role_sha256"], "H2": doc["vms"]["vm2"]["role_sha256"]}})
-        self.assertEqual(got["carried_digest"], {"H1": ART_DIGEST, "H2": ART_DIGEST})
+class RecomputeTest(TempCase):
+    """A stored all-true pre-flight that OUT's files and the caller's inputs
+    do not reproduce refuses, naming the key."""
 
     def test_no_ancestry_refuses(self):
         built = build_out(self.t)
-        self.stand_in(built.net)
         with self.assertRaisesRegex(b.Refused, "recomputed pre-flight .*hop_pin_has_enrol"):
             b.read_receipt(str(built.out), built.man, built.vectors, False)
 
     def test_other_vectors_refuse(self):
         built = build_out(self.t)
-        self.stand_in(built.net)
         other = json.loads(built.vectors)
         for c in other["cases"]:
             if c["min_sender_age_s"] == 0:
@@ -934,15 +1060,20 @@ class ReadPastNetTest(TempCase):
             b.read_receipt(str(built.out), built.man, json.dumps(other).encode(), True)
 
     def test_other_net_values_refuse_for_each_vm(self):
+        """NET's file replaced by one whose own_domain for `n` differs, the
+        receipt naming its sha: only net_values_match_<n> can tell."""
         for n in b.VMS:
             with self.subTest(n=n):
                 t = self.t / n
                 t.mkdir()
                 built = build_out(t)
-                net = json.loads(json.dumps(built.net))
-                net[n]["own_domain"] = "other.internal"
-                self.stand_in(net)
-                with self.assertRaisesRegex(b.Refused, f"recomputed pre-flight .*net_values_match_{n}"):
+                doc = json.loads((built.out / b.NET_VALUES_NAME).read_bytes())
+                doc[n]["own_domain"] = "other.internal"
+                data = b.receipt_bytes(doc)
+                (built.out / b.NET_VALUES_NAME).unlink()
+                (built.out / b.NET_VALUES_NAME).write_bytes(data)
+                rewrite_receipt(built.out, dict(built.doc, net_values_sha256=b.sha256(data)))
+                with self.assertRaisesRegex(b.Refused, f"recomputed pre-flight is not the stored all-true one: net_values_match_{n}$"):
                     b.read_receipt(str(built.out), built.man, built.vectors, True)
 
     def test_a_stored_field_the_files_do_not_reproduce_refuses(self):
@@ -958,7 +1089,6 @@ class ReadPastNetTest(TempCase):
                 t = self.t / key
                 t.mkdir()
                 built = build_out(t, after=after)
-                self.stand_in(built.net)
                 with self.assertRaisesRegex(b.Refused, f"recomputed pre-flight .*{key}"):
                     b.read_receipt(str(built.out), built.man, built.vectors, True)
 

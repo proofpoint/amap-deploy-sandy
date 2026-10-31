@@ -28,8 +28,8 @@ The file owners and the sealing of OUT's payload directories are not this
 module's to check: ADM and D-SEAL own them on the installed copy.
 
 Nothing here renders, installs or runs anything; it refuses by raising
-Refused, with the rule it broke. NET's values file refuses every input until
-its closed shape is fixed, so no receipt can be written or read through yet."""
+Refused, with the rule it broke. NET's values file is parsed in its closed
+shape, NET-VALUES-SHAPE r2."""
 
 import hashlib
 import json
@@ -58,6 +58,18 @@ MIN_SENDER_AGE_MAX_S = 31536000
 DEPLOY_CHECKOUT = "/opt/amap/src/amap-deploy-sandy"
 #: The commit whose ancestry proves the hop pin carries the router's sender-age setting.
 ENROL_COMMIT = "6d104e705974b0f9c90507629f5371755fbe0ca4"
+
+#: NET-VALUES-SHAPE r2's closed key sets.
+NET_KEYS = frozenset({"version", *VMS})
+NET_VM_KEYS = frozenset({"vm", "hostname", "own_domain", "login", "probe_domain", "statement", "fleet_hosts",
+                         "d7_source"})
+#: The hub's frozen login parts and probe domain, as sha256 pins: hub_runtime's
+#: LOGIN_LOCAL_SHA256, LOGIN_DOMAIN_SHA256 and PROBE_DOMAIN_SHA256, which a test holds equal.
+LOGIN_LOCAL_SHA256 = "74c95604043427f0bee1d0e16bfa53afd537f736ad0073c4cc4e1ccb3a82b5dc"
+LOGIN_DOMAIN_SHA256 = "4a28207acfde319b5b21e4bbf0cec138201f1242e9b966029ae6e9a8122e5889"
+PROBE_DOMAIN_SHA256 = "f40f36185588e8a6292c654f632086d5b204c5d763779ce632bd5138b805af56"
+#: The fields the pre-flight compares with each role manifest.
+NET_MATCH_KEYS = ("vm", "hostname", "own_domain")
 
 ROLE_SCHEMA = "amap-m1-role/1"
 #: ROLE-MANIFEST-INTERFACE r3's closed key sets.
@@ -91,6 +103,9 @@ _DNS = re.compile(rf"{_LABEL}(\.{_LABEL})*")
 _CONTAINER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 _IMAGE_ID = re.compile(r"sha256:[0-9a-f]{64}")
 _IMAGE_NAME = re.compile(r"[a-z0-9][a-z0-9._/-]*")
+_OWN = re.compile(rf"{_LABEL}\.internal")
+_STATEMENT = re.compile(r"[ -~]{1,400}")
+_REPO_PATH = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]*(/[A-Za-z0-9_][A-Za-z0-9._-]*)*")
 _UNIT = re.compile(r"[A-Za-z0-9:_.@\\-]+\.(service|mount|timer|socket|target|path)")
 _KEY_PART = re.compile(r"[\x21-\x7e]+")
 _OPEN = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
@@ -345,11 +360,47 @@ def on_manifest_sha256(files: Dict[str, Dict[str, str]]) -> str:
 
 # --- the parsed inputs ------------------------------------------------------------
 
-def net_values(data: bytes) -> Any:
-    """NET's values file. Its closed shape is not fixed yet, so every input
-    refuses: no receipt can carry values from a file whose keys nobody has
-    reviewed."""
-    raise Refused("NET's net-values shape is not fixed yet (B6c schema d5.3 §2b.3): no receipt can be written")
+def net_values(data: bytes) -> Dict[str, Dict[str, Any]]:
+    """NET's values file under NET-VALUES-SHAPE r2: its bytes exactly
+    canonical(doc) and one LF; the top level closed {version, vm1, vm2},
+    version the int 1; each VM closed, every field typed, vm == hostname,
+    and the login parts and probe domain equal to the hub's pins. Returns
+    {vm1: ..., vm2: ...}, each VM's object as written."""
+    doc = _closed(strict_loads(data, "NET's values file"), NET_KEYS, "NET's values file")
+    if data != receipt_bytes(doc):
+        raise Refused("NET's values file is not canonical JSON and one LF")
+    if type(doc["version"]) is not int or doc["version"] != 1:
+        raise Refused("NET's values file's version is not the int 1")
+    out = {}
+    for n in VMS:
+        what = f"NET's values for {n}"
+        e = _closed(doc[n], NET_VM_KEYS, what)
+        _match(e["vm"], _HOSTNAME, f"{what}: vm")
+        _match(e["hostname"], _HOSTNAME, f"{what}: hostname")
+        if e["vm"] != e["hostname"]:
+            raise Refused(f"{what}: vm is not hostname")
+        own = _match(e["own_domain"], _OWN, f"{what}: own_domain")
+        login = _closed(e["login"], frozenset({"local", "domain"}), f"{what}: login")
+        if (type(login["local"]) is not str or type(login["domain"]) is not str
+                or sha256(login["local"].encode()) != LOGIN_LOCAL_SHA256
+                or sha256(login["domain"].encode()) != LOGIN_DOMAIN_SHA256):
+            raise Refused(f"{what}: login is not the hub's frozen login local part and domain")
+        if sha256(_match(e["probe_domain"], _OWN, f"{what}: probe_domain").encode()) != PROBE_DOMAIN_SHA256:
+            raise Refused(f"{what}: probe_domain is not the hub's frozen probe domain")
+        _match(e["statement"], _STATEMENT, f"{what}: statement")
+        fleet = e["fleet_hosts"]
+        if type(fleet) is not list:
+            raise Refused(f"{what}: fleet_hosts is not a list")
+        for d in fleet:
+            _match(d, _OWN, f"{what}: a fleet host")
+        if not fleet or fleet != sorted(set(fleet)) or own in fleet:
+            raise Refused(f"{what}: fleet_hosts is not a sorted, distinct, non-empty list without own_domain")
+        src = _closed(e["d7_source"], frozenset({"sha256", "commit", "from"}), f"{what}: d7_source")
+        _match(src["sha256"], _HEX64, f"{what}: d7_source.sha256")
+        _match(src["commit"], _HEX40, f"{what}: d7_source.commit")
+        _match(src["from"], _REPO_PATH, f"{what}: d7_source.from")
+        out[n] = e
+    return out
 
 
 def parse_role_manifest(data: bytes) -> Dict[str, Any]:
@@ -537,9 +588,8 @@ def preflight(receipt: Dict[str, Any], *, man: bytes, vectors: bytes, hop_ancest
     compared type for type. `vms` maps vm1/vm2 to the parsed facts of that
     VM's OUT tree: `files` (walk), `role` (parse_role_manifest), `router`
     ((age, state_dir), parse_router), `feature` ((age, fleet_domain),
-    parse_feature), `overlay` (parse_overlay). `net` is NET's parsed values;
-    without them the refusal stands before this is reached. Writer and
-    reader both call this one function."""
+    parse_feature), `overlay` (parse_overlay). `net` is net_values()'s
+    result. Writer and reader both call this one function."""
     v = receipt["v"]
     head, tree, hop = man_values(man)
     art_digest = digest(sha256(artifact))
@@ -558,7 +608,7 @@ def preflight(receipt: Dict[str, Any], *, man: bytes, vectors: bytes, hop_ancest
     for n in VMS:
         f, e = vms[n], receipt["vms"][n]
         role, (router_age, state_dir), ov = f["role"], f["router"], f["overlay"]
-        out[f"net_values_match_{n}"] = same(net[n], {k: role[k] for k in ("vm", "hostname", "own_domain")})
+        out[f"net_values_match_{n}"] = same({k: net[n][k] for k in NET_MATCH_KEYS}, {k: role[k] for k in NET_MATCH_KEYS})
         out[f"manifest_is_receipt_{n}"] = (role["role"] == ROLE_OF[n] and
                                             same({k: role[k] for k in ("role", "vm", "hostname", "fd", "own_domain")},
                                                  {k: e[k] for k in ("role", "vm", "hostname", "fd", "own_domain")}))
