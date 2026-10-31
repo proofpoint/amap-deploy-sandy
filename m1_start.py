@@ -149,6 +149,9 @@ def check(go: Dict[str, str], order: str, records: Dict[str, bytes], boot_id: st
     for key, name in (("a2a", "a2a"), ("ctlr", "ctlr"), ("psr", "psr"), ("harpf", "harpf")):
         if go[key] != _sha(records[name]):
             raise Refused(f"{key}= is not the sha256 of the {name} record given")
+    # TODO(U1-74): NET's PSR v1 grammar arrives with its G-CODE-PVE package.
+    # Until it does, only an exact `result PASS` line admits, and any line
+    # naming DIFF in a recheck refuses: every other receipt fails closed.
     if "result PASS" not in _lines(records["psr"]):
         raise Refused("the PSR receipt does not carry `result PASS`")
     has_recheck = "psr_recheck" in records
