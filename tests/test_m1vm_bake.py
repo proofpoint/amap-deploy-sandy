@@ -39,7 +39,8 @@ def make_pin():
         "op_home": "/home/op",
         "apt": {"sources": ["deb [signed-by=/usr/share/keyrings/u.gpg] https://snapshot.example.org/ubuntu/20261030T000000Z noble main"],
                 "packages": {"docker-ce": "5:27.0.0-1", "git": "1:2.43.0-1", "acl": "2.3.2-1",
-                             "qemu-guest-agent": "1:8.2.2", "python3": "3.12.3-0", "systemd-coredump": "255.4-1"}},
+                             "qemu-guest-agent": "1:8.2.2", "python3": "3.12.3-0", "systemd-coredump": "255.4-1"},
+                "ubuntu_sources_sha256": "5" * 64},
         "quiet": {"mask": ["unattended-upgrades.service", "apt-daily.timer", "apt-daily-upgrade.timer",
                            "motd-news.timer"], "remove": ["snapd", "apport"]},
         "docker": {"d_uuid": "11111111-2222-4333-8444-555555555555", "log_max_size": "10m", "log_max_file": 3},
@@ -97,11 +98,51 @@ class FakeHost:
         # (INFERRED from systemctl's documented behaviour, not measured).
         self.enable_drops = []
         self.fstab = "# /etc/fstab\nUUID=abc / ext4 defaults 0 1\n#/swap.img none swap sw 0 0\n"
+        # What clean's absence test prints for a path that is still there.
+        self.clean_left = {}
         self.unit_dir = {"": "d 755 root root ", "m1-state-check.service": "f 644 root root ",
                          "srv-m1\\x2dstate.mount": "f 644 root root ", "var-lib-docker.mount": "f 644 root root "}
         self.enable_adds = {"local-fs.target.requires": "d 755 root root ", **{
             f"local-fs.target.requires/{u}": f"l 777 root root {bake.UNIT_DIR}/{u}"
             for u in ("srv-m1\\x2dstate.mount", "var-lib-docker.mount")}}
+        # /etc/apt/sources.list.d as `find -printf '%y %f\0'` lists it once bake's
+        # list is written, ubuntu.sources' sha, and what bake's legacy-list test
+        # prints after its rm -f.
+        self.apt_dir = {"m1-snapshot.list": "f", "ubuntu.sources": "f"}
+        self.ubuntu_sources_sha = pin["apt"]["ubuntu_sources_sha256"]
+        self.legacy_list = "absent\n"
+        # apt's configuration, resolved as apt does (READ, apt-config(8); the
+        # -o order MEASURED by Opus on apt 3.0.3): the defaults, then
+        # apt.conf and apt.conf.d (apt_conf), then an inherited APT_CONFIG
+        # file (apt_config_env) unless env -u APT_CONFIG removed it, then
+        # each command-line -o, last. Every apt-get that resolves to other
+        # paths, or ran under APT_CONFIG, is recorded, and so is an install
+        # under an APT::Sources::With entry (a list a drop-in appends to, under
+        # any Binary:: scope, case-insensitive; MEASURED by Opus on apt 3.0.3),
+        # which no -o clears. `apt-config dump` prints every key.
+        self.apt_conf = {}
+        self.apt_config_env = None
+        self.unaccounted = []
+        self.under_apt_config = []
+        self.apt_dump_seen = []
+
+    def apt_resolve(self, a):
+        prog = next(i for i, x in enumerate(a) if x in ("apt-get", "apt-config"))
+        unset = any(a[i:i + 2] == ["-u", "APT_CONFIG"] for i in range(prog))
+        cfg = {"Dir::Etc": "/etc/apt/", "Dir::Etc::sourcelist": "sources.list", "Dir::Etc::sourceparts": "sources.list.d"}
+        cfg.update(self.apt_conf)
+        if self.apt_config_env is not None and not unset:
+            cfg.update(self.apt_config_env)
+            self.under_apt_config.append(list(a))
+        for i in range(prog + 1, len(a) - 1):
+            if a[i] == "-o":
+                k, v = a[i + 1].split("=", 1)
+                cfg[k] = v
+
+        def path(k):
+            v = cfg[k]
+            return v if v.startswith("/") else cfg["Dir::Etc"].rstrip("/") + "/" + v
+        return cfg, (cfg["Dir::Etc"], path("Dir::Etc::sourcelist"), path("Dir::Etc::sourceparts").rstrip("/") + "/")
 
     def put(self, path, text, mode="0644", owner="root:root"):
         self.log.append(["<put>", path])
@@ -125,6 +166,36 @@ class FakeHost:
             return ""
         if a == ["cat", "/etc/fstab"]:
             return self.fstab
+        if a[:2] == ["find", bake.APT_DIR]:
+            if a[2:] != ["-mindepth", "1", "-maxdepth", "1", "-printf", "%y %f\\0"]:
+                raise AssertionError(f"unmodelled find {a[2:]!r}")
+            return "".join(f"{t} {n}\0" for n, t in sorted(self.apt_dir.items()))
+        if a[:2] == ["sh", "-c"] and a[3:4] == ["m1-legacy"]:
+            if a[2:] != ['if [ -e "$1" ] || [ -L "$1" ]; then echo present; else echo absent; fi', "m1-legacy",
+                        "/etc/apt/sources.list"]:
+                raise AssertionError(f"unmodelled legacy test {a[2:]!r}")
+            return self.legacy_list
+        if "apt-config" in a or "apt-get" in a:
+            cfg, got = self.apt_resolve(a)
+            if "apt-config" in a:
+                tail, rest = a[a.index("apt-config") + 1:], []
+                while tail:
+                    tail = tail[2:] if tail[0] == "-o" else (rest.append(tail[0]) or tail[1:])
+                if rest == ["dump"]:
+                    self.apt_dump_seen = [f'{k} "{v}";' for k, v in cfg.items()]
+                    return "".join(f"{l}\n" for l in self.apt_dump_seen)
+                if rest != ["shell", "L", "Dir::Etc::sourcelist/f", "P", "Dir::Etc::sourceparts/d"]:
+                    raise AssertionError(f"unmodelled apt-config {a!r}")
+                return f"L='{got[1]}'\nP='{got[2]}'\n"
+            if got != ("/etc/apt/", "/etc/apt/sources.list", f"{bake.APT_DIR}/") or (
+                    "install" in a and any("sources::with" in k.lower() for k in cfg)):
+                self.unaccounted.append(list(a))
+        if a == ["sha256sum", f"{bake.APT_DIR}/ubuntu.sources"]:
+            return f"{self.ubuntu_sources_sha}  {a[1]}\n"
+        if a[:2] == ["sh", "-c"] and a[3:4] == ["m1-clean"]:
+            if a[2] != 'if [ -e "$1" ] || [ -L "$1" ]; then echo present; else echo absent; fi' or len(a) != 5:
+                raise AssertionError(f"unmodelled clean test {a[2:]!r}")
+            return self.clean_left.get(a[4], "absent\n")
         if a[:2] == ["find", bake.UNIT_DIR]:
             if a[2:] != ["-printf", "%P\\t%y %m %u %g %l\\0"]:
                 raise AssertionError(f"unmodelled find {a[2:]!r}")
@@ -267,6 +338,10 @@ class PinTest(unittest.TestCase):
             "missing systemd-coredump pin": lambda p: p["apt"]["packages"].pop("systemd-coredump"),
             "bad version": lambda p: p["apt"]["packages"].update(git="1 2"),
             "non-deb source": lambda p: p["apt"].update(sources=["http://x"]),
+            "no ubuntu.sources sha": lambda p: p["apt"].pop("ubuntu_sources_sha256"),
+            "short ubuntu.sources sha": lambda p: p["apt"].update(ubuntu_sources_sha256="5" * 63),
+            "uppercase ubuntu.sources sha": lambda p: p["apt"].update(ubuntu_sources_sha256="A" * 64),
+            "extra apt key": lambda p: p["apt"].update(keyring_sha256="5" * 64),
             "unit name": lambda p: p["quiet"].update(mask=["rm -rf"]),
             "low uid": lambda p: p["accounts"]["uid-1"].update(uid=20),
             "duplicate uid": lambda p: p["accounts"]["uid-2"].update(uid=2104),
@@ -631,6 +706,168 @@ class SequenceTest(BakeCase):
         plan = json.loads(self.host.files["/run/m1-bake/man-plan.json"][0])
         self.assertEqual(plan["builds"]["router1"], {"commit": H("d"), "tree": H("e"), "image": "m1-hop:pin"})
         self.assertEqual(plan["images"], sorted(["m1-hop:pin", "m1-hub:pin", self.pin["base_images"][0]]))
+
+
+class AptCensusTest(BakeCase):
+    """PIN-RESIDUAL-3-CENSUS: before any fetch, sources.list.d is exactly bake's
+    list and ubuntu.sources at PIN's sha, the legacy list is gone, and every
+    fetch reads only those paths (BAKE-APT-CENSUS-R2)."""
+
+    def fetches(self):
+        return [a for a in self.host.log if "apt-get" in a]
+
+    def test_census_runs_between_the_list_and_the_first_fetch(self):
+        self.run_bake()
+        written = self.index(lambda a: a == ["<put>", f"{bake.APT_DIR}/m1-snapshot.list"])
+        removed = self.index(lambda a: a == ["rm", "-f", "/etc/apt/sources.list"])
+        listed = self.index(lambda a: a[:2] == ["find", bake.APT_DIR])
+        hashed = self.index(lambda a: a == ["sha256sum", f"{bake.APT_DIR}/ubuntu.sources"])
+        legacy = self.index(lambda a: a[3:4] == ["m1-legacy"])
+        resolved = self.index(lambda a: "apt-config" in a and "shell" in a)
+        dumped = self.index(lambda a: "apt-config" in a and "dump" in a)
+        update = self.index(lambda a: "apt-get" in a and "update" in a)
+        first_fetch = min(i for i, a in enumerate(self.host.log) if "apt-get" in a)
+        self.assertEqual(update, first_fetch)
+        self.assertLess(written, listed)
+        self.assertLess(removed, legacy)
+        self.assertLess(max(listed, hashed, legacy, resolved, dumped), update)
+
+    def test_redirects_are_overridden(self):
+        # Each redirect would make apt read a source the census never saw; the
+        # command-line -o and env -u APT_CONFIG leave every fetch on the census's paths.
+        redirects = {
+            "apt.conf main list": lambda h: h.apt_conf.update({"Dir::Etc::sourcelist": "/etc/apt/other.list"}),
+            "apt.conf.d sourceparts": lambda h: h.apt_conf.update({"Dir::Etc::sourceparts": "/var/lib/other.d"}),
+            "Dir::Etc": lambda h: h.apt_conf.update({"Dir::Etc": "/var/lib/other-etc/"}),
+            "inherited APT_CONFIG": lambda h: setattr(h, "apt_config_env", {"Dir::Etc::sourceparts": "/var/lib/other.d"}),
+        }
+        for name, redirect in redirects.items():
+            with self.subTest(name):
+                self.setUp()
+                redirect(self.host)
+                self.run_bake()
+                self.assertTrue(any("update" in a for a in self.fetches()))
+                self.assertTrue(any("install" in a for a in self.fetches()))
+                self.assertEqual(self.host.unaccounted, [])
+                self.assertEqual(self.host.under_apt_config, [])
+
+    def test_sources_with_is_refused_before_fetch(self):
+        # A drop-in adds a source for install that no -o clears and the shell
+        # assert does not show (BAKE-APT-CENSUS-R3; MEASURED by Opus on apt 3.0.3).
+        for name, key in {"global": "APT::Sources::With::",
+                          "Binary::apt-get scope": "Binary::apt-get::APT::Sources::With::",
+                          "another case": "apt::sources::WITH::"}.items():
+            with self.subTest(name):
+                self.setUp()
+                self.host.apt_conf[key] = "/var/lib/other/Packages"
+                with self.assertRaises(bake.BakeFail) as cm:
+                    self.run_bake()
+                self.assertIn("apt: apt's configuration adds sources through APT::Sources::With", str(cm.exception))
+                self.assertIn(key, str(cm.exception))
+                self.assertEqual(self.fetches(), [])
+
+    def test_dump_that_does_not_show_the_bindings_is_refused_before_fetch(self):
+        # An empty or partial dump proves nothing about APT::Sources::With (Codex r3 AMEND).
+        bound = ['Dir::Etc "/etc/apt/";', 'Dir::Etc::sourcelist "/etc/apt/sources.list";',
+                 f'Dir::Etc::sourceparts "{bake.APT_DIR}/";']
+        for name, out in {"empty": "", "whitespace only": " \n\t\n",
+                          "one binding missing": "\n".join(bound[:2]) + "\n",
+                          "binding with another value": "\n".join(bound[:2] + ['Dir::Etc::sourceparts "/var/lib/other.d/";']) + "\n",
+                          }.items():
+            with self.subTest(name):
+                self.setUp()
+                self.host.over["apt-config .* dump$"] = out
+                with self.assertRaises(bake.BakeFail) as cm:
+                    self.run_bake()
+                self.assertIn("apt: apt-config dump does not show the command-line bindings", str(cm.exception))
+                self.assertEqual(self.fetches(), [])
+
+    def test_dump_bindings_match_measured_apt(self):
+        # MEASURED on apt 3.0.3 (arm64): `apt-config <APT_DIRS> dump` prints these three lines.
+        self.run_bake()
+        self.assertEqual(sorted(l for l in self.host.apt_dump_seen if l.startswith("Dir::Etc")),
+                         ['Dir::Etc "/etc/apt/";', 'Dir::Etc::sourcelist "/etc/apt/sources.list";',
+                          'Dir::Etc::sourceparts "/etc/apt/sources.list.d/";'])
+
+    def test_resolution_other_than_the_census_paths_is_refused_before_fetch(self):
+        for name, out in {"another list": "L='/etc/apt/other.list'\nP='/etc/apt/sources.list.d/'\n",
+                          "another parts dir": "L='/etc/apt/sources.list'\nP='/var/lib/other.d/'\n",
+                          "no final newline": "L='/etc/apt/sources.list'\nP='/etc/apt/sources.list.d/'"}.items():
+            with self.subTest(name):
+                self.setUp()
+                self.host.over["apt-config"] = out
+                with self.assertRaises(bake.BakeFail) as cm:
+                    self.run_bake()
+                self.assertIn("apt: apt resolves its sources to", str(cm.exception))
+                self.assertEqual(self.fetches(), [])
+
+    def test_breaks(self):
+        breaks = {
+            "extra source file": (lambda h: h.apt_dir.update({"other.list": "f"}), "not exactly"),
+            "extra .sources file": (lambda h: h.apt_dir.update({"docker.sources": "f"}), "not exactly"),
+            "stray backup": (lambda h: h.apt_dir.update({"ubuntu.sources.curtin.orig": "f"}), "not exactly"),
+            "ubuntu.sources missing": (lambda h: h.apt_dir.pop("ubuntu.sources"), "not exactly"),
+            "ubuntu.sources a link": (lambda h: h.apt_dir.update({"ubuntu.sources": "l"}), "not exactly"),
+            "ubuntu.sources a directory": (lambda h: h.apt_dir.update({"ubuntu.sources": "d"}), "not exactly"),
+            "bake's list a link": (lambda h: h.apt_dir.update({"m1-snapshot.list": "l"}), "not exactly"),
+            "a subdirectory": (lambda h: h.apt_dir.update({"x": "d"}), "not exactly"),
+            "ubuntu.sources changed": (lambda h: setattr(h, "ubuntu_sources_sha", "6" * 64),
+                                       "ubuntu.sources is " + "6" * 64),
+            "legacy list left": (lambda h: setattr(h, "legacy_list", "present\n"),
+                                 "/etc/apt/sources.list is not proven absent"),
+            # An sh that errs prints nothing; only "absent" proves the list gone (R3).
+            "legacy test printed nothing": (lambda h: setattr(h, "legacy_list", ""),
+                                            "/etc/apt/sources.list is not proven absent"),
+            "legacy test printed more": (lambda h: setattr(h, "legacy_list", "absent\nx\n"),
+                                         "/etc/apt/sources.list is not proven absent"),
+        }
+        for name, (brk, needle) in breaks.items():
+            with self.subTest(name):
+                self.setUp()
+                brk(self.host)
+                with self.assertRaises(bake.BakeFail) as cm:
+                    self.run_bake()
+                self.assertTrue(str(cm.exception).startswith("apt: "), str(cm.exception))
+                self.assertIn(needle, str(cm.exception))
+                self.assertEqual(self.fetches(), [], "a fetch ran before the census refused")
+
+    def test_sha_compared_with_pin_not_a_constant(self):
+        # Witness: PIN carries another sha and the host's file has it; the census passes.
+        self.pin["apt"]["ubuntu_sources_sha256"] = "7" * 64
+        self.host.ubuntu_sources_sha = "7" * 64
+        self.run_bake()
+
+
+PROXY_PATHS = ("/etc/apt/apt.conf.d/95m1-proxy", f"{bake.UNIT_DIR}/docker.service.d/m1-proxy.conf",
+               "/home/op/.docker/config.json", "/root/.docker/config.json")
+
+
+class ProxyCleanTest(BakeCase):
+    """BAKE-BUILD-PROXY: NET's 208 user-data writes the proxy settings; clean
+    deletes each and proves it gone, so MAN never records one."""
+
+    def test_every_proxy_setting_is_deleted_and_proven_gone_after_the_builds_and_before_man(self):
+        self.run_bake()
+        sandy_build = self.index(lambda a: a[:1] == ["runuser"])
+        man = self.index(lambda a: "man.py" in " ".join(a))
+        for path in PROXY_PATHS:
+            with self.subTest(path):
+                removed = self.index(lambda a: a == ["rm", "-f", path])
+                tested = self.index(lambda a: a[3:5] == ["m1-clean", path])
+                self.assertLess(sandy_build, removed)
+                self.assertLess(removed, tested)
+                self.assertLess(tested, man)
+
+    def test_a_path_still_present_fails_before_man(self):
+        for path in PROXY_PATHS:
+            for name, out in {"present": "present\n", "test printed nothing": ""}.items():
+                with self.subTest(path=path, case=name):
+                    self.setUp()
+                    self.host.clean_left[path] = out
+                    with self.assertRaises(bake.BakeFail) as cm:
+                        self.run_bake()
+                    self.assertTrue(str(cm.exception).startswith(f"clean: {path} is still present"), str(cm.exception))
+                    self.assertFalse(any("man.py" in " ".join(a) for a in self.host.log))
 
 
 class StepFailTest(BakeCase):
