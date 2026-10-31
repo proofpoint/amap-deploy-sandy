@@ -369,6 +369,8 @@ class EgressTest(unittest.TestCase):
                                                          for i in items]) + "\n", ""),
             "two lines": lambda items: (0, "[]\n[]\n", ""),
             "not a list": lambda items: (0, "{}\n", ""),
+            "extra non-object": lambda items: (0, json.dumps([dict(i, ok=(i["port"] != 1 and i["kind"] == "tcp"))
+                                                             for i in items] + [7]) + "\n", ""),
         }
         for name, fake in cases.items():
             with self.subTest(name):

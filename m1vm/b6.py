@@ -298,7 +298,7 @@ def phase_egress(profile_path, profile_sha, probe_path, runner=run):
             p.row(which, False, exc.strerror or str(exc))
             continue
         echoed = [{k: v for k, v in g.items() if k != "ok"} for g in got if isinstance(g, dict)]
-        p.row(f"{which}-echo", echoed == items, f"{len(got)} result(s) for {len(items)} item(s), in order")
+        p.row(f"{which}-echo", len(got) == len(items) and echoed == items, f"{len(got)} result(s) for {len(items)} item(s), in order")
         for item, g in zip(items, got):
             ok = isinstance(g, dict) and g.get("ok") is want
             p.row(f"{which}:{item['kind']}:{item['addr']}:{item['port']}", ok,

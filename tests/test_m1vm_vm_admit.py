@@ -37,6 +37,8 @@ ACCOUNTS = {"op": {"name": "op", "uid": 2101, "gid": 2101}, "m1-admin": {"name":
             "adm": {"name": "m1adm", "uid": 2103, "gid": 2103}, "uid-1": {"name": "m1router", "uid": 2104, "gid": 2104},
             "uid-2": {"name": "m1hub", "uid": 2105, "gid": 2105}, "registry": {"name": "m1reg", "uid": 2106, "gid": 2106}}
 KEYS = {"op": [KEY_OP, KEY_NET], "m1-admin": [KEY_ADMIN], "adm": [KEY_ADM]}
+HOMES = {"op": "/home/op", "m1-admin": "/home/m1admin", "adm": "/var/lib/m1adm"}
+DROPIN = b"[Socket]\nExecStartPost=/usr/bin/setfacl -m u:2104:rw /run/docker.sock\n"
 
 
 class Vm:
@@ -45,13 +47,16 @@ class Vm:
     def __init__(self):
         self.root = Path(tempfile.mkdtemp())
         r = self.root
-        homes = {"op": "/home/op", "m1-admin": "/home/m1admin", "adm": "/var/lib/m1adm"}
+        homes = HOMES
         lines = ["root:x:0:0:root:/root:/bin/bash"]
         for role, a in ACCOUNTS.items():
             home = homes.get(role, f"/var/lib/{a['name']}")
             lines.append(f"{a['name']}:x:{a['uid']}:{a['gid']}::{home}:/bin/sh")
         (r / "etc/sudoers.d").mkdir(parents=True)
         (r / "etc/passwd").write_text("\n".join(lines) + "\n")
+        (r / "etc/passwd").chmod(0o644)
+        (r / "etc/group").write_text("root:x:0:\ndocker:x:999:op\n")
+        (r / "etc/group").chmod(0o644)
         (r / "etc/sudoers.d/m1-admin").write_text("m1admin ALL=(ALL:ALL) NOPASSWD: ALL\n")
         (r / "etc/sudoers.d/m1adm").write_text("m1adm ALL=(root) NOPASSWD: /usr/bin/python3 -I -S -B -\n")
         for p in (r / "etc/sudoers.d").iterdir():
@@ -65,17 +70,28 @@ class Vm:
         os.symlink("/dev/null", r / "etc/systemd/system/qemu-guest-agent.service")
         (r / "proc/sys/kernel/random").mkdir(parents=True)
         (r / "proc/sys/kernel/random/boot_id").write_text(BOOT + "\n")
+        dev = os.stat(r).st_dev
+        (r / "proc/self").mkdir(parents=True)
+        (r / "proc/self/mountinfo").write_text(
+            f"1 0 {os.major(dev)}:{os.minor(dev)} / / rw - ext4 /dev/sda1 rw\n"
+            f"9 1 {os.major(dev)}:{os.minor(dev)} / /srv/m1-state rw - ext4 /dev/sdc rw\n")
         (r / "proc/1/fd").mkdir(parents=True)
         os.symlink("/dev/null", r / "proc/1/fd/0")
         sandy = r / "srv/m1-state/sandy"
         sandy.mkdir(parents=True)
         (sandy / ".base_build_hash").write_bytes(b"b\n")
+        (sandy / ".base_build_hash").chmod(0o644)
         (r / "opt/amap").mkdir(parents=True)
         self.man = {"schema": "m1vm-man/1", "images": {"m1-hop:pin": IMG},
                     "hdot": [{"name": ".base_build_hash", "mode": "0644", "sha256": hashlib.sha256(b"b\n").hexdigest()}],
-                    "accounts": {a["name"]: {"uid": a["uid"], "gid": a["gid"], "home": "",
+                    "files": {"/etc/systemd/system/docker.socket.d/m1-acl.conf":
+                              {"sha256": hashlib.sha256(DROPIN).hexdigest(), "mode": "0644", "uid": 0, "gid": 0}},
+                    "accounts": {a["name"]: {"uid": a["uid"], "gid": a["gid"], "home": HOMES.get(role, f"/var/lib/{a['name']}"),
                                              "groups": ["docker"] if role == "op" else []}
                                  for role, a in ACCOUNTS.items()}}
+        (r / "etc/systemd/system/docker.socket.d").mkdir(parents=True)
+        (r / "etc/systemd/system/docker.socket.d/m1-acl.conf").write_bytes(DROPIN)
+        (r / "etc/systemd/system/docker.socket.d/m1-acl.conf").chmod(0o644)
         self.write_man()
         self.cmd = {}
 
@@ -129,8 +145,10 @@ class AdmCase(unittest.TestCase):
 
         def as_root(st, path):
             uid = st.st_uid
-            if path.startswith(("/etc/", "/opt/")) and path not in self.foreign:
+            if path.startswith(("/etc/", "/opt/", "/proc/")) and path not in self.foreign:
                 uid = 0
+            elif path.startswith("/srv/m1-state/sandy/"):
+                uid = 2101
             elif "/.ssh/" in path:
                 owner = {"/home/op": 2101, "/home/m1admin": 2102, "/var/lib/m1adm": 2103}
                 uid = next((u for h, u in owner.items() if path.startswith(h)), uid)
@@ -156,13 +174,27 @@ class AdmCase(unittest.TestCase):
                                now=lambda: (2026, 10, 31, 0, 0, 0, 4, 304, 0))
         return rc, out.getvalue().splitlines()
 
-    def failing(self, phase="A1", **over):
+    OWED = {"agent-prov", "systemd-tree", "role-and-o-n"}  # UNKNOWN by design until their inputs exist
+
+    def failing(self, phase="A1", owed=False, **over):
         _, lines = self.admit(phase, **over)
-        return sorted(l.split()[2] for l in lines if l.startswith("CHECK ") and l.split()[3] != "PASS")
+        return sorted(l.split()[2] for l in lines if l.startswith("CHECK ") and l.split()[3] != "PASS"
+                      and (owed or l.split()[2] not in self.OWED))
 
 
 class PassTest(AdmCase):
+    def test_a1_owes_two_rows(self):
+        rc, lines = self.admit()
+        self.assertEqual(rc, 1)
+        self.assertEqual(self.failing(owed=True), ["agent-prov", "systemd-tree"])
+        self.assertTrue(lines[-1].startswith("VM-ADMIT A1 FAIL failed=0 unknown=2"))
+
     def test_a1_pass_line(self):
+        owed = {n: mock.patch.object(vm_admit.Admission, n, lambda self: (True, "stand-in"))
+                for n in ("check_agent_prov", "check_systemd_tree")}
+        for p in owed.values():
+            p.start()
+            self.addCleanup(p.stop)
         rc, lines = self.admit()
         self.assertEqual(rc, 0, lines)
         self.assertEqual(lines[-1],
@@ -176,7 +208,7 @@ class PassTest(AdmCase):
         rc, lines = self.admit("A2a")
         self.assertEqual(rc, 1)
         self.assertIn("CHECK A2a role-and-o-n UNKNOWN", "\n".join(lines))
-        self.assertTrue(lines[-1].startswith("VM-ADMIT A2a FAIL failed=0 unknown=1"))
+        self.assertTrue(lines[-1].startswith("VM-ADMIT A2a FAIL failed=0 unknown=3"))
 
 
 class BreakTest(AdmCase):
@@ -294,3 +326,132 @@ class StdinTest(unittest.TestCase):
     def test_bad_params_is_usage(self):
         r = self.run_stdin(b'M1_ADM_PARAMS = {"phase": "A1"}\n')
         self.assertEqual(r.returncode, 2, r.stdout)
+
+
+class ReaderTest(unittest.TestCase):
+    """read_regular: to EOF through short reads; a change while read fails."""
+
+    def setUp(self):
+        self.d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.d)
+        (self.d / "f").write_bytes(b"x" * 100000)
+        p = mock.patch.object(vm_admit, "ROOT", str(self.d))
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_short_reads_complete(self):
+        real = os.read
+        with mock.patch.object(vm_admit.os, "read", lambda fd, n: real(fd, min(n, 7))):
+            data, _ = vm_admit.read_regular("/f")
+        self.assertEqual(data, b"x" * 100000)
+
+    def test_change_while_read_fails(self):
+        real = os.fstat
+        calls = {"n": 0}
+
+        def fstat(fd):
+            st = real(fd)
+            calls["n"] += 1
+            if calls["n"] == 2:
+                return os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, st.st_uid, st.st_gid,
+                                       st.st_size + 1, st.st_atime, st.st_mtime, st.st_ctime))
+            return st
+        with mock.patch.object(vm_admit.os, "fstat", fstat):
+            with self.assertRaises(OSError):
+                vm_admit.read_regular("/f")
+
+    def test_cap(self):
+        with self.assertRaises(OSError):
+            vm_admit.read_regular("/f", limit=99999)
+
+
+class PolicyTest(AdmCase):
+    def test_policy_breaks(self):
+        cases = {
+            "passwd mode": (lambda: (self.vm.root / "etc/passwd").chmod(0o664), "accounts"),
+            "keys mode": (lambda: (self.vm.root / "home/op/.ssh/authorized_keys").chmod(0o644), "keys"),
+            "sudoers mode": (lambda: (self.vm.root / "etc/sudoers.d/m1adm").chmod(0o640), "sudoers"),
+            "op not in docker on the guest": (lambda: (self.vm.root / "etc/group").write_text("docker:x:999:\n"),
+                                              "accounts"),
+        }
+        for name, (brk, row) in cases.items():
+            with self.subTest(name):
+                self.setUp()
+                brk()
+                self.assertIn(row, self.failing())
+
+    def test_foreign_owner_and_extra_link(self):
+        self.foreign.add("/etc/sudoers.d/m1adm")
+        self.assertIn("sudoers", self.failing())
+        self.setUp()
+        os.link(self.vm.root / "etc/sudoers.d/m1adm", self.vm.root / "etc/second-name")
+        self.assertIn("sudoers", self.failing())
+
+    def test_op_outside_docker_on_both_sides(self):
+        (self.vm.root / "etc/group").write_text("docker:x:999:\n")
+        self.vm.man["accounts"]["op"]["groups"] = []
+        sha = self.vm.write_man()
+        self.assertIn("accounts", self.failing(man_sha256=sha))
+
+    def test_man_home_must_equal_the_guest(self):
+        self.vm.man["accounts"]["op"]["home"] = "/home/elsewhere"
+        sha = self.vm.write_man()
+        self.assertIn("accounts", self.failing(man_sha256=sha))
+
+    def test_hdot_on_the_wrong_filesystem(self):
+        (self.vm.root / "proc/self/mountinfo").write_text("1 0 999:999 / / rw - ext4 /dev/sda1 rw\n"
+                                                          "9 1 999:998 / /srv/m1-state rw - ext4 /dev/sdc rw\n")
+        self.assertIn("hdot", self.failing("A2b"))
+
+    def test_mountinfo_without_the_state_mount_is_unknown(self):
+        dev = os.stat(self.vm.root).st_dev
+        (self.vm.root / "proc/self/mountinfo").write_text(f"1 0 {os.major(dev)}:{os.minor(dev)} / / rw - ext4 /dev/sda1 rw\n")
+        _, lines = self.admit("A2b")
+        self.assertIn("CHECK A2b hdot UNKNOWN", "\n".join(lines))
+
+    def test_socket_acl_exact(self):
+        cases = {
+            "extra entry": lambda: self.vm.cmd.update({"getfacl": (0, "user::rw-\nuser:2104:rw-\nuser:2101:rw-\n"
+                                                                   "group::rw-\nmask::rw-\nother::---\n")}),
+            "other readable": lambda: self.vm.cmd.update({"getfacl": (0, "user::rw-\nuser:2104:rw-\ngroup::rw-\n"
+                                                                      "mask::rw-\nother::r--\n")}),
+            "drop-in changed": lambda: ((self.vm.root / "etc/systemd/system/docker.socket.d/m1-acl.conf").write_bytes(b"x\n")),
+        }
+        for name, brk in cases.items():
+            with self.subTest(name):
+                self.setUp()
+                brk()
+                self.assertIn("socket-acl", self.failing("A2b"))
+
+    def test_absent_is_observed_once(self):
+        calls = []
+        real = vm_admit.lstat_path
+
+        def lstat(path):
+            calls.append(path)
+            return None if len([c for c in calls if c == path]) == 1 else real("/etc/passwd")
+        with mock.patch.object(vm_admit, "lstat_path", lstat):
+            ok, detail = vm_admit.Admission(params(self.vm), self.vm.runner).check_absent("/root/.ssh")()
+        self.assertEqual((ok, detail), (True, "/root/.ssh: absent"))
+
+
+class SchemaTest(AdmCase):
+    def test_nested_refusals(self):
+        def acc(**over):
+            a = json.loads(json.dumps(ACCOUNTS))
+            for k, v in over.items():
+                a[k] = v
+            return a
+        for over in ({"accounts": acc(extra={"name": "x", "uid": 3000, "gid": 3000})},
+                     {"accounts": {k: v for k, v in ACCOUNTS.items() if k != "registry"}},
+                     {"accounts": acc(op={"name": "op", "uid": 2101})},
+                     {"accounts": acc(op={"name": "op", "uid": 0, "gid": 0})},
+                     {"accounts": acc(op={"name": "Op x", "uid": 2101, "gid": 2101})},
+                     {"keys": {"op": [KEY_OP]}},
+                     {"keys": dict(KEYS, op=[])},
+                     {"keys": dict(KEYS, op=["a\nb"])}):
+            with self.subTest(over):
+                p = params(self.vm)
+                p.update(over)
+                with redirect_stdout(io.StringIO()):
+                    self.assertEqual(vm_admit.main(p, runner=self.vm.runner), 2)

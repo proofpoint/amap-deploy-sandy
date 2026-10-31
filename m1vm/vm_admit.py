@@ -89,11 +89,40 @@ def read_regular(path, limit=1 << 22):
                 raise OSError(errno.EFBIG, f"{path}: larger than the bound")
             chunks.append(chunk)
         end = os.fstat(ffd)
-        if (end.st_size, end.st_mtime_ns) != (total, st.st_mtime_ns):
+        if (end.st_dev, end.st_ino, end.st_size, end.st_mtime_ns) != (st.st_dev, st.st_ino, total, st.st_mtime_ns):
             raise OSError(errno.EAGAIN, f"{path}: changed while read")
         return b"".join(chunks), st
     finally:
         os.close(ffd)
+
+
+def mount_devices():
+    """{mountpoint: (major, minor)} from the kernel's mountinfo; the LAST
+    entry for a mountpoint wins, as the kernel resolves it."""
+    data, _ = read_regular("/proc/self/mountinfo", 1 << 20)
+    out = {}
+    for line in data.decode("utf-8", "replace").splitlines():
+        f = line.split()
+        if len(f) > 4 and re.fullmatch(r"[0-9]+:[0-9]+", f[2]):
+            major, minor = f[2].split(":")
+            out[f[4]] = (int(major), int(minor))
+    return out
+
+
+def read_protected(path, uid, mode, mount, limit=1 << 22):
+    """The declared read policy, for EVERY protected input (Codex ADM (3)):
+    a regular file read to EOF without following a link, owned by UID, with
+    exactly MODE, one link, and on the filesystem mounted at MOUNT."""
+    data, st = read_regular(path, limit)
+    if st.st_uid != uid or stat.S_IMODE(st.st_mode) != mode or st.st_nlink != 1:
+        raise OSError(errno.EPERM, f"{path}: uid {st.st_uid} mode {stat.S_IMODE(st.st_mode):04o} "
+                                   f"links {st.st_nlink}, not uid {uid} mode {mode:04o} one link")
+    dev = mount_devices().get(mount)
+    if dev is None:
+        raise Unknown(f"{mount}: not in mountinfo")
+    if (os.major(st.st_dev), os.minor(st.st_dev)) != dev:
+        raise OSError(errno.EXDEV, f"{path}: not on the filesystem mounted at {mount}")
+    return data
 
 
 def lstat_path(path):
@@ -180,40 +209,57 @@ class Admission:
         return bid
 
     def man(self):
-        data, st = read_regular(MAN_PATH)
+        data = read_protected(MAN_PATH, 0, 0o444, "/")
         sha = hashlib.sha256(data).hexdigest()
-        return sha, json.loads(data.decode("utf-8")), st
+        return sha, json.loads(data.decode("utf-8"))
 
     def check_man(self):
-        sha, _, st = self.man()
-        ok = sha == self.p["man_sha256"] and st.st_uid == 0 and stat.S_IMODE(st.st_mode) == 0o444 and st.st_nlink == 1
-        return ok, f"{sha} uid={st.st_uid} mode={stat.S_IMODE(st.st_mode):04o} links={st.st_nlink}"
+        sha, _ = self.man()
+        return sha == self.p["man_sha256"], f"{sha} (root 0444, one link, on /)"
 
-    def check_accounts(self):
-        _, man, _ = self.man()
-        bad = []
-        passwd = {}
-        for line in read_regular("/etc/passwd")[0].decode("utf-8").splitlines():
+    def passwd(self):
+        out = {}
+        for line in read_protected("/etc/passwd", 0, 0o644, "/").decode("utf-8").splitlines():
             f = line.split(":")
             if len(f) == 7:
-                passwd[f[0]] = (int(f[2]), int(f[3]), f[5])
+                out[f[0]] = (int(f[2]), int(f[3]), f[5])
+        return out
+
+    def groups_of(self, name):
+        out = []
+        for line in read_protected("/etc/group", 0, 0o644, "/").decode("utf-8").splitlines():
+            f = line.split(":")
+            if len(f) == 4 and name in f[3].split(","):
+                out.append(f[0])
+        return sorted(out)
+
+    def check_accounts(self):
+        """Every PIN account's uid, gid and home, measured on the guest AND
+        equal to MAN's; its supplementary groups on the guest equal MAN's;
+        <op> is in docker on the guest (Codex ADM (2))."""
+        _, man = self.man()
+        passwd = self.passwd()
+        bad = []
         for role, want in sorted(self.p["accounts"].items()):
-            have = passwd.get(want["name"])
+            name = want["name"]
+            have = passwd.get(name)
+            rec = man["accounts"].get(name)
             if have is None or have[:2] != (want["uid"], want["gid"]):
-                bad.append(f"{role}={want['name']}:{have}")
-            elif man["accounts"].get(want["name"], {}).get("uid") != want["uid"]:
-                bad.append(f"{role}: MAN disagrees")
+                bad.append(f"{role}={name}: guest {have}")
+            elif not isinstance(rec, dict) or (rec.get("uid"), rec.get("gid"), rec.get("home")) != have:
+                bad.append(f"{role}={name}: MAN {rec} differs from the guest")
+            elif rec.get("groups") != self.groups_of(name):
+                bad.append(f"{role}={name}: groups {self.groups_of(name)} on the guest, {rec.get('groups')} in MAN")
         op = self.p["accounts"]["op"]["name"]
-        if "docker" not in man["accounts"].get(op, {}).get("groups", []):
-            bad.append(f"{op} not in MAN's docker group")
-        return not bad, "; ".join(bad) or f"{len(self.p['accounts'])} accounts as PIN and MAN"
+        if "docker" not in self.groups_of(op):
+            bad.append(f"{op} is not in docker on the guest")
+        return not bad, "; ".join(bad) or f"{len(self.p['accounts'])} accounts as PIN, MAN and the guest"
 
     def home_of(self, name):
-        for line in read_regular("/etc/passwd")[0].decode("utf-8").splitlines():
-            f = line.split(":")
-            if len(f) == 7 and f[0] == name:
-                return f[5]
-        raise Unknown(f"{name}: no passwd entry")
+        have = self.passwd().get(name)
+        if have is None:
+            raise Unknown(f"{name}: no passwd entry")
+        return have[2]
 
     def check_keys(self):
         """Stage S: each keyed account's authorized_keys exactly PIN's lines,
@@ -225,20 +271,15 @@ class Admission:
             path = f"{self.home_of(name)}/.ssh/authorized_keys"
             keyed[path] = True
             try:
-                data, st = read_regular(path)
+                data = read_protected(path, self.p["accounts"][role]["uid"], 0o600, "/")
             except OSError as exc:
                 bad.append(f"{path}: {exc.strerror or exc}")
                 continue
-            if data.decode("utf-8") != "\n".join(lines) + "\n":
+            if data != ("\n".join(lines) + "\n").encode("utf-8"):
                 bad.append(f"{path}: not exactly PIN's keys")
-            if st.st_uid != self.p["accounts"][role]["uid"] or stat.S_IMODE(st.st_mode) & 0o077:
-                bad.append(f"{path}: owner or mode")
-        for line in read_regular("/etc/passwd")[0].decode("utf-8").splitlines():
-            f = line.split(":")
-            if len(f) != 7:
-                continue
-            path = f"{f[5].rstrip('/')}/.ssh/authorized_keys"
-            if path not in keyed and f[5].startswith("/") and lstat_path(path) is not None:
+        for name, (_, _, home) in sorted(self.passwd().items()):
+            path = f"{home.rstrip('/')}/.ssh/authorized_keys"
+            if path not in keyed and home.startswith("/") and lstat_path(path) is not None:
                 bad.append(f"{path}: an unlisted keyed account")
         return not bad, "; ".join(bad) or "Stage S exactly"
 
@@ -251,9 +292,8 @@ class Admission:
         if names != sorted(want):
             return False, f"{SUDOERS_DIR} holds {names!r}"
         for name, text in want.items():
-            data, st = read_regular(f"{SUDOERS_DIR}/{name}")
-            if data.decode("utf-8") != text or (st.st_uid, stat.S_IMODE(st.st_mode), st.st_nlink) != (0, 0o440, 1):
-                return False, f"{name}: not the reviewed rule, root 0440, one link"
+            if read_protected(f"{SUDOERS_DIR}/{name}", 0, 0o440, "/") != text.encode("utf-8"):
+                return False, f"{name}: not the reviewed rule"
         return True, f"exactly {sorted(want)}"
 
     def check_agent_sealed(self):
@@ -285,6 +325,15 @@ class Admission:
             return False, f"{AGENT_PORT} held by pid(s) {holders}"
         return True, "masked to /dev/null, inactive, port unheld"
 
+    def check_agent_prov(self):
+        raise Unknown("PROV-n agent_sealed / qm agent=0 not yet bound into the parameters")
+
+    def check_systemd_tree(self):
+        raise Unknown("MAN does not yet record /etc/systemd/system, so the rest of it is not compared")
+
+    def check_role_and_o_n(self):
+        raise Unknown("binds DS's B6c pre-flight receipt, not yet reviewed")
+
     def check_state_mount(self):
         rc, out = self.runner(["/usr/bin/findmnt", "-n", "-o", "UUID,SOURCE,FSTYPE", "--target", STATE])
         f = out.split()
@@ -296,14 +345,18 @@ class Admission:
         return True, f"{STATE} from {f[1]} ({f[0]}); D at /var/lib/docker"
 
     def check_absent(self, path):
-        return lambda: (lstat_path(path) is None, f"{path}: {'absent' if lstat_path(path) is None else 'present'}")
+        def observe():  # one observation (Codex ADM (4))
+            seen = lstat_path(path)
+            return seen is None, f"{path}: {'absent' if seen is None else 'present'}"
+        return observe
 
     def check_hdot(self):
-        _, man, _ = self.man()
+        _, man = self.man()
+        op_uid = self.p["accounts"]["op"]["uid"]
         bad = []
         for e in man["hdot"]:
             try:
-                data, _ = read_regular(f"{SANDY_HOME}/{e['name']}")
+                data = read_protected(f"{SANDY_HOME}/{e['name']}", op_uid, int(e["mode"], 8), STATE)
                 if hashlib.sha256(data).hexdigest() != e["sha256"]:
                     bad.append(f"{e['name']}: sha differs")
             except OSError as exc:
@@ -311,7 +364,7 @@ class Admission:
         return not bad, "; ".join(bad) or f"{len(man['hdot'])} HDOT entries equal MAN's"
 
     def check_images(self):
-        _, man, _ = self.man()
+        _, man = self.man()
         bad = []
         for ref, iid in sorted(man["images"].items()):
             rc, out = self.runner(["/usr/bin/docker", "image", "inspect", "--format", "{{.Id}}", ref])
@@ -320,10 +373,19 @@ class Admission:
         return not bad, "; ".join(bad) or f"{len(man['images'])} images at MAN's Ids"
 
     def check_socket_acl(self):
+        """The drop-in is MAN's bytes, and the socket's ACL is exactly what
+        that drop-in makes of the stock root:docker 0660 socket."""
+        _, man = self.man()
+        dropin = "/etc/systemd/system/docker.socket.d/m1-acl.conf"
+        rec = man["files"].get(dropin)
+        data = read_protected(dropin, 0, 0o644, "/")
+        if not rec or hashlib.sha256(data).hexdigest() != rec.get("sha256"):
+            return False, f"{dropin}: not MAN's bytes"
         uid1 = self.p["accounts"]["uid-1"]["uid"]
         rc, out = self.runner(["/usr/bin/getfacl", "-n", "--omit-header", "/run/docker.sock"])
-        entries = {l for l in out.splitlines() if l and not l.startswith("#")}
-        return rc == 0 and f"user:{uid1}:rw-" in entries, f"/run/docker.sock: {sorted(entries)}"
+        entries = sorted(l for l in out.splitlines() if l)
+        want = sorted(["user::rw-", f"user:{uid1}:rw-", "group::rw-", "mask::rw-", "other::---"])
+        return rc == 0 and entries == want, f"/run/docker.sock: {entries}"
 
     # -- the phases -----------------------------------------------------------
 
@@ -333,6 +395,11 @@ class Admission:
         self.check("keys", self.check_keys)
         self.check("sudoers", self.check_sudoers)
         self.check("agent-sealed", self.check_agent_sealed)
+        # Exactness still owed (Codex ADM (5)): PROV-n's agent_sealed and
+        # qm agent=0 are on the operator's side and not yet passed in; MAN does
+        # not yet record /etc/systemd/system as a whole. UNKNOWN until they are.
+        self.check("agent-prov", self.check_agent_prov)
+        self.check("systemd-tree", self.check_systemd_tree)
         self.check("root-ssh-absent", self.check_absent("/root/.ssh"))
         self.check("bake-copy-absent", self.check_absent("/var/lib/m1-bake"))
         self.check("mounts", self.check_state_mount)
@@ -340,8 +407,7 @@ class Admission:
             self.check("hdot", self.check_hdot)
             self.check("images", self.check_images)
             self.check("socket-acl", self.check_socket_acl)
-            self.check("role-and-o-n", lambda: (_ for _ in ()).throw(
-                Unknown("binds DS's B6c pre-flight receipt, not yet reviewed")))
+            self.check("role-and-o-n", self.check_role_and_o_n)
 
     def final_line(self, utc):
         if self.failed or self.unknown:
@@ -371,6 +437,20 @@ def validate_params(p):
             raise ValueError(f"{k}: a lowercase UUID")
     if not (isinstance(p["att"], str) and re.fullmatch(r"ATT-[0-9]+", p["att"])):
         raise ValueError("att: ATT-<n>")
+    roles = {"op", "m1-admin", "adm", "uid-1", "uid-2", "registry"}
+    acc = p["accounts"]
+    if not isinstance(acc, dict) or set(acc) != roles:
+        raise ValueError(f"accounts: exactly {sorted(roles)}")
+    for role, a in acc.items():
+        if not (isinstance(a, dict) and set(a) == {"name", "uid", "gid"} and isinstance(a["name"], str)
+                and re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", a["name"])
+                and all(type(a[k]) is int and 1000 <= a[k] < 60000 for k in ("uid", "gid"))):
+            raise ValueError(f"accounts.{role}: exactly {{name, uid, gid}}")
+    keys = p["keys"]
+    if not isinstance(keys, dict) or set(keys) != {"op", "m1-admin", "adm"} or not all(
+            isinstance(v, list) and v and all(isinstance(l, str) and l and "\n" not in l for l in v)
+            for v in keys.values()):
+        raise ValueError("keys: exactly {op, m1-admin, adm}, each a list of key lines")
 
 
 def main(params, runner=run, now=time.gmtime):
