@@ -28,7 +28,9 @@ START = {"uid_1": 1001, "group_add": 1002, "config": "/srv/data/sandy/features/a
 ROLE = {"schema": "amap-m1-role/1", "role": "H1", "vm": "m1vm1", "hostname": "m1vm1", "fd": "sandy.m1vm1.internal",
         "own_domain": "m1vm1.example.org", "ids": {"op": 1000, "m1-admin": 1003, "adm": 1004, "uid-1": 1001,
                                                     "uid-2": 1005, "registry": 1006},
-        "units": ["m1-state-check.service", "srv-m1\\x2dstate.mount"], "start": START}
+        "units": ["m1-state-check.service", "srv-m1\\x2dstate.mount"],
+        "fleet_policy_digest": "sha256:1b3083aed757ac7358acb763ee1a383d6572e9836754b59966e3e08f0459f120",
+        "start": START}
 
 
 def psr_bytes(ctlr, recheck_of=None, diff=(), prewindow="PASS", result=None, users_x="-", tweak=None):
@@ -521,6 +523,16 @@ class RoleManifestTest(Fixture):
             with self.subTest(keys=sorted(doc)):
                 self.write_role(doc)
                 self.refused("with exactly:")
+
+    def test_a_manifest_without_fleet_policy_digest_is_refused(self):
+        """ROLE-MANIFEST-INTERFACE r3 makes the key required; a manifest
+        written to r1's key set refuses."""
+        self.write_role({k: v for k, v in ROLE.items() if k != "fleet_policy_digest"})
+        self.refused("with exactly:")
+
+    def test_the_role_keys_are_the_interface_set(self):
+        self.assertEqual(ms.ROLE_KEYS, {"schema", "role", "vm", "hostname", "fd", "own_domain", "ids", "units",
+                                        "fleet_policy_digest", "start"})
 
     def test_a_missing_or_extra_start_key_is_refused(self):
         for start in ({k: v for k, v in START.items() if k != "name"}, {**START, "detach": True}):
