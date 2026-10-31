@@ -2416,8 +2416,9 @@ engine reads as not running.
 9. **A5, final.** `python3 amap-sandy.py partition-check ... --ready` exits 0
    only when all six claims PASS. `partition-check`'s exit 0 without `--ready`
    means only that its object was written, so read all six cells. Then
-   `python3 amap-sandy.py verify` (on a launchd host,
-   `python3 amap-sandy.py verify --a5`) must pass, and step 7 must be
+   `python3 amap-sandy.py verify --image <router.image.digest> --container
+   <router.container>` (on a launchd host, `verify --a5` with the same two
+   flags) must pass, and step 7 must be
    complete (above): the newest placed post-activation document for A2's
    token has P01 and P02 PASS. `--ready` cannot discharge it. Only then is
    the host ready. E1's claim names the step-8 run and time it rests on: the key

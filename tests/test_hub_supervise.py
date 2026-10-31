@@ -917,9 +917,9 @@ class StartSweepTest(unittest.TestCase):
         return found
 
     def gate(self, exposure_found, secrets_checks=None, overlay=None, spec_path=None, horizon=None,
-             no_delegation=None, keys=None):
+             no_delegation=None, keys=None, built=None):
         good = [rh.check("x", rh.Fact("x", True, "a test"), True, "x")]
-        built = spec()
+        built = built or spec()
 
         def same(*a, **k):
             return good
@@ -944,9 +944,22 @@ class StartSweepTest(unittest.TestCase):
         start check must pass what the router answered, never nothing."""
         seen = []
         answer = ("/opt/ex/local/router.json", "a" * 64)
-        self.gate([], no_delegation=lambda ks, live, rb, sg: seen.append(live) or [],
+        self.gate([], no_delegation=lambda ks, live, rb, sg, router=None: seen.append(live) or [],
                   keys={"containers": [], "live": answer})
         self.assertEqual(seen, [answer])
+
+    def test_the_start_check_hands_the_documents_router_section_to_the_binding_remedy(self):
+        """The binding's remedy starts the local router by the router
+        section's image Id and container, so the start check must pass that
+        section, never nothing."""
+        import dataclasses
+        from types import SimpleNamespace
+        seen = []
+        want = SimpleNamespace(image_digest="sha256:" + "d" * 64, container="router-z")
+        self.gate([], no_delegation=lambda ks, live, rb, sg, router=None: seen.append(router) or [],
+                  keys={"containers": [], "live": ("/opt/ex/local/router.json", "a" * 64)},
+                  built=dataclasses.replace(spec(), router=want))
+        self.assertEqual(seen, [want])
 
     def test_a_bound_delegation_free_config_passes_the_real_gate(self):
         """hub_keys.verify_start_delegation unstubbed, with every other group

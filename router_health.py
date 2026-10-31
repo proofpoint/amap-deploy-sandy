@@ -852,7 +852,8 @@ def verify_container(ctx: Ctx) -> Iterator[Check]:
                    "first check passes",
             first=check(claim=CONTAINER_RUNNING, expected=ctx.fact("true"), actual=False,
                         remedy=f"start it from the router checkout: docker/run.sh --config "
-                               f"{ctx.value('router_config')} --name {name} --detach. "
+                               f"{ctx.value('router_config')} --image {ctx.value('image')} --name {name} "
+                               f"--detach. "
                                f"There is no container named {name}"))
         return
 
