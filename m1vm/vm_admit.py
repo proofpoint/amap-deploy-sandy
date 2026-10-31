@@ -387,8 +387,8 @@ class Admission:
             return False, f"systemctl: {props}"
         # /proc shows the resolved device, never the alias, so compare the
         # opened objects themselves: a character device by its rdev, anything
-        # else by (dev, ino) (Opus ADM 1). After agent=0 applies, the port is
-        # gone and nothing can hold it.
+        # else by (dev, ino) (Opus ADM 1). With the alias absent, a holder of
+        # any virtio port FAILs and no holder is UNKNOWN, never PASS.
         try:
             port = os.stat(os.path.join(ROOT, AGENT_PORT.lstrip("/")))
         except FileNotFoundError:
@@ -462,11 +462,14 @@ class Admission:
         states = [l.partition("=")[2] for l in out.splitlines() if l.startswith("UnitFileState=")]
         if rc != 0 or states != ["masked"] * len(QUIET_MASK):
             return False, f"{list(QUIET_MASK)}: {states}"
-        # Purged means unknown to dpkg, or known only as not-installed with no
-        # config files left (Codex round7 1).
+        # Purged means unknown to dpkg (rc 1), or known only as not-installed
+        # with no config files left (Codex round7 1). Any other rc is a dpkg
+        # that did not answer (Opus round7 (b)3).
         present = []
         for pkg in QUIET_REMOVE:
             rc, out = self.runner(["/usr/bin/dpkg-query", "-W", "-f", "${Status}", pkg])
+            if rc not in (0, 1):
+                raise Unknown(f"dpkg-query {pkg}: rc {rc}")
             if rc == 0 and out.strip() not in ("unknown ok not-installed", "purge ok not-installed"):
                 present.append(f"{pkg}={out.strip()!r}")
         if present:

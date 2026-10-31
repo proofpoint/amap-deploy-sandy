@@ -23,6 +23,7 @@ from unittest import mock
 
 M1VM = Path(__file__).resolve().parent.parent / "m1vm"
 sys.path.insert(0, str(M1VM))
+import man  # noqa: E402
 import vm_admit  # noqa: E402
 
 STATE_UUID = "3f2c8a10-5b7e-4c1d-9a2e-6f0b1c2d3e4f"
@@ -68,6 +69,10 @@ class Vm:
             (d / "authorized_keys").chmod(0o600)
         (r / "etc/systemd/system").mkdir(parents=True)
         os.symlink("/dev/null", r / "etc/systemd/system/qemu-guest-agent.service")
+        # What BAKE's `systemctl enable` leaves for the two RequiredBy=local-fs.target mounts.
+        (r / "etc/systemd/system/local-fs.target.requires").mkdir()
+        for u in ("srv-m1\\x2dstate.mount", "var-lib-docker.mount"):
+            os.symlink(f"/etc/systemd/system/{u}", r / "etc/systemd/system/local-fs.target.requires" / u)
         (r / "proc/sys/kernel/random").mkdir(parents=True)
         (r / "proc/sys/kernel/random/boot_id").write_text(BOOT + "\n")
         dev = os.stat(r).st_dev
@@ -106,10 +111,14 @@ class Vm:
         self.cmd = {}
 
     def record_units(self):
-        """MAN's tree of /etc/systemd/system, as BAKE would record it on T0:
-        the guest's tree before G-AS-n's mask link."""
-        with mock.patch.object(vm_admit, "ROOT", str(self.root)):
-            t = vm_admit.guest_tree("/etc/systemd/system")
+        """MAN's tree of /etc/systemd/system as m1-man itself records it on T0
+        (man.tree, Opus round7 (b)2): the guest's tree, enable's links
+        included, before G-AS-n's mask link. Files are root's on T0, as the
+        checks' view reports them."""
+        t = man.tree(str(self.root / "etc/systemd/system"))
+        for e in t.values():
+            if e["type"] == "f":
+                e["uid"] = 0
         t.pop("qemu-guest-agent.service")
         self.man["trees"] = {"/etc/systemd/system": t}
         return self.write_man()
@@ -622,6 +631,61 @@ class Part2Test(AdmCase):
         import shutil as sh
         sh.rmtree(self.vm.root / "srv/m1-state/sandy/features/amap/instances")
         self.assertIn("instances-empty", self.failing("A2b"))
+
+
+class Round7Test(AdmCase):
+    """Opus round7: enable's links in MAN, and the survivors' gaps."""
+
+    def lines(self, phase="A1", **over):
+        return "\n".join(self.admit(phase, **over)[1])
+
+    def test_enable_links_recorded_pass_a1(self):
+        tree = self.vm.man["trees"]["/etc/systemd/system"]
+        self.assertEqual(tree["local-fs.target.requires/var-lib-docker.mount"]["target"],
+                         "/etc/systemd/system/var-lib-docker.mount")
+        self.assertIn("CHECK A1 systemd-tree PASS", self.lines())
+
+    def test_man_taken_before_enable_fails_a1(self):
+        # Round 7's order: MAN recorded before enable made its links.
+        for k in [k for k in self.vm.man["trees"]["/etc/systemd/system"] if k.startswith("local-fs.target.requires")]:
+            del self.vm.man["trees"]["/etc/systemd/system"][k]
+        sha = self.vm.write_man()
+        self.assertIn("CHECK A1 systemd-tree FAIL", self.lines(man_sha256=sha))
+
+    def test_mask_link_wrong_target_fails(self):
+        p = self.vm.root / "etc/systemd/system/qemu-guest-agent.service"
+        p.unlink()
+        os.symlink("/lib/systemd/system/qemu-guest-agent.service", p)
+        self.assertIn("CHECK A1 systemd-tree FAIL", self.lines())
+
+    def test_fifo_in_unit_dir_fails(self):
+        os.mkfifo(self.vm.root / "etc/systemd/system/x.fifo")
+        self.assertIn("CHECK A1 systemd-tree FAIL", self.lines())
+
+    def test_man_without_trees_is_unknown(self):
+        del self.vm.man["trees"]
+        sha = self.vm.write_man()
+        self.assertIn("CHECK A1 systemd-tree UNKNOWN", self.lines(man_sha256=sha))
+
+    def test_dpkg_query_error_is_unknown(self):
+        self.vm.cmd["dpkg-query -W -f ${Status} snapd"] = (2, "")
+        self.assertIn("CHECK A1 auto-change-off UNKNOWN", self.lines())
+
+    def test_systemctl_error_fails(self):
+        self.vm.cmd["UnitFileState"] = (1, "".join("UnitFileState=masked\n" for _ in vm_admit.QUIET_MASK))
+        self.assertIn("auto-change-off", self.failing())
+
+    def test_docker_ps_error_is_unknown(self):
+        self.vm.cmd["docker ps --all"] = (1, "")
+        self.assertIn("CHECK A2a containers UNKNOWN", self.lines("A2a"))
+
+    def test_phase_gating(self):
+        (self.vm.root / "srv/m1-state/sandy/features/amap/instances/x").mkdir()
+        self.vm.cmd["docker ps --all"] = (0, "abc\n")
+        post = self.lines("POST")
+        self.assertNotIn("instances-empty", post)
+        self.assertIn("CHECK POST instances UNKNOWN", post)
+        self.assertIn("CHECK A2b containers UNKNOWN", self.lines("A2b"))
 
 
 class PackagesTest(AdmCase):

@@ -130,6 +130,9 @@ class BuildTest(ManCase):
         self.assertEqual(tr["outside"]["type"], "l")  # recorded, never crossed
         self.assertEqual(tr["docker.socket.d/m1-acl.conf"]["sha256"], hashlib.sha256(b"[Socket]\n").hexdigest())
         self.assertEqual(tr["docker.socket.d"]["type"], "d")
+        st = os.stat(t / "docker.socket.d")
+        self.assertEqual(tr["docker.socket.d"], {"type": "d", "mode": f"{st.st_mode & 0o7777:04o}",
+                                                 "uid": st.st_uid, "gid": st.st_gid})
 
     def test_tree_refuses_a_socket(self):
         import socket
@@ -194,7 +197,9 @@ class FailTest(ManCase):
                        lambda p: p["roles"].pop("op"), lambda p: p["roles"].update(op="nosuch"),
                        lambda p: p["roles"].update(extra=ME),
                        lambda p: p["builds"]["router1"].update(image="other:x"),
-                       lambda p: p["builds"]["router1"].update(tree="nope")):
+                       lambda p: p["builds"]["router1"].update(tree="nope"),
+                       lambda p: p.update(trees="/etc"), lambda p: p.update(trees=["/a", "/a"]),
+                       lambda p: p.update(trees=["rel"]), lambda p: p.update(trees=["/a/../b"])):
             with self.subTest(mutate):
                 self.setUp()
                 mutate(self.plan)

@@ -35,8 +35,10 @@ Steps, in order:
   units        the state-check and mount units rendered, NOT yet enabled
   clean        containers stopped, builder pruned, dangling images removed,
                proxy files and <bundle-dir> deleted
-  man          MAN written (m1-man)
-  enable       the units enabled; the template is never booted after this
+  enable       the units enabled; enable must have added exactly the two
+               mounts' local-fs.target.requires links; the template is never
+               booted after this
+  man          MAN written (m1-man), so its unit tree holds those links
   assert-d     the image set equals MAN's, the builder cache is empty
 """
 
@@ -501,11 +503,12 @@ def step_bundle(pin, host):
     if host.run(["cat", f"{EXEC_ROOT}/bundle/PIN"]) != pin_commit + "\n":
         raise BakeFail("bundle: bundle/PIN is not the deploy pin")
     # The whole result tree, directories and every entry type included
-    # (Opus round5): exactly these entries with these types, modes and owner.
-    want_tree = {".": "d 700 root", "bundle": "d 555 root", "empty-home": "d 700 root"}
-    want_tree.update({f"bundle/{n}": "f 444 root" for n in want})
+    # (Opus round5): exactly these entries with these types, modes, owner and
+    # group.
+    want_tree = {".": "d 700 root root", "bundle": "d 555 root root", "empty-home": "d 700 root root"}
+    want_tree.update({f"bundle/{n}": "f 444 root root" for n in want})
     got_tree = {}
-    for rec in host.run(["find", EXEC_ROOT, "-printf", "%P\\t%y %m %u\\0"]).split("\0"):
+    for rec in host.run(["find", EXEC_ROOT, "-printf", "%P\\t%y %m %u %g\\0"]).split("\0"):
         if rec:
             rel, _, desc = rec.partition("\t")
             got_tree[rel or "."] = desc
@@ -580,8 +583,35 @@ def step_man(pin, host, pin_sha):
     return out[-1].split("=", 1)[1]
 
 
+MOUNT_UNITS = ("srv-m1\\x2dstate.mount", "var-lib-docker.mount")
+
+
+def unit_dir_entries(host):
+    """{relpath: "type mode owner group target"} of every entry under UNIT_DIR."""
+    out = {}
+    for rec in host.run(["find", UNIT_DIR, "-printf", "%P\\t%y %m %u %g %l\\0"]).split("\0"):
+        if rec:
+            rel, _, desc = rec.partition("\t")
+            out[rel or "."] = desc
+    return out
+
+
 def step_enable(pin, host):
-    host.run(["systemctl", "enable", "srv-m1\\x2dstate.mount", "var-lib-docker.mount"])
+    """Enable the two mounts, then require that enable added exactly their
+    `RequiredBy=local-fs.target` links (and the .requires directory, if it was
+    absent) and changed nothing else, so MAN, taken next, records them
+    (Opus round7 (a)1)."""
+    before = unit_dir_entries(host)
+    host.run(["systemctl", "enable", *MOUNT_UNITS])
+    after = unit_dir_entries(host)
+    req = "local-fs.target.requires"
+    want = {f"{req}/{u}": f"l 777 root root {UNIT_DIR}/{u}" for u in MOUNT_UNITS}
+    if req not in before:
+        want[req] = "d 755 root root "
+    added = {k: v for k, v in after.items() if k not in before}
+    if added != want or any(after.get(k) != v for k, v in before.items()):
+        raise BakeFail(f"enable: {UNIT_DIR} changed beyond the two mounts' links "
+                       f"({sorted(set(added.items()) ^ set(want.items()))[:5]} differ)")
 
 
 def step_assert_d(pin, host, man_sha):
@@ -630,10 +660,12 @@ def bake(pin, pin_sha, host):
         except BakeFail as exc:
             msg = str(exc)
             raise BakeFail(msg if msg.startswith(f"{name}: ") else f"{name}: {msg}") from None
-    print("M1-BAKE STEP man", flush=True)
-    man_sha = step_man(pin, host, pin_sha)
+    # Enable before MAN, so MAN's UNIT_DIR tree holds enable's links (Opus
+    # round7 (a)1). MAN writes its plan and MAN.json and changes no unit.
     print("M1-BAKE STEP enable", flush=True)
     step_enable(pin, host)
+    print("M1-BAKE STEP man", flush=True)
+    man_sha = step_man(pin, host, pin_sha)
     print("M1-BAKE STEP assert-d", flush=True)
     return step_assert_d(pin, host, man_sha)
 

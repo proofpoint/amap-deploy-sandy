@@ -78,6 +78,14 @@ class FakeHost:
         self.findmnt_calls = 0
         self.bundle_scripts = []
         self.unmount_after = None
+        # UNIT_DIR as `find -printf '%P\t%y %m %u %g %l\0'` lists it; enable
+        # adds what systemctl enable makes for a RequiredBy= unit in UNIT_DIR
+        # (INFERRED from systemctl's documented behaviour, not measured).
+        self.unit_dir = {"": "d 755 root root ", "m1-state-check.service": "f 644 root root ",
+                         "srv-m1\\x2dstate.mount": "f 644 root root ", "var-lib-docker.mount": "f 644 root root "}
+        self.enable_adds = {"local-fs.target.requires": "d 755 root root ", **{
+            f"local-fs.target.requires/{u}": f"l 777 root root {bake.UNIT_DIR}/{u}"
+            for u in ("srv-m1\\x2dstate.mount", "var-lib-docker.mount")}}
 
     def put(self, path, text, mode="0644", owner="root:root"):
         self.files[path] = (text, mode, owner)
@@ -91,6 +99,13 @@ class FakeHost:
                     raise out
                 return out
         a = argv
+        if a[:2] == ["systemctl", "enable"]:
+            self.unit_dir.update(self.enable_adds)
+            return ""
+        if a[:2] == ["find", bake.UNIT_DIR]:
+            if a[2:] != ["-printf", "%P\\t%y %m %u %g %l\\0"]:
+                raise AssertionError(f"unmodelled find {a[2:]!r}")
+            return "".join(f"{k}\t{v}\0" for k, v in sorted(self.unit_dir.items()))
         if a[0] == "sha256sum" and a[1].endswith("host_steps.py"):
             return self.pin["writer_sha256"] + "  " + a[1] + "\n"
         if a == ["cat", f"{bake.SRC}/amap-deploy-sandy/m1vm/bundle-lines.txt"]:
@@ -99,9 +114,10 @@ class FakeHost:
             self.bundle_scripts.append(a[5])
             return "END-OF-BLOCK\n" if len(self.bundle_scripts) == 1 else ""
         if a[:2] == ["find", bake.EXEC_ROOT] and a[-1].startswith("%P\\t"):
-            files = ["partition_job.py", "partition_store.py", "partition_weekly.closure", "PIN"]
-            return "".join(["\td 700 root\0", "bundle\td 555 root\0", "empty-home\td 700 root\0"]
-                           + [f"bundle/{f}\tf 444 root\0" for f in files])
+            # Only the format whose fields the fake supplies (type, mode, owner, group).
+            if a[-1] != "%P\\t%y %m %u %g\\0":
+                raise AssertionError(f"unmodelled find format {a[-1]!r}")
+            return part()
         if a[:2] == ["find", bake.EXEC_ROOT]:
             return "bundle\0empty-home\0"
         if a[:3] == ["git", "-C", f"{bake.SRC}/amap-deploy-sandy"] and a[3] == "show":
@@ -168,6 +184,16 @@ class FakeHost:
         if a == ["cat", bake.MAN_PATH]:
             return self.man
         return ""
+
+
+def part(**changes):
+    """`find /opt/amap/partition -printf '%P\\t%y %m %u %g\\0'` of the reviewed
+    tree, with CHANGES applied (a value of None removes the entry)."""
+    entries = {"": "d 700 root root", "bundle": "d 555 root root", "empty-home": "d 700 root root",
+               **{f"bundle/{f}": "f 444 root root"
+                  for f in ("partition_job.py", "partition_store.py", "partition_weekly.closure", "PIN")}}
+    entries.update(changes)
+    return "".join(f"{k}\t{v}\0" for k, v in entries.items() if v is not None)
 
 
 class PinTest(unittest.TestCase):
@@ -321,9 +347,24 @@ class SequenceTest(BakeCase):
         self.assertLess(prune, man)
         self.assertLess(bundles, man)
         self.assertLess(units, enable)
-        self.assertLess(man, enable)   # enabled only as the last act before the check (Opus N7)
-        self.assertLess(enable, assert_d)
+        self.assertLess(enable, man)   # MAN records enable's links (Opus round7 (a)1)
+        self.assertLess(man, assert_d)
         self.assertEqual(enable, max(i for i, a in enumerate(self.host.log) if a[0] == "systemctl"))
+
+    def test_man_records_enables_links(self):
+        # MAN's plan names UNIT_DIR's whole tree, and m1-man runs once enable's
+        # links are in place, so ADM's A1 systemd-tree sees them in MAN.
+        self.run_bake()
+        plan = json.loads(self.host.files["/run/m1-bake/man-plan.json"][0])
+        self.assertIn(bake.UNIT_DIR, plan["trees"])
+        man = self.index(lambda a: "man.py" in " ".join(a))
+        last_find = max(i for i, a in enumerate(self.host.log) if a[:2] == ["find", bake.UNIT_DIR])
+        self.assertLess(last_find, man)
+        self.assertIn("local-fs.target.requires/var-lib-docker.mount", self.host.unit_dir)
+
+    def test_enable_with_requires_dir_already_present(self):
+        self.host.unit_dir["local-fs.target.requires"] = "d 755 root root "
+        self.run_bake()
 
     def test_d_mounted_before_docker_exists(self):
         self.run_bake()
@@ -510,17 +551,23 @@ class StepFailTest(BakeCase):
             "bundle pin": (lambda h: h.over.update({"^cat /opt/amap/partition/bundle/PIN$": H("0") + "\n"}),
                            "bundle/PIN is not the deploy pin"),
             "bundle file mode": (lambda h: h.over.update({"^find /opt/amap/partition -printf":
-                "\td 700 root\0bundle\td 555 root\0empty-home\td 700 root\0bundle/partition_job.py\tf 644 root\0"
-                "bundle/partition_store.py\tf 444 root\0bundle/partition_weekly.closure\tf 444 root\0bundle/PIN\tf 444 root\0"}),
-                "not exactly the reviewed tree"),
-            "bundle dir mode": (lambda h: h.over.update({"^find /opt/amap/partition -printf":
-                "\td 755 root\0bundle\td 555 root\0empty-home\td 700 root\0bundle/partition_job.py\tf 444 root\0"
-                "bundle/partition_store.py\tf 444 root\0bundle/partition_weekly.closure\tf 444 root\0bundle/PIN\tf 444 root\0"}),
-                "not exactly the reviewed tree"),
+                part(**{"bundle/partition_job.py": "f 644 root root"})}), "not exactly the reviewed tree"),
+            "bundle dir mode": (lambda h: h.over.update({"^find /opt/amap/partition -printf": part(**{"": "d 755 root root"})}),
+                                "not exactly the reviewed tree"),
+            "bundle file group": (lambda h: h.over.update({"^find /opt/amap/partition -printf":
+                part(**{"bundle/PIN": "f 444 root op"})}), "not exactly the reviewed tree"),
             "bundle stray link": (lambda h: h.over.update({"^find /opt/amap/partition -printf":
-                "\td 700 root\0bundle\td 555 root\0empty-home\td 700 root\0bundle/partition_job.py\tf 444 root\0"
-                "bundle/partition_store.py\tf 444 root\0bundle/partition_weekly.closure\tf 444 root\0bundle/PIN\tf 444 root\0"
-                "bundle/x\tl 777 root\0"}), "not exactly the reviewed tree"),
+                part(**{"bundle/x": "l 777 root root"})}), "not exactly the reviewed tree"),
+            "enable adds more": (lambda h: h.enable_adds.update({"multi-user.target.wants/x.service":
+                                                                 "l 777 root root /etc/systemd/system/x.service"}),
+                                 "enable: /etc/systemd/system changed beyond"),
+            "enable link elsewhere": (lambda h: h.enable_adds.update({"local-fs.target.requires/var-lib-docker.mount":
+                                                                      "l 777 root root /lib/systemd/system/x.mount"}),
+                                      "enable: /etc/systemd/system changed beyond"),
+            "enable adds one link": (lambda h: h.enable_adds.pop("local-fs.target.requires/var-lib-docker.mount"),
+                                     "enable: /etc/systemd/system changed beyond"),
+            "enable changes a unit": (lambda h: h.enable_adds.update({"var-lib-docker.mount": "f 600 root root "}),
+                                      "enable: /etc/systemd/system changed beyond"),
             "command fails": (lambda h: h.over.update({"^docker pull": bake.BakeFail("docker pull: exit 1")}),
                               "images: docker pull"),
             "admin sudoers broader": (lambda h: h.over.update({"^sha256sum /etc/sudoers.d/m1-admin$":
