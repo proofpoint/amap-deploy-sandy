@@ -1,7 +1,9 @@
 """m1_start, the start wrapper: one positive case, then one negative case per
 refusal rule, each planted alone. A refusal must name its own rule, exit 3,
 and exec nothing. The records are small files whose sha the go text quotes,
-built here; the A2a record carries the key=value fields the wrapper reads."""
+built here. The A2a record follows ADM's specified line form (DS2 d8 §5;
+ADM has no bytes yet, so this is the specified producer, not a measured
+one): CHECK rows, then the final `VM-ADMIT A2a PASS ...` line."""
 
 import calendar
 import contextlib
@@ -51,7 +53,10 @@ class Fixture(unittest.TestCase):
 
     def write_a2a(self, ctlr, boot=BOOT, at=None):
         at = self.a2a_t if at is None else at
-        self.write("a2a", f"A2A PASS vm=1 ctlr={ctlr} boot_id={boot} utc={utc(at)}\n".encode())
+        self.write("a2a", (f"CHECK mount PASS ctlr=decoy\n"
+                           f"VM-ADMIT A2a PASS host=H1 att=ATT-1 boot_id={boot} adm={'1' * 64} man={'2' * 64} "
+                           f"ovl=none prov={'3' * 64} env=none exp=none d7={'4' * 64} dd={'5' * 64} ctlr={ctlr} "
+                           f"utc={utc(at)}\n").encode())
 
     def sha(self, name):
         return hashlib.sha256(self.files[name]).hexdigest()
@@ -194,6 +199,29 @@ class CtlrTest(Fixture):
         self.write("a2a", self.files["a2a"].rstrip(b"\n") + b" ctlr=" + self.sha("ctlr").encode() + b"\n")
         self.go["a2a"] = self.sha("a2a")
         self.refused("2 ctlr= field(s), not exactly one")
+
+    def test_an_a2a_whose_last_line_is_not_a2a_pass_is_refused(self):
+        self.write("a2a", self.files["a2a"].replace(b"VM-ADMIT A2a PASS", b"VM-ADMIT A2a FAIL"))
+        self.go["a2a"] = self.sha("a2a")
+        self.refused("last line is not `VM-ADMIT A2a PASS")
+
+    def test_an_a2b_line_is_refused(self):
+        self.write("a2a", self.files["a2a"].replace(b"VM-ADMIT A2a PASS", b"VM-ADMIT A2b PASS"))
+        self.go["a2a"] = self.sha("a2a")
+        self.refused("last line is not `VM-ADMIT A2a PASS")
+
+    def test_a_trailing_check_row_is_refused(self):
+        self.write("a2a", self.files["a2a"] + b"CHECK late PASS\n")
+        self.go["a2a"] = self.sha("a2a")
+        self.refused("last line is not `VM-ADMIT A2a PASS")
+
+    def test_a_ctlr_in_a_check_row_is_not_read(self):
+        a2a = self.files["a2a"].replace(b"CHECK mount PASS ctlr=decoy", b"CHECK mount PASS ctlr=" +
+                                        self.sha("ctlr").encode())
+        a2a = a2a.replace(b" ctlr=" + self.sha("ctlr").encode() + b" utc=", b" ctlr=none utc=")
+        self.write("a2a", a2a)
+        self.go["a2a"] = self.sha("a2a")
+        self.refused("ctlr=none")
 
 
 class BootAndWindowTest(Fixture):

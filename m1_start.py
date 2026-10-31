@@ -21,11 +21,13 @@ It refuses unless:
   - the PSR receipt carries the line `result PASS`;
   - psr_recheck= appears only on the later go, exactly when --psr-recheck is
     given, and that receipt carries `result PASS` and no `DIFF` line;
-  - the A2a record's own `ctlr=` equals the go's `ctlr=`; an A2a with
-    `ctlr=none` was taken before CTL-R was admitted and is never quotable;
-  - the go's boot_id equals the A2a record's and this machine's current one;
-  - the go's a2a_utc equals the A2a record's `utc=`, and now is within
-    W1 (900 s) after it, never before it;
+  - the A2a record (ADM's whole output) ends in the line
+    `VM-ADMIT A2a PASS ... boot_id=<id> ... ctlr=<sha> utc=<UTC>`, whose
+    `ctlr=` equals the go's `ctlr=`; an A2a with `ctlr=none` was taken before
+    CTL-R was admitted and is never quotable;
+  - the go's boot_id equals that line's and this machine's current one;
+  - the go's a2a_utc equals that line's `utc=`, and now is within W1 (900 s)
+    after it, never before it;
   - ARGV is a docker/run.sh start by image Id: `--image sha256:<64 hex>`
     and `--detach`.
 
@@ -119,6 +121,22 @@ def _fields(data: bytes) -> Dict[str, List[str]]:
     return out
 
 
+A2A_HEAD = ("VM-ADMIT", "A2a", "PASS")
+
+
+def a2a_fields(data: bytes) -> Dict[str, List[str]]:
+    """The fields of ADM's A2a line, its output's LAST line: three positional
+    tokens, exactly `VM-ADMIT A2a PASS`, then key=value tokens. The CHECK rows
+    above it are never read for these fields."""
+    lines = [ln for ln in data.decode("utf-8", "replace").splitlines() if ln.strip()]
+    if not lines:
+        raise Refused("the A2a record is empty")
+    toks = lines[-1].split()
+    if tuple(toks[:3]) != A2A_HEAD:
+        raise Refused("the A2a record's last line is not `VM-ADMIT A2a PASS ...`")
+    return _fields(" ".join(toks[3:]).encode())
+
+
 def _one(fields: Dict[str, List[str]], key: str, what: str) -> str:
     vals = fields.get(key, [])
     if len(vals) != 1:
@@ -150,7 +168,7 @@ def check(go: Dict[str, str], order: str, records: Dict[str, bytes], boot_id: st
             raise Refused("the PSR-RECHECK receipt shows a DIFF")
         if "result PASS" not in lines:
             raise Refused("the PSR-RECHECK receipt does not carry `result PASS`")
-    a2a = _fields(records["a2a"])
+    a2a = a2a_fields(records["a2a"])
     a2a_ctlr = _one(a2a, "ctlr", "A2a")
     if a2a_ctlr == "none":
         raise Refused("the A2a record has ctlr=none: it was taken before CTL-R was admitted; re-run A2a")
