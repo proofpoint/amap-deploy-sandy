@@ -11,7 +11,10 @@ the items against an offline, mounted copy of R. Standard library only.
 
 NET's seal (`seal 208`, G-B4b step 3) runs the items with the spec's sha bound
 in its profile; the patterns and the allow-list feed its absence scan (NET
-r20 §2.5). Every path is resolved one component at a time under DIR with
+r20 §2.5). The shipped patterns list is empty: any literal it named would
+also sit, as text, in this spec inside the deploy checkout on R, and git's
+own bundle signatures are in /usr/bin/git, so either would hit on every
+bake. The bundle directory's absence is asserted by path (SS-02). Every path is resolved one component at a time under DIR with
 O_NOFOLLOW, so a symbolic link anywhere on the way is a FAIL, never followed.
 
 What SEALSPEC does NOT cover, and what does (DS2 d8 §3.1):
@@ -156,9 +159,9 @@ def validate(spec):
                                   or item["min"] < 1 or expect == "none"):
                 raise SpecError(f"{iid}: min must be a positive integer, and not with 'none'")
     patterns = spec["patterns"]
-    if (not isinstance(patterns, list) or not patterns
+    if (not isinstance(patterns, list)
             or not all(isinstance(p, str) and p for p in patterns) or len(set(patterns)) != len(patterns)):
-        raise SpecError("patterns must be a non-empty list of distinct non-empty strings")
+        raise SpecError("patterns must be a list of distinct non-empty strings")
     allowlist = spec["allowlist"]
     if not isinstance(allowlist, list):
         raise SpecError("allowlist must be a list")

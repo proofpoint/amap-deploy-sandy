@@ -43,9 +43,6 @@
     {"id": "SS-20", "glob": "/usr/lib/udev/rules.d/*qemu-guest-agent*", "expect": "file", "min": 1,
      "why": "the agent is started by udev on its virtio port, not by an enablement link (INFERRED: Ubuntu's packaging)"}
   ],
-  "patterns": [
-    "# v2 git bundle\n",
-    "# v3 git bundle\n"
-  ],
+  "patterns": [],
   "allowlist": []
 }
