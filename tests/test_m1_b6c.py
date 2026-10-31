@@ -27,19 +27,22 @@ ART_DIGEST = b.digest(b.sha256(ART))
 STATE_DIR = "/srv/m1-state/router-state"
 RUN_DIR = "/srv/m1-state/run"
 IMAGE = "sha256:" + "d" * 64
-D7_FROM = "generated/d7-m1.json"
 STATEMENT = "A stand-in for the adopted attestation statement."
+D7_FROM = "generated/d7-m1.json"
 
 #: The fixture's invented login and probe names. m1_b6c pins the hub's real,
 #: frozen ones by sha256 (as hub_runtime does); these tests point the pins at
 #: the fixture's values for the module and restore them afterwards.
 FIXTURE_PINS = {"LOGIN_LOCAL_SHA256": "rt", "LOGIN_DOMAIN_SHA256": "logins.internal",
                 "PROBE_DOMAIN_SHA256": "probe-x.internal"}
+#: The statement and D7 path pins are NET's (r3 V1, V2), not the hub's; the tests
+#: point them at the fixture's invented statement and path the same way.
+STATEMENT_PIN = {"STATEMENT_SHA256": STATEMENT, "D7_SOURCE_FROM_SHA256": D7_FROM}
 _saved = {}
 
 
 def setUpModule():
-    for name, value in FIXTURE_PINS.items():
+    for name, value in {**FIXTURE_PINS, **STATEMENT_PIN}.items():
         _saved[name] = getattr(b, name)
         setattr(b, name, hashlib.sha256(value.encode()).hexdigest())
 
@@ -446,16 +449,14 @@ class NetValuesTest(unittest.TestCase):
             with self.subTest(k=k, v=v):
                 self.refuses(lambda d: d["vm1"]["login"].__setitem__(k, v), "vm1: login is not the hub's frozen")
         self.refuses(lambda d: d["vm2"].__setitem__("probe_domain", "probe-y.internal"),
-                     "vm2: probe_domain is not the hub's frozen")
+                     "vm2: probe_domain, the hub's frozen probe domain, is not the pinned value")
         self.refuses(lambda d: d["vm2"].__setitem__("probe_domain", True), "vm2: probe_domain")
 
     def test_the_statement_is_printable_ascii_up_to_400(self):
         for v in ("", "x" * 401, "tab\there", None):
             with self.subTest(v=repr(v)[:12]):
-                self.refuses(lambda d: d["vm1"].__setitem__("statement", v), "vm1: statement")
-        doc = json.loads(json.dumps(self.doc))
-        doc["vm1"]["statement"] = "x" * 400
-        b.net_values(b.receipt_bytes(doc))
+                self.refuses(lambda d: [d[n].__setitem__("statement", v) for n in b.VMS], "vm1: statement")
+        self.assertEqual(len(STATEMENT), len(STATEMENT.encode("ascii")))
 
     def test_fleet_hosts(self):
         cases = ((["m1vm2.internal", "m1vm0.internal"], "sorted, distinct"),
@@ -469,9 +470,100 @@ class NetValuesTest(unittest.TestCase):
 
     def test_d7_source(self):
         for k, v in (("sha256", "A" * 64), ("sha256", "a" * 63), ("commit", "4" * 39), ("commit", 4),
-                     ("from", "/abs/d7.json"), ("from", "../d7.json"), ("from", ".hidden/d7.json"), ("from", "a" * 64 + " ")):
+                     ("from", "/abs/d7.json"), ("from", "../d7.json"), ("from", ".hidden/d7.json"), ("from", "a" * 64 + " "),
+                     ("from", "generated/d7-m2.json"), ("from", "other/d7-m1.json"), ("from", "a" * 64)):
             with self.subTest(k=k, v=v):
                 self.refuses(lambda d: d["vm2"]["d7_source"].__setitem__(k, v), f"vm2: d7_source.{k}")
+
+    def test_own_domain_is_hostname_dot_internal(self):
+        for n, v in (("vm1", "m1vm9.internal"), ("vm2", "m1vm9.internal"), ("vm1", "m1vm1x.internal"),
+                     ("vm2", "m1vm2x.internal")):
+            with self.subTest(n=n, v=v):
+                self.refuses(lambda d: d[n].__setitem__("own_domain", v), f"{n}: own_domain is not hostname")
+
+    def test_the_hostnames_differ(self):
+        def one_host(d):
+            for k in ("vm", "hostname"):
+                d["vm2"][k] = d["vm1"][k]
+            d["vm2"]["own_domain"] = d["vm1"]["own_domain"]
+            d["vm2"]["fleet_hosts"] = ["m1vm9.internal"]
+        self.refuses(one_host, "one hostname for both VMs")
+
+    def test_each_fleet_is_exactly_the_other_vms_own_domain(self):
+        for n, fleet in (("vm1", ["m1vm9.internal"]), ("vm2", ["m1vm0.internal", "m1vm1.internal"]),
+                         ("vm1", ["m1vm0.internal", "m1vm2.internal"])):
+            with self.subTest(n=n, fleet=fleet):
+                self.refuses(lambda d: d[n].__setitem__("fleet_hosts", fleet),
+                             f"for {n}: fleet_hosts is not exactly")
+
+    def test_each_r3_parser_rule_refuses_by_its_id(self):
+        """NET-VALUES-SHAPE r3's rules for net_values(), one break each. C4's
+        statement, login and probe_domain parts are implied by V1 and V3 (each
+        VM is pinned to the same value), so d7_source is C4's own witness."""
+        def one_host(d):
+            for k in ("vm", "hostname", "own_domain"):
+                d["vm2"][k] = d["vm1"][k]
+            d["vm1"]["fleet_hosts"] = d["vm2"]["fleet_hosts"] = ["m1vm9.internal"]
+        cases = {
+            "C1": one_host,
+            "C2": lambda d: d["vm1"].__setitem__("own_domain", "m1vm9.internal"),
+            "C3": lambda d: d["vm2"].__setitem__("fleet_hosts", ["m1vm9.internal"]),
+            "C4": lambda d: d["vm1"]["d7_source"].__setitem__("sha256", "b" * 64),
+            "C5": lambda d: d["vm2"].__setitem__("vm", "m1vm9"),
+            "V1": lambda d: [d[n].__setitem__("statement", STATEMENT + "!") for n in b.VMS],
+            "V2": lambda d: [d[n]["d7_source"].__setitem__("from", "generated/d7-m2.json") for n in b.VMS],
+            "V3": lambda d: [d[n].__setitem__("probe_domain", "probe-y.internal") for n in b.VMS],
+        }
+        for rule, edit in cases.items():
+            with self.subTest(rule=rule):
+                self.refuses(edit, f"\\(r3 {rule}\\)$")
+
+    def test_the_statement_is_g_h3a(self):
+        for v in (" " + STATEMENT, STATEMENT + " "):
+            with self.subTest(v=v):
+                self.refuses(lambda d: [d[n].__setitem__("statement", v) for n in b.VMS], "statement, the adopted G-H3a statement, is not the pinned value")
+        self.refuses(lambda d: [d[n].__setitem__("statement", STATEMENT + "!") for n in b.VMS], "vm1: statement, the adopted G-H3a statement, is not the pinned value \\(r3 V1\\)")
+
+    def test_the_real_statement_pin_is_r3s(self):
+        self.assertEqual(_saved["STATEMENT_SHA256"], "80a96df1686fcf6210e29d551e613d73b7c9e43f33dcda46c9d7d1881de1bef4")
+
+    def test_a_pinned_value_is_never_printed(self):
+        """statement, probe_domain and d7_source.from are private names fixed
+        by sha pins: a refusal, malformed or well-formed, never prints the
+        candidate (nor the expected value, which the parser does not hold)."""
+        cases = {
+            "from, malformed": ("../private-path.json", lambda d, v: [d[n]["d7_source"].__setitem__("from", v) for n in b.VMS]),
+            "from, well-formed": ("private/other-d7.json", lambda d, v: [d[n]["d7_source"].__setitem__("from", v) for n in b.VMS]),
+            "statement, malformed": ("private\ttext", lambda d, v: [d[n].__setitem__("statement", v) for n in b.VMS]),
+            "statement, well-formed": ("private statement text", lambda d, v: [d[n].__setitem__("statement", v) for n in b.VMS]),
+            "probe, malformed": ("private-probe.example.org", lambda d, v: [d[n].__setitem__("probe_domain", v) for n in b.VMS]),
+            "probe, well-formed": ("private-probe.internal", lambda d, v: [d[n].__setitem__("probe_domain", v) for n in b.VMS]),
+        }
+        for name, (v, edit) in cases.items():
+            with self.subTest(name=name):
+                doc = json.loads(json.dumps(self.doc))
+                edit(doc, v)
+                with self.assertRaises(b.Refused) as cm:
+                    b.net_values(b.receipt_bytes(doc))
+                msg = str(cm.exception)
+                self.assertIn("(r3 V", msg)
+                self.assertNotIn("private", msg)
+                self.assertIn("malformed" if "malformed" in name else "is not the pinned value", msg)
+
+    def test_the_real_d7_path_pin_is_r3s(self):
+        self.assertEqual(_saved["D7_SOURCE_FROM_SHA256"], "b92940d660dd16ada8d304fd6e94364a155bd0831532ac37315ec96a067b6ed1")
+
+    def test_the_shared_fields_agree_across_the_vms(self):
+        cases = {"d7_source": lambda d: d["vm2"]["d7_source"].__setitem__("sha256", "b" * 64),
+                 "d7_source ": lambda d: d["vm1"]["d7_source"].__setitem__("commit", "5" * 40)}
+        for k, edit in cases.items():
+            with self.subTest(k=k):
+                self.refuses(edit, f"differ between the VMs in {k.strip()}")
+
+    def test_login_and_probe_are_shared_too(self):
+        """login and probe_domain are pinned, so the pins already make them
+        equal across the VMs; the shared set still names them."""
+        self.assertEqual(set(b.NET_SHARED_KEYS), {"login", "probe_domain", "statement", "d7_source"})
 
     def test_strict_json(self):
         data = b.receipt_bytes(self.doc)
@@ -766,11 +858,18 @@ def _same_as_vm1(key):
     return f
 
 
-def _net(n, key, value):
+def renamed(doc, n, host="m1vm9"):
+    """NET's file with VM `n` renamed throughout (vm, hostname, own_domain,
+    and the other VM's fleet), so it parses but names a VM the manifest does not."""
+    other = b.VMS[1 - b.VMS.index(n)]
+    doc[n].update(vm=host, hostname=host, own_domain=host + ".internal")
+    doc[other]["fleet_hosts"] = [host + ".internal"]
+    return doc
+
+
+def _net_renamed(n):
     def f(parts):
-        doc = net_doc({m: parts["vms"][m]["role"] for m in b.VMS})
-        doc[n][key] = value
-        parts["net_bytes"] = b.receipt_bytes(doc)
+        parts["net_bytes"] = b.receipt_bytes(renamed(net_doc({m: parts["vms"][m]["role"] for m in b.VMS}), n))
     return f
 
 
@@ -788,7 +887,7 @@ def vm_breaks(n):
     breaks it alone."""
     v = ["vms", n]
     return {
-        f"net_values_match_{n}": (_net(n, "own_domain", "other.internal"), None),
+        f"net_values_match_{n}": (_net_renamed(n), None),
         f"manifest_is_receipt_{n}": (None, _edit_vm(n, ["hostname"], "other")),
         f"role_digest_{n}": (_set(v + ["role", "fleet_policy_digest"], "sha256:" + "0" * 64), None),
         f"feature_value_{n}": (_set(v + ["feature", "feature", "min_sender_age_s"], 9), None),
@@ -840,6 +939,20 @@ class PreflightTest(TempCase):
                 pf = build_out(t, mutate, edit, write=False).doc["preflight"]
                 self.assertEqual([k for k, ok in pf.items() if not ok], [key])
 
+    def test_a_manifest_vm_other_than_its_hostname_breaks_net_values_match(self):
+        """NET's file has vm == hostname, so net_values_match is what holds the
+        manifest's vm to its hostname: the manifest grammar alone lets them differ."""
+        for n in b.VMS:
+            with self.subTest(n=n):
+                t = self.t / f"vm-{n}"
+                t.mkdir()
+
+                def vm_only(parts, n=n):
+                    parts["net_bytes"] = b.receipt_bytes(net_doc({m: parts["vms"][m]["role"] for m in b.VMS}))
+                    parts["vms"][n]["role"]["vm"] = parts["vms"][n]["role"]["hostname"] + "x"
+                pf = build_out(t, vm_only, write=False).doc["preflight"]
+                self.assertEqual([k for k, ok in pf.items() if not ok], [f"net_values_match_{n}"])
+
     def test_crossed_roles_break_role_differ_and_vm2s_mapping(self):
         def both_h1(parts):
             parts["vms"]["vm2"]["role"]["role"] = "H1"
@@ -881,6 +994,14 @@ class ReadReceiptTest(TempCase):
                               "H2": doc["vms"]["vm2"]["files"]["router.json"]["sha256"]},
             "manifest_sha256": {"H1": doc["vms"]["vm1"]["role_sha256"], "H2": doc["vms"]["vm2"]["role_sha256"]}})
         self.assertEqual(got["carried_digest"], {"H1": ART_DIGEST, "H2": ART_DIGEST})
+
+    def test_an_empty_net_file_refuses_by_name(self):
+        built = build_out(self.t)
+        (built.out / b.NET_VALUES_NAME).unlink()
+        (built.out / b.NET_VALUES_NAME).write_bytes(b"")
+        rewrite_receipt(built.out, dict(built.doc, net_values_sha256=b.sha256(b"")))
+        with self.assertRaisesRegex(b.Refused, "NET's values file is not JSON"):
+            self.read(built)
 
     def test_a_net_file_net_values_refuses_refuses(self):
         built = build_out(self.t)
@@ -1069,16 +1190,14 @@ class RecomputeTest(TempCase):
             b.read_receipt(str(built.out), built.man, json.dumps(other).encode(), True)
 
     def test_other_net_values_refuse_for_each_vm(self):
-        """NET's file replaced by one whose own_domain for `n` differs, the
-        receipt naming its sha: only net_values_match_<n> can tell."""
+        """NET's file replaced by one that renames VM `n`, the receipt naming
+        its sha: only net_values_match_<n> can tell."""
         for n in b.VMS:
             with self.subTest(n=n):
                 t = self.t / n
                 t.mkdir()
                 built = build_out(t)
-                doc = json.loads((built.out / b.NET_VALUES_NAME).read_bytes())
-                doc[n]["own_domain"] = "other.internal"
-                data = b.receipt_bytes(doc)
+                data = b.receipt_bytes(renamed(json.loads((built.out / b.NET_VALUES_NAME).read_bytes()), n))
                 (built.out / b.NET_VALUES_NAME).unlink()
                 (built.out / b.NET_VALUES_NAME).write_bytes(data)
                 rewrite_receipt(built.out, dict(built.doc, net_values_sha256=b.sha256(data)))

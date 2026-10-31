@@ -29,7 +29,7 @@ module's to check: ADM and D-SEAL own them on the installed copy.
 
 Nothing here renders, installs or runs anything; it refuses by raising
 Refused, with the rule it broke. NET's values file is parsed in its closed
-shape, NET-VALUES-SHAPE r2."""
+shape, NET-VALUES-SHAPE r3, with every rule r3 gives its parser."""
 
 import hashlib
 import json
@@ -59,7 +59,7 @@ DEPLOY_CHECKOUT = "/opt/amap/src/amap-deploy-sandy"
 #: The commit whose ancestry proves the hop pin carries the router's sender-age setting.
 ENROL_COMMIT = "6d104e705974b0f9c90507629f5371755fbe0ca4"
 
-#: NET-VALUES-SHAPE r2's closed key sets.
+#: NET-VALUES-SHAPE r3's closed key sets.
 NET_KEYS = frozenset({"version", *VMS})
 NET_VM_KEYS = frozenset({"vm", "hostname", "own_domain", "login", "probe_domain", "statement", "fleet_hosts",
                          "d7_source"})
@@ -68,6 +68,13 @@ NET_VM_KEYS = frozenset({"vm", "hostname", "own_domain", "login", "probe_domain"
 LOGIN_LOCAL_SHA256 = "74c95604043427f0bee1d0e16bfa53afd537f736ad0073c4cc4e1ccb3a82b5dc"
 LOGIN_DOMAIN_SHA256 = "4a28207acfde319b5b21e4bbf0cec138201f1242e9b966029ae6e9a8122e5889"
 PROBE_DOMAIN_SHA256 = "f40f36185588e8a6292c654f632086d5b204c5d763779ce632bd5138b805af56"
+#: The adopted attestation statement (G-H3a), as its sha256 pin: NET-VALUES-SHAPE r3 V1.
+STATEMENT_SHA256 = "80a96df1686fcf6210e29d551e613d73b7c9e43f33dcda46c9d7d1881de1bef4"
+#: The D7 source's path in NET's repository, as its sha256 pin (of the path's
+#: ASCII bytes): NET-VALUES-SHAPE r3 V2. NET's generator carries the path itself.
+D7_SOURCE_FROM_SHA256 = "b92940d660dd16ada8d304fd6e94364a155bd0831532ac37315ec96a067b6ed1"
+#: The fields that are one value for the fleet, so equal on both VMs.
+NET_SHARED_KEYS = ("login", "probe_domain", "statement", "d7_source")
 #: The fields the pre-flight compares with each role manifest.
 NET_MATCH_KEYS = ("vm", "hostname", "own_domain")
 
@@ -207,6 +214,17 @@ def _int(v: Any, what: str, lo: int = 0, hi: int = MIN_SENDER_AGE_MAX_S) -> int:
 def _match(v: Any, pattern: "re.Pattern[str]", what: str) -> str:
     if type(v) is not str or not pattern.fullmatch(v):
         raise Refused(f"{what} {v!r} is malformed")
+    return v
+
+
+def _pinned(v: Any, pattern: "re.Pattern[str]", pin: str, what: str, rule: str) -> str:
+    """A value fixed by a sha256 pin (of its ASCII bytes): exactly a str in
+    `pattern`'s grammar, whose sha is `pin`. Pinned values are private names,
+    so neither refusal prints the value supplied or the one expected."""
+    if type(v) is not str or not pattern.fullmatch(v):
+        raise Refused(f"{what} is malformed ({rule})")
+    if sha256(v.encode("ascii")) != pin:
+        raise Refused(f"{what} is not the pinned value ({rule})")
     return v
 
 
@@ -364,11 +382,20 @@ def on_manifest_sha256(files: Dict[str, Dict[str, str]]) -> str:
 # --- the parsed inputs ------------------------------------------------------------
 
 def net_values(data: bytes) -> Dict[str, Dict[str, Any]]:
-    """NET's values file under NET-VALUES-SHAPE r2: its bytes exactly
-    canonical(doc) and one LF; the top level closed {version, vm1, vm2},
-    version the int 1; each VM closed, every field typed, vm == hostname,
-    and the login parts and probe domain equal to the hub's pins. Returns
-    {vm1: ..., vm2: ...}, each VM's object as written."""
+    """NET's values file under NET-VALUES-SHAPE r3. Its bytes are exactly
+    canonical(doc) and one LF; the top level is closed {version, vm1, vm2},
+    version the int 1; each VM is closed and every field typed. Then r3's
+    parser rules, each refusal naming its id:
+      C1 the two hostnames differ;
+      C2 own_domain == hostname + ".internal";
+      C3 each fleet_hosts is exactly [the other VM's own_domain];
+      C4 statement, d7_source, login and probe_domain are equal on both VMs;
+      C5 vm == hostname;
+      V1 sha256(statement) is G-H3a's pin;
+      V2 d7_source.from is the frozen D7 path, by its sha256 pin;
+      V3 the login parts and probe_domain equal the hub's pins.
+    r3's E1-E4 are the generator's, proven in NET's receipt, not here.
+    Returns {vm1: ..., vm2: ...}, each VM's object as written."""
     doc = _closed(strict_loads(data, "NET's values file"), NET_KEYS, "NET's values file")
     if data != receipt_bytes(doc):
         raise Refused("NET's values file is not canonical JSON and one LF")
@@ -381,16 +408,19 @@ def net_values(data: bytes) -> Dict[str, Dict[str, Any]]:
         _match(e["vm"], _HOSTNAME, f"{what}: vm")
         _match(e["hostname"], _HOSTNAME, f"{what}: hostname")
         if e["vm"] != e["hostname"]:
-            raise Refused(f"{what}: vm is not hostname")
+            raise Refused(f"{what}: vm is not hostname (r3 C5)")
         own = _match(e["own_domain"], _OWN, f"{what}: own_domain")
+        if own != e["hostname"] + ".internal":
+            raise Refused(f"{what}: own_domain is not hostname + .internal (r3 C2)")
         login = _closed(e["login"], frozenset({"local", "domain"}), f"{what}: login")
         if (type(login["local"]) is not str or type(login["domain"]) is not str
                 or sha256(login["local"].encode()) != LOGIN_LOCAL_SHA256
                 or sha256(login["domain"].encode()) != LOGIN_DOMAIN_SHA256):
-            raise Refused(f"{what}: login is not the hub's frozen login local part and domain")
-        if sha256(_match(e["probe_domain"], _OWN, f"{what}: probe_domain").encode()) != PROBE_DOMAIN_SHA256:
-            raise Refused(f"{what}: probe_domain is not the hub's frozen probe domain")
-        _match(e["statement"], _STATEMENT, f"{what}: statement")
+            raise Refused(f"{what}: login is not the hub's frozen login local part and domain (r3 V3)")
+        _pinned(e["probe_domain"], _OWN, PROBE_DOMAIN_SHA256, f"{what}: probe_domain, the hub's frozen probe domain,",
+                "r3 V3")
+        _pinned(e["statement"], _STATEMENT, STATEMENT_SHA256, f"{what}: statement, the adopted G-H3a statement,",
+                "r3 V1")
         fleet = e["fleet_hosts"]
         if type(fleet) is not list:
             raise Refused(f"{what}: fleet_hosts is not a list")
@@ -401,8 +431,17 @@ def net_values(data: bytes) -> Dict[str, Dict[str, Any]]:
         src = _closed(e["d7_source"], frozenset({"sha256", "commit", "from"}), f"{what}: d7_source")
         _match(src["sha256"], _HEX64, f"{what}: d7_source.sha256")
         _match(src["commit"], _HEX40, f"{what}: d7_source.commit")
-        _match(src["from"], _REPO_PATH, f"{what}: d7_source.from")
+        _pinned(src["from"], _REPO_PATH, D7_SOURCE_FROM_SHA256, f"{what}: d7_source.from, the frozen D7 path,", "r3 V2")
         out[n] = e
+    a, z = (out[n] for n in VMS)
+    if a["hostname"] == z["hostname"]:
+        raise Refused("NET's values name one hostname for both VMs (r3 C1)")
+    for n, other in zip(VMS, reversed(VMS)):
+        if not same(out[n]["fleet_hosts"], [out[other]["own_domain"]]):
+            raise Refused(f"NET's values for {n}: fleet_hosts is not exactly [{other}'s own_domain] (r3 C3)")
+    for k in NET_SHARED_KEYS:
+        if not same(a[k], z[k]):
+            raise Refused(f"NET's values differ between the VMs in {k} (r3 C4)")
     return out
 
 
