@@ -162,34 +162,46 @@ def read_protected(path, uid, mode, mount, limit=1 << 22):
     return data
 
 
+# Characters some line splitter would break a line at, other than "\n".
+_ODD_BREAKS = "\x00\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029"
+
+
 def effective(runner, conf, section, key):
     """The last value of KEY in [SECTION] of `systemd-analyze cat-config
     CONF`, which prints the main file and every drop-in, each under a
     `# /<path>` comment, in the order systemd applies them (form INFERRED
     from systemd's documentation until the native control); None if KEY is
-    never set. Each file starts outside any section, as systemd reads it
-    (Opus followup10 (b)1, Codex). A command failure is Unknown; a continued
-    line inside SECTION, which this reading would not join, is ValueError."""
+    never set. A command failure is Unknown.
+
+    Where this reading and systemd's merge could differ, it raises
+    ValueError, so the row FAILs (controller ruling on followup2: when in
+    doubt, FAIL; exact agreement is the native control's to measure):
+      - a NUL, a lone CR, or another character some splitter breaks lines at;
+      - any non-comment line ending in a backslash, in any section;
+      - any KEY= after a `# /` line and before the next section header.
+        Such a line may be a file boundary or an ordinary comment, so it
+        never sets or resets the section by itself (Codex, Opus followup2)."""
     rc, out = runner(["/usr/bin/systemd-analyze", "cat-config", conf])
     if rc != 0:
         raise Unknown(f"systemd-analyze cat-config {conf}: rc {rc}")
-    value, current = None, None
-    # systemd splits on newlines only; splitlines() would also split on \v, \f, \x85, ...
+    if any(c in out for c in _ODD_BREAKS) or "\r" in out.replace("\r\n", ""):
+        raise ValueError(f"{conf}: a NUL, lone CR or other line-break character")
+    value, current, after_path = None, None, False
     for line in out.split("\n"):
-        line = line.strip()
-        # A comment ("#" or ";") never parses as KEY= or [SECTION]; a "# /"
-        # comment is cat-config's file header.
-        if line.startswith("# /"):
-            current = None  # each file starts outside any section, as systemd reads it
-        elif line.startswith("[") and line.endswith("]"):
-            current = line[1:-1]
-        else:
-            name, sep, val = line.partition("=")
-            if current == section and line.endswith("\\"):
-                raise ValueError(f"{conf}: a continued line in [{section}]")
-            # Outside any section (current None), systemd ignores KEY, and so does this.
-            if sep and name.strip() == key and current == section:
-                value = val.strip()
+        line = line.strip(" \t\r")
+        if line.startswith(("#", ";")):
+            after_path = after_path or line.startswith("# /")
+            continue
+        if line.endswith("\\"):
+            raise ValueError(f"{conf}: a continued line")
+        if line.startswith("[") and line.endswith("]"):
+            current, after_path = line[1:-1], False
+            continue
+        name, sep, val = line.partition("=")
+        if sep and after_path:
+            raise ValueError(f"{conf}: {name.strip()}= after a `# /` line, before any section header")
+        if sep and name.strip() == key and current == section:
+            value = val.strip(" \t")
     return value
 
 

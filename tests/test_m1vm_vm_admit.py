@@ -695,6 +695,9 @@ class Round7Test(AdmCase):
                 # Opus followup10 (b)1-2: each reading below differs from systemd's, or is not volatile.
                 **{name: (lambda tail=tail: self.vm.cmd.update({"cat-config systemd/journald.conf": (0, JOURNAL + tail)}))
                    for name, tail in CAT_CONFIG_BREAKS.items()},
+                **{name: (lambda tail=tail: self.vm.cmd.update(
+                    {"cat-config systemd/journald.conf": (0, JOURNAL_VOLATILE + tail)}))
+                   for name, tail in PATH_COMMENT_BREAKS.items()},
         }.items():
             with self.subTest(name):
                 self.setUp()
@@ -709,6 +712,11 @@ class Round7Test(AdmCase):
         self.vm.cmd["cat-config systemd/journald.conf"] = (
             0, JOURNAL + "\n# /run/systemd/journald.conf.d/zzz.conf\n[Journal]\nStorage=volatile\n")
         self.assertIn("CHECK A1 auto-change-off PASS", self.lines())
+        # Control for PATH_COMMENT_BREAKS: the volatile base alone, and with CRLF line ends, PASSes.
+        for out in (JOURNAL_VOLATILE, JOURNAL_VOLATILE.replace("\n", "\r\n")):
+            self.setUp()
+            self.vm.cmd["cat-config systemd/journald.conf"] = (0, out)
+            self.assertIn("CHECK A1 auto-change-off PASS", self.lines())
         self.setUp()
         self.vm.cmd["cat-config systemd/journald.conf"] = (1, "")
         self.assertIn("CHECK A1 auto-change-off UNKNOWN", self.lines())
@@ -748,7 +756,24 @@ CAT_CONFIG_BREAKS = {
     "headerless later drop-in": "\n# /run/systemd/journald.conf.d/zzz.conf\nStorage=volatile\n",
     "continued line": "X=a\\\nStorage=volatile\n",
     "split only on newline": "X=a\x0bStorage=volatile\n",
+    # Opus followup2 (a)2: a continuation outside [Journal] swallows its header for systemd.
+    "continuation in another section": "[Other]\nX=a\\\n[Journal]\nStorage=volatile\n",
+    "continuation with no =": "[Other]\nfoo\\\n[Journal]\nStorage=volatile\n",
 }
+# After the reviewed volatile, a persistent that systemd may apply but a line
+# split on "\n" alone would hide inside another line, and (Codex followup2) a
+# drop-in whose `# /` line is an ordinary comment inside [Journal].
+PATH_COMMENT_BREAKS = {
+    "a NUL": "[Journal]\nX=1\x00Storage=persistent\n",
+    "a lone CR": "[Journal]\nX=1\rStorage=persistent\n",
+    "a file separator": "[Journal]\nX=1\x1cStorage=persistent\n",
+    "path comment in a section": "# /run/systemd/journald.conf.d/zz.conf\n[Journal]\n# /an-ordinary-path-comment\n"
+                                 "Storage=persistent\n",
+    "indented path comment": "# /run/systemd/journald.conf.d/zz.conf\n[Journal]\n   # /an-ordinary-path-comment\n"
+                             "Storage=persistent\n",
+}
+JOURNAL_VOLATILE = ("# /etc/systemd/journald.conf\n[Journal]\n#Storage=auto\n\n"
+                    "# /etc/systemd/journald.conf.d/m1.conf\n[Journal]\nStorage=volatile\n\n")
 
 
 class PackagesTest(AdmCase):
