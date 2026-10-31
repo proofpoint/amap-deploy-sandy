@@ -5,7 +5,7 @@
   python3 -I -S -B b6.py b6d    --man MAN
   python3 -I -S -B b6.py facts
   python3 -I -S -B b6.py state  --instance-data PATH
-  python3 -I -S -B b6.py seed   --man MAN --seed SEED --dst SANDY_HOME --op OP
+  python3 -I -S -B b6.py seed   --man MAN --seed SEED --dst SANDY_HOME
   python3 -I -S -B b6.py fprint --man MAN --run-dir DIR --deploy CHECKOUT
   python3 -I -S -B b6.py graph
   python3 -I -S -B b6.py egress --profile PROFILE --profile-sha256 HEX --probe NET_PROBE_FILE
@@ -171,15 +171,18 @@ def phase_state(instance_data, runner=run):
     return p
 
 
-def phase_seed(man_path, man, seed, dst, op_name, runner=run):
-    """m1-seed-copy as <op> (LC d8 §2.3), whose uid comes from MAN."""
+def phase_seed(man_path, man, seed, dst, runner=run):
+    """m1-seed-copy as <op> (LC d8 §2.3): MAN's `roles` binds the op role to
+    one account name, and MAN's `accounts` gives that name's uid; no caller
+    names the account (Codex item 6 blocker)."""
     p = Phase("seed")
-    acct = man.get("accounts", {}).get(op_name)
+    op_name = man.get("roles", {}).get("op") if isinstance(man.get("roles"), dict) else None
+    acct = man.get("accounts", {}).get(op_name) if isinstance(op_name, str) else None
     uid = acct.get("uid") if isinstance(acct, dict) else None
     if type(uid) is not int or uid < 1000:
-        p.row("op-uid", False, f"MAN has no account {op_name!r} with a uid >= 1000")
+        p.row("op-uid", False, f"MAN binds no op role to an account with a uid >= 1000 ({op_name!r})")
         return p
-    p.row("op-uid", True, f"{op_name}={uid}")
+    p.row("op-uid", True, f"role op = {op_name} = {uid}")
     rc, out, err = runner(["sudo", "-n", "-u", f"#{uid}", "--", PYTHON, "-I", "-S", "-B", SEED_COPY,
                            "--man", man_path, "--src", seed, "--dst", dst])
     last = out.strip().splitlines()[-1] if out.strip() else ""
@@ -297,8 +300,12 @@ def phase_egress(profile_path, profile_sha, probe_path, runner=run):
         except OSError as exc:
             p.row(which, False, exc.strerror or str(exc))
             continue
-        echoed = [{k: v for k, v in g.items() if k != "ok"} for g in got if isinstance(g, dict)]
-        p.row(f"{which}-echo", len(got) == len(items) and echoed == items, f"{len(got)} result(s) for {len(items)} item(s), in order")
+        shaped = (len(got) == len(items) and all(isinstance(g, dict) and set(g) == PROBE_KEYS | {"ok"}
+                                                 and isinstance(g["ok"], bool) for g in got))
+        echoed = [{k: v for k, v in g.items() if k != "ok"} for g in got] if shaped else None
+        p.row(f"{which}-echo", shaped and echoed == items, f"{len(got)} result(s) for {len(items)} item(s), in order")
+        if not shaped:
+            continue
         for item, g in zip(items, got):
             ok = isinstance(g, dict) and g.get("ok") is want
             p.row(f"{which}:{item['kind']}:{item['addr']}:{item['port']}", ok,
@@ -359,7 +366,7 @@ def phase_graph(runner=run):
 # ------------------------------------------------------------------ the CLI
 
 FLAGS = {"b6d": {"--man"}, "facts": set(), "state": {"--instance-data"},
-         "seed": {"--man", "--seed", "--dst", "--op"}, "fprint": {"--man", "--run-dir", "--deploy"}, "graph": set(),
+         "seed": {"--man", "--seed", "--dst"}, "fprint": {"--man", "--run-dir", "--deploy"}, "graph": set(),
          "egress": {"--profile", "--profile-sha256", "--probe"}}
 
 
@@ -372,11 +379,6 @@ def parse(argv):
         if flag not in FLAGS[argv[0]] or flag in got or not rest:
             raise Usage(f"{argv[0]}: unexpected {flag!r}")
         value = rest.pop(0)
-        if flag == "--op":
-            if not re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", value):
-                raise Usage("--op must be an account name")
-            got[flag] = value
-            continue
         if flag == "--profile-sha256":
             if not re.fullmatch(r"[0-9a-f]{64}", value):
                 raise Usage("--profile-sha256 must be 64 lowercase hex")
@@ -407,7 +409,7 @@ def main(argv, runner=run):
     elif phase == "state":
         p = phase_state(a["--instance-data"], runner)
     elif phase == "seed":
-        p = phase_seed(a["--man"], man, a["--seed"], a["--dst"], a["--op"], runner)
+        p = phase_seed(a["--man"], man, a["--seed"], a["--dst"], runner)
     elif phase == "graph":
         p = phase_graph(runner)
     elif phase == "egress":

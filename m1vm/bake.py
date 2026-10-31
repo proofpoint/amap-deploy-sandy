@@ -487,7 +487,8 @@ def step_man(pin, host, pin_sha):
         f"{UNIT_DIR}/m1-state-check.service", f"{UNIT_DIR}/srv-m1\\x2dstate.mount", f"{UNIT_DIR}/var-lib-docker.mount",
         f"{OPT}/bin/m1-seed-copy", f"{OPT}/bin/m1-state-check"}),
         "checkouts": [f"{SRC}/{n}" for n in sorted(pin["repos"])], "images": refs,
-        "accounts": [pin["accounts"][a]["name"] for a in ACCOUNTS], "builds": builds(pin, host)}
+        "accounts": [pin["accounts"][a]["name"] for a in ACCOUNTS],
+        "roles": {a: pin["accounts"][a]["name"] for a in ACCOUNTS}, "builds": builds(pin, host)}
     host.put("/run/m1-bake/man-plan.json", json.dumps(plan, sort_keys=True) + "\n")
     out = host.run(["python3", "-I", "-S", "-B", f"{SRC}/amap-deploy-sandy/m1vm/man.py", "write",
                     "--plan", "/run/m1-bake/man-plan.json", "--out", MAN_PATH]).strip().splitlines()

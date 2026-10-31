@@ -7,7 +7,7 @@ PLAN is the `man` member of PIN, a JSON object naming what MAN records:
 
   {"pin_sha256": HEX, "seed": "/opt/amap/sandy-seed",
    "files": [ABS, ...], "checkouts": [ABS, ...], "images": [REF, ...],
-   "accounts": [NAME, ...],
+   "accounts": [NAME, ...], "roles": {ROLE: NAME, ...},
    "builds": {NAME: {"commit": HEX40, "tree": HEX40, "image": REF}, ...}}
 
 MAN then holds, in canonical JSON (sorted keys, no spaces):
@@ -19,6 +19,9 @@ MAN then holds, in canonical JSON (sorted keys, no spaces):
   - `images`: {ref: image Id}, from the engine;
   - `packages`: {name: version}, every installed package (dpkg-query -W);
   - `accounts`: {name: {uid, gid, home, groups}} (supplementary groups);
+  - `roles`: {role: name}, exactly the six PIN roles, each naming one of
+    `accounts`, so a reader binds a role (e.g. `op`) to its account
+    unambiguously;
   - `builds`: {name: {commit, tree, image, id}}, each router image's pin, its
     clean export's tree and its engine Id (the per-VM fingerprint check reads
     these; controller ruling (i)).
@@ -45,7 +48,8 @@ import subprocess
 import sys
 
 SCHEMA = "m1vm-man/1"
-PLAN_KEYS = {"pin_sha256", "seed", "files", "checkouts", "images", "accounts", "builds"}
+PLAN_KEYS = {"pin_sha256", "seed", "files", "checkouts", "images", "accounts", "roles", "builds"}
+ROLES = ("op", "m1-admin", "adm", "uid-1", "uid-2", "registry")
 GIT = "/usr/bin/git"
 DOCKER = "/usr/bin/docker"
 DPKG_QUERY = "/usr/bin/dpkg-query"
@@ -249,6 +253,11 @@ def validate_plan(plan):
     for a in plan["accounts"]:
         if not _NAME_RE.match(a):
             raise Usage(f"{a!r}: not an account name")
+    r = plan["roles"]
+    if not (isinstance(r, dict) and set(r) == set(ROLES) and all(isinstance(v, str) and v in plan["accounts"]
+                                                                 for v in r.values())):
+        # Distinct names per role are PIN's rule (bake.validate_pin: distinct uids).
+        raise Usage(f"roles must be exactly {list(ROLES)}, each a name in accounts")
     b = plan["builds"]
     if not isinstance(b, dict) or not b:
         raise Usage("builds must be a non-empty object")
@@ -271,6 +280,7 @@ def build(plan, runner=run):
         "images": {r: image_id(r, runner) for r in plan["images"]},
         "packages": packages(runner),
         "accounts": {a: account(a) for a in plan["accounts"]},
+        "roles": dict(plan["roles"]),
         "builds": {n: dict(rec, id=image_id(rec["image"], runner)) for n, rec in plan["builds"].items()},
     }
 

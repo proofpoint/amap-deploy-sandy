@@ -55,7 +55,9 @@ class Runner:
         raise AssertionError(argv)
 
 
-MAN = {"accounts": {"op": {"uid": 2101, "gid": 2101, "home": "/home/op", "groups": ["docker"]}},
+MAN = {"accounts": {"op": {"uid": 2101, "gid": 2101, "home": "/home/op", "groups": ["docker"]},
+                    "m1adm": {"uid": 2103, "gid": 2103, "home": "/var/lib/m1adm", "groups": []}},
+       "roles": {"op": "op", "adm": "m1adm"},
        "images": {"m1-hop:pin": IMG}, "hdot": [{"name": ".base_build_hash", "mode": "0644",
                                                  "sha256": hashlib.sha256(b"b\n").hexdigest()}],
        "builds": {"router1": {"commit": COMMIT, "tree": "e" * 40, "image": "m1-hop:pin", "id": IMG}}}
@@ -107,26 +109,34 @@ class PhaseTest(unittest.TestCase):
         dst = self.tmp / "sandy"
         dst.mkdir()
         (dst / ".base_build_hash").write_bytes(b"b\n")
-        self.assertTrue(b6.phase_seed("/opt/amap/MAN.json", MAN, "/opt/amap/sandy-seed", str(dst), "op", self.r).ok)
+        self.assertTrue(b6.phase_seed("/opt/amap/MAN.json", MAN, "/opt/amap/sandy-seed", str(dst), self.r).ok)
         (dst / ".base_build_hash").write_bytes(b"changed\n")
-        self.assertFalse(b6.phase_seed("/m", MAN, "/s", str(dst), "op", self.r).ok)
+        self.assertFalse(b6.phase_seed("/m", MAN, "/s", str(dst), self.r).ok)
         (dst / ".base_build_hash").write_bytes(b"b\n")
         r = Runner()
         r.over["{{.Id}}"] = (0, "sha256:" + "2" * 64 + "\n", "")
-        self.assertFalse(b6.phase_seed("/m", MAN, "/s", str(dst), "op", r).ok)
+        self.assertFalse(b6.phase_seed("/m", MAN, "/s", str(dst), r).ok)
         r = Runner()
         r.over[b6.SEED_COPY] = (1, "", "REFUSE x")
-        self.assertFalse(b6.phase_seed("/m", MAN, "/s", str(dst), "op", r).ok)
+        self.assertFalse(b6.phase_seed("/m", MAN, "/s", str(dst), r).ok)
 
     def test_seed_runs_as_op(self):
         dst = self.tmp / "sandy"
         dst.mkdir()
         (dst / ".base_build_hash").write_bytes(b"b\n")
-        b6.phase_seed("/m", MAN, "/s", str(dst), "op", self.r)
+        b6.phase_seed("/m", MAN, "/s", str(dst), self.r)
         argv = [a for a, _ in self.r.calls if b6.SEED_COPY in a][0]
         self.assertEqual(argv[:5], ["sudo", "-n", "-u", "#2101", "--"])
-        self.assertFalse(b6.phase_seed("/m", MAN, "/s", str(dst), "nobody", self.r).ok)
-        self.assertFalse(b6.phase_seed("/m", {"accounts": {"op": {"uid": 0}}}, "/s", str(dst), "op", self.r).ok)
+        # Another valid non-root MAN account is never taken for op: only the role binding names it.
+        other = json.loads(json.dumps(MAN))
+        other["roles"]["op"] = "m1adm"
+        b6.phase_seed("/m", other, "/s", str(dst), self.r)
+        argv = [a for a, _ in self.r.calls if b6.SEED_COPY in a][-1]
+        self.assertEqual(argv[3], "#2103")
+        for bad in ({k: v for k, v in MAN.items() if k != "roles"},
+                    dict(MAN, roles={"op": "nosuch"}),
+                    dict(MAN, accounts={"op": {"uid": 0}}, roles={"op": "op"})):
+            self.assertFalse(b6.phase_seed("/m", bad, "/s", str(dst), self.r).ok)
 
     def test_df_fields_must_be_integers(self):
         r = Runner()
@@ -188,7 +198,7 @@ class PhaseTest(unittest.TestCase):
 class CliTest(unittest.TestCase):
     def test_usage(self):
         for argv in ([], ["frob"], ["b6d"], ["b6d", "--man", "rel"], ["seed", "--man", "/a", "--seed", "/b"],
-                     ["seed", "--man", "/a", "--seed", "/b", "--dst", "/c", "--op", "Bad Name"],
+                     ["seed", "--man", "/a", "--seed", "/b", "--dst", "/c", "--op", "op"],
                      ["facts", "--man", "/a"]):
             with self.subTest(argv):
                 with redirect_stderr(io.StringIO()):
@@ -369,6 +379,11 @@ class EgressTest(unittest.TestCase):
                                                          for i in items]) + "\n", ""),
             "two lines": lambda items: (0, "[]\n[]\n", ""),
             "not a list": lambda items: (0, "{}\n", ""),
+            "extra key": lambda items: (0, json.dumps([dict(i, ok=(i["port"] != 1 and i["kind"] == "tcp"), x=1)
+                                                      for i in items]) + "\n", ""),
+            "ok not bool": lambda items: (0, json.dumps([dict(i, ok=1 if (i["port"] != 1 and i["kind"] == "tcp") else 0)
+                                                        for i in items]) + "\n", ""),
+            "short": lambda items: (0, json.dumps([dict(i, ok=False) for i in items][:-1]) + "\n", ""),
             "extra non-object": lambda items: (0, json.dumps([dict(i, ok=(i["port"] != 1 and i["kind"] == "tcp"))
                                                              for i in items] + [7]) + "\n", ""),
         }

@@ -70,6 +70,7 @@ class ManCase(unittest.TestCase):
         self.plan = {"pin_sha256": "d" * 64, "seed": str(self.seed),
                      "files": [str(self.etc / "sudoers-m1-admin")], "checkouts": [str(self.repo)],
                      "images": ["amap-router-local:m1"], "accounts": [ME],
+                     "roles": {r: ME for r in ("op", "m1-admin", "adm", "uid-1", "uid-2", "registry")},
                      "builds": {"router1": {"commit": HEAD, "tree": TREE, "image": "amap-router-local:m1"}}}
 
     def build(self):
@@ -80,7 +81,8 @@ class BuildTest(ManCase):
     def test_shape(self):
         m = self.build()
         self.assertEqual(sorted(m), ["accounts", "builds", "checkouts", "files", "hdot", "images", "packages",
-                                     "pin_sha256", "schema"])
+                                     "pin_sha256", "roles", "schema"])
+        self.assertEqual(m["roles"]["op"], ME)
         self.assertEqual(m["builds"], {"router1": {"commit": HEAD, "tree": TREE, "image": "amap-router-local:m1",
                                                    "id": IMAGE}})
         self.assertEqual(m["schema"], "m1vm-man/1")
@@ -146,7 +148,9 @@ class FailTest(ManCase):
             "bad image id": (lambda: self.runner.out.update(image="\n"), "no image Id"),
             "duplicate package": (lambda: self.runner.out.update(dpkg="a\t1\na\t2\n"), "not one distinct package"),
             "no packages": (lambda: self.runner.out.update(dpkg=""), "no packages"),
-            "unknown account": (lambda: self.plan.update(accounts=["nosuchaccount9"]), "absent"),
+            "unknown account": (lambda: self.plan.update(accounts=["nosuchaccount9"],
+                                                         roles={r: "nosuchaccount9" for r in self.plan["roles"]}),
+                                "absent"),
         }
         for name, (brk, needle) in breaks.items():
             with self.subTest(name):
@@ -159,6 +163,8 @@ class FailTest(ManCase):
                        lambda p: p.update(seed="rel"), lambda p: p.update(files=[]),
                        lambda p: p.update(files=["/a", "/a"]), lambda p: p.update(accounts=["Bad Name"]),
                        lambda p: p.update(checkouts=["/x/../y"]), lambda p: p.update(builds={}),
+                       lambda p: p["roles"].pop("op"), lambda p: p["roles"].update(op="nosuch"),
+                       lambda p: p["roles"].update(extra=ME),
                        lambda p: p["builds"]["router1"].update(image="other:x"),
                        lambda p: p["builds"]["router1"].update(tree="nope")):
             with self.subTest(mutate):
