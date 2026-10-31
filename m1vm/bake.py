@@ -347,13 +347,21 @@ def step_apt(pin, host):
     have = host.run(["sha256sum", f"{APT_DIR}/ubuntu.sources"]).split()[0]
     if have != pin["apt"]["ubuntu_sources_sha256"]:
         raise BakeFail(f"apt: {APT_DIR}/ubuntu.sources is {have}, not PIN's {pin['apt']['ubuntu_sources_sha256']}")
-    if host.run(["sh", "-c", 'if [ -e "$1" ] || [ -L "$1" ]; then echo present; fi', "m1-legacy",
-                 "/etc/apt/sources.list"]).strip():
-        raise BakeFail("apt: /etc/apt/sources.list is still present")
+    legacy = host.run(["sh", "-c", 'if [ -e "$1" ] || [ -L "$1" ]; then echo present; else echo absent; fi',
+                       "m1-legacy", "/etc/apt/sources.list"])
+    if legacy != "absent\n":
+        raise BakeFail(f"apt: /etc/apt/sources.list is not proven absent (the test printed {legacy!r})")
     resolved = host.run([*APT_ENV, "apt-config", *APT_DIRS, "shell", "L", "Dir::Etc::sourcelist/f",
                          "P", "Dir::Etc::sourceparts/d"])
     if resolved != APT_RESOLVED:
         raise BakeFail(f"apt: apt resolves its sources to {resolved!r}, not {APT_RESOLVED!r}")
+    # APT::Sources::With (a list, so a drop-in appends to it; also under a
+    # Binary:: scope that only the full dump shows) gives install a source no
+    # -o clears (BAKE-APT-CENSUS-R3). apt's keys are case-insensitive.
+    added = [l for l in host.run([*APT_ENV, "apt-config", *APT_DIRS, "dump"]).splitlines()
+             if "sources::with" in l.lower()]
+    if added:
+        raise BakeFail(f"apt: apt's configuration adds sources through APT::Sources::With: {added}")
     # needrestart only lists, never restarts: the guest agent (and anything
     # else) is not restarted under the bake (Opus item 2 B4).
     host.put("/etc/needrestart/conf.d/m1.conf", "$nrconf{restart} = 'l';\n")

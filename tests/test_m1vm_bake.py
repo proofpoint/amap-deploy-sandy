@@ -108,13 +108,16 @@ class FakeHost:
         # prints after its rm -f.
         self.apt_dir = {"m1-snapshot.list": "f", "ubuntu.sources": "f"}
         self.ubuntu_sources_sha = pin["apt"]["ubuntu_sources_sha256"]
-        self.legacy_list = ""
+        self.legacy_list = "absent\n"
         # apt's configuration, resolved as apt does (READ, apt-config(8); the
         # -o order MEASURED by Opus on apt 3.0.3): the defaults, then
         # apt.conf and apt.conf.d (apt_conf), then an inherited APT_CONFIG
         # file (apt_config_env) unless env -u APT_CONFIG removed it, then
         # each command-line -o, last. Every apt-get that resolves to other
-        # paths, or ran under APT_CONFIG, is recorded.
+        # paths, or ran under APT_CONFIG, is recorded, and so is an install
+        # under an APT::Sources::With entry (a list a drop-in appends to, under
+        # any Binary:: scope, case-insensitive; MEASURED by Opus on apt 3.0.3),
+        # which no -o clears. `apt-config dump` prints every key.
         self.apt_conf = {}
         self.apt_config_env = None
         self.unaccounted = []
@@ -136,7 +139,7 @@ class FakeHost:
         def path(k):
             v = cfg[k]
             return v if v.startswith("/") else cfg["Dir::Etc"].rstrip("/") + "/" + v
-        return (cfg["Dir::Etc"], path("Dir::Etc::sourcelist"), path("Dir::Etc::sourceparts").rstrip("/") + "/")
+        return cfg, (cfg["Dir::Etc"], path("Dir::Etc::sourcelist"), path("Dir::Etc::sourceparts").rstrip("/") + "/")
 
     def put(self, path, text, mode="0644", owner="root:root"):
         self.log.append(["<put>", path])
@@ -165,19 +168,23 @@ class FakeHost:
                 raise AssertionError(f"unmodelled find {a[2:]!r}")
             return "".join(f"{t} {n}\0" for n, t in sorted(self.apt_dir.items()))
         if a[:2] == ["sh", "-c"] and a[3:4] == ["m1-legacy"]:
-            if a[2:] != ['if [ -e "$1" ] || [ -L "$1" ]; then echo present; fi', "m1-legacy", "/etc/apt/sources.list"]:
+            if a[2:] != ['if [ -e "$1" ] || [ -L "$1" ]; then echo present; else echo absent; fi', "m1-legacy",
+                        "/etc/apt/sources.list"]:
                 raise AssertionError(f"unmodelled legacy test {a[2:]!r}")
             return self.legacy_list
         if "apt-config" in a or "apt-get" in a:
-            got = self.apt_resolve(a)
+            cfg, got = self.apt_resolve(a)
             if "apt-config" in a:
                 tail, rest = a[a.index("apt-config") + 1:], []
                 while tail:
                     tail = tail[2:] if tail[0] == "-o" else (rest.append(tail[0]) or tail[1:])
+                if rest == ["dump"]:
+                    return "".join(f'{k} "{v}";\n' for k, v in cfg.items())
                 if rest != ["shell", "L", "Dir::Etc::sourcelist/f", "P", "Dir::Etc::sourceparts/d"]:
                     raise AssertionError(f"unmodelled apt-config {a!r}")
                 return f"L='{got[1]}'\nP='{got[2]}'\n"
-            if got != ("/etc/apt/", "/etc/apt/sources.list", f"{bake.APT_DIR}/"):
+            if got != ("/etc/apt/", "/etc/apt/sources.list", f"{bake.APT_DIR}/") or (
+                    "install" in a and any("sources::with" in k.lower() for k in cfg)):
                 self.unaccounted.append(list(a))
         if a == ["sha256sum", f"{bake.APT_DIR}/ubuntu.sources"]:
             return f"{self.ubuntu_sources_sha}  {a[1]}\n"
@@ -708,13 +715,14 @@ class AptCensusTest(BakeCase):
         listed = self.index(lambda a: a[:2] == ["find", bake.APT_DIR])
         hashed = self.index(lambda a: a == ["sha256sum", f"{bake.APT_DIR}/ubuntu.sources"])
         legacy = self.index(lambda a: a[3:4] == ["m1-legacy"])
-        resolved = self.index(lambda a: "apt-config" in a)
+        resolved = self.index(lambda a: "apt-config" in a and "shell" in a)
+        dumped = self.index(lambda a: "apt-config" in a and "dump" in a)
         update = self.index(lambda a: "apt-get" in a and "update" in a)
         first_fetch = min(i for i, a in enumerate(self.host.log) if "apt-get" in a)
         self.assertEqual(update, first_fetch)
         self.assertLess(written, listed)
         self.assertLess(removed, legacy)
-        self.assertLess(max(listed, hashed, legacy, resolved), update)
+        self.assertLess(max(listed, hashed, legacy, resolved, dumped), update)
 
     def test_redirects_are_overridden(self):
         # Each redirect would make apt read a source the census never saw; the
@@ -734,6 +742,21 @@ class AptCensusTest(BakeCase):
                 self.assertTrue(any("install" in a for a in self.fetches()))
                 self.assertEqual(self.host.unaccounted, [])
                 self.assertEqual(self.host.under_apt_config, [])
+
+    def test_sources_with_is_refused_before_fetch(self):
+        # A drop-in adds a source for install that no -o clears and the shell
+        # assert does not show (BAKE-APT-CENSUS-R3; MEASURED by Opus on apt 3.0.3).
+        for name, key in {"global": "APT::Sources::With::",
+                          "Binary::apt-get scope": "Binary::apt-get::APT::Sources::With::",
+                          "another case": "apt::sources::WITH::"}.items():
+            with self.subTest(name):
+                self.setUp()
+                self.host.apt_conf[key] = "/var/lib/other/Packages"
+                with self.assertRaises(bake.BakeFail) as cm:
+                    self.run_bake()
+                self.assertIn("apt: apt's configuration adds sources through APT::Sources::With", str(cm.exception))
+                self.assertIn(key, str(cm.exception))
+                self.assertEqual(self.fetches(), [])
 
     def test_resolution_other_than_the_census_paths_is_refused_before_fetch(self):
         for name, out in {"another list": "L='/etc/apt/other.list'\nP='/etc/apt/sources.list.d/'\n",
@@ -760,7 +783,12 @@ class AptCensusTest(BakeCase):
             "ubuntu.sources changed": (lambda h: setattr(h, "ubuntu_sources_sha", "6" * 64),
                                        "ubuntu.sources is " + "6" * 64),
             "legacy list left": (lambda h: setattr(h, "legacy_list", "present\n"),
-                                 "/etc/apt/sources.list is still present"),
+                                 "/etc/apt/sources.list is not proven absent"),
+            # An sh that errs prints nothing; only "absent" proves the list gone (R3).
+            "legacy test printed nothing": (lambda h: setattr(h, "legacy_list", ""),
+                                            "/etc/apt/sources.list is not proven absent"),
+            "legacy test printed more": (lambda h: setattr(h, "legacy_list", "absent\nx\n"),
+                                         "/etc/apt/sources.list is not proven absent"),
         }
         for name, (brk, needle) in breaks.items():
             with self.subTest(name):
