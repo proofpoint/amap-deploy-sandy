@@ -73,7 +73,8 @@ RUN_SH = "/opt/amap/src/amap-router-local-hop/docker/run.sh"
 #: as `role=`, carrying the start's values.
 ROLE_MANIFEST = "/srv/m1-state/sandy/features/amap/m1-role.json"
 ROLE_SCHEMA = "amap-m1-role/1"
-ROLE_KEYS = frozenset({"schema", "role", "vm", "hostname", "fd", "own_domain", "ids", "units", "start"})
+ROLE_KEYS = frozenset({"schema", "role", "vm", "hostname", "fd", "own_domain", "ids", "units",
+                       "fleet_policy_digest", "start"})
 START_KEYS = frozenset({"uid_1", "group_add", "config", "image", "name"})
 ROLE_MODE = 0o444
 _IMAGE_ID = re.compile(r"sha256:[0-9a-f]{64}")
