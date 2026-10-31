@@ -3747,9 +3747,12 @@ def sibling_diff(existing: Any, rendered: Dict[str, Any]) -> List[str]:
                 if not same:
                     out.append(f"~ {key}[{slug}] {h!r} -> {w!r}")
             continue
-        if have != want:
+        if have != want or type(have) is not type(want):
             if have is None:
                 out.append(f"+ {key}: {want!r}")
+            elif want is None and key in SENDER_AGE_KEYS:
+                out.append(f"- {key}: {have!r} (not rendered for this host's router: only the hop pin's router "
+                           f"reads it, and the primary pin's refuses it)")
             elif want is None:
                 out.append(f"- {key}: {have!r} (the policy no longer declares it)")
             else:
@@ -3765,7 +3768,8 @@ SENDER_AGE_KEYS = (fp.MIN_SENDER_AGE_KEY,)
 def sender_age_key(policy: Dict[str, Any]) -> Dict[str, Any]:
     """The hop router's top-level `min_sender_age_s`, from the policy's own
     key: the sender-age floor in seconds, which that router enforces (its
-    loader takes an int from 0 to one year and refuses a bool). It is
+    loader takes exactly an int, never a bool or an int subclass, from 0 to
+    one year). It is
     rendered only into a configuration the hop pin's loader validates; the
     primary pin's router has no such key and would refuse it. Absent in the
     policy is absent here: `policy_checks` decides absence, and the router's
@@ -3773,7 +3777,7 @@ def sender_age_key(policy: Dict[str, Any]) -> Dict[str, Any]:
     if fp.MIN_SENDER_AGE_KEY not in policy:
         return {}
     age = policy[fp.MIN_SENDER_AGE_KEY]
-    if isinstance(age, bool) or not isinstance(age, int) or not 0 <= age <= fp.MIN_SENDER_AGE_MAX_S:
+    if type(age) is not int or not 0 <= age <= fp.MIN_SENDER_AGE_MAX_S:
         raise ProvisionError(f"the policy's {fp.MIN_SENDER_AGE_KEY!r} is {age!r}, not a whole number of seconds "
                              f"from 0 to {fp.MIN_SENDER_AGE_MAX_S}")
     return {fp.MIN_SENDER_AGE_KEY: age}
@@ -3797,9 +3801,13 @@ def hop_router_keys(policy: Dict[str, Any], state_dir: Path, overlay: Optional[P
         return None, [] if decommission else hp.state_problems(str(state_dir), None)
     try:
         spec = hsu.load_spec(hsu.read_spec(None, overlay))
-        keys = dict(hp.hop_keys(spec, link, policy.get(fp.FLEET_DOMAIN_KEY)), **sender_age_key(policy))
-    except (ValueError, ProvisionError) as e:     # SpecError, HopRenderError; a malformed sender age
+        keys = hp.hop_keys(spec, link, policy.get(fp.FLEET_DOMAIN_KEY))
+    except ValueError as e:     # SpecError and HopRenderError
         return None, [f"a hop host (the policy has {hp.HOP_LINK_KEY}): {e}"]
+    try:
+        keys = dict(keys, **sender_age_key(policy))
+    except ProvisionError as e:
+        return None, [str(e)]
     if spec_out is not None:
         spec_out.append(spec)
     problems = hp.plugin_problems(keys["transport_plugin"]["path"], keys["transport_plugin"]["sha256"])

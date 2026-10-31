@@ -52,7 +52,9 @@ class SenderAgeKeyTest(unittest.TestCase):
                     prov.sender_age_key({KEY: age})
 
     def test_other_shapes_are_refused(self):
-        for age in (-1, fp.MIN_SENDER_AGE_MAX_S + 1, 1.0, "0", None):
+        class Seconds(int):
+            pass
+        for age in (-1, fp.MIN_SENDER_AGE_MAX_S + 1, 1.0, "0", None, Seconds(0)):
             with self.subTest(age=age):
                 with self.assertRaises(prov.ProvisionError):
                     prov.sender_age_key({KEY: age})
@@ -116,6 +118,16 @@ class HopKeysTest(unittest.TestCase):
         keys, problems = prov.hop_router_keys({KEY: False}, Path("/x/state"), None)
         self.assertIsNone(keys)
         self.assertTrue(problems and KEY in problems[0], problems)
+        self.assertNotIn("a hop host", problems[0], "the sender age is not a host-setup problem")
+
+    def test_a_spec_problem_is_still_a_hop_host_problem(self):
+        def refuse(raw):
+            raise ValueError("no hub section")
+        self.addCleanup(setattr, prov.hsu, "load_spec", prov.hsu.load_spec)
+        prov.hsu.load_spec = refuse
+        keys, problems = prov.hop_router_keys({KEY: 0}, Path("/x/state"), None)
+        self.assertIsNone(keys)
+        self.assertEqual(problems, [f"a hop host (the policy has {hp.HOP_LINK_KEY}): no hub section"])
 
 
 class HopLoaderTest(unittest.TestCase):
@@ -236,6 +248,28 @@ class VerifyTest(unittest.TestCase):
         policy = {hp.REGISTRY_POLICY_KEY: True, KEY: 0}
         got = self.verify(policy, dict(self.base, registry_dir=str(self.reg), **{KEY: 86400}))
         self.assertTrue(any(f"~ {KEY} 86400 -> 0" in g for g in got), got)
+
+    def test_a_key_on_disk_that_is_not_rendered_is_named(self):
+        got = self.verify({hp.REGISTRY_POLICY_KEY: True},
+                          dict(self.base, registry_dir=str(self.reg), **{KEY: 0}))
+        self.assertTrue(any(f"- {KEY}: 0 (not rendered for this host's router" in g for g in got), got)
+
+    def test_a_primary_router_host_with_the_key_on_disk_is_drift_by_name(self):
+        """The policy declares the key, but a primary-pin host renders it
+        nowhere: a file that carries it is drift, named, not a key the
+        router refuses unseen."""
+        got = self.verify({KEY: 0}, dict(self.base, **{KEY: 0}))
+        self.assertTrue(any(f"- {KEY}: 0 (not rendered for this host's router" in g for g in got), got)
+        self.assertFalse(any("not a key the router reads" in g for g in got), got)
+
+    def test_a_bool_or_float_on_disk_is_not_the_int_rendered(self):
+        policy = {hp.REGISTRY_POLICY_KEY: True, KEY: 0}
+        for on_disk in (False, 0.0):
+            with self.subTest(on_disk=on_disk):
+                got = self.verify(policy, dict(self.base, registry_dir=str(self.reg), **{KEY: on_disk}))
+                self.assertTrue(any(f"~ {KEY} {on_disk!r} -> 0" in g for g in got), got)
+        got = prov.sibling_diff({KEY: True}, {KEY: 1})
+        self.assertEqual(got, [f"~ {KEY} True -> 1"])
 
     def test_the_key_is_not_called_unknown_to_the_router(self):
         got = prov.sibling_diff(dict(self.base, **{KEY: 0}), dict(self.base, **{KEY: 0}))
