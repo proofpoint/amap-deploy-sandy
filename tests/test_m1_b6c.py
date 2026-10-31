@@ -438,3 +438,41 @@ class PreflightTest(unittest.TestCase):
                                               "role": b.parse_role_manifest(b.canonical(role_doc(n))),
                                               "router_age": 0,
                                               "feature": (0, doc["vms"][n]["fd"])} for n in b.VMS})["hop_pin_has_enrol"])
+
+
+class ReadPastNetTest(unittest.TestCase):
+    """With NET's step stood in (net_values replaced, restored after each
+    test), a correct OUT returns HAR-PFV's projection, and a stored all-true
+    pre-flight that the inputs do not reproduce refuses."""
+
+    def setUp(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        self.t = Path(os.path.realpath(td.name))
+        self.addCleanup(setattr, b, "net_values", b.net_values)
+        b.net_values = lambda data: NET
+        self.vectors = VECTORS.read_bytes()
+
+    def test_a_correct_out_returns_the_projection(self):
+        out, man, doc = build_out(self.t)
+        got = b.read_receipt(str(out), man, self.vectors, True)
+        self.assertEqual(got["projection"], {
+            "result": "PASS", "artifact_sha256": doc["fleet_artifact"]["sha256"],
+            "render_sha256": {"H1": doc["vms"]["vm1"]["files"]["router.json"]["sha256"],
+                              "H2": doc["vms"]["vm2"]["files"]["router.json"]["sha256"]},
+            "manifest_sha256": {"H1": doc["vms"]["vm1"]["role_sha256"], "H2": doc["vms"]["vm2"]["role_sha256"]}})
+        self.assertEqual(got["carried_digest"], {"H1": ART_DIGEST, "H2": ART_DIGEST})
+
+    def test_an_unreproduced_preflight_refuses(self):
+        out, man, _ = build_out(self.t)
+        with self.assertRaisesRegex(b.Refused, "recomputed pre-flight .*hop_pin_has_enrol"):
+            b.read_receipt(str(out), man, self.vectors, False)
+
+    def test_other_vectors_refuse(self):
+        out, man, _ = build_out(self.t)
+        other = json.loads(VECTORS.read_text())
+        for c in other["cases"]:
+            if c["min_sender_age_s"] == 0:
+                c["digest"] = "sha256:" + "0" * 64
+        with self.assertRaisesRegex(b.Refused, "artifact_known_answer"):
+            b.read_receipt(str(out), man, json.dumps(other).encode(), True)
