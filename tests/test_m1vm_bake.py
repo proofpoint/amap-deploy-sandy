@@ -122,6 +122,7 @@ class FakeHost:
         self.apt_config_env = None
         self.unaccounted = []
         self.under_apt_config = []
+        self.apt_dump_seen = []
 
     def apt_resolve(self, a):
         prog = next(i for i, x in enumerate(a) if x in ("apt-get", "apt-config"))
@@ -179,7 +180,8 @@ class FakeHost:
                 while tail:
                     tail = tail[2:] if tail[0] == "-o" else (rest.append(tail[0]) or tail[1:])
                 if rest == ["dump"]:
-                    return "".join(f'{k} "{v}";\n' for k, v in cfg.items())
+                    self.apt_dump_seen = [f'{k} "{v}";' for k, v in cfg.items()]
+                    return "".join(f"{l}\n" for l in self.apt_dump_seen)
                 if rest != ["shell", "L", "Dir::Etc::sourcelist/f", "P", "Dir::Etc::sourceparts/d"]:
                     raise AssertionError(f"unmodelled apt-config {a!r}")
                 return f"L='{got[1]}'\nP='{got[2]}'\n"
@@ -757,6 +759,29 @@ class AptCensusTest(BakeCase):
                 self.assertIn("apt: apt's configuration adds sources through APT::Sources::With", str(cm.exception))
                 self.assertIn(key, str(cm.exception))
                 self.assertEqual(self.fetches(), [])
+
+    def test_dump_that_does_not_show_the_bindings_is_refused_before_fetch(self):
+        # An empty or partial dump proves nothing about APT::Sources::With (Codex r3 AMEND).
+        bound = ['Dir::Etc "/etc/apt/";', 'Dir::Etc::sourcelist "/etc/apt/sources.list";',
+                 f'Dir::Etc::sourceparts "{bake.APT_DIR}/";']
+        for name, out in {"empty": "", "whitespace only": " \n\t\n",
+                          "one binding missing": "\n".join(bound[:2]) + "\n",
+                          "binding with another value": "\n".join(bound[:2] + ['Dir::Etc::sourceparts "/var/lib/other.d/";']) + "\n",
+                          }.items():
+            with self.subTest(name):
+                self.setUp()
+                self.host.over["apt-config .* dump$"] = out
+                with self.assertRaises(bake.BakeFail) as cm:
+                    self.run_bake()
+                self.assertIn("apt: apt-config dump does not show the command-line bindings", str(cm.exception))
+                self.assertEqual(self.fetches(), [])
+
+    def test_dump_bindings_match_measured_apt(self):
+        # MEASURED on apt 3.0.3 (arm64): `apt-config <APT_DIRS> dump` prints these three lines.
+        self.run_bake()
+        self.assertEqual(sorted(l for l in self.host.apt_dump_seen if l.startswith("Dir::Etc")),
+                         ['Dir::Etc "/etc/apt/";', 'Dir::Etc::sourcelist "/etc/apt/sources.list";',
+                          'Dir::Etc::sourceparts "/etc/apt/sources.list.d/";'])
 
     def test_resolution_other_than_the_census_paths_is_refused_before_fetch(self):
         for name, out in {"another list": "L='/etc/apt/other.list'\nP='/etc/apt/sources.list.d/'\n",

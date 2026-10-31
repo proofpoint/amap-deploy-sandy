@@ -357,9 +357,14 @@ def step_apt(pin, host):
         raise BakeFail(f"apt: apt resolves its sources to {resolved!r}, not {APT_RESOLVED!r}")
     # APT::Sources::With (a list, so a drop-in appends to it; also under a
     # Binary:: scope that only the full dump shows) gives install a source no
-    # -o clears (BAKE-APT-CENSUS-R3). apt's keys are case-insensitive.
-    added = [l for l in host.run([*APT_ENV, "apt-config", *APT_DIRS, "dump"]).splitlines()
-             if "sources::with" in l.lower()]
+    # -o clears (BAKE-APT-CENSUS-R3). apt's keys are case-insensitive. The dump
+    # proves it enumerated the configuration by showing APT_DIRS' own bindings,
+    # as `<key> "<value>";` lines (MEASURED, apt 3.0.3), so an empty dump fails.
+    dump = host.run([*APT_ENV, "apt-config", *APT_DIRS, "dump"]).splitlines()
+    unbound = sorted({f'{k} "{v}";' for k, v in (o.split("=", 1) for o in APT_DIRS[1::2])} - set(dump))
+    if unbound:
+        raise BakeFail(f"apt: apt-config dump does not show the command-line bindings {unbound}")
+    added = [l for l in dump if "sources::with" in l.lower()]
     if added:
         raise BakeFail(f"apt: apt's configuration adds sources through APT::Sources::With: {added}")
     # needrestart only lists, never restarts: the guest agent (and anything
