@@ -71,11 +71,14 @@ class Vm:
         (r / "proc/sys/kernel/random").mkdir(parents=True)
         (r / "proc/sys/kernel/random/boot_id").write_text(BOOT + "\n")
         dev = os.stat(r).st_dev
-        (r / "proc/self").mkdir(parents=True)
-        (r / "proc/self/mountinfo").write_text(
+        (r / f"proc/{os.getpid()}").mkdir(parents=True)
+        (r / f"proc/{os.getpid()}/mountinfo").write_text(
             f"1 0 {os.major(dev)}:{os.minor(dev)} / / rw - ext4 /dev/sda1 rw\n"
             f"9 1 {os.major(dev)}:{os.minor(dev)} / /srv/m1-state rw - ext4 /dev/sdc rw\n")
         (r / "proc/1/fd").mkdir(parents=True)
+        (r / "dev/virtio-ports").mkdir(parents=True)
+        (r / "dev/vport2p1").write_text("")
+        os.symlink("../vport2p1", r / "dev/virtio-ports/org.qemu.guest_agent.0")
         os.symlink("/dev/null", r / "proc/1/fd/0")
         sandy = r / "srv/m1-state/sandy"
         sandy.mkdir(parents=True)
@@ -241,6 +244,22 @@ class BreakTest(AdmCase):
                 self.assertNotIn(" PASS host=", lines[-1])
                 self.assertIn(name, self.failing(), lines)
 
+    def test_absent_alias_is_never_pass(self):
+        # No alias (agent=0 applied, or never present): UNKNOWN, not PASS.
+        (self.vm.root / "dev/virtio-ports/org.qemu.guest_agent.0").unlink()
+        _, lines = self.admit()
+        self.assertIn("CHECK A1 agent-sealed UNKNOWN", "\n".join(lines))
+
+    def test_absent_alias_with_a_surviving_fd_fails(self):
+        (self.vm.root / "dev/virtio-ports/org.qemu.guest_agent.0").unlink()
+        # The alias is gone, but a process still holds the resolved device.
+        os.symlink("/dev/vport2p1", self.vm.root / "proc/1/fd/4")
+        real_stat = os.stat
+        with mock.patch.object(vm_admit.os, "stat", lambda p, *a, **k: real_stat(p, *a, **k)
+                               if not str(p).endswith("/proc/1/fd/4") else real_stat(self.vm.root / "dev/vport2p1")):
+            _, lines = self.admit()
+        self.assertIn("CHECK A1 agent-sealed FAIL the agent port is held by pid(s) ['1']", "\n".join(lines))
+
     def test_man_sha_must_match(self):
         self.assertEqual(self.failing(man_sha256="9" * 64), ["man"])
 
@@ -256,12 +275,8 @@ class BreakTest(AdmCase):
             "agent active": (lambda: self.vm.cmd.update({"qemu-guest-agent.service":
                                                          (0, "ActiveState=active\nUnitFileState=masked\n")}),
                              "agent-sealed"),
-            "agent port held": (lambda: ((self.vm.root / "dev/virtio-ports").mkdir(parents=True),
-                                         (self.vm.root / "dev/vport2p1").write_text(""),
-                                         os.symlink("../vport2p1", self.vm.root / "dev/virtio-ports/org.qemu.guest_agent.0"),
-                                         # /proc shows the RESOLVED object, never the alias
-                                         os.symlink(self.vm.root / "dev/vport2p1", self.vm.root / "proc/1/fd/3")),
-                                "agent-sealed"),
+            "agent port held": (lambda: os.symlink(self.vm.root / "dev/vport2p1", self.vm.root / "proc/1/fd/3"),
+                                "agent-sealed"),  # /proc shows the RESOLVED object, never the alias
             "op sandy home on R": (lambda: (self.vm.root / "home/op/.sandy").mkdir(), "op-sandy-absent"),
             "docker not D": (lambda: self.vm.cmd.update({"--target /var/lib/docker": (0, STATE_UUID + "\n")}),
                              "mounts"),
@@ -342,6 +357,47 @@ class StdinTest(unittest.TestCase):
         self.assertEqual(r.returncode, 2, r.stdout)
 
 
+class RealProcTest(unittest.TestCase):
+    """read_proc against THIS machine's real /proc (read-only), where
+    pseudo-files report size 0 and /proc/self is a link (Opus round5)."""
+
+    def test_mountinfo_and_boot_id_are_read(self):
+        self.assertEqual(vm_admit.ROOT, "/")
+        info = vm_admit.read_proc(f"{os.getpid()}/mountinfo")
+        self.assertTrue(info.strip(), "a real mountinfo is never empty")
+        devs = vm_admit.mount_devices()
+        self.assertIn("/", devs)
+        bid = vm_admit.read_proc("sys/kernel/random/boot_id", 64).decode().strip()
+        self.assertRegex(bid, r"\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z")
+
+    def test_admission_reads_the_real_boot_id(self):
+        bid = vm_admit.Admission({"phase": "A1"}).boot_id()
+        self.assertRegex(bid, r"\A[0-9a-f-]{36}\Z")
+
+    def test_cap(self):
+        with self.assertRaises(OSError):
+            vm_admit.read_proc(f"{os.getpid()}/mountinfo", limit=8)
+
+    def test_link_as_last_component_refused(self):
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d)
+        (d / "proc/1").mkdir(parents=True)
+        (d / "real").write_text("x")
+        os.symlink(d / "real", d / "proc/1/mountinfo")
+        with mock.patch.object(vm_admit, "ROOT", str(d)):
+            with self.assertRaises(OSError):
+                vm_admit.read_proc("1/mountinfo")
+
+    def test_proc_self_is_never_followed(self):
+        with self.assertRaises(OSError):
+            vm_admit.read_proc("self/mountinfo")
+
+    def test_read_regular_would_refuse_a_pseudo_file(self):
+        # The reason read_proc exists: the size-0 check rejects /proc files.
+        with self.assertRaises(OSError):
+            vm_admit.read_regular(f"/proc/{os.getpid()}/mountinfo")
+
+
 class ReaderTest(unittest.TestCase):
     """read_regular: to EOF through short reads; a change while read fails."""
 
@@ -413,13 +469,13 @@ class PolicyTest(AdmCase):
         self.assertIn("accounts", self.failing(man_sha256=sha))
 
     def test_hdot_on_the_wrong_filesystem(self):
-        (self.vm.root / "proc/self/mountinfo").write_text("1 0 999:999 / / rw - ext4 /dev/sda1 rw\n"
+        (self.vm.root / f"proc/{os.getpid()}/mountinfo").write_text("1 0 999:999 / / rw - ext4 /dev/sda1 rw\n"
                                                           "9 1 999:998 / /srv/m1-state rw - ext4 /dev/sdc rw\n")
         self.assertIn("hdot", self.failing("A2b"))
 
     def test_mountinfo_without_the_state_mount_is_unknown(self):
         dev = os.stat(self.vm.root).st_dev
-        (self.vm.root / "proc/self/mountinfo").write_text(f"1 0 {os.major(dev)}:{os.minor(dev)} / / rw - ext4 /dev/sda1 rw\n")
+        (self.vm.root / f"proc/{os.getpid()}/mountinfo").write_text(f"1 0 {os.major(dev)}:{os.minor(dev)} / / rw - ext4 /dev/sda1 rw\n")
         _, lines = self.admit("A2b")
         self.assertIn("CHECK A2b hdot UNKNOWN", "\n".join(lines))
 

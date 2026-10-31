@@ -96,10 +96,40 @@ def read_regular(path, limit=1 << 22):
         os.close(ffd)
 
 
+def read_proc(rel, limit=1 << 20):
+    """A /proc pseudo-file, PROC-relative: walked from ROOT/proc with
+    O_NOFOLLOW (so /proc/self, a link, is never used: callers name their own
+    pid), read to EOF under LIMIT. Pseudo-files report size 0, so there is
+    no size comparison (Opus round5, MEASURED on a real kernel)."""
+    parts = ["proc"] + [p for p in rel.split("/") if p]
+    fd = os.open(ROOT, _DIR_FLAGS)
+    try:
+        for part in parts[:-1]:
+            nfd = os.open(part, _DIR_FLAGS, dir_fd=fd)
+            os.close(fd)
+            fd = nfd
+        ffd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
+    finally:
+        os.close(fd)
+    try:
+        chunks, total = [], 0
+        while True:
+            chunk = os.read(ffd, 65536)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > limit:
+                raise OSError(errno.EFBIG, f"/proc/{rel}: larger than the bound")
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(ffd)
+
+
 def mount_devices():
     """{mountpoint: (major, minor)} from the kernel's mountinfo; the LAST
     entry for a mountpoint wins, as the kernel resolves it."""
-    data, _ = read_regular("/proc/self/mountinfo", 1 << 20)
+    data = read_proc(f"{os.getpid()}/mountinfo")
     out = {}
     for line in data.decode("utf-8", "replace").splitlines():
         f = line.split()
@@ -202,7 +232,7 @@ class Admission:
     # -- A1: identity and accounts ------------------------------------------
 
     def boot_id(self):
-        data, _ = read_regular(BOOT_ID, 64)
+        data = read_proc("sys/kernel/random/boot_id", 64)
         bid = data.decode("ascii").strip()
         if not _UUID.match(bid):
             raise Unknown("boot_id is not a lowercase UUID")
@@ -316,9 +346,13 @@ class Admission:
         try:
             port = os.stat(os.path.join(ROOT, AGENT_PORT.lstrip("/")))
         except FileNotFoundError:
-            return True, "masked to /dev/null, inactive, and the port device is gone"
+            port = None
 
-        def same(st):
+        def same(st, link):
+            if port is None:
+                # No alias to compare against: any open virtio port device is
+                # suspect (its resolved name is /dev/vport<N>p<M>; INFERRED).
+                return re.fullmatch(r"/dev/vport[0-9]+p[0-9]+", link) is not None
             if stat.S_ISCHR(port.st_mode):
                 return stat.S_ISCHR(st.st_mode) and st.st_rdev == port.st_rdev
             return (st.st_dev, st.st_ino) == (port.st_dev, port.st_ino)
@@ -330,13 +364,18 @@ class Admission:
             except OSError:
                 continue
             for fd in fds:
+                path = f"{proc}/{pid}/fd/{fd}"
                 try:
-                    if same(os.stat(f"{proc}/{pid}/fd/{fd}")):
+                    if same(os.stat(path), os.readlink(path)):
                         holders.append(pid)
                 except OSError:
                     continue
         if holders:
-            return False, f"{AGENT_PORT} held by pid(s) {sorted(set(holders))}"
+            return False, f"the agent port is held by pid(s) {sorted(set(holders))}"
+        if port is None:
+            # A missing alias does not prove no process holds the device (Codex
+            # round5): without an identity to compare, the row cannot PASS.
+            raise Unknown(f"{AGENT_PORT} absent: no device identity to prove the port unheld")
         return True, "masked to /dev/null, inactive, port unheld"
 
     def check_op_sandy(self):
