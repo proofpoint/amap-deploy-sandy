@@ -462,12 +462,42 @@ class Admission:
         states = [l.partition("=")[2] for l in out.splitlines() if l.startswith("UnitFileState=")]
         if rc != 0 or states != ["masked"] * len(QUIET_MASK):
             return False, f"{list(QUIET_MASK)}: {states}"
-        installed = []
+        # Purged means unknown to dpkg, or known only as not-installed with no
+        # config files left (Codex round7 1).
+        present = []
         for pkg in QUIET_REMOVE:
             rc, out = self.runner(["/usr/bin/dpkg-query", "-W", "-f", "${Status}", pkg])
-            if rc == 0 and out.strip().endswith(" installed"):
-                installed.append(pkg)
-        return not installed, f"masked: {len(QUIET_MASK)}; installed of {list(QUIET_REMOVE)}: {installed}"
+            if rc == 0 and out.strip() not in ("unknown ok not-installed", "purge ok not-installed"):
+                present.append(f"{pkg}={out.strip()!r}")
+        if present:
+            return False, f"not purged: {present}"
+        # DS2 d8 §1.1 step 2's other three: coredumps not stored, the journal
+        # volatile, swap off.
+        for path, text in (("/etc/systemd/coredump.conf.d/m1.conf", "[Coredump]\nStorage=none\n"),
+                           ("/etc/systemd/journald.conf.d/m1.conf", "[Journal]\nStorage=volatile\n")):
+            if read_protected(path, 0, 0o644, "/") != text.encode("utf-8"):
+                return False, f"{path}: not the reviewed setting"
+        swaps = read_proc("swaps").decode("utf-8", "replace").splitlines()
+        if len(swaps) != 1 or not swaps[0].startswith("Filename"):
+            return False, f"swap is on: {swaps[1:3]}"
+        return True, f"{len(QUIET_MASK)} masked; {list(QUIET_REMOVE)} purged; coredump none; journal volatile; no swap"
+
+    def check_packages(self):
+        """Every installed package and version exactly MAN's (A1)."""
+        _, man = self.man()
+        rc, out = self.runner(["/usr/bin/dpkg-query", "-W", "-f", "${db:Status-Abbrev}\t${Package}\t${Version}\n"])
+        if rc != 0:
+            raise Unknown("dpkg-query failed")
+        have = {}
+        for line in out.splitlines():
+            f = line.split("\t")
+            if len(f) == 3 and f[0].startswith("ii"):
+                have[f[1]] = f[2]
+        want = man.get("packages")
+        if not isinstance(want, dict) or not want:
+            raise Unknown("MAN records no packages")
+        diff = sorted(set(have.items()) ^ set(want.items()))
+        return not diff, f"{len(have)} packages{'' if not diff else ', differing: ' + str(diff[:4])}"
 
     def check_instances_empty(self):
         """The router's instances/ exists and is empty until sandy launches
@@ -569,6 +599,11 @@ class Admission:
         self.check("identity", self.owed("hostname, VM, role and domain vs the role manifest and meta-data"))
         self.check("machine-id", self.owed("machine-id and host keys distinct from the other VM (from PROV)"))
         self.check("auto-change-off", self.check_auto_change_off)
+        self.check("packages", self.check_packages)
+        # Codex round7 2: until every A1 fact is built, an explicit remainder
+        # row keeps A1 from passing on the rows that happen to exist.
+        self.check("a1-remainder", self.owed("the kernel against MAN, and the remaining closed-system facts "
+                                             "(round5 review) not yet built"))
         if self.phase not in ("A1", "A1r"):
             self.check("hdot", self.check_hdot)
             self.check("images", self.check_images)

@@ -260,12 +260,19 @@ def image_id(ref, runner):
 
 
 def packages(runner):
+    """Installed packages only ("ii"), in the form ADM reads them back; a
+    removed package's leftover config state is not an installed package."""
     out = {}
-    for n, line in enumerate(runner([DPKG_QUERY, "-W", "-f", "${Package}\t${Version}\n"]).splitlines(), 1):
-        name, sep, version = line.partition("\t")
-        if not sep or not name or not version or name in out:
-            raise Fail(f"dpkg-query: line {n} is not one distinct package")
-        out[name] = version
+    for n, line in enumerate(runner([DPKG_QUERY, "-W", "-f", "${db:Status-Abbrev}\t${Package}\t${Version}\n"])
+                             .splitlines(), 1):
+        f = line.split("\t")
+        if len(f) != 3 or not f[1] or not f[2]:
+            raise Fail(f"dpkg-query: line {n} is not one package")
+        if not f[0].startswith("ii"):
+            continue
+        if f[1] in out:
+            raise Fail(f"dpkg-query: {f[1]} listed twice")
+        out[f[1]] = f[2]
     if not out:
         raise Fail("dpkg-query: no packages")
     return out

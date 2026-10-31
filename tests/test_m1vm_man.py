@@ -37,7 +37,7 @@ class Runner:
             "rev-parse HEAD^{commit}": HEAD + "\n",
             "rev-parse HEAD^{tree}": TREE + "\n",
             "image": IMAGE + "\n",
-            "dpkg": "docker-ce\t5:27.0.0-1\npython3\t3.12.3-0\n",
+            "dpkg": "ii \tdocker-ce\t5:27.0.0-1\nii \tpython3\t3.12.3-0\nrc \tsnapd\t2.66\n",
         }
 
     def __call__(self, argv):
@@ -173,7 +173,8 @@ class FailTest(ManCase):
             "bad git output": (lambda: self.runner.out.update({"rev-parse HEAD^{tree}": "nope\n"}),
                                "did not print a commit"),
             "bad image id": (lambda: self.runner.out.update(image="\n"), "no image Id"),
-            "duplicate package": (lambda: self.runner.out.update(dpkg="a\t1\na\t2\n"), "not one distinct package"),
+            "duplicate package": (lambda: self.runner.out.update(dpkg="ii \ta\t1\nii \ta\t2\n"), "listed twice"),
+            "malformed line": (lambda: self.runner.out.update(dpkg="ii a 1\n"), "not one package"),
             "no packages": (lambda: self.runner.out.update(dpkg=""), "no packages"),
             "unknown account": (lambda: self.plan.update(accounts=["nosuchaccount9"],
                                                          roles={r: "nosuchaccount9" for r in self.plan["roles"]}),

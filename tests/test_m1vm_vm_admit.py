@@ -85,7 +85,7 @@ class Vm:
         (sandy / ".base_build_hash").write_bytes(b"b\n")
         (sandy / ".base_build_hash").chmod(0o644)
         (r / "opt/amap").mkdir(parents=True)
-        self.man = {"schema": "m1vm-man/1", "images": {"m1-hop:pin": IMG},
+        self.man = {"schema": "m1vm-man/1", "images": {"m1-hop:pin": IMG}, "packages": {"docker-ce": "5:27.0.0-1"},
                     "hdot": [{"name": ".base_build_hash", "mode": "0644", "sha256": hashlib.sha256(b"b\n").hexdigest()}],
                     "files": {"/etc/systemd/system/docker.socket.d/m1-acl.conf":
                               {"sha256": hashlib.sha256(DROPIN).hexdigest(), "mode": "0644", "uid": 0, "gid": 0}},
@@ -96,6 +96,12 @@ class Vm:
         (r / "etc/systemd/system/docker.socket.d/m1-acl.conf").write_bytes(DROPIN)
         (r / "etc/systemd/system/docker.socket.d/m1-acl.conf").chmod(0o644)
         (r / "srv/m1-state/sandy/features/amap/instances").mkdir(parents=True)
+        for rel, text in (("etc/systemd/coredump.conf.d/m1.conf", "[Coredump]\nStorage=none\n"),
+                          ("etc/systemd/journald.conf.d/m1.conf", "[Journal]\nStorage=volatile\n")):
+            (r / rel).parent.mkdir(parents=True, exist_ok=True)
+            (r / rel).write_text(text)
+            (r / rel).chmod(0o644)
+        (r / "proc/swaps").write_text("Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n")
         self.record_units()
         self.cmd = {}
 
@@ -123,6 +129,8 @@ class Vm:
                 return out
         if argv[:4] == ["/usr/bin/systemctl", "show", "-p", "UnitFileState"]:
             return 0, "".join("UnitFileState=masked\n" for _ in argv[5:])
+        if argv[0] == "/usr/bin/dpkg-query" and "${db:Status-Abbrev}\t${Package}\t${Version}\n" in argv:
+            return 0, "ii \tdocker-ce\t5:27.0.0-1\nrc \tsnapd\t2.66\n"
         if argv[0] == "/usr/bin/dpkg-query":
             return 1, ""
         if argv[:3] == ["/usr/bin/docker", "ps", "--all"]:
@@ -201,7 +209,8 @@ class AdmCase(unittest.TestCase):
                                now=lambda: (2026, 10, 31, 0, 0, 0, 4, 304, 0))
         return rc, out.getvalue().splitlines()
 
-    OWED = {"agent-prov", "role-and-o-n", "identity", "machine-id", "instances", "volumes", "enrolment-trees",
+    OWED = {"agent-prov", "role-and-o-n", "identity", "machine-id", "a1-remainder", "instances", "volumes",
+            "enrolment-trees",
             "units-table", "clock", "router1", "router2", "fingerprint"}  # UNKNOWN by design until their inputs exist
 
     def failing(self, phase="A1", owed=False, **over):
@@ -214,8 +223,8 @@ class PassTest(AdmCase):
     def test_a1_owes_three_rows(self):
         rc, lines = self.admit()
         self.assertEqual(rc, 1)
-        self.assertEqual(self.failing(owed=True), ["agent-prov", "identity", "machine-id"])
-        self.assertTrue(lines[-1].startswith("VM-ADMIT A1 FAIL failed=0 unknown=3"))
+        self.assertEqual(self.failing(owed=True), ["a1-remainder", "agent-prov", "identity", "machine-id"])
+        self.assertTrue(lines[-1].startswith("VM-ADMIT A1 FAIL failed=0 unknown=4"))
 
     def test_a1_pass_line(self):
         owed = {n: mock.patch.object(vm_admit.Admission, n, lambda self: (True, "stand-in"))
@@ -237,7 +246,7 @@ class PassTest(AdmCase):
         rc, lines = self.admit("A2a")
         self.assertEqual(rc, 1)
         self.assertIn("CHECK A2a role-and-o-n UNKNOWN", "\n".join(lines))
-        self.assertTrue(lines[-1].startswith("VM-ADMIT A2a FAIL failed=0 unknown=11"))
+        self.assertTrue(lines[-1].startswith("VM-ADMIT A2a FAIL failed=0 unknown=12"))
 
 
 class BreakTest(AdmCase):
@@ -585,9 +594,23 @@ class Part2Test(AdmCase):
                 self.setUp()
                 self.vm.cmd["UnitFileState"] = out
                 self.assertIn("auto-change-off", self.failing())
+        for name, brk in {
+                "snapd installed": lambda: self.vm.cmd.update({"dpkg-query -W -f ${Status} snapd": (0, "install ok installed")}),
+                "apport config left": lambda: self.vm.cmd.update({"dpkg-query -W -f ${Status} apport":
+                                                                      (0, "deinstall ok config-files")}),
+                "coredump stored": lambda: (self.vm.root / "etc/systemd/coredump.conf.d/m1.conf").write_text(
+                    "[Coredump]\nStorage=external\n"),
+                "journal persistent": lambda: (self.vm.root / "etc/systemd/journald.conf.d/m1.conf").unlink(),
+                "swap on": lambda: (self.vm.root / "proc/swaps").write_text(
+                    "Filename\tType\tSize\tUsed\tPriority\n/swap.img\tfile\t1\t0\t-2\n"),
+        }.items():
+            with self.subTest(name):
+                self.setUp()
+                brk()
+                self.assertIn("auto-change-off", self.failing())
         self.setUp()
-        self.vm.cmd["dpkg-query -W -f ${Status} snapd"] = (0, "install ok installed")
-        self.assertIn("auto-change-off", self.failing())
+        self.vm.cmd["dpkg-query -W -f ${Status} snapd"] = (0, "purge ok not-installed")
+        self.assertNotIn("auto-change-off", self.failing())
 
     def test_instances_and_containers_at_a2a(self):
         (self.vm.root / "srv/m1-state/sandy/features/amap/instances/x").mkdir()
@@ -599,6 +622,26 @@ class Part2Test(AdmCase):
         import shutil as sh
         sh.rmtree(self.vm.root / "srv/m1-state/sandy/features/amap/instances")
         self.assertIn("instances-empty", self.failing("A2b"))
+
+
+class PackagesTest(AdmCase):
+    def test_packages_exact(self):
+        self.assertNotIn("packages", self.failing())
+        for out in ("ii \tdocker-ce\t5:27.0.0-2\n", "ii \tdocker-ce\t5:27.0.0-1\nii \tcurl\t8\n", ""):
+            with self.subTest(out):
+                self.setUp()
+                self.vm.cmd["${db:Status-Abbrev}"] = (0, out)
+                self.assertIn("packages", self.failing())
+
+    def test_remainder_keeps_a1_from_passing(self):
+        owed = {n: mock.patch.object(vm_admit.Admission, n, lambda self: (True, "stand-in"))
+                for n in ("check_agent_prov",)}
+        for p in owed.values():
+            p.start()
+            self.addCleanup(p.stop)
+        rc, lines = self.admit()
+        self.assertEqual(rc, 1)
+        self.assertIn("CHECK A1 a1-remainder UNKNOWN", "\n".join(lines))
 
 
 class SharedConstantsTest(unittest.TestCase):
