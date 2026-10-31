@@ -8,7 +8,8 @@ PLAN is the `man` member of PIN, a JSON object naming what MAN records:
   {"pin_sha256": HEX, "seed": "/opt/amap/sandy-seed",
    "files": [ABS, ...], "checkouts": [ABS, ...], "images": [REF, ...],
    "accounts": [NAME, ...], "roles": {ROLE: NAME, ...},
-   "builds": {NAME: {"commit": HEX40, "tree": HEX40, "image": REF}, ...}}
+   "builds": {NAME: {"commit": HEX40, "tree": HEX40, "image": REF}, ...},
+   "trees": [ABS, ...]}
 
 MAN then holds, in canonical JSON (sorted keys, no spaces):
   - `schema` "m1vm-man/1" and `pin_sha256`;
@@ -24,7 +25,12 @@ MAN then holds, in canonical JSON (sorted keys, no spaces):
     unambiguously;
   - `builds`: {name: {commit, tree, image, id}}, each router image's pin, its
     clean export's tree and its engine Id (the per-VM fingerprint check reads
-    these; controller ruling (i)).
+    these; controller ruling (i));
+  - `trees`: {root: {relpath: entry}} for each named tree, every entry
+    under it (the root itself as "."): `{"type": "d", "mode", "uid", "gid"}`,
+    `{"type": "f", "mode", "uid", "gid", "sha256"}` or `{"type": "l",
+    "uid", "target"}`; anything else (a socket, a device) fails the write.
+    Walked without following a link, so a link is recorded, never crossed.
 
 Every path is opened from / one component at a time with O_NOFOLLOW; a link,
 a missing file or a non-regular file fails the write. MAN is created O_EXCL
@@ -48,7 +54,8 @@ import subprocess
 import sys
 
 SCHEMA = "m1vm-man/1"
-PLAN_KEYS = {"pin_sha256", "seed", "files", "checkouts", "images", "accounts", "roles", "builds"}
+PLAN_KEYS = {"pin_sha256", "seed", "files", "checkouts", "images", "accounts", "roles", "builds", "trees"}
+MAX_TREE_ENTRIES = 4096
 ROLES = ("op", "m1-admin", "adm", "uid-1", "uid-2", "registry")
 GIT = "/usr/bin/git"
 DOCKER = "/usr/bin/docker"
@@ -196,6 +203,46 @@ def run(argv):
     return r.stdout
 
 
+def tree(root):
+    """{relpath: entry} for every object under ROOT, walked fd-relative with
+    O_NOFOLLOW; links recorded by target, never followed."""
+    out = {}
+
+    def entry(st, dir_fd, name, rel):
+        mode = f"{stat.S_IMODE(st.st_mode):04o}"
+        if stat.S_ISDIR(st.st_mode):
+            return {"type": "d", "mode": mode, "uid": st.st_uid, "gid": st.st_gid}
+        if stat.S_ISREG(st.st_mode):
+            rec = file_record(dir_fd, name, f"{root}/{rel}")
+            return {"type": "f", "mode": rec["mode"], "uid": rec["uid"], "gid": rec["gid"], "sha256": rec["sha256"]}
+        if stat.S_ISLNK(st.st_mode):
+            return {"type": "l", "uid": st.st_uid, "target": os.readlink(name, dir_fd=dir_fd)}
+        raise Fail(f"{root}/{rel}: neither a file, a directory nor a link")
+
+    def walk(fd, rel):
+        for name in sorted(os.listdir(fd)):
+            sub = f"{rel}/{name}" if rel != "." else name
+            st = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            out[sub] = entry(st, fd, name, sub)
+            if len(out) > MAX_TREE_ENTRIES:
+                raise Fail(f"{root}: more than {MAX_TREE_ENTRIES} entries")
+            if stat.S_ISDIR(st.st_mode):
+                nfd = os.open(name, _DIR_FLAGS, dir_fd=fd)
+                try:
+                    walk(nfd, sub)
+                finally:
+                    os.close(nfd)
+
+    fd = open_dir(root)
+    try:
+        st = os.fstat(fd)
+        out["."] = {"type": "d", "mode": f"{stat.S_IMODE(st.st_mode):04o}", "uid": st.st_uid, "gid": st.st_gid}
+        walk(fd, ".")
+    finally:
+        os.close(fd)
+    return out
+
+
 def checkout(path, runner):
     os.close(open_dir(path))  # the path itself must be a plain directory, walked from /
     head =runner([GIT, "-C", path, "rev-parse", "--verify", "HEAD^{commit}"]).strip()
@@ -258,6 +305,9 @@ def validate_plan(plan):
                                                                  for v in r.values())):
         # Distinct names per role are PIN's rule (bake.validate_pin: distinct uids).
         raise Usage(f"roles must be exactly {list(ROLES)}, each a name in accounts")
+    t = plan["trees"]
+    if not isinstance(t, list) or len(set(t)) != len(t) or not all(_norm_abs(p) for p in t):
+        raise Usage("trees must be a list of distinct normalised absolute paths")
     b = plan["builds"]
     if not isinstance(b, dict) or not b:
         raise Usage("builds must be a non-empty object")
@@ -282,6 +332,7 @@ def build(plan, runner=run):
         "accounts": {a: account(a) for a in plan["accounts"]},
         "roles": dict(plan["roles"]),
         "builds": {n: dict(rec, id=image_id(rec["image"], runner)) for n, rec in plan["builds"].items()},
+        "trees": {p: tree(p) for p in plan["trees"]},
     }
 
 

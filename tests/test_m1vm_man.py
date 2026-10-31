@@ -71,6 +71,7 @@ class ManCase(unittest.TestCase):
                      "files": [str(self.etc / "sudoers-m1-admin")], "checkouts": [str(self.repo)],
                      "images": ["amap-router-local:m1"], "accounts": [ME],
                      "roles": {r: ME for r in ("op", "m1-admin", "adm", "uid-1", "uid-2", "registry")},
+                     "trees": [],
                      "builds": {"router1": {"commit": HEAD, "tree": TREE, "image": "amap-router-local:m1"}}}
 
     def build(self):
@@ -81,7 +82,7 @@ class BuildTest(ManCase):
     def test_shape(self):
         m = self.build()
         self.assertEqual(sorted(m), ["accounts", "builds", "checkouts", "files", "hdot", "images", "packages",
-                                     "pin_sha256", "roles", "schema"])
+                                     "pin_sha256", "roles", "schema", "trees"])
         self.assertEqual(m["roles"]["op"], ME)
         self.assertEqual(m["builds"], {"router1": {"commit": HEAD, "tree": TREE, "image": "amap-router-local:m1",
                                                    "id": IMAGE}})
@@ -114,6 +115,32 @@ class BuildTest(ManCase):
         with redirect_stdout(io.StringIO()) as o, redirect_stderr(io.StringIO()):
             self.assertEqual(seed_copy.main(argv), 0)
         self.assertTrue(o.getvalue().splitlines()[-1].startswith("M1-SEED-COPY PASS n=3 "))
+
+    def test_trees_record_every_entry_without_following_links(self):
+        t = self.tmp / "units"
+        (t / "docker.socket.d").mkdir(parents=True)
+        (t / "docker.socket.d/m1-acl.conf").write_text("[Socket]\n")
+        os.symlink("/dev/null", t / "qemu-guest-agent.service")
+        os.symlink("/etc", t / "outside")
+        self.plan["trees"] = [str(t)]
+        tr = self.build()["trees"][str(t)]
+        self.assertEqual(sorted(tr), [".", "docker.socket.d", "docker.socket.d/m1-acl.conf", "outside",
+                                      "qemu-guest-agent.service"])
+        self.assertEqual(tr["qemu-guest-agent.service"], {"type": "l", "uid": os.getuid(), "target": "/dev/null"})
+        self.assertEqual(tr["outside"]["type"], "l")  # recorded, never crossed
+        self.assertEqual(tr["docker.socket.d/m1-acl.conf"]["sha256"], hashlib.sha256(b"[Socket]\n").hexdigest())
+        self.assertEqual(tr["docker.socket.d"]["type"], "d")
+
+    def test_tree_refuses_a_socket(self):
+        import socket
+        t = self.tmp / "units"
+        t.mkdir()
+        sk = socket.socket(socket.AF_UNIX)
+        self.addCleanup(sk.close)
+        sk.bind(str(t / "s"))
+        self.plan["trees"] = [str(t)]
+        with self.assertRaises(man.Fail):
+            self.build()
 
     def test_canonical_is_stable(self):
         a = man.canonical(self.build())

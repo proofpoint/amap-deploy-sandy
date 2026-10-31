@@ -95,8 +95,18 @@ class Vm:
         (r / "etc/systemd/system/docker.socket.d").mkdir(parents=True)
         (r / "etc/systemd/system/docker.socket.d/m1-acl.conf").write_bytes(DROPIN)
         (r / "etc/systemd/system/docker.socket.d/m1-acl.conf").chmod(0o644)
-        self.write_man()
+        (r / "srv/m1-state/sandy/features/amap/instances").mkdir(parents=True)
+        self.record_units()
         self.cmd = {}
+
+    def record_units(self):
+        """MAN's tree of /etc/systemd/system, as BAKE would record it on T0:
+        the guest's tree before G-AS-n's mask link."""
+        with mock.patch.object(vm_admit, "ROOT", str(self.root)):
+            t = vm_admit.guest_tree("/etc/systemd/system")
+        t.pop("qemu-guest-agent.service")
+        self.man["trees"] = {"/etc/systemd/system": t}
+        return self.write_man()
 
     def write_man(self):
         p = self.root / "opt/amap/MAN.json"
@@ -111,6 +121,12 @@ class Vm:
         for pat, out in self.cmd.items():
             if pat in key:
                 return out
+        if argv[:4] == ["/usr/bin/systemctl", "show", "-p", "UnitFileState"]:
+            return 0, "".join("UnitFileState=masked\n" for _ in argv[5:])
+        if argv[0] == "/usr/bin/dpkg-query":
+            return 1, ""
+        if argv[:3] == ["/usr/bin/docker", "ps", "--all"]:
+            return 0, ""
         if "qemu-guest-agent.service" in argv:
             return 0, "ActiveState=inactive\nUnitFileState=masked\n"
         if argv[:3] == ["/usr/bin/findmnt", "-n", "-o"] and argv[3] == "UUID,SOURCE,FSTYPE":
@@ -142,6 +158,11 @@ class AdmCase(unittest.TestCase):
         patcher = mock.patch.object(vm_admit, "ROOT", str(self.vm.root))
         patcher.start()
         self.addCleanup(patcher.stop)
+        # The fixture's mask link is the test user's, not root's.
+        mask = mock.patch.object(vm_admit, "AGENT_MASK",
+                                 ("qemu-guest-agent.service", {"type": "l", "uid": os.getuid(), "target": "/dev/null"}))
+        mask.start()
+        self.addCleanup(mask.stop)
         # Root ownership, as on a real VM, for the files root owns there.
         real_read, real_lstat = vm_admit.read_regular, vm_admit.lstat_path
         self.foreign = set()
@@ -169,6 +190,9 @@ class AdmCase(unittest.TestCase):
             p = mock.patch.object(vm_admit, name, fn)
             p.start()
             self.addCleanup(p.stop)
+        # MAN's unit tree is recorded through the same (root-owning) view the
+        # checks read, as BAKE records it on T0.
+        self.vm.record_units()
 
     def admit(self, phase="A1", **over):
         out = io.StringIO()
@@ -177,9 +201,8 @@ class AdmCase(unittest.TestCase):
                                now=lambda: (2026, 10, 31, 0, 0, 0, 4, 304, 0))
         return rc, out.getvalue().splitlines()
 
-    OWED = {"agent-prov", "systemd-tree", "role-and-o-n", "identity", "machine-id", "auto-change-off",
-            "instances-empty", "enrolment-trees", "containers", "units-table", "clock", "router1", "router2",
-            "fingerprint"}  # UNKNOWN by design until their inputs exist
+    OWED = {"agent-prov", "role-and-o-n", "identity", "machine-id", "instances", "volumes", "enrolment-trees",
+            "units-table", "clock", "router1", "router2", "fingerprint"}  # UNKNOWN by design until their inputs exist
 
     def failing(self, phase="A1", owed=False, **over):
         _, lines = self.admit(phase, **over)
@@ -188,12 +211,11 @@ class AdmCase(unittest.TestCase):
 
 
 class PassTest(AdmCase):
-    def test_a1_owes_two_rows(self):
+    def test_a1_owes_three_rows(self):
         rc, lines = self.admit()
         self.assertEqual(rc, 1)
-        self.assertEqual(self.failing(owed=True), ["agent-prov", "auto-change-off", "identity", "machine-id",
-                                                    "systemd-tree"])
-        self.assertTrue(lines[-1].startswith("VM-ADMIT A1 FAIL failed=0 unknown=5"))
+        self.assertEqual(self.failing(owed=True), ["agent-prov", "identity", "machine-id"])
+        self.assertTrue(lines[-1].startswith("VM-ADMIT A1 FAIL failed=0 unknown=3"))
 
     def test_a1_pass_line(self):
         owed = {n: mock.patch.object(vm_admit.Admission, n, lambda self: (True, "stand-in"))
@@ -215,7 +237,7 @@ class PassTest(AdmCase):
         rc, lines = self.admit("A2a")
         self.assertEqual(rc, 1)
         self.assertIn("CHECK A2a role-and-o-n UNKNOWN", "\n".join(lines))
-        self.assertTrue(lines[-1].startswith("VM-ADMIT A2a FAIL failed=0 unknown=14"))
+        self.assertTrue(lines[-1].startswith("VM-ADMIT A2a FAIL failed=0 unknown=11"))
 
 
 class BreakTest(AdmCase):
@@ -525,3 +547,63 @@ class SchemaTest(AdmCase):
                 p.update(over)
                 with redirect_stdout(io.StringIO()):
                     self.assertEqual(vm_admit.main(p, runner=self.vm.runner), 2)
+
+
+class Part2Test(AdmCase):
+    """ADM part 2's first real rows."""
+
+    def test_systemd_tree_breaks(self):
+        cases = {
+            "extra unit at A1": (lambda: (self.vm.root / "etc/systemd/system/amap-x.service").write_text(""), "A1", "FAIL"),
+            "changed drop-in": (lambda: ((self.vm.root / "etc/systemd/system/docker.socket.d/m1-acl.conf").write_text("x\n")),
+                                "A1", "FAIL"),
+            "mask missing": (lambda: (self.vm.root / "etc/systemd/system/qemu-guest-agent.service").unlink(), "A1", "FAIL"),
+            "extra unit at A2a is UNKNOWN": (lambda: (self.vm.root / "etc/systemd/system/amap-x.service").write_text(""),
+                                             "A2a", "UNKNOWN"),
+        }
+        for name, (brk, phase, verdict) in cases.items():
+            with self.subTest(name):
+                self.setUp()
+                brk()
+                _, lines = self.admit(phase)
+                self.assertIn(f"CHECK {phase} systemd-tree {verdict}", "\n".join(lines))
+
+    def test_template_already_masked_fails(self):
+        self.vm.man["trees"]["/etc/systemd/system"]["qemu-guest-agent.service"] = {"type": "l", "uid": os.getuid(),
+                                                                                  "target": "/dev/null"}
+        sha = self.vm.write_man()
+        _, lines = self.admit(man_sha256=sha)
+        self.assertIn("CHECK A1 systemd-tree FAIL MAN's T0 already has", "\n".join(lines))
+
+    def test_auto_change(self):
+        cases = {
+            "one unmasked": (0, "UnitFileState=masked\nUnitFileState=enabled\nUnitFileState=masked\nUnitFileState=masked\n"),
+            "too few": (0, "UnitFileState=masked\n"),
+        }
+        for name, out in cases.items():
+            with self.subTest(name):
+                self.setUp()
+                self.vm.cmd["UnitFileState"] = out
+                self.assertIn("auto-change-off", self.failing())
+        self.setUp()
+        self.vm.cmd["dpkg-query -W -f ${Status} snapd"] = (0, "install ok installed")
+        self.assertIn("auto-change-off", self.failing())
+
+    def test_instances_and_containers_at_a2a(self):
+        (self.vm.root / "srv/m1-state/sandy/features/amap/instances/x").mkdir()
+        self.assertIn("instances-empty", self.failing("A2a"))
+        self.setUp()
+        self.vm.cmd["docker ps --all"] = (0, "abc\n")
+        self.assertIn("containers", self.failing("A2a"))
+        self.setUp()
+        import shutil as sh
+        sh.rmtree(self.vm.root / "srv/m1-state/sandy/features/amap/instances")
+        self.assertIn("instances-empty", self.failing("A2b"))
+
+
+class SharedConstantsTest(unittest.TestCase):
+    def test_quiet_sets_equal_bakes(self):
+        import bake
+        self.assertEqual(vm_admit.QUIET_MASK, bake.QUIET_MASK)
+        self.assertEqual(vm_admit.QUIET_REMOVE, bake.QUIET_REMOVE)
+        self.assertEqual(vm_admit.UNIT_DIR, bake.UNIT_DIR)

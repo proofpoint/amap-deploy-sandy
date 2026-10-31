@@ -45,6 +45,13 @@ SUDOERS_DIR = "/etc/sudoers.d"
 AGENT_UNIT = "/etc/systemd/system/qemu-guest-agent.service"
 AGENT_PORT = "/dev/virtio-ports/org.qemu.guest_agent.0"
 BOOT_ID = "/proc/sys/kernel/random/boot_id"
+UNIT_DIR = "/etc/systemd/system"
+INSTANCES = "/srv/m1-state/sandy/features/amap/instances"
+# DS2 d8 §1.1 step 2 (bake.QUIET_MASK / QUIET_REMOVE; a test pins them equal).
+QUIET_MASK = ("unattended-upgrades.service", "apt-daily.timer", "apt-daily-upgrade.timer", "motd-news.timer")
+QUIET_REMOVE = ("snapd", "apport")
+# The one change G-AS-n makes to R (NET r20 §3.2; LC d8 §2.2's named delta).
+AGENT_MASK = ("qemu-guest-agent.service", {"type": "l", "uid": 0, "target": "/dev/null"})
 ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C"}
 TIMEOUT_S = 60
 _HEX64 = re.compile(r"[0-9a-f]{64}\Z")
@@ -153,6 +160,45 @@ def read_protected(path, uid, mode, mount, limit=1 << 22):
     if (os.major(st.st_dev), os.minor(st.st_dev)) != dev:
         raise OSError(errno.EXDEV, f"{path}: not on the filesystem mounted at {mount}")
     return data
+
+
+def guest_tree(root):
+    """{relpath: entry} of ROOT on the guest, in m1-man's `trees` form."""
+    out = {}
+    parts = [p for p in root.split("/") if p]
+    fd = os.open(ROOT, _DIR_FLAGS)
+    try:
+        for part in parts:
+            nfd = os.open(part, _DIR_FLAGS, dir_fd=fd)
+            os.close(fd)
+            fd = nfd
+        st = os.fstat(fd)
+        out["."] = {"type": "d", "mode": f"{stat.S_IMODE(st.st_mode):04o}", "uid": st.st_uid, "gid": st.st_gid}
+
+        def walk(dfd, rel):
+            for name in sorted(os.listdir(dfd)):
+                sub = f"{rel}/{name}" if rel != "." else name
+                st = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+                mode = f"{stat.S_IMODE(st.st_mode):04o}"
+                if stat.S_ISDIR(st.st_mode):
+                    out[sub] = {"type": "d", "mode": mode, "uid": st.st_uid, "gid": st.st_gid}
+                    nfd = os.open(name, _DIR_FLAGS, dir_fd=dfd)
+                    try:
+                        walk(nfd, sub)
+                    finally:
+                        os.close(nfd)
+                elif stat.S_ISLNK(st.st_mode):
+                    out[sub] = {"type": "l", "uid": st.st_uid, "target": os.readlink(name, dir_fd=dfd)}
+                elif stat.S_ISREG(st.st_mode):
+                    data, fst = read_regular(f"{root}/{sub}")
+                    out[sub] = {"type": "f", "mode": f"{stat.S_IMODE(fst.st_mode):04o}", "uid": fst.st_uid,
+                                "gid": fst.st_gid, "sha256": hashlib.sha256(data).hexdigest()}
+                else:
+                    out[sub] = {"type": "other"}
+        walk(fd, ".")
+    finally:
+        os.close(fd)
+    return out
 
 
 def lstat_path(path):
@@ -387,7 +433,58 @@ class Admission:
         raise Unknown("PROV-n agent_sealed / qm agent=0 not yet bound into the parameters")
 
     def check_systemd_tree(self):
-        raise Unknown("MAN does not yet record /etc/systemd/system, so the rest of it is not compared")
+        """/etc/systemd/system exactly as MAN recorded it, plus G-AS-n's one
+        mask link. From A2a, D-UNITS has placed DS's units: MAN's entries
+        must still be unchanged, and any extra entry is UNKNOWN until DS's
+        unit table is bound (Codex ADM (5); Opus round4 2)."""
+        _, man = self.man()
+        want = man.get("trees", {}).get(UNIT_DIR)
+        if not isinstance(want, dict):
+            raise Unknown(f"MAN records no tree for {UNIT_DIR}")
+        want = dict(want)
+        name, link = AGENT_MASK
+        if name in want:
+            return False, f"MAN's T0 already has {name}: the template's agent was masked"
+        want[name] = link
+        have = guest_tree(UNIT_DIR)
+        changed = sorted(k for k in want if have.get(k) != want[k])
+        if changed:
+            return False, f"{len(changed)} entr(y/ies) differ from MAN: {changed[:5]}"
+        extra = sorted(set(have) - set(want))
+        if extra and self.phase in ("A1", "A1r"):
+            return False, f"{len(extra)} entr(y/ies) not in MAN: {extra[:5]}"
+        if extra:
+            raise Unknown(f"{len(extra)} entr(y/ies) beyond MAN, to be bound to DS's unit table: {extra[:5]}")
+        return True, f"{len(want)} entries exactly MAN's plus the agent mask"
+
+    def check_auto_change_off(self):
+        rc, out = self.runner(["/usr/bin/systemctl", "show", "-p", "UnitFileState", "--", *QUIET_MASK])
+        states = [l.partition("=")[2] for l in out.splitlines() if l.startswith("UnitFileState=")]
+        if rc != 0 or states != ["masked"] * len(QUIET_MASK):
+            return False, f"{list(QUIET_MASK)}: {states}"
+        installed = []
+        for pkg in QUIET_REMOVE:
+            rc, out = self.runner(["/usr/bin/dpkg-query", "-W", "-f", "${Status}", pkg])
+            if rc == 0 and out.strip().endswith(" installed"):
+                installed.append(pkg)
+        return not installed, f"masked: {len(QUIET_MASK)}; installed of {list(QUIET_REMOVE)}: {installed}"
+
+    def check_instances_empty(self):
+        """The router's instances/ exists and is empty until sandy launches
+        (A2a, A2b; LC d8 §4.3)."""
+        st = lstat_path(INSTANCES)
+        if st is None or not stat.S_ISDIR(st.st_mode):
+            return False, f"{INSTANCES}: not a directory"
+        names = listdir(INSTANCES)
+        return not names, f"{INSTANCES}: {len(names)} entr(y/ies)"
+
+    def check_no_containers(self):
+        """Before D-START-1 the engine holds no container at all (A2a)."""
+        rc, out = self.runner(["/usr/bin/docker", "ps", "--all", "--quiet", "--no-trunc"])
+        if rc != 0:
+            raise Unknown("docker ps failed")
+        ids = out.split()
+        return not ids, f"{len(ids)} container(s)"
 
     def check_role_and_o_n(self):
         raise Unknown("binds DS's B6c pre-flight receipt, not yet reviewed")
@@ -471,15 +568,22 @@ class Admission:
         # UNKNOWN until built, so A1 cannot PASS early (Opus ADM 2).
         self.check("identity", self.owed("hostname, VM, role and domain vs the role manifest and meta-data"))
         self.check("machine-id", self.owed("machine-id and host keys distinct from the other VM (from PROV)"))
-        self.check("auto-change-off", self.owed("unattended-upgrades/apt-daily/motd-news masked, snapd and apport absent"))
+        self.check("auto-change-off", self.check_auto_change_off)
         if self.phase not in ("A1", "A1r"):
             self.check("hdot", self.check_hdot)
             self.check("images", self.check_images)
             self.check("socket-acl", self.check_socket_acl)
             self.check("role-and-o-n", self.check_role_and_o_n)
-            for name, reason in (("instances-empty", "the router's instances/ empty (A2a) or D-S's set (POST)"),
+            if self.phase in ("A2a", "A2b"):
+                self.check("instances-empty", self.check_instances_empty)
+            else:
+                self.check("instances", self.owed("POST: instances/ holds exactly D-S's lanes"))
+            if self.phase == "A2a":
+                self.check("containers", self.check_no_containers)
+            else:
+                self.check("containers", self.owed("the closed container set ([1], then D-S's sandboxes)"))
+            for name, reason in (("volumes", "the closed volume set ([2]'s secret volume, by name from B6c)"),
                                  ("enrolment-trees", "the registry and identities trees against EXP-n and ENV-n"),
-                                 ("containers", "the closed container and volume sets for this phase"),
                                  ("units-table", "DS r12 §7's unit table"),
                                  ("clock", "time-sync on and the inter-VM skew within NET's bound"),
                                  ("router1", "[1]'s delivered file vs the render; from A2b its nested health rule"),

@@ -98,6 +98,10 @@ class FakeHost:
         if a[:4] == ["bash", "-e", "-o", "pipefail"]:
             self.bundle_scripts.append(a[5])
             return "END-OF-BLOCK\n" if len(self.bundle_scripts) == 1 else ""
+        if a[:2] == ["find", bake.EXEC_ROOT] and a[-1].startswith("%P\\t"):
+            files = ["partition_job.py", "partition_store.py", "partition_weekly.closure", "PIN"]
+            return "".join(["\td 700 root\0", "bundle\td 555 root\0", "empty-home\td 700 root\0"]
+                           + [f"bundle/{f}\tf 444 root\0" for f in files])
         if a[:2] == ["find", bake.EXEC_ROOT]:
             return "bundle\0empty-home\0"
         if a[:3] == ["git", "-C", f"{bake.SRC}/amap-deploy-sandy"] and a[3] == "show":
@@ -505,7 +509,18 @@ class StepFailTest(BakeCase):
                                                              "partition_job.py\0PIN\0"}), "not exactly the closure"),
             "bundle pin": (lambda h: h.over.update({"^cat /opt/amap/partition/bundle/PIN$": H("0") + "\n"}),
                            "bundle/PIN is not the deploy pin"),
-            "bundle mode": (lambda h: h.over.update({"^find /opt/amap/partition/bundle .* !": "PIN\0"}), "not root 0444"),
+            "bundle file mode": (lambda h: h.over.update({"^find /opt/amap/partition -printf":
+                "\td 700 root\0bundle\td 555 root\0empty-home\td 700 root\0bundle/partition_job.py\tf 644 root\0"
+                "bundle/partition_store.py\tf 444 root\0bundle/partition_weekly.closure\tf 444 root\0bundle/PIN\tf 444 root\0"}),
+                "not exactly the reviewed tree"),
+            "bundle dir mode": (lambda h: h.over.update({"^find /opt/amap/partition -printf":
+                "\td 755 root\0bundle\td 555 root\0empty-home\td 700 root\0bundle/partition_job.py\tf 444 root\0"
+                "bundle/partition_store.py\tf 444 root\0bundle/partition_weekly.closure\tf 444 root\0bundle/PIN\tf 444 root\0"}),
+                "not exactly the reviewed tree"),
+            "bundle stray link": (lambda h: h.over.update({"^find /opt/amap/partition -printf":
+                "\td 700 root\0bundle\td 555 root\0empty-home\td 700 root\0bundle/partition_job.py\tf 444 root\0"
+                "bundle/partition_store.py\tf 444 root\0bundle/partition_weekly.closure\tf 444 root\0bundle/PIN\tf 444 root\0"
+                "bundle/x\tl 777 root\0"}), "not exactly the reviewed tree"),
             "command fails": (lambda h: h.over.update({"^docker pull": bake.BakeFail("docker pull: exit 1")}),
                               "images: docker pull"),
             "admin sudoers broader": (lambda h: h.over.update({"^sha256sum /etc/sudoers.d/m1-admin$":

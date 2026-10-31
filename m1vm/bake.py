@@ -500,10 +500,18 @@ def step_bundle(pin, host):
         raise BakeFail(f"bundle: bundle/ holds {len(have)} file(s), not exactly the closure's {len(want)}")
     if host.run(["cat", f"{EXEC_ROOT}/bundle/PIN"]) != pin_commit + "\n":
         raise BakeFail("bundle: bundle/PIN is not the deploy pin")
-    modes = host.run(["find", f"{EXEC_ROOT}/bundle", "-mindepth", "1", "-type", "f", "!", "(", "-user", "root",
-                      "-perm", "0444", ")", "-printf", "%P\\0"]).split("\0")
-    if any(modes):
-        raise BakeFail("bundle: a bundle file is not root 0444")
+    # The whole result tree, directories and every entry type included
+    # (Opus round5): exactly these entries with these types, modes and owner.
+    want_tree = {".": "d 700 root", "bundle": "d 555 root", "empty-home": "d 700 root"}
+    want_tree.update({f"bundle/{n}": "f 444 root" for n in want})
+    got_tree = {}
+    for rec in host.run(["find", EXEC_ROOT, "-printf", "%P\\t%y %m %u\\0"]).split("\0"):
+        if rec:
+            rel, _, desc = rec.partition("\t")
+            got_tree[rel or "."] = desc
+    if got_tree != want_tree:
+        raise BakeFail(f"bundle: {EXEC_ROOT} is not exactly the reviewed tree "
+                       f"({sorted(set(got_tree) ^ set(want_tree))[:5]} differ)")
     return [f"{EXEC_ROOT}/bundle/{n}" for n in want]
 
 
@@ -560,7 +568,10 @@ def step_man(pin, host, pin_sha):
         f"{OPT}/bin/m1-seed-copy", f"{OPT}/bin/m1-state-check", WRITER} | set(bundle_files(pin, host))),
         "checkouts": [f"{SRC}/{n}" for n in sorted(pin["repos"])], "images": refs,
         "accounts": [pin["accounts"][a]["name"] for a in ACCOUNTS],
-        "roles": {a: pin["accounts"][a]["name"] for a in ACCOUNTS}, "builds": builds(pin, host)}
+        "roles": {a: pin["accounts"][a]["name"] for a in ACCOUNTS}, "builds": builds(pin, host),
+        # Whole trees, so ADM compares every entry (Codex ADM (5)) and the
+        # partition root's directories and modes are on record (Opus round5).
+        "trees": [UNIT_DIR, EXEC_ROOT, "/opt/amap/libexec"]}
     host.put("/run/m1-bake/man-plan.json", json.dumps(plan, sort_keys=True) + "\n")
     out = host.run(["python3", "-I", "-S", "-B", f"{SRC}/amap-deploy-sandy/m1vm/man.py", "write",
                     "--plan", "/run/m1-bake/man-plan.json", "--out", MAN_PATH]).strip().splitlines()
