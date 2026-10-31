@@ -178,6 +178,8 @@ def effective(runner, conf, section, key):
     doubt, FAIL; exact agreement is the native control's to measure):
       - a NUL, a lone CR, or another character some splitter breaks lines at;
       - any non-comment line ending in a backslash, in any section;
+      - a line that opens a section header and does not close it, where
+        systemd stops reading (Opus followup3 (a)1);
       - any KEY= after a `# /` line and before the next section header.
         Such a line may be a file boundary or an ordinary comment, so it
         never sets or resets the section by itself (Codex, Opus followup2)."""
@@ -194,13 +196,16 @@ def effective(runner, conf, section, key):
             continue
         if line.endswith("\\"):
             raise ValueError(f"{conf}: a continued line")
-        if line.startswith("[") and line.endswith("]"):
+        if line.startswith("["):
+            if not line.endswith("]"):
+                raise ValueError(f"{conf}: a malformed section header")
             current, after_path = line[1:-1], False
             continue
         name, sep, val = line.partition("=")
         if sep and after_path:
             raise ValueError(f"{conf}: {name.strip()}= after a `# /` line, before any section header")
-        if sep and name.strip() == key and current == section:
+        # ASCII blanks only, as systemd strips; never NBSP or \x1f (Opus followup3 (a)2, Codex).
+        if sep and name.strip(" \t") == key and current == section:
             value = val.strip(" \t")
     return value
 

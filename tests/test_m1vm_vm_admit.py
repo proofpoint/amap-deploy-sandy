@@ -698,6 +698,8 @@ class Round7Test(AdmCase):
                 **{name: (lambda tail=tail: self.vm.cmd.update(
                     {"cat-config systemd/journald.conf": (0, JOURNAL_VOLATILE + tail)}))
                    for name, tail in PATH_COMMENT_BREAKS.items()},
+                "malformed section header": lambda: self.vm.cmd.update(
+                    {"cat-config systemd/journald.conf": (0, MALFORMED_HEADER)}),
         }.items():
             with self.subTest(name):
                 self.setUp()
@@ -759,7 +761,17 @@ CAT_CONFIG_BREAKS = {
     # Opus followup2 (a)2: a continuation outside [Journal] swallows its header for systemd.
     "continuation in another section": "[Other]\nX=a\\\n[Journal]\nStorage=volatile\n",
     "continuation with no =": "[Other]\nfoo\\\n[Journal]\nStorage=volatile\n",
+    # Opus followup3 (a)2 and its survivors: systemd strips ASCII blanks only.
+    "NBSP before the key": "\xa0Storage=volatile\n",
+    "NBSP after the value": "Storage=volatile\xa0\n",
+    "NBSP around a header": "[Other]\n\xa0[Journal]\xa0\nStorage=volatile\n",
+    # Opus followup3 survivor B2: a plain comment does not end the `# /` doubt.
+    "plain comment after a path line": "\n# /run/systemd/journald.conf.d/zzz.conf\n# note\nStorage=volatile\n",
 }
+# Opus followup3 (a)1: systemd stops reading at a header with no `]`, so m1.conf
+# after it is never applied and the earlier persistent stands.
+MALFORMED_HEADER = ("# /etc/systemd/journald.conf\n[Journal]\nStorage=persistent\n[Journal\n\n"
+                    "# /etc/systemd/journald.conf.d/m1.conf\n[Journal]\nStorage=volatile\n")
 # After the reviewed volatile, a persistent that systemd may apply but a line
 # split on "\n" alone would hide inside another line, and (Codex followup2) a
 # drop-in whose `# /` line is an ordinary comment inside [Journal].
