@@ -29,7 +29,10 @@ Each phase prints `B6 <check> PASS|FAIL <detail>` rows; its last line is
           --verify-image FILE --commit <MAN's builds.router1.commit>` run from
           CHECKOUT prints EXACT and exits 0.
   graph   the boot-stop contract, read from systemd itself on 206 (NET
-          d0fe2ccb option 0): m1-state-check.service is Type=oneshot,
+          d0fe2ccb option 0): /etc/systemd/system/local-fs.target.requires
+          is root:root 0755 and holds the two mounts as root-owned links to
+          /etc/systemd/system/<unit> (read, never followed);
+          m1-state-check.service is Type=oneshot,
           RemainAfterExit, and active; the state mount Requires and is After
           it, is RequiredBy local-fs.target, carries no nofail and is active
           from /dev/disk/by-label/m1-state; local-fs.target Requires both
@@ -333,8 +336,46 @@ def show(unit, props, runner):
     return got if set(got) == set(props) else None
 
 
-def phase_graph(runner=run):
+UNIT_DIR = "/etc/systemd/system"
+REQUIRES_DIR = "local-fs.target.requires"
+ROOT_UID = 0
+ROOT_GID = 0
+
+
+def enable_links(unit_dir=UNIT_DIR):
+    """(dir uid, gid, mode, {unit: (link uid, target)}) of UNIT_DIR's
+    local-fs.target.requires, walked from / with O_NOFOLLOW; links are read,
+    never followed. OSError if any step is not a plain directory or link."""
+    fd = os.open("/", _DIR_FLAGS)
+    try:
+        for part in [x for x in f"{unit_dir}/{REQUIRES_DIR}".split("/") if x]:
+            nfd = os.open(part, _DIR_FLAGS, dir_fd=fd)
+            os.close(fd)
+            fd = nfd
+        st = os.fstat(fd)
+        links = {}
+        for unit in (DATA_MOUNT, DOCKER_MOUNT):
+            # readlink refuses anything but a link (EINVAL).
+            lst = os.stat(unit, dir_fd=fd, follow_symlinks=False)
+            links[unit] = (lst.st_uid, os.readlink(unit, dir_fd=fd))
+    finally:
+        os.close(fd)
+    return st.st_uid, st.st_gid, stat.S_IMODE(st.st_mode), links
+
+
+def phase_graph(runner=run, unit_dir=UNIT_DIR):
     p = Phase("graph")
+    # What `systemctl enable` made for the two RequiredBy= mounts, MEASURED
+    # here on the first clone: bake's enable check and ADM's A1 systemd-tree
+    # both rest on this form.
+    try:
+        uid, gid, mode, links = enable_links(unit_dir)
+    except OSError as exc:
+        p.row("enable-links", False, f"{unit_dir}/{REQUIRES_DIR}: {exc}")
+    else:
+        want = {u: (ROOT_UID, f"{UNIT_DIR}/{u}") for u in (DATA_MOUNT, DOCKER_MOUNT)}
+        p.row("enable-links", (uid, gid, mode) == (ROOT_UID, ROOT_GID, 0o755) and links == want,
+              f"{REQUIRES_DIR} {uid}:{gid} {mode:04o} {links}")
     c = show(CHECK_UNIT, ("Type", "RemainAfterExit", "ActiveState", "Result"), runner)
     p.row("check-unit", c is not None, f"{CHECK_UNIT}: {c}")
     if c:

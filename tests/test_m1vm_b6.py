@@ -14,6 +14,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stdout, redirect_stderr
 from pathlib import Path
+from unittest import mock
 
 M1VM = Path(__file__).resolve().parent.parent / "m1vm"
 sys.path.insert(0, str(M1VM))
@@ -240,6 +241,38 @@ class GraphTest(unittest.TestCase):
         "local-fs.target": {"Requires": "srv-m1\\x2dstate.mount var-lib-docker.mount -.mount"},
     }
 
+    def setUp(self):
+        # The guest's unit dir as `systemctl enable` leaves it for the two
+        # RequiredBy=local-fs.target mounts (INFERRED until 206 measures it),
+        # owned by the test user, who stands in for root.
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.req = self.tmp / "local-fs.target.requires"
+        self.req.mkdir()
+        self.req.chmod(0o755)
+        for u in (b6.DATA_MOUNT, b6.DOCKER_MOUNT):
+            os.symlink(f"/etc/systemd/system/{u}", self.req / u)
+        for name, value in (("ROOT_UID", os.getuid()), ("ROOT_GID", os.getgid())):
+            p = mock.patch.object(b6, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+
+    @staticmethod
+    def link_owner(uid):
+        """os.stat, with UID as the owner of what it reports without following
+        a link: the links, while the directory's fstat is untouched."""
+        real = os.stat
+
+        def stat_(path, *a, **kw):
+            st = real(path, *a, **kw)
+            if kw.get("follow_symlinks") is False:
+                st = os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, uid) + tuple(st)[5:])
+            return st
+        return stat_
+
+    def graph(self, runner):
+        return b6.phase_graph(runner, unit_dir=str(self.tmp))
+
     def runner(self, units):
         def run(argv, root=False, check=True):
             self.assertEqual(argv[:3], [b6.SYSTEMCTL, "show", "-p"])
@@ -254,7 +287,7 @@ class GraphTest(unittest.TestCase):
         return {u: dict(v) for u, v in self.GOOD.items()}
 
     def test_pass(self):
-        p = b6.phase_graph(self.runner(self.units()))
+        p = self.graph(self.runner(self.units()))
         self.assertTrue(p.ok, p.lines())
         self.assertEqual(p.lines()[-1], "M1-B6 graph PASS")
 
@@ -279,15 +312,46 @@ class GraphTest(unittest.TestCase):
             with self.subTest(name):
                 units = self.units()
                 units[unit][key] = value
-                self.assertFalse(b6.phase_graph(self.runner(units)).ok)
+                self.assertFalse(self.graph(self.runner(units)).ok)
+
+    def test_enable_links(self):
+        self.assertIn("B6 enable-links PASS", "\n".join(self.graph(self.runner(self.units())).lines()))
+        # Every break names its paths through self, which each setUp renews.
+        def link():
+            return self.req / b6.DOCKER_MOUNT
+
+        def relink(target):
+            link().unlink()
+            os.symlink(target, link())
+        breaks = {
+            "relative target": lambda: relink(f"../{b6.DOCKER_MOUNT}"),
+            "vendor target": lambda: relink(f"/lib/systemd/system/{b6.DOCKER_MOUNT}"),
+            "link missing": lambda: link().unlink(),
+            "a file, not a link": lambda: (link().unlink(), link().write_text("")),
+            "dir mode": lambda: self.req.chmod(0o775),
+            "dir a link": lambda: (os.rename(self.req, self.tmp / "real"),
+                                   os.symlink(self.tmp / "real", self.req)),
+            "dir absent": lambda: shutil.rmtree(self.req),
+            "not root's": lambda: mock.patch.object(b6, "ROOT_UID", os.getuid() + 1).start(),
+            "group not root's": lambda: mock.patch.object(b6, "ROOT_GID", os.getgid() + 1).start(),
+            "link not root's": lambda: mock.patch.object(b6.os, "stat", self.link_owner(os.getuid() + 1)).start(),
+        }
+        for name, brk in breaks.items():
+            with self.subTest(name):
+                self.setUp()
+                brk()
+                lines = "\n".join(self.graph(self.runner(self.units())).lines())
+                mock.patch.stopall()
+                self.assertIn("B6 enable-links FAIL", lines)
+                self.assertTrue(lines.endswith("M1-B6 graph FAIL"))
 
     def test_missing_unit_or_property(self):
         units = self.units()
         units.pop("m1-state-check.service")
-        self.assertFalse(b6.phase_graph(self.runner(units)).ok)
+        self.assertFalse(self.graph(self.runner(units)).ok)
         units = self.units()
         units["local-fs.target"] = {}
-        self.assertFalse(b6.phase_graph(self.runner(units)).ok)
+        self.assertFalse(self.graph(self.runner(units)).ok)
 
     def test_duplicate_property_line_fails(self):
         def run(argv, root=False, check=True):
