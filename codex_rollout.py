@@ -272,22 +272,69 @@ def stamp() -> str:
 BACKUPS_DIR = "rollout-backups"
 
 
+def resolved(path: Path) -> Path:
+    """`path` with its existing part resolved strictly (every link followed,
+    a loop or an unreadable component refused) and its missing tail, which
+    holds no link because it does not exist, appended as spelt. A `..` in
+    that tail is refused: there is nothing to resolve it against. The tail
+    is what backup or rollback will create."""
+    here, tail = (path if path.is_absolute() else Path.cwd() / path), []
+    try:
+        while True:
+            try:
+                top = here.resolve(strict=True)
+                break
+            except FileNotFoundError:
+                if here.parent == here:
+                    raise
+                if os.path.lexists(here):
+                    raise Refused(f"cannot resolve {path}: {here} is a link to nothing")
+                tail.insert(0, here.name)
+                here = here.parent
+    except (OSError, RuntimeError) as e:
+        raise Refused(f"cannot resolve {path} ({e})")
+    if ".." in tail:
+        raise Refused(f"cannot resolve {path}: '..' after a component that does not exist")
+    return top.joinpath(*tail)
+
+
+def within(path: Path, top: Path) -> bool:
+    """Whether the resolved `path` is the resolved directory `top` or under
+    it, by spelling or by identity (device and inode) of any existing
+    ancestor, so a spelling that differs only in case on a case-insensitive
+    disk is still inside."""
+    try:
+        t = os.stat(top)
+    except OSError as e:
+        raise Refused(f"cannot read {top} ({e})")
+    for p in (path, *path.parents):
+        if p == top:
+            return True
+        try:
+            s = os.stat(p)
+        except FileNotFoundError:
+            continue
+        except OSError as e:
+            raise Refused(f"cannot read {p} ({e})")
+        if (s.st_dev, s.st_ino) == (t.st_dev, t.st_ino):
+            return True
+    return False
+
+
 def features_clear(feature: Path, backups: Path) -> None:
-    """Nothing of this tool's in sandy's features directory, and no backup
-    root inside it: sandy reads each directory there as a feature and, on
-    one it refuses, mounts no feature in any sandbox it launches."""
+    """No backup root inside sandy's features directory, and nothing of this
+    tool's left there: sandy reads each directory there as a feature and, on
+    one it refuses, mounts no feature in any sandbox it launches. The root is
+    proven outside first, because the remedy for a left-over directory moves
+    its contents into the root; the root itself need not exist yet."""
     features = feature.parent
+    if within(resolved(backups), resolved(features)):
+        raise Refused(f"{backups} is inside sandy's features directory {features}; "
+                      f"set AMAP_ROOT to a directory outside it")
     stray = features / f"{feature.name}.{BACKUPS_DIR}"
     if os.path.lexists(stray):
         raise Refused(f"{stray} is in sandy's features directory, so sandy mounts no feature "
                       f"at launch; move its contents to {backups} and remove it")
-    try:
-        inside = backups.resolve().is_relative_to(features.resolve())
-    except OSError as e:
-        raise Refused(f"cannot resolve {backups} ({e})")
-    if inside:
-        raise Refused(f"{backups} is inside sandy's features directory {features}; "
-                      f"set AMAP_ROOT to a directory outside it")
 
 
 def backup(feature: Path, backups: Path) -> Path:
