@@ -362,6 +362,31 @@ class RolloutTest(unittest.TestCase):
         self.assertTrue(cr.within(other / "rollout-backups", features))
         self.assertFalse(cr.within(self.amap / "rollout-backups", features))
 
+    def test_a_features_directory_that_does_not_exist_yet_is_compared_by_spelling(self):
+        features = self.root / "fresh-home" / "features"
+        feature = features / "amap"
+        self.assertFalse(os.path.lexists(features.parent))
+        cr.features_clear(feature, self.amap / "rollout-backups")
+        for backups in (features / "rollout-backups", features.parent / "FEATURES" / "rollout-backups"):
+            with self.subTest(str(backups)):
+                with self.assertRaises(cr.Refused) as e:
+                    cr.features_clear(feature, backups)
+                self.assertIn("is inside sandy's features directory", str(e.exception))
+        self.assertFalse(os.path.lexists(features.parent), "the check creates nothing")
+
+    def test_a_features_directory_or_ancestor_that_cannot_be_read_is_refused(self):
+        features = cr.resolved(self.feature.parent)
+        real = os.stat
+        for unreadable in (features, self.amap):
+            def stat_(p, *a, _u=unreadable, **k):
+                if Path(p) == _u:
+                    raise PermissionError(13, "Permission denied", str(p))
+                return real(p, *a, **k)
+            with self.subTest(str(unreadable)), mock.patch.object(cr.os, "stat", stat_):
+                with self.assertRaises(cr.Refused) as e:
+                    cr.within(self.amap / "rollout-backups", features)
+                self.assertIn(f"cannot read {unreadable}", str(e.exception))
+
     def test_a_link_copied_before_its_target_and_a_directory_mode_survive_the_round_trip(self):
         # Copying a link's own metadata is not portable: in a reviewer's confined workspace
         # it resolved the link, so a link copied before its target raised ENOENT. Which

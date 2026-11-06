@@ -302,9 +302,14 @@ def within(path: Path, top: Path) -> bool:
     """Whether the resolved `path` is the resolved directory `top` or under
     it, by spelling or by identity (device and inode) of any existing
     ancestor, so a spelling that differs only in case on a case-insensitive
-    disk is still inside."""
+    disk is still inside. A `top` that does not exist yet has no identity
+    to compare, so `path` is inside it when an ancestor's spelling equals
+    `top`'s with case ignored, which refuses the spelling a case-insensitive
+    disk would make the same directory once it is created."""
     try:
         t = os.stat(top)
+    except FileNotFoundError:
+        return any(str(p).casefold() == str(top).casefold() for p in (path, *path.parents))
     except OSError as e:
         raise Refused(f"cannot read {top} ({e})")
     for p in (path, *path.parents):
