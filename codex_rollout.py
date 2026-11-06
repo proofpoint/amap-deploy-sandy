@@ -305,10 +305,17 @@ def within(path: Path, top: Path) -> bool:
     disk is still inside. A `top` that does not exist yet has no identity
     to compare, so `path` is inside it when an ancestor's spelling equals
     `top`'s with case ignored, which refuses the spelling a case-insensitive
-    disk would make the same directory once it is created."""
+    disk would make the same directory once it is created. That comparison
+    holds only for ASCII spellings: a disk that also ignores Unicode
+    normalization makes more spellings one directory, so a non-ASCII
+    spelling of either is refused rather than compared."""
     try:
         t = os.stat(top)
     except FileNotFoundError:
+        if not (str(path).isascii() and str(top).isascii()):
+            raise Refused(f"{top} does not exist yet and {path} or it is not spelt in ASCII, "
+                          f"so whether one is inside the other cannot be decided; "
+                          f"create {top}, or use an ASCII path")
         return any(str(p).casefold() == str(top).casefold() for p in (path, *path.parents))
     except OSError as e:
         raise Refused(f"cannot read {top} ({e})")

@@ -374,6 +374,25 @@ class RolloutTest(unittest.TestCase):
                 self.assertIn("is inside sandy's features directory", str(e.exception))
         self.assertFalse(os.path.lexists(features.parent), "the check creates nothing")
 
+    def test_a_non_ascii_spelling_against_a_features_directory_that_does_not_exist_is_refused(self):
+        # NFC and NFD spell one directory on a disk that ignores normalization; casefold alone
+        # does not equate them, so neither spelling may reach the by-spelling comparison.
+        nfc, nfd = "caf\u00e9", "cafe\u0301"
+        for features, backups in ((self.root / nfc / "features", self.root / nfd / "features" / "rollout-backups"),
+                                  (self.root / nfd / "features", self.root / nfc / "features" / "rollout-backups"),
+                                  (self.root / "fresh-home" / "features", self.root / nfc / "rollout-backups"),
+                                  # KELVIN SIGN folds to an ASCII "k": an ASCII path can alias a non-ASCII top.
+                                  (self.root / "\u212a" / "features", self.root / "k" / "features" / "rollout-backups")):
+            self.assertFalse(os.path.lexists(features))
+            with self.subTest(ascii(str(features)) + " " + ascii(str(backups))):
+                with self.assertRaises(cr.Refused) as e:
+                    cr.features_clear(features / "amap", backups)
+                self.assertIn("not spelt in ASCII", str(e.exception))
+        cr.features_clear(self.root / "fresh-home" / "features" / "amap", self.amap / "rollout-backups")
+        (self.root / nfc).mkdir()
+        self.assertTrue(cr.within(self.root / nfc / "rollout-backups", self.root / nfc),
+                        "an existing top is still compared by identity")
+
     def test_a_features_directory_or_ancestor_that_cannot_be_read_is_refused(self):
         features = cr.resolved(self.feature.parent)
         real = os.stat
