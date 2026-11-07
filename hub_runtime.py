@@ -98,6 +98,9 @@ ABSENT_PREFIXES = ("OAUTH2_",)
 BUDGET_S = ss.PROBE_BUDGET_S
 BUDGETS = ss.PROBE_BUDGETS
 SWITCHES_OFF = ("HUB_UNKNOWN_TARGET_DSN", "HUB_INTAKE_SWEEP")
+#: The runtime's RELAY_CLAIM switch: the hub-link router always runs with it on.
+CLAIM_ENV = "RELAY_CLAIM"
+CLAIM_VALUE = "on"
 #: How long the hub-link router may recover an inbound item, in days,
 #: rendered so the value the router validates at start (1..29) is the one
 #: verify compares. It must stay below the local router's dedup horizon.
@@ -415,6 +418,7 @@ def environment(spec: Any, hs: HubSpec) -> List[Tuple[str, str]]:
         raise HubSpecError(f"{s.principal} has {len(peers)} hop peers; the hub-link router needs exactly one")
     env = [
         ("RELAY_LINK_ROLE", ROLE),
+        (CLAIM_ENV, CLAIM_VALUE),
         ("SMTP_AUTH_METHOD", AUTH_METHOD),
         ("SMTP_PASSWORD_FILE", posixpath.join(s.container_dir, s.file)),
         ("SMTP_HOST", p["smtp_host"]),

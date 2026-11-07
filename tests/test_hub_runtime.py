@@ -403,6 +403,10 @@ class RenderingTest(unittest.TestCase):
                 env = hr.environment(s, s.hub)
                 self.assertEqual([v for k, v in env if k == hr.CARRIAGE_ENV], [value])
 
+    def test_relay_claim_is_rendered_on_exactly_once(self):
+        env = hr.environment(self.spec, self.spec.hub)
+        self.assertEqual([v for k, v in env if k == "RELAY_CLAIM"], ["on"])
+
     def test_the_d7_owner_is_root(self):
         self.assertEqual((self.env["HUB_D7_CONFIG"], self.env["HUB_D7_UID"]), ("/opt/ex/d7/d7.json", "0"))
 
@@ -567,6 +571,12 @@ class CompareTest(unittest.TestCase):
         live["Config"]["Env"] = [e for e in live["Config"]["Env"] if not e.startswith(hr.CARRIAGE_ENV + "=")]
         self.assertEqual(hr.compare(live, self.rendered, []),
                          [f"{hr.CARRIAGE_ENV} differs from the rendering and the image"])
+
+    def test_a_running_container_without_relay_claim_is_named(self):
+        live = copy.deepcopy(self.rendered)
+        live["Config"]["Env"] = [e for e in live["Config"]["Env"] if not e.startswith("RELAY_CLAIM=")]
+        self.assertEqual(hr.compare(live, self.rendered, []),
+                         ["RELAY_CLAIM differs from the rendering and the image"])
 
     def test_an_extra_mount_is_named(self):
         live = copy.deepcopy(self.rendered)
