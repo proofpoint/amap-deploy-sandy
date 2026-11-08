@@ -553,6 +553,28 @@ class VolumeTest(Base):
         self.assertNotIn("--cap-add", argv)
         self.assertIn("type=volume,src=ex-secret,dst=/v,volume-nocopy,readonly", argv)
         self.assertEqual(argv[-2:], ["stat-secret", "/v"])
+        # The runtime's image declares its own entrypoint (the hub-link router's is a mode dispatcher that refuses
+        # an unknown mode, as measured on the alpha VMs): the one-shot names python3 as the entrypoint, and the
+        # image is followed by python3's arguments, never by "python3" itself.
+        i = argv.index("ex/runtime@sha256:" + "a" * 64)
+        self.assertEqual(argv[i - 2:i + 4], ["--entrypoint", "python3", "ex/runtime@sha256:" + "a" * 64,
+                                             "-I", "-S", "/w/host_steps.py"])
+
+    def test_every_one_shot_role_names_python3_as_its_entrypoint(self):
+        # Each one-shot (the plan's root step, the writer, the stat) runs the pinned writer through python3 as the
+        # entrypoint, whatever ENTRYPOINT the runtime's image declares: the image is followed by python3's
+        # arguments, and "python3" never appears after the image.
+        s = spec()
+        img = "ex/runtime@sha256:" + "a" * 64
+        for role, kw in (("root", dict(user="0:0", rw=True, caps=ss.WRITER_CAPS)),
+                         ("writer", dict(user="0:0", rw=True, caps=ss.WRITER_CAPS, stdin=True)),
+                         ("stat", dict(user=f"{DOWN}:{DOWNGRP}", rw=False))):
+            argv = ss.oneshot(s, role, "r1", **kw)
+            i = argv.index(img)
+            self.assertEqual(argv[i - 2:i], ["--entrypoint", "python3"], role)
+            self.assertEqual(argv[i + 1:i + 4], ["-I", "-S", "/w/host_steps.py"], role)
+            self.assertEqual(argv.count("--entrypoint"), 1, role)
+            self.assertNotIn("python3", argv[i + 1:], role)
 
     def test_docker_through_sudo_where_recorded(self):
         s = spec(docker_via_sudo=True)
@@ -901,6 +923,7 @@ class PlanTest(unittest.TestCase):
         root = next(line for line in lines if line.endswith(f"root /v {DOWN} {DOWNGRP} 0700 --exclusive"))
         self.assertTrue(root.startswith("/usr/bin/python3 -I -S /opt/ex/libexec/host_steps.py lock /srv/op/run --"))
         self.assertNotIn("/dev/stdin", text)
+        self.assertIn("--entrypoint python3 ex/runtime@sha256:" + "a" * 64 + " -I -S /w/host_steps.py root /v ", root)
         for flag in ("--pull never", "--network none", "--cap-drop ALL", "--cap-add CHOWN",
                      "volume-nocopy", "/w,readonly"):
             self.assertIn(flag, root)

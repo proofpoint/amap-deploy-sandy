@@ -303,8 +303,11 @@ def oneshot(s: SecretSpec, role: str, run_id: str, *, user: str, rw: bool, caps:
     """A one-shot container in the reviewed shape: the pinned image, no pull,
     no network, no log, a read-only root, no core, no new privileges, every
     capability dropped but `caps`, the volume (no copy from the image) and
-    the writer directory read-only. `client` is the docker to run it with: a
-    live call's, from live_docker; the rendered plan's, docker(s), otherwise."""
+    the writer directory read-only. The image's python3 is named as the
+    entrypoint, so the pinned writer does not run the runtime image's declared
+    entrypoint (the hub-link router's is a mode dispatcher). `client` is the
+    docker to run it with: a live call's, from live_docker; the rendered
+    plan's, docker(s), otherwise."""
     vol = f"type=volume,src={s.volume},dst={IN_VOLUME},volume-nocopy" + ("" if rw else ",readonly")
     argv = (docker(s) if client is None else list(client)) + ["run", "--rm"] + (["-i"] if stdin else []) + [
         "--pull", "never", "--log-driver", "none", "--network", "none", "--read-only",
@@ -314,7 +317,7 @@ def oneshot(s: SecretSpec, role: str, run_id: str, *, user: str, rw: bool, caps:
         argv += ["--cap-add", c]
     argv += ["--label", f"org.amap.oneshot={role}", "--label", f"org.amap.run={run_id}",
              "--mount", vol, "--mount", f"type=bind,src={s.writer_dir},dst={IN_WRITER},readonly",
-             s.image, "python3", "-I", "-S", posixpath.join(IN_WRITER, WRITER)]
+             "--entrypoint", "python3", s.image, "-I", "-S", posixpath.join(IN_WRITER, WRITER)]
     return argv
 
 
