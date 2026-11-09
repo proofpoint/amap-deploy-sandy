@@ -29,6 +29,7 @@ from pathlib import Path
 import host_setup as hs
 import hub_runtime as hr
 import hub_supervise as hv
+import secret_setup as ss
 import router_health as rh
 from _gate import open_gate
 from test_hub_keys import full_doc as keys_doc
@@ -190,6 +191,9 @@ class SystemdTest(unittest.TestCase):
         self.assertEqual(body[k + 4:k + 11], ["-I", "-S", "-B", sec.writer, "lock", sec.run_dir, "--"])
         self.assertIn("probe-weekly", body)
         self.assertIn("probe-login", body)
+        x = body.index("XDG_RUNTIME_DIR=" + ss.PROBE_RUNTIME_DIR)
+        self.assertEqual(body[x - 1], "-e")
+        self.assertLess(x, body.index("probe-login"), "the runtime dir is set before the image runs")
         self.assertNotIn("sudo", " ".join(body), "root's argv never holds sudo")
         self.assertIn(b"OnCalendar=Mon *-*-* 04:17:00", timer)
         self.assertIn(b"Unit=hub-link-probe.service", timer)

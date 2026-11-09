@@ -120,6 +120,14 @@ APPORT_HOOK = "/usr/share/apport/apport"
 APPORT_DEFAULT = "/etc/default/apport"
 APPORT_UNITS = ("apport.service", "apport-forward.socket")
 
+#: The probe's XDG_RUNTIME_DIR. The runtime's relay.py builds its default lock
+#: path when it is imported, from XDG_RUNTIME_DIR or, when that is unset, from
+#: tempfile.gettempdir(), which raises under --read-only with no writable
+#: temporary directory. probe-login takes no lock, so the path is only computed,
+#: never created. It names no directory in the image, so a lock taken there would
+#: fail on the read-only root rather than write anywhere.
+PROBE_RUNTIME_DIR = "/nonexistent/amap-probe"
+
 
 class SecretSpecError(ValueError):
     """The secrets section is unusable."""
@@ -333,9 +341,9 @@ WRITER_CAPS = ("CHOWN", "FOWNER", "DAC_OVERRIDE")
 def probe(s: SecretSpec, run_id: str, root: bool = False) -> List[str]:
     """The one-shot login probe (the design's §6): the runtime's image, uid,
     read-only mount, network and SMTP settings, running only `probe-login`,
-    with its phase budgets set so the whole probe fits inside the weekly
-    job's timeout. `root`: the job root runs, which names docker directly
-    (root's argv never holds sudo)."""
+    with PROBE_RUNTIME_DIR as its XDG_RUNTIME_DIR and its phase budgets set
+    so the whole probe fits inside the weekly job's timeout. `root`: the job
+    root runs, which names docker directly (root's argv never holds sudo)."""
     if s.probe is None:
         raise SecretSpecError("secrets.probe is needed to render the probe")
     pr = s.probe
@@ -346,7 +354,8 @@ def probe(s: SecretSpec, run_id: str, root: bool = False) -> List[str]:
         "--mount", f"type=volume,src={s.volume},dst={s.container_dir},readonly,volume-nocopy",
         "-e", f"SMTP_PASSWORD_FILE={posixpath.join(s.container_dir, s.file)}",
         "-e", f"SMTP_USERNAME={pr['username']}", "-e", f"SMTP_HOST={pr['smtp_host']}",
-        "-e", f"SMTP_PORT={pr['smtp_port']}", "-e", "SMTP_AUTH_METHOD=password"]
+        "-e", f"SMTP_PORT={pr['smtp_port']}", "-e", "SMTP_AUTH_METHOD=password",
+        "-e", f"XDG_RUNTIME_DIR={PROBE_RUNTIME_DIR}"]
     for budget in PROBE_BUDGETS:
         argv += ["-e", f"{budget}={PROBE_BUDGET_S}"]
     return argv + [s.image, "probe-login"]

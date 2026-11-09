@@ -796,6 +796,28 @@ class RemedyAndProbeTest(Base):
         self.assertEqual(argv[argv.index("--user") + 1], f"{DOWN}:{DOWNGRP}")
         self.assertNotIn("--cap-add", argv)
 
+    def test_the_probe_sets_its_runtime_dir_and_mounts_nothing_for_it(self):
+        """The runtime's relay.py computes its default lock path at import, from
+        XDG_RUNTIME_DIR or else tempfile.gettempdir(), which raises under
+        --read-only with no writable temporary directory. Both forms of the
+        probe (the operator's, and the weekly job's root form) set it exactly
+        once, to PROBE_RUNTIME_DIR, before the image, set no TMPDIR, and mount
+        nothing but the secret volume."""
+        s = spec(probe={"network": "ex-net", "smtp_host": "hub.example.org", "smtp_port": 587,
+                        "username": "probe-user@ex.example.org"})
+        for root in (False, True):
+            argv = ss.probe(s, "w-1", root=root)
+            i = len(argv) - 2
+            self.assertEqual(argv[i:], ["ex/runtime@sha256:" + "a" * 64, "probe-login"])
+            envs = [argv[k + 1] for k in range(i) if argv[k] == "-e"]
+            self.assertEqual([e for e in envs if e.startswith("XDG_RUNTIME_DIR=")],
+                             ["XDG_RUNTIME_DIR=" + ss.PROBE_RUNTIME_DIR], f"root={root}")
+            self.assertFalse([e for e in envs if e.startswith("TMPDIR=")], f"root={root}")
+            self.assertEqual([argv[k + 1] for k in range(i) if argv[k] == "--mount"],
+                             ["type=volume,src=ex-secret,dst=/run/secrets/ex,readonly,volume-nocopy"], f"root={root}")
+            self.assertIn("--read-only", argv[:i])
+        self.assertTrue(ss.PROBE_RUNTIME_DIR.startswith("/nonexistent/"))
+
     def test_held_runs_the_stat_one_shot_without_the_wrapper(self):
         s = spec()
         seen = []
