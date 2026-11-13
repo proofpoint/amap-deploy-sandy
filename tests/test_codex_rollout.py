@@ -140,7 +140,7 @@ class RolloutTest(unittest.TestCase):
         return self.calls.read_text().splitlines() if self.calls.exists() else []
 
     def backups(self):
-        d = self.feature.parent / "amap.rollout-backups"
+        d = self.amap / "rollout-backups"
         return sorted(d.iterdir()) if d.exists() else []
 
     def launcher_text(self):
@@ -275,6 +275,136 @@ class RolloutTest(unittest.TestCase):
         aside = [p for p in self.backups() if p.name.endswith("-replaced")]
         self.assertEqual(len(aside), 1)
         self.assertEqual((aside[0] / "payload/codex/interactive-launch").read_text(), "new launcher\n")
+
+    # ---- sandy's features directory holds the feature and nothing of this tool's
+
+    def test_apply_and_rollback_leave_nothing_beside_the_feature_in_sandys_features_directory(self):
+        # Sandy reads each directory under features/ as a feature, and on one it refuses
+        # mounts none: only the backup's location can put a second entry there.
+        r = self.run_("apply")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(sorted(os.listdir(self.feature.parent)), ["amap"])
+        b, = self.backups()
+        r = self.run_("rollback", str(b))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(sorted(os.listdir(self.feature.parent)), ["amap"])
+        self.assertEqual(len(self.backups()), 2)
+
+    def test_a_backup_directory_left_in_sandys_features_directory_refuses_every_verb(self):
+        stray = self.feature.parent / "amap.rollout-backups"
+        (stray / "20261024T161750Z").mkdir(parents=True)
+        for args in (("check",), ("apply",), ("rollback", str(stray / "20261024T161750Z"))):
+            r = self.run_(*args)
+            self.assertEqual(r.returncode, 1, args)
+            self.assertIn(f"{stray} is in sandy's features directory, so sandy mounts no feature "
+                          f"at launch; move its contents to {self.amap / 'rollout-backups'}", r.stderr)
+        self.assertEqual(self.installs(), [])
+        self.assertEqual(self.launcher_text(), "old launcher\n")
+
+    def test_a_backup_root_inside_sandys_features_directory_refuses(self):
+        with self.assertRaises(cr.Refused) as e:
+            cr.features_clear(self.feature, self.feature.parent / "elsewhere" / "rollout-backups")
+        self.assertIn("is inside sandy's features directory", str(e.exception))
+        cr.features_clear(self.feature, self.amap / "rollout-backups")
+
+    def test_a_root_inside_the_left_over_directory_is_refused_before_any_move_is_named(self):
+        # The left-over directory's remedy moves its contents into the root and removes it:
+        # with the root inside it, following that would delete the moved backups.
+        stray = self.feature.parent / "amap.rollout-backups"
+        (stray / "20261024T161750Z").mkdir(parents=True)
+        for args in (("check",), ("apply",), ("rollback", str(stray / "20261024T161750Z"))):
+            r = self.run_(*args, AMAP_ROOT=str(stray))
+            self.assertEqual(r.returncode, 1, args)
+            self.assertIn(f"{stray / 'rollout-backups'} is inside sandy's features directory", r.stderr)
+            self.assertNotIn("move its contents", r.stderr)
+        self.assertEqual(self.installs(), [])
+        self.assertEqual(sorted(os.listdir(stray)), ["20261024T161750Z"])
+
+    def test_a_root_reaching_the_features_directory_through_a_link_or_dotdot_is_inside(self):
+        features = self.feature.parent
+        (self.root / "via").symlink_to(features)
+        dotdot = self.amap / ".." / "sandy-home" / "features" / "x" / "rollout-backups"
+        for backups in (self.root / "via" / "rollout-backups", dotdot):
+            with self.subTest(str(backups)), self.assertRaises(cr.Refused) as e:
+                cr.features_clear(self.feature, backups)
+            self.assertIn("is inside sandy's features directory", str(e.exception))
+
+    def test_a_root_that_cannot_be_resolved_is_refused(self):
+        (self.root / "loop").symlink_to("loop")
+        (self.root / "nowhere").symlink_to("absent-target")
+        for backups, why in ((self.root / "loop" / "rollout-backups", "cannot resolve"),
+                             (self.root / "nowhere" / "rollout-backups", "is a link to nothing"),
+                             (self.root / "absent" / ".." / "rollout-backups", "'..' after a component")):
+            with self.subTest(str(backups)), self.assertRaises(cr.Refused) as e:
+                cr.features_clear(self.feature, backups)
+            self.assertIn(why, str(e.exception))
+
+    def test_a_root_that_does_not_exist_yet_is_accepted_and_apply_makes_it(self):
+        backups = self.root / "fresh" / "rollout-backups"
+        self.assertFalse(os.path.lexists(backups.parent))
+        cr.features_clear(self.feature, backups)
+        self.assertFalse(os.path.lexists(backups.parent), "the check creates nothing")
+        self.assertFalse(os.path.lexists(self.amap / "rollout-backups"))
+        r = self.run_("apply")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue((self.amap / "rollout-backups").is_dir())
+
+    def test_a_spelling_of_the_features_directory_that_differs_only_in_case_is_inside(self):
+        # Stands in for a case-insensitive disk: the other spelling is the same directory.
+        features = cr.resolved(self.feature.parent)
+        other = features.parent / features.name.upper()
+        real = os.stat
+
+        def stat_(p, *a, **k):
+            return real(features if Path(p) == other else p, *a, **k)
+        cr.os.stat = stat_
+        self.addCleanup(setattr, cr.os, "stat", real)
+        self.assertTrue(cr.within(other / "rollout-backups", features))
+        self.assertFalse(cr.within(self.amap / "rollout-backups", features))
+
+    def test_a_features_directory_that_does_not_exist_yet_is_compared_by_spelling(self):
+        features = self.root / "fresh-home" / "features"
+        feature = features / "amap"
+        self.assertFalse(os.path.lexists(features.parent))
+        cr.features_clear(feature, self.amap / "rollout-backups")
+        for backups in (features / "rollout-backups", features.parent / "FEATURES" / "rollout-backups"):
+            with self.subTest(str(backups)):
+                with self.assertRaises(cr.Refused) as e:
+                    cr.features_clear(feature, backups)
+                self.assertIn("is inside sandy's features directory", str(e.exception))
+        self.assertFalse(os.path.lexists(features.parent), "the check creates nothing")
+
+    def test_a_non_ascii_spelling_against_a_features_directory_that_does_not_exist_is_refused(self):
+        # NFC and NFD spell one directory on a disk that ignores normalization; casefold alone
+        # does not equate them, so neither spelling may reach the by-spelling comparison.
+        nfc, nfd = "caf\u00e9", "cafe\u0301"
+        for features, backups in ((self.root / nfc / "features", self.root / nfd / "features" / "rollout-backups"),
+                                  (self.root / nfd / "features", self.root / nfc / "features" / "rollout-backups"),
+                                  (self.root / "fresh-home" / "features", self.root / nfc / "rollout-backups"),
+                                  # KELVIN SIGN folds to an ASCII "k": an ASCII path can alias a non-ASCII top.
+                                  (self.root / "\u212a" / "features", self.root / "k" / "features" / "rollout-backups")):
+            self.assertFalse(os.path.lexists(features))
+            with self.subTest(ascii(str(features)) + " " + ascii(str(backups))):
+                with self.assertRaises(cr.Refused) as e:
+                    cr.features_clear(features / "amap", backups)
+                self.assertIn("not spelt in ASCII", str(e.exception))
+        cr.features_clear(self.root / "fresh-home" / "features" / "amap", self.amap / "rollout-backups")
+        (self.root / nfc).mkdir()
+        self.assertTrue(cr.within(self.root / nfc / "rollout-backups", self.root / nfc),
+                        "an existing top is still compared by identity")
+
+    def test_a_features_directory_or_ancestor_that_cannot_be_read_is_refused(self):
+        features = cr.resolved(self.feature.parent)
+        real = os.stat
+        for unreadable in (features, self.amap):
+            def stat_(p, *a, _u=unreadable, **k):
+                if Path(p) == _u:
+                    raise PermissionError(13, "Permission denied", str(p))
+                return real(p, *a, **k)
+            with self.subTest(str(unreadable)), mock.patch.object(cr.os, "stat", stat_):
+                with self.assertRaises(cr.Refused) as e:
+                    cr.within(self.amap / "rollout-backups", features)
+                self.assertIn(f"cannot read {unreadable}", str(e.exception))
 
     def test_a_link_copied_before_its_target_and_a_directory_mode_survive_the_round_trip(self):
         # Copying a link's own metadata is not portable: in a reviewer's confined workspace
