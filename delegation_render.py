@@ -6,8 +6,10 @@ The block (the local router's `_delegation` at the hop pin):
 - `signing_key`: the keys section's path, and this host's inventory entry's
   `key_id` and `public_key`;
 - `runtimes`: every other inventory entry, each with its one key;
-- `crypto`: exactly `{"crypto_backend": "pyca"}`. The openssl backend and its
-  path are never rendered, so no new tool joins the router's closure;
+- `crypto`: exactly `{"crypto_backend": "pyca"}` by default, so no new tool
+  joins the router's closure. ALPHA-2 passes `crypto=CRYPTO_OPENSSL` (ruling
+  W7-CRYPTO-OPENSSL), the one other value rendered: its path is fixed, and
+  the caller measures that tool on the router's side;
 - `inbound`: present, and true, only where the policy turns it on.
 `partition_verified` is never rendered here: A3 adds the token.
 
@@ -45,6 +47,9 @@ import fleet_keys as fk
 POLICY_MEMBER = "delegation"
 POLICY_MEMBERS = frozenset({"inbound"})
 CRYPTO = {"crypto_backend": "pyca"}
+CRYPTO_OPENSSL = {"crypto_backend": "openssl", "openssl_path": "/usr/bin/openssl"}
+#: The only crypto members ever rendered.
+CRYPTO_CHOICES = (CRYPTO, CRYPTO_OPENSSL)
 
 
 class DelegationRenderError(ValueError):
@@ -59,11 +64,14 @@ def parse_policy(raw: Any) -> Optional[bool]:
     return raw["inbound"]
 
 
-def render_block(*, key_path: str, me: fk.Host, peers: Sequence[fk.Host], inbound: bool) -> Dict[str, Any]:
+def render_block(*, key_path: str, me: fk.Host, peers: Sequence[fk.Host], inbound: bool,
+                 crypto: Dict[str, str] = CRYPTO) -> Dict[str, Any]:
+    if not any(crypto == c for c in CRYPTO_CHOICES):
+        raise DelegationRenderError("crypto must be one of the rendered choices, not " + repr(crypto))
     block: Dict[str, Any] = {
         "signing_key": {"path": key_path, "key_id": me.key_id, "public_key": me.public_key},
         "runtimes": [p.table_entry() for p in peers],
-        "crypto": dict(CRYPTO),
+        "crypto": dict(crypto),
     }
     if inbound:
         block["inbound"] = True

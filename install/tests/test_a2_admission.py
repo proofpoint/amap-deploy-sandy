@@ -729,6 +729,18 @@ class EndToEndTest(Base):
         rc = a2_main.main(["--loop", "L2"], site.installer_sha, site.entry, site)
         self.assertEqual((rc, site.out.getvalue()), (2, ""))
 
+    def test_an_l1_that_runs_s6_or_later_without_s3_is_refused_before_anything_runs(self):
+        """Ruling W5-R13-L1-STAGESET-REQUIRED, through the launcher: the refusal comes before the private files are
+        read, any lock is taken or the runner is executed, so no stage, S6 or later included, writes a receipt."""
+        for argv in (["--only", "S6"], ["--only", "S6b"], ["--only", "S9"], ["--from", "S4"], ["--from", "S5"],
+                     ["--from", "S6"], ["--from", "S10"]):
+            with self.subTest(argv=argv):
+                site = self.w.site()
+                self.refuses("RUNNER.STAGE_SET", a2_admit.launch, argv, site)
+                self.assertEqual(site.exec_calls, [])
+                self.assertFalse(os.path.exists(os.path.join(self.w.home, "alpha2-work", "runs")) and any(
+                    os.listdir(os.path.join(self.w.home, "alpha2-work", "runs"))))
+
     def test_launcher_refuses_while_another_run_holds_a_target(self):
         self.holder(a2_locks.lock_path(self.w.root, "hv"))
         self.refuses("RUNNER.TARGET_LOCKED", a2_admit.launch, ["--loop", "L2"], self.w.site())
@@ -1185,6 +1197,62 @@ class DirectPathTest(Base):
         for bad in ("../../x", "20261116T000000Z-0000000g"):
             self.refuses("RUNNER.ADMISSION", self.admit, bad, ["--verify"])
         self.assertEqual(os.listdir(os.path.join(self.w.home, "alpha2-work", "runs")), [])
+
+
+class WritersPerStageSetTest(Base):
+    """6.1/3.7 (ruling LOCK-WRITERS-PER-STAGE-SET): a lock may pin 0 to 2
+    writers; admission refuses PREFLIGHT.LOCK, before any lock target is
+    taken, unless every writer whose stage the run executes is pinned. Only
+    an L1 run (--only/--from) can leave a writer's stage out."""
+
+    def lock_with(self, uses):
+        doc = copy.deepcopy(a2fix.LOCK)
+        doc["writers"] = [w for w in doc["writers"] if w["use"] in uses]
+        self.w.write_private(lock_raw=a2fix.dumps(doc))
+
+    def admits(self, argv):
+        c = a2_admit._common(argv, self.w.site())
+        self.assertEqual(c.inv.command, "install")
+
+    def test_without_writers_only_l1_runs_before_s6b_are_admitted(self):
+        """Under RUNNER.STAGE_SET an L1 that reaches S6b or S7 also runs S3, so it runs both writers' stages: only an
+        --only of S0 to S5 is admitted without writers."""
+        self.lock_with(())
+        for argv in (["--only", "S0"], ["--only", "S3"], ["--only", "S5"]):
+            with self.subTest(argv=argv):
+                self.admits(argv)
+        for argv in (["--from", "S3"], ["--from", "S0"], ["--loop", "L2"], ["--leak-run"]):
+            with self.subTest(argv=argv):
+                e = self.refuses("PREFLIGHT.LOCK", a2_admit._common, argv, self.w.site())
+                self.assertEqual(e.detail, "writers")
+
+    def test_one_writer_is_never_enough_for_a_run_reaching_its_stages(self):
+        """Each writer is tied to its own stage (WritersRequiredTest covers the function over every stage set). Every
+        L1 that RUNNER.STAGE_SET admits and that reaches S6b or S7 runs both, so one pinned writer refuses it."""
+        for one in (("hub_login",), ("api_key",)):
+            with self.subTest(pinned=one):
+                self.lock_with(one)
+                self.refuses("PREFLIGHT.LOCK", a2_admit._common, ["--from", "S3"], self.w.site())
+                self.admits(["--only", "S5"])
+
+    def test_with_both_writers_every_run_passes_this_check(self):
+        self.lock_with(("api_key", "hub_login"))
+        for argv in (["--loop", "L2"], ["--from", "S0"], ["--from", "S3"], ["--only", "S5"]):
+            with self.subTest(argv=argv):
+                a2_admit._common(argv, self.w.site())
+
+    def test_the_schema_takes_zero_to_two_unique_writers(self):
+        import a2_private
+        doc = copy.deepcopy(a2fix.LOCK)
+        for writers in ([], doc["writers"][:1], doc["writers"]):
+            with self.subTest(n=len(writers)):
+                d = dict(doc, writers=writers)
+                a2_private.check_lock(a2_private.parse(a2fix.dumps(d), "alpha2.lock/1"))
+        for writers in (doc["writers"] + doc["writers"][:1], [doc["writers"][0], doc["writers"][0]]):
+            with self.subTest(n=len(writers)):
+                with self.assertRaises(a2_private.Invalid):
+                    a2_private.check_lock(a2_private.parse(a2fix.dumps(dict(doc, writers=writers)),
+                                                           "alpha2.lock/1"))
 
 
 if __name__ == "__main__":

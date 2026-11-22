@@ -12,6 +12,7 @@ import sys
 RUNNER_SENTENCES = {
     'RUNNER.ENV': 'Look at the launch line: the environment holds a variable it does not allow.',
     'RUNNER.ARGS': "Look at the command's arguments: one does not match its pattern.",
+    'RUNNER.STAGE_SET': "Look at the command's arguments: an L1 that runs S6 or a later stage must also run S3.",
     'RUNNER.HOSTS_TARGETS': 'Look at alpha2.hosts: two targets share a name.',
     'RUNNER.LOCK_ROOT': 'Look at the runner entry in alpha2.hosts and the lock root: this host or its lock root is not the one named there, or the lock root or a lock file is missing or not owned and moded as required.',
     'RUNNER.TARGET_LOCKED': 'Look at the target named in the message: another run holds its lock.',
@@ -28,7 +29,7 @@ RUNNER_SENTENCES = {
     'PREFLIGHT.NET_RUNTIME': "Look at NET's runtime on the runner host: it is missing or cannot run offline.",
     'PREFLIGHT.LEAK_LOCK': 'Look at alpha2.lock: it fails the leak check named in the receipt.',
     'PREFLIGHT.LEAK_HOSTS': 'Look at alpha2.hosts: it fails the leak check named in the receipt.',
-    'PREFLIGHT.PRIVATE_SOURCE': "Look at the private overlay checkout: a file is not from it, it is not clean at a commit, a file's bytes differ from its blob at HEAD, or it does not meet the lock's overlay pin and tag.",
+    'PREFLIGHT.PRIVATE_SOURCE': "Look at the private overlay checkout: a file is not from it, its working tree is not exactly the tagged commit's tree, a file's bytes differ from that tree, or the tagged commit does not meet the lock's overlay pin.",
     'PREFLIGHT.REPO_ACCESS': 'Look at access to the repository named in the receipt.',
     'PREFLIGHT.FETCH': 'Look at the work directory: a pinned commit was not fetched, or its pinned tag is not that commit.',
     'PREFLIGHT.TARGET_ACCESS': 'Look at access to the target named in the receipt.',
@@ -36,7 +37,7 @@ RUNNER_SENTENCES = {
     'PREFLIGHT.OPERATOR_ROUTE': "Look at the operator's ssh route from the runner host to the target named in the receipt.",
     'PREFLIGHT.LIVE_DEPLOY': "Look at the work directory: it is the runner host's live deploy.",
     'PREFLIGHT.KEEP_AWAKE': "Look at the runner host's sleep settings: sleep is not shown disabled.",
-    'PREFLIGHT.SURVEY': 'Look at the survey in the receipt: an l3 target differs from the bare start state.',
+    'PREFLIGHT.SURVEY': 'Look at the survey in the receipt: an l3 target differs from the bare start state, or a loop target is not at its pinned snapshot.',
     'PREFLIGHT.HANDOFF': "Look at the stop file, the hypervisor's loop tasks and, for an L3 or bare install or a destroy, the hypervisor's L3 arm gate: one does not allow this run.",
     'PREFLIGHT.BUDGET': "Look at the loop's budget: the day's runs are used up, its account usage is not shown below the limit, the broker refused the start record, or budget.d could not be read.",
 }
@@ -58,6 +59,17 @@ STAGE_SENTENCES = {
     'PREDECESSOR_FAILED': 'Look at the predecessor receipt: its stage did not pass.',
     'PREDECESSOR_INSTALLER': 'Look at the predecessor receipt: a different installer wrote it.',
     'PIN': 'Look at the pin in alpha2.lock and the file, image or commit it names: they differ.',
+    'TARGET_ACCESS': 'Look at the VM named in the receipt: the route to it failed, timed out, or is not configured.',
+    'EXISTS_DIFFERENT': 'Look at the router key on the VM named in the receipt: a key is already there, and the router.json there names another.',
+    'INTERPRETER': 'Look at the VM named in the receipt: its python3 is older than the release the stage requires.',
+    'CLOCK': "Look at hub-t's clock: it differs from this machine's by more than the allowed skew, or could not be read.",
+    'HUB_NAME': "Look at alpha2.hosts: the run's hub name is not a host key of the pinned inventory.",
+    'HUB_HOSTNAME': "Look at this run's S3 receipt: its HUB_HOSTNAME fact, the hub's mail server hostname, is missing or malformed.",
+    'ROUTER_REFUSED': "Look at router.json on the VM named in the receipt: the router's own check of it failed.",
+    'PEER_STORE': "Look at the router's peer store on the VM named in the receipt: it is not ready with admission open, or its initialisation failed; it is never retried or repaired.",
+    'REGISTRY': "Look at the router's registry entry on the VM named in the receipt: the registry program refused it, or its read-back does not match.",
+    'PLACED_DIFFERENT': "Look at the directory on the VM named in the receipt: a file the stage places is there and differs, or the directory holds a name the stage does not place; nothing is ever replaced.",
+    'OWNER': 'Look at the path on the VM named in the receipt: it, or a directory above it, has another owner, group or mode than the stage requires; it is never repaired.',
     'NOT_RESTORED': "Look at the receipt's final observed state: a write failed and the restore did not complete.",
     'UNCLASSIFIED': "Look at the receipt's final observed state: this stage failed in a way it does not name.",
 }
@@ -93,9 +105,18 @@ class Refusal(Exception):
         return EXIT.get(self.cause, DEFAULT_EXIT)
 
 
+#: The prefixes whose causes come before any write to a target: the runner and launcher, S0 and S1.
+NOT_WRITING_PREFIXES = ("RUNNER", "PREFLIGHT", "CREDENTIALS")
+
+
 def _two_or_three(cause):
-    """Causes whose exit is 2 or 3 by whether a write happened (4.2, 4.3)."""
-    return cause in ("RUNNER.CUSTODY", "RUNNER.OUTPUT_GUARD") or cause.endswith(".UNCLASSIFIED")
+    """Causes whose exit is 2 or 3 by whether a write happened (3.4, 4.2, 4.3): RUNNER.CUSTODY and
+    RUNNER.OUTPUT_GUARD, every UNCLASSIFIED, and every cause of a stage that writes. A stage's cause exits 2 before
+    the stage's first write and 3 after it, keeping its name: exit 2 always means the stage wrote nothing."""
+    if cause in ("RUNNER.CUSTODY", "RUNNER.OUTPUT_GUARD") or cause.endswith(".UNCLASSIFIED"):
+        return True
+    stage, _, name = cause.partition(".")
+    return stage not in NOT_WRITING_PREFIXES and name in STAGE_SENTENCES
 
 
 def sentence(cause):

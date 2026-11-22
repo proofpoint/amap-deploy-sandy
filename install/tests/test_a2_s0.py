@@ -15,6 +15,7 @@ import unittest
 import a2fix
 from a2fix import git
 import a2_budget
+import a2_git
 import a2_args
 import a2_locks
 import a2_main
@@ -22,6 +23,11 @@ import a2_record
 from a2_causes import Refusal
 
 NOT_BUILT = a2_main.NOT_BUILT
+
+
+def _append(path, text):
+    with open(path, "a") as f:
+        f.write(text)
 
 
 class Base(unittest.TestCase):
@@ -238,14 +244,25 @@ class GitSafetyTest(Base):
                 self.assertEqual((f.read(), os.stat(p).st_mtime_ns), (data, mtime))
 
     def test_a_checkouts_fsmonitor_never_runs(self):
-        marker = os.path.join(self.base, "fsmonitor-ran")
-        script = os.path.join(self.base, "fsmon.sh")
-        with open(script, "w") as f:
-            f.write("#!/bin/sh\ntouch %s\nexit 1\n" % marker)
-        os.chmod(script, 0o755)
-        git(self.w.private, "config", "core.fsmonitor", script)
-        self.assert_s0_pass(self.run_s0())
-        self.assertFalse(os.path.exists(marker))
+        """In the installer's own checkout, where S0 does run git status, a
+        configured fsmonitor is overridden; in the private checkout no git
+        runs at all."""
+        for repo in (self.gw.inst, self.w.private):
+            with self.subTest(repo=repo):
+                marker = os.path.join(self.base, "fsmonitor-ran")
+                script = os.path.join(self.base, "fsmon.sh")
+                with open(script, "w") as f:
+                    f.write("#!/bin/sh\ntouch %s\nexit 1\n" % marker)
+                os.chmod(script, 0o755)
+                git(repo, "config", "core.fsmonitor", script)
+                try:
+                    self.assert_s0_pass(self.run_s0())
+                finally:
+                    git(repo, "config", "--unset", "core.fsmonitor")
+                    for h in self.held:
+                        a2_locks.release(h)
+                    self.held = []
+                self.assertFalse(os.path.exists(marker))
 
     def test_a_global_config_in_home_has_no_effect(self):
         """GIT_CONFIG_GLOBAL=/dev/null: a redirect in the run's HOME is not read."""
@@ -274,25 +291,84 @@ class GitSafetyTest(Base):
         self.assertEqual(seen[-1], a2_git.env_for(self.w.home, ""))
         self.assertNotIn("LC_CTYPE", seen[-1])
 
-    def test_bytes_admitted_not_reread(self):
-        """S0 checks the bytes admission read. A change to the file after
-        admission (hidden from status by skip-worktree) is not what L6 hashes."""
+    def test_no_git_command_runs_in_the_private_checkout(self):
+        """Every git S0 runs names its repository with -C: none is the
+        private checkout or anything under it."""
         import a2_git
+        repos = []
+
+        class Recording(a2_git.Git):
+            def run(self, repo, *args, **kw):
+                repos.append(os.path.realpath(repo))
+                return super().run(repo, *args, **kw)
+        o = self.gw.site_over()
+        self.assert_s0_pass(self.run_s0(git=Recording(o["git"].env, protocols=("file",))))
+        priv = os.path.realpath(self.w.private)
+        self.assertTrue(repos)
+        self.assertEqual([r for r in repos if r == priv or r.startswith(priv + os.sep)], [])
+
+    def test_the_checkouts_own_config_never_runs(self):
+        """The probe the S0 review measured: a clean filter in the checkout's
+        .git/config, `* filter=p` in .git/info/attributes, and a tracked file
+        whose stat changed. S0 passes and the filter never ran."""
+        import time
+        marker = os.path.join(self.base, "filter-ran")
         priv = self.w.private
-        p = os.path.join(priv, "alpha2.hosts")
-        git(priv, "update-index", "--skip-worktree", "alpha2.hosts")
+        git(priv, "config", "filter.p.clean", "touch %s; cat" % marker)
+        os.makedirs(os.path.join(priv, ".git", "info"), exist_ok=True)
+        with open(os.path.join(priv, ".git", "info", "attributes"), "w") as f:
+            f.write("* filter=p\n")
+        os.utime(os.path.join(priv, "alpha2.hosts"), (time.time() + 5, time.time() + 5))
+        self.assert_s0_pass(self.run_s0())
+        self.assertFalse(os.path.exists(marker))
+
+    def test_what_the_checkouts_git_dir_holds_does_not_matter(self):
+        """.git is never opened: a config of garbage, then a .git that is a
+        plain file, each leave S0 passing."""
+        priv = self.w.private
+        with open(os.path.join(priv, ".git", "config"), "w") as f:
+            f.write("[[[ not git config\n")
+        self.assert_s0_pass(self.run_s0())
+        for h in self.held:
+            a2_locks.release(h)
+        self.held = []
+        shutil.rmtree(os.path.join(priv, ".git"))
+        with open(os.path.join(priv, ".git"), "w") as f:
+            f.write("gitdir: /nonexistent\n")
+        self.assert_s0_pass(self.run_s0())
+
+    def test_l6_compares_the_bytes_admission_read(self):
+        """Admission reads a hosts file one byte longer than the tag's; by the
+        time S0 walks the working tree it is the tag's again. The walk alone
+        would pass: only L6, on the bytes admission read, refuses."""
+        import a2_git
+        p = os.path.join(self.w.private, "alpha2.hosts")
+        with open(p, "rb") as f:
+            original = f.read()
+        with open(p, "ab") as f:
+            f.write(b"\n")
+
+        class Restoring(a2_git.Git):
+            def tree_files(self, repo, rev):
+                with open(p, "wb") as f:
+                    f.write(original)
+                return super().tree_files(repo, rev)
+        o = self.gw.site_over()
+        self.assert_s0_fail("PREFLIGHT.PRIVATE_SOURCE", git=Restoring(o["git"].env, protocols=("file",)))
+
+    def test_a_change_after_admission_refuses(self):
+        """A file changed after admission read it: the working tree is no
+        longer the tag's tree, whatever git's index says."""
+        import a2_git
+        p = os.path.join(self.w.private, "alpha2.hosts")
 
         class Changing(a2_git.Git):
-            done = []
-
-            def head(self, repo):
-                if repo == priv and not self.done:
-                    self.done.append(1)
-                    with open(p, "ab") as f:
-                        f.write(b"\n")
-                return super().head(repo)
+            def tree_files(self, repo, rev):
+                with open(p, "ab") as f:
+                    f.write(b"\n")
+                return super().tree_files(repo, rev)
         o = self.gw.site_over()
-        self.assert_s0_pass(self.run_s0(git=Changing(o["git"].env, protocols=("file",))))
+        self.assert_s0_fail("PREFLIGHT.PRIVATE_SOURCE", git=Changing(o["git"].env, protocols=("file",)))
 
 
 class InterpreterTest(Base):
@@ -411,17 +487,131 @@ class PrivateSourceTest(Base):
             "+refs/tags/alpha2-rc1")
         self.assert_s0_fail("PREFLIGHT.PRIVATE_SOURCE")
 
-    def test_mode_only_change_to_hosts(self):
-        p = os.path.join(self.w.private, "alpha2.hosts")
-        git(self.w.private, "update-index", "--chmod=+x", "alpha2.hosts")
-        os.chmod(p, 0o700)
-        git(self.w.private, "commit", "-q", "-m", "mode")
-        os.chmod(p, 0o700)
-        lock = copy.deepcopy(self.gw.lock)
-        self.gw.commit_lock(lock)
-        os.chmod(p, 0o600)
-        git(self.w.private, "update-index", "--chmod=+x", "alpha2.hosts")
+    def test_a_working_file_whose_exec_bit_differs_from_the_tree(self):
+        os.chmod(os.path.join(self.w.private, "alpha2.hosts"), 0o700)
         self.assert_s0_fail("PREFLIGHT.PRIVATE_SOURCE")
+
+    def track_in_overlay(self, name, mode):
+        """Commit `name` and make that commit overlay.commit, then commit the
+        lock on top: rule 3 then sees only the lock, so the walk alone is
+        what can refuse."""
+        priv = self.w.private
+        p = os.path.join(priv, name)
+        with open(p, "w") as f:
+            f.write("#!/bin/sh\n")
+        os.chmod(p, mode)
+        git(priv, "add", name)
+        git(priv, "commit", "-q", "-m", "extra")
+        lock = copy.deepcopy(self.gw.lock)
+        lock["overlay"]["commit"] = git(priv, "rev-parse", "HEAD")
+        self.gw.commit_lock(lock)
+        return p
+
+    def test_an_executable_in_the_tree_needs_the_exec_bit(self):
+        """The other direction: the tree has a 100755 file, the working copy
+        has lost the bit."""
+        tool = self.track_in_overlay("tool.sh", 0o700)
+        self.assert_s0_pass(self.run_s0())
+        for h in self.held:
+            a2_locks.release(h)
+        self.held = []
+        os.chmod(tool, 0o600)
+        self.assert_s0_fail("PREFLIGHT.PRIVATE_SOURCE")
+
+    def test_a_missing_tracked_file_refuses(self):
+        p = self.track_in_overlay("readme", 0o600)
+        self.assert_s0_pass(self.run_s0())
+        for h in self.held:
+            a2_locks.release(h)
+        self.held = []
+        os.unlink(p)
+        self.assert_s0_fail("PREFLIGHT.PRIVATE_SOURCE")
+
+    def test_the_working_tree_must_be_exactly_the_tags_tree(self):
+        priv = self.w.private
+        cases = (
+            ("an untracked file", lambda: open(os.path.join(priv, "extra"), "w").close()),
+            ("an ignored file", lambda: (_append(os.path.join(priv, ".git", "info", "exclude"), "junk\n"),
+                                         open(os.path.join(priv, "junk"), "w").close())),
+            ("a symlink", lambda: os.symlink("alpha2.lock", os.path.join(priv, "link"))),
+            ("a file in a subdirectory", lambda: (os.mkdir(os.path.join(priv, "d")),
+                                                  open(os.path.join(priv, "d", "x"), "w").close())),
+            ("a nested .git", lambda: (os.mkdir(os.path.join(priv, "d")), os.mkdir(os.path.join(priv, "d", ".git")),
+                                       open(os.path.join(priv, "d", ".git", "x"), "w").close())),
+            ("a FIFO", lambda: os.mkfifo(os.path.join(priv, "fifo"))),
+            ("a symlinked directory", lambda: os.symlink(self.base, os.path.join(priv, "dlink"))),
+        )
+        for label, act in cases:
+            with self.subTest(case=label):
+                snap = os.path.join(self.base, "snap")
+                shutil.copytree(priv, snap, symlinks=True)
+                try:
+                    act()
+                    self.assert_s0_fail("PREFLIGHT.PRIVATE_SOURCE")
+                finally:
+                    for h in self.held:
+                        a2_locks.release(h)
+                    self.held = []
+                    shutil.rmtree(priv)
+                    os.rename(snap, priv)
+
+    def test_an_empty_directory_is_not_a_difference(self):
+        """git tracks no directory, so an empty one is in no tree."""
+        os.mkdir(os.path.join(self.w.private, "empty"))
+        self.assert_s0_pass(self.run_s0())
+
+    def test_the_walk_bounds(self):
+        import a2_s0
+        for name, value in (("WORKTREE_MAX_FILES", 1), ("WORKTREE_MAX_FILE", 8)):
+            with self.subTest(bound=name):
+                old = getattr(a2_s0, name)
+                setattr(a2_s0, name, value)
+                try:
+                    self.assert_s0_fail("PREFLIGHT.PRIVATE_SOURCE")
+                finally:
+                    setattr(a2_s0, name, old)
+                    for h in self.held:
+                        a2_locks.release(h)
+                    self.held = []
+
+    def test_a_symlinked_or_absent_private_dir_refuses(self):
+        import a2_s0
+        import types
+        link = os.path.join(self.base, "private-link")
+        os.symlink(self.w.private, link)
+        self.assert_s0_fail("PREFLIGHT.PRIVATE_SOURCE", private_dir=link)
+        # Unset: refused before any git runs (admission refuses it first in a run; this is S0's own check).
+        class NoGit:
+            def __getattr__(self, name):
+                raise AssertionError("git used: " + name)
+        with self.assertRaises(Refusal) as cm:
+            a2_s0.check_private_source(types.SimpleNamespace(lock={"overlay": {}}),
+                                       types.SimpleNamespace(private_dir=None, git=NoGit()))
+        self.assertEqual(cm.exception.cause, "PREFLIGHT.PRIVATE_SOURCE")
+
+    def test_a_deep_or_wide_directory_tree_refuses_by_name(self):
+        """Directory depth and count are bounded and refuse PREFLIGHT.
+        PRIVATE_SOURCE: a 1200-level chain (past Python's recursion limit)
+        and, with the bounds patched low, one empty directory."""
+        import a2_s0
+        d = self.w.private
+        for _ in range(1200):
+            d = os.path.join(d, "d")
+            os.mkdir(d)
+        self.assert_s0_fail("PREFLIGHT.PRIVATE_SOURCE")
+        shutil.rmtree(os.path.join(self.w.private, "d"))
+        os.mkdir(os.path.join(self.w.private, "empty"))
+        for name in ("WORKTREE_MAX_DEPTH", "WORKTREE_MAX_DIRS"):
+            with self.subTest(bound=name):
+                old = getattr(a2_s0, name)
+                setattr(a2_s0, name, 0 if name == "WORKTREE_MAX_DEPTH" else 1)
+                try:
+                    for h in self.held:
+                        a2_locks.release(h)
+                    self.held = []
+                    self.assert_s0_fail("PREFLIGHT.PRIVATE_SOURCE")
+                finally:
+                    setattr(a2_s0, name, old)
 
     def test_tag_on_overlay_commit_not_on_head(self):
         priv = self.w.private
@@ -429,10 +619,11 @@ class PrivateSourceTest(Base):
         git(priv, "push", "-q", "-f", self.gw.url_map[self.gw.URLS["overlay"]], "+refs/tags/alpha2-rc1")
         self.assert_s0_fail("PREFLIGHT.PRIVATE_SOURCE")
 
-    def test_tag_on_a_same_tree_commit_that_is_not_head(self):
-        """The tag peels to a commit with HEAD's exact tree and parent but a
-        different id: every tree, blob and ancestry rule would pass, so only
-        rule 1 (the tag peels to HEAD) can refuse."""
+    def test_tag_on_a_same_tree_commit_that_is_not_head_passes(self):
+        """Rule 1 is on the files: the tag peels to a commit with HEAD's exact
+        tree and parent but a different id, and the working tree is exactly
+        that tree, so S0 passes. The checkout's HEAD is never read; the
+        receipt records the tag's commit."""
         priv = self.w.private
         tree = git(priv, "rev-parse", "HEAD^{tree}")
         parent = git(priv, "rev-parse", "HEAD^")
@@ -440,7 +631,9 @@ class PrivateSourceTest(Base):
         git(priv, "tag", "-f", "-a", "alpha2-rc1", "-m", "t", other)
         git(priv, "push", "-q", "-f", self.gw.url_map[self.gw.URLS["overlay"]], other + ":refs/heads/other",
             "+refs/tags/alpha2-rc1")
-        self.assert_s0_fail("PREFLIGHT.PRIVATE_SOURCE")
+        self.assert_s0_pass(self.run_s0())
+        facts, _rc = self.receipt()
+        self.assertEqual(facts["PRIVATE_COMMIT"], other)
 
     def test_lightweight_tag_refused(self):
         priv = self.w.private
@@ -473,6 +666,102 @@ class PrivateSourceTest(Base):
         self.assertEqual(e.detail, "repository: overlay")
 
 
+class OverlaySshTest(Base):
+    """Before the overlay fetch, ssh's effective configuration for overlay.repo's exact host and port pins the
+    overlay endpoint (NET creds r7 part 2; the controller's 2db4cc41). Each broken option refuses
+    PREFLIGHT.REPO_ACCESS before anything is fetched."""
+
+    def with_eff(self, change):
+        import a2fix as fx
+        def eff(home, host, port):
+            d = fx.overlay_ssh(home, host, port)
+            change(d, home)
+            return d
+        return eff
+
+    def test_ssh_refusing_the_configuration_refuses(self):
+        def boom(home, host, port):
+            raise a2_git.GitError("ssh -G refused the configuration")
+        self.assert_s0_fail("PREFLIGHT.REPO_ACCESS", overlay_ssh_config=boom)
+
+    def test_the_host_and_port_come_from_overlay_repo(self):
+        seen = []
+        import a2fix as fx
+        def eff(home, host, port):
+            seen.append((home, host, port))
+            return fx.overlay_ssh(home, host, port)
+        self.assert_s0_pass(self.run_s0(overlay_ssh_config=eff))
+        self.assertEqual(seen, [(self.w.home, "git.example.org", 22)])
+
+
+_OVERLAY_SSH_CASES = {
+    "another_hostname": lambda d, h: d.update(hostname=["other.example.org"]),
+    "a_host_spelled_unlike_the_block": lambda d, h: d.update(hostname=["GIT.example.org"]),
+    "another_port": lambda d, h: d.update(port=["2222"]),
+    "no_strict_host_key_checking": lambda d, h: d.update(stricthostkeychecking=["ask"]),
+    "strict_host_key_checking_dropped": lambda d, h: d.pop("stricthostkeychecking"),
+    "the_default_known_hosts": lambda d, h: d.update(userknownhostsfile=[h + "/.ssh/known_hosts"]),
+    "a_wrong_known_hosts_path": lambda d, h: d.update(userknownhostsfile=["/tmp/known_hosts_overlay"]),
+    "two_known_hosts_files": lambda d, h: d.update(userknownhostsfile=[h + "/.ssh/known_hosts_overlay",
+                                                                       h + "/.ssh/known_hosts"]),
+    "another_alias": lambda d, h: d.update(hostkeyalias=["a2-hub-t"]),
+    "an_agent": lambda d, h: d.update(identityagent=["SSH_AUTH_SOCK"]),
+    "not_identities_only": lambda d, h: d.update(identitiesonly=["no"]),
+    "not_batch": lambda d, h: d.update(batchmode=["no"]),
+    "forwarding_the_agent": lambda d, h: d.update(forwardagent=["yes"]),
+    "another_user": lambda d, h: d.update(user=["root"]),
+    "another_key": lambda d, h: d.update(identityfile=[h + "/.ssh/id_ed25519"]),
+    "a_key_below_ssh": lambda d, h: d.update(identityfile=[h + "/.ssh/x/id_a2_loop_overlay"]),
+    "two_keys": lambda d, h: d.update(identityfile=[h + "/.ssh/id_a2_loop_overlay", h + "/.ssh/id_a2_l3_overlay"]),
+}
+
+
+def _overlay_case(change):
+    def test(self):
+        e = self.assert_s0_fail("PREFLIGHT.REPO_ACCESS", overlay_ssh_config=self.with_eff(change))
+        self.assertEqual(e.detail, "repository: overlay")
+    return test
+
+
+for _label, _change in _OVERLAY_SSH_CASES.items():
+    setattr(OverlaySshTest, "test_refuses_" + _label, _overlay_case(_change))
+
+
+class SshEffectiveTest(unittest.TestCase):
+    """a2_git.ssh_effective runs the real `ssh -G` (it connects to nothing) against a configuration shaped like
+    NET's config_overlay."""
+
+    def setUp(self):
+        import tempfile
+        self.home = tempfile.mkdtemp(prefix="a2ssh-")
+        self.addCleanup(__import__("shutil").rmtree, self.home, True)
+        os.mkdir(os.path.join(self.home, ".ssh"), 0o700)
+
+    def test_the_effective_options(self):
+        if not os.path.exists(a2_git.SSH):
+            self.skipTest("no ssh client")
+        h = self.home
+        with open(os.path.join(h, ".ssh", "config_overlay"), "w") as f:
+            f.write("Host *\n  User git\n  IdentityFile %s/.ssh/id_a2_loop_overlay\n  IdentitiesOnly yes\n"
+                    "  IdentityAgent none\n  StrictHostKeyChecking yes\n  UserKnownHostsFile %s/.ssh/known_hosts_overlay\n"
+                    "  HostKeyAlias a2-overlay\n  ForwardAgent no\n  BatchMode yes\n" % (h, h))
+        eff = a2_git.ssh_effective(h, "git.example.org", 2222)
+        self.assertEqual(eff["hostname"], ["git.example.org"])
+        self.assertEqual(eff["port"], ["2222"])
+        self.assertEqual(eff["stricthostkeychecking"], ["true"])
+        self.assertEqual(eff["userknownhostsfile"], [h + "/.ssh/known_hosts_overlay"])
+        self.assertEqual(eff["identityfile"], [h + "/.ssh/id_a2_loop_overlay"])
+        self.assertEqual(eff["hostkeyalias"], ["a2-overlay"])
+
+    def test_a_missing_configuration_is_a_git_error(self):
+        if not os.path.exists(a2_git.SSH):
+            self.skipTest("no ssh client")
+        with self.assertRaises(a2_git.GitError):
+            a2_git.ssh_effective(self.home, "git.example.org", 22)
+        with self.assertRaises(a2_git.GitError):
+            a2_git.ssh_effective(self.home, "git.example.org", 0)
+
+
 class L7Test(Base):
     def test_mode_allows_others(self):
         os.chmod(os.path.join(self.w.private, "alpha2.hosts"), 0o604)
@@ -490,11 +779,14 @@ class L7Test(Base):
 
     def test_a_symlinked_private_dir_is_resolved(self):
         """The file's own path is resolved: reached through a symlink, it is
-        still under the deny root that holds the real directory."""
+        still under the deny root that holds the real directory. (S0 refuses
+        a symlinked private dir earlier, at L6; this is L7 on its own.)"""
+        import a2_s0
         link = os.path.join(self.base, "private-link")
         os.symlink(self.w.private, link)
-        self.assert_s0_fail("PREFLIGHT.LEAK_LOCK", private_dir=link,
-                            sandbox_mount_roots=(self.w.private,))
+        with self.assertRaises(Refusal) as cm:
+            a2_s0.check_l7(self.site(private_dir=link, sandbox_mount_roots=(self.w.private,)))
+        self.assertEqual(cm.exception.cause, "PREFLIGHT.LEAK_LOCK")
 
     def test_unset_deny_list_refuses(self):
         self.assert_s0_fail("PREFLIGHT.LEAK_LOCK", sandbox_mount_roots=None)
@@ -521,20 +813,79 @@ class FetchTest(Base):
         git(work, *tag_args)
         git(work, "push", "-q", "-f", self.gw.url_map[self.gw.URLS[name]], "+refs/tags/alpha2-rc1")
 
+    # The tag rule binds every run outside the loop (E24 B); a dry run is one
+    # the loop account can start. Loop runs pin by commit only (below).
+    TAGGED = ("--dry-run",)
+
     def test_component_tag_absent(self):
         git(self.gw.url_map[self.gw.URLS["router"]], "tag", "-d", "alpha2-rc1")
-        self.assert_s0_fail("PREFLIGHT.FETCH")
+        self.assert_s0_fail("PREFLIGHT.FETCH", argv=self.TAGGED)
 
     def test_component_tag_on_another_commit(self):
         work = os.path.join(self.base, "work-router")
         git(work, "commit", "-q", "--allow-empty", "-m", "later")
         self.push_tag("router", "tag", "-a", "alpha2-rc1", "-m", "moved")
-        e = self.assert_s0_fail("PREFLIGHT.FETCH")
+        e = self.assert_s0_fail("PREFLIGHT.FETCH", argv=self.TAGGED)
         self.assertEqual(e.detail, "repository: router")
 
     def test_component_lightweight_tag(self):
         self.push_tag("router", "tag", "alpha2-rc1")
-        self.assert_s0_fail("PREFLIGHT.FETCH")
+        self.assert_s0_fail("PREFLIGHT.FETCH", argv=self.TAGGED)
+
+    def test_a_loop_run_pins_components_by_commit_only(self):
+        """E24 B: a missing or moved component tag does not stop a loop run;
+        the fetch proves the pinned commit is on the remote."""
+        git(self.gw.url_map[self.gw.URLS["router"]], "tag", "-d", "alpha2-rc1")
+        self.push_tag("connector", "tag", "alpha2-rc1")
+        for argv in (("--loop", "L2"), ("--only", "S1")):
+            with self.subTest(argv=argv):
+                self.assert_s0_pass(self.run_s0(argv=argv))
+                for h in self.held:
+                    a2_locks.release(h)
+                self.held = []
+
+    def test_a_loop_run_refuses_a_commit_the_remote_does_not_have(self):
+        lock = copy.deepcopy(self.gw.lock)
+        lock["components"][0]["commit"] = "1" * 40
+        self.gw.commit_lock(lock)
+        e = self.assert_s0_fail("PREFLIGHT.FETCH")
+        self.assertEqual(e.detail, "repository: " + lock["components"][0]["name"])
+
+    def test_a_loop_run_refuses_a_commit_no_remote_ref_reaches(self):
+        """The commit object exists in the remote, but no branch or tag reaches
+        it: a fetch of the refs never brings it, so it is not proven."""
+        name = self.gw.lock["components"][0]["name"]
+        bare = self.gw.url_map[self.gw.URLS[name]]
+        tree = git(bare, "rev-parse", "HEAD^{tree}")
+        loose = git(bare, "commit-tree", tree, "-m", "unreferenced")
+        lock = copy.deepcopy(self.gw.lock)
+        lock["components"][0]["commit"] = loose
+        self.gw.commit_lock(lock)
+        e = self.assert_s0_fail("PREFLIGHT.FETCH")
+        self.assertEqual(e.detail, "repository: " + name)
+
+    def test_a_loop_run_refuses_a_commit_only_another_ref_namespace_reaches(self):
+        """A commit the remote holds under a ref that is neither a branch nor
+        a tag (a review ref, say) is not proven: only refs/heads/* and
+        refs/tags/* are fetched, so it never arrives."""
+        name = self.gw.lock["components"][0]["name"]
+        bare = self.gw.url_map[self.gw.URLS[name]]
+        tree = git(bare, "rev-parse", "HEAD^{tree}")
+        side = git(bare, "commit-tree", tree, "-m", "review only")
+        git(bare, "update-ref", "refs/pull/1/head", side)
+        lock = copy.deepcopy(self.gw.lock)
+        lock["components"][0]["commit"] = side
+        self.gw.commit_lock(lock)
+        e = self.assert_s0_fail("PREFLIGHT.FETCH")
+        self.assertEqual(e.detail, "repository: " + name)
+
+    def test_a_loop_run_refuses_a_remote_with_no_refs(self):
+        over = self.gw.site_over()["repo_url_map"]
+        empty = os.path.join(self.base, "empty.git")
+        git(self.base, "init", "-q", "--bare", empty)
+        over[self.gw.URLS["connector"]] = empty
+        e = self.assert_s0_fail("PREFLIGHT.FETCH", repo_url_map=over)
+        self.assertEqual(e.detail, "repository: connector")
 
     def test_component_remote_unreachable(self):
         over = self.gw.site_over()["repo_url_map"]
@@ -630,10 +981,121 @@ class ProbeAndCustodyTest(Base):
                 for h in self.held:
                     a2_locks.release(h)
                 self.held = []
-                self.assert_s0_fail(cause, **{slot: lambda h: "UNOBSERVED"})
+                self.assert_s0_fail(cause, **{slot: lambda h, scope: "UNOBSERVED"})
+
+    def test_a_loop_run_needs_the_pinned_snapshot_set(self):
+        import a2fix as fx
+
+        def altered(change):
+            def probe(hosts, names):
+                got = fx.pinned_snapshots(hosts, names)
+                change(got)
+                return got
+            return probe
+        bad = (("unobserved", lambda h, n: "UNOBSERVED"),
+               ("snaptime differs", altered(lambda g: g["vm-a-t"].update(snaptime=g["vm-a-t"]["snaptime"] + 1))),
+               ("not the current parent", altered(lambda g: g["hub-t"].update(current_parent=False))),
+               ("not the only snapshot", altered(lambda g: g["vm-b-t"].update(only=False))),
+               ("a member missing", altered(lambda g: g.pop("hub-t"))),
+               ("an extra member", altered(lambda g: g.update({"vm-a": dict(g["vm-a-t"])}))),
+               ("snaptime as a string", altered(lambda g: g["vm-a-t"].update(snaptime=str(g["vm-a-t"]["snaptime"])))),
+               # Equal in value, wrong in type: only the int check refuses it.
+               ("snaptime as a float", altered(lambda g: g["vm-a-t"].update(snaptime=float(g["vm-a-t"]["snaptime"])))),
+               ("an extra key", altered(lambda g: g["vm-a-t"].update(name="cp-base"))),
+               ("truthy, not True", altered(lambda g: g["vm-a-t"].update(only=1))),
+               ("current_parent 1", altered(lambda g: g["vm-a-t"].update(current_parent=1))),
+               ("current_parent 'true'", altered(lambda g: g["vm-a-t"].update(current_parent="true"))),
+               ("only 'true'", altered(lambda g: g["vm-b-t"].update(only="true"))))
+        for label, probe in bad:
+            with self.subTest(case=label):
+                for h in self.held:
+                    a2_locks.release(h)
+                self.held = []
+                self.assert_s0_fail("PREFLIGHT.SURVEY", probe_loop_snapshots=probe)
+
+    def test_the_snapshot_probe_is_asked_for_exactly_the_restore_set(self):
+        import a2fix as fx
+        asked = []
+
+        def probe(hosts, names):
+            asked.append(tuple(names))
+            return fx.pinned_snapshots(hosts, names)
+        self.assert_s0_pass(self.run_s0(probe_loop_snapshots=probe))
+        self.assertEqual(asked, [("hub-t", "vm-a-t", "vm-b-t")])
+
+    def test_only_loop_scope_runs_read_the_snapshot_set(self):
+        """check_probes directly, for each loop kind: L1, L2 and L2-leak read the set (an unknown read refuses);
+        L3 and a bare install never call the probe."""
+        import types
+        import a2_s0
+
+        def never(hosts, names):
+            raise AssertionError("read the loop snapshot set")
+        ok = lambda h, scope: "ok"
+        site = types.SimpleNamespace(probe_tools=ok, probe_net_runtime=ok, probe_keep_awake=ok,
+                                     probe_target_access=ok, probe_hub_read=ok, probe_operator_route=ok,
+                                     probe_survey=ok, probe_loop_snapshots=lambda h, n: "UNOBSERVED")
+        for loop in ("L1", "L2", "L2-leak"):
+            with self.subTest(loop=loop):
+                c = types.SimpleNamespace(inv=a2_args.Invocation("install", loop, {}), hosts=self.w.hosts)
+                with self.assertRaises(Refusal) as cm:
+                    a2_s0.check_probes(c, site)
+                self.assertEqual(cm.exception.cause, "PREFLIGHT.SURVEY")
+        site.probe_loop_snapshots = never
+        for loop in ("L3", None):
+            with self.subTest(loop=loop):
+                c = types.SimpleNamespace(inv=a2_args.Invocation("install", loop, {}), hosts=self.w.hosts)
+                a2_s0.check_probes(c, site)
+
+    def test_every_probe_is_given_the_runs_scope(self):
+        """So NET's hub and target probes read the run's own hub (a2_private.hub_for_scope)."""
+        import types
+        import a2_s0
+        import a2fix as fx
+        seen = []
+        rec = lambda h, scope: seen.append(scope) or "ok"
+        site = types.SimpleNamespace(probe_tools=rec, probe_net_runtime=rec, probe_keep_awake=rec,
+                                     probe_target_access=rec, probe_hub_read=rec, probe_operator_route=rec,
+                                     probe_survey=rec, probe_loop_snapshots=fx.pinned_snapshots)
+        for loop, scope in (("L1", "loop"), ("L2", "loop"), ("L2-leak", "loop"), ("L3", "l3"), (None, "l3")):
+            with self.subTest(loop=loop):
+                seen.clear()
+                a2_s0.check_probes(types.SimpleNamespace(inv=a2_args.Invocation("install", loop, {}),
+                                                         hosts=self.w.hosts), site)
+                self.assertTrue(seen)
+                self.assertEqual(set(seen), {scope})
+
+    def test_hub_read_refuses_for_both_scopes_and_its_default_too(self):
+        """(a) and (b) of the controller's 3ac46e75: for a loop run and an l3 run, a hub-read answer other than "ok"
+        refuses PREFLIGHT.HUB_READ, exit 2; the Site's own default (unobserved) refuses the same way."""
+        import types
+        import a2_s0
+        import a2_site
+        import a2fix as fx
+        ok = lambda h, scope: "ok"
+        default = a2_site.Site().probe_hub_read
+        for loop in ("L1", "L2", "L2-leak", "L3", None):
+            for label, answer in (("not ok", lambda h, scope: "no"), ("unobserved", default),
+                                  ("empty", lambda h, scope: ""), ("None", lambda h, scope: None)):
+                with self.subTest(loop=loop, answer=label):
+                    site = types.SimpleNamespace(probe_tools=ok, probe_net_runtime=ok, probe_keep_awake=ok,
+                                                 probe_target_access=ok, probe_hub_read=answer,
+                                                 probe_operator_route=ok, probe_survey=ok,
+                                                 probe_loop_snapshots=fx.pinned_snapshots)
+                    with self.assertRaises(Refusal) as cm:
+                        a2_s0.check_probes(types.SimpleNamespace(inv=a2_args.Invocation("install", loop, {}),
+                                                                 hosts=self.w.hosts), site)
+                    self.assertEqual((cm.exception.cause, cm.exception.rc), ("PREFLIGHT.HUB_READ", 2))
+
+    def test_a_hub_read_refusal_ends_the_run_at_s0(self):
+        """(a), end to end through the runner: S0's receipt is the FAIL, and no stage from S1 to S9 wrote one (S10's
+        summary is written on every exit)."""
+        e = self.assert_s0_fail("PREFLIGHT.HUB_READ", probe_hub_read=lambda h, scope: "no")
+        self.assertEqual(e.rc, 2)
+        self.assertEqual(sorted(os.listdir(os.path.join(self.run_dir(), "receipts"))), ["S0--.txt", "S10--.txt"])
 
     def test_survey_only_for_l3_or_bare(self):
-        self.assert_s0_pass(self.run_s0(probe_survey=lambda h: "UNOBSERVED"))
+        self.assert_s0_pass(self.run_s0(probe_survey=lambda h, scope: "UNOBSERVED"))
 
     def test_placement_differs_or_unobserved_is_custody(self):
         for ans in ("differs", "UNOBSERVED", "weird"):
@@ -646,7 +1108,7 @@ class ProbeAndCustodyTest(Base):
     def test_stop_set_during_s0_is_handoff(self):
         stop = os.path.join(self.w.root, "stop.d", "monitor", "stop")
 
-        def setting_probe(h):
+        def setting_probe(h, scope):
             open(stop, "w").close()
             return "ok"
         self.assert_s0_fail("PREFLIGHT.HANDOFF", probe_hub_read=setting_probe)

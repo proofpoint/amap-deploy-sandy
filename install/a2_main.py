@@ -10,6 +10,7 @@ import signal
 import threading
 
 import a2_admit
+import a2_args
 import a2_causes
 import a2_git
 import a2_guard
@@ -17,12 +18,56 @@ import a2_record
 import a2_s0
 import a2_s1
 import a2_s10
+import a2_site
 from a2_causes import Refusal
 from a2_site import Site
 
 #: The point where package 2a ends: S0 has passed and its receipt is
 #: written; S1 to S10 follow it (package 2b).
 NOT_BUILT = "RUNNER.UNCLASSIFIED"
+#: The stages after S1 this runner dispatches, each through its Site slot (ruling W7-STAGE-DISPATCH-OWNER): S2 and
+#: S3 are NET's, S4 waits on its own package; an unfilled slot (None) stops the run there, NOT_BUILT, rc 3. A stage
+#: past S6 is not dispatched yet, and a run that selects one stops there the same way.
+DISPATCH = {"S2": "run_s2", "S3": "run_s3", "S4": "run_s4", "S5": "run_s5", "S6": "run_s6"}
+#: The commands whose stages the dispatch runs; any other command stops after S1, NOT_BUILT, before any stage.
+DISPATCH_COMMANDS = ("install", "dry-run")
+
+
+def dispatch(c, site, rec, active):
+    """Run each stage the run selects after S1, through its slot. Returns None when every one ran, or the NOT_BUILT
+    refusal for the first that cannot: a command the dispatch does not run (before any stage), a stage DISPATCH
+    does not name, or an unfilled slot. `active` is a one-element list the running stage's id is kept in, so the
+    runner can name it if the stage raises."""
+    if c.inv.command not in DISPATCH_COMMANDS:
+        return Refusal(NOT_BUILT, c.inv.command + " not built", rc=3)
+    for sid in run_stages(c.inv):
+        fn = getattr(site, DISPATCH[sid]) if sid in DISPATCH else None
+        if fn == a2_site.BUILT_IN:
+            fn = built_in(sid)
+        if fn is None:
+            return Refusal(NOT_BUILT, sid + " not built", rc=3)
+        active[0] = sid
+        fn(c, site, rec)
+    return None
+
+
+def built_in(sid):
+    """The runner's own stage function for a slot left at a2_site.BUILT_IN."""
+    if sid == "S5":
+        import a2_s5
+        return a2_s5.run_s5
+    if sid == "S6":
+        import a2_s6
+        return a2_s6.run_s6
+    return None
+
+
+def run_stages(inv):
+    """The stages after S1 the run selects, in order: an L1's `--only` or `--from` set (a2_args.l1_stages), every
+    stage otherwise."""
+    if inv.loop == "L1" and inv.opts:
+        return [s for s in a2_args.l1_stages(inv.opts) if s not in ("S0", "S1")]
+    return list(a2_args.STAGE_IDS[2:])
 
 
 def main(argv, installer_sha, entry, site=None):
@@ -155,7 +200,7 @@ def run(run_id, argv, site, stops=None):
     if stops is None:
         stops = _Stops()
     with stops:
-        _run(run_id, argv, site, stops)
+        return _run(run_id, argv, site, stops)
 
 
 def _run(run_id, argv, site, stops):
@@ -181,7 +226,9 @@ def _run(run_id, argv, site, stops):
             rec.write_receipt("S1", None, rec.started, "FAIL", s1_custody, rc=2, cause=cause)
             raise Refusal(cause)
         held = a2_s1.run_s1(c, site, rec, guard, s1_custody)
-        stop = Refusal(NOT_BUILT, rc=3)
+        current = [active]
+        stop = dispatch(c, site, rec, current)
+        active = current[0]
     except Refusal as r:
         stops.holding = True
         stop = r
@@ -226,7 +273,9 @@ def _run(run_id, argv, site, stops):
             if stop is None or stop.rc < 3:
                 stop = Refusal("SUMMARY.UNCLASSIFIED", rc=3)
     stops.closed = True
-    raise stop
+    if stop is not None:
+        raise stop
+    return 0
 
 
 def _finish(rec):

@@ -443,7 +443,7 @@ class SummaryTest(Rec):
         self.assertIn("RL reply-depth check UNMEASURED", lines)
         self.assertIn("operator steps UNMEASURED: not supplied to this package", lines)
         self.assertIn("round trip: alpha2_install.py --check-roundtrip abcd1234abcd1234", lines)
-        self.assertIn("agent agent-a address agent-a@a-t.example.org INFERRED", lines)
+        self.assertIn("agent agent-a address agent-a@a-t.internal INFERRED", lines)
         self.assertIn("vm vm-a-t access: ssh vm-a-t INFERRED", lines)
         self.assertIn("lock sha " + a2fix.H64, lines)
         # The run's VMs only: an L2 run lists no l3 VM.

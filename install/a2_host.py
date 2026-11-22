@@ -6,9 +6,14 @@ account database, never from the environment's own claims.
 import os
 import pwd
 
+import re
+
 from a2_causes import Refusal
 
 ENV_NAMES = ("HOME", "PATH", "SSH_AUTH_SOCK", "TERM")
+#: a2_git.SAFE_HOME, restated: this module's import closure is the launcher's and stays as it is. HOME reaches
+#: GIT_SSH_COMMAND, which a shell runs, so it must be a plain absolute path.
+SAFE_HOME = re.compile(r"(/[A-Za-z0-9._-]+)+")
 LAUNCH_PATH = "/usr/bin:/bin"
 
 
@@ -80,7 +85,8 @@ def check_env(environ, account, home):
         raise Refusal("RUNNER.ENV")
     if environ["PATH"] != LAUNCH_PATH:
         raise Refusal("RUNNER.ENV")
-    if environ["HOME"] != home:
+    if environ["HOME"] != home or not SAFE_HOME.fullmatch(home) or any(
+            s in (".", "..") for s in home.split("/")):
         raise Refusal("RUNNER.ENV")
     if account == "l3" and environ["SSH_AUTH_SOCK"] != "":
         raise Refusal("RUNNER.ENV")
