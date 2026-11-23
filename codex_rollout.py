@@ -28,7 +28,8 @@ only, so it runs the same on Linux and Darwin.
 It then prints install's own dry run, run with that same sandy.
 
 `apply` runs the same checks, then copies the feature's payload, feature.json
-and router.json into a new backup directory and compares the copy with the
+and router.json into a new backup directory under AMAP_ROOT/rollout-backups
+and compares the copy with the
 live files entry by entry (type, mode, link target and content). Only then
 does it run `install --apply` and `verify`, both with the same sandy, and a
 problem from either is a nonzero exit naming the backup. The backup's
@@ -38,6 +39,10 @@ inventory is written beside it as INVENTORY.json.
 payload, feature.json and router.json aside into another new directory
 (nothing is deleted), copies the backup back, and compares the restored files
 with the inventory.
+
+Backups never live in sandy's features directory: sandy reads every
+directory there as a feature, and one it refuses mounts no feature at all.
+Every verb refuses while a directory of this tool's backups is still there.
 
 Every step checks its own result: a failed copy, hash, listing or command
 stops the run with a nonzero exit, and no later step runs. Nothing here
@@ -264,8 +269,88 @@ def stamp() -> str:
     return time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
 
 
-def backup(feature: Path) -> Path:
-    dest = new_dir(feature.parent / f"{feature.name}.rollout-backups" / stamp())
+BACKUPS_DIR = "rollout-backups"
+
+
+def resolved(path: Path) -> Path:
+    """`path` with its existing part resolved strictly (every link followed,
+    a loop or an unreadable component refused) and its missing tail, which
+    holds no link because it does not exist, appended as spelt. A `..` in
+    that tail is refused: there is nothing to resolve it against. The tail
+    is what backup or rollback will create."""
+    here, tail = (path if path.is_absolute() else Path.cwd() / path), []
+    try:
+        while True:
+            try:
+                top = here.resolve(strict=True)
+                break
+            except FileNotFoundError:
+                if here.parent == here:
+                    raise
+                if os.path.lexists(here):
+                    raise Refused(f"cannot resolve {path}: {here} is a link to nothing")
+                tail.insert(0, here.name)
+                here = here.parent
+    except (OSError, RuntimeError) as e:
+        raise Refused(f"cannot resolve {path} ({e})")
+    if ".." in tail:
+        raise Refused(f"cannot resolve {path}: '..' after a component that does not exist")
+    return top.joinpath(*tail)
+
+
+def within(path: Path, top: Path) -> bool:
+    """Whether the resolved `path` is the resolved directory `top` or under
+    it, by spelling or by identity (device and inode) of any existing
+    ancestor, so a spelling that differs only in case on a case-insensitive
+    disk is still inside. A `top` that does not exist yet has no identity
+    to compare, so `path` is inside it when an ancestor's spelling equals
+    `top`'s with case ignored, which refuses the spelling a case-insensitive
+    disk would make the same directory once it is created. That comparison
+    holds only for ASCII spellings: a disk that also ignores Unicode
+    normalization makes more spellings one directory, so a non-ASCII
+    spelling of either is refused rather than compared."""
+    try:
+        t = os.stat(top)
+    except FileNotFoundError:
+        if not (str(path).isascii() and str(top).isascii()):
+            raise Refused(f"{top} does not exist yet and {path} or it is not spelt in ASCII, "
+                          f"so whether one is inside the other cannot be decided; "
+                          f"create {top}, or use an ASCII path")
+        return any(str(p).casefold() == str(top).casefold() for p in (path, *path.parents))
+    except OSError as e:
+        raise Refused(f"cannot read {top} ({e})")
+    for p in (path, *path.parents):
+        if p == top:
+            return True
+        try:
+            s = os.stat(p)
+        except FileNotFoundError:
+            continue
+        except OSError as e:
+            raise Refused(f"cannot read {p} ({e})")
+        if (s.st_dev, s.st_ino) == (t.st_dev, t.st_ino):
+            return True
+    return False
+
+
+def features_clear(feature: Path, backups: Path) -> None:
+    """No backup root inside sandy's features directory, and nothing of this
+    tool's left there: sandy reads each directory there as a feature and, on
+    one it refuses, mounts no feature in any sandbox it launches. The root is
+    proven outside first, because the remedy for a left-over directory moves
+    its contents into the root; the root itself need not exist yet."""
+    features = feature.parent
+    if within(resolved(backups), resolved(features)):
+        raise Refused(f"{backups} is inside sandy's features directory {features}; "
+                      f"set AMAP_ROOT to a directory outside it")
+    stray = features / f"{feature.name}.{BACKUPS_DIR}"
+    if os.path.lexists(stray):
+        raise Refused(f"{stray} is in sandy's features directory, so sandy mounts no feature "
+                      f"at launch; move its contents to {backups} and remove it")
+
+
+def backup(feature: Path, backups: Path) -> Path:
+    dest = new_dir(backups / stamp())
     present = [n for n in PARTS if os.path.lexists(feature / n)]
     try:
         for name in present:
@@ -287,7 +372,7 @@ def deployment(ds: Path, sandy: str, *args: str) -> int:
     return subprocess.run([sys.executable, str(ds / "amap-sandy.py"), "--sandy", sandy, *args]).returncode
 
 
-def rollback(feature: Path, b: Path) -> Path:
+def rollback(feature: Path, backups: Path, b: Path) -> Path:
     try:
         doc = json.loads((b / INVENTORY).read_text())
         parts, want = list(doc["parts"]), doc["entries"]
@@ -301,7 +386,7 @@ def rollback(feature: Path, b: Path) -> Path:
         raise Refused(f"{b} cannot be read ({e}); restore it by hand")
     if have != want:
         raise Refused(f"{b} does not match its {INVENTORY}; restore it by hand")
-    aside = new_dir(feature.parent / f"{feature.name}.rollout-backups" / f"{stamp()}-replaced")
+    aside = new_dir(backups / f"{stamp()}-replaced")
     try:
         for name in PARTS:
             if os.path.lexists(feature / name):
@@ -322,13 +407,15 @@ def main(argv: Sequence[str]) -> int:
     ds = root / "amap-deploy-sandy"
     sandy = os.environ.get("SANDY_BIN") or "sandy"
     feature = Path(os.environ.get("SANDY_HOME") or Path.home() / ".sandy") / "features" / "amap"
+    backups = root / BACKUPS_DIR
     try:
+        features_clear(feature, backups)
         if mode == "check":
             checks(root, ds, sandy)
             return deployment(ds, sandy, "install")
         if mode == "apply":
             checks(root, ds, sandy)
-            b = backup(feature)
+            b = backup(feature, backups)
             say(f"  ok  backup {b}, matching the live files")
             if deployment(ds, sandy, "install", "--apply") != 0:
                 raise Refused(f"install --apply failed (above); to roll back: amap-codex-rollout.py rollback {b}")
@@ -339,7 +426,7 @@ def main(argv: Sequence[str]) -> int:
                 f"Roll back with: amap-codex-rollout.py rollback {b}")
             return 0
         if mode == "rollback" and len(argv) == 2:
-            aside = rollback(feature, Path(argv[1]))
+            aside = rollback(feature, backups, Path(argv[1]))
             say(f"Restored {argv[1]}; the replaced files are in {aside}. Relaunch each Codex sandbox.")
             say("The checkouts are unchanged: an install from them renders the newer payload again.")
             return 0
