@@ -20,13 +20,6 @@ ADAPTER = "sandy"
 _LOGICAL_ID = re.compile(r"[0-9a-f]{32}")
 _CONFIRM = re.compile(r"[0-9a-f]{16}")
 _UTC = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
-#: The two exact binding key sets of a show (HOST): with identity_dir always, and name_json only when active and
-#: the adapter is configured.
-BINDING_KEYS = ({"adapter", "address", "epoch", "first_registered_ts", "identity_dir", "logical_id", "name",
-                 "state"},
-                {"adapter", "address", "epoch", "first_registered_ts", "identity_dir", "logical_id", "name",
-                 "name_json", "state"})
-OUTPUT_MAX = 1 << 16
 
 
 class RegistryRefused(Exception):

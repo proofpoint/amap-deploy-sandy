@@ -141,6 +141,7 @@ class RegistryTest(unittest.TestCase):
             "a short id": lambda d: d["results"][0].update(logical_id=LID[:31]),
             "another status": lambda d: d["results"][0].update(status="retired"),
             "an echoed plan that differs": lambda d: d["plan"].update(registry_seq=1),
+            "an echoed plan for another stable_key": lambda d: d["plan"]["items"][0].update(stable_key="/scratch/x"),
         }
         for label, change in apply_cases.items():
             with self.subTest(apply=label):

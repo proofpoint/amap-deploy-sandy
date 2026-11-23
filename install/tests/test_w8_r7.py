@@ -79,7 +79,7 @@ class SlugGuardTest(R7Base):
             with self.subTest(n=n):
                 slug = S7.expected_slug(self.fake.home + "/dev/agent-" + agent_id(n))
                 self.assertEqual(S7.slug_fits(agent_id(n)),
-                                 a2_agent_registry._SLUG.fullmatch(slug) is not None)
+                                 a2_agent_registry.SLUG.fullmatch(slug) is not None)
         self.assertTrue(S7.slug_fits(agent_id(49)))
         self.assertFalse(S7.slug_fits(agent_id(50)))
 

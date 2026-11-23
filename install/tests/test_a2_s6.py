@@ -291,7 +291,8 @@ class RegistryTest(unittest.TestCase):
 
     def test_plan_apply_show(self):
         got, L = self.run_reg((0, TR.PLAN), (0, TR.APPLY), (0, TR.SHOW))
-        self.assertEqual(got, [("ROUTER_LOGICAL_ID", TR.LID), ("REGISTRY", "CREATED")])
+        self.assertEqual(got, [("ROUTER_LOGICAL_ID", TR.LID), ("ROUTER_STABLE_KEY", "/scratch/keys/router-vm1"),
+                               ("REGISTRY", "CREATED")])
         plan, apply_, show = (c[2] for c in L.calls)
         tree = ["/usr/bin/python3", "-I", "-B", "-c"]
         self.assertEqual(plan[:4], tree)
@@ -314,11 +315,12 @@ class RegistryTest(unittest.TestCase):
         apply_ = TR.edit(TR.APPLY, lambda d: (d["plan"]["items"][0].update(action="already_bound"),
                                               d["results"][0].update(status="already_bound")))
         got, _ = self.run_reg((0, plan), (0, apply_), (0, TR.SHOW))
-        self.assertEqual(got, [("ROUTER_LOGICAL_ID", TR.LID), ("REGISTRY", "ALREADY")])
+        self.assertEqual(got, [("ROUTER_LOGICAL_ID", TR.LID), ("ROUTER_STABLE_KEY", "/scratch/keys/router-vm1"),
+                               ("REGISTRY", "ALREADY")])
 
     def test_confirm_mismatch_replans_once(self):
         got, L = self.run_reg((0, TR.PLAN), (1, TR.CONFIRM_MISMATCH), (0, TR.PLAN), (0, TR.APPLY), (0, TR.SHOW))
-        self.assertEqual(got[1], ("REGISTRY", "CREATED"))
+        self.assertEqual(got[-1], ("REGISTRY", "CREATED"))
         self.assertEqual(len(L.calls), 5)
 
     def test_a_second_replan_refuses(self):
@@ -330,6 +332,21 @@ class RegistryTest(unittest.TestCase):
         got, L = self.run_reg((0, TR.PLAN), (1, REFUSED_KEY_BOUND))
         self.assertEqual(got, ("CONFIG.REGISTRY", 3))
         self.assertEqual(len(L.calls), 2)
+
+    def test_a_key_the_registry_normalised_passes_is_recorded_and_shown_by(self):
+        """HOST normalises the batch's key against the VM's filesystem (HOST's answer f46595f6, lines 17-20), so its
+        plan may return another key than the raw one: S6 keeps HOST's key, records it, and the show queries by it."""
+        norm = "/scratch/Keys/router-vm1"
+        plan, apply_ = (TR.edit(x, lambda d: d["plan"]["items"][0].update(stable_key=norm)) for x in (TR.PLAN, TR.APPLY))
+        got, L = self.run_reg((0, plan), (0, apply_), (0, TR.SHOW))
+        self.assertEqual(got, [("ROUTER_LOGICAL_ID", TR.LID), ("ROUTER_STABLE_KEY", norm), ("REGISTRY", "CREATED")])
+        self.assertEqual(json.loads(L.stdins[2])["key"], norm)
+
+    def test_an_apply_for_another_key_than_the_plan_refuses(self):
+        apply_ = TR.edit(TR.APPLY, lambda d: d["plan"]["items"][0].update(stable_key="/scratch/keys/other"))
+        got, L = self.run_reg((0, TR.PLAN), (0, apply_))
+        self.assertEqual(got, ("CONFIG.REGISTRY", 3))
+        self.assertEqual([c[5] for c in L.calls], [False, True])
 
     def test_a_bad_plan_or_show_refuses(self):
         got, _ = self.run_reg((0, b"{}\n"))

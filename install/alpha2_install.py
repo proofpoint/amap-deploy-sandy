@@ -19,7 +19,11 @@ import sys
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 MANIFEST = "MANIFEST"
-_LINE = re.compile(rb"([0-9a-f]{64})  ([A-Za-z0-9_]{1,64}\.py)")
+#: Installer data files MANIFEST may list beside the modules, each by its exact name (ruling S3-RENDER-LOCK-A).
+#: They are read through the VM layer's pinned_installer_file, never imported.
+INSTALLER_DATA = ("a2_s3_render.py.lock",)
+_LINE = re.compile(rb"([0-9a-f]{64})  ([A-Za-z0-9_]{1,64}\.py|"
+                   + b"|".join(re.escape(n.encode("ascii")) for n in INSTALLER_DATA) + rb")")
 _INTERPRETER_TEXT = ("CAUSE=PREFLIGHT.INTERPRETER\n"
                      "Look at the interpreter and the installer files: a hash differs from alpha2.lock.\n")
 

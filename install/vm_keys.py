@@ -11,11 +11,12 @@ install/MANIFEST, and runs them through the VM layer's launcher as `/usr/bin/pyt
 - The public key is the last 32 bytes of `openssl pkey -inform DER -pubout -outform DER` over the PKCS#8 prefix and
   the seed, as 64 lower-case hex characters. The seed is never printed, logged or sent anywhere.
 - If the router.json named on the command line (a path relative to HOME) exists, its `delegation.signing_key.public_key` must equal the public
-  key: a key is never regenerated or silently replaced.
+  key: a key is never regenerated or silently replaced. router.json is read first: when it records a key and there is
+  no seed, nothing is created and the exit is 7.
 
 The only output is one line: `CREATED <hex>` or `EXISTING <hex>`.
 Exit codes: 0 done, 2 usage, 3 an existing key differs from router.json, 4 a placement rule broken, 5 an OS error,
-6 openssl failed or printed something else.
+6 openssl failed or printed something else, 7 router.json records a key and there is no seed (nothing written).
 """
 
 import json
@@ -32,7 +33,7 @@ PKCS8_PREFIX = bytes.fromhex("302e020100300506032b657004220420")
 SPKI_PREFIX = bytes.fromhex("302a300506032b6570032100")
 ROUTER_JSON_MAX = 1 << 20
 
-OK, USAGE, DIFFERS, NOT_ALLOWED, OS_ERROR, OPENSSL_FAILED = 0, 2, 3, 4, 5, 6
+OK, USAGE, DIFFERS, NOT_ALLOWED, OS_ERROR, OPENSSL_FAILED, NO_SEED = 0, 2, 3, 4, 5, 6, 7
 
 
 class Stop(Exception):
@@ -78,12 +79,15 @@ def _read_exact(fd, n):
     return buf
 
 
-def seed(home, euid):
-    """(seed bytes as a bytearray, created). The directory and file rules hold, or Stop."""
+def seed(home, euid, create=True):
+    """(seed bytes as a bytearray, created). The directory and file rules hold, or Stop. With `create` false, a missing
+    seed is Stop(NO_SEED) before anything is made."""
     if not os.path.isabs(home) or os.path.normpath(home) != home:
         raise Stop(NOT_ALLOWED)
     _check_ancestors(home, euid)
     d = os.path.join(home, DIR_NAME)
+    if not create and not os.path.lexists(d):
+        raise Stop(NO_SEED)
     try:
         os.mkdir(d, 0o700)
     except FileExistsError:
@@ -99,6 +103,8 @@ def seed(home, euid):
         created = False
         if SEED_NAME in names and not stat.S_ISREG(os.stat(SEED_NAME, dir_fd=dfd, follow_symlinks=False).st_mode):
             raise Stop(NOT_ALLOWED)
+        if SEED_NAME not in names and not create:
+            raise Stop(NO_SEED)
         if SEED_NAME not in names:
             fd = os.open(SEED_NAME, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400, dir_fd=dfd)
             try:
@@ -172,12 +178,12 @@ def main(argv):
     home = os.environ.get("HOME", "")
     euid = os.geteuid()
     try:
-        s, created = seed(home, euid)
+        rec = recorded_public_key(os.path.join(home, rel))
+        s, created = seed(home, euid, create=rec is None)
         try:
             pub = public_key(s)
         finally:
             s[:] = b"\x00" * len(s)
-        rec = recorded_public_key(os.path.join(home, rel))
         if rec is not None and rec != pub:
             return DIFFERS
         os.write(1, ("%s %s\n" % ("CREATED" if created else "EXISTING", pub)).encode())
