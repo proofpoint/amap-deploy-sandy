@@ -50,8 +50,11 @@ class Layer:
     """The VM layer after S2. Each pinned script is recognised by its stand-in text; the router and registry
     program by their shim. Records every call."""
 
-    def __init__(self):
-        self.calls, self._wrote = [], set()
+    def __init__(self, normalise=None):
+        self.calls, self._wrote, self.placed = [], set(), {}
+        #: The registry program's key normalisation (HOST's answer f46595f6, lines 17-20: it probes the VM's
+        #: filesystem). The identity unless a case names another.
+        self.normalise = normalise or (lambda key: key)
 
     def wrote(self, stage):
         return stage in self._wrote
@@ -99,6 +102,8 @@ class Layer:
             dirs = vm_dirs.RELAY_DIRS if argv[5:] == ["--relay"] else vm_dirs.DIRS
             return 0, "".join("CREATED %s\n" % r for r, _, _ in dirs).encode(), b""
         if src == "# pinned vm_place.py":
+            for p, _m, b in vm_place.parse(stdin):
+                self.placed[(vm, argv[5], "/".join(p))] = b
             return 0, "".join("PLACED %s\n" % "/".join(p) for p, _m, _b in vm_place.parse(stdin)).encode(), b""
         if src == a2_s6.RL_SHIM:
             verb = argv[8:]
@@ -106,7 +111,10 @@ class Layer:
                 return 0, b"matrix\n", b""
             return 0, SHOW_READY, b""
         if "regtool.opverbs" in src:
-            return 0, (TR.PLAN if "plan" in argv else TR.APPLY).replace(b"router-vm1", vm_slug(vm).encode()), b""
+            # HOST returns the batch's stable_key (the hosts file's router.stable_key) after its own normalisation.
+            key = self.normalise({d["name"]: d["router"]["stable_key"] for d in hosts()["vms"]}[vm])
+            return 0, (TR.PLAN if "plan" in argv else TR.APPLY).replace(b"/scratch/keys/router-vm1", key.encode()).replace(
+                b"router-vm1", vm_slug(vm).encode()), b""
         if "regtool" in src:
             return 0, TR.SHOW.replace(b"router-vm1", vm_slug(vm).encode()).replace(
                 b"fleet.example.org", vm_domain(vm).encode()), b""
@@ -215,6 +223,19 @@ class S5Test(Base):
 
 class S6Test(Base):
 
+    def test_a_key_the_registry_normalises_is_the_one_recorded(self):
+        """The registry program returns another key than the hosts file's (its filesystem normalisation): S6
+        completes, and the receipt records the program's key, never the raw one."""
+        self.prior()
+        L = Layer(normalise=lambda key: key.upper())
+        self.site.vm_layer = L
+        a2_s6.run_s6(self.c, self.site, self.rec)
+        for vm in ("vm-a-t", "vm-b-t"):
+            facts, rc = self.receipt("S6", vm)
+            key = {d["name"]: d["router"]["stable_key"] for d in hosts()["vms"]}[vm]
+            self.assertNotEqual(key.upper(), key)
+            self.assertEqual((facts["REGISTRY"], facts["ROUTER_STABLE_KEY"], rc), ("CREATED", key.upper(), 0))
+
     def test_a_full_run_on_both_vms(self):
         self.prior()
         L = Layer()
@@ -225,6 +246,10 @@ class S6Test(Base):
             self.assertEqual((facts["RESULT"], facts["CONFIG"], facts["PEER_STORE"], facts["REGISTRY"], rc),
                              ("CHANGED", "PLACED", "ALREADY", "CREATED", 0))
             self.assertEqual(facts["PLUGIN_SHA"], a2_s6._sha(b"plugin bytes"))
+            self.assertEqual(facts["PREFIX_JSON_SHA"], a2_s6._sha(L.placed[(vm, ".amap-relay-config", "prefix.json")]))
+            self.assertEqual(facts["D7_SHA"], a2_s6._sha(L.placed[(vm, ".amap-relay-config", "d7.json")]))
+            key = {d["name"]: d["router"]["stable_key"] for d in hosts()["vms"]}[vm]
+            self.assertEqual(facts["ROUTER_STABLE_KEY"], key)
         roots = [c[3][0] for c in L.calls if c[0] == "exec" and c[2] == "# pinned vm_place.py"]
         self.assertEqual(roots[:8], [".amap-router-code", ".a2-registry-code", ".sandy/features/amap", ".amap-router",
                                      ".amap-relay-env", ".amap-relay-config", ".amap-registry",
@@ -256,6 +281,21 @@ class S6Test(Base):
         old = r6.PLUGIN_SHA256
         r6.PLUGIN_SHA256 = a2_s6._sha(b"plugin bytes")
         self.addCleanup(setattr, r6, "PLUGIN_SHA256", old)
+
+    def test_a_value_the_renders_refuse_stops_before_any_write(self):
+        """A login domain longer than the env-file's 63-character rule (Opus's r8 N3 example): the renders run
+        before S6's first write, so the stage refuses UNCLASSIFIED rc 2 with no write made on the VM."""
+        self.prior()
+        self.c.lock["hub_login"]["domain"] = "d" * 64 + ".example.org"
+        L = Layer()
+        self.site.vm_layer = L
+        with self.assertRaises(Refusal) as cm:
+            a2_s6.run_s6(self.c, self.site, self.rec)
+        self.assertEqual((cm.exception.cause, cm.exception.rc), ("CONFIG.UNCLASSIFIED", 2))
+        self.assertFalse(L.wrote("CONFIG"))
+        self.assertEqual([c for c in L.calls if c[0] == "install_file"], [])
+        facts, rc = self.receipt("S6", "vm-a-t")
+        self.assertEqual((facts["CAUSE"], rc), ("CONFIG.UNCLASSIFIED", 2))
 
     def test_before_any_vm_each_refusal_is_in_the_first_receipt(self):
         cases = [

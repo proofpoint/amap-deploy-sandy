@@ -241,18 +241,21 @@ def _registry_refused():
 def registry(layer, vm, v, facts, run_id, program):
     """Plan, apply and show the router's binding, with `program` the lock's registry_program (its package and
     adapter interface, pinned by check_lock). host.json and the batch are already placed. Returns
-    [(ROUTER_LOGICAL_ID, 32 hex), (REGISTRY, CREATED or ALREADY)]. Every refusal is CONFIG.REGISTRY, rc 3: S6 has
-    written by now. HOST's own REPLAN answers (confirm_mismatch, a committed delivery failure, an unknown commit) get
-    one fresh plan; anything else, never retried."""
+    [(ROUTER_LOGICAL_ID, 32 hex), (ROUTER_STABLE_KEY, the plan's key), (REGISTRY, CREATED or ALREADY)]. Every refusal
+    is CONFIG.REGISTRY, rc 3: S6 has written by now. The stable_key is HOST's, as its plan returns it: HOST normalises
+    the batch's key against the VM's filesystem, so it is never compared with the raw key. The apply must echo the
+    plan, key included (parse_apply), and the strict show queries by that key. HOST's own REPLAN answers
+    (confirm_mismatch, a committed delivery failure, an unknown commit) get one fresh plan; anything else, never
+    retried."""
     import a2_registry as reg
-    home, slug, key = facts["home"], v["router"]["slug"], v["router"]["stable_key"]
+    home, slug = facts["home"], v["router"]["slug"]
     r = posixpath.join(home, REGISTRY_DIR)
     batch = posixpath.join(home, BATCH_ROOT, BATCH_NAME)
     for _ in range(REGISTRY_ATTEMPTS):
         rc, out, _err = _host(layer, vm, v, home, program["package"] + ".opverbs",
                               ["--registry", r, "plan", "import", "--batch", batch], False)
         try:
-            confirm, action, plan, _stable = reg.parse_plan(rc, out, slug)
+            confirm, action, plan, stable = reg.parse_plan(rc, out, slug)
             rc, out, _err = _host(layer, vm, v, home, program["package"] + ".opverbs",
                                   ["--registry", r, "apply", "import", "--batch", batch, "--confirm", confirm,
                                    "--operator", OPERATOR, "--reason", "S6 " + run_id], True)
@@ -264,12 +267,13 @@ def registry(layer, vm, v, facts, run_id, program):
         except reg.RegistryRefused:
             raise _registry_refused()
         rc, out, _err = _host(layer, vm, v, home, program["package"], ["--registry", r], False,
-                              stdin=reg.show_input(key, program["adapter_interface"]))
+                              stdin=reg.show_input(stable, program["adapter_interface"]))
         try:
             lid = reg.parse_show(rc, out, slug, lid, idir, v["fleet_domain"])
         except (reg.RegistryError, reg.RegistryRefused):
             raise _registry_refused()
-        return [("ROUTER_LOGICAL_ID", lid), ("REGISTRY", "CREATED" if status == "imported" else "ALREADY")]
+        return [("ROUTER_LOGICAL_ID", lid), ("ROUTER_STABLE_KEY", stable),
+                ("REGISTRY", "CREATED" if status == "imported" else "ALREADY")]
     raise _registry_refused()
 
 
@@ -366,6 +370,26 @@ def run_vm(layer, c, vm_doc, other_doc, keys, hub_fqdn, run_id):
     vm, v = vm_doc["name"], vm_doc
     facts = measure(layer, vm, v)
     home = facts["home"]
+    # Every render runs before S6's first write, so a value the renderers refuse stops the stage with nothing
+    # written (3.4: UNCLASSIFIED, rc 2 only when no write can be shown).
+    try:
+        rp = c.lock["registry_program"]
+        router = r6.text(r6.router_json(agent_home=home, sandy_home=facts["sandy_home"], fleet_domain=v["fleet_domain"],
+                                        relay_uid=facts["relay_uid"], run_id=run_id, own_key_id=keys[vm]["KEY_ID"],
+                                        own_public_key=keys[vm]["KEY_PUBLIC"],
+                                        other={"slug": other_doc["router"]["slug"],
+                                               "fleet_domain": other_doc["fleet_domain"],
+                                               "key_id": keys[other_doc["name"]]["KEY_ID"],
+                                               "public_key": keys[other_doc["name"]]["KEY_PUBLIC"]}))
+        feature = f6.text(f6.manifest(fleet_domain=v["fleet_domain"]))
+        env = e6.text(e6.environment(agent_home=home, relay_home=facts["relay_home"], agent_uid=facts["uid"],
+                                     fleet_domain=v["fleet_domain"], hub_fqdn=hub_fqdn,
+                                     login_local=c.lock["hub_login"]["local"], login_domain=c.lock["hub_login"]["domain"]))
+        d7_doc = d7.text(d7.d7(own_domain=v["fleet_domain"], other_domains=[other_doc["fleet_domain"]], run_id=run_id))
+        prefix = d7.text(d7.prefix(hub_fqdn=hub_fqdn,
+                                   hub_short=c.hosts["hub_loop" if v["scope"] == "loop" else "hub"]["name"]))
+    except ValueError:
+        raise Refusal(STAGE + ".UNCLASSIFIED", "render", rc=3 if layer.wrote(STAGE) else None)
     rows, intakes = directories(layer, vm, v, facts)
     rows += relay_directories(layer, vm, v)
     changed = intakes == "CHANGED" or any(what == "CREATED" for _rel, what in rows)
@@ -374,21 +398,6 @@ def run_vm(layer, c, vm_doc, other_doc, keys, hub_fqdn, run_id):
     # the same file from /.
     if layer.install_file(vm, plugin, vm_bootstrap.PLUGIN, mode=0o444, stage=STAGE) != "ALREADY":
         changed = True
-    rp = c.lock["registry_program"]
-    router = r6.text(r6.router_json(agent_home=home, sandy_home=facts["sandy_home"], fleet_domain=v["fleet_domain"],
-                                    relay_uid=facts["relay_uid"], run_id=run_id, own_key_id=keys[vm]["KEY_ID"],
-                                    own_public_key=keys[vm]["KEY_PUBLIC"],
-                                    other={"slug": other_doc["router"]["slug"],
-                                           "fleet_domain": other_doc["fleet_domain"],
-                                           "key_id": keys[other_doc["name"]]["KEY_ID"],
-                                           "public_key": keys[other_doc["name"]]["KEY_PUBLIC"]}))
-    feature = f6.text(f6.manifest(fleet_domain=v["fleet_domain"]))
-    env = e6.text(e6.environment(agent_home=home, relay_home=facts["relay_home"], agent_uid=facts["uid"],
-                                 fleet_domain=v["fleet_domain"], hub_fqdn=hub_fqdn,
-                                 login_local=c.lock["hub_login"]["local"], login_domain=c.lock["hub_login"]["domain"]))
-    d7_doc = d7.text(d7.d7(own_domain=v["fleet_domain"], other_domains=[other_doc["fleet_domain"]], run_id=run_id))
-    prefix = d7.text(d7.prefix(hub_fqdn=hub_fqdn,
-                               hub_short=c.hosts["hub_loop" if v["scope"] == "loop" else "hub"]["name"]))
     payload = p6.entries(layer, p6.connector_of(c.hosts, vm))
     import a2_registry as reg
     placements = [
@@ -411,7 +420,8 @@ def run_vm(layer, c, vm_doc, other_doc, keys, hub_fqdn, run_id):
     if ("PEER_STORE", "INITIALISED") in out or ("REGISTRY", "CREATED") in out:
         changed = True
     receipt = [("CONFIG", "PLACED"), ("ROUTER_JSON_SHA", _sha(router)), ("FEATURE_JSON_SHA", _sha(feature)),
-               ("RE_ENV_SHA", _sha(env)), ("D7_SHA", _sha(d7_doc)), ("PLUGIN_SHA", _sha(plugin)),
+               ("RE_ENV_SHA", _sha(env)), ("D7_SHA", _sha(d7_doc)), ("PREFIX_JSON_SHA", _sha(prefix)),
+               ("PLUGIN_SHA", _sha(plugin)),
                ("AGENT_UID", str(facts["uid"])), ("RELAY_UID", str(facts["relay_uid"])),
                ("HOP_GID", str(facts["hop_gid"])), ("PYTHON", facts["python"])] + out
     return receipt, "CHANGED" if changed else "ALREADY"

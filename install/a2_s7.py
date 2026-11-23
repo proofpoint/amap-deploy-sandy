@@ -147,11 +147,11 @@ def expected_slug(ws):
 
 def slug_fits(agent_id):
     """Whether the sandbox name S7 will import for `agent_id` passes the registry's slug rule
-    (a2_agent_registry._SLUG, the pattern registry_import applies; private there today, and
-    imported, never restated). The name is `agent-<id>-<8 hex>` (expected_slug of
+    (a2_agent_registry.SLUG, the pattern registry_import applies; imported, never restated).
+    The name is `agent-<id>-<8 hex>` (expected_slug of
     `<home>/dev/agent-<id>`): its basename part and its length do not depend on the home, so
     this is decided from alpha2.hosts before any VM contact."""
-    return a2_agent_registry._SLUG.fullmatch(expected_slug("/dev/agent-" + agent_id)) is not None
+    return a2_agent_registry.SLUG.fullmatch(expected_slug("/dev/agent-" + agent_id)) is not None
 
 
 def check_slugs(site, agents):

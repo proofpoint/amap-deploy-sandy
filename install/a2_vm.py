@@ -35,7 +35,10 @@ SSH_ROUTE_FAILED = 255
 BOOTSTRAP = "vm_bootstrap.py"
 LAUNCHER = "vm_launch.py"
 MANIFEST = "MANIFEST"
-_MANIFEST_LINE = re.compile(rb"([0-9a-f]{64})  ([A-Za-z0-9_]{1,64}\.py)")
+#: alpha2_install.INSTALLER_DATA: data files MANIFEST may list by exact name.
+INSTALLER_DATA = ("a2_s3_render.py.lock",)
+_MANIFEST_LINE = re.compile(rb"([0-9a-f]{64})  ([A-Za-z0-9_]{1,64}\.py|"
+                            + b"|".join(re.escape(n.encode("ascii")) for n in INSTALLER_DATA) + rb")")
 _ACCOUNT = re.compile(r"[a-z_][a-z0-9_-]{0,31}")
 _ALIAS = re.compile(r"[a-z0-9][a-z0-9._-]{0,252}")
 _SHA = re.compile(r"[0-9a-f]{64}")

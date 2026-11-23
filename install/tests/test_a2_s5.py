@@ -72,10 +72,27 @@ class VmKeysTest(unittest.TestCase):
     def test_a_router_json_naming_another_key_refuses_and_prints_nothing(self):
         self.place()
         self.router_json("0" * 64)
+        with open(self.seed, "rb") as f:
+            before = (sorted(os.listdir(self.d)), os.lstat(self.seed).st_mtime_ns, f.read())
         p = self.run_keys()
         self.assertEqual((p.returncode, p.stdout), (3, b""))
+        with open(self.seed, "rb") as f:
+            self.assertEqual((sorted(os.listdir(self.d)), os.lstat(self.seed).st_mtime_ns, f.read()), before)
         self.router_json(RFC_PUB)
         self.assertEqual(self.run_keys().returncode, 0)
+
+    def test_a_router_json_key_without_a_seed_creates_nothing(self):
+        """Opus's r8 N1: router.json is read first, so a key it records with no seed behind it exits 7 and leaves no
+        seed and no directory; the next run meets the same state, not an orphan seed."""
+        self.router_json(RFC_PUB)
+        for _ in range(2):
+            p = self.run_keys()
+            self.assertEqual((p.returncode, p.stdout), (7, b""))
+            self.assertFalse(os.path.lexists(self.d))
+        os.mkdir(self.d, 0o700)
+        p = self.run_keys()
+        self.assertEqual((p.returncode, p.stdout), (7, b""))
+        self.assertEqual(os.listdir(self.d), [])
 
     def test_placement_rules(self):
         cases = (
@@ -118,8 +135,11 @@ class VmKeysTest(unittest.TestCase):
 
 
 class FakeLayer:
-    def __init__(self, rc, out):
-        self.rc, self.out, self.calls = rc, out, []
+    def __init__(self, rc, out, prior=False):
+        self.rc, self.out, self.calls, self.prior = rc, out, [], prior
+
+    def wrote(self, stage):
+        return self.prior
 
     def pinned_installer_file(self, name, stage):
         assert name == "vm_keys.py" and stage == "KEYS"
@@ -141,9 +161,14 @@ class S5Test(unittest.TestCase):
         self.assertEqual(a2_s5.keys_on_vm(L, "vm-a", "rl", "router-a")[2], ("KEY", "ALREADY"))
 
     def test_refusals(self):
-        with self.assertRaises(Refusal) as cm:
-            a2_s5.keys_on_vm(FakeLayer(3, b""), "vm-a", "rl", "router-a")
-        self.assertEqual((cm.exception.cause, cm.exception.rc), ("KEYS.EXISTS_DIFFERENT", 3))
+        # vm_keys writes nothing on rc 3 (another key recorded) or rc 7 (a key recorded, no seed), so each is rc 2
+        # unless an earlier VM's call wrote.
+        for code in (3, 7):
+            for prior, want in ((False, 2), (True, 3)):
+                with self.subTest(code=code, prior=prior):
+                    with self.assertRaises(Refusal) as cm:
+                        a2_s5.keys_on_vm(FakeLayer(code, b"", prior), "vm-a", "rl", "router-a")
+                    self.assertEqual((cm.exception.cause, cm.exception.rc), ("KEYS.EXISTS_DIFFERENT", want))
         for rc, out in ((0, b""), (0, b"CREATED " + b"0" * 63 + b"\n"), (0, ("CREATED %s\nmore\n" % RFC_PUB).encode()),
                         (4, b""), (0, ("created %s\n" % RFC_PUB).encode()), (0, ("CREATED %s" % RFC_PUB).encode())):
             with self.subTest(rc=rc, out=out[:20]):

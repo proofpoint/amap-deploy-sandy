@@ -30,6 +30,29 @@ class ManifestTest(unittest.TestCase):
         self.assertEqual(make_manifest.main(["x", "--check"]), 0,
                          "install/MANIFEST is stale: run install/tests/make_manifest.py")
 
+    def test_the_three_installer_data_lists_are_one(self):
+        import a2_vm
+        import alpha2_install
+        self.assertEqual(make_manifest.INSTALLER_DATA, ("a2_s3_render.py.lock",))
+        self.assertEqual(alpha2_install.INSTALLER_DATA, make_manifest.INSTALLER_DATA)
+        self.assertEqual(a2_vm.INSTALLER_DATA, make_manifest.INSTALLER_DATA)
+
+    def test_a_present_lock_is_listed_and_an_absent_one_is_not(self):
+        d = tempfile.mkdtemp(prefix="a2mf-")
+        self.addCleanup(shutil.rmtree, d, True)
+        for name, data in (("a.py", b"A = 1\n"), ("notes.txt", b"n\n"), ("x.lock", b"x\n")):
+            with open(os.path.join(d, name), "wb") as f:
+                f.write(data)
+        self.addCleanup(setattr, make_manifest, "INSTALL", make_manifest.INSTALL)
+        make_manifest.INSTALL = d
+        a = make_manifest.render()
+        self.assertEqual([ln.split(b"  ")[1] for ln in a.splitlines()], [b"a.py"])
+        with open(os.path.join(d, "a2_s3_render.py.lock"), "wb") as f:
+            f.write(b"lock\n")
+        import hashlib
+        self.assertEqual(make_manifest.render(),
+                         a + (hashlib.sha256(b"lock\n").hexdigest() + "  a2_s3_render.py.lock\n").encode())
+
 
 class LoaderTest(unittest.TestCase):
     def setUp(self):
@@ -74,6 +97,25 @@ class LoaderTest(unittest.TestCase):
             lines = [ln if not ln.endswith("  a2_main.py\n") else h + "  a2_main.py\n" for ln in f]
         with open(mf, "w") as f:
             f.writelines(lines)
+        r = run_entry(self.inst, ["--verify"])
+        self.assertEqual(r.stderr.splitlines()[0], INTERPRETER_LINE)
+
+    def test_a_listed_render_lock_is_data_the_loader_accepts(self):
+        with open(os.path.join(self.inst, "a2_s3_render.py.lock"), "wb") as f:
+            f.write(b"lock\n")
+        self.addCleanup(setattr, make_manifest, "INSTALL", make_manifest.INSTALL)
+        make_manifest.INSTALL = self.inst
+        self.assertEqual(make_manifest.main(["x"]), 0)
+        with open(os.path.join(self.inst, "MANIFEST"), "rb") as f:
+            self.assertIn(b"  a2_s3_render.py.lock\n", f.read())
+        r = run_entry(self.inst, ["--verify"])
+        self.assertEqual(r.returncode, 2)
+        self.assertEqual(r.stderr.splitlines()[0], "CAUSE=PREFLIGHT.PRIVATE_SOURCE")
+
+    def test_another_data_name_in_the_manifest_refuses(self):
+        mf = os.path.join(self.inst, "MANIFEST")
+        with open(mf, "ab") as f:
+            f.write(b"0" * 64 + b"  other.lock\n")
         r = run_entry(self.inst, ["--verify"])
         self.assertEqual(r.stderr.splitlines()[0], INTERPRETER_LINE)
 

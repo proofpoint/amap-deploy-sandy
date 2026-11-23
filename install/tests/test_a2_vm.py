@@ -654,6 +654,40 @@ class WriteRuleTest(Base):
         self.assertFalse(os.path.exists(os.path.join(self.root, "usr", "local", "bin")))
 
 
+class InstallerDataTest(Base):
+    """The real VmLayer.pinned_installer_file over a real MANIFEST on a scratch checkout (ruling S3-RENDER-LOCK-A,
+    FAKE-FIDELITY-RULE): S3's render lock is admitted by its exact name only when MANIFEST lists it."""
+    LOCK_NAME = "a2_s3_render.py.lock"
+
+    def list_lock(self, data):
+        with open(os.path.join(self.inst, self.LOCK_NAME), "wb") as f:
+            f.write(data)
+        with open(os.path.join(self.inst, "MANIFEST"), "a") as f:
+            f.write("%s  %s\n" % (hashlib.sha256(data).hexdigest(), self.LOCK_NAME))
+        self.lock["installer"]["sha256"] = self.manifest_sha()
+
+    def test_a_listed_lock_is_read_back(self):
+        self.list_lock(b'{"render": "lock"}\n')
+        self.assertEqual(self.layer().pinned_installer_file(self.LOCK_NAME, "HUB-CHECK"), b'{"render": "lock"}\n')
+
+    def test_an_absent_lock_refuses_pin(self):
+        self.refuses("HUB-CHECK.PIN", self.layer().pinned_installer_file, self.LOCK_NAME, "HUB-CHECK")
+
+    def test_a_lock_whose_bytes_differ_refuses_pin(self):
+        self.list_lock(b"a\n")
+        with open(os.path.join(self.inst, self.LOCK_NAME), "wb") as f:
+            f.write(b"b\n")
+        self.refuses("HUB-CHECK.PIN", self.layer().pinned_installer_file, self.LOCK_NAME, "HUB-CHECK")
+
+    def test_another_data_name_is_never_listed(self):
+        with open(os.path.join(self.inst, "other.lock"), "wb") as f:
+            f.write(b"x\n")
+        with open(os.path.join(self.inst, "MANIFEST"), "a") as f:
+            f.write("%s  other.lock\n" % hashlib.sha256(b"x\n").hexdigest())
+        self.lock["installer"]["sha256"] = self.manifest_sha()
+        self.refuses("HUB-CHECK.PIN", self.layer().pinned_installer_file, "other.lock", "HUB-CHECK")
+
+
 class HopIntakesLayerTest(Base):
     """The layer's call of vm_bootstrap's hopintakes (W7-HOPINTAKES, option R): the op's own rules are
     test_vm_hopintakes'; here, the route, the argument checks before ssh, and each rc's meaning under the write

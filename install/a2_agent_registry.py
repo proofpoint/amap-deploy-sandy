@@ -26,7 +26,8 @@ from a2_causes import Refusal
 AGENT_BATCH_ROOT = ".amap-registry-agents"
 #: The agent account's home, as its passwd entry gives it (the launcher's HOME is the same entry).
 HOME_ARGV = [a2_s6.PYTHON, "-I", "-S", "-c", "import os, pwd; print(pwd.getpwuid(os.geteuid()).pw_dir)"]
-_SLUG = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+#: The slug registry_import accepts, so a caller can check its own slug before its first write.
+SLUG = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 
 
 class AgentRegistry:
@@ -72,10 +73,13 @@ class AgentRegistry:
             raise Refusal(stage + ".UNCLASSIFIED", "place " + AGENT_BATCH_ROOT, rc=3)
 
     def registry_import(self, vm, slug, stable_key, *, stage):
-        """Import one agent: its batch placed, then plan, apply with that plan's confirm, then a strict show."""
+        """Import one agent: its batch placed, then plan, apply with that plan's confirm, then a strict show. The
+        stable_key kept is HOST's, as its plan returns it (HOST normalises the batch's key against the VM's
+        filesystem), never compared with `stable_key`; the apply echoes it (parse_apply), and the shows query by it."""
         v = self._vm(vm, stage)
-        if (not isinstance(slug, str) or not _SLUG.fullmatch(slug) or not isinstance(stable_key, str)
-                or not stable_key.startswith("/") or posixpath.normpath(stable_key) != stable_key):
+        if (not isinstance(slug, str) or not SLUG.fullmatch(slug) or not isinstance(stable_key, str)
+                or not stable_key.startswith("/") or stable_key.startswith("//")
+                or posixpath.normpath(stable_key) != stable_key):
             raise Refusal(stage + ".UNCLASSIFIED", "agent slug or key", rc=self._rc(stage))
         program = self.layer.lock["registry_program"]
         home = self._home(vm, v, stage)
@@ -87,7 +91,7 @@ class AgentRegistry:
             rc, out, _err = self._host(vm, v, home, program["package"] + ".opverbs",
                                        ["--registry", r, "plan", "import", "--batch", batch], False, stage)
             try:
-                confirm, _action, plan, _stable = reg.parse_plan(rc, out, slug)
+                confirm, _action, plan, stable = reg.parse_plan(rc, out, slug)
                 rc, out, _err = self._host(vm, v, home, program["package"] + ".opverbs",
                                            ["--registry", r, "apply", "import", "--batch", batch, "--confirm", confirm,
                                             "--operator", a2_s6.OPERATOR, "--reason", stage + " agent " + slug],
@@ -100,12 +104,12 @@ class AgentRegistry:
             except reg.RegistryRefused:
                 raise refused
             rc, out, _err = self._host(vm, v, home, program["package"], ["--registry", r], False, stage,
-                                       stdin=reg.show_input(stable_key, program["adapter_interface"]))
+                                       stdin=reg.show_input(stable, program["adapter_interface"]))
             try:
                 lid = reg.parse_show(rc, out, slug, lid, idir, v["fleet_domain"])
             except (reg.RegistryError, reg.RegistryRefused):
                 raise refused
-            self._imported[(vm, slug)] = (stable_key, lid, idir)
+            self._imported[(vm, slug)] = (stable, lid, idir)
             return None
         raise refused
 

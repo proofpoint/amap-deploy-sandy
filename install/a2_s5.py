@@ -3,7 +3,9 @@
 On each VM of the run, as the account RL runs as, the pinned vm_keys.py creates the seed if absent and prints only the
 public key; the seed never leaves the VM. The key id is `<router slug>-k1`. A re-run recomputes the public key from
 the existing seed, and an existing router.json that names another key refuses `KEYS.EXISTS_DIFFERENT`: a key is never
-regenerated. The receipt of each VM carries KEY_ID, KEY_PUBLIC and KEY (CREATED or ALREADY); S6 renders them into the
+regenerated. A router.json that records a key with no seed on the VM refuses the same cause. In both, vm_keys writes
+nothing (it creates a seed only when router.json records no key), so the refusal is rc 2 before the stage's first
+write. The receipt of each VM carries KEY_ID, KEY_PUBLIC and KEY (CREATED or ALREADY); S6 renders them into the
 VM's own router.json and the other VM's delegation.runtimes[].
 """
 
@@ -19,6 +21,8 @@ ROUTER_JSON = ".amap-router/router.json"
 KEY_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 _LINE = re.compile(rb"(CREATED|EXISTING) ([0-9a-f]{64})\n")
 _EXISTS_DIFFERENT = 3
+#: vm_keys' NO_SEED: router.json records a key and there is no seed; vm_keys wrote nothing.
+_NO_SEED = 7
 
 
 def key_id(slug):
@@ -33,10 +37,13 @@ def keys_on_vm(layer, vm, router_account, slug):
     """The facts of this VM's S5 receipt: [(KEY_ID, id), (KEY_PUBLIC, 64 hex), (KEY, CREATED or ALREADY)]."""
     kid = key_id(slug)
     src = layer.pinned_installer_file(KEYS_SCRIPT, STAGE).decode("utf-8")
+    prior = layer.wrote(STAGE)
     rc, out, _err = layer.exec(vm, [PYTHON, "-I", "-S", "-c", src, ROUTER_JSON], account=router_account,
                                stage=STAGE, writes=True)
     if rc == _EXISTS_DIFFERENT:
-        raise Refusal(STAGE + ".EXISTS_DIFFERENT", vm, rc=3)
+        raise Refusal(STAGE + ".EXISTS_DIFFERENT", vm, rc=3 if prior else None)
+    if rc == _NO_SEED:
+        raise Refusal(STAGE + ".EXISTS_DIFFERENT", vm, rc=3 if prior else None)
     m = _LINE.fullmatch(out) if rc == 0 else None
     if m is None:
         raise Refusal(STAGE + ".UNCLASSIFIED", "keys rc %d" % rc, rc=3)

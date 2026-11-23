@@ -82,7 +82,7 @@ STAGE_SENTENCES = {
     'TARGET_ACCESS': 'Look at the VM named in the receipt: the route to it failed, timed out, or is not configured.',
     'EXISTS_DIFFERENT': 'Look at the router key on the VM named in the receipt: a key is already there, and the router.json there names another.',
     'INTERPRETER': 'Look at the VM named in the receipt: its python3 is older than the release the stage requires.',
-    'CLOCK': "Look at hub-t's clock: it differs from this machine's by more than the allowed skew, or could not be read.",
+    'CLOCK': "Look at the run scope's hub clock: it differs from this machine's by more than the allowed skew, or could not be read.",
     'HUB_NAME': "Look at alpha2.hosts: the run's hub name is not a host key of the pinned inventory.",
     'HUB_HOSTNAME': "Look at this run's S3 receipt: its HUB_HOSTNAME fact, the hub's mail server hostname, is missing or malformed.",
     'ROUTER_REFUSED': "Look at router.json on the VM named in the receipt: the router's own check of it failed.",

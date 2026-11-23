@@ -107,7 +107,7 @@ class RefusalTest(Base):
 
     def test_a_bad_slug_or_key_refuses_before_any_call(self):
         for slug, key in (("", KEY), ("-x", KEY), ("a/b", KEY), (None, KEY), (SLUG, "rel"), (SLUG, "/a/../b"),
-                          (SLUG, None), (SLUG, "/a/")):
+                          (SLUG, None), (SLUG, "/a/"), (SLUG, "//a/b")):
             with self.subTest(slug=slug, key=key):
                 L = ScriptLayer()
                 self.refuses("AGENTS.UNCLASSIFIED", 2, A.AgentRegistry(L).registry_import, "vm-a", slug, key,
@@ -147,6 +147,24 @@ class RefusalTest(Base):
     def test_a_hard_refusal_is_never_retried(self):
         L = ScriptLayer((0, HOME), (0, PLACED), (0, TR.PLAN),
                         (1, b'{"error": {"code": "key_bound", "detail": "x"}, "ok": false}\n'))
+        self.refuses("AGENTS.REGISTRY", 3, A.AgentRegistry(L).registry_import, "vm-a", SLUG, KEY, stage="AGENTS")
+        self.assertEqual(len(L.calls), 4)
+
+    def test_a_key_the_registry_normalised_passes_and_every_show_uses_it(self):
+        """HOST normalises the batch's key against the VM's filesystem (HOST's answer f46595f6, lines 17-20), so its
+        plan may return another key than the raw one. That key is kept, and both shows query by it."""
+        norm = "/scratch/Keys/router-vm1"
+        plan, apply_ = (TR.edit(x, lambda d: d["plan"]["items"][0].update(stable_key=norm)) for x in (TR.PLAN, TR.APPLY))
+        L = ScriptLayer((0, HOME), (0, PLACED), (0, plan), (0, apply_), (0, TR.SHOW), (0, TR.SHOW))
+        R = A.AgentRegistry(L)
+        self.assertIsNone(R.registry_import("vm-a", SLUG, KEY, stage="AGENTS"))
+        self.assertEqual(R.registry_read("vm-a", SLUG, stage="AGENTS"), TR.LID)
+        self.assertEqual([json.loads(c["stdin"])["key"] for c in L.calls[4:]], [norm, norm])
+        self.assertEqual(json.loads(vm_place.parse(L.calls[1]["stdin"])[0][2])[0]["key"], KEY)
+
+    def test_an_apply_for_another_key_than_the_plan_refuses(self):
+        apply_ = TR.edit(TR.APPLY, lambda d: d["plan"]["items"][0].update(stable_key="/scratch/keys/other"))
+        L = ScriptLayer((0, HOME), (0, PLACED), (0, TR.PLAN), (0, apply_))
         self.refuses("AGENTS.REGISTRY", 3, A.AgentRegistry(L).registry_import, "vm-a", SLUG, KEY, stage="AGENTS")
         self.assertEqual(len(L.calls), 4)
 
