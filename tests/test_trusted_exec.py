@@ -3,6 +3,7 @@ what order, and how it discovers what a command loads, on synthetic images
 built here byte by byte (Mach-O for macOS's dyld, ELF for Linux's loader)."""
 
 import errno
+import json
 import os
 import struct
 import subprocess
@@ -686,6 +687,165 @@ class LoaderConfigTest(unittest.TestCase):
 
     def test_darwin_names_the_dyld_fallbacks(self):
         self.assertEqual(set(hs.loader_dirs("darwin")), set(hs.DYLD_FALLBACK_DIRS))
+
+
+
+
+class DynloadTest(unittest.TestCase):
+    """DS-DARWIN-DYNLOAD: the extension-module directory is the sys.path entry
+    _ctypes is found in, under the standard library. A build-time DESTSHARED
+    (the CLT python names an Xcode tree, as measured on the Mac) is used only
+    when no _ctypes is found, and is held to the same rule."""
+
+    F = "/T/F/Versions/3.9"
+    STD = F + "/lib/python3.9"
+    DYN = STD + "/lib-dynload"
+    XCODE = "/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/lib-dynload"
+
+    def test_the_path_entry_ctypes_is_in_wins_over_destshared(self):
+        """The Mac's shape (T10 M4): DESTSHARED names an Xcode tree, sys.path the CLT one."""
+        try:
+            got = hs._dynload_dir(self.STD, self.STD, [self.STD, self.DYN], self.DYN, self.XCODE)
+        except hs.Tooling as e:
+            self.fail(f"DESTSHARED was chosen over the _ctypes entry and refused: {e}")
+        self.assertEqual(got, self.DYN)
+
+    def test_destshared_only_without_ctypes_and_only_under_the_library(self):
+        self.assertEqual(hs._dynload_dir(self.STD, self.STD, [self.STD], None, self.DYN), self.DYN)
+        self.assertEqual(hs._dynload_dir(self.STD, self.STD, [self.STD], None, None), self.STD + "/lib-dynload")
+        with self.assertRaisesRegex(hs.Tooling, "not under the interpreter's library"):
+            hs._dynload_dir(self.STD, self.STD, [self.STD], None, self.XCODE)
+
+    def test_a_ctypes_dir_off_the_path_or_outside_the_library_refuses(self):
+        with self.assertRaisesRegex(hs.Tooling, "not on the interpreter's path"):
+            hs._dynload_dir(self.STD, self.STD, [self.STD], self.DYN, None)
+        with self.assertRaisesRegex(hs.Tooling, "not under the interpreter's library"):
+            hs._dynload_dir(self.STD, self.STD, ["/opt/x/lib-dynload"], "/opt/x/lib-dynload", None)
+        with self.assertRaisesRegex(hs.Tooling, "not under the interpreter's library"):
+            hs._dynload_dir(self.STD, self.STD, [self.STD + "/../x"], self.STD + "/../x", None)
+        with self.assertRaisesRegex(hs.Tooling, "not under the interpreter's library"):
+            hs._dynload_dir(self.STD, self.STD, [self.STD + "x/lib-dynload"], self.STD + "x/lib-dynload", None)
+
+    def test_the_query_reports_the_path_entry_ctypes_is_found_in(self):
+        """The real query, on this host's interpreter: `ctypes` names a
+        sys.path entry holding _ctypes, found without loading it."""
+        p = subprocess.run([os.path.realpath(sys.executable), "-I", "-S", "-B", "-c", hs._CLOSURE_QUERY],
+                           capture_output=True, text=True, env={}, timeout=60)
+        found = json.loads(p.stdout)
+        self.assertIsNotNone(found["ctypes"])
+        self.assertIn(found["ctypes"], found["path"])
+        self.assertTrue([n for n in os.listdir(found["ctypes"]) if n.startswith("_ctypes")], found["ctypes"])
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux DESTSHARED compatibility row")
+    def test_linux_is_unchanged(self):
+        import sysconfig
+        lib, _, _ = hs._ask_closure(os.path.realpath(sys.executable))
+        self.assertEqual(lib[2], sysconfig.get_config_var("DESTSHARED") or
+                         os.path.join(sysconfig.get_paths()["platstdlib"], "lib-dynload"))
+
+
+class FakeInterpreterTest(Tmp):
+    """exec_closure and startup_closure end to end with a fake interpreter
+    that reports a DESTSHARED differing from sys.path: absent, and under a
+    group-writable Applications holding a planted module. The modules judged
+    are the ones on sys.path, and the DESTSHARED tree is never named. Both
+    closures judge Python.app's binary on darwin, each executable under its
+    own main and the modules under the app's."""
+
+    def interpreter(self, destshared, app=False):
+        fw = os.path.join(self.d, "F/Versions/3.9")
+        std = fw + "/lib/python3.9"
+        dyn = std + "/lib-dynload"
+        self.put("F/Versions/3.9/lib/python3.9/lib-dynload/_ctypes.so", b"", 0o644)
+        self.put("F/Versions/3.9/lib/python3.9/lib-dynload/m.so", b"", 0o644)
+        if app:
+            self.put("F/Versions/3.9/Resources/Python.app/Contents/MacOS/Python", b"", 0o755)
+        facts = {"stdlib": std, "platstdlib": std, "path": [std, dyn], "ctypes": dyn, "destshared": destshared,
+                 "prefix": fw, "zips": []}
+        self.put("facts.json", json.dumps(facts).encode(), 0o644)
+        py = self.put("F/Versions/3.9/bin/python3.9", f"#!/bin/sh\ncat '{self.d}/facts.json'\n".encode(), 0o755)
+        return py, dyn, fw
+
+    def calls(self, platform, startup=False, **kw):
+        seen = []
+        self.addCleanup(setattr, hs, "_elf_closure", hs._elf_closure)
+        self.addCleanup(setattr, hs, "_macho_closure", hs._macho_closure)
+        hs._elf_closure = lambda images, *a, **k: (seen.append(("elf", list(images), None)), ([], []))[1]
+        hs._macho_closure = lambda images, main, *a, **k: (seen.append(("macho", list(images), main)),
+                                                           ([], [main + ".searched"]))[1]
+        py, dyn, fw = self.interpreter(**kw)
+        if startup:
+            closure = hs.startup_closure(py, "/usr/bin/docker", (py,), platform=platform)
+        else:
+            closure = hs.exec_closure(py, ["/usr/bin/docker"], [py], platform=platform)
+        return seen, closure, py, dyn, fw
+
+    def test_an_absent_destshared_is_never_named_and_the_path_modules_are_judged(self):
+        seen, closure, py, dyn, _ = self.calls("linux", destshared="/Applications/Xcode.app/x/lib-dynload")
+        self.assertEqual(seen, [("elf", [py, "/usr/bin/docker", dyn + "/_ctypes.so", dyn + "/m.so"], None)])
+        self.assertIn(dyn, closure[hs.REQUIRED])
+        self.assertFalse([p for p in closure[hs.REQUIRED] if "Xcode" in p], closure[hs.REQUIRED])
+
+    def test_a_destshared_under_a_writable_applications_is_never_named(self):
+        bad = os.path.join(self.d, "Applications/Xcode.app/lib-dynload")
+        self.put("Applications/Xcode.app/lib-dynload/evil.so", b"", 0o644)
+        os.chmod(os.path.join(self.d, "Applications"), 0o775)
+        seen, closure, py, dyn, _ = self.calls("linux", destshared=bad)
+        self.assertFalse([i for _, imgs, _ in seen for i in imgs if "evil" in i], seen)
+        self.assertNotIn(bad, closure[hs.REQUIRED])
+
+    def test_darwin_judges_python_app_as_its_own_main_and_the_modules_under_it(self):
+        seen, closure, py, dyn, fw = self.calls("darwin", destshared="/Applications/Xcode.app/x/lib-dynload", app=True)
+        app = os.path.join(fw, *hs.DARWIN_APP_MAIN)
+        self.assertIn(app, closure[hs.REQUIRED])
+        self.assertEqual(sorted((tuple(i), m) for _, i, m in seen),
+                         sorted([((py,), py), (("/usr/bin/docker",), "/usr/bin/docker"), ((app,), app),
+                                 ((dyn + "/_ctypes.so", dyn + "/m.so"), app)]))
+
+    def test_darwin_without_python_app_keeps_the_interpreter_as_the_modules_main(self):
+        seen, closure, py, dyn, fw = self.calls("darwin", destshared=None)
+        self.assertNotIn(os.path.join(fw, *hs.DARWIN_APP_MAIN), closure[hs.REQUIRED])
+        self.assertIn(((dyn + "/_ctypes.so", dyn + "/m.so"), py), [(tuple(i), m) for _, i, m in seen])
+
+    def test_startup_judges_python_app_as_its_own_main_and_the_modules_under_it(self):
+        """Codex B1 at 75bfb8a8: the startup preflight's closure had neither the app nor per-binary mains."""
+        seen, closure, py, dyn, fw = self.calls("darwin", startup=True, destshared=None, app=True)
+        app = os.path.join(fw, *hs.DARWIN_APP_MAIN)
+        self.assertIn(app, closure[hs.REQUIRED])
+        self.assertEqual(sorted((tuple(i), m) for _, i, m in seen),
+                         sorted([((py,), py), (("/usr/bin/docker",), "/usr/bin/docker"), ((app,), app),
+                                 ((dyn + "/_ctypes.so", dyn + "/m.so"), app)]))
+        self.assertIn(app + ".searched", closure[hs.OPTIONAL], "the directories dyld searches are would-be places")
+
+    def test_startup_without_python_app_keeps_the_interpreter_as_the_modules_main(self):
+        seen, closure, py, dyn, fw = self.calls("darwin", startup=True, destshared=None)
+        self.assertNotIn(os.path.join(fw, *hs.DARWIN_APP_MAIN), closure[hs.REQUIRED])
+        self.assertIn(((dyn + "/_ctypes.so", dyn + "/m.so"), py), [(tuple(i), m) for _, i, m in seen])
+        self.assertIn((("/usr/bin/docker",), "/usr/bin/docker"), [(tuple(i), m) for _, i, m in seen])
+
+    def test_startup_on_linux_lists_every_image_once_through_the_loader(self):
+        seen, closure, py, dyn, _ = self.calls("linux", startup=True, destshared=None, app=True)
+        self.assertEqual(seen, [("elf", [py, "/usr/bin/docker", dyn + "/_ctypes.so", dyn + "/m.so"], None)])
+        self.assertFalse([p for p in closure[hs.REQUIRED] if "Python.app" in p], closure[hs.REQUIRED])
+
+    def test_verified_tools_refuses_a_writable_python_app(self):
+        """The live consumer (secret_setup's operator closure, probe-weekly's
+        tools): a group-writable Python.app binary is judged and refused.
+        closure_problems is reduced to the mode rule, since the fixture is
+        not root's; _trusted_tool to the identity."""
+        py, dyn, fw = self.interpreter(destshared=None, app=True)
+        app = os.path.join(fw, *hs.DARWIN_APP_MAIN)
+        os.chmod(app, 0o775)
+        for name, value in (("_trusted_tool", lambda p: p),
+                            ("_macho_closure", lambda images, main, *a, **k: ([], [])),
+                            ("closure_problems", lambda c: [f"{p} is writable by others" for p in c[hs.REQUIRED]
+                                                            if os.path.isfile(p) and os.stat(p).st_mode & 0o022])):
+            self.addCleanup(setattr, hs, name, getattr(hs, name))
+            setattr(hs, name, value)
+        with self.assertRaisesRegex(hs.Tooling, "Python.app"):
+            hs._verified_tools(py, "/usr/bin/docker", platform="darwin")
+        os.chmod(app, 0o755)
+        self.assertEqual(hs._verified_tools(py, "/usr/bin/docker", platform="darwin"), (py, "/usr/bin/docker"))
 
 
 if __name__ == "__main__":

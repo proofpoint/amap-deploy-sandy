@@ -1306,46 +1306,104 @@ def _linked_libraries(binaries):
 
 
 #: Asks the interpreter, under an empty environment, where its startup closure is.
-_CLOSURE_QUERY = ("import json,os,sys,sysconfig\n"
+#: It reports facts, and _ask_closure chooses: the extension-module directory is the one
+#: _ctypes would load from (find_spec loads nothing), never a build-time DESTSHARED alone
+#: (DS-DARWIN-DYNLOAD: the CLT python's names an Xcode tree that is not the one it imports from).
+_CLOSURE_QUERY = ("import importlib.util,json,os,sys,sysconfig\n"
                   "p=sysconfig.get_paths()\n"
-                  "d=sysconfig.get_config_var('DESTSHARED') or os.path.join(p['platstdlib'],'lib-dynload')\n"
-                  "print(json.dumps({'paths':[p['stdlib'],p['platstdlib'],d],"
-                  "'zips':[x for x in sys.path if x.endswith('.zip')]}))\n")
+                  "s=importlib.util.find_spec('_ctypes')\n"
+                  "o=s.origin if s is not None and isinstance(s.origin,str) and os.path.isabs(s.origin) else None\n"
+                  "print(json.dumps({'stdlib':p['stdlib'],'platstdlib':p['platstdlib'],'path':sys.path,"
+                  "'ctypes':os.path.dirname(o) if o else None,'destshared':sysconfig.get_config_var('DESTSHARED'),"
+                  "'prefix':sys.prefix,'zips':[x for x in sys.path if x.endswith('.zip')]}))\n")
 #: The parts of a startup closure: paths that must exist; libraries the
 #: operating system's tool named (on macOS possibly only in the shared
 #: cache); and optional paths the interpreter would load if present (a zip on
 #: its path), whose would-be place is protected when they are absent.
 REQUIRED, LIBRARIES, OPTIONAL = "required", "libraries", "optional"
+#: Under a framework build's prefix, the binary its launcher re-execs (dyld's image 0).
+DARWIN_APP_MAIN = ("Resources", "Python.app", "Contents", "MacOS", "Python")
 
 
-def startup_closure(python, docker, spelled=()):
-    """Every path root's runs of `python` and `docker` load from, by part:
-    REQUIRED, the binaries (their realpaths, and `spelled`, the approved
-    document's spellings, whose routes the unit execs), the interpreter's standard library and its
-    extension modules, and on macOS the developer directory xcode-select
-    chose; LIBRARIES, what both binaries and every extension module link;
-    OPTIONAL, each zip on the interpreter's path."""
+def _dynload_dir(stdlib, platstdlib, path, ctypes_dir, destshared):
+    """The extension-module directory the interpreter imports from: the
+    sys.path entry _ctypes is found in; DESTSHARED (or platstdlib's
+    lib-dynload) only when no _ctypes is found. Either way it must lie
+    under the standard library, textually and with no `..`. Tooling
+    otherwise: never a guess."""
+    if ctypes_dir is not None:
+        if ctypes_dir not in path:
+            raise Tooling(f"_ctypes is found in {ctypes_dir}, which is not on the interpreter's path")
+        d = ctypes_dir
+    else:
+        d = destshared or os.path.join(platstdlib, "lib-dynload")
+    if not (isinstance(d, str) and d.startswith(stdlib.rstrip("/") + "/") and ".." not in d.split("/")):
+        raise Tooling(f"the extension-module directory {d} is not under the interpreter's library {stdlib}")
+    return d
+
+
+def _ask_closure(python):
+    """([stdlib, platstdlib, extension-module directory], [zips], prefix), as
+    the interpreter reports them under an empty environment."""
     try:
         p = subprocess.run([python, "-I", "-S", "-B", "-c", _CLOSURE_QUERY], shell=False, close_fds=True,
                            stdin=subprocess.DEVNULL, env={}, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                            timeout=60)
         found = json.loads(p.stdout)
-    except (OSError, subprocess.TimeoutExpired, ValueError) as e:
+        stdlib, platstdlib, path, zips, prefix = (found["stdlib"], found["platstdlib"], found["path"], found["zips"],
+                                                  found["prefix"])
+        ctypes_dir, destshared = found["ctypes"], found["destshared"]
+    except (OSError, subprocess.TimeoutExpired, ValueError, KeyError, TypeError) as e:
         raise Tooling(f"the interpreter cannot say where its library is: {e}") from None
-    def absolute(xs):
-        if not isinstance(xs, list) or not all(isinstance(x, str) and x.startswith("/") for x in xs):
-            raise Tooling("the interpreter named its library in a form that is not absolute paths")
-        return xs
-    paths = absolute(found.get("paths")) + [python, docker] + list(spelled)
-    optional = absolute(found.get("zips"))
-    if len(found["paths"]) != 3:
-        raise Tooling("the interpreter did not name its library, platform library and extension modules")
-    dynload = found["paths"][2]
-    modules = []
-    if os.path.isdir(dynload):
-        modules = [os.path.join(dynload, n) for n in os.listdir(dynload) if n.endswith(".so")]
-    libraries = _linked_libraries([python, docker] + modules)
-    if sys.platform == "darwin" and os.path.exists(XCODE_SELECT):
+    named = [stdlib, platstdlib, prefix] + ([ctypes_dir] if ctypes_dir is not None else [])
+    if not (isinstance(path, list) and isinstance(zips, list)
+            and all(isinstance(x, str) and x.startswith("/") for x in named + zips)
+            and all(isinstance(x, str) for x in path) and (destshared is None or isinstance(destshared, str))):
+        raise Tooling("the interpreter did not name its library in absolute paths")
+    return [stdlib, platstdlib, _dynload_dir(stdlib, platstdlib, path, ctypes_dir, destshared)], zips, prefix
+
+
+def _modules(dynload):
+    """The extension modules in `dynload`, sorted; none when it is not a directory."""
+    return sorted(os.path.join(dynload, n) for n in os.listdir(dynload) if n.endswith(".so")) \
+        if os.path.isdir(dynload) else []
+
+
+def _closure_images(python, tools, modules, prefix, platform=None):
+    """(binaries, libraries, searched): the executables judged, what they and
+    `modules` link, and the directories a loader searches. On macOS a
+    framework build's launcher re-execs Python.app's binary, dyld's real main
+    image, so it is judged too; each executable is its own @executable_path,
+    and the modules load under the process's main, Python.app's binary where
+    it exists."""
+    binaries = [python] + list(tools)
+    if (platform or sys.platform) != "darwin":
+        libraries, searched = _elf_closure(binaries + modules)
+        return binaries, libraries, searched
+    app = os.path.join(prefix, *DARWIN_APP_MAIN)
+    if os.path.lexists(app):
+        binaries.append(app)
+    libs, opt = set(), set()
+    for main, images in [(b, [b]) for b in binaries] + [(app if app in binaries else python, modules)]:
+        got, searched_ = _macho_closure(images, main)
+        libs.update(got)
+        opt.update(searched_)
+    return binaries, sorted(libs), sorted(opt)
+
+
+def startup_closure(python, docker, spelled=(), platform=None):
+    """Every path root's runs of `python` and `docker` load from, by part:
+    REQUIRED, the binaries (their realpaths, on macOS Python.app's binary,
+    and `spelled`, the approved document's spellings, whose routes the unit
+    execs), the interpreter's standard library and its extension modules,
+    and on macOS the developer directory xcode-select chose; LIBRARIES, what
+    the binaries and every extension module link; OPTIONAL, each zip on the
+    interpreter's path and the directories the loader searches."""
+    lib, zips, prefix = _ask_closure(python)
+    binaries, libraries, searched = _closure_images(python, [docker], _modules(lib[2]), prefix, platform)
+    paths = lib + binaries + list(spelled)
+    optional = zips + searched
+    if (platform or sys.platform) == "darwin" and os.path.exists(XCODE_SELECT):
         try:
             dev = subprocess.run([XCODE_SELECT, "-p"], shell=False, close_fds=True, stdin=subprocess.DEVNULL, env={},
                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=30).stdout.decode().strip()
@@ -1534,11 +1592,11 @@ def _docker_closure(docker, spelled=None):
             OPTIONAL: []}
 
 
-def _verified_tools(python3, docker):
+def _verified_tools(python3, docker, platform=None):
     """The interpreter's and docker's realpaths once they and their startup
     closure are root's alone; Tooling otherwise."""
     python, dock = _trusted_tool(python3), _trusted_tool(docker)
-    bad = closure_problems(startup_closure(python, dock, (python3, docker)))
+    bad = closure_problems(startup_closure(python, dock, (python3, docker), platform=platform))
     if bad:
         raise Tooling("the startup closure is not root's alone: " + "; ".join(bad[:5]))
     return python, dock
@@ -1916,25 +1974,8 @@ def exec_closure(python, tools, spelled, platform=None):
     library they and the modules link. On macOS the libraries are read from
     the Mach-O load commands, never through /usr/bin/otool (an xcrun stub),
     and the rpath directories dyld searches are optional paths."""
-    try:
-        p = subprocess.run([python, "-I", "-S", "-B", "-c", _CLOSURE_QUERY], shell=False, close_fds=True,
-                           stdin=subprocess.DEVNULL, env={}, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                           timeout=60)
-        found = json.loads(p.stdout)
-        paths, zips = found["paths"], found["zips"]
-    except (OSError, subprocess.TimeoutExpired, ValueError, KeyError, TypeError) as e:
-        raise Tooling(f"the interpreter cannot say where its library is: {e}") from None
-    if not (isinstance(paths, list) and len(paths) == 3 and isinstance(zips, list)
-            and all(isinstance(x, str) and x.startswith("/") for x in paths + zips)):
-        raise Tooling("the interpreter did not name its library in absolute paths")
-    dynload = paths[2]
-    modules = sorted(os.path.join(dynload, n) for n in os.listdir(dynload) if n.endswith(".so")) \
-        if os.path.isdir(dynload) else []
-    binaries = [python] + list(tools)
-    if (platform or sys.platform) == "darwin":
-        libraries, searched = _macho_closure(binaries + modules, python)
-    else:
-        libraries, searched = _elf_closure(binaries + modules)
+    paths, zips, prefix = _ask_closure(python)
+    binaries, libraries, searched = _closure_images(python, tools, _modules(paths[2]), prefix, platform)
     return {REQUIRED: sorted(set(paths + binaries + list(spelled))), LIBRARIES: libraries,
             OPTIONAL: sorted(set(zips + searched))}
 

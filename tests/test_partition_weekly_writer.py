@@ -15,7 +15,6 @@ records every call with the path it was run as."""
 import hashlib
 import json
 import re
-import types
 import os
 import signal
 import shutil
@@ -217,7 +216,7 @@ import json
 sys.path.insert(0, %r)
 import host_steps as hs
 hs.ROOT_UID, hs.ROOT_GID = os.getuid(), os.getgid()
-hs.startup_closure = lambda python, docker, spelled=(): json.loads(os.environ.get("PW_CLOSURE", "[]"))
+hs.startup_closure = lambda python, docker, spelled=(), platform=None: json.loads(os.environ.get("PW_CLOSURE", "[]"))
 hs._docker_closure = lambda docker, spelled=None: json.loads(os.environ.get("PW_DOCKER_CLOSURE", "[]"))
 hs._ancestor_ok = lambda st: True
 hs._trusted_tool = lambda p: os.path.realpath(p)
@@ -1590,10 +1589,11 @@ class ClosureTest(unittest.TestCase):
         with open(xs, "w") as f:
             f.write("#!/bin/sh\necho /Library/Developer/CommandLineTools\n")
         os.chmod(xs, 0o755)
-        for name, value in (("XCODE_SELECT", xs), ("sys", types.SimpleNamespace(platform="darwin"))):
+        for name, value in (("XCODE_SELECT", xs), ("_macho_closure", lambda images, main, *a, **k: ([], []))):
             self.addCleanup(setattr, hs, name, getattr(hs, name))
             setattr(hs, name, value)
-        found = sum(hs.startup_closure(os.path.realpath(sys.executable), os.path.realpath("/bin/sh")).values(), [])
+        found = sum(hs.startup_closure(os.path.realpath(sys.executable), os.path.realpath("/bin/sh"),
+                                       platform="darwin").values(), [])
         self.assertIn("/Library/Developer/CommandLineTools", found)
 
 
