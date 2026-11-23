@@ -3,6 +3,9 @@
 Every argv value is matched in full against its pattern before it is used
 or recorded (section 3.3). A mismatch, an unknown flag, or a forbidden
 combination is `RUNNER.ARGS`; the detail never echoes the argument.
+A valid standalone `--rotate-key` is `RUNNER.ROTATE_UNSUPPORTED`: key rotation is not
+in ALPHA-2 (Dan ALPHA2-W8-ROTATE-FALLBACK), so it never becomes an Invocation and
+nothing after the parse (private files, locks, handoff, broker, run directory) runs.
 """
 
 import re
@@ -122,7 +125,7 @@ def _resolve(f):
             opts["id"] = f["--id"]
         return Invocation("add-agent", None, opts)
     if "--rotate-key" in keys:
-        return Invocation("rotate-key", None, {})
+        raise Refusal("RUNNER.ROTATE_UNSUPPORTED")
     if "--check-roundtrip" in keys:
         return Invocation("check-roundtrip", None, {"nonce": f["--check-roundtrip"]})
     if "--destroy" in keys:

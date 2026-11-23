@@ -13,6 +13,8 @@ RUNNER_SENTENCES = {
     'RUNNER.ENV': 'Look at the launch line: the environment holds a variable it does not allow.',
     'RUNNER.ARGS': "Look at the command's arguments: one does not match its pattern.",
     'RUNNER.STAGE_SET': "Look at the command's arguments: an L1 that runs S6 or a later stage must also run S3.",
+    # PROPOSED for DS (W8 r4.1; Dan ALPHA2-W8-ROTATE-FALLBACK): the parser's refusal.
+    'RUNNER.ROTATE_UNSUPPORTED': 'Look at the command: --rotate-key is disabled in this release.',
     'RUNNER.HOSTS_TARGETS': 'Look at alpha2.hosts: two targets share a name.',
     'RUNNER.LOCK_ROOT': 'Look at the runner entry in alpha2.hosts and the lock root: this host or its lock root is not the one named there, or the lock root or a lock file is missing or not owned and moded as required.',
     'RUNNER.TARGET_LOCKED': 'Look at the target named in the message: another run holds its lock.',
@@ -51,6 +53,24 @@ CREDENTIALS_SENTENCES = {
     'CREDENTIALS.LEAK_HOSTS': 'Look at alpha2.hosts: it contains a value entered at the prompt.',
 }
 
+#: S7's own names (W8, PROPOSED for contract 4.6 and 4.7; DS folds them).
+AGENTS_SENTENCES = {
+    'AGENTS.NO_START_PATH': "Look at the agent's start path named in the receipt: sandy's approvals, the credential or the sandbox image would not let it start.",
+    'AGENTS.ADD_AGENT_AMBIGUOUS': 'Look at alpha2.hosts: the agents named for this host do not pick exactly one agent to add.',
+    'AGENTS.CONFIG_NOT_PLACED': "Look at S6's receipt for this VM and the VM's amap feature files: they are not placed, or differ from what S6 recorded.",
+    'AGENTS.VM_ACCESS': 'Look at access to the VM named in the receipt.',
+    'AGENTS.WRITER': "Look at the credential writer on the VM: it refused or failed.",
+    'AGENTS.IMAGE_BUILD': "Look at sandy's sandbox image build on the VM: it did not finish.",
+    'AGENTS.SLUG_UNOBSERVED': "Look at sandy's state for the workspace: the sandbox name could not be read.",
+    'AGENTS.SLUG_TOO_LONG': "Look at alpha2.hosts: an agent's id makes a sandbox name longer than the agent registry accepts.",
+    'AGENTS.REGISTRY': "Look at the agent's registry entry on the VM named in the receipt: the registry program refused its import, or its read-back does not match.",
+    'AGENTS.ROTATE_LEFTOVER': "Look at the VM's sandy secrets directory: a previous credential file is left from a rotation.",
+    'AGENTS.SECRETS_TEMP_LEFTOVER': "Look at the VM's sandy secrets directory: a temporary credential file is left from an interrupted write.",
+    'AGENTS.ROTATE_UNDONE': 'Look at the rotation in the receipt: the new credential did not take, and the old one is back in force.',
+    # PROPOSED for DS (Dan ALPHA2-W8-ROTATE-FALLBACK): --rotate-key is not in ALPHA-2.
+    'AGENTS.ROTATE_UNSUPPORTED': 'Look at the ALPHA-2 scope: key rotation is not supported in this release; rotate by hand.',
+}
+
 STAGE_SENTENCES = {
     'LOCK': 'Look at alpha2.lock: it is unreadable, fails its schema, or changed since S0 read it.',
     'HOSTS': 'Look at alpha2.hosts: it is unreadable, fails its schema, or changed since S0 read it.',
@@ -79,6 +99,7 @@ STAGE_SENTENCES = {
 #: launcher and S0 admission write nothing, so 2 is right for them here.
 EXIT = {
     "RUNNER.SUMS": 4,
+    "AGENTS.ROTATE_UNDONE": 3,
 }
 DEFAULT_EXIT = 2
 
@@ -102,6 +123,8 @@ class Refusal(Exception):
     def rc(self):
         if self._rc is not None:
             return self._rc
+        if self.cause.endswith(".NOT_RESTORED"):
+            return 3  # 4.2: NOT_RESTORED exits 3
         return EXIT.get(self.cause, DEFAULT_EXIT)
 
 
@@ -116,7 +139,7 @@ def _two_or_three(cause):
     if cause in ("RUNNER.CUSTODY", "RUNNER.OUTPUT_GUARD") or cause.endswith(".UNCLASSIFIED"):
         return True
     stage, _, name = cause.partition(".")
-    return stage not in NOT_WRITING_PREFIXES and name in STAGE_SENTENCES
+    return stage not in NOT_WRITING_PREFIXES and (name in STAGE_SENTENCES or cause in AGENTS_SENTENCES)
 
 
 def sentence(cause):
@@ -124,6 +147,8 @@ def sentence(cause):
         return RUNNER_SENTENCES[cause]
     if cause in CREDENTIALS_SENTENCES:
         return CREDENTIALS_SENTENCES[cause]
+    if cause in AGENTS_SENTENCES:
+        return AGENTS_SENTENCES[cause]
     stage, _, name = cause.partition(".")
     text = STAGE_SENTENCES.get(name)
     if text is None or not stage:

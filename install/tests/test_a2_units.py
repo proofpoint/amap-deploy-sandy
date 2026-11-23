@@ -669,7 +669,6 @@ class ArgsTest(unittest.TestCase):
         self.ok(["--add-agent", "vm-a"], "add-agent", None, {"host": "vm-a"})
         self.ok(["--add-agent", "vm-a", "--id", "agent-b"], "add-agent", None,
                 {"host": "vm-a", "id": "agent-b"})
-        self.ok(["--rotate-key"], "rotate-key", None)
         self.ok(["--check-roundtrip", "abcd1234"], "check-roundtrip", None, {"nonce": "abcd1234"})
         self.ok(["--only", "S5"], "install", "L1", {"only": "S5"})
         self.ok(["--from", "S3"], "install", "L1", {"from": "S3"})
@@ -693,6 +692,18 @@ class ArgsTest(unittest.TestCase):
         self.bad(["--bogus"])
         self.bad(["--only"])
         self.bad(["--runner"])
+
+    def test_rotate_key_is_refused_at_the_parse(self):  # Dan ALPHA2-W8-ROTATE-FALLBACK
+        with self.assertRaises(Refusal) as cm:
+            a2_args.parse(["--rotate-key"])
+        self.assertEqual((cm.exception.cause, cm.exception.rc), ("RUNNER.ROTATE_UNSUPPORTED", 2))
+        # The existing validation still comes first: a malformed line is RUNNER.ARGS.
+        for argv in (["--rotate-key", "--rotate-key"], ["--rotate-key", "--dry-run"],
+                     ["--rotate-key", "--loop", "L2"], ["--rotate-key", "--bogus"],
+                     ["--rotate-key", "--canary"], ["--rotate-key", "--id", "agent-b"],
+                     ["--rotate-key", "--only", "S1"]):
+            with self.subTest(argv=argv):
+                self.bad(argv)
 
     def test_writes_target(self):
         for cmd in ("dry-run", "verify", "check-roundtrip"):
@@ -831,9 +842,13 @@ class WritersRequiredTest(unittest.TestCase):
 
     def test_every_other_command_needs_both(self):
         for argv in (["--loop", "L2"], ["--loop", "L3"], ["--leak-run"], [], ["--dry-run"], ["--verify"],
-                     ["--rotate-key"], ["--destroy"]):
+                     ["--destroy"]):
             with self.subTest(argv=argv):
                 self.assertEqual(self.req(argv), {"api_key", "hub_login"})
+        # --rotate-key never reaches writers_required in ALPHA-2: the parse refuses it.
+        with self.assertRaises(a2_causes.Refusal) as cm:
+            self.req(["--rotate-key"])
+        self.assertEqual(cm.exception.cause, "RUNNER.ROTATE_UNSUPPORTED")
 
 
 if __name__ == "__main__":

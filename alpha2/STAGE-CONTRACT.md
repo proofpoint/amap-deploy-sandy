@@ -416,7 +416,7 @@ requires are listed; the rest is a slot.
 | S5 `KEYS` | `KEYS.EXISTS_DIFFERENT` (a re-run never regenerates a key); [stage review] |
 | S6 `CONFIG` | `CONFIG.HOSTS` (an account or the hop group named in `alpha2.hosts` is missing on the VM, the relay account is root or the agent's uid, or an account lacks the hop group), `CONFIG.INTERPRETER` (the VM's python3 is older than RL's floor), `CONFIG.OWNER` (a path S6 lays out, including the hop intakes the bootstrap makes, is never repaired), `CONFIG.HUB_HOSTNAME` (S3's `HUB_HOSTNAME` fact, which S6 renders as RE's `SMTP_HOST`, `IMAP_HOST` and the prefix template's `hub_fqdn`, is missing or malformed), `CONFIG.ROUTER_REFUSED` (RL's `peers` over the placed router.json exits non-zero), `CONFIG.PEER_STORE` (RL's peer store is not ready with admission open after a never-admitted init, or an existing one is not), `CONFIG.REGISTRY` (the registry program refuses the router's import, or the read-back by key disagrees with the apply or host.json), `CONFIG.PLACED_DIFFERENT` (a placed file is already there and differs, or an exactly-owned directory holds an extra name); [stage review] |
 | S6b `HUB-LOGIN` | `HUB-LOGIN.PROBE` (RE's probe does not show the login by account name); [stage review] |
-| S7 `AGENTS` | `AGENTS.NO_START_PATH` (rule 10 of 3.7); [stage review] |
+| S7 `AGENTS` | Each S7 cause exits 2 before S7's first write and 3 after, keeping its name (3.4; stage-wide, so a later VM's causes follow an earlier VM's writes); every VM's S6 receipt is read before the first write. `AGENTS.NO_START_PATH` (rule 10 of 3.7), `AGENTS.ADD_AGENT_AMBIGUOUS` (`--add-agent` does not select exactly one `agents[]` entry for the host; the detail is a count, never an id), `AGENTS.CONFIG_NOT_PLACED` (a run VM's S6 receipt does not say `CONFIG` `PLACED` with both shas, checked for every run VM before any VM contact; or, on the VM, router.json and feature.json do not re-hash to its `ROUTER_JSON_SHA` and `FEATURE_JSON_SHA`), `AGENTS.VM_ACCESS` (the VM cannot be reached as its agent account, or that account's `HOME` is not absolute, is `/`, starts with `//` or is not in normal form), `AGENTS.WRITER` (the credential writer or its bootstrap refused or failed), `AGENTS.PIN` with detail `sandy schema` (PROPOSED, W8 r6: after install, the installed sandy's `--print-schema` does not answer the capabilities S6 rendered for, `a2_sandy_caps`), `AGENTS.PIN` with detail `connector` (a connector file of S6's payload is missing from the connector's tree at the lock's commit, read as S6 reads it, or does not re-hash to it; the lock pins the connector by commit, with no files[] row per file), `AGENTS.IMAGE_BUILD` (sandy's build of the sandbox image failed), `AGENTS.SLUG_UNOBSERVED` (the sandbox name cannot be read from sandy's state), `AGENTS.SLUG_TOO_LONG` (PROPOSED, W8 r7: an agent's sandbox name `agent-<id>-<8 hex>` does not pass the agent registry's slug rule, `a2_agent_registry`; decided from `alpha2.hosts` before any VM contact; exit 2), `AGENTS.REGISTRY` (the agent registry (`a2_agent_registry`, through `a2_vm.bind`) refused the agent's import, or its read-back does not match), `AGENTS.ROTATE_LEFTOVER` (a previous credential file from a rotation is present), `AGENTS.SECRETS_TEMP_LEFTOVER` (a writer temporary from an interrupted write is present), `AGENTS.ROTATE_UNDONE` (exit 3: a rotation's new credential did not take, and the previous one was restored and started), `AGENTS.ROTATE_UNSUPPORTED` (PROPOSED, W8 r4: `--rotate-key` in ALPHA-2; refused before any VM contact or write; exit 2) |
 | S8 `START` | `START.INIT` (peer-store init failed or half done; never retried blindly), `START.NOT_ADMITTING` (no "peer store: admission open"); [stage review] |
 | S9 `VERIFY` | the `VERIFY.*` names of 4.5; `VERIFY.PROCESSING_<id>` (section 7.2); [stage review] |
 | S10 `SUMMARY` | [stage review] |
@@ -454,6 +454,7 @@ carries a value.
 | `RUNNER.ENV` | Look at the launch line: the environment holds a variable it does not allow. |
 | `RUNNER.ARGS` | Look at the command's arguments: one does not match its pattern. |
 | `RUNNER.STAGE_SET` | Look at the command's arguments: an L1 that runs S6 or a later stage must also run S3. |
+| `RUNNER.ROTATE_UNSUPPORTED` | Look at the command: --rotate-key is disabled in this release. |
 | `RUNNER.HOSTS_TARGETS` | Look at alpha2.hosts: two targets share a name. |
 | `RUNNER.LOCK_ROOT` | Look at the runner entry in alpha2.hosts and the lock root: this host or its lock root is not the one named there, or the lock root or a lock file is missing or not owned and moded as required. |
 | `RUNNER.TARGET_LOCKED` | Look at the target named in the message: another run holds its lock. |
@@ -487,6 +488,19 @@ carries a value.
 | `CREDENTIALS.KEY_NOT_LIVE` | Look at the API key: the live check did not accept it. |
 | `CREDENTIALS.LEAK_LOCK` | Look at alpha2.lock: it contains a value entered at the prompt. |
 | `CREDENTIALS.LEAK_HOSTS` | Look at alpha2.hosts: it contains a value entered at the prompt. |
+| `AGENTS.NO_START_PATH` | Look at the agent's start path named in the receipt: sandy's approvals, the credential or the sandbox image would not let it start. |
+| `AGENTS.ADD_AGENT_AMBIGUOUS` | Look at alpha2.hosts: the agents named for this host do not pick exactly one agent to add. |
+| `AGENTS.CONFIG_NOT_PLACED` | Look at S6's receipt for this VM and the VM's amap feature files: they are not placed, or differ from what S6 recorded. |
+| `AGENTS.VM_ACCESS` | Look at access to the VM named in the receipt. |
+| `AGENTS.WRITER` | Look at the credential writer on the VM: it refused or failed. |
+| `AGENTS.IMAGE_BUILD` | Look at sandy's sandbox image build on the VM: it did not finish. |
+| `AGENTS.SLUG_UNOBSERVED` | Look at sandy's state for the workspace: the sandbox name could not be read. |
+| `AGENTS.SLUG_TOO_LONG` | Look at alpha2.hosts: an agent's id makes a sandbox name longer than the agent registry accepts. |
+| `AGENTS.REGISTRY` | Look at the agent's registry entry on the VM named in the receipt: the registry program refused its import, or its read-back does not match. |
+| `AGENTS.ROTATE_LEFTOVER` | Look at the VM's sandy secrets directory: a previous credential file is left from a rotation. |
+| `AGENTS.SECRETS_TEMP_LEFTOVER` | Look at the VM's sandy secrets directory: a temporary credential file is left from an interrupted write. |
+| `AGENTS.ROTATE_UNDONE` | Look at the rotation in the receipt: the new credential did not take, and the old one is back in force. |
+| `AGENTS.ROTATE_UNSUPPORTED` | Look at the ALPHA-2 scope: key rotation is not supported in this release; rotate by hand. |
 
 Sentences for the `VERIFY.*` names and for every other stage-specific name in
 4.6 are added by that stage's review (S9 for `VERIFY.*`); until then those
@@ -516,7 +530,7 @@ manifest.
 | `--verify` | `verify` | only the run directory |
 | `--verify --canary` | `canary` | one round trip between stand-in agents (E10); outside section 7's read-only list |
 | `--add-agent <host> [--id <id>]` | `add-agent` | yes |
-| `--rotate-key` | `rotate-key` | yes: section 3.7 |
+| `--rotate-key` | `rotate-key` | none in ALPHA-2: refused with `AGENTS.ROTATE_UNSUPPORTED` before any VM contact (PROPOSED, W8 r4); section 3.7 after ALPHA-2 |
 | `--check-roundtrip <nonce>` | `check-roundtrip` | only the run directory |
 | `--only <stage>`, `--from <stage>` | `install`, with `"loop": "L1"` | as the stages run; a stage set that includes S6 or later but not S3 is `RUNNER.STAGE_SET` |
 | `--leak-run` | `install`, with `"loop": "L2-leak"` | the leak run of a.11: section 3.7 rule 3a; stops after the last secret writer |
