@@ -140,7 +140,7 @@ class RolloutTest(unittest.TestCase):
         return self.calls.read_text().splitlines() if self.calls.exists() else []
 
     def backups(self):
-        d = self.feature.parent / "amap.rollout-backups"
+        d = self.amap / "rollout-backups"
         return sorted(d.iterdir()) if d.exists() else []
 
     def launcher_text(self):
@@ -275,6 +275,37 @@ class RolloutTest(unittest.TestCase):
         aside = [p for p in self.backups() if p.name.endswith("-replaced")]
         self.assertEqual(len(aside), 1)
         self.assertEqual((aside[0] / "payload/codex/interactive-launch").read_text(), "new launcher\n")
+
+    # ---- sandy's features directory holds the feature and nothing of this tool's
+
+    def test_apply_and_rollback_leave_nothing_beside_the_feature_in_sandys_features_directory(self):
+        # Sandy reads each directory under features/ as a feature, and on one it refuses
+        # mounts none: only the backup's location can put a second entry there.
+        r = self.run_("apply")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(sorted(os.listdir(self.feature.parent)), ["amap"])
+        b, = self.backups()
+        r = self.run_("rollback", str(b))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(sorted(os.listdir(self.feature.parent)), ["amap"])
+        self.assertEqual(len(self.backups()), 2)
+
+    def test_a_backup_directory_left_in_sandys_features_directory_refuses_every_verb(self):
+        stray = self.feature.parent / "amap.rollout-backups"
+        (stray / "20261024T161750Z").mkdir(parents=True)
+        for args in (("check",), ("apply",), ("rollback", str(stray / "20261024T161750Z"))):
+            r = self.run_(*args)
+            self.assertEqual(r.returncode, 1, args)
+            self.assertIn(f"{stray} is in sandy's features directory, so sandy mounts no feature "
+                          f"at launch; move its contents to {self.amap / 'rollout-backups'}", r.stderr)
+        self.assertEqual(self.installs(), [])
+        self.assertEqual(self.launcher_text(), "old launcher\n")
+
+    def test_a_backup_root_inside_sandys_features_directory_refuses(self):
+        with self.assertRaises(cr.Refused) as e:
+            cr.features_clear(self.feature, self.feature.parent / "elsewhere" / "rollout-backups")
+        self.assertIn("is inside sandy's features directory", str(e.exception))
+        cr.features_clear(self.feature, self.amap / "rollout-backups")
 
     def test_a_link_copied_before_its_target_and_a_directory_mode_survive_the_round_trip(self):
         # Copying a link's own metadata is not portable: in a reviewer's confined workspace

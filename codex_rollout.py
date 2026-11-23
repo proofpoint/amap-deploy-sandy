@@ -28,7 +28,8 @@ only, so it runs the same on Linux and Darwin.
 It then prints install's own dry run, run with that same sandy.
 
 `apply` runs the same checks, then copies the feature's payload, feature.json
-and router.json into a new backup directory and compares the copy with the
+and router.json into a new backup directory under AMAP_ROOT/rollout-backups
+and compares the copy with the
 live files entry by entry (type, mode, link target and content). Only then
 does it run `install --apply` and `verify`, both with the same sandy, and a
 problem from either is a nonzero exit naming the backup. The backup's
@@ -38,6 +39,10 @@ inventory is written beside it as INVENTORY.json.
 payload, feature.json and router.json aside into another new directory
 (nothing is deleted), copies the backup back, and compares the restored files
 with the inventory.
+
+Backups never live in sandy's features directory: sandy reads every
+directory there as a feature, and one it refuses mounts no feature at all.
+Every verb refuses while a directory of this tool's backups is still there.
 
 Every step checks its own result: a failed copy, hash, listing or command
 stops the run with a nonzero exit, and no later step runs. Nothing here
@@ -264,8 +269,29 @@ def stamp() -> str:
     return time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
 
 
-def backup(feature: Path) -> Path:
-    dest = new_dir(feature.parent / f"{feature.name}.rollout-backups" / stamp())
+BACKUPS_DIR = "rollout-backups"
+
+
+def features_clear(feature: Path, backups: Path) -> None:
+    """Nothing of this tool's in sandy's features directory, and no backup
+    root inside it: sandy reads each directory there as a feature and, on
+    one it refuses, mounts no feature in any sandbox it launches."""
+    features = feature.parent
+    stray = features / f"{feature.name}.{BACKUPS_DIR}"
+    if os.path.lexists(stray):
+        raise Refused(f"{stray} is in sandy's features directory, so sandy mounts no feature "
+                      f"at launch; move its contents to {backups} and remove it")
+    try:
+        inside = backups.resolve().is_relative_to(features.resolve())
+    except OSError as e:
+        raise Refused(f"cannot resolve {backups} ({e})")
+    if inside:
+        raise Refused(f"{backups} is inside sandy's features directory {features}; "
+                      f"set AMAP_ROOT to a directory outside it")
+
+
+def backup(feature: Path, backups: Path) -> Path:
+    dest = new_dir(backups / stamp())
     present = [n for n in PARTS if os.path.lexists(feature / n)]
     try:
         for name in present:
@@ -287,7 +313,7 @@ def deployment(ds: Path, sandy: str, *args: str) -> int:
     return subprocess.run([sys.executable, str(ds / "amap-sandy.py"), "--sandy", sandy, *args]).returncode
 
 
-def rollback(feature: Path, b: Path) -> Path:
+def rollback(feature: Path, backups: Path, b: Path) -> Path:
     try:
         doc = json.loads((b / INVENTORY).read_text())
         parts, want = list(doc["parts"]), doc["entries"]
@@ -301,7 +327,7 @@ def rollback(feature: Path, b: Path) -> Path:
         raise Refused(f"{b} cannot be read ({e}); restore it by hand")
     if have != want:
         raise Refused(f"{b} does not match its {INVENTORY}; restore it by hand")
-    aside = new_dir(feature.parent / f"{feature.name}.rollout-backups" / f"{stamp()}-replaced")
+    aside = new_dir(backups / f"{stamp()}-replaced")
     try:
         for name in PARTS:
             if os.path.lexists(feature / name):
@@ -322,13 +348,15 @@ def main(argv: Sequence[str]) -> int:
     ds = root / "amap-deploy-sandy"
     sandy = os.environ.get("SANDY_BIN") or "sandy"
     feature = Path(os.environ.get("SANDY_HOME") or Path.home() / ".sandy") / "features" / "amap"
+    backups = root / BACKUPS_DIR
     try:
+        features_clear(feature, backups)
         if mode == "check":
             checks(root, ds, sandy)
             return deployment(ds, sandy, "install")
         if mode == "apply":
             checks(root, ds, sandy)
-            b = backup(feature)
+            b = backup(feature, backups)
             say(f"  ok  backup {b}, matching the live files")
             if deployment(ds, sandy, "install", "--apply") != 0:
                 raise Refused(f"install --apply failed (above); to roll back: amap-codex-rollout.py rollback {b}")
@@ -339,7 +367,7 @@ def main(argv: Sequence[str]) -> int:
                 f"Roll back with: amap-codex-rollout.py rollback {b}")
             return 0
         if mode == "rollback" and len(argv) == 2:
-            aside = rollback(feature, Path(argv[1]))
+            aside = rollback(feature, backups, Path(argv[1]))
             say(f"Restored {argv[1]}; the replaced files are in {aside}. Relaunch each Codex sandbox.")
             say("The checkouts are unchanged: an install from them renders the newer payload again.")
             return 0
