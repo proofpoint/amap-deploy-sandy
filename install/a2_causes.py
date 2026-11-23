@@ -88,6 +88,15 @@ STAGE_SENTENCES = {
     'ROUTER_REFUSED': "Look at router.json on the VM named in the receipt: the router's own check of it failed.",
     'PEER_STORE': "Look at the router's peer store on the VM named in the receipt: it is not ready with admission open, or its initialisation failed; it is never retried or repaired.",
     'REGISTRY': "Look at the router's registry entry on the VM named in the receipt: the registry program refused it, or its read-back does not match.",
+    'CLOCK_SKEW': "Look at the clocks of the run's two VMs: they differ by more than 2 s, or one could not be read; nothing was started.",
+    'TRUSTDIR_MOUNTED': "Look at the containers' mounts on the VM named in the receipt: a mount makes a router or relay trust directory, or the plugin's root path, visible inside a sandbox or the router's container, or a container S8 started or checks can reach the docker daemon (its socket, the docker group, or privileged).",
+    'TRUSTDIR_UNREAD': "Look at the VM named in the receipt: a router or relay trust path S8 derives from S6's env-file and the agent home (the files S6 placed included) lies outside its allowed root (the relay home for the relay's paths, the agent home or the plugin's directory for the rest); or such a path, or a bind source of an agent sandbox or of the router's container, is missing, malformed or not its own path (a symlink in it) when its owning account resolves it; or S6's env-file could not be read or names a key the relay must not be given, or the docker group could not be read, or a container's mount table or host config could not be read or holds a mount the check cannot judge; the trust directories could not be shown clear.",
+    'CONFIG_CHANGED': "Look at what S6 placed on the VM named in the receipt: a file no longer matches S6's receipt, the plugin's or the env-file's owner or mode moved, router.json and the env-file name different paths or another plugin path, or the relay ledger directory is gone or not reachable as the relay account; nothing was started on that VM.",
+    'RUNNING': "Look at the VM named in the receipt: a router or relay container of this installer already exists there, or the relay ledger is already initialised; restore the VM, never re-run onto it.",
+    'RL_REFUSED': "Look at the router on the VM named in the receipt: its start script refused, its container could not be inspected, or it exited, restarted or never polled, and the script's error or the container's logs name the reason; a started container was stopped, not removed.",
+    'NOT_ADMITTING': "Look at the router's status on the VM named in the receipt: its first poll broke one of the six admission conditions; it was stopped, not removed.",
+    'LEDGER_UNUSABLE': "Look at the relay ledger directory on the VM named in the receipt: it is not the relay account's own 0700 directory (its owner, mode or type), or RE's own read-only check reports it unusable or gave no report S8 could read; nothing was started on that VM.",
+    'RE_REFUSED': "Look at the relay on the VM named in the receipt: its one-shot ledger init failed (a failed init leaves no container and no logs), or its container refused or never became healthy, and that container's logs name the reason; a started container was stopped, not removed.",
     'PLACED_DIFFERENT': "Look at the directory on the VM named in the receipt: a file the stage places is there and differs, or the directory holds a name the stage does not place; nothing is ever replaced.",
     'OWNER': 'Look at the path on the VM named in the receipt: it, or a directory above it, has another owner, group or mode than the stage requires; it is never repaired.',
     'NOT_RESTORED': "Look at the receipt's final observed state: a write failed and the restore did not complete.",
@@ -102,6 +111,13 @@ EXIT = {
     "AGENTS.ROTATE_UNDONE": 3,
 }
 DEFAULT_EXIT = 2
+#: Stage causes that arise only after the stage's first write: they exit 3, never 2, and 4.2's Exit cell says "3".
+#: The constructor refuses them without rc=3, so the code cannot give the exit the contract rules out.
+AFTER_WRITE_ONLY = frozenset({"NOT_RESTORED", "RE_REFUSED", "RL_REFUSED", "NOT_ADMITTING"})
+#: Stage causes that arise only before the stage's first write: they exit 2, never 3, and 4.2's Exit cell says "2".
+#: The constructor refuses them at rc=3.
+BEFORE_WRITE_ONLY = frozenset({"CLOCK", "CLOCK_SKEW", "HUB_HOSTNAME", "HUB_NAME", "PREDECESSOR_FAILED",
+                               "PREDECESSOR_INCOMPLETE", "PREDECESSOR_INSTALLER", "PREDECESSOR_MISSING"})
 
 
 class Refusal(Exception):
@@ -114,6 +130,10 @@ class Refusal(Exception):
             raise ValueError("cause not in the contract table")
         if rc is not None and not (rc == 3 and _two_or_three(cause)):
             raise ValueError("exit code not allowed for this cause")
+        if cause.partition(".")[2] in AFTER_WRITE_ONLY and rc != 3:
+            raise ValueError("this cause arises only after a write: rc=3")
+        if cause.partition(".")[2] in BEFORE_WRITE_ONLY and rc == 3:
+            raise ValueError("this cause arises only before a write: never rc=3")
         super().__init__(cause)
         self.cause = cause
         self.detail = detail

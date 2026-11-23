@@ -2,6 +2,7 @@
 argv, environment and account. Each refusal has a test that makes it fire
 on a surface only that check can produce."""
 
+import ast
 import copy
 import io
 import json
@@ -32,7 +33,118 @@ def contract_sentences():
     return out
 
 
+def contract_exit_cells():
+    """Section 4.2's table: {NAME: its Exit cell}, read from the contract file itself."""
+    with open(CONTRACT, encoding="utf-8") as f:
+        text = f.read()
+    sec = text.split("### 4.2 Names every stage carries", 1)[1].split("\n### 4.3", 1)[0]
+    out = {}
+    for line in sec.splitlines():
+        m = re.fullmatch(r"\| `([A-Z][A-Z0-9_]*)` \| ([^|]+) \| .+ \|", line)
+        if m:
+            out[m.group(1)] = m.group(2)
+    return out
+
+
+def _calls_in_functions(tree):
+    """(enclosing function name, call node) for every call in a module."""
+    out = []
+
+    def visit(node, func):
+        for ch in ast.iter_child_nodes(node):
+            here = ch.name if isinstance(ch, (ast.FunctionDef, ast.AsyncFunctionDef)) else func
+            if isinstance(ch, ast.Call):
+                out.append((here, ch))
+            visit(ch, here)
+    visit(tree, "<module>")
+    return out
+
+
 class CausesTest(unittest.TestCase):
+    def test_every_4_2_exit_cell_matches_what_the_code_allows(self):
+        """Codex's W13 r2 blocker 1: 4.2's Exit cell is the exit before a write. A cause that arises only after a
+        write (AFTER_WRITE_ONLY, which the constructor holds to rc 3) says "3"; no other cause says "3" alone, and
+        a "3 after a write" cell names a cause that can take rc 3."""
+        cells = contract_exit_cells()
+        self.assertEqual(sorted(cells), sorted(a2_causes.STAGE_SENTENCES))
+        self.assertEqual(sorted(n for n, c in cells.items() if c == "3"), sorted(a2_causes.AFTER_WRITE_ONLY))
+        self.assertEqual(sorted(n for n, c in cells.items() if c == "2"), sorted(a2_causes.BEFORE_WRITE_ONLY))
+        for name, cell in cells.items():
+            with self.subTest(name=name):
+                self.assertIn(cell, ("2", "3", "2 (3 after a write)", "3, or 2 only when no write can be shown"))
+                if cell == "2 (3 after a write)":
+                    self.assertEqual(Refusal("START." + name, rc=3).rc, 3)
+                    self.assertEqual(Refusal("START." + name).rc, 2)
+                if cell == "2":
+                    # Gate B's note N4: a "2" cell's cause cannot be built at rc 3.
+                    with self.assertRaises(ValueError):
+                        Refusal("START." + name, rc=3)
+                    self.assertEqual(Refusal("START." + name).rc, 2)
+
+    def test_an_after_write_only_cause_cannot_exit_2(self):
+        for name in a2_causes.AFTER_WRITE_ONLY:
+            with self.subTest(name=name):
+                with self.assertRaises(ValueError):
+                    Refusal("START." + name)
+                self.assertEqual(Refusal("START." + name, rc=3).rc, 3)
+
+    def test_every_after_write_only_raise_site_passes_rc_3(self):
+        """Opus's W13 r3 note N-C7: a Refusal naming an AFTER_WRITE_ONLY cause without rc=3 is a ValueError, which
+        a2_main turns into UNCLASSIFIED and so loses the cause's name. Every call in install/*.py that names one
+        such cause passes the literal rc=3; the sites found are the three S8 helpers, so the scan is not empty. A
+        BEFORE_WRITE_ONLY cause (every "2" cell: step 3's CLOCK_SKEW, the receipt readers' PREDECESSOR_*, and the
+        rest) passes no rc at any named site."""
+        found, before, dynamic = [], [], set()
+        known = set(a2_causes.STAGE_SENTENCES)
+        for name in sorted(os.listdir(a2fix.INSTALL)):
+            if not name.endswith(".py"):
+                continue
+            with open(os.path.join(a2fix.INSTALL, name), encoding="utf-8") as f:
+                tree = ast.parse(f.read())
+            for func, node in _calls_in_functions(tree):
+                # Gate B's W13 r4 note N7: `Refusal(...)` and `<module>.Refusal(...)` alike.
+                if not ((isinstance(node.func, ast.Name) and node.func.id == "Refusal")
+                        or (isinstance(node.func, ast.Attribute) and node.func.attr == "Refusal")):
+                    continue
+                # The cause positional or as cause= (gate A's W13 r4 note N7).
+                arg = node.args[0] if node.args else next((k.value for k in node.keywords if k.arg == "cause"), None)
+                if arg is None:
+                    dynamic.add((name, func))
+                    continue
+                consts = [c.value for c in ast.walk(arg)
+                          if isinstance(c, ast.Constant) and isinstance(c.value, str)]
+                if not ({c.rpartition(".")[2] for c in consts} & known
+                        or any(c.startswith(("RUNNER.", "PREFLIGHT.", "CREDENTIALS.")) for c in consts)
+                        or any(c in a2_causes.AGENTS_SENTENCES for c in consts)):
+                    dynamic.add((name, func))
+                names = {c.rpartition(".")[2] for c in consts}
+                for cause in names & a2_causes.AFTER_WRITE_ONLY:
+                    found.append((name, cause))
+                    rc = [k.value for k in node.keywords if k.arg == "rc"]
+                    with self.subTest(site=(name, node.lineno)):
+                        self.assertTrue(len(rc) == 1 and isinstance(rc[0], ast.Constant) and rc[0].value == 3)
+                for cause in names & a2_causes.BEFORE_WRITE_ONLY:
+                    # Gate B's note N4: a before-write-only cause never passes rc, so it keeps exit 2.
+                    before.append((name, cause))
+                    with self.subTest(site=(name, node.lineno)):
+                        self.assertEqual([k.arg for k in node.keywords if k.arg == "rc"], [])
+        # A cause built at runtime escapes the name scan, so each such site is listed here and read by hand: a new
+        # one fails until it is added (and reviewed for AFTER_WRITE_ONLY and BEFORE_WRITE_ONLY causes).
+        self.assertEqual(sorted(dynamic), [
+            ("a2_admit.py", "_common"), ("a2_main.py", "_run"), ("a2_main.py", "dispatch"),
+            ("a2_s0.py", "_fetch_tag"), ("a2_s0.py", "_run_checks"), ("a2_s0.py", "check_l7"),
+            ("a2_s0.py", "check_probes"), ("a2_s1.py", "check_l5"), ("a2_s6.py", "read_prior"),
+            ("a2_s7.py", "read_s6"), ("a2_s8.py", "measure"), ("a2_s8.py", "run"), ("a2_s8_run.py", "_read"), ("a2_s8_run.py", "run_s8"),
+            ("a2_site.py", "slot"), ("a2_vm.py", "_refused")])
+        self.assertEqual(sorted(found), [("a2_s7.py", "NOT_RESTORED"), ("a2_s7.py", "NOT_RESTORED"),
+                                         ("a2_s7.py", "NOT_RESTORED"), ("a2_s8_re.py", "RE_REFUSED"),
+                                         ("a2_s8_rl.py", "NOT_ADMITTING"), ("a2_s8_rl.py", "RL_REFUSED")])
+        self.assertEqual(sorted(set(before)), [
+            ("a2_record.py", "PREDECESSOR_FAILED"), ("a2_record.py", "PREDECESSOR_INCOMPLETE"),
+            ("a2_record.py", "PREDECESSOR_INSTALLER"), ("a2_record.py", "PREDECESSOR_MISSING"),
+            ("a2_s6.py", "HUB_HOSTNAME"), ("a2_s6.py", "PREDECESSOR_INCOMPLETE"), ("a2_s8_checks.py", "CLOCK_SKEW"),
+            ("a2_s8_run.py", "PREDECESSOR_FAILED"), ("a2_s8_run.py", "PREDECESSOR_INCOMPLETE")])
+
     def test_every_sentence_is_the_contracts_byte_for_byte(self):
         want = contract_sentences()
         for cause, text in a2_causes.RUNNER_SENTENCES.items():
