@@ -96,6 +96,10 @@ def _common(argv, site):
         lock, hosts = a2_private.load_pair(lock_raw, hosts_raw)
     except a2_private.PairInvalid as e:
         raise Refusal(e.cause, e.detail)
+    # A writer this run's stages execute must be pinned (6.1, 3.7).
+    pinned = {w["use"] for w in lock["writers"]}
+    if a2_private.writers_required(inv, a2_args.STAGE_IDS) - pinned:
+        raise Refusal("PREFLIGHT.LOCK", "writers")
     account, _name, home = a2_host.kernel_account(hosts["runner"], site.getuid, site.geteuid,
                                                      site.getpwuid)
     a2_host.check_account(inv, account)

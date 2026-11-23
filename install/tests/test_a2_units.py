@@ -63,11 +63,11 @@ class CausesTest(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     Refusal(cause, rc=rc)
 
-    def test_default_site_accepts_no_host_identity(self):
+    def test_default_site_reads_the_reviewed_slots(self):
         import a2_site
-        from unittest import mock
-        with mock.patch.object(a2_site, "_machine_id", lambda: "0123456789abcdef0123456789abcdef"):
-            self.assertIsNone(a2_site.Site().host_identity())
+        s = a2_site.Site()
+        self.assertEqual(s.private_dir, "/srv/a2-private")
+        self.assertIs(s.host_identity, a2_site.host_identity)
 
     def test_sums_exits_4(self):
         self.assertEqual(Refusal("RUNNER.SUMS").rc, 4)
@@ -78,6 +78,362 @@ def _pair(lock=None, hosts=None):
     hosts = hosts if hosts is not None else a2fix.dumps(a2fix.hosts_doc("/srv/locks"))
     return lock, hosts
 
+
+class L1StageSetTest(unittest.TestCase):
+    """Ruling W5-R13-L1-STAGESET-REQUIRED at argument parsing: an L1 stage set that includes S6 or later must
+    include S3; every other --only/--from is unchanged."""
+
+    def test_every_only_and_from(self):
+        import a2_args
+        late = a2_args.STAGE_IDS[a2_args.STAGE_IDS.index("S6"):]
+        for flag in ("--only", "--from"):
+            for stage in a2_args.STAGE_IDS:
+                stages = [stage] if flag == "--only" else list(a2_args.STAGE_IDS[a2_args.STAGE_IDS.index(stage):])
+                refused = any(s in late for s in stages) and "S3" not in stages
+                with self.subTest(flag=flag, stage=stage):
+                    if refused:
+                        with self.assertRaises(Refusal) as cm:
+                            a2_args.parse([flag, stage])
+                        self.assertEqual((cm.exception.cause, cm.exception.rc), ("RUNNER.STAGE_SET", 2))
+                    else:
+                        inv = a2_args.parse([flag, stage])
+                        self.assertEqual((inv.command, inv.loop), ("install", "L1"))
+        self.assertEqual(a2_args.parse(["--from", "S3"]).opts, {"from": "S3"})
+        self.assertEqual(a2_args.parse(["--only", "S5"]).opts, {"only": "S5"})
+
+
+class RegistryProgramLockTest(unittest.TestCase):
+    """The lock's registry_program (W7-REGISTRY-NAME-IN-LOCK): shape, and each name held to its pin (the fixture
+    points the pins at its invented names, as a2fix states)."""
+
+    def bad(self, change, path=None):
+        d = copy.deepcopy(a2fix.LOCK)
+        change(d)
+        with self.assertRaises(a2_private.Invalid) as cm:
+            a2_private.check_lock(d)
+        if path is not None:
+            self.assertEqual(cm.exception.path, path)
+
+    def test_the_fixture_passes_and_each_name_is_pinned(self):
+        a2_private.check_lock(copy.deepcopy(a2fix.LOCK))
+        for key, other in (("package", "othertool"), ("config_schema", "othertool.config/1"),
+                           ("adapter_interface", "othertool.adapter/1")):
+            with self.subTest(key=key):
+                self.bad(lambda d: d["registry_program"].update({key: other}), "$.registry_program." + key)
+
+    def test_shape(self):
+        for change in (lambda d: d.pop("registry_program"), lambda d: d["registry_program"].update(extra="x"),
+                       lambda d: d["registry_program"].update(package="Reg-Tool"),
+                       lambda d: d["registry_program"].update(config_schema="regtool.config"),
+                       lambda d: d["registry_program"].update(adapter_interface="regtool.adapter/0")):
+            self.bad(change)
+
+    def test_the_component_is_pinned_and_names_exactly_one_component(self):
+        self.bad(lambda d: d["registry_program"].update(component="router"), "$.registry_program.component")
+
+        def gone(d):
+            d["components"] = [c for c in d["components"] if c["name"] != "registry"]
+        self.bad(gone, "$.registry_program.component")
+
+    def test_the_plugin_is_exactly_one_files_row(self):
+        def zero(d):
+            d["files"] = [f for f in d["files"] if f["sha256"] != d["plugin"]["sha256"]]
+
+        def two(d):
+            d["files"].append({"path": "dist/other.py", "component": "connector", "sha256": d["plugin"]["sha256"]})
+
+        def mismatch(d):
+            d["plugin"]["sha256"] = "d" * 64
+        for change in (zero, two, mismatch):
+            with self.subTest(change=change.__name__):
+                self.bad(change, "$.plugin.sha256")
+        self.assertEqual([(f["component"], f["path"]) for f in a2_private.plugin_rows(a2fix.LOCK)],
+                         [("router", "dist/plugin.py")])
+
+    def test_the_pins_are_sha256_shaped_and_distinct(self):
+        import importlib
+        fresh = importlib.reload(a2_private)
+        pins = (fresh.REGISTRY_PACKAGE_SHA256, fresh.REGISTRY_CONFIG_SCHEMA_SHA256,
+                fresh.REGISTRY_ADAPTER_INTERFACE_SHA256, fresh.REGISTRY_COMPONENT_SHA256)
+        importlib.reload(a2fix)
+        self.assertTrue(all(len(p) == 64 and set(p) <= set("0123456789abcdef") for p in pins))
+        self.assertEqual(len(set(pins)), 4)
+
+
+class HubLoginLockTest(unittest.TestCase):
+    """The lock's hub_login (W7-HUB-LOGIN-IN-LOCK): shape, and each name held to its pin (the fixture points the
+    pins at its invented names, as a2fix states)."""
+
+    def bad(self, change, path):
+        d = copy.deepcopy(a2fix.LOCK)
+        change(d)
+        with self.assertRaises(a2_private.Invalid) as cm:
+            a2_private.check_lock(d)
+        self.assertEqual(cm.exception.path, path)
+
+    def test_the_fixture_passes_and_each_name_is_pinned(self):
+        a2_private.check_lock(copy.deepcopy(a2fix.LOCK))
+        self.bad(lambda d: d["hub_login"].update(local="other"), "$.hub_login.local")
+        self.bad(lambda d: d["hub_login"].update(domain="other.example"), "$.hub_login.domain")
+
+    def test_shape(self):
+        for change in (lambda d: d.pop("hub_login"), lambda d: d["hub_login"].update(extra="x"),
+                       lambda d: d["hub_login"].update(local="L"), lambda d: d["hub_login"].update(domain="nodot"),
+                       lambda d: d["hub_login"].update(local=7)):
+            d = copy.deepcopy(a2fix.LOCK)
+            change(d)
+            with self.assertRaises(a2_private.Invalid):
+                a2_private.check_lock(d)
+
+
+class HostsKeysTest(unittest.TestCase):
+    """The W7 hosts keys: each VM's accounts and router; RL's slug rules."""
+
+    def bad(self, change):
+        d = a2fix.hosts_doc("/srv/locks")
+        change(d)
+        with self.assertRaises(a2_private.Invalid):
+            a2_private.check_hosts(d)
+
+    def test_the_fixture_passes(self):
+        a2_private.check_hosts(a2fix.hosts_doc("/srv/locks"))
+
+    def test_refusals(self):
+        cases = {
+            "relay is the agent": lambda d: d["vms"][0].update(relay_account="agent"),
+            "no router": lambda d: d["vms"][0].pop("router"),
+            "no hop group": lambda d: d["vms"][0].pop("hop_group"),
+            "a slug off RL's pattern": lambda d: d["vms"][0]["router"].update(slug="Router-A"),
+            "a reserved slug": lambda d: d["vms"][0]["router"].update(slug="postmaster"),
+            "two slugs with one skeleton": lambda d: d["vms"][1]["router"].update(slug="r0uter-a-t"),
+            "a slug and an agent id with one skeleton": lambda d: d["agents"][0].update(id="routera-t"),
+            "a relative stable_key": lambda d: d["vms"][0]["router"].update(stable_key="srv/x"),
+            "two stable keys alike": lambda d: d["vms"][1]["router"].update(
+                stable_key=d["vms"][0]["router"]["stable_key"]),
+            "an extra router key": lambda d: d["vms"][0]["router"].update(logical_id="0" * 32),
+            "a fleet domain that is not <host>.internal": lambda d: d["vms"][0].update(fleet_domain="a.example.org"),
+            "a fleet domain with two labels before internal": lambda d: d["vms"][0].update(fleet_domain="x.a.internal"),
+            "the hub login's domain": lambda d: (self.reserve("resv.internal"),
+                                                 d["vms"][0].update(fleet_domain="resv.internal")),
+            "an upper-case fleet domain": lambda d: d["vms"][0].update(fleet_domain="A-t.internal"),
+            "a bare internal": lambda d: d["vms"][0].update(fleet_domain="internal"),
+            "an authored key_id (the key id is router.slug + -k1, never authored)":
+                lambda d: d["vms"][0].update(key_id="router-a-t-k1"),
+        }
+        for label, change in cases.items():
+            with self.subTest(case=label):
+                self.bad(change)
+
+    def reserve(self, domain):
+        """Point the login-domain pin at an invented `<host>.internal`, for this test (W7-LOGIN-DOMAIN-BY-PIN)."""
+        import hashlib
+        old = a2_private.LOGIN_DOMAIN_SHA256
+        self.addCleanup(setattr, a2_private, "LOGIN_DOMAIN_SHA256", old)
+        a2_private.LOGIN_DOMAIN_SHA256 = hashlib.sha256(domain.encode()).hexdigest()
+
+    def test_fleet_host_refuses_the_login_domain_by_its_pin(self):
+        self.assertEqual(a2_private.fleet_host("resv.internal"), "resv")
+        self.reserve("resv.internal")
+        self.assertIsNone(a2_private.fleet_host("resv.internal"))
+        self.assertEqual(a2_private.fleet_host("resvx.internal"), "resvx")
+
+    def test_fleet_host(self):
+        self.assertEqual(a2_private.fleet_host("a-t.internal"), "a-t")
+        self.assertEqual(a2_private.fleet_host("x" * 63 + ".internal"), "x" * 63)
+        for bad in ("a.internal.", "a.internalx", "a_b.internal", "-a.internal", "a-.internal",
+                    "x" * 64 + ".internal", ".internal", "a.Internal", None, 7):
+            self.assertIsNone(a2_private.fleet_host(bad), bad)
+
+    def test_the_skeleton_rule_is_per_vm_for_agent_ids(self):
+        """RL's names are per router: an agent id may share a skeleton with ANOTHER VM's router slug, never with its
+        own VM's; router slugs are distinct across the whole file."""
+        d = a2fix.hosts_doc("/srv/locks")
+        d["agents"][0].update(id="r0uter-b-t")
+        a2_private.check_hosts(d)
+        d["agents"][0].update(id="r0uter-a-t")
+        with self.assertRaises(a2_private.Invalid) as cm:
+            a2_private.check_hosts(d)
+        self.assertEqual(cm.exception.path, "$.agents")
+
+    def test_skeleton(self):
+        self.assertEqual(a2_private.skeleton("R0uter_1.i-5"), "routerlls")
+        self.assertEqual(a2_private.skeleton("router-a"), a2_private.skeleton("r0uter_a"))
+
+
+class HubLoopTest(unittest.TestCase):
+    """hub_loop and the loop's snapshot set (W5-HUBT, DS's half): one restore set, one hub per scope, and the hosts
+    rules that tie them together."""
+
+    def hosts(self):
+        return a2fix.hosts_doc("/srv/locks")
+
+    def invalid(self, doc, path=None):
+        with self.assertRaises(a2_private.Invalid) as cm:
+            a2_private.check_hosts(doc)
+        if path is not None:
+            self.assertEqual(cm.exception.path, path)
+
+    def test_the_restore_set_and_the_hub_per_scope(self):
+        h = self.hosts()
+        self.assertEqual(a2_private.loop_restore_set(h), ("hub-t", "vm-a-t", "vm-b-t"))
+        self.assertEqual(a2_private.hub_for_scope(h, "loop"), {"name": "hub-t", "domain": "hub-t.example.org"})
+        self.assertEqual(a2_private.hub_for_scope(h, "l3"), {"name": "hub", "domain": "hub.example.org"})
+        with self.assertRaises(ValueError):
+            a2_private.hub_for_scope(h, "L2")
+        a2_private.check_hosts(h)
+
+    def test_the_pinned_set_must_name_exactly_the_restore_set(self):
+        for change in (lambda d: d["loop_snapshots"].pop(), lambda d: d["loop_snapshots"].append(
+                           {"vm": "vm-a", "snaptime": "1795000003"}),
+                       lambda d: d["loop_snapshots"].__setitem__(0, {"vm": "vm-x", "snaptime": "1795000000"})):
+            with self.subTest(change=change):
+                d = self.hosts()
+                change(d)
+                self.invalid(d, "$.loop_snapshots")
+
+    def test_shapes(self):
+        cases = (("$.loop_snapshots", lambda d: d["loop_snapshots"].append(dict(d["loop_snapshots"][0]))),
+                 ("$.loop_snapshots[0].snaptime", lambda d: d["loop_snapshots"][0].update(snaptime="0")),
+                 ("$.loop_snapshots[0].snaptime", lambda d: d["loop_snapshots"][0].update(snaptime="1" * 13)),
+                 ("$.loop_snapshots[0].snaptime", lambda d: d["loop_snapshots"][0].update(snaptime=1795000000)),
+                 ("$.hub_loop", lambda d: d.pop("hub_loop")),
+                 ("$.hub_loop.vm_id", lambda d: d["hub_loop"].update(vm_id="x")),
+                 ("$.hub_loop.domain", lambda d: d["hub_loop"].update(domain=d["hub"]["domain"])))
+        for path, change in cases:
+            with self.subTest(path=path):
+                d = self.hosts()
+                change(d)
+                self.invalid(d)
+
+    def test_the_default_site_reads_no_snapshot_set(self):
+        import a2_site
+        h = self.hosts()
+        self.assertEqual(a2_site.Site().probe_loop_snapshots(h, a2_private.loop_restore_set(h)), "UNOBSERVED")
+
+    def test_hub_loop_takes_part_in_the_distinct_names(self):
+        import a2_locks
+        for change in (lambda d: d["hub_loop"].update(name="vm-a"), lambda d: d["hub_loop"].update(vm_id="300"),
+                       lambda d: d["hub_loop"].update(name="hub")):
+            with self.subTest(change=change):
+                d = self.hosts()
+                change(d)
+                with self.assertRaises(Refusal) as cm:
+                    a2_locks.check_names_distinct(d)
+                self.assertEqual(cm.exception.cause, "RUNNER.HOSTS_TARGETS")
+
+    def test_a_loop_run_locks_hub_loop_and_an_l3_run_does_not(self):
+        import a2_locks
+        h = self.hosts()
+        loop = a2_locks.targets(h, [v for v in h["vms"] if v["scope"] == "loop"])
+        l3 = a2_locks.targets(h, [v for v in h["vms"] if v["scope"] == "l3"])
+        self.assertIn("hub-t", loop)
+        self.assertIn("vm:320", loop)
+        self.assertNotIn("hub-t", l3)
+        self.assertNotIn("vm:320", l3)
+        # A destroy-shaped list holds VMs of both scopes: one loop VM among them is enough to lock hub-t.
+        mixed = a2_locks.targets(h, h["vms"])
+        self.assertIn("hub-t", mixed)
+        self.assertIn("vm:320", mixed)
+
+
+class HostIdentityTest(unittest.TestCase):
+    """a2_site.host_identity: "a2-" + the first 16 hex of sha256 over the
+    machine id's 32 hex characters, from a file that reads as exactly those
+    and at most one newline; anything else is None (RUNNER.LOCK_ROOT)."""
+
+    MID = b"0123456789abcdef0123456789abcdef"
+
+    def setUp(self):
+        import tempfile
+        self.d = tempfile.mkdtemp(prefix="a2mid-")
+        self.addCleanup(__import__("shutil").rmtree, self.d, True)
+
+    def ident(self, raw):
+        import a2_site
+        p = os.path.join(self.d, "machine-id")
+        with open(p, "wb") as f:
+            f.write(raw)
+        return a2_site.host_identity(p)
+
+    def test_the_identity_is_a2_and_16_hex_of_the_32_characters(self):
+        import hashlib
+        want = "a2-" + hashlib.sha256(self.MID).hexdigest()[:16]
+        self.assertEqual(self.ident(self.MID + b"\n"), want)
+        self.assertEqual(self.ident(self.MID), want)
+        self.assertNotEqual(want, "a2-" + hashlib.sha256(self.MID + b"\n").hexdigest()[:16])
+
+    def test_the_identity_fits_the_host_id_pattern(self):
+        import a2_private
+        self.assertTrue(a2_private.matches("host_id", self.ident(self.MID + b"\n")))
+
+    def test_any_other_content_is_none(self):
+        for raw in (b"", b"\n", self.MID[:31], self.MID + b"0", self.MID.upper(), self.MID + b"\n\n",
+                    self.MID + b"\r\n", self.MID + b" ", b" " + self.MID, self.MID[:30] + b"g0",
+                    self.MID + b"\x00", b"\xef\xbb\xbf" + self.MID, self.MID * 4 + b"\n", b"0" * 200):
+            with self.subTest(raw=raw):
+                self.assertIsNone(self.ident(raw))
+
+    def test_an_unreadable_or_missing_file_is_none(self):
+        import a2_site
+        self.assertIsNone(a2_site.host_identity(os.path.join(self.d, "absent")))
+        self.assertIsNone(a2_site.host_identity(self.d))
+
+
+class GitTrustTest(unittest.TestCase):
+    """a2_git names no safe.directory: git refuses a checkout another
+    account owns, and S0 runs no git in the private overlay checkout at all.
+    Reachability: has_commit needs a fetched branch or tag to reach the
+    commit."""
+
+    def setUp(self):
+        import tempfile
+        self.d = tempfile.mkdtemp(prefix="a2sd-")
+        self.addCleanup(__import__("shutil").rmtree, self.d, True)
+
+    def env(self):
+        import a2_git
+        return dict(a2_git.env_for(self.d), GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.org",
+                    GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.org")
+
+    def test_real_git_refuses_another_owners_checkout(self):
+        """Why S0 runs no git in the private checkout: git refuses a
+        repository another account owns (measured with git's own test switch,
+        GIT_TEST_ASSUME_DIFFERENT_OWNER, git 2.35.2 and later), and a2_git
+        names no safe.directory to get past that."""
+        import subprocess
+        import a2_git
+        repo = os.path.join(self.d, "repo")
+        os.mkdir(repo)
+        subprocess.run(["/usr/bin/git", "-C", repo, "init", "-q"], env=self.env(), check=True)
+        subprocess.run(["/usr/bin/git", "-C", repo, "commit", "-q", "--allow-empty", "-m", "x"], env=self.env(),
+                       check=True)
+        self.assertRegex(a2_git.Git(a2_git.env_for(self.d)).head(repo), "^[0-9a-f]{40}$")
+        other = dict(a2_git.env_for(self.d), GIT_TEST_ASSUME_DIFFERENT_OWNER="1")
+        with self.assertRaises(a2_git.GitError):
+            a2_git.Git(other).head(repo)
+        self.assertFalse(hasattr(a2_git, "for_site"))
+        import inspect
+        self.assertNotIn("safe_dirs", inspect.signature(a2_git.Git).parameters)
+
+    def test_has_commit_needs_a_fetched_ref_to_reach_it(self):
+        """A commit object in the bare repository that no refs/a2h or
+        refs/a2t ref reaches is not had: an object a server put in the pack
+        beside the refs' closure does not count."""
+        import subprocess
+        import a2_git
+        bare = os.path.join(self.d, "b.git")
+        subprocess.run(["/usr/bin/git", "init", "-q", "--bare", bare], env=self.env(), check=True)
+        run = lambda *a: subprocess.run(["/usr/bin/git", "-C", bare] + list(a), env=self.env(), check=True,
+                                        capture_output=True, text=True, input="").stdout.strip()
+        tree = run("mktree")
+        reached = run("commit-tree", tree, "-m", "reached")
+        loose = run("commit-tree", tree, "-m", "loose")
+        run("update-ref", "refs/a2h/main", reached)
+        run("update-ref", "refs/other/x", loose)
+        g = a2_git.Git(a2_git.env_for(self.d))
+        self.assertTrue(g.has_commit(bare, reached))
+        self.assertFalse(g.has_commit(bare, loose))
+        self.assertFalse(g.has_commit(bare, "1" * 40))
 
 class ReadPrivatePairTest(unittest.TestCase):
     """a2_admit.read_private_pair: the shared reader of the two private
@@ -315,7 +671,7 @@ class ArgsTest(unittest.TestCase):
                 {"host": "vm-a", "id": "agent-b"})
         self.ok(["--rotate-key"], "rotate-key", None)
         self.ok(["--check-roundtrip", "abcd1234"], "check-roundtrip", None, {"nonce": "abcd1234"})
-        self.ok(["--only", "S6b"], "install", "L1", {"only": "S6b"})
+        self.ok(["--only", "S5"], "install", "L1", {"only": "S5"})
         self.ok(["--from", "S3"], "install", "L1", {"from": "S3"})
         self.ok(["--leak-run"], "install", "L2-leak")
         self.ok(["--loop", "L2"], "install", "L2")
@@ -369,6 +725,25 @@ class EnvAccountTest(unittest.TestCase):
         del e["TERM"]
         self.refuses("RUNNER.ENV", a2_host.check_env, e, "loop", "/h")
         self.refuses("RUNNER.ENV", a2_host.check_env_names, self.env(X="1"))
+
+    def test_a_home_a_shell_would_split_refuses(self):
+        """HOME reaches git's GIT_SSH_COMMAND, which a shell runs: it must be a plain absolute path, even when it
+        is the account database's own home."""
+        import a2_git
+        self.assertEqual(a2_host.SAFE_HOME.pattern, a2_git.SAFE_HOME.pattern)
+        for home in ("/h x", "/h;id", "/h/$X", "/h/../h", "/h/.", "relative", "/h'q", "/"):
+            with self.subTest(home=home):
+                self.refuses("RUNNER.ENV", a2_host.check_env, self.env(HOME=home), "loop", home)
+                with self.assertRaises(ValueError):
+                    a2_git.env_for(home)
+
+    def test_git_reads_only_the_overlay_ssh_configuration(self):
+        import a2_git
+        e = a2_git.env_for("/var/lib/acct")
+        self.assertEqual(e["GIT_SSH_COMMAND"], "ssh -F /var/lib/acct/.ssh/config_overlay")
+        self.assertEqual(set(e), {"PATH", "HOME", "SSH_AUTH_SOCK", "GIT_SSH_COMMAND", "GIT_CONFIG_NOSYSTEM",
+                                  "GIT_CONFIG_GLOBAL", "GIT_TERMINAL_PROMPT", "LC_ALL", "GIT_NO_REPLACE_OBJECTS",
+                                  "GIT_OPTIONAL_LOCKS"})
 
     def test_received_environ(self):
         import shutil
@@ -425,6 +800,40 @@ class EnvAccountTest(unittest.TestCase):
         self.refuses("RUNNER.ACCOUNT", a2_host.check_account, I("install", None, {}), "loop")
         self.refuses("RUNNER.ACCOUNT", a2_host.check_account, I("install", "L2", {}), "l3")
         self.refuses("RUNNER.ACCOUNT", a2_host.check_account, I("destroy", None, {}), "loop")
+
+
+class WritersRequiredTest(unittest.TestCase):
+    """a2_private.writers_required over every command and stage set."""
+
+    def req(self, argv):
+        import a2_private
+        return a2_private.writers_required(a2_args.parse(argv), a2_args.STAGE_IDS)
+
+    def req_l1(self, opts):
+        """The function itself, over every stage set, including those RUNNER.STAGE_SET now refuses at parsing."""
+        import a2_private
+        return a2_private.writers_required(a2_args.Invocation("install", "L1", opts), a2_args.STAGE_IDS)
+
+    def test_l1_only(self):
+        both = {"api_key", "hub_login"}
+        for st in a2_args.STAGE_IDS:
+            want = {"S6b": {"hub_login"}, "S7": {"api_key"}}.get(st, set())
+            with self.subTest(only=st):
+                self.assertEqual(self.req_l1({"only": st}), want)
+        for st in a2_args.STAGE_IDS:
+            i = a2_args.STAGE_IDS.index(st)
+            want = ({"hub_login"} if i <= a2_args.STAGE_IDS.index("S6b") else set()) | \
+                   ({"api_key"} if i <= a2_args.STAGE_IDS.index("S7") else set())
+            with self.subTest(frm=st):
+                self.assertEqual(self.req_l1({"from": st}), want)
+        self.assertEqual(self.req(["--from", "S0"]), both)
+        self.assertEqual(self.req(["--only", "S5"]), set())
+
+    def test_every_other_command_needs_both(self):
+        for argv in (["--loop", "L2"], ["--loop", "L3"], ["--leak-run"], [], ["--dry-run"], ["--verify"],
+                     ["--rotate-key"], ["--destroy"]):
+            with self.subTest(argv=argv):
+                self.assertEqual(self.req(argv), {"api_key", "hub_login"})
 
 
 if __name__ == "__main__":

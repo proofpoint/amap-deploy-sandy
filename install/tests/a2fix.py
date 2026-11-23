@@ -24,6 +24,21 @@ INSTALL = os.path.dirname(HERE)
 REPO = os.path.dirname(INSTALL)
 sys.path.insert(0, INSTALL)
 
+import a2_private  # noqa: E402
+
+#: The fixture lock's invented hub login names. a2_private pins the real, frozen ones by sha256; every test process
+#: that imports this fixture points the pins at these (as tests/test_hub_runtime.py does for hub_runtime).
+FIXTURE_LOGIN = {"local": "lname", "domain": "logins.example"}
+a2_private.LOGIN_LOCAL_SHA256 = hashlib.sha256(FIXTURE_LOGIN["local"].encode()).hexdigest()
+a2_private.LOGIN_DOMAIN_SHA256 = hashlib.sha256(FIXTURE_LOGIN["domain"].encode()).hexdigest()
+#: The fixture lock's invented registry program names, pinned the same way.
+FIXTURE_REGISTRY = {"package": "regtool", "config_schema": "regtool.config/1", "adapter_interface": "regtool.adapter/1",
+                    "component": "registry"}
+a2_private.REGISTRY_PACKAGE_SHA256 = hashlib.sha256(FIXTURE_REGISTRY["package"].encode()).hexdigest()
+a2_private.REGISTRY_CONFIG_SCHEMA_SHA256 = hashlib.sha256(FIXTURE_REGISTRY["config_schema"].encode()).hexdigest()
+a2_private.REGISTRY_ADAPTER_INTERFACE_SHA256 = hashlib.sha256(FIXTURE_REGISTRY["adapter_interface"].encode()).hexdigest()
+a2_private.REGISTRY_COMPONENT_SHA256 = hashlib.sha256(FIXTURE_REGISTRY["component"].encode()).hexdigest()
+
 ME = pwd.getpwuid(os.getuid())
 H40 = "a" * 40
 H64 = "b" * 64
@@ -38,14 +53,19 @@ LOCK = {
     "components": [{"name": "router", "repo": "ssh://git@git.example.org/amap/router", "commit": H40,
                     "tag": "alpha2-rc1"},
                    {"name": "connector", "repo": "https://git.example.org/amap/connector", "commit": H40,
+                    "tag": "alpha2-rc1"},
+                   {"name": "registry", "repo": "ssh://git@git.example.org/amap/registry", "commit": H40,
                     "tag": "alpha2-rc1"}],
     "images": [{"name": "router-img", "built_from": "router", "image_id": "sha256:" + H64}],
-    "files": [{"path": "alpha/packages/a.sh", "component": "router", "sha256": H64}],
+    "files": [{"path": "alpha/packages/a.sh", "component": "router", "sha256": H64},
+              {"path": "dist/plugin.py", "component": "router", "sha256": "c" * 64}],
     "writers": [{"use": "api_key", "path": "install/w/api.py", "sha256": H64},
                 {"use": "hub_login", "path": "install/w/hub.py", "sha256": H64}],
-    "plugin": {"sha256": H64, "plugin_api": "1.2"},
+    "plugin": {"sha256": "c" * 64, "plugin_api": "1.2"},
     "d7_source": {"sha256": H64},
     "vm_template": {"name": "tmpl"},
+    "hub_login": dict(FIXTURE_LOGIN),
+    "registry_program": dict(FIXTURE_REGISTRY),
 }
 
 
@@ -56,13 +76,19 @@ def hosts_doc(lock_root, loop_account=None, l3_account="l3-runner", host_id="hos
                    "loop_account": loop_account or ME.pw_name, "l3_account": l3_account},
         "hypervisor": {"name": "hv", "ssh_alias": "hv"},
         "hub": {"name": "hub", "domain": "hub.example.org"},
+        "hub_loop": {"name": "hub-t", "domain": "hub-t.example.org", "vm_id": "320"},
+        "loop_snapshots": [{"vm": "hub-t", "snaptime": "1795000000"}, {"vm": "vm-a-t", "snaptime": "1795000001"},
+                           {"vm": "vm-b-t", "snaptime": "1795000002"}],
         "vms": [
-            {"name": "vm-a-t", "scope": "loop", "vm_id": "300", "fleet_domain": "a-t.example.org",
-             "key_id": "ka-t", "ssh_alias": "vm-a-t"},
-            {"name": "vm-b-t", "scope": "loop", "vm_id": "301", "fleet_domain": "b-t.example.org",
-             "key_id": "kb-t", "ssh_alias": "vm-b-t"},
-            {"name": "vm-a", "scope": "l3", "vm_id": "310", "fleet_domain": "a.example.org",
-             "key_id": "ka", "ssh_alias": "vm-a"},
+            {"name": "vm-a-t", "scope": "loop", "vm_id": "300", "fleet_domain": "a-t.internal",
+             "ssh_alias": "vm-a-t", "agent_account": "agent", "relay_account": "relay",
+             "hop_group": "hop", "router": {"slug": "router-a-t", "stable_key": "/srv/agent/.amap-router"}},
+            {"name": "vm-b-t", "scope": "loop", "vm_id": "301", "fleet_domain": "b-t.internal",
+             "ssh_alias": "vm-b-t", "agent_account": "agent", "relay_account": "relay",
+             "hop_group": "hop", "router": {"slug": "router-b-t", "stable_key": "/srv/agent-b/.amap-router"}},
+            {"name": "vm-a", "scope": "l3", "vm_id": "310", "fleet_domain": "a.internal",
+             "ssh_alias": "vm-a", "agent_account": "agent", "relay_account": "relay",
+             "hop_group": "hop", "router": {"slug": "router-a", "stable_key": "/srv/agent-l3/.amap-router"}},
         ],
         "agents": [{"id": "agent-a", "vm": "vm-a-t", "connector": "connector"}],
         "destroy_deny": [],
@@ -115,7 +141,7 @@ class World:
         import a2_locks
         names = [a2_locks.RUNNER_LOCK]
         hv = self.hosts
-        tg = [hv["hypervisor"]["name"], hv["hub"]["name"]]
+        tg = [hv["hypervisor"]["name"], hv["hub"]["name"], hv["hub_loop"]["name"], "vm:" + hv["hub_loop"]["vm_id"]]
         for v in hv["vms"]:
             tg += [v["name"], "vm:" + v["vm_id"]]
         names += [a2_locks.target_key(t) + ".lock" for t in tg]
@@ -301,7 +327,8 @@ class GitWorld:
 
     URLS = {"overlay": "ssh://git@git.example.org/amap/private-overlay",
             "router": "ssh://git@git.example.org/amap/router",
-            "connector": "https://git.example.org/amap/connector"}
+            "connector": "https://git.example.org/amap/connector",
+            "registry": "ssh://git@git.example.org/amap/registry"}
 
     def __init__(self, world, tag="alpha2-rc1"):
         import shutil
@@ -312,7 +339,7 @@ class GitWorld:
         os.mkdir(self.remotes)
         self.url_map = {}
         commits = {}
-        for name in ("router", "connector"):
+        for name in ("router", "connector", "registry"):
             bare = self._bare(name)
             work = os.path.join(world.base, "work-" + name)
             git(world.base, "init", "-q", work)
@@ -383,14 +410,32 @@ class GitWorld:
     def site_over(self):
         import a2_git
         g = a2_git.Git(a2_git.env_for(self.w.home), protocols=("file",))
-        ok = lambda h: "ok"
+        ok = lambda h, scope: "ok"
         return dict(git=g, repo_url_map=dict(self.url_map),
                     entry=os.path.join(self.inst, "install", "alpha2_install.py"),
                     sandbox_mount_roots=(os.path.join(self.w.base, "sandbox-mounts"),),
                     live_deploy_paths=(os.path.join(self.w.base, "live"),),
                     probe_tools=ok, probe_net_runtime=ok, probe_keep_awake=ok,
                     probe_target_access=ok, probe_hub_read=ok, probe_operator_route=ok,
-                    probe_survey=ok, probe_placement=lambda h: "match")
+                    probe_survey=ok, probe_placement=lambda h: "match",
+                    probe_loop_snapshots=pinned_snapshots, overlay_ssh_config=overlay_ssh)
+
+
+def overlay_ssh(home, host, port):
+    """ssh -G's effective overlay configuration as NET's config_overlay gives it, for any host and port (its
+    options sit under `Host *`); shape measured from OpenSSH 10.0's `ssh -G`."""
+    return {"user": ["git"], "hostname": [host], "port": [str(port)], "batchmode": ["yes"],
+            "identitiesonly": ["yes"], "stricthostkeychecking": ["true"], "hostkeyalias": ["a2-overlay"],
+            "identityagent": ["none"], "forwardagent": ["no"],
+            "userknownhostsfile": [home + "/.ssh/known_hosts_overlay"],
+            "identityfile": [home + "/.ssh/id_a2_loop_overlay"]}
+
+
+def pinned_snapshots(hosts, names):
+    """A `snapshots` read that agrees with the hosts document: every member at its pinned snaptime, its base
+    snapshot the current parent and the only one."""
+    pinned = {e["vm"]: int(e["snaptime"]) for e in hosts["loop_snapshots"]}
+    return {n: {"snaptime": pinned[n], "current_parent": True, "only": True} for n in names}
 
 
 def _sha(path):

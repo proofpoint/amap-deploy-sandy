@@ -23,7 +23,7 @@ is a finding. It applies these decisions:
 | Decision | Effect here |
 |---|---|
 | E5 (a) | A component change arrives through its own reviewed PR and is pinned in `alpha2.lock` (section 6.1). Nothing here pins a component any other way. |
-| E6 (b) | S3 and S6b CHECK the hub and write nothing to it. The installer holds no hub write path. The operator resets and sets the router logins before every fresh run (section 3.6). |
+| E6 (b) | S3 and S6b CHECK the hub and write nothing to it. The installer holds no hub write path. The operator resets and sets the router logins before every fresh run (section 3.6). Here "hub" is the `l3` scope's `hub` (6.2); hub-t (`hub_loop`) is one of the loop's throwaway test VMs (E1), restored only as 3.6 states (E3). |
 | E7 (a) | One review per stage against this contract. The installer is approved by its sha, and each green run by the sha of its receipt SUMS (section 5.4). |
 | E14 (a) | S2 applies: it starts NET's reviewed program and creates the VMs if absent. |
 | E16 (a) | `alpha2.lock` and `alpha2.hosts` live in the private overlay repository; run manifests live there or on the runner host. Only code and the formats below are public. S0 leak-checks both files (section 8). |
@@ -39,6 +39,8 @@ is a finding. It applies these decisions:
 | E23 | Decided 2026-11-15T04:59:02Z: the registry program joins the ALPHA-2 tag list, and the private overlay is tagged privately; the lock pins both. The registry program is a `components[]` entry, and the overlay is pinned by `overlay` (section 6.1). |
 | E24 | Decided 2026-11-15T04:59:58Z: tag names as in plan section 11, `alpha2-rcN` at each lock change, plus a final tag on the green fresh (L3) run. Every tag in one lock is the same `alpha2-rcN` (section 6.1); the final tag is D5's (section 9) [OPEN: final tag name]. |
 | E25 | Settled by E11 (a′), decided 2026-11-15T14:01:57Z (`--destroy` is added now and uses the L3 key, never the loop key), and by the second round of the apply-key questions, decided 2026-11-15T14:06:36Z (the L3 arm gate, and `destroy` limited to the pinned VMs). `--destroy`'s VM scope is the `vms[]` entries of `alpha2.hosts` that are not on the runner-side list `destroy_deny` (section 6.2), and only those that carry the installer's marker inside an armed window and are not on the L3 forced program's own hard deny list (section 9a); never the hub (E6 (b)). Its own confirmation is the arm gate the operator sets for each sitting, with the `--destroy` line frozen at D3 (5.3b). The real VMs are rebuilt from bare by the final run (L3 target VMs (A), decided 2026-11-15T14:22:59Z). |
+| ALPHA2-IMAGE-BUILD-PIN (D) | Decided 2026-11-20T17:07:58Z: the sandy agent sandbox images are built on each VM as usual (`sandy --build-only` in S7) and their ids are RECORDED in S7's receipt for information only: no `images[]` row, no check, no refusal on the value. The router's and the relay end's images stay `images[]` pins (section 6.1). Accepted trade-off: an L3 image may differ from the loop's |
+| ALPHA2-L3-ID-REMINT (A) | Decided 2026-11-20T17:09:05Z: every bare L3 mints new router and agent ids, on four conditions: (1) no ALPHA-2 state lives off a VM's own disk (every RE state directory and its volume on the VM; verify V15); (2) `min_sender_age_s` is 0 on both VMs, rendered by S6, which checks the two are equal; (3) S8 refuses a clock skew over 2 s between the VMs before start; (4) at each bare L3 start the operator empties the rebuilt hosts' router mailboxes and lets queued hub mail drain (section 9, U2) |
 
 What this draft ADDS beyond the proposal, for the reviewer to accept or
 change (the proposal sets the requirement; the shape below is this draft's):
@@ -207,6 +209,13 @@ No other exit code is permitted. A stage that cannot classify its own failure ex
 
 ### 3.6 The hub (E6 (b))
 
+In this section "the hub" is the `l3` scope's `hub` (6.2). hub-t, the loop's `hub_loop`, is one of the three
+throwaway test VMs of E1, and the loop identity holds restore, start, stop and status on exactly those VMs (E3). The
+only writes to it are S2's, under the E3 loop identity: its power state (start, stop) and the rollback to its pinned
+snapshot, restoring it as a member of `loop_restore_set`; nothing else in the installer, and no program it calls,
+writes to hub-t. S3 checks hub-t read-only, as it does the
+hub, for a loop-scope run.
+
 - S3 `HUB-CHECK` is read-only: the hub facts record against the pinned
   inventory commit and against what RE's reader expects; the group's render
   compared with the live hub; the default group's bytes recorded. Its apply
@@ -240,7 +249,7 @@ is a negative test of the S1 review; each MUST be shown to fail closed.
 6. The writer checks every return code, writes in a full-write loop to a
    0600 temp file in a 0700 directory, fsyncs, renames atomically, and removes
    the temp on any failure.
-7. The bytes hashed are the bytes executed. On each VM, one fixed bootstrap (committed, pinned in `files[]`) is run by the VM's absolute interpreter in a cleaned environment (`env -i`, `-I`). It reads the writer file once into memory, hashes those bytes itself (no external hasher), compares them with the `writers[]` sha from `alpha2.lock` passed as an argument, and on a match executes the in-memory bytes. On a mismatch it exits before reading stdin, the value is never sent, and the cause is `<STAGE>.PIN`. Hashing on the runner host, or hashing in one process and executing in another, does not meet this rule. Negative test: a writer altered by one byte on the VM gets no value and the stage exits 2.
+7. The bytes hashed are the bytes executed. On each VM, one fixed bootstrap (committed in the installer and pinned through `install/MANIFEST`) is run by the VM's absolute interpreter in a cleaned environment (`env -i`, `-I`), as `python3 -I -S -c <its bytes>`, so no bootstrap or writer file exists on the VM. The runner reads the writer's bytes from its checkout, refuses unless they match the `writers[]` sha from `alpha2.lock`, and sends them first on stdin. The bootstrap reads them once into memory, hashes those bytes itself (no external hasher), compares them with the `writers[]` sha passed as an argument, and only on a match writes `READY` and executes the in-memory bytes. The runner sends the value only after `READY`. On a mismatch the bootstrap exits without `READY`, the value is never sent, and the cause is `<STAGE>.PIN`. Hashing on the runner host, or hashing in one process and executing in another, does not meet this rule. Negative test: a writer altered by one byte on the VM gets no value and the stage exits 2. The mode decides the value: `write` and `rotate` send a non-empty value, `finish` and `restore` send none, and any other pairing refuses before the route is used. After the writer returns, the bootstrap prints `RC <n>`; a session without it failed in the bootstrap and is `<STAGE>.UNCLASSIFIED` (3). The whole session runs under one deadline. Stated residual: `READY` is a line on the login account's shell; that account can `sudo -n` and is root-equivalent, so "never before `READY`" holds while that shell is trusted. The login shell is POSIX sh family (a VM base requirement).
 8. The check of which credential is in force follows sandy's grammar: the
    last duplicate wins.
 9. Interpreters are invoked by absolute path, in a cleaned environment. The
@@ -300,15 +309,33 @@ in this list fails its review, and a name is added only by a diff to this file.
 
 ### 4.2 Names every stage carries
 
+**The write rule (every cause of a stage that writes, this table's and 4.4's):** a stage's cause exits 2 before
+the stage's first write and 3 after it, keeping its name. Exit 2 from any stage therefore always means the stage
+wrote nothing, which later stages and the operator rely on. "Write" is 3.4's: any write by the stage, a write through
+the VM layer included (a root placement, a secret, or a command the stage declared as writing). S0 and S1, and the
+runner's own causes, write nothing to a target and keep their exits. The Exit column below is the exit BEFORE a
+write.
+
 | NAME | Exit | When |
 |---|---|---|
-| `LOCK` | 2 | `alpha2.lock` unreadable, or fails its schema (section 6.1) |
-| `HOSTS` | 2 | `alpha2.hosts` unreadable, or fails its schema (section 6.2) |
+| `LOCK` | 2 (3 after a write) | `alpha2.lock` unreadable, or fails its schema (section 6.1) |
+| `HOSTS` | 2 (3 after a write) | `alpha2.hosts` unreadable, or fails its schema (section 6.2) |
 | `PREDECESSOR_MISSING` | 2 | A predecessor's receipt is absent from the run directory |
 | `PREDECESSOR_INCOMPLETE` | 2 | A predecessor's receipt has no valid end line |
 | `PREDECESSOR_FAILED` | 2 | A predecessor's end line has rc other than 0 |
 | `PREDECESSOR_INSTALLER` | 2 | A predecessor was written by a different installer sha, outside the one K8 relaxation (section 3.3) |
-| `PIN` | 2 | A file, image or commit does not match its pin in `alpha2.lock` |
+| `PIN` | 2 (3 after a write) | A file, image or commit does not match its pin in `alpha2.lock` |
+| `TARGET_ACCESS` | 2 (3 after a write) | The route to a VM (ssh to its `ssh_alias`, with the host key S2 pinned) failed, timed out, or is not configured. After the stage's first write, on any VM, it exits 3 under the write rule, because a VM may have changed |
+| `EXISTS_DIFFERENT` | 2 (3 after a write) | A key or file the stage would create already exists and differs from what the run expects; it is never regenerated or replaced |
+| `INTERPRETER` | 2 (3 after a write) | A VM's `python3` is older than the release a component the stage runs there requires (S6: RL's floor, 3.11) |
+| `CLOCK` | 2 | hub-t's clock is more than the allowed skew (60 s) from the runner's, or could not be read (S3, NET's; read-only) |
+| `HUB_NAME` | 2 | The run scope's hub name is not a host key of the pinned network inventory (6.2); S3 is read-only, so it never follows a write of its own |
+| `HUB_HOSTNAME` | 2 | The run's S3 receipt has no `HUB_HOSTNAME` fact, or it is not a lowercase DNS name of at most 253 characters (S6, ruling W7-S6-HUB-HOSTNAME: the hub MTA's own hostname, S6's `hub_fqdn`, read before S6's first write) |
+| `ROUTER_REFUSED` | 2 (3 after a write) | RL's `peers` verb, run over the router.json the stage placed, exits non-zero (S6) |
+| `PEER_STORE` | 2 (3 after a write) | RL's peer store is not `ready` with admission `open` and exactly its three artefacts, or `peer-store init --never-admitted` failed or left it otherwise; never retried or repaired (S6) |
+| `REGISTRY` | 2 (3 after a write) | The registry program (E23) refuses the router's import, or its read-back by key does not match the apply and the placed host.json; never repaired (S6) |
+| `PLACED_DIFFERENT` | 2 (3 after a write) | A file the stage places is already there with other bytes, mode or type, or a directory the stage owns exactly holds a name it does not place; nothing is ever replaced (S6, vm_place; S6's transport plugin through the root bootstrap, placed only where absent; an agent's registry batch in S7) |
+| `OWNER` | 2 (3 after a write) | A path the stage creates or uses exists with another owner, group or mode, or a directory above it is not trusted; it is never repaired |
 | `NOT_RESTORED` | 3 | A write failed and the restore did not reach the prior state |
 | `UNCLASSIFIED` | 3, or 2 only when no write can be shown | Section 3.4 |
 
@@ -325,6 +352,7 @@ in this list fails its review, and a name is added only by a diff to this file.
 | `RUNNER.LOCK_ROOT` | 2 | The runner host or the lock root differs from `runner` in `alpha2.hosts`, or the lock root or a lock file is not owned and moded as section 5.3 requires (section 5.3) |
 | `RUNNER.CUSTODY` | 2 or 3 | The custody read-back at a stage boundary, or before a first target write, is not what section 5.3b requires; exit 3 if the run has written to a target, else 2 |
 | `RUNNER.ARGS` | 2 | An argv value does not match its pattern (section 3.3) |
+| `RUNNER.STAGE_SET` | 2 | An L1 (`--only`, `--from`) whose stage set includes S6 or a later stage but not S3: it would skip every hub check (ruling W5-R13-L1-STAGESET-REQUIRED). Refused at argument parsing, before any file is read or any stage runs |
 | `RUNNER.ADMISSION` | 2 | The runner does not hold the locks of its run or, for a command that can write to a target, a valid broker record of its own account, or they do not bind it to this run (section 5.1a) |
 | `RUNNER.DESTROY_DENY` | 2 | A `destroy` whose `alpha2.hosts` has no `destroy_deny` (section 6.2): the hard deny list is UNCONFIGURED |
 | `RUNNER.NOT_STARTED` | 2 | No runner was started after a start record may have been published: the launcher's exec of the runner failed in any way (5.1a step 5), or the broker was sent a request and its answer was lost, late or malformed (5.3c). The record, if written, stays counted |
@@ -343,15 +371,15 @@ a.4's S0 row:
 | `PREFLIGHT.NET_RUNTIME` | NET's runtime on the runner host is absent or cannot run offline |
 | `PREFLIGHT.LEAK_LOCK` | Section 8 refuses `alpha2.lock` |
 | `PREFLIGHT.LEAK_HOSTS` | Section 8 refuses `alpha2.hosts` |
-| `PREFLIGHT.PRIVATE_SOURCE` | Either file does not come from the private overlay checkout, or that checkout is not clean at a committed state, or a file's bytes differ from its blob at HEAD, or the checkout does not meet the lock's `overlay` pin and tag (section 6.1) |
+| `PREFLIGHT.PRIVATE_SOURCE` | Either file does not come from the private overlay checkout, or that checkout's working tree is not exactly the tree of the commit `overlay.tag` peels to, or a file's bytes differ from that tree, or that commit does not meet the lock's `overlay` pin (section 6.1) |
 | `PREFLIGHT.REPO_ACCESS` | The read-only access probe to a pinned repository fails |
 | `PREFLIGHT.FETCH` | A pinned commit could not be fetched into the work directory, or the fetch did not produce that commit, or a pinned tag, as fetched and peeled, is not its pinned commit (section 6.1) |
-| `PREFLIGHT.TARGET_ACCESS` | The read-only access probe to a target (the hypervisor, the hub, each VM that exists) fails |
-| `PREFLIGHT.HUB_READ` | The hub's read-only checks fail, including the render comparison |
+| `PREFLIGHT.TARGET_ACCESS` | The read-only access probe to a target (the hypervisor, the run's own hub by `hub_for_scope` (6.2), each VM that exists) fails |
+| `PREFLIGHT.HUB_READ` | The read-only checks of the run's own hub (`hub_for_scope`, 6.2) fail, including the render comparison |
 | `PREFLIGHT.OPERATOR_ROUTE` | The operator's ssh route from the runner host to a VM (E20) fails its read-only rehearsal |
 | `PREFLIGHT.LIVE_DEPLOY` | The run directory is the runner host's live deploy |
 | `PREFLIGHT.KEEP_AWAKE` | The runner host's sleep is not shown disabled (A2-16, section 5.3a) |
-| `PREFLIGHT.SURVEY` | Before L3 only: an `l3` target differs from the bare start state (E2: each `l3` VM absent; the hub as b.4 records) |
+| `PREFLIGHT.SURVEY` | Before L3 or a bare install: an `l3` target differs from the bare start state (E2: each `l3` VM absent; the hub as b.4 records). Before an L1, L2 or L2-leak run: a member of the loop's snapshot set is not at its pinned base snapshot (6.2 `loop_snapshots`: the snaptime differs, the snapshot is not the current parent or not the only one), or the read cannot be made |
 | `PREFLIGHT.HANDOFF` | The stop file is set or `UNOBSERVED` for a command it applies to; or, for a command that can write to a target, the hypervisor does not report itself free of loop tasks; or an `L3` or bare `install`, or a `destroy`, does not read the hypervisor's L3 arm gate open, or for an `install` with too little time left in it (section 5.3b) |
 | `PREFLIGHT.BUDGET` | A run that can write to a target: for an L2 run, the day's count of L2 runs is 12; for any such run, the loop's account usage is at 80% or more or cannot be shown below it, or the broker refused to write its start record, or `budget.d` could not be read (section 5.3c) |
 
@@ -359,7 +387,7 @@ All exit 2. The target lock is the runner's (`RUNNER.TARGET_LOCKED`).
 
 ### 4.5 `--verify` names
 
-These are a.6's names, unchanged.
+These are a.6's names, plus `VERIFY.RE_STATE_OFF_VM` (V15, ALPHA2-L3-ID-REMINT condition 1).
 
 `VERIFY.RL_FORM`, `VERIFY.RL_REGISTRY`, `VERIFY.RL_DELEGATION`,
 `VERIFY.PEERSTORE_CLOSED`, `VERIFY.RL_NO_VERIFY_SIGNAL`,
@@ -367,7 +395,7 @@ These are a.6's names, unchanged.
 `VERIFY.RE_POLL_FAILED`, `VERIFY.RE_PUMP_FAILED`, `VERIFY.RE_AUTH_FAILED`,
 `VERIFY.RE_NOT_PROGRESSING`, `VERIFY.HOP_LAYOUT`, `VERIFY.HOP_TREE_UNREADABLE`,
 `VERIFY.HUB_LOGIN`, `VERIFY.HUBENV`, `VERIFY.D7`, `VERIFY.AGENT_<id>_<WHAT>`,
-`VERIFY.OPERATOR_ROUTE`, `VERIFY.HOST`.
+`VERIFY.OPERATOR_ROUTE`, `VERIFY.HOST`, `VERIFY.RE_STATE_OFF_VM`.
 
 `VERIFY.AGENT_<id>_<WHAT>`: `<id>` is the agent's id from `alpha2.hosts`,
 upper-cased with every character outside `[A-Z0-9]` replaced by `_`; `<WHAT>`
@@ -383,10 +411,10 @@ requires are listed; the rest is a slot.
 |---|---|
 | S1 `CREDENTIALS` | `CREDENTIALS.CORE_LIMIT` (rule 1 of 3.7), `CREDENTIALS.NO_ECHO` (rule 2), `CREDENTIALS.FORM`, `CREDENTIALS.KEY_NOT_LIVE` (rule 3), `CREDENTIALS.LEAK_LOCK`, `CREDENTIALS.LEAK_HOSTS` (section 8 L5); [stage review] |
 | S2 `VMS` | `VMS.NO_MARKER` (a VM of that name exists without the installer's marker); [stage review] |
-| S3 `HUB-CHECK` | [stage review] |
+| S3 `HUB-CHECK` | `HUB-CHECK.CLOCK` (L1, L2 and L2-leak: hub-t's clock, read by S3 as its first hub check over the bound route, after S2's restore where the run has one, is more than 60 s from the runner's midpoint, or unread; NET's), `HUB-CHECK.HUB_NAME` (the run scope's hub name, `hub_for_scope(hosts, scope)["name"]`, is not a host key of the pinned network inventory; NET's S3 check, 6.2); [stage review] |
 | S4 `IMAGES` | `IMAGES.FINGERPRINT` (router fingerprint not EXACT); [stage review] |
 | S5 `KEYS` | `KEYS.EXISTS_DIFFERENT` (a re-run never regenerates a key); [stage review] |
-| S6 `CONFIG` | [stage review] |
+| S6 `CONFIG` | `CONFIG.HOSTS` (an account or the hop group named in `alpha2.hosts` is missing on the VM, the relay account is root or the agent's uid, or an account lacks the hop group), `CONFIG.INTERPRETER` (the VM's python3 is older than RL's floor), `CONFIG.OWNER` (a path S6 lays out, including the hop intakes the bootstrap makes, is never repaired), `CONFIG.HUB_HOSTNAME` (S3's `HUB_HOSTNAME` fact, which S6 renders as RE's `SMTP_HOST`, `IMAP_HOST` and the prefix template's `hub_fqdn`, is missing or malformed), `CONFIG.ROUTER_REFUSED` (RL's `peers` over the placed router.json exits non-zero), `CONFIG.PEER_STORE` (RL's peer store is not ready with admission open after a never-admitted init, or an existing one is not), `CONFIG.REGISTRY` (the registry program refuses the router's import, or the read-back by key disagrees with the apply or host.json), `CONFIG.PLACED_DIFFERENT` (a placed file is already there and differs, or an exactly-owned directory holds an extra name); [stage review] |
 | S6b `HUB-LOGIN` | `HUB-LOGIN.PROBE` (RE's probe does not show the login by account name); [stage review] |
 | S7 `AGENTS` | `AGENTS.NO_START_PATH` (rule 10 of 3.7); [stage review] |
 | S8 `START` | `START.INIT` (peer-store init failed or half done; never retried blindly), `START.NOT_ADMITTING` (no "peer store: admission open"); [stage review] |
@@ -410,10 +438,22 @@ carries a value.
 | `<STAGE>.PREDECESSOR_FAILED` | Look at the predecessor receipt: its stage did not pass. |
 | `<STAGE>.PREDECESSOR_INSTALLER` | Look at the predecessor receipt: a different installer wrote it. |
 | `<STAGE>.PIN` | Look at the pin in alpha2.lock and the file, image or commit it names: they differ. |
+| `<STAGE>.TARGET_ACCESS` | Look at the VM named in the receipt: the route to it failed, timed out, or is not configured. |
+| `<STAGE>.EXISTS_DIFFERENT` | Look at the router key on the VM named in the receipt: a key is already there, and the router.json there names another. |
+| `<STAGE>.INTERPRETER` | Look at the VM named in the receipt: its python3 is older than the release the stage requires. |
+| `<STAGE>.CLOCK` | Look at hub-t's clock: it differs from this machine's by more than the allowed skew, or could not be read. |
+| `<STAGE>.HUB_NAME` | Look at alpha2.hosts: the run's hub name is not a host key of the pinned inventory. |
+| `<STAGE>.HUB_HOSTNAME` | Look at this run's S3 receipt: its HUB_HOSTNAME fact, the hub's mail server hostname, is missing or malformed. |
+| `<STAGE>.ROUTER_REFUSED` | Look at router.json on the VM named in the receipt: the router's own check of it failed. |
+| `<STAGE>.PEER_STORE` | Look at the router's peer store on the VM named in the receipt: it is not ready with admission open, or its initialisation failed; it is never retried or repaired. |
+| `<STAGE>.REGISTRY` | Look at the router's registry entry on the VM named in the receipt: the registry program refused it, or its read-back does not match. |
+| `<STAGE>.PLACED_DIFFERENT` | Look at the directory on the VM named in the receipt: a file the stage places is there and differs, or the directory holds a name the stage does not place; nothing is ever replaced. |
+| `<STAGE>.OWNER` | Look at the path on the VM named in the receipt: it, or a directory above it, has another owner, group or mode than the stage requires; it is never repaired. |
 | `<STAGE>.NOT_RESTORED` | Look at the receipt's final observed state: a write failed and the restore did not complete. |
 | `<STAGE>.UNCLASSIFIED` | Look at the receipt's final observed state: this stage failed in a way it does not name. |
 | `RUNNER.ENV` | Look at the launch line: the environment holds a variable it does not allow. |
 | `RUNNER.ARGS` | Look at the command's arguments: one does not match its pattern. |
+| `RUNNER.STAGE_SET` | Look at the command's arguments: an L1 that runs S6 or a later stage must also run S3. |
 | `RUNNER.HOSTS_TARGETS` | Look at alpha2.hosts: two targets share a name. |
 | `RUNNER.LOCK_ROOT` | Look at the runner entry in alpha2.hosts and the lock root: this host or its lock root is not the one named there, or the lock root or a lock file is missing or not owned and moded as required. |
 | `RUNNER.TARGET_LOCKED` | Look at the target named in the message: another run holds its lock. |
@@ -430,7 +470,7 @@ carries a value.
 | `PREFLIGHT.NET_RUNTIME` | Look at NET's runtime on the runner host: it is missing or cannot run offline. |
 | `PREFLIGHT.LEAK_LOCK` | Look at alpha2.lock: it fails the leak check named in the receipt. |
 | `PREFLIGHT.LEAK_HOSTS` | Look at alpha2.hosts: it fails the leak check named in the receipt. |
-| `PREFLIGHT.PRIVATE_SOURCE` | Look at the private overlay checkout: a file is not from it, it is not clean at a commit, a file's bytes differ from its blob at HEAD, or it does not meet the lock's overlay pin and tag. |
+| `PREFLIGHT.PRIVATE_SOURCE` | Look at the private overlay checkout: a file is not from it, its working tree is not exactly the tagged commit's tree, a file's bytes differ from that tree, or the tagged commit does not meet the lock's overlay pin. |
 | `PREFLIGHT.REPO_ACCESS` | Look at access to the repository named in the receipt. |
 | `PREFLIGHT.FETCH` | Look at the work directory: a pinned commit was not fetched, or its pinned tag is not that commit. |
 | `PREFLIGHT.TARGET_ACCESS` | Look at access to the target named in the receipt. |
@@ -438,7 +478,7 @@ carries a value.
 | `PREFLIGHT.OPERATOR_ROUTE` | Look at the operator's ssh route from the runner host to the target named in the receipt. |
 | `PREFLIGHT.LIVE_DEPLOY` | Look at the work directory: it is the runner host's live deploy. |
 | `PREFLIGHT.KEEP_AWAKE` | Look at the runner host's sleep settings: sleep is not shown disabled. |
-| `PREFLIGHT.SURVEY` | Look at the survey in the receipt: an l3 target differs from the bare start state. |
+| `PREFLIGHT.SURVEY` | Look at the survey in the receipt: an l3 target differs from the bare start state, or a loop target is not at its pinned snapshot. |
 | `PREFLIGHT.HANDOFF` | Look at the stop file, the hypervisor's loop tasks and, for an L3 or bare install or a destroy, the hypervisor's L3 arm gate: one does not allow this run. |
 | `PREFLIGHT.BUDGET` | Look at the loop's budget: the day's runs are used up, its account usage is not shown below the limit, the broker refused the start record, or budget.d could not be read. |
 | `CREDENTIALS.CORE_LIMIT` | Look at the core-dump limit: it could not be set to zero. |
@@ -478,7 +518,7 @@ manifest.
 | `--add-agent <host> [--id <id>]` | `add-agent` | yes |
 | `--rotate-key` | `rotate-key` | yes: section 3.7 |
 | `--check-roundtrip <nonce>` | `check-roundtrip` | only the run directory |
-| `--only <stage>`, `--from <stage>` | `install`, with `"loop": "L1"` | as the stages run |
+| `--only <stage>`, `--from <stage>` | `install`, with `"loop": "L1"` | as the stages run; a stage set that includes S6 or later but not S3 is `RUNNER.STAGE_SET` |
 | `--leak-run` | `install`, with `"loop": "L2-leak"` | the leak run of a.11: section 3.7 rule 3a; stops after the last secret writer |
 | `--loop L2` or `--loop L3` | `install`, without `--only`, `--from` or `--leak-run` | records the loop in the manifest; apart from 5.3b (an L3 run targets the real VMs, runs only as the L3 runner account, does not read the stop file, and needs the hypervisor's L3 arm gate open) and 5.3c (the L2 count), it changes no behaviour; given together with `--only`, `--from` or `--leak-run`, or twice, it is `RUNNER.ARGS` |
 | `--destroy` | `destroy` | deletes, through NET's program, only VMs in the pinned set that carry the installer's marker, inside an armed window, never one on either hard deny list (`destroy_deny`, 6.2, and the forced program's own, 9a), and never the hub (3.6, 9a; E25, section 1) |
@@ -593,7 +633,7 @@ One kernel lock per TARGET name, by this algorithm:
    either runner account. Either difference refuses with `RUNNER.LOCK_ROOT`.
    Both runner accounts use that one lock root; `HOME` does not select it.
 1. The targets are `hypervisor.name`, `hub.name`, the `name` of every VM of
-   the run (6.2, 5.3b; for `destroy`, every `vms[]` entry of either scope not on the hard deny list `destroy_deny`, decided from `alpha2.hosts` alone; a `destroy` whose `alpha2.hosts` has no `destroy_deny` refuses with `RUNNER.DESTROY_DENY` before any lock), and `vm:<vm_id>` for each of them, from the
+   the run (6.2, 5.3b; for `destroy`, every `vms[]` entry of either scope not on the hard deny list `destroy_deny`, decided from `alpha2.hosts` alone; a `destroy` whose `alpha2.hosts` has no `destroy_deny` refuses with `RUNNER.DESTROY_DENY` before any lock), and `vm:<vm_id>` for each of them, and, for a run with any `loop` VM, `hub_loop.name` and `vm:<hub_loop.vm_id>` (the loop restores hub-t with its VMs), from the
    in-memory `alpha2.hosts`
    after that file has passed L1 to L4 (section 8); no name is hashed or used
    before then. A duplicated target refuses the run (`RUNNER.HOSTS_TARGETS`).
@@ -644,6 +684,7 @@ loop's test VMs, `l3` for the real VMs that the final run rebuilds from bare
 (E1, E2). A command run as the L3 runner account acts only on the `l3`
 VMs, except `destroy`, which acts on VMs of either scope within the limits
 of 9a; a command run as the loop runner account acts only on the `loop` VMs
+and on `hub_loop` (hub-t), which it restores with them as `loop_restore_set` (E1, E3; 3.6)
 (the two accounts, below). The loop never touches an `l3` VM: no command run
 as the loop runner account names one, and its key's forced program refuses them
 ([OPEN: apply credentials design, NET]). A run's VMs are the entries of its
@@ -879,7 +920,7 @@ that does not begin with `.tmp-` is not of the form `start-<run_id>.json` or
 is not a regular file, or when a record does not parse, breaks its schema,
 or disagrees with its name, or when one `run_id` names a record in both subdirectories, or when a record is not a regular file owned by root with mode 0644 and one link. A `budget.d`, or a subdirectory of it, that is missing, is not a directory, is not owned by root with mode 0755, has an ACL or group write, or cannot be listed is `UNOBSERVED`. Neither the broker, the launcher nor the runner creates it.
 
-A `budget.d.<utc>` (section 9) is read by the same rules, except that an entry that fails them is not `UNOBSERVED`. It counts as one `L2` start on the UTC day of its name's `run_id` (or of `<utc>` if the name does not parse), and under path (b) any permit whose `observed_at` is before `<utc>` and that was current at `<utc>` grants nothing. Every `budget.d.<utc>` is read, whatever its day; the count keeps only records whose `started_at` falls on the day being counted.
+A `budget.d.<utc>` (section 9) is read by the same rules, except that an entry that fails them is not `UNOBSERVED`. It counts as one `L2` start on the UTC day of its name's `run_id` (or of `<utc>` if the name does not parse), and under path (b) any permit that was current at `<utc>` (`observed_at <= <utc> < expires_at`) grants nothing. Every `budget.d.<utc>` is read, whatever its day; the count keeps only records whose `started_at` falls on the day being counted. `<utc>` is the `utc` pattern (the section 9 operator line renames with `date -u +%Y-%m-%dT%H:%M:%SZ`, under `flock <lock_root>/budget.d`); a `budget.d.*` name that is not that pattern, a `<utc>` that is not a real date, a set-aside that cannot be listed, or a `loop` or `l3` inside one that is not a directory refuses, because its count cannot be made; a missing subdirectory counts nothing, and any other name at its top counts as one `L2` start on the set-aside's day. The per-account ceiling of start records per UTC day is 32, counted in the live `budget.d` only.
 
 **Admission, before launch.** For a supported invocation, the launcher
 (5.1a) enforces both limits before the runner exists. While it holds `runner.lock` and the target locks
@@ -979,7 +1020,6 @@ share that key's value.
 | `commit` | `^[0-9a-f]{40}$` |
 | `image_id` | `^sha256:[0-9a-f]{64}$` |
 | `name` | `^[a-z][a-z0-9-]{0,62}$` |
-| `key_id` | `^[a-z][a-z0-9-]{0,62}$` |
 | `vm_id` | `^[0-9]{1,9}$` |
 | `domain` | `^(?=.{1,253}$)[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$` |
 | `repo_url` | the regex in the fenced block below this table. No password, no query, no fragment. `git@` is the only userinfo allowed |
@@ -1022,7 +1062,10 @@ never by a run.
                { "use": "hub_login", "path": "<relpath>", "sha256": "<sha256>" } ],
   "plugin": { "sha256": "<sha256>", "plugin_api": "<plugin_api>" },
   "d7_source": { "sha256": "<sha256>" },
-  "vm_template": { "name": "<name>" }
+  "vm_template": { "name": "<name>" },
+  "hub_login": { "local": "<login_part>", "domain": "<login_domain>" },
+  "registry_program": { "package": "<pkg_name>", "config_schema": "<iface_token>",
+                        "adapter_interface": "<iface_token>", "component": "<name>" }
 }
 ```
 
@@ -1036,10 +1079,12 @@ never by a run.
 | `components` | R | array ≥1 | objects below | `name` unique; every `tag`, and `overlay.tag`, the same (E24) |
 | `images` | R | array ≥1 | objects below | `name` unique |
 | `files` | R | array ≥1 | objects below | `path` unique within one `component` |
-| `writers` | R | array of exactly 2 | objects below | `use` unique: one `api_key`, one `hub_login` |
+| `writers` | R | array of 0 to 2 | objects below | `use` unique. A run needs each writer whose stage is in its stage set (S6b `hub_login`, S7 `api_key`): only an L1 run (`--only`, `--from`) may need fewer than both; S0's admission refuses `PREFLIGHT.LOCK` otherwise |
 | `plugin` | R | object | below | |
 | `d7_source` | R | object | below | |
 | `vm_template` | R | object | below | |
+| `hub_login` | R | object | below | The hub login's two private names (W7-HUB-LOGIN-IN-LOCK) |
+| `registry_program` | R | object | below | The registry program's four private names (W7-REGISTRY-NAME-IN-LOCK, W7-PRIVATE-COMPONENT-LOOKUP) |
 | `overlay` | R | object | below | The private overlay's pin (E23) |
 
 **`installer`**: `repo` R string `repo_url`; `commit` R string `commit`;
@@ -1069,7 +1114,11 @@ one lock is that one tag (E24). S0 fetches each pinned commit and refuses
 with `PREFLIGHT.FETCH` unless the tag, an annotated tag read from the refs
 the remote fetch returned (never a tag created in the work directory),
 peeled to a commit, is exactly that commit. A tag never selects a commit:
-`commit` pins, and the tag is checked against it.
+`commit` pins, and the tag is checked against it. For an L1, L2 or L2-leak run
+(E24 B) a component is pinned by commit only: S0 fetches the remote's branches
+and tags into a fresh bare repository and refuses with `PREFLIGHT.FETCH` unless
+the pinned commit is reachable from one of them; the tag rule applies to every
+other run. The overlay's tag below is checked in every run.
 
 **`overlay`**: `repo` R string `repo_url`; `commit` R string `commit`; `tag`
 R string `rc_tag`, equal to every `components[].tag`. The private overlay
@@ -1086,17 +1135,28 @@ S0 reads `overlay.tag` as components' tags are read: the annotated tag ref
 returned by a fetch from the private overlay's remote (`overlay.repo`), never
 a tag created in the local checkout.
 
-S0 refuses with `PREFLIGHT.PRIVATE_SOURCE` unless all of these hold for the
-overlay checkout HEAD that section 8 L6 records:
+S0 refuses with `PREFLIGHT.PRIVATE_SOURCE` unless all of these hold for T, the
+commit `overlay.tag` peels to, read in the installer's own fresh bare
+repository (section 8 L6 records T). S0 runs no git command in the private
+checkout and reads nothing under its `.git`: its owner is another account,
+and git would run that account's configuration in the runner's environment.
 
-1. `overlay.tag`, an annotated tag as the remote fetch returned it, peeled to a commit, is HEAD;
-2. HEAD is `overlay.commit` or descends from it;
-3. the tree comparison of `overlay.commit` with HEAD, recursive and with
+1. `overlay.tag` is an annotated tag as the remote fetch returned it, and the
+   checkout's working tree, walked without git and without following a
+   symlink, is EXACTLY T's tree: every path, mode (100644, or 100755 when the
+   owner may execute) and byte, and nothing more, with the top-level `.git`
+   skipped by name. An ignored file, a symlink, a FIFO, a missing file or a
+   changed byte refuses; a directory deeper than 32 levels, more than 1024
+   directories, more than 4096 files or a file over 16 MiB refuses. A tracked
+   path that is not valid UTF-8 never passes, and the overlay tracks no
+   executable (the reviewed publication makes every file 0640);
+2. T is `overlay.commit` or descends from it;
+3. the tree comparison of `overlay.commit` with T, recursive and with
    rename and copy detection off (as `git diff-tree --no-renames -r`), has
    no entries, or exactly one entry, whose path is `alpha2.lock`. Any other
    entry refuses, a mode-only change to `alpha2.hosts` and a submodule
    (gitlink) included;
-4. `alpha2.lock` at HEAD is a regular blob with mode 100644. Adding it is
+4. `alpha2.lock` at T is a regular blob with mode 100644. Adding it is
    the only change of type allowed; a symlink (120000) or gitlink (160000)
    at that path refuses.
 
@@ -1119,10 +1179,28 @@ only at S0.
 bytes it executes (3.7 rule 7).
 
 **`plugin`**: `sha256` R string `sha256`; `plugin_api` R string `plugin_api`.
-`VERIFY.PLUGIN_MISMATCH` compares against it.
+`VERIFY.PLUGIN_MISMATCH` compares against it. Exactly one `files[]` row has this `sha256` (W7-PRIVATE-COMPONENT-LOOKUP);
+none, or more than one, is L3 at `$.plugin.sha256`. S6 reads the plugin by that row's component and path, through the
+VM layer's pinned-file read, and places it root-owned 0444 at the plugin path.
 
 **`d7_source`**: `sha256` R string `sha256`. `VERIFY.D7` derives the placed
 digest's expectation from it.
+
+**`hub_login`**: `local` R string `^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`; `domain` R string, one or more such labels
+joined by `.`. Both are private identifiers: the installer pins each by sha256 (the same pins as this repository's
+hub renderer) and refuses a value whose sha differs (L3, at `$.hub_login.local` or `$.hub_login.domain`). They are
+the same for every hub. S6 writes each VM's hub login as `<local>@<host>.<domain>`, with `<host>` the VM's
+`fleet_host` (6.2).
+
+**`registry_program`**: `package` R string `^[a-z_][a-z0-9_]{0,63}$`, the registry program's (E23) Python package;
+`config_schema` and `adapter_interface` R strings `^[a-z0-9]([a-z0-9.-]{0,62}[a-z0-9])?/[1-9][0-9]{0,3}$`, its
+host.json schema token and its adapter interface token; `component` R string `name`, the `components[]` entry that
+holds the program, which must name exactly one. All four are private identifiers: the installer pins each by
+sha256 (the values at the program's pinned commit) and refuses a value whose sha differs (L3, at
+`$.registry_program.<key>`; a component naming no entry, or two, is L3 at `$.registry_program.component`). S6 places
+`component`'s tree under `package` and runs `<package>.opverbs` and `<package>` from the program's placed tree
+(`.a2-registry-code` in the agent account's home), writes `config_schema` into host.json, and sends
+`adapter_interface` with the read-back.
 
 **`vm_template`**: `name` R string `name`. The pin form is **[OPEN: NET
 (W4)]**; until a key and pattern for it are assigned here, no other key is
@@ -1140,8 +1218,12 @@ ids from this file instead of their literals.
               "loop_account": "<name>", "l3_account": "<name>" },
   "hypervisor": { "name": "<name>", "ssh_alias": "<name>" },
   "hub": { "name": "<name>", "domain": "<domain>" },
+  "hub_loop": { "name": "<name>", "domain": "<domain>", "vm_id": "<vm_id>" },
+  "loop_snapshots": [ { "vm": "<vm name or hub_loop.name>", "snaptime": "<snaptime>" } ],
   "vms": [ { "name": "<name>", "scope": "loop", "vm_id": "<vm_id>", "fleet_domain": "<domain>",
-             "key_id": "<key_id>", "ssh_alias": "<name>" } ],
+             "ssh_alias": "<name>",
+             "agent_account": "<name>", "relay_account": "<name>", "hop_group": "<name>",
+             "router": { "slug": "<slug>", "stable_key": "<abspath>" } } ],
   "agents": [ { "id": "<name>", "vm": "<vm name>", "connector": "<component name>" } ],
   "destroy_deny": [ "<vm name>" ]
 }
@@ -1154,13 +1236,23 @@ ids from this file instead of their literals.
 | `schema` | R | string | constant `alpha2.hosts/1` | |
 | `runner` | R | object | below | The one runner host for every run; its locks are local to that host (5.3, 5.3b) |
 | `hypervisor` | R | object | below | |
-| `hub` | R | object | below | Checked by S0 and S3 only (E6 (b)) |
-| `vms` | R | array ≥1 | objects below | `name`, `vm_id`, `fleet_domain`, `key_id`, `ssh_alias` each unique |
+| `hub` | R | object | below | The `l3` scope's hub. Checked by S0 and S3 only (E6 (b)) |
+| `hub_loop` | R | object | below | The `loop` scope's hub, hub-t, a VM on the hypervisor and never a `vms[]` entry (E1). Its `domain` differs from `hub.domain` |
+| `loop_snapshots` | R | array | objects below | `vm` unique; the `vm` values are exactly `loop_restore_set` (below), else L3 |
+| `vms` | R | array ≥1 | objects below | `name`, `vm_id`, `fleet_domain`, `ssh_alias` each unique |
 | `agents` | R | array ≥1 | objects below | `id` unique |
 | `destroy_deny` | O | array | strings `name`, each naming a `vms[]` entry | Unique. `destroy`'s hard deny list (5.3, 5.3b, 9a). ABSENT is UNCONFIGURED: `destroy` refuses with `RUNNER.DESTROY_DENY`, and no other command reads it. `[]` is configured and protects no entry. The operator authors it with the rest of the file |
 
-Across the file, `hypervisor.name`, `hub.name` and every `vms[].name` are
-pairwise distinct; with `vm:<vm_id>` they are the lock targets of 5.3.
+Across the file, `hypervisor.name`, `hub.name`, `hub_loop.name` and every `vms[].name` are
+pairwise distinct, and so is every `vm:<vm_id>`, `hub_loop`'s included; they are the lock targets of 5.3.
+
+`loop_restore_set` is the sorted names of every `vms[]` entry of scope `loop`, and `hub_loop.name`: the one set the
+loop restores together, that S0 checks and that D2a pins (installer function `a2_private.loop_restore_set`; S2's
+restore and NET's checks call it, and nothing keeps a second list). The hub a run uses is
+`a2_private.hub_for_scope(hosts, scope)`, with `scope` `"loop"` for an L1, L2 or L2-leak run and `"l3"` otherwise:
+`hub_loop` and `hub` respectively. S0 passes that scope to every probe slot (`probe(hosts, scope)`), so NET's hub
+and target probes read the run's own hub. hub-t's two lock targets (`hub_loop.name`, `vm:<hub_loop.vm_id>`) are
+targets of `alpha2.hosts` like any other, so D2b's lock files include them before the first run on this layout.
 
 **`runner`**: `host_id` R string `host_id`, the runner host's machine identity, read as the S0 review fixes [OPEN: S0 review: the identity source]; `lock_root` R string `abspath`, the one lock root (5.3); `loop_account` R string `name`, the loop runner account; `l3_account` R string `name`, the L3 runner account, different from `loop_account` (5.3b).
 
@@ -1169,16 +1261,30 @@ access probe and S2's target.
 
 **`hub`**: `name` R string `name`; `domain` R string `domain`.
 
+**`hub_loop`**: `name` R string `name`; `domain` R string `domain`; `vm_id` R string `vm_id`.
+
+Each of `hub.name` and `hub_loop.name` is EXACTLY the host key of that hub in the network inventory pinned by the
+lock (the key S3's render reads). The installer cannot see the inventory; S3 checks the key, its address and its
+host entries against the pinned inventory (NET's S3 checks, `HUB-CHECK.*`).
+
+**`loop_snapshots[]`**: `vm` R string `name`; `snaptime` R string `^[1-9][0-9]{0,11}$`, the base snapshot's PVE
+`snaptime` in epoch seconds. S0 compares it, as an integer, with the read of NET's read-only `snapshots` verb. A
+re-baseline is a new overlay commit and tag (D2a), never a runtime write.
+
 **`vms[]`**: `name` R string `name`; `scope` R string enum `loop`, `l3`, the runs that act on it (5.3b), with at least one entry of each; `vm_id` R string `vm_id`; `fleet_domain`
-R string `domain`; `key_id` R string `key_id`; `ssh_alias` R string `name`
+R string `domain`; `ssh_alias` R string `name`
 (the operator route from the runner host, E20). The host key is NOT here: S2 captures it into the
 installer's pinned known_hosts and records that file's sha in its receipt,
 because a rebuilt VM has a new host key; later stages and `--verify` pin
-against S2's receipt. `router` — **[OPEN: RL/HOP]**: until RL/HOP decides
-whether the router slug and logical id are authored here or minted by S6,
-`vms[].router` is ABSENT (present is refused, L2), review of any S6 or S9
-code that needs the router slug or logical id is blocked, and no stage may
-choose authored-versus-minted behaviour itself.
+against S2's receipt. `router` and the accounts are defined in the next paragraph.
+
+**`vms[]`, the accounts and the router (W7)**: `agent_account` R string `name`, the account sandy, the agents and
+the VM's router run as; `relay_account` R string `name`, the relay end's container account, never `agent_account`;
+`hop_group` R string `name`, the group both are in (the hop root's group); `router` R object {`slug` R string
+`^[a-z0-9][a-z0-9-]{0,62}$`, `stable_key` R string `abspath`}: the router's instance name and its registry key
+on the VM (unique across the file). The logical id is never authored: S6 reads it back from the registry. The router's delegation key id is never authored either: it is `router.slug` + `-k1` (S5). Each `fleet_domain` is exactly `<host>.internal`: one label of `[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?`, then `.internal`, lower-case, and never the hub login's domain (held by its sha256 pin, 6.1). RE's own domain (`HUB_OWN_DOMAIN`) is that domain, and the hub's mailbox and router login for the VM are named by `<host>`, so S6 derives both and nothing about the mailbox account is authored. Any of these broken is L3. On each VM, its
+router slug and the `agents[].id` of the agents on that VM have pairwise distinct skeletons, and every router slug has a skeleton distinct from every other router slug's (NFC, casefold, 0 to o, 1 and i to l, 5 to s,
+then `-`, `_` and `.` dropped), and no slug is `postmaster` or `abuse`; any of these broken is L3.
 
 **`agents[]`**: `id` R string `name`; `vm` R string `name`, which MUST name
 an entry of `vms[]`; `connector` R string `name`, which MUST name an entry of
@@ -1271,6 +1377,7 @@ non-secret keys (section 3.3).
 | V12 | Agents | Workspace present; registry entry active; secret file present with its mode (content never read); connector at its pin; sandbox image present. Prints every agent and who may task it, from RL's own output, else labelled INFERRED | `VERIFY.AGENT_<id>_<WHAT>` |
 | V13 | Operator route | The operator's ssh route from the runner host reaches each VM and shows the host key pinned by S2's receipt, read-only | `VERIFY.OPERATOR_ROUTE` |
 | V14 | Host | No SSH agent socket inside the RL or RE container; capability waiver rows exactly as recorded | `VERIFY.HOST` |
+| V15 | RE state on the VM | Every RE state directory (inbound state, relay ledger, mailbox root) and any volume behind it is on the VM's own disk: the RE container's mounts read back, and none has a source on nfs, cifs, 9p, virtiofs or sshfs, or a volume whose driver is not `local` (ALPHA2-L3-ID-REMINT condition 1) | `VERIFY.RE_STATE_OFF_VM` |
 
 Rules for the check list:
 
@@ -1301,7 +1408,7 @@ receipt names the check number and the JSON path, never the value.
 | L3 | Every value has its type and matches, in full, the pattern or enum the field table assigns it. A string field with no assigned pattern is a contract defect, and the field is refused until one is assigned | A pattern-checked field cannot carry free text |
 | L4 | Neither any parsed string nor the raw file bytes match a deny pattern: a PEM or OpenSSH private key header; an API key shape [OPEN: the shapes, from the S1 review]; the token shapes `ghp_`, `github_pat_` and `glpat-`; URL userinfo with a password (`://[^/@]*:[^/@]*@`) | Defence in depth behind L2 and L3; the raw pass catches an escaped form |
 | L5 | No string, and no raw byte sequence of the file, equals or contains a value S1 holds, compared in memory only. S0 runs before S1, so S1 runs this check on the in-memory bytes S0 checked, after the prompt and before any writer receives a value. A failure there is `CREDENTIALS.LEAK_LOCK` or `CREDENTIALS.LEAK_HOSTS` (exit 2), and no writer runs. In the `L2-leak` run the value is the canary | The direct test, per a.11 |
-| L6 | The file is tracked; the private overlay checkout is clean at a committed state that meets the lock's `overlay` pin (section 6.1); and the exact bytes S0 read for the file, hashed as a git blob with no filter applied, equal the blob id of the file's path in HEAD's tree, whatever the index flags (`skip-worktree`, `assume-unchanged`) or configured filters report (`PREFLIGHT.PRIVATE_SOURCE` otherwise). The receipt records the commit | A run is reproducible only from a committed file |
+| L6 | The private overlay checkout's working tree is exactly the tree of T, the commit `overlay.tag` peels to, which meets the lock's `overlay` pin (section 6.1); and the exact bytes S0 read for the file, hashed as a git blob with no filter applied, equal the blob id of the file's path in T's tree (`PREFLIGHT.PRIVATE_SOURCE` otherwise). No git runs in the checkout, so no index flag or configured filter is consulted. The receipt records T | A run is reproducible only from a committed file |
 | L7 | The file's mode allows no access by others, and its realpath is not under any root in a committed deny list of sandbox mount roots (the list is part of the S0 review) | E3: identity never in a sandbox mount |
 | L8 | Receipts carry the file's sha256 only, never its content | The public run record must not carry the values |
 
@@ -1314,10 +1421,12 @@ The admitting process (the launcher, for a supported invocation, 5.1a) reads eac
 | # | Touch | Relation to the stages |
 |---|---|---|
 | — | Before every fresh run (L3 and every bare start): NET's reviewed text resets and sets the two router logins (E6 (b)) | Precondition of S3 and S6b; S3 checks it, S6b proves the login |
+| U1 | Before every L3 run: NET's reviewed `empty-host-mailbox`, bound to the run's scope by `hub_for_scope` and `--hosts-sha`, refuses while any mail is queued for the hosts' domains and otherwise empties their router mailboxes. "Drain" means no queued mail remains when the step completes; mail that will not clear is a separately reviewed operator step | S3's `mailbox-count` check proves it inside the run (`HUB-CHECK.MAILBOX_NOT_EMPTY`). L2 and L2-leak need no U1: hub-t is restored with the loop's snapshot set (section 9, D2a) |
+| U2 | At the start of each bare L3, before the launcher: the same invocation as U1 for that run (ALPHA2-L3-ID-REMINT condition 4) | As U1 |
 | — | The operator sets its stop in the E19 stop file before the final run, so that the loop drains, and clears it only after that run's S10 has printed its SUMS sha | The loop refuses while it is set, and a loop run in progress stops at its next stage boundary; the final run does not read it, and its locks keep the loop out while it runs (5.3b) |
-| — | The brakes for an L2 run (E13): the router stop, de-enrolment, the cross-host `task_deny`, and the 7-day reply window | Named in the L2 runbook text; available throughout every L2 run. The runbook also says that `loop` and `l3` agents share one hub (E9 allows equal agent names in different fleet domains), so nothing in the installer stops a loop agent from addressing an `l3` agent through it; the brakes are the control |
+| — | The brakes for an L2 run (E13): the router stop, de-enrolment, the cross-host `task_deny`, and the 7-day reply window | Named in the L2 runbook text; available throughout every L2 run. |
 | D2 | One setup sitting on the runner host: the profile capture; test credentials entered once; a dry attach on a test VM with the test key; plus, per E20 and E3, the one ssh include line and the loop-identity install, and the L3 runner account with its key (9a); for each runner account, its work directory and `runs` (5.2) | Before the first L2 |
-| D2a | Hypervisor setup with NET: test network, test VMs built by S2, the stand-in hub, snapshots. The test VMs and their snapshots are created by the L3 key inside an armed window (9a) | Before the first L2 |
+| D2a | Hypervisor setup with NET: test network, test VMs built by S2, the stand-in hub (`hub_loop`, hub-t), snapshots. The test VMs and their snapshots are created by the L3 key inside an armed window (9a). The snapshot set is `loop_restore_set`, taken QUIESCENT (RE stopped on every agent VM, no RE journal or held records, hub-t's mailbox count 0, each recorded in the D2a receipt), with hub-t's certificate valid until at least 2027-01-01 (NET checks it). Its snaptimes go into `alpha2.hosts`' `loop_snapshots` by an overlay commit and tag; every L2 and L2-leak restores the whole set, never a part (RE: hub-t alone skips mail, agents alone replay it) | Before the first L2 |
 | D2b | One-time: the operator creates the lock root (root, 0755), one lock file per target key of `alpha2.hosts` and `runner.lock` (each root, 0644, 5.3 step 4), `stop.d` with one subdirectory per setter role, each readable (r-x) by both runner accounts and writable by neither, and `budget.d` with its `loop` and `l3` subdirectories (all root, 0755, with no ACL and no group write, 5.3c), and installs the budget broker and its socket (5.3c). The operator binds only `stop.d/controller` and `stop.d/monitor` read-write into the controller's and the monitor's sandboxes. No runner account can write in the lock root, in `budget.d` or in either of its subdirectories. A change to `alpha2.hosts` that adds a target needs its lock file created the same way before the next run. Neither `budget.d` nor the lock root is in any sandbox mount. The S0 review checks that only the broker writes in `budget.d`, and only start records, and that neither the launcher nor the runner writes in `stop.d`. Both sandboxes run on the runner host, because a bind mount cannot cross hosts | Before the first L2; not per run (5.3b, 5.3c) |
 | — | A `budget.d` read that is `UNOBSERVED` because of a record: the operator measures that no run is active and the 5.3 locks are free, renames `budget.d` whole to `budget.d.<utc>` (it never edits or removes a record), and creates a new `budget.d` with empty `loop` and `l3` subdirectories, owned as D2b states. A `RUNNER.TARGET_LOCKED` the operator did not expect: as root, find the holder with `lslocks` and stop that account's processes (5.3 step 4) | Lets runs count their budget again (5.3c). The day's count and the permit check of 5.3c also read every `budget.d.<utc>` |
 | — | Adopting the VMs that predate the installer's marker: a reviewed operator step gives them the marker | Before `--destroy` retires them (9a) |
@@ -1351,6 +1460,15 @@ key. These are also decided:
   (given the marker) by a reviewed operator step before `--destroy` retires
   them (section 9). The real VMs are then rebuilt from bare by the final run
   (E1, E2).
+- S0's git reads ssh's configuration only from `<HOME>/.ssh/config_overlay` (`GIT_SSH_COMMAND` = `ssh -F` that
+  file, the one variable git gets beyond its fixed set; HOME must be a plain absolute path or `RUNNER.ENV`). Each
+  runner account holds its own read-only overlay deploy key and the overlay host's pinned key there (NET's creds
+  r7 part 2), because S0 fetches `overlay.tag` in every run, loop runs included. `overlay.repo` is the
+  `ssh://git@<host>[:<port>]/<path>` form; the components are https. Before the fetch, S0 reads ssh's EFFECTIVE
+  configuration for that exact host and port (`ssh -G` under `config_overlay`) and requires: the same hostname and
+  port, `user git`, the account's own `id_a2_*_overlay` key alone, `<HOME>/.ssh/known_hosts_overlay` alone,
+  `stricthostkeychecking` on, `hostkeyalias a2-overlay`, `batchmode`, `identitiesonly`, no agent and no agent
+  forwarding. Anything else is `PREFLIGHT.REPO_ACCESS`, with nothing fetched.
 - A loop run's S2 does not use the L3 key. It creates a missing test VM only
   if the loop key's forced commands allow it; otherwise S2 fails closed.
 

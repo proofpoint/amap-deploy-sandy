@@ -40,6 +40,27 @@ def _bad():
     return Refusal("RUNNER.ARGS")
 
 
+#: Ruling W5-R13-L1-STAGESET-REQUIRED: an L1 whose stage set runs S6 or later must also run S3, or it would skip
+#: every hub check (S3's render, host entries, certificate window, hub name, route binding and clock).
+HUB_CHECK_STAGE = "S3"
+NEEDS_HUB_CHECK_FROM = "S6"
+
+
+def l1_stages(opts):
+    """The stage ids an L1 run's `--only` or `--from` selects, in order."""
+    if "only" in opts:
+        return [opts["only"]]
+    return list(STAGE_IDS[STAGE_IDS.index(opts["from"]):])
+
+
+def _l1(opts):
+    stages = l1_stages(opts)
+    late = STAGE_IDS[STAGE_IDS.index(NEEDS_HUB_CHECK_FROM):]
+    if any(s in late for s in stages) and HUB_CHECK_STAGE not in stages:
+        raise Refusal("RUNNER.STAGE_SET")
+    return Invocation("install", "L1", opts)
+
+
 def parse(argv):
     flags = {}
     i = 0
@@ -107,9 +128,9 @@ def _resolve(f):
     if "--destroy" in keys:
         return Invocation("destroy", None, {})
     if "--only" in keys:
-        return Invocation("install", "L1", {"only": f["--only"]})
+        return _l1({"only": f["--only"]})
     if "--from" in keys:
-        return Invocation("install", "L1", {"from": f["--from"]})
+        return _l1({"from": f["--from"]})
     if "--leak-run" in keys:
         return Invocation("install", "L2-leak", {})
     if "--loop" in keys:

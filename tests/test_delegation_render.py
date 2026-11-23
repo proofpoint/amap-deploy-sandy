@@ -124,6 +124,16 @@ class RenderTest(Fixture):
         self.assertNotIn("partition_verified", block)
         self.assertIs(dr.render_block(key_path="/k", me=me, peers=peers, inbound=True)["inbound"], True)
 
+    def test_crypto_is_pyca_unless_the_openssl_choice_is_passed(self):
+        me, peers = fk.select(inventory(*GOOD), FLEET_DOMAIN, ["beta.internal"])
+        block = dr.render_block(key_path="/k", me=me, peers=peers, inbound=False, crypto=dr.CRYPTO_OPENSSL)
+        self.assertEqual(block["crypto"], {"crypto_backend": "openssl", "openssl_path": "/usr/bin/openssl"})
+        self.assertIsNot(block["crypto"], dr.CRYPTO_OPENSSL)
+        for bad in ({"crypto_backend": "openssl"}, {"crypto_backend": "openssl", "openssl_path": "/tmp/openssl"},
+                    {"crypto_backend": "pyca", "openssl_path": "/usr/bin/openssl"}, {}, "pyca"):
+            with self.assertRaises(dr.DelegationRenderError):
+                dr.render_block(key_path="/k", me=me, peers=peers, inbound=False, crypto=bad)
+
     def test_the_hop_link_carries_the_switch_and_nothing_else_new(self):
         self.assertIsNone(link().inbound)
         self.assertIs(link(delegation={"inbound": True}).inbound, True)

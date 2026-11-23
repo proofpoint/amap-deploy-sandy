@@ -51,9 +51,10 @@ def _deny_list_ok(hard_deny, hosts):
 
 def check_names_distinct(hosts):
     """6.2 and 4.3: across the whole file, `hypervisor.name`, `hub.name`,
-    every `vms[].name` and every `vm:<vm_id>` are pairwise distinct,
-    whatever the run's scope."""
-    names = [hosts["hypervisor"]["name"], hosts["hub"]["name"]]
+    `hub_loop.name`, every `vms[].name` and every `vm:<vm_id>` (hub_loop's
+    included) are pairwise distinct, whatever the run's scope."""
+    names = [hosts["hypervisor"]["name"], hosts["hub"]["name"],
+             hosts["hub_loop"]["name"], "vm:" + hosts["hub_loop"]["vm_id"]]
     for v in hosts["vms"]:
         names.append(v["name"])
         names.append("vm:" + v["vm_id"])
@@ -62,11 +63,16 @@ def check_names_distinct(hosts):
 
 
 def targets(hosts, vms):
-    """5.3 step 1: sorted by UTF-8 byte order; a duplicate refuses."""
+    """5.3 step 1: sorted by UTF-8 byte order; a duplicate refuses. A run
+    with any `loop` VM also locks hub_loop, which the loop restores with
+    its VMs."""
     names = [hosts["hypervisor"]["name"], hosts["hub"]["name"]]
     for v in vms:
         names.append(v["name"])
         names.append("vm:" + v["vm_id"])
+    if any(v["scope"] == "loop" for v in vms):
+        names.append(hosts["hub_loop"]["name"])
+        names.append("vm:" + hosts["hub_loop"]["vm_id"])
     if len(set(names)) != len(names):
         raise Refusal("RUNNER.HOSTS_TARGETS")
     return sorted(names, key=lambda n: n.encode("utf-8"))
