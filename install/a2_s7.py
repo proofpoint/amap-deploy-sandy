@@ -560,7 +560,7 @@ def apply_agent(vm, vm_name, agent, lock, s6_facts, value, registry, n):
     if isinstance(err, Refusal):
         raise err  # the layer's own refusal after a write: its cause, exit 3, as raised
     if outcome != "done":
-        raise Refusal("AGENTS.NOT_RESTORED", detail="writer outcome unknown; the new credential may stand") from err
+        raise Refusal("AGENTS.NOT_RESTORED", detail="writer outcome unknown; the new credential may stand", rc=3) from err
     facts.append((p + "SECRET_FILE", "present"))
     if vm.sandy("--build-only", "--workspace", ws, writes=True)[0] != 0:
         raise Refusal("AGENTS.IMAGE_BUILD", rc=wrote_rc(vm.site))
@@ -671,13 +671,13 @@ def rotate_vm(vm, checked, restart, value):
     if outcome == "done" and _restart_all(vm, restart):
         outcome, err = vm.write_secret("finish")
         if outcome != "done":
-            raise Refusal("AGENTS.NOT_RESTORED", detail="previous file not removed") from err
+            raise Refusal("AGENTS.NOT_RESTORED", detail="previous file not removed", rc=3) from err
         return list(restart)
     restored = vm.write_secret("restore")[0] == "done"
     started = _restart_all(vm, restart)
     if restored and started:
         raise Refusal("AGENTS.ROTATE_UNDONE") from err
-    raise Refusal("AGENTS.NOT_RESTORED") from err
+    raise Refusal("AGENTS.NOT_RESTORED", rc=3) from err
 
 
 def _restart_all(vm, workspaces):

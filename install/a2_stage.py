@@ -27,7 +27,8 @@ def per_vm(rec, site, stage_id, names, step, plan=None, dry_run=False):
         try:
             facts, result = step(name)
         except Refusal as r:
-            rec.write_receipt(stage_id, name, started, "FAIL", [], rc=r.rc, cause=r.cause)
+            # A stage may attach the state its refusal left (3.4: an rc-3 receipt says what state was left).
+            rec.write_receipt(stage_id, name, started, "FAIL", getattr(r, "facts", []), rc=r.rc, cause=r.cause)
             raise
         rec.write_receipt(stage_id, name, started, result, facts)
 

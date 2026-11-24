@@ -1090,7 +1090,9 @@ class CausesTest(unittest.TestCase):
                          sorted(k for k in want if k.startswith("AGENTS.")))
 
     def test_not_restored_exits_3(self):
-        self.assertEqual(Refusal("AGENTS.NOT_RESTORED").rc, 3)
+        self.assertEqual(Refusal("AGENTS.NOT_RESTORED", rc=3).rc, 3)
+        with self.assertRaises(ValueError):  # an after-write-only cause names its exit (a2_causes.AFTER_WRITE_ONLY)
+            Refusal("AGENTS.NOT_RESTORED")
         self.assertEqual(Refusal("AGENTS.ROTATE_UNDONE").rc, 3)
         self.assertEqual(Refusal("AGENTS.NO_START_PATH").rc, 2)
 
