@@ -54,7 +54,11 @@ KEYS = ("RELAY_LINK_ROLE", "RELAY_CLAIM", "SMTP_AUTH_METHOD", "SMTP_PASSWORD_FIL
         "HUB_CONFIG_UID", "HUB_PREFIX_TEMPLATE", "TRANSPORT_PLUGIN_PATH", "TRANSPORT_PLUGIN_SHA256") + SWITCHES_OFF + (
         RECOVERY_ENV,)
 #: RE refuses these when present (its answer to E1); never rendered.
-ABSENT = ("SMTP_PASSWORD", "IMAP_PASSWORD", "SSLKEYLOGFILE", "OUTBOX_DIR", "INBOUND_RAW_DIR")
+#: RELAY_CMD, NOTIFY_CMD, BOTH_LOOP_CMD and PROBE_CMD are RE's entrypoint overrides (RE's entrypoint.sh): each
+#: replaces the command the entrypoint execs for its mode, so none may reach RE (S4 checks the files of the mode S8
+#: runs, and S8 runs the image's own).
+ABSENT = ("SMTP_PASSWORD", "IMAP_PASSWORD", "SSLKEYLOGFILE", "OUTBOX_DIR", "INBOUND_RAW_DIR",
+          "RELAY_CMD", "NOTIFY_CMD", "BOTH_LOOP_CMD", "PROBE_CMD")
 ABSENT_PREFIXES = ("OAUTH2_",)
 
 _LOGIN_PART = re.compile(r"[a-z0-9]([a-z0-9.-]{0,61}[a-z0-9])?")

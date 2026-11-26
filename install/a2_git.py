@@ -222,6 +222,12 @@ class Git:
                           "refs/a2h", "refs/a2t")
         return out.strip() != b""
 
+    def is_ancestor(self, bare, ancestor, commit):
+        """Whether `ancestor` is an ancestor of (or equal to) `commit` in `bare`'s own history: no network. Exit 0 is
+        yes and 1 no; an absent object exits 128, which refuses (GitError), so a caller fails closed on either."""
+        rc, _ = self.run(bare, "merge-base", "--is-ancestor", "--end-of-options", ancestor, commit, ok=(0, 1))
+        return rc == 0
+
     def blob_at(self, bare, commit, path):
         """The bytes of `path` at `commit` in a bare repository this installer fetched: plumbing only, no checkout,
         no filter. A path that is not a blob refuses."""

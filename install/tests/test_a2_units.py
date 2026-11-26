@@ -91,9 +91,9 @@ class CausesTest(unittest.TestCase):
     def test_every_after_write_only_raise_site_passes_rc_3(self):
         """Opus's W13 r3 note N-C7: a Refusal naming an AFTER_WRITE_ONLY cause without rc=3 is a ValueError, which
         a2_main turns into UNCLASSIFIED and so loses the cause's name. Every call in install/*.py that names one
-        such cause passes the literal rc=3; the sites found are the three S8 helpers, so the scan is not empty. A
-        BEFORE_WRITE_ONLY cause (every "2" cell: step 3's CLOCK_SKEW, the receipt readers' PREDECESSOR_*, and the
-        rest) passes no rc at any named site."""
+        such cause passes the literal rc=3; the sites found are S4's obtain, S7 and the three S8 helpers, so the
+        scan is not empty. A BEFORE_WRITE_ONLY cause (every "2" cell: step 3's CLOCK_SKEW, the receipt readers'
+        PREDECESSOR_*, and the rest) passes no rc at any named site."""
         found, before, dynamic = [], [], set()
         known = set(a2_causes.STAGE_SENTENCES)
         for name in sorted(os.listdir(a2fix.INSTALL)):
@@ -136,13 +136,15 @@ class CausesTest(unittest.TestCase):
             ("a2_s0.py", "check_probes"), ("a2_s1.py", "check_l5"), ("a2_s6.py", "read_prior"),
             ("a2_s7.py", "read_s6"), ("a2_s8.py", "measure"), ("a2_s8.py", "run"), ("a2_s8_run.py", "_read"), ("a2_s8_run.py", "run_s8"),
             ("a2_site.py", "slot"), ("a2_vm.py", "_refused")])
-        self.assertEqual(sorted(found), [("a2_s7.py", "NOT_RESTORED"), ("a2_s7.py", "NOT_RESTORED"),
+        self.assertEqual(sorted(found), [("a2_s4.py", "ID_MISMATCH"), ("a2_s4.py", "LOAD"),
+                                         ("a2_s7.py", "NOT_RESTORED"), ("a2_s7.py", "NOT_RESTORED"),
                                          ("a2_s7.py", "NOT_RESTORED"), ("a2_s8_re.py", "RE_REFUSED"),
                                          ("a2_s8_rl.py", "NOT_ADMITTING"), ("a2_s8_rl.py", "RL_REFUSED")])
         self.assertEqual(sorted(set(before)), [
             ("a2_record.py", "PREDECESSOR_FAILED"), ("a2_record.py", "PREDECESSOR_INCOMPLETE"),
             ("a2_record.py", "PREDECESSOR_INSTALLER"), ("a2_record.py", "PREDECESSOR_MISSING"),
-            ("a2_s6.py", "HUB_HOSTNAME"), ("a2_s6.py", "PREDECESSOR_INCOMPLETE"), ("a2_s8_checks.py", "CLOCK_SKEW"),
+            ("a2_s4.py", "RE_FIX"), ("a2_s6.py", "HUB_HOSTNAME"), ("a2_s6.py", "PREDECESSOR_INCOMPLETE"),
+            ("a2_s8_checks.py", "CLOCK_SKEW"),
             ("a2_s8_run.py", "PREDECESSOR_FAILED"), ("a2_s8_run.py", "PREDECESSOR_INCOMPLETE")])
 
     def test_every_sentence_is_the_contracts_byte_for_byte(self):
@@ -688,6 +690,17 @@ class PrivateFilesTest(unittest.TestCase):
         h["vms"][1]["vm_id"] = h["vms"][0]["vm_id"]
         self.fails("hosts", "L3", hosts=a2fix.dumps(h))
 
+    def test_L3_image_archive_sha256_is_a_sha256(self):
+        for bad in ("D" * 64, "d" * 63, 7):
+            d = copy.deepcopy(a2fix.LOCK)
+            d["images"][0]["archive_sha256"] = bad
+            self.fails("lock", "L3", lock=a2fix.dumps(d))
+
+    def test_L3_image_archive_sha256_is_required(self):
+        d = copy.deepcopy(a2fix.LOCK)
+        del d["images"][0]["archive_sha256"]
+        self.fails("lock", "L3", lock=a2fix.dumps(d))
+
     def test_L3_image_built_from_component(self):
         d = copy.deepcopy(a2fix.LOCK)
         d["images"][0]["built_from"] = "nope"
@@ -741,6 +754,16 @@ class PrivateFilesTest(unittest.TestCase):
         for c in d["components"]:
             c["tag"] = "alpha2-rc12"
         d["overlay"]["tag"] = "alpha2-rc12"
+        a2_private.load_pair(a2fix.dumps(d), a2fix.dumps(a2fix.hosts_doc("/srv/locks")))
+
+    def test_L3_the_installer_component_is_the_installer_commit(self):
+        """The installer's own component in components[] has installer.commit (S4 reads its root files from the
+        installer checkout, by files[] rows of this component). Absent, it is not required."""
+        d = copy.deepcopy(a2fix.LOCK)
+        d["components"].append({"name": a2_private.INSTALLER_COMPONENT, "repo": d["installer"]["repo"],
+                                "commit": "d" * 40, "tag": "alpha2-rc1"})
+        self.fails("lock", "L3", lock=a2fix.dumps(d))
+        d["components"][-1]["commit"] = d["installer"]["commit"]
         a2_private.load_pair(a2fix.dumps(d), a2fix.dumps(a2fix.hosts_doc("/srv/locks")))
 
     def test_L3_destroy_deny(self):

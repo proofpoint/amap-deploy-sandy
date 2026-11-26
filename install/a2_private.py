@@ -182,7 +182,8 @@ LOCK_FIELDS = {
     "components": ARR(OBJ({"name": S("name"), "repo": S("repo_url"), "commit": S("commit"),
                            "tag": S("rc_tag")}),
                       unique=("name",)),
-    "images": ARR(OBJ({"name": S("name"), "built_from": S("name"), "image_id": S("image_id")}),
+    "images": ARR(OBJ({"name": S("name"), "built_from": S("name"), "image_id": S("image_id"),
+                        "archive_sha256": S("sha256")}),
                   unique=("name",)),
     "files": ARR(OBJ({"path": S("relpath"), "component": S("name"), "sha256": S("sha256")})),
     "writers": ARR(OBJ({"use": ENUM("api_key", "hub_login"), "path": S("relpath"),
@@ -255,6 +256,8 @@ LOGIN_DOMAIN_SHA256 = "4a28207acfde319b5b21e4bbf0cec138201f1242e9b966029ae6e9a81
 REGISTRY_PACKAGE_SHA256 = "08839ced62ba20aba0dd60aac3876f15df67ec9087a13fc0d1ebe107afc4b0ae"
 REGISTRY_CONFIG_SCHEMA_SHA256 = "77369da2fd759bae9c6acfc6f098ef4605b1e46c0c45e63518b579531b01b893"
 REGISTRY_ADAPTER_INTERFACE_SHA256 = "31fe5b260ff0475d8cbe310acf2bbee1f595b5d577c90a928a9a1156803e33c5"
+#: The installer's own component in components[] (a2_s6_payload.INSTALLER_COMPONENT): its commit is installer.commit.
+INSTALLER_COMPONENT = "amap-deploy-sandy"
 REGISTRY_COMPONENT_SHA256 = "d607d98b73729498bc0ccf3863c38b915daad7be1c08215ec43940f70541b3ab"
 
 
@@ -290,6 +293,10 @@ def check_lock(doc):
     for i, c in enumerate(doc["components"]):
         if c["tag"] != doc["overlay"]["tag"]:
             raise Invalid("L3", "$.components[" + str(i) + "].tag")
+        # The installer's own component is the installer checkout: S4 reads its root files there, by files[] rows of
+        # this component, so the two commits are one.
+        if c["name"] == INSTALLER_COMPONENT and c["commit"] != doc["installer"]["commit"]:
+            raise Invalid("L3", "$.components[" + str(i) + "].commit")
     for i, img in enumerate(doc["images"]):
         if img["built_from"] not in names:
             raise Invalid("L3", "$.images[" + str(i) + "].built_from")

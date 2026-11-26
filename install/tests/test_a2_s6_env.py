@@ -70,6 +70,15 @@ class EnvTest(unittest.TestCase):
                 with self.assertRaises(e6.EnvRefused):
                     e6.text(bad)
 
+    def test_res_entrypoint_overrides_never_reach_re(self):
+        """RE's entrypoint.sh takes RELAY_CMD, NOTIFY_CMD, BOTH_LOOP_CMD and PROBE_CMD as overrides of the command
+        each mode execs (RE's measured lines 60-63): each is refused by the env-file, so S8's start refuses it too."""
+        for k in ("RELAY_CMD", "NOTIFY_CMD", "BOTH_LOOP_CMD", "PROBE_CMD"):
+            with self.subTest(k=k):
+                self.assertIn(k, e6.ABSENT)
+                with self.assertRaises(e6.EnvRefused):
+                    e6.text([(k, "python3 /app/host/x.py")])
+
     def test_refusals(self):
         for kw in (dict(agent_home="home/agent"), dict(relay_home="/home/agent"), dict(relay_home="/home/agent/r"),
                    dict(agent_home="/home/relay/a"), dict(agent_uid=0), dict(agent_uid=True), dict(agent_uid="1"),
