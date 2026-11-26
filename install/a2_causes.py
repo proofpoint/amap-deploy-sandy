@@ -97,6 +97,14 @@ STAGE_SENTENCES = {
     'NOT_ADMITTING': "Look at the router's status on the VM named in the receipt: its first poll broke one of the six admission conditions; it was stopped, not removed.",
     'LEDGER_UNUSABLE': "Look at the relay ledger directory on the VM named in the receipt: it is not the relay account's own 0700 directory (its owner, mode or type), or RE's own read-only check reports it unusable or gave no report S8 could read; nothing was started on that VM.",
     'RE_REFUSED': "Look at the relay on the VM named in the receipt: its one-shot ledger init failed (a failed init leaves no container and no logs), or its container refused or never became healthy, and that container's logs name the reason; a started container was stopped, not removed.",
+    'FINGERPRINT': "Look at the router image on the VM named in the receipt: its router package is not exactly the pinned router's.",
+    'REVISION': 'Look at the image on the VM named in the receipt: its revision label is not the commit alpha2.lock pins for it.',
+    'READBACK': 'Look at the image on the VM named in the receipt: a file under its working directory has another owner or mode, or the user it runs as cannot read a file it needs.',
+    'OPENSSL': 'Look at the image on the VM named in the receipt: it has no openssl command, or one older than 3.0.',
+    'RE_FIX': "Look at the relay's commit in alpha2.lock: it does not include the relay's fix for the hop wedge; nothing was written.",
+    'DOCKER': 'Look at docker on the VM named in the receipt: it is not installed, or the agent account cannot reach the daemon.',
+    'LOAD': "Look at the image archive and the VM named in the receipt: docker load of the archive failed; an image that loaded in part is never run, and the VM's recovery is a restore.",
+    'ID_MISMATCH': "Look at the image archive and alpha2.lock: the archive loaded on the VM named in the receipt, but the image Id alpha2.lock pins is not there; the VM's recovery is a restore.",
     'PLACED_DIFFERENT': "Look at the directory on the VM named in the receipt: a file the stage places is there and differs, or the directory holds a name the stage does not place; nothing is ever replaced.",
     'OWNER': 'Look at the path on the VM named in the receipt: it, or a directory above it, has another owner, group or mode than the stage requires; it is never repaired.',
     'NOT_RESTORED': "Look at the receipt's final observed state: a write failed and the restore did not complete.",
@@ -113,10 +121,10 @@ EXIT = {
 DEFAULT_EXIT = 2
 #: Stage causes that arise only after the stage's first write: they exit 3, never 2, and 4.2's Exit cell says "3".
 #: The constructor refuses them without rc=3, so the code cannot give the exit the contract rules out.
-AFTER_WRITE_ONLY = frozenset({"NOT_RESTORED", "RE_REFUSED", "RL_REFUSED", "NOT_ADMITTING"})
+AFTER_WRITE_ONLY = frozenset({"NOT_RESTORED", "RE_REFUSED", "RL_REFUSED", "NOT_ADMITTING", "LOAD", "ID_MISMATCH"})
 #: Stage causes that arise only before the stage's first write: they exit 2, never 3, and 4.2's Exit cell says "2".
 #: The constructor refuses them at rc=3.
-BEFORE_WRITE_ONLY = frozenset({"CLOCK", "CLOCK_SKEW", "HUB_HOSTNAME", "HUB_NAME", "PREDECESSOR_FAILED",
+BEFORE_WRITE_ONLY = frozenset({"CLOCK", "CLOCK_SKEW", "RE_FIX", "HUB_HOSTNAME", "HUB_NAME", "PREDECESSOR_FAILED",
                                "PREDECESSOR_INCOMPLETE", "PREDECESSOR_INSTALLER", "PREDECESSOR_MISSING"})
 
 
