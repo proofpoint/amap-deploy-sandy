@@ -1,48 +1,38 @@
-"""W8: S7's token writer, run as the VM would run it (`env -i /usr/bin/python3 -I -S -B
-<bootstrap> <writer> <sha> <mode> <path>`; the bootstrap here is the TEST stand-in for
-DS's), plus in-process fault injection. Synthetic values only.
+"""W8: S7's token writer, run as the VM runs it: the REAL rule-7 bootstrap (vm_bootstrap.py
+`secret api_key <mode> <sha> agent`, through tests/secret_session.py), plus in-process fault
+injection on `apply`. Synthetic values only.
 
-The writer pins its target to <the account's home>/.sandy/.secrets from the account
-database. The subprocess tests therefore run a scratch COPY of the writer in which that one
-expression names a test home; every other byte is the shipped file (`writer_copy`)."""
+FAKED, and only these: the writer's LOOKUP (the agent account is this uid with a test home)
+and BECOME (no uid change without root), by text in secret_session.faked_writer; every
+other byte is the shipped writer, and the bootstrap is the shipped one."""
 
+import collections
 import hashlib
+import inspect
 import os
-import resource
+import signal
 import stat
-import subprocess
-import tempfile
 import unittest
 from unittest import mock
 
 import a2fix  # noqa: F401  (puts install/ on sys.path)
+import secret_session
 import vm_token_writer as W
 
-BOOT = os.path.join(a2fix.INSTALL, "tests", "standin_bootstrap.py")
 WRITER = os.path.join(a2fix.INSTALL, "vm_token_writer.py")
 TOKEN = b"sk-ant-oat01-SYNTHETIC-token-value-0001"
 TOKEN2 = b"sk-ant-oat01-SYNTHETIC-token-value-0002"
-PIN_EXPR = "(home if home is not None else pwd.getpwuid(uid).pw_dir)"
+Result = collections.namedtuple("Result", "returncode stdout stderr")
 
 
-def sha(path):
-    with open(path, "rb") as f:
-        return hashlib.sha256(f.read()).hexdigest()
-
-
-def writer_copy(dest_dir, home):
-    """The shipped writer with only its pinned-home expression replaced."""
-    with open(WRITER, encoding="utf-8") as f:
-        src = f.read()
-    assert src.count(PIN_EXPR) == 1
-    path = os.path.join(dest_dir, "vm_token_writer.py")
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(src.replace(PIN_EXPR, "(home if home is not None else %r)" % home))
-    return path
+def writer_copy(home):
+    """The shipped writer's text with LOOKUP and BECOME faked for the account "agent"."""
+    return secret_session.faked_writer(WRITER, home, "agent")
 
 
 class Base(unittest.TestCase):
     def setUp(self):
+        import tempfile
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.home = os.path.join(self.tmp.name, "home")
@@ -50,15 +40,17 @@ class Base(unittest.TestCase):
         os.makedirs(self.sandy)
         os.chmod(self.sandy, 0o700)
         self.secrets = os.path.join(self.sandy, ".secrets")
-        tools = os.path.join(self.tmp.name, "tools")
-        os.mkdir(tools)
-        self.writer = writer_copy(tools, self.home)
+        self.writer = writer_copy(self.home)
 
-    def run_vm(self, mode, value=None, extra=(), writer=None, want=None):
-        w = writer or self.writer
-        return subprocess.run(["/usr/bin/env", "-i", "/usr/bin/python3", "-I", "-S", "-B", BOOT, w,
-                               want or sha(w), mode] + list(extra),
-                              input=value if value is not None else b"", capture_output=True, timeout=60)
+    def run_vm(self, mode, value=None, writer=None, want=None, account="agent"):
+        """One real session. The bootstrap's exit code is the writer's on every path that
+        reached the writer (it prints RC <n> and returns n)."""
+        if value is None and mode in W.VALUE_MODES:
+            value = b""
+        rc, out, err = secret_session.run(writer or self.writer, "api_key", mode, value, account, want=want)
+        if out.startswith(b"READY\n") and out != b"READY\nRC %d\n" % rc:
+            raise AssertionError("the bootstrap's RC line does not match its exit code: %r" % out)
+        return Result(rc, out, err)
 
     def put(self, data, mode=0o600, path=None):
         p = path or self.secrets
@@ -74,18 +66,14 @@ class Base(unittest.TestCase):
         return sorted(os.listdir(self.sandy))
 
     def inproc(self, mode, value=b""):
-        """main() in this process against the test home, stdin from a pipe."""
-        r, w = os.pipe()
-        os.write(w, value)
-        os.close(w)
-        self.addCleanup(os.close, r)
-        W.main(["w", mode], stdin_fd=r, home=self.home)
-        return r
+        """apply() in this process, as the child would run it, against the test home."""
+        v = bytearray(value) if mode in W.VALUE_MODES else None
+        return W.apply(mode, v, os.getuid(), self.home)
 
 
 class WriteTest(Base):
     def test_fresh_file_one_line_0600(self):
-        p = self.run_vm("write", TOKEN + b"\n")
+        p = self.run_vm("write", TOKEN)
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertEqual(self.read(), W.KEY + b"=" + TOKEN + b"\n")
         self.assertEqual(stat.S_IMODE(os.stat(self.secrets).st_mode), 0o600)
@@ -109,7 +97,7 @@ class WriteTest(Base):
 
     def test_nothing_printed_and_no_value_in_output(self):
         p = self.run_vm("write", TOKEN)
-        self.assertEqual(p.stdout + p.stderr, b"")
+        self.assertEqual((p.stdout, p.stderr), (b"READY\nRC 0\n", b""))
         p = self.run_vm("write", b"bad value with spaces")
         self.assertNotIn(b"bad value", p.stdout + p.stderr)
         self.assertEqual(p.stderr, b"CAUSE=VALUE_FORM\n")
@@ -141,14 +129,11 @@ class WriteTest(Base):
 
 
 class TargetPinTest(Base):  # Opus 5; DS 5d428598: no path is passed
-    def test_no_path_argument_is_accepted(self):
-        ws = os.path.join(self.home, "dev", "agent-a", ".sandy")
-        os.makedirs(ws)
-        os.chmod(ws, 0o700)
-        p = self.run_vm("write", TOKEN, extra=[os.path.join(ws, ".secrets")])
-        self.assertEqual((p.returncode, p.stderr), (2, b"CAUSE=ARGS\n"))
-        self.assertFalse(os.path.exists(os.path.join(ws, ".secrets")))
-        self.assertFalse(os.path.exists(self.secrets))
+    def test_no_path_reaches_the_writer(self):
+        """The bootstrap's entry takes the mode, the value and the account, nothing else; the
+        path is derived from the account database alone."""
+        self.assertEqual(list(inspect.signature(W.main).parameters), ["mode", "value", "account"])
+        self.assertEqual(list(inspect.signature(W.apply).parameters), ["mode", "value", "uid", "home"])
 
     def test_a_symlinked_sandy_directory_is_refused(self):
         real = os.path.join(self.tmp.name, "elsewhere")
@@ -160,26 +145,115 @@ class TargetPinTest(Base):  # Opus 5; DS 5d428598: no path is passed
 
     def test_the_shipped_pin_is_the_account_databases_home(self):
         import pwd
-        self.assertEqual(W.pinned_path(os.getuid()), pwd.getpwuid(os.getuid()).pw_dir + "/.sandy/.secrets")
+        self.assertIs(W.LOOKUP, pwd.getpwnam)
+        self.assertIs(W.BECOME, W._become_account)
+        self.assertEqual(W.pinned_path("/home/agent"), "/home/agent/.sandy/.secrets")
+        self.assertEqual(W.account_of(pwd.getpwuid(os.getuid()).pw_name)[2], pwd.getpwuid(os.getuid()).pw_dir)
+
+    def test_a_primary_group_of_root_refuses(self):
+        rootgrp = secret_session.faked_writer(WRITER, self.home, "agent", gid=0)
+        p = self.run_vm("write", TOKEN, writer=rootgrp)
+        self.assertEqual((p.returncode, p.stderr), (2, b"CAUSE=ACCOUNT\n"))
+        self.assertFalse(os.path.exists(self.secrets))
+
+    def test_an_unknown_account_or_root_refuses(self):
+        p = self.run_vm("write", TOKEN, account="nobody")
+        self.assertEqual((p.returncode, p.stderr), (2, b"CAUSE=ACCOUNT\n"))
+        root = secret_session.faked_writer(WRITER, self.home, "agent", uid=0)
+        p = self.run_vm("write", TOKEN, writer=root)
+        self.assertEqual((p.returncode, p.stderr), (2, b"CAUSE=ACCOUNT\n"))
+        self.assertFalse(os.path.exists(self.secrets))
 
 
 class RuleOneTest(Base):  # Opus 3
-    def test_a_core_limit_failure_reads_nothing(self):
-        with mock.patch.object(W.resource, "setrlimit", side_effect=OSError("no")):
-            with self.assertRaises(W.Refuse) as cm:
-                r = None
-                rd, wr = os.pipe()
-                os.write(wr, TOKEN)
-                os.close(wr)
-                self.addCleanup(os.close, rd)
-                W.main(["w", "write"], stdin_fd=rd, home=self.home)
-        self.assertEqual(cm.exception.cause, "CORE_LIMIT")
-        self.assertEqual(os.read(rd, 100), TOKEN)  # stdin untouched
+    def in_child(self, **patches):
+        """main() in this process: LOOKUP, BECOME and not_dumpable stood in (this test
+        process's core limit is not zero; the real sessions above run not_dumpable for
+        real), plus `patches` on W; the child's stderr captured."""
+        import pwd
+        base = dict(LOOKUP=lambda n: pwd.struct_passwd(("agent", "x", os.getuid(), os.getgid(), "", self.home, "/")),
+                    BECOME=lambda u, g: None, not_dumpable=lambda: None)
+        base.update(patches)
+        for k, v in base.items():
+            mock.patch.object(W, k, v).start()
+        self.addCleanup(mock.patch.stopall)
+        r, w = os.pipe()
+        saved = os.dup(2)
+        os.dup2(w, 2)
+        os.close(w)
+        try:
+            rc = W.main("write", bytearray(TOKEN), "agent")
+        finally:
+            os.dup2(saved, 2)
+            os.close(saved)
+        err = os.read(r, 4096)
+        os.close(r)
+        return rc, err
+
+    def test_a_core_limit_or_dumpable_failure_after_the_drop_writes_nothing(self):
+        def no(*a, **k):
+            raise W.Refuse("CORE_LIMIT")
+        self.assertEqual(self.in_child(not_dumpable=no), (2, b"CAUSE=CORE_LIMIT\n"))
         self.assertFalse(os.path.exists(self.secrets))
 
-    def test_core_zero_refuses_when_the_limit_does_not_hold(self):
-        with self.assertRaises(W.Refuse):
-            W.core_zero(setrlimit=lambda *a: None, getrlimit=lambda r: (1, 1))
+    def test_not_dumpable_refuses_when_the_limit_or_the_flag_does_not_hold(self):
+        for prctl, lim in ((lambda op, *a: 0, (1, 1)), (lambda op, *a: -1, (0, 0)),
+                           (lambda op, *a: 1 if op == W.PR_GET_DUMPABLE else 0, (0, 0))):
+            with self.assertRaises(W.Refuse) as cm:
+                W.not_dumpable(prctl, lambda r, l=lim: l)
+            self.assertEqual(cm.exception.cause, "CORE_LIMIT")
+        W.not_dumpable(lambda op, *a: 0, lambda r: (0, 0))
+
+    def test_a_failed_drop_writes_nothing(self):
+        def drop(u, g):
+            raise PermissionError(1, "EPERM")
+        self.assertEqual(self.in_child(BECOME=drop), (2, b"CAUSE=DROP\n"))
+        self.assertFalse(os.path.exists(self.secrets))
+
+    def test_an_unexpected_error_in_the_child_is_rc4_with_one_cause_line(self):  # Opus W8 r2, 3 (X11)
+        def odd(*a, **k):
+            raise RuntimeError("anything")
+        rc, err = self.in_child(apply=odd)
+        self.assertEqual((rc, err), (4, b"CAUSE=UNCLASSIFIED\n"))  # unknown: S7 must not read it as "nothing changed"
+
+    def test_a_child_killed_is_rc4(self):
+        rc, err = self.in_child(BECOME=lambda u, g: os.kill(os.getpid(), signal.SIGKILL))
+        self.assertEqual((rc, err), (4, b"CAUSE=UNCLASSIFIED\n"))
+
+    def test_the_drop_is_groups_gid_uid_then_root_must_fail(self):
+        calls = []
+        ids = {"uid": 0, "gid": 0, "groups": []}
+
+        def setuid(u):
+            calls.append(("setuid", u))
+            if u == 0 and ids["uid"] != 0:
+                raise PermissionError(1, "EPERM")
+            ids["uid"] = u
+        fakes = dict(setgroups=lambda g: calls.append(("setgroups", list(g))) or ids.update(groups=list(g)),
+                     setgid=lambda g: calls.append(("setgid", g)) or ids.update(gid=g), setuid=setuid,
+                     getresuid=lambda: (ids["uid"],) * 3, getresgid=lambda: (ids["gid"],) * 3,
+                     getgroups=lambda: ids["groups"])
+        with mock.patch.multiple(W.os, **fakes):
+            W._become_account(1001, 1002)
+        self.assertEqual(calls, [("setgroups", [1002]), ("setgid", 1002), ("setuid", 1001), ("setuid", 0)])
+
+    def test_a_saved_root_id_refuses(self):
+        for resuid, resgid in (((1001, 1001, 0), (1002,) * 3), ((1001,) * 3, (1002, 1002, 0))):
+            fakes = dict(setgroups=lambda g: None, setgid=lambda g: None,
+                         setuid=lambda u: (_ for _ in ()).throw(PermissionError(1, "EPERM")) if u == 0 else None,
+                         getresuid=lambda r=resuid: r, getresgid=lambda r=resgid: r, getgroups=lambda: [1002])
+            with mock.patch.multiple(W.os, **fakes):
+                with self.assertRaises(W.Refuse) as cm:
+                    W._become_account(1001, 1002)
+            self.assertEqual(cm.exception.cause, "DROP")
+
+    def test_regaining_root_refuses(self):
+        fakes = dict(setgroups=lambda g: None, setgid=lambda g: None, setuid=lambda u: None,
+                     getresuid=lambda: (1001,) * 3, getresgid=lambda: (1002,) * 3, getgroups=lambda: [1002])
+        with mock.patch.multiple(W.os, **fakes):
+            with self.assertRaises(W.Refuse) as cm:
+                W._become_account(1001, 1002)
+        self.assertEqual(cm.exception.cause, "DROP")
 
 
 class FaultTest(Base):  # Opus 2, monitor M1, MB
@@ -224,7 +298,7 @@ class FaultTest(Base):  # Opus 2, monitor M1, MB
         self.assertEqual((e.cause, e.rc), ("DURABILITY_UNCERTAIN", 4))
         self.assertEqual(self.read(), W.KEY + b"=" + TOKEN2 + b"\n")  # the change stands
         self.assertEqual(self.read(self.secrets + ".prev"), self.old)  # and can be restored
-        W.main(["w", "restore"], home=self.home)
+        W.apply("restore", None, os.getuid(), self.home)
         self.assertEqual(self.read(), self.old)
 
     def test_a_failed_directory_open_after_the_rename_keeps_prev_rc4(self):
@@ -238,13 +312,6 @@ class FaultTest(Base):  # Opus 2, monitor M1, MB
             e = self.rotate()
         self.assertEqual((e.cause, e.rc), ("DURABILITY_UNCERTAIN", 4))
         self.assertTrue(os.path.exists(self.secrets + ".prev"))
-
-    def test_any_unexpected_error_prints_one_cause_line(self):
-        p = subprocess.run(["/usr/bin/env", "-i", "/usr/bin/python3", "-I", "-S", "-B", BOOT, self.writer,
-                            sha(self.writer), "write"], stdin=subprocess.DEVNULL,
-                           capture_output=True, timeout=60)
-        self.assertEqual(p.stderr.count(b"CAUSE="), 1)
-        self.assertNotIn(b"Traceback", p.stderr)
 
 
 class LeftoverTest(Base):  # monitor M2, L2
@@ -330,41 +397,31 @@ class FinishRestoreFaultTest(Base):  # Opus W8 r2, 3 (X3, X4); monitor L3
         self.assertTrue(os.path.exists(self.secrets + ".prev"))
 
 
-class CatchAllTest(unittest.TestCase):  # Opus W8 r2, 3 (X11)
-    def test_an_unclassified_error_is_rc4_with_one_cause_line(self):
-        written = []
-        with mock.patch.object(W, "main", side_effect=RuntimeError("anything")), \
-                mock.patch.object(W.os, "write", side_effect=lambda fd, b: written.append((fd, b)) or len(b)):
-            rc = W.run(["w", "write"])
-        self.assertEqual(rc, 4)  # unknown: S7 must not read it as "nothing changed"
-        self.assertEqual(written, [(2, b"CAUSE=UNCLASSIFIED\n")])
-
-
 class BootstrapTest(Base):
     def test_a_writer_changed_by_one_byte_gets_no_value(self):
-        changed = os.path.join(self.tmp.name, "w.py")
-        with open(self.writer, "rb") as f:
-            data = bytearray(f.read())
+        data = bytearray(self.writer.encode())
         data[-2] ^= 0x01
-        with open(changed, "wb") as f:
-            f.write(data)
-        r, w = os.pipe()
-        os.write(w, TOKEN)
-        os.close(w)
-        p = subprocess.run(["/usr/bin/env", "-i", "/usr/bin/python3", "-I", "-S", "-B", BOOT, changed,
-                            sha(self.writer), "write"], stdin=r, capture_output=True, timeout=60)
-        unread = os.read(r, 100)
-        os.close(r)
-        self.assertEqual((p.returncode, p.stderr), (2, b"CAUSE=PIN\n"))
-        self.assertEqual(unread, TOKEN)
+        p = self.run_vm("write", TOKEN, writer=bytes(data), want=hashlib.sha256(self.writer.encode()).hexdigest())
+        self.assertEqual((p.returncode, p.stdout), (3, b""))  # the bootstrap's PIN, no READY
         self.assertFalse(os.path.exists(self.secrets))
 
-    def test_symlinked_writer_and_bad_sha_refused(self):
-        link = os.path.join(self.tmp.name, "link.py")
-        os.symlink(self.writer, link)
-        self.assertEqual(self.run_vm("write", TOKEN, writer=link, want=sha(self.writer)).stderr, b"CAUSE=PIN\n")
-        self.assertEqual(self.run_vm("write", TOKEN, want="z" * 64).stderr, b"CAUSE=PIN\n")
-        self.assertFalse(os.path.exists(self.secrets))
+    def test_mode_and_value_pairing_is_the_writers_own_too(self):
+        for mode, value in (("bogus", None), ("finish", bytearray(TOKEN)), ("write", None), ("rotate", b"bytes")):
+            with self.subTest(mode=mode):
+                with mock.patch.object(W.os, "fork", side_effect=AssertionError("forked")):
+                    r, w = os.pipe()
+                    saved = os.dup(2)
+                    os.dup2(w, 2)
+                    os.close(w)
+                    try:
+                        rc = W.main(mode, value, "agent")
+                    finally:
+                        os.dup2(saved, 2)
+                        os.close(saved)
+                    err = os.read(r, 4096)
+                    os.close(r)
+                self.assertEqual(rc, 2)
+                self.assertIn(err, (b"CAUSE=MODE\n", b"CAUSE=VALUE_FORM\n"))
 
 
 if __name__ == "__main__":

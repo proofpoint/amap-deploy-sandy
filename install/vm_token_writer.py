@@ -1,19 +1,24 @@
 """S7's writer (stage contract 3.7; lock `writers[]` use `api_key`), run on a VM by DS's
-rule-7 bootstrap as the agent account. For ALPHA-2 the Claude credential is the setup
+rule-7 bootstrap (vm_bootstrap.py `secret api_key <mode> <sha> <agent account>`), which runs as root and calls
+`main(mode, value, account)` in its own process. This writer never writes as root: it forks, and the child becomes
+the agent account (its own primary group only), proves it cannot become root again and sets itself not dumpable
+and reads that back (a uid change sets the flag to the kernel's fs.suid_dumpable, 0 by default;
+the child does not rely on that setting) before it touches a file. For ALPHA-2 the Claude credential is the setup
 token, `CLAUDE_CODE_OAUTH_TOKEN`, written to sandy's privileged secrets file. That file is
 derived here and nowhere else: exactly `<the account's home>/.sandy/.secrets`, with the
 home from the account database, never a workspace `.sandy/.secrets` (sandy a.12 answers,
 section 4; DS 5d428598: vm_write_secret passes NO path). Its directory must resolve to
 itself (no symlink on the way).
 
-    write      the value from stdin becomes the file's one token line
+    write      the value becomes the file's one token line
     rotate     the same, keeping the old file as .secrets.prev; a value equal to the
                one sandy reads today is refused (VALUE_UNCHANGED)
     finish     rotation succeeded: remove .secrets.prev
     restore    rotation failed: .secrets.prev back in place of .secrets
 
-The value arrives on stdin only, never as an argument or a variable (rule 9). DS's
-bootstrap runs this in a closed environment: PATH=/usr/bin:/bin, LC_ALL=C and HOME only.
+The value arrives from the bootstrap, which read it from stdin, never as an argument or a variable
+(rule 9): a bytearray for write and rotate, None for finish and restore. The bootstrap runs in a
+closed environment: PATH=/usr/bin:/bin and LC_ALL=C only.
 
 How the file is read is sandy's own rule (`_load_sandy_config`, sandy 15522+ at 924fa5b6):
 - lines are split on LF only, and a final line without an LF is never read;
@@ -28,36 +33,40 @@ value with a leading or trailing quote, which sandy would strip. S7's rule-10 co
 (`grep -c '^KEY='`) is the same predicate.
 
 Rules (3.7):
-- 1: the core-dump limit is set to zero before stdin is read; if that fails, the writer
-  exits without reading;
+- 1: the bootstrap sets the core-dump limit to zero before it reads the value; the child
+  checks it again, and sets itself not dumpable, after the uid change and before any file;
 - 6: every return code is checked, and a full-write loop writes a 0600 temporary in the
   same 0700 directory, which is fsynced and renamed into place;
 - 8: the result holds exactly one token line.
 The value, its length and any part of it are never printed. The only output is one fixed
-`CAUSE=` line, on refusal.
+`CAUSE=` line on stderr, on refusal.
 
 Exit codes:
 - 0: done;
 - 2: refused, and nothing changed;
 - 3: a change was attempted and undone, so the file is as it was;
-- 4: the change STANDS but is not known durable (DURABILITY_UNCERTAIN), or a finish or
-  restore step failed half way. S7 treats 4 as "restore needed".
+- 4: the change STANDS but is not known durable (DURABILITY_UNCERTAIN), a finish or
+  restore step failed half way, or the child ended without an answer. S7 treats 4 as
+  "restore needed".
 The writer keeps the value's bytes in bytearrays and zeroes those it owns. Immutable
 copies made by Python on the way are not zeroed; with core dumps off, that is defence in
 depth only.
 """
 
+import ctypes
 import os
 import pwd
 import resource
 import stat
-import sys
 
+MODES = ("write", "rotate", "finish", "restore")
+VALUE_MODES = ("write", "rotate")
 KEY = b"CLAUDE_CODE_OAUTH_TOKEN"
 VALUE_MAX = 4096
 FILE_MAX = 1 << 20
 PREV = ".prev"
 TEMP_PREFIX = ".secrets.tmp-"
+PR_SET_DUMPABLE, PR_GET_DUMPABLE = 4, 3
 
 
 class Refuse(Exception):
@@ -66,39 +75,77 @@ class Refuse(Exception):
         self.cause, self.rc = cause, rc
 
 
-def core_zero(setrlimit=None, getrlimit=None):
-    setrlimit = setrlimit or resource.setrlimit
-    getrlimit = getrlimit or resource.getrlimit
+def _cause(name):
     try:
-        setrlimit(resource.RLIMIT_CORE, (0, 0))
+        os.write(2, ("CAUSE=%s\n" % name).encode("ascii"))
+    except OSError:
+        pass
+
+
+def value_ok(value):
+    """Printable ASCII only, 1 to VALUE_MAX bytes, in a bytearray, and no leading or trailing
+    quote (sandy would strip it)."""
+    if type(value) is not bytearray or not 0 < len(value) <= VALUE_MAX:
+        return False
+    for c in value:
+        if not 0x21 <= c <= 0x7e:
+            return False
+    return value[:1] not in (b'"', b"'") and value[-1:] not in (b'"', b"'")
+
+
+def account_of(name):
+    """(uid, gid, home) of the agent account, from the account database. Root, a primary group of root, or a
+    home that is not a plain absolute path, refuses."""
+    try:
+        pw = LOOKUP(name)
+    except (KeyError, TypeError, ValueError):
+        raise Refuse("ACCOUNT")
+    home = pw.pw_dir
+    if (pw.pw_uid == 0 or pw.pw_gid == 0 or not isinstance(home, str) or not home.startswith("/") or home.startswith("//")
+            or any(s in (".", "..") for s in home.split("/")) or home.rstrip("/") != home):
+        raise Refuse("ACCOUNT")
+    return pw.pw_uid, pw.pw_gid, home
+
+
+def _become_account(uid, gid):
+    """Root to exactly `uid`:`gid`, no supplementary group but `gid`; then becoming root
+    again must fail."""
+    os.setgroups([gid])
+    os.setgid(gid)
+    os.setuid(uid)
+    if (os.getresuid() != (uid, uid, uid) or os.getresgid() != (gid, gid, gid)
+            or os.getgroups() not in ([], [gid])):
+        raise Refuse("DROP")
+    try:
+        os.setuid(0)
+    except PermissionError:
+        return
+    raise Refuse("DROP")
+
+
+#: The account database and the uid change: the only two names the RealLayerTest stands in
+#: for (by text, without root), each named in its NOTE as FAKED.
+LOOKUP = pwd.getpwnam
+BECOME = _become_account
+
+
+def not_dumpable(prctl=None, getrlimit=resource.getrlimit):
+    """After the uid change: not dumpable (set and read back) and the core limit still zero,
+    or refuse."""
+    try:
+        if prctl is None:
+            prctl = ctypes.CDLL(None, use_errno=True).prctl
+        if prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) != 0 or prctl(PR_GET_DUMPABLE, 0, 0, 0, 0) != 0:
+            raise OSError("dumpable")
         if getrlimit(resource.RLIMIT_CORE) != (0, 0):
-            raise OSError
-    except (OSError, ValueError):
+            raise OSError("core limit")
+    except (OSError, AttributeError, ValueError):
         raise Refuse("CORE_LIMIT")
 
 
-def read_value(fd=0):
-    """One line from stdin into a bytearray; the trailing LF is dropped. Printable ASCII
-    only, non-empty, and no leading or trailing quote (sandy would strip it)."""
-    buf = bytearray()
-    while len(buf) <= VALUE_MAX + 1:
-        b = os.read(fd, VALUE_MAX + 2 - len(buf))
-        if not b:
-            break
-        buf += b
-    if buf.endswith(b"\n"):
-        del buf[-1]
-    ok = (0 < len(buf) <= VALUE_MAX and all(0x21 <= c <= 0x7e for c in buf)
-          and buf[:1] not in (b'"', b"'") and buf[-1:] not in (b'"', b"'"))
-    if not ok:
-        buf[:] = b"\0" * len(buf)
-        raise Refuse("VALUE_FORM")
-    return buf
-
-
-def pinned_path(uid, home=None):
-    """<the account's home>/.sandy/.secrets, from the account database."""
-    return (home if home is not None else pwd.getpwuid(uid).pw_dir) + "/.sandy/.secrets"
+def pinned_path(home):
+    """<the account's home>/.sandy/.secrets, the home from the account database."""
+    return home + "/.sandy/.secrets"
 
 
 def check_target(path, uid):
@@ -284,21 +331,16 @@ def restore(path):
         raise Refuse("DURABILITY_UNCERTAIN", rc=4)
 
 
-def main(argv, stdin_fd=0, uid=None, home=None):
-    if len(argv) != 2 or argv[1] not in ("write", "rotate", "finish", "restore"):
-        raise Refuse("ARGS")
-    mode = argv[1]
-    uid = os.getuid() if uid is None else uid
-    path = pinned_path(uid, home)
+def apply(mode, value, uid, home):
+    """One mode, already as the account. Returns 0 or raises Refuse."""
+    path = pinned_path(home)
     check_target(path, uid)
     if mode == "finish":
         return finish(path)
     if mode == "restore":
         return restore(path)
-    core_zero()
     no_leftovers(os.path.dirname(path), path, mode == "rotate")
     existing = _read_existing(path, uid)
-    value = read_value(stdin_fd)
     data = bytearray()
     try:
         if mode == "rotate" and current_value_equals(existing, value):
@@ -306,22 +348,55 @@ def main(argv, stdin_fd=0, uid=None, home=None):
         data = merged(existing, value)
         replace(path, data, keep_previous=(mode == "rotate"))
     finally:
-        value[:] = b"\0" * len(value)
         data[:] = b"\0" * len(data)
-
-
-def run(argv):
-    """The CLI: exactly one fixed CAUSE= line on any refusal or error, never a traceback."""
-    try:
-        main(argv)
-    except Refuse as e:
-        os.write(2, ("CAUSE=%s\n" % e.cause).encode("ascii"))
-        return e.rc
-    except BaseException:
-        os.write(2, b"CAUSE=UNCLASSIFIED\n")
-        return 4
     return 0
 
 
-if __name__ == "__main__":
-    os._exit(run(sys.argv))
+def _child(ids, mode, value):
+    rc = 4
+    try:
+        try:
+            BECOME(ids[0], ids[1])
+        except OSError:
+            raise Refuse("DROP")
+        not_dumpable()
+        rc = apply(mode, value, ids[0], ids[2]) or 0
+    except Refuse as e:
+        _cause(e.cause)
+        rc = e.rc
+    except BaseException:
+        _cause("UNCLASSIFIED")
+        rc = 4
+    finally:
+        if value is not None:
+            value[:] = b"\0" * len(value)
+    os._exit(rc)
+
+
+def main(mode, value, account):
+    """The bootstrap's entry. Every check that needs no account runs here, before the fork;
+    the file is touched only by the child, as the account."""
+    try:
+        if mode not in MODES:
+            raise Refuse("MODE")
+        if mode in VALUE_MODES:
+            if not value_ok(value):
+                raise Refuse("VALUE_FORM")
+        elif value is not None:
+            raise Refuse("VALUE_FORM")
+        ids = account_of(account)
+    except Refuse as e:
+        _cause(e.cause)
+        return e.rc
+    pid = os.fork()
+    if pid == 0:
+        _child(ids, mode, value)
+    try:
+        _, status = os.waitpid(pid, 0)
+    except OSError:
+        _cause("UNCLASSIFIED")
+        return 4
+    if os.WIFEXITED(status):
+        return os.WEXITSTATUS(status)
+    _cause("UNCLASSIFIED")
+    return 4

@@ -37,7 +37,6 @@ CONNECTOR = "c" * 40
 SANDY_BYTES = b"#!/usr/bin/env bash\n# synthetic sandy\n"
 SANDY_FILES = {"sandy": SANDY_BYTES, "proxy/go.mod": b"module proxy\n", "proxy/main.go": b"package main\n",
                "proxy/.gitignore": b"bin/\n"}
-BOOT = os.path.join(a2fix.INSTALL, "tests", "standin_bootstrap.py")
 WRITER = os.path.join(a2fix.INSTALL, "vm_token_writer.py")
 FILE_TOOLS = ("/usr/bin/stat", "/usr/bin/mkdir", "/usr/bin/sha256sum", "/usr/bin/cat", "/usr/bin/grep")
 #: The connector's bin/ tree, by path under CONNECTOR_PREFIX (component_tree's shape), with
@@ -211,19 +210,17 @@ class FakeVm:
         if self.writer_rc_override and mode in self.writer_rc_override:
             return self.writer_rc_override[mode]
         if self.writer is None:
-            from test_w8_writer import writer_copy
-            d = os.path.join(os.path.dirname(self.home), "writer")
-            os.makedirs(d, exist_ok=True)
-            self.writer = writer_copy(d, self.home)
-        p = subprocess.run(["/usr/bin/env", "-i", "/usr/bin/python3", "-I", "-S", "-B", BOOT, self.writer,
-                            sha_file(self.writer), mode],
-                           input=bytes(value) if value is not None else b"", capture_output=True, timeout=60)
+            # The shipped writer under the REAL bootstrap; FAKED: its LOOKUP and BECOME only.
+            import secret_session
+            self.writer = secret_session.faked_writer(WRITER, self.home, "agent")
+        import secret_session
+        rc, _out, _err = secret_session.run(self.writer, "api_key", mode, value, "agent")
         if mode in self.writer_after:
             after = self.writer_after[mode]
             if isinstance(after, BaseException):
                 raise after
             return after
-        return p.returncode
+        return rc
 
 
 class Run:

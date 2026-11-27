@@ -3,8 +3,8 @@
 newline-delimited JSON-RPC 2.0 on stdio and implements the four tools the stand-in uses,
 with the text shapes the real servers return (measured from the live delegation reader:
 `id: <id>` list lines; read_message's headers, the authenticated-peer banner between
-two rule lines, then the body; submit's {"req_id"}; submit_result's "pending" or a
-JSON verdict).
+two rule lines, then the body; submit's {"req_id"}; submit_result's "pending" or an attestation line
+then the verdict as indented JSON, over several lines).
 
 - With INBOX_MESSAGE_DIR set it is the reader: each message is <dir>/<id>.json
   {"from", "subject", "body"}.
@@ -52,7 +52,11 @@ def tools(name, args):
         if not os.path.exists(p):
             return text("pending")
         with open(p) as f:
-            return text(f.read())
+            last = f.read().strip().splitlines()[-1]
+        # As the connector's inbox-submit prints it (tool_submit_result at its pin 3a20c280, MEASURED by
+        # test_w8_standin_real): an attestation line when the result carries one, then the result indented.
+        return text("attestation: self-stamp (runtime-applied, not stranger-verifiable)\n"
+                    + json.dumps(json.loads(last), indent=2))
     return {"isError": True, "content": [{"type": "text", "text": "no such tool"}]}
 
 

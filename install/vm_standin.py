@@ -201,18 +201,22 @@ def message_parts(text):
 
 
 def verdict_of(text):
-    """submit_result's verdict: "pending", or the last line that is a JSON object (a
-    preceding attestation line is tolerated)."""
-    if text.strip() == "pending":
+    """submit_result's verdict: "pending", or the one JSON object the connector's
+    inbox-submit prints (json.dumps(result, indent=2), so it spans lines), after at most
+    one leading `attestation:` line."""
+    t = text.strip()
+    if t == "pending":
         return None
-    for line in reversed(text.strip().splitlines()):
-        try:
-            v = json.loads(line)
-        except ValueError:
-            continue
-        if isinstance(v, dict):
-            return v
-    raise Failed("submit_result gave no verdict")
+    lines = t.splitlines()
+    if lines and lines[0].startswith("attestation:"):
+        lines = lines[1:]
+    try:
+        v = json.loads("\n".join(lines))
+    except ValueError:
+        raise Failed("submit_result gave no verdict")
+    if not isinstance(v, dict):
+        raise Failed("submit_result gave no verdict")
+    return v
 
 
 def submitted(submit, text, deadline):

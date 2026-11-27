@@ -48,6 +48,7 @@ CREDENTIALS_SENTENCES = {
     'CREDENTIALS.CORE_LIMIT': 'Look at the core-dump limit: it could not be set to zero.',
     'CREDENTIALS.NO_ECHO': 'Look at the terminal: the prompt could not read without echo.',
     'CREDENTIALS.FORM': 'Look at the value named by its form rule in the receipt: it is not well formed.',
+    'CREDENTIALS.MAILBOX_REUSED': 'Look at the mailbox values entered at the prompt: two VMs were given the same one.',
     'CREDENTIALS.KEY_NOT_LIVE': 'Look at the API key: the live check did not accept it.',
     'CREDENTIALS.LEAK_LOCK': 'Look at alpha2.lock: it contains a value entered at the prompt.',
     'CREDENTIALS.LEAK_HOSTS': 'Look at alpha2.hosts: it contains a value entered at the prompt.',
@@ -69,6 +70,13 @@ AGENTS_SENTENCES = {
     'AGENTS.ROTATE_UNDONE': 'Look at the rotation in the receipt: the new credential did not take, and the old one is back in force.',
     # PROPOSED for DS (Dan ALPHA2-W8-ROTATE-FALLBACK): --rotate-key is not in ALPHA-2.
     'AGENTS.ROTATE_UNSUPPORTED': 'Look at the ALPHA-2 scope: key rotation is not supported in this release; rotate by hand.',
+}
+
+#: S6b's own names (contract 4.6 and 4.7).
+HUB_LOGIN_SENTENCES = {
+    'HUB-LOGIN.PROBE': "Look at RE's login probe on the VM named in the receipt: the hub did not accept the login, or the probe could not reach it; the detail names the probe's class.",
+    'HUB-LOGIN.WRITER': 'Look at the password writer on the VM named in the receipt: it refused or failed.',
+    'HUB-LOGIN.FILE': "Look at RE's password file on the VM named in the receipt: it is not the relay account's own one-link 0400 file.",
 }
 
 STAGE_SENTENCES = {
@@ -167,7 +175,8 @@ def _two_or_three(cause):
     if cause in ("RUNNER.CUSTODY", "RUNNER.OUTPUT_GUARD") or cause.endswith(".UNCLASSIFIED"):
         return True
     stage, _, name = cause.partition(".")
-    return stage not in NOT_WRITING_PREFIXES and (name in STAGE_SENTENCES or cause in AGENTS_SENTENCES)
+    return stage not in NOT_WRITING_PREFIXES and (name in STAGE_SENTENCES or cause in AGENTS_SENTENCES
+                                                  or cause in HUB_LOGIN_SENTENCES)
 
 
 def sentence(cause):
@@ -177,6 +186,8 @@ def sentence(cause):
         return CREDENTIALS_SENTENCES[cause]
     if cause in AGENTS_SENTENCES:
         return AGENTS_SENTENCES[cause]
+    if cause in HUB_LOGIN_SENTENCES:
+        return HUB_LOGIN_SENTENCES[cause]
     stage, _, name = cause.partition(".")
     text = STAGE_SENTENCES.get(name)
     if text is None or not stage:

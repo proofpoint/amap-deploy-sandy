@@ -3,11 +3,21 @@ regenerates MANIFEST there (so the manifest test cannot kill it for free),
 and runs the whole suite. A mutant the suite does not turn red SURVIVED.
 
 Usage: python3 -I -B install/tests/mutants.py [--jobs N] [label ...]
-Exit 0 only when every selected mutant is killed and every old string
-matched exactly once.
+Exit 0 only when the unmutated control passes and every selected mutant is
+KILLED or a named EQUIVALENT. A mutant whose anchor does not match once,
+whose source does not compile, under which a test module does not import,
+or under which the suite runs another number of tests than the control is
+BAD-MUTANT or BAD-IMPORT; one that outruns the time limit (3 x the
+control's duration, 600 s at least) is TIMEOUT; both exit 1. Each KILLED
+names its first failing test. With --jobs above 1, one more unmutated
+control runs inside the pool for every N mutants, and every kill is run
+again alone: one that does not fail again on the same first test is
+UNSTABLE (exit 1). Exit 3 when any control is red or the identity mutant
+does not survive (then no verdict is printed).
 """
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -251,6 +261,76 @@ M = [
     ("S1-FORM-SLOT", "a2_s1.py", "    if form_rules is None:\n        raise Refusal(\"CREDENTIALS.FORM\", \"form rule: not supplied\")", "    if form_rules is None:\n        return"),
     ("S1-FORM-RULE", "a2_s1.py", "        if not v or rule(v) is not True:", "        if not v:"),
     ("S1-FORM-EMPTY", "a2_s1.py", "        if not v or rule(v) is not True:", "        if rule(v) is not True:"),
+    ("S1-DISTINCT-CALL", "a2_s1.py", "        check_distinct(values)\n", ""),
+    ("S1-DISTINCT-PAIRS", "a2_s1.py", "for j in range(i + 1, len(boxes)):", "for j in range(i + 1, min(i + 2, len(boxes))):"),
+    ("S1-DISTINCT-CT", "a2_s1.py", "if hmac.compare_digest(boxes[i], boxes[j]):", "if boxes[i] == boxes[j]:"),
+    # package S6b: the two writers on the bootstrap's interface, and the stage
+    ('LW-VALUE-RANGE', 'vm_login_writer.py', 'not 0 < len(value) <= VALUE_MAX:', 'not 0 < len(value):'),
+    ('LW-VALUE-BYTES', 'vm_login_writer.py', '        if not 0x21 <= b <= 0x7E:\n            return False', '        if False:\n            return False'),
+    ('LW-MODE', 'vm_login_writer.py', 'if mode not in MODES:\n            raise Refuse("MODE")', 'if False:\n            raise Refuse("MODE")'),
+    ('LW-ROOT-ACCOUNT', 'vm_login_writer.py', 'if (pw.pw_uid == 0 or', 'if (False or'),
+    ('LW-ROOT-AGAIN', 'vm_login_writer.py', '    except PermissionError:\n        return\n    raise Refuse("DROP")', '    except PermissionError:\n        return\n    return'),
+    ('LW-DROP-IDS', 'vm_login_writer.py', '\n            or os.getgroups() not in ([], [gid])):', '):'),
+    ('LW-SETGROUPS', 'vm_login_writer.py', '    os.setgroups([gid])\n', ''),
+    ('LW-DUMPABLE', 'vm_login_writer.py', '        if prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) != 0 or prctl(PR_GET_DUMPABLE, 0, 0, 0, 0) != 0:\n            raise OSError("dumpable")', '        if False:\n            raise OSError("dumpable")'),
+    ('LW-CORE-LIMIT', 'vm_login_writer.py', '        if getrlimit(resource.RLIMIT_CORE) != (0, 0):\n            raise OSError("core limit")', '        if False:\n            raise OSError("core limit")'),
+    ('LW-DUMPABLE-CALL', 'vm_login_writer.py', '    not_dumpable()\n    lfd = open_login_dir(home, uid)', '    lfd = open_login_dir(home, uid)'),
+    ('LW-DIR-BOTH', 'vm_login_writer.py', 'if not _own_dir(rfd, uid) or not _own_dir(lfd, uid):', 'if not _own_dir(lfd, uid):'),
+    ('LW-DIR-MODE', 'vm_login_writer.py', ' and stat.S_IMODE(st.st_mode) == DIR_MODE', ''),
+    ('LW-NOFOLLOW', 'vm_login_writer.py', 'DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC', 'DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC'),
+    ('LW-TEMP-LEFTOVER', 'vm_login_writer.py', 'if any(n.startswith(TEMP_PREFIX) for n in names):', 'if False:'),
+    ('LW-FILE-CHECK', 'vm_login_writer.py', 'if not stat.S_ISREG(st.st_mode) or st.st_uid != uid or st.st_nlink != 1:\n        raise Refuse("LOGIN_FILE")', 'if False:\n        raise Refuse("LOGIN_FILE")'),
+    ('LW-FILE-NLINK', 'vm_login_writer.py', 'if not stat.S_ISREG(st.st_mode) or st.st_uid != uid or st.st_nlink != 1:', 'if not stat.S_ISREG(st.st_mode) or st.st_uid != uid:'),
+    ('LW-FCHMOD', 'vm_login_writer.py', '            os.fchmod(fd, FILE_MODE)\n', ''),
+    ('LW-READBACK', 'vm_login_writer.py', 'if (not stat.S_ISREG(st.st_mode) or stat.S_IMODE(st.st_mode) != FILE_MODE or (st.st_uid, st.st_gid) != (uid, gid)', 'if (False'),
+    ('LW-UNLINK-TEMP', 'vm_login_writer.py', '            os.unlink(tmp, dir_fd=lfd)', '            pass'),
+    ('LW-DIR-FSYNC', 'vm_login_writer.py', '        renamed = True\n        os.fsync(lfd)', '        renamed = True'),
+    ('LW-AFTER-RENAME', 'vm_login_writer.py', '        if renamed:\n            raise Refuse("DURABILITY_UNCERTAIN", rc=4)', '        if False:\n            raise Refuse("DURABILITY_UNCERTAIN", rc=4)'),
+    ('LW-SIGNALLED', 'vm_login_writer.py', '        return os.WEXITSTATUS(status)\n    _cause("UNCLASSIFIED")\n    return 4', '        return os.WEXITSTATUS(status)\n    return 0'),
+    ('LW-DROP-ERROR', 'vm_login_writer.py', '        except OSError:\n            raise Refuse("DROP")\n        rc = write_as', '        except OSError:\n            pass\n        rc = write_as'),
+    ('TW-MODE', 'vm_token_writer.py', 'if mode not in MODES:\n            raise Refuse("MODE")', 'if False:\n            raise Refuse("MODE")'),
+    ('TW-VALUE-NONE', 'vm_token_writer.py', '        elif value is not None:\n            raise Refuse("VALUE_FORM")', '        elif False:\n            raise Refuse("VALUE_FORM")'),
+    ('TW-VALUE-QUOTE', 'vm_token_writer.py', '    return value[:1] not in (b\'"\', b"\'") and value[-1:] not in (b\'"\', b"\'")', '    return True'),
+    ('TW-VALUE-BYTES', 'vm_token_writer.py', '        if not 0x21 <= c <= 0x7e:\n            return False', '        if False:\n            return False'),
+    ('TW-ROOT-ACCOUNT', 'vm_token_writer.py', 'if (pw.pw_uid == 0 or', 'if (False or'),
+    ('TW-ROOT-AGAIN', 'vm_token_writer.py', '    except PermissionError:\n        return\n    raise Refuse("DROP")', '    except PermissionError:\n        return\n    return'),
+    ('TW-SETGROUPS', 'vm_token_writer.py', '    os.setgroups([gid])\n', ''),
+    ('TW-DUMPABLE-CALL', 'vm_token_writer.py', '        not_dumpable()\n        rc = apply', '        rc = apply'),
+    ('TW-DUMPABLE', 'vm_token_writer.py', '        if prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) != 0 or prctl(PR_GET_DUMPABLE, 0, 0, 0, 0) != 0:\n            raise OSError("dumpable")', '        if False:\n            raise OSError("dumpable")'),
+    ('TW-SIGNALLED', 'vm_token_writer.py', '        return os.WEXITSTATUS(status)\n    _cause("UNCLASSIFIED")\n    return 4', '        return os.WEXITSTATUS(status)\n    return 0'),
+    ('TW-DROP-ERROR', 'vm_token_writer.py', '        except OSError:\n            raise Refuse("DROP")\n        not_dumpable()', '        except OSError:\n            pass\n        not_dumpable()'),
+    ('TW-CATCHALL', 'vm_token_writer.py', '    except BaseException:\n        _cause("UNCLASSIFIED")\n        rc = 4', '    except BaseException:\n        _cause("UNCLASSIFIED")\n        rc = 2'),
+    ('S6B-PROBE-OUT', 'a2_s6b.py', 'if rc == 0 and out == PROBE_OK:', 'if rc == 0:'),
+    ('S6B-PROBE-RC', 'a2_s6b.py', 'if rc == 0 and out == PROBE_OK:', 'if out == PROBE_OK:'),
+    ('S6B-FILE', 'a2_s6b.py', '        raise _refused(layer, "FILE", vm)', '        pass'),
+    ('S6B-ENV-DERIVE', 'a2_s6b.py', '    if hashlib.sha256(text).hexdigest() != s6["RE_ENV_SHA"]:\n        raise _refused(layer, "CONFIG_CHANGED", "env re-derive")', '    if False:\n        raise _refused(layer, "CONFIG_CHANGED", "env re-derive")'),
+    ('S6B-ENV-VM', 'a2_s6b.py', '        raise _refused(layer, "CONFIG_CHANGED", "env-file on the VM")', '        pass'),
+    ('S6B-LOGIN-SHAPE', 'a2_s6b.py', '        raise _refused(layer, "CONFIG_CHANGED", "login shape")', '        pass'),
+    ('S6B-IDS', 'a2_s6b.py', '        raise _refused(layer, "CONFIG_CHANGED", "ids")', '        pass'),
+    ('S6B-BINDING', 'a2_s6b.py', 'held.values.get(a2_s1.mailbox_label(name))', 'held.values.get(a2_s1.mailbox_label(names[0]))'),
+    ('S6B-WRITER-RC', 'a2_s6b.py', 'raise Refusal(STAGE + ".WRITER", vm, rc=3 if before else None)', 'raise Refusal(STAGE + ".WRITER", vm)'),
+    ('S6B-WRITER-UNKNOWN', 'a2_s6b.py', 'if type(rc) is int and rc in WRITER_NO_CHANGE:', 'if type(rc) is int:'),
+    ('S6B-PROBE-USER', 'a2_s6b.py', '"--user", "%d:%d" % (m["relay_uid"], m["relay_gid"])', '"--user", "%d:%d" % (m["relay_uid"], m["hop_gid"])'),
+    ('S6B-PROBE-RO', 'a2_s6b.py', '"type=bind,src=%s,dst=%s,readonly" % (pw, pw)', '"type=bind,src=%s,dst=%s" % (pw, pw)'),
+    ('S6B-DOCKER', 'a2_s6b.py', '    if rc in DOCKER_FAILED:\n        raise _refused(layer, "DOCKER", vm)\n', ''),
+    ('SI-VERDICT-MULTILINE', 'vm_standin.py', '    v = json.loads("\\n".join(lines))', '    v = json.loads(lines[-1])'),
+    ('SI-VERDICT-ATTESTATION', 'vm_standin.py', '    if lines and lines[0].startswith("attestation:"):\n        lines = lines[1:]\n', ''),
+    ("LW-O-EXCL", "vm_login_writer.py", "os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW", "os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW"),
+    ("S6B-READBACK-ACCOUNT", "a2_s6b.py", 'account=v["relay_account"], stage=STAGE, writes=False)', 'account=v["agent_account"], stage=STAGE, writes=False)'),
+    ("S6B-PROBE-NAME", "a2_s6b.py", '"--rm", "--name", name, "--pull"', '"--rm", "--pull"'),
+    ("S6B-PROBE-RM", "a2_s6b.py", '            rm_rc = layer.exec(vm, [DOCKER, "rm", "-f", "--", name], account=v["agent_account"], stage=STAGE,\n                               writes=True)[0]\n', '            rm_rc = 0\n'),
+    ("LW-SAVED-IDS", "vm_login_writer.py", "    if (os.getresuid() != (uid, uid, uid) or os.getresgid() != (gid, gid, gid)\n            or os.getgroups()", "    if (False\n            or os.getgroups()"),
+    ("TW-SAVED-IDS", "vm_token_writer.py", "    if (os.getresuid() != (uid, uid, uid) or os.getresgid() != (gid, gid, gid)\n            or os.getgroups()", "    if (False\n            or os.getgroups()"),
+    ("LW-GID-ROOT", "vm_login_writer.py", "if (pw.pw_uid == 0 or pw.pw_gid == 0 or", "if (pw.pw_uid == 0 or"),
+    ("TW-GID-ROOT", "vm_token_writer.py", "if (pw.pw_uid == 0 or pw.pw_gid == 0 or", "if (pw.pw_uid == 0 or"),
+    ("LW-TEMP-LEFT", "vm_login_writer.py", '            raise Refuse("TEMP_LEFT", rc=4)', '            pass'),
+    ("LW-SIZE", "vm_login_writer.py", " or st.st_size != len(value)):", "):"),
+    ("S6B-RM-SWALLOW", "a2_s6b.py", '        except Refusal:\n            what = "rm -f refused by the layer"\n', '        except ValueError:\n            what = "rm -f refused by the layer"\n'),
+    ("S6B-PROBE-FACT", "a2_s6b.py", '        r.facts = list(getattr(r, "facts", [])) + [("PROBE_CONTAINER", name + " may remain; " + what)]\n', ''),
+    ("S1-MAILBOX-RANGE", "a2_site.py", "or not MAILBOX_MIN <= len(v) <= MAILBOX_MAX:", "or not 1 <= len(v):"),
+    ("S1-MAILBOX-BYTES", "a2_site.py", "        if not 0x21 <= b <= 0x7E:\n            return False", "        if False:\n            return False"),
+    ("S1-MAILBOX-TYPE", "a2_site.py", "if not isinstance(v, bytearray) or not MAILBOX_MIN", "if not MAILBOX_MIN"),
+    ("S1-MAILBOX-DEFAULT", "a2_site.py", 'self.form_rules = {"mailbox": mailbox_form}', 'self.form_rules = {"mailbox": lambda v: True}'),
     ("S1-LIVE-SLOT", "a2_s1.py", "    if live_check is None:\n        raise Refusal(\"CREDENTIALS.KEY_NOT_LIVE\")", "    if live_check is None:\n        return \"pass\""),
     ("S1-LIVE-TRUE", "a2_s1.py", "    if ok is not True:\n        raise Refusal(\"CREDENTIALS.KEY_NOT_LIVE\")", "    if not ok:\n        raise Refusal(\"CREDENTIALS.KEY_NOT_LIVE\")"),
     ("S1-STUB-ONLY-LEAK", "a2_s1.py", '    if inv.loop == "L2-leak":\n        return "stub"', '    if inv.loop in ("L2-leak", "L2"):\n        return "stub"'),
@@ -310,7 +390,7 @@ M = [
     ("EL-SOURCE-RUN", "a2_s10.py", '    if man["source_run"] is not None:\n        return', '    if False:\n        return'),
     ("EL-STATE-FINAL", "a2_s10.py", '    if man["state"] != "final":\n        return', '    if False:\n        return'),
     ("EL-UNEXPECTED", "a2_s10.py", "    if set(have) - set(expected):\n        return", "    if False:\n        return"),
-    ("EL-MISSING", "a2_s10.py", "        if st is None:\n            return", "        if st is None:\n            continue"),
+    ("EL-MISSING", "a2_s10.py", '        if st is None:\n            return False, "a stage has no receipt: "', '        if st is None:\n            continue\n        if False:\n            return False, "a stage has no receipt: "'),
     ("EL-RC", "a2_s10.py", '        if st["rc"] != 0:\n            return', '        if False:\n            return'),
     ("EL-CHECK-RECEIPT", "a2_s10.py", "            except ValueError:\n                return False, \"a receipt breaks a 3.3 rule: \" + st[\"stage\"]", "            except ValueError:\n                facts, rc = a2_record.parse_receipt(data)[0], st[\"rc\"]"),
     ("EL-RC-ROW", "a2_s10.py", '            if rc != st["rc"]:\n                return', '            if False:\n                return'),
@@ -601,7 +681,7 @@ M = [
     ('BOOT-HI-CHMOD', 'vm_bootstrap.py', '                os.fchmod(ifd, INTAKE_MODE)\n', ''),
     ('BOOT-HI-READBACK', 'vm_bootstrap.py', '                if not _intake_ok(_fstat(ifd), uid, gid):\n                    raise Stop(READBACK)', '                pass'),
     ('BOOT-HI-ALREADY', 'vm_bootstrap.py', '        return OK if created else ALREADY', '        return OK'),
-    ('BOOT-HI-ONLY-ABSENT', 'vm_bootstrap.py', '                absent.append(name)\n                continue', '                absent.append(name)\n                continue\n            absent.append(name)'),
+    ("BOOT-HI-ONLY-ABSENT", "vm_bootstrap.py", "            finally:\n                os.close(ifd)\n        for name in absent:", "            finally:\n                os.close(ifd)\n            absent.append(name)\n        for name in absent:"),
     ('BOOT-HI-CHECK-FIRST', 'vm_bootstrap.py', '        absent = []\n        for name in INTAKES:', '        absent = []\n        for name in INTAKES[:1]:'),
     ('BOOT-HI-RELAY-ROOT', 'vm_bootstrap.py', '    if uid == 0 or not (pw.pw_gid == gid', '    if not (pw.pw_gid == gid'),
     ('BOOT-HI-RELAY-MEMBER', 'vm_bootstrap.py', 'or not (pw.pw_gid == gid or account in gr.gr_mem):', ':'),
@@ -760,7 +840,7 @@ M = [
     ('S6-RELAY-ROOT', 'a2_s6.py', 'doc["relay_uid"] in (0, doc["uid"])', 'doc["relay_uid"] == doc["uid"]'),
     ('S6-RELAY-AGENT', 'a2_s6.py', 'doc["relay_uid"] in (0, doc["uid"])', 'doc["relay_uid"] == 0'),
     ('S6-AGENT-ROOT', 'a2_s6.py', 'if (doc["uid"] == 0 or doc["relay_uid"]', 'if (doc["relay_uid"]'),
-    ('S6-IN-HOP', 'a2_s6.py', ' or not doc["agent_in_hop"]\n            or not doc["relay_in_hop"]):', ':'),
+    ("S6-IN-HOP", "a2_s6.py", ' or not doc["agent_in_hop"]\n            or not doc["relay_in_hop"]):', '):'),
     ('S6-MEASURE-KEYS', 'a2_s6.py', 'if (doc is None or set(doc) != MEASURE_KEYS or', 'if (doc is None or not MEASURE_KEYS <= set(doc) or'),
     ('S6-MEASURE-INT', 'a2_s6.py', '    return type(v) is int and v >= 0', '    return isinstance(v, int)'),
     ('S6-HOME-NORM', 'a2_s6.py', 'if not h.startswith("/") or posixpath.normpath(h) != h or h == "/":', 'if not h.startswith("/"):'),
@@ -786,7 +866,7 @@ M = [
     ('E6-TEXT-NL', 'a2_s6_env.py', '                or any(c in v for c in "\\n\\r\\0") or v != v.strip() or not v):', '                or v != v.strip() or not v):'),
     ('E6-LOGIN', 'a2_s6_env.py', '        if not isinstance(v, str) or not _LOGIN_PART.fullmatch(v):', '        if not isinstance(v, str):'),
     ('S6-RELAY-HOME-NEST', 'a2_s6.py', '    if relay_home == home or relay_home.startswith(home + "/") or home.startswith(relay_home + "/"):\n        raise Refusal(STAGE + ".HOSTS", vm)\n', ''),
-    ('LOCK-REG-PIN', 'a2_private.py', '        if _pin(rp[key]) != pin:\n            raise Invalid("L3", "$.registry_program." + key)\n', ''),
+    ("LOCK-REG-PIN", "a2_private.py", '        if _pin(rp[key]) != pin:\n            raise Invalid("L3", "$.registry_program." + key)\n', '        if False:\n            raise Invalid("L3", "$.registry_program." + key)\n'),
     ('LOCK-REG-PIN-KEYS', 'a2_private.py', '("package", REGISTRY_PACKAGE_SHA256), ("config_schema", REGISTRY_CONFIG_SCHEMA_SHA256),', '("package", REGISTRY_PACKAGE_SHA256),'),
     ('LOCK-REG-COMPONENT-ONE', 'a2_private.py', '    if [c["name"] for c in doc["components"]].count(rp["component"]) != 1:\n        raise Invalid("L3", "$.registry_program.component")\n', ''),
     ('LOCK-REG-COMPONENT-PIN', 'a2_private.py', ', ("component", REGISTRY_COMPONENT_SHA256)):', '):'),
@@ -1287,40 +1367,81 @@ EQUIVALENT = {
 }
 
 
-def _one(mutant):
-    """Run one mutant in its own copy; returns (label, verdict) or
-    (label, None) for a bad mutant."""
+#: Copied into each mutant's tree: the whole repository but these. The suite reads files outside install/ (the
+#: contract under alpha2/, payload/, siblings.json, and the root's hygiene_gate.py and router_fingerprint.py), so a
+#: partial copy turns every run red whatever the mutant does; the control run below is what proves the copy is enough.
+COPY_IGNORE = shutil.ignore_patterns(".git", "__pycache__")
+#: The unmutated run every invocation makes first. Its suite must pass, or no verdict is reported.
+CONTROL = ("CONTROL", None, None, None)
+#: An identity mutant: it goes through the whole edit path (the anchor matched once, the file rewritten, MANIFEST
+#: regenerated) and changes nothing, so it must SURVIVE. A KILLED identity means the edit path itself breaks the
+#: suite, and no verdict is reported.
+IDENTITY = ("IDENTITY", "a2_site.py", "MAILBOX_MAX = 128\n", "MAILBOX_MAX = 128\n")
+
+
+#: A run's test count, from unittest's own summary line on stderr.
+_RAN = re.compile(r"^Ran (\d+) tests? in ([0-9.]+)s$", re.M)
+#: The first failed or errored test, as unittest names it: printed beside each kill, so a kill can be audited.
+_FIRST_FAIL = re.compile(r"^(?:FAIL|ERROR): (\S+ \([^)]*\))", re.M)
+#: unittest's marks for a test module that did not import: the module's tests did not run, so a red suite here is no
+#: kill.
+_IMPORT_FAILED = ("Failed to import test module", "unittest.loader._FailedTest")
+#: The suite's time limit is TIMEOUT_FACTOR times the control's own duration, and never under TIMEOUT_FLOOR_S.
+TIMEOUT_FACTOR = 3
+TIMEOUT_FLOOR_S = 600
+
+
+def _one(mutant, expect_ran=None, timeout_s=TIMEOUT_FLOOR_S):
+    """Run one mutant in its own copy of the repository. Returns (label, verdict, ran, seconds):
+    - KILLED: the suite ran expect_ran tests (the control's count) and failed;
+    - SURVIVED or EQUIVALENT (...): it ran them all and passed;
+    - BAD-MUTANT (...): the anchor did not match once, the edited source does not compile, a test module did not
+      import, or the suite ran another number of tests: the suite never tested the mutant;
+    - TIMEOUT: the suite did not finish inside timeout_s: no verdict.
+    CONTROL makes no edit; its own (ran, seconds) set expect_ran and the limit for the rest."""
     label, fname, old, new = mutant
     tmp = tempfile.mkdtemp(prefix="a2mut-")
     try:
-        dst = os.path.join(tmp, "install")
-        shutil.copytree(INSTALL, dst, ignore=shutil.ignore_patterns("__pycache__"))
-        # The suite reads the contract at <repo>/alpha2/STAGE-CONTRACT.md.
-        os.mkdir(os.path.join(tmp, "alpha2"))
-        shutil.copy(os.path.join(os.path.dirname(INSTALL), "alpha2", "STAGE-CONTRACT.md"),
-                    os.path.join(tmp, "alpha2"))
-        p = os.path.join(dst, fname)
-        with open(p, encoding="utf-8") as f:
-            src = f.read()
-        if src.count(old) != 1:
-            return label, None
-        with open(p, "w", encoding="utf-8") as f:
-            f.write(src.replace(old, new))
+        repo = os.path.join(tmp, "repo")
+        shutil.copytree(os.path.dirname(INSTALL), repo, ignore=COPY_IGNORE, symlinks=True)
+        dst = os.path.join(repo, "install")
+        if fname is not None:
+            p = os.path.join(dst, fname)
+            # A symlink in the copy would carry the edit outside it, into the tree being tested.
+            if os.path.islink(p) or not os.path.realpath(p).startswith(os.path.realpath(repo) + os.sep):
+                return label, "BAD-MUTANT (the file is a symlink or resolves outside the copy)", None, None
+            with open(p, encoding="utf-8", newline="") as f:
+                src = f.read()
+            if src.count(old) != 1:
+                return label, "BAD-MUTANT (old string did not match exactly once)", None, None
+            edited = src.replace(old, new)
+            if fname.endswith(".py"):
+                try:
+                    compile(edited, p, "exec")
+                except SyntaxError as e:
+                    return label, "BAD-MUTANT (does not compile: line %s)" % e.lineno, None, None
+            with open(p, "w", encoding="utf-8", newline="") as f:
+                f.write(edited)
         subprocess.run([sys.executable, "-I", "-B", os.path.join(dst, "tests", "make_manifest.py")],
                        check=True, stdin=subprocess.DEVNULL)
         try:
             r = subprocess.run([sys.executable, "-I", "-B", "-m", "unittest", "discover", "-s",
                                 os.path.join(dst, "tests"), "-t", os.path.join(dst, "tests")],
-                               capture_output=True, text=True, timeout=600, cwd=dst,
+                               capture_output=True, text=True, timeout=timeout_s, cwd=dst,
                                stdin=subprocess.DEVNULL)
-            verdict = "KILLED" if r.returncode != 0 else "SURVIVED"
         except subprocess.TimeoutExpired:
-            # The suite did not pass: a hang under a mutant is a kill, and is
-            # reported as one so it can be looked at.
-            verdict = "KILLED (timeout)"
+            return label, "TIMEOUT (over %d s)" % timeout_s, None, None
+        m = _RAN.findall(r.stderr)
+        ran, secs = (int(m[-1][0]), float(m[-1][1])) if m else (None, None)
+        if any(mark in r.stderr for mark in _IMPORT_FAILED):
+            return label, "BAD-IMPORT (a test module did not import)", ran, secs
+        if ran is None or (expect_ran is not None and ran != expect_ran):
+            return label, "BAD-MUTANT (ran %s tests, the control ran %s)" % (ran, expect_ran), ran, secs
+        first = _FIRST_FAIL.search(r.stderr)
+        verdict = ("KILLED by " + (first.group(1) if first else "an unnamed failure")) if r.returncode != 0 else "SURVIVED"
         if verdict == "SURVIVED" and label in EQUIVALENT:
             verdict = "EQUIVALENT (" + EQUIVALENT[label] + ")"
-        return label, verdict
+        return label, verdict, ran, secs
     finally:
         shutil.rmtree(tmp, True)
 
@@ -1328,24 +1449,67 @@ def _one(mutant):
 def run(labels, jobs=1):
     """Each mutant runs in its own copy, `jobs` at a time; the report is in
     the order of M whatever order they finish in."""
+    import functools
     from concurrent.futures import ThreadPoolExecutor
     chosen = [m for m in M if not labels or m[0] in labels]
     if labels and len(chosen) != len(labels):
         print("UNKNOWN LABEL in", labels)
         return 2
+    # The control: the same copy, no edit. A red control means every verdict below would be "KILLED" for a reason
+    # that is not the mutant, so nothing is reported. Its test count and duration bind every other run.
+    _lb, control, ran, secs = _one(CONTROL)
+    if control != "SURVIVED":
+        print("CONTROL RED (%s): the unmutated copy's suite does not pass; no mutant verdict is meaningful" % control)
+        return 3
+    limit = max(TIMEOUT_FLOOR_S, int(TIMEOUT_FACTOR * secs))
+    print("CONTROL green: the unmutated copy's suite passes: Ran %d tests in %.1fs; timeout %d s" % (ran, secs, limit))
+    _lb, identity, _r, _s = _one(IDENTITY, ran, limit)
+    if identity != "SURVIVED":
+        print("IDENTITY %s: an edit that changes nothing does not survive; no mutant verdict is meaningful" % identity)
+        return 3
+    print("IDENTITY survived: an edit that changes nothing leaves the suite green")
+    # With more than one copy at a time, one more CONTROL runs inside the pool for every `jobs` mutants, so a red
+    # caused by the copies running side by side (load, a shared path, a timing) shows as a red control, not as kills.
+    tasks = []
+    for i, m in enumerate(chosen):
+        if jobs > 1 and i % jobs == 0:
+            tasks.append(CONTROL)
+        tasks.append(m)
     with ThreadPoolExecutor(max_workers=jobs) as pool:
-        results = list(pool.map(_one, chosen))
-    bad = sum(1 for _, v in results if v is None)
-    survived = [lb for lb, v in results if v == "SURVIVED"]
-    equivalent = [lb for lb, v in results if v and v.startswith("EQUIVALENT")]
-    for lb, v in results:
-        print("%-20s %s" % (lb, "BAD-MUTANT: old string did not match exactly once" if v is None else v))
-    print("mutants=%d killed=%d survived=%d equivalent=%d bad=%d"
-          % (len(chosen), len(chosen) - len(survived) - len(equivalent) - bad,
-             len(survived), len(equivalent), bad))
-    if survived:
-        print("SURVIVORS:", " ".join(survived))
-    return 0 if not survived and not bad else 1
+        done = list(pool.map(functools.partial(_one, expect_ran=ran, timeout_s=limit), tasks))
+    controls = [v for (lb, v, _r, _s) in done if lb == CONTROL[0]]
+    results = [d for d in done if d[0] != CONTROL[0]]
+    if jobs > 1:
+        red = [v for v in controls if v != "SURVIVED"]
+        print("concurrent controls=%d green=%d" % (len(controls), len(controls) - len(red)))
+        if red:
+            print("CONCURRENT CONTROL RED (%s): copies run side by side disturb the suite; no verdict" % red[0])
+            return 3
+        # A green concurrent control does not prove that no kill came from the copies disturbing each other: each
+        # kill is run again alone, and stands only if it fails again on the same first test.
+        confirmed = []
+        for lb, v, r_, s_ in results:
+            if v.startswith("KILLED"):
+                m = next(x for x in chosen if x[0] == lb)
+                again = _one(m, expect_ran=ran, timeout_s=limit)[1]
+                if again != v:
+                    v = "UNSTABLE (side by side: %s; alone: %s)" % (v, again)
+            confirmed.append((lb, v, r_, s_))
+        results = confirmed
+    for lb, v, _r, _s in results:
+        print("%-20s %s" % (lb, v))
+    killed = [lb for lb, v, _r, _s in results if v.startswith("KILLED")]
+    survived = [lb for lb, v, _r, _s in results if v == "SURVIVED"]
+    equivalent = [lb for lb, v, _r, _s in results if v.startswith("EQUIVALENT")]
+    bad = [lb for lb, v, _r, _s in results if v.startswith(("BAD-MUTANT", "BAD-IMPORT"))]
+    timeout = [lb for lb, v, _r, _s in results if v.startswith("TIMEOUT")]
+    unstable = [lb for lb, v, _r, _s in results if v.startswith("UNSTABLE")]
+    print("mutants=%d killed=%d survived=%d equivalent=%d bad=%d timeout=%d unstable=%d"
+          % (len(chosen), len(killed), len(survived), len(equivalent), len(bad), len(timeout), len(unstable)))
+    for name, labs in (("SURVIVORS", survived), ("BAD", bad), ("TIMEOUTS", timeout), ("UNSTABLE", unstable)):
+        if labs:
+            print(name + ":", " ".join(labs))
+    return 0 if not survived and not bad and not timeout and not unstable else 1
 
 
 if __name__ == "__main__":

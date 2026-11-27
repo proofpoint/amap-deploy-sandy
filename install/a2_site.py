@@ -22,6 +22,23 @@ UNOBSERVED = "UNOBSERVED"
 #: group, and nothing for others.
 PRIVATE_DIR = "/srv/a2-private"
 
+#: S1's mailbox form rule (ruling S1-MAILBOX-FORM-RULE): the hub's set-login
+#: verb's own rule, so a value it accepts is the only kind S1 accepts. RE and
+#: S6b's writer accept a superset (printable ASCII, no space).
+MAILBOX_MIN = 24
+MAILBOX_MAX = 128
+
+
+def mailbox_form(v):
+    """True only for a bytearray of MAILBOX_MIN to MAILBOX_MAX bytes, each
+    0x21 to 0x7E. Reads the bytes in place: never a copy, never a str."""
+    if not isinstance(v, bytearray) or not MAILBOX_MIN <= len(v) <= MAILBOX_MAX:
+        return False
+    for b in v:
+        if not 0x21 <= b <= 0x7E:
+            return False
+    return True
+
 #: The runner host's machine identity source (6.2 `runner.host_id`).
 MACHINE_ID_PATH = "/etc/machine-id"
 MACHINE_ID_READ = 128
@@ -137,15 +154,16 @@ class Site:
         #: The run's output guard (3.3), created by a2_main.main.
         self.guard = None
         #: S1 (3.7): the core limit calls, the controlling terminal and
-        #: stdin; the form rules ([OPEN: the shapes], the S1 review), a dict
-        #: {"api_key": f, "mailbox": f} of predicates over a bytearray, None
-        #: refuses; the live check ([OPEN: endpoint]), None refuses.
+        #: stdin; the form rules, a dict {"api_key": f, "mailbox": f} of
+        #: predicates over a bytearray, a missing one refusing: "mailbox" is
+        #: mailbox_form, "api_key" is [OPEN: the shapes] (the S1 review); the
+        #: live check ([OPEN: endpoint]), None refuses.
         import resource
         self.setrlimit = resource.setrlimit
         self.getrlimit = resource.getrlimit
         self.tty_path = "/dev/tty"
         self.stdin_fd = 0
-        self.form_rules = None
+        self.form_rules = {"mailbox": mailbox_form}
         self.live_check = None
         #: S10 (5.5): the three operator steps' text, from the runbook;
         #: None prints them as UNMEASURED.

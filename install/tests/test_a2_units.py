@@ -134,6 +134,9 @@ class CausesTest(unittest.TestCase):
             ("a2_admit.py", "_common"), ("a2_main.py", "_run"), ("a2_main.py", "dispatch"),
             ("a2_s0.py", "_fetch_tag"), ("a2_s0.py", "_run_checks"), ("a2_s0.py", "check_l7"),
             ("a2_s0.py", "check_probes"), ("a2_s1.py", "check_l5"), ("a2_s6.py", "read_prior"),
+            # S6b: _read keeps the reader's PREDECESSOR_* (no rc); _refused, measure and write pass rc only for
+            # CONFIG_CHANGED, FILE, DOCKER, PROBE, WRITER, HOSTS, INTERPRETER and UNCLASSIFIED.
+            ("a2_s6b.py", "_read"), ("a2_s6b.py", "_refused"), ("a2_s6b.py", "measure"), ("a2_s6b.py", "write"),
             ("a2_s7.py", "read_s6"), ("a2_s8.py", "measure"), ("a2_s8.py", "run"), ("a2_s8_run.py", "_read"), ("a2_s8_run.py", "run_s8"),
             ("a2_site.py", "slot"), ("a2_vm.py", "_refused")])
         self.assertEqual(sorted(found), [("a2_s4.py", "ID_MISMATCH"), ("a2_s4.py", "LOAD"),
@@ -144,6 +147,7 @@ class CausesTest(unittest.TestCase):
             ("a2_record.py", "PREDECESSOR_FAILED"), ("a2_record.py", "PREDECESSOR_INCOMPLETE"),
             ("a2_record.py", "PREDECESSOR_INSTALLER"), ("a2_record.py", "PREDECESSOR_MISSING"),
             ("a2_s4.py", "RE_FIX"), ("a2_s6.py", "HUB_HOSTNAME"), ("a2_s6.py", "PREDECESSOR_INCOMPLETE"),
+            ("a2_s6b.py", "HUB_HOSTNAME"), ("a2_s6b.py", "PREDECESSOR_INCOMPLETE"),
             ("a2_s8_checks.py", "CLOCK_SKEW"),
             ("a2_s8_run.py", "PREDECESSOR_FAILED"), ("a2_s8_run.py", "PREDECESSOR_INCOMPLETE")])
 

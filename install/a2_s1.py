@@ -12,6 +12,7 @@ form rules ([OPEN: the shapes], the S1 review) and the live check
 ([OPEN: endpoint]).
 """
 
+import hmac
 import os
 import resource
 import signal
@@ -306,6 +307,17 @@ def check_forms(values, form_rules):
             raise Refusal("CREDENTIALS.FORM", "form rule: " + kind)
 
 
+def check_distinct(values):
+    """Rule 4: no two VMs' mailbox values are equal. Each pair is compared
+    in constant time, on the held bytearrays; the refusal names only the
+    rule, never which VMs."""
+    boxes = [v for label, v in values.items() if label != API_KEY]
+    for i in range(len(boxes)):
+        for j in range(i + 1, len(boxes)):
+            if hmac.compare_digest(boxes[i], boxes[j]):
+                raise Refusal("CREDENTIALS.MAILBOX_REUSED", "form rule: mailbox values distinct")
+
+
 def check_live(values, inv, live_check):
     """Rule 3: one authenticated request for the API key, made by the
     installer's own process ([OPEN: endpoint]; unset refuses). Rule 3a: in
@@ -404,6 +416,8 @@ def run_s1(c, site, run, guard, custody=()):
         facts.append(("BINDING", " ".join(labels)))
         check_forms(values, site.form_rules)
         facts.append(("FORM", "pass"))
+        check_distinct(values)
+        facts.append(("DISTINCT", "pass"))
         facts.append(("KEY_LIVE", check_live(values, c.inv, site.live_check)))
         check_l5(values, c)
         facts.append(("LEAK_CHECK", "L5 pass"))

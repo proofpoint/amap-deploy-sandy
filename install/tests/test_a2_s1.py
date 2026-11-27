@@ -13,6 +13,7 @@ import a2fix
 import a2_args
 import a2_guard
 import a2_s1
+import a2_site
 from a2_causes import Refusal
 
 
@@ -617,6 +618,91 @@ class RulesTest(_KeepsMask):
         g.check("..s3cret..")
 
 
+class MailboxFormRuleTest(unittest.TestCase):
+    """Ruling S1-MAILBOX-FORM-RULE: the mailbox rule is the hub set-login
+    verb's own, 24 to 128 bytes each 0x21-0x7E, and it is the default
+    Site's. The api_key rule stays an open slot, so the default still
+    refuses a run, naming that rule."""
+
+    def test_edges(self):
+        rule = a2_site.mailbox_form
+        for n, ok in ((23, False), (24, True), (128, True), (129, False), (0, False)):
+            with self.subTest(n=n):
+                self.assertIs(rule(bytearray(b"x" * n)), ok)
+
+    def test_each_byte_is_printable_ascii_without_space(self):
+        rule = a2_site.mailbox_form
+        base = b"!" * 12 + b"~" * 12
+        self.assertIs(rule(bytearray(base)), True)
+        for bad in (0x20, 0x7F, 0x00, 0x0A, 0x0D, 0x09, 0x80, 0xFF):
+            for at in (0, 11, 23):
+                with self.subTest(byte=bad, at=at):
+                    v = bytearray(base)
+                    v[at] = bad
+                    self.assertIs(rule(v), False)
+
+    def test_a_space_inside_refuses(self):
+        self.assertIs(a2_site.mailbox_form(bytearray(b"abcdefghijkl mnopqrstuvwxyz")), False)
+
+    def test_only_a_bytearray(self):
+        for v in (b"x" * 24, "x" * 24, None, [0x41] * 24, memoryview(bytearray(b"x" * 24))):
+            with self.subTest(kind=type(v).__name__):
+                self.assertIs(a2_site.mailbox_form(v), False)
+
+    def test_the_default_site_carries_it_and_leaves_api_key_open(self):
+        rules = a2_site.Site().form_rules
+        self.assertEqual(set(rules), {"mailbox"})
+        self.assertIs(rules["mailbox"], a2_site.mailbox_form)
+        good = {"api_key": bytearray(b"k" * 30), "mailbox:vm-a": bytearray(b"m" * 24)}
+        with self.assertRaises(Refusal) as cm:
+            a2_s1.check_forms(good, rules)
+        self.assertEqual((cm.exception.cause, cm.exception.detail), ("CREDENTIALS.FORM", "form rule: api_key"))
+        with_key = dict(rules, api_key=lambda v: True)
+        a2_s1.check_forms(good, with_key)
+        for v in (bytearray(b"m" * 23), bytearray(b"m" * 129), bytearray(b"m" * 12 + b" " + b"m" * 11)):
+            with self.subTest(n=len(v)):
+                with self.assertRaises(Refusal) as cm:
+                    a2_s1.check_forms({"api_key": bytearray(b"k"), "mailbox:vm-a": v}, with_key)
+                self.assertEqual((cm.exception.cause, cm.exception.detail),
+                                 ("CREDENTIALS.FORM", "form rule: mailbox"))
+
+
+class DistinctMailboxTest(unittest.TestCase):
+    """Rule 4: two VMs' mailbox values are never equal (check_distinct)."""
+
+    def test_equal_pair_refuses_naming_only_the_rule(self):
+        for vals in ((b"one-value-x", b"one-value-x"), (b"a-value-1", b"b-value-2", b"a-value-1"),
+                     (b"a-value-1", b"b-value-2", b"b-value-2")):
+            v = {"api_key": bytearray(b"k-secret")}
+            v.update(("mailbox:vm-" + str(i), bytearray(x)) for i, x in enumerate(vals))
+            with self.subTest(n=len(vals)):
+                with self.assertRaises(Refusal) as cm:
+                    a2_s1.check_distinct(v)
+                self.assertEqual((cm.exception.cause, cm.exception.detail),
+                                 ("CREDENTIALS.MAILBOX_REUSED", "form rule: mailbox values distinct"))
+
+    def test_distinct_values_and_the_api_key_pass(self):
+        a2_s1.check_distinct({"api_key": bytearray(b"same-as-a"), "mailbox:vm-a": bytearray(b"same-as-a"),
+                              "mailbox:vm-b": bytearray(b"other-one")})
+        a2_s1.check_distinct({"api_key": bytearray(b"k"), "mailbox:vm-a": bytearray(b"only-one")})
+        a2_s1.check_distinct({"api_key": bytearray(b"k"), "mailbox:vm-a": bytearray(b"prefix"),
+                              "mailbox:vm-b": bytearray(b"prefix-longer")})
+
+    def test_compared_in_constant_time(self):
+        import hmac
+        calls = []
+        real = hmac.compare_digest
+
+        def spy(a, b):
+            calls.append((type(a), type(b)))
+            return real(a, b)
+        hmac.compare_digest = spy
+        self.addCleanup(setattr, hmac, "compare_digest", real)
+        a2_s1.check_distinct({"api_key": bytearray(b"k"), "mailbox:vm-a": bytearray(b"x1"),
+                              "mailbox:vm-b": bytearray(b"x2"), "mailbox:vm-c": bytearray(b"x3")})
+        self.assertEqual(calls, [(bytearray, bytearray)] * 3)
+
+
 class RunnerS1Test(_KeepsMask):
     """S1 through the runner, after a passing S0 (a2fix.GitWorld)."""
 
@@ -772,14 +858,42 @@ class RunnerS1Test(_KeepsMask):
         base = {"RUN_ID", "COMMAND", "LOOP", "INSTALLER_SHA", "LOCK_SHA", "HOSTS_SHA", "STAGE", "HOST",
                 "STARTED", "ENDED", "RESULT"}
         self.assertEqual(set(facts) - base, {"CUSTODY_LOCKS", "CUSTODY_PLACEMENT", "CUSTODY_STOP",
-                                             "CORE_LIMIT", "NO_ECHO", "BINDING", "FORM", "KEY_LIVE",
+                                             "CORE_LIMIT", "NO_ECHO", "BINDING", "FORM", "DISTINCT", "KEY_LIVE",
                                              "LEAK_CHECK", "HOLD"})
         # 5.3b: the custody read-back taken before S1, as S1's facts.
         self.assertEqual({k: facts[k] for k in ("CUSTODY_LOCKS", "CUSTODY_PLACEMENT", "CUSTODY_STOP")},
                          {"CUSTODY_LOCKS": "held", "CUSTODY_PLACEMENT": "match", "CUSTODY_STOP": "unset"})
-        self.assertEqual({k: facts[k] for k in ("CORE_LIMIT", "NO_ECHO", "FORM", "KEY_LIVE", "LEAK_CHECK")},
-                         {"CORE_LIMIT": "0", "NO_ECHO": "verified", "FORM": "pass", "KEY_LIVE": "pass",
-                          "LEAK_CHECK": "L5 pass"})
+        self.assertEqual({k: facts[k] for k in ("CORE_LIMIT", "NO_ECHO", "FORM", "DISTINCT", "KEY_LIVE",
+                                                "LEAK_CHECK")},
+                         {"CORE_LIMIT": "0", "NO_ECHO": "verified", "FORM": "pass", "DISTINCT": "pass",
+                          "KEY_LIVE": "pass", "LEAK_CHECK": "L5 pass"})
+
+    def test_two_vms_given_one_mailbox_value_refuse_before_the_live_check(self):
+        """Rule 4 (two-VM negative): the run's two VMs are given the same
+        mailbox value. S1 refuses CREDENTIALS.MAILBOX_REUSED, exit 2, after
+        the form check and before the live check, and no file or terminal
+        line holds the value."""
+        live = []
+        same = b"mbx-secret-same"
+        e, site, p = self.run_with([b"api-secret-1x", same, same], live_check=lambda k: live.append(1) or True)
+        self.assertEqual((e.cause, e.rc, e.detail), ("CREDENTIALS.MAILBOX_REUSED", 2, "form rule: mailbox values distinct"))
+        self.assertEqual(live, [])
+        import a2_record
+        facts, _sid, _host, rc = a2_record.parse_receipt(self.read("receipts", "S1--.txt"))
+        self.assertEqual((facts["RESULT"], facts["FORM"], rc), ("FAIL", "pass", 2))
+        self.assertNotIn("DISTINCT", facts)
+        self.assertNotIn("KEY_LIVE", facts)
+        run_dir = os.path.join(self.w.home, "alpha2-work", "runs", self.rid)
+        for root, _dirs, files in os.walk(run_dir):
+            for f in files:
+                with open(os.path.join(root, f), "rb") as fh:
+                    data = fh.read()
+                self.assertNotIn(same, data, f)
+        self.assertNotIn(same.decode(), site.out.getvalue())
+
+    def test_distinct_values_pass_the_same_run(self):
+        e, site, p = self.run_with([b"api-secret-1x", b"mbx-secret-ax", b"mbx-secret-bx"])
+        self.assertNotEqual(e.cause, "CREDENTIALS.MAILBOX_REUSED")
 
     def test_no_part_hash_or_length_of_a_value_reaches_any_file_or_the_terminal(self):
         """3.3 forbids a value, its hash, length, prefix or any part: every

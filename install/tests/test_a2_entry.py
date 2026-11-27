@@ -165,13 +165,13 @@ class ExecCarriesLocksTest(unittest.TestCase):
             "    h=a2_locks.acquire(order, uid)\n"
             "    if sys.argv[4]=='0':\n"
             "        [os.set_inheritable(fd, False) for fd in h.values()]\n"
-            "    os.execv(sys.executable,[sys.executable,'-I','-c',sys.argv[5],sys.argv[1],root,'check'])\n"
+            "    os.execv(sys.executable,[sys.executable,'-I','-B','-c',sys.argv[5],sys.argv[1],root,'check'])\n"
             "try:\n"
             "    a2_locks.find_held(order, uid); print('held')\n"
             "except Exception as e:\n"
             "    print(getattr(e,'cause','?'))\n"
         )
-        r = subprocess.run([sys.executable, "-I", "-c", code, a2fix.INSTALL, self.w.root, "take",
+        r = subprocess.run([sys.executable, "-I", "-B", "-c", code, a2fix.INSTALL, self.w.root, "take",
                             "1" if inheritable else "0", code], capture_output=True, text=True, timeout=60)
         return r.stdout.strip()
 
